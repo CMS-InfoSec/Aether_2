@@ -70,9 +70,11 @@ class RecordingSession:
                         "size": fill["size"],
                         "price": fill["price"],
                         "fee": fill.get("fee"),
+
                         "instrument": fill.get("symbol")
                         or order.get("symbol")
                         or order.get("market"),
+
                     }
                 )
             return FakeResult(rows)
@@ -94,7 +96,9 @@ class RecordingSession:
                     {
                         "order_id": order["order_id"],
                         "account_id": account_id,
+
                         "instrument": order.get("symbol") or order.get("market"),
+
                         "size": order["size"],
                         "submitted_ts": submitted,
                     }
@@ -116,7 +120,9 @@ def sample_session() -> RecordingSession:
         {
             "order_id": "ord-1",
             "account_id": "alpha",
+
             "market": "BTC-USD",
+
             "symbol": "BTC-USD",
             "side": "BUY",
             "size": 1,
@@ -125,7 +131,9 @@ def sample_session() -> RecordingSession:
         {
             "order_id": "ord-2",
             "account_id": "alpha",
+
             "market": "BTC-USD",
+
             "symbol": "BTC-USD",
             "side": "SELL",
             "size": 1,
@@ -134,7 +142,9 @@ def sample_session() -> RecordingSession:
         {
             "order_id": "ord-3",
             "account_id": "beta",
+
             "market": "ETH-USD",
+
             "symbol": "ETH-USD",
             "side": "SELL",
             "size": 2,
@@ -145,9 +155,11 @@ def sample_session() -> RecordingSession:
         {
             "fill_id": "fill-1",
             "order_id": "ord-1",
+
             "market": "BTC-USD",
             "symbol": "BTC-USD",
             "fill_ts": datetime(2024, 5, 1, 0, 15, tzinfo=timezone.utc),
+
             "price": 100,
             "size": 1,
             "fee": 0.5,
@@ -155,9 +167,11 @@ def sample_session() -> RecordingSession:
         {
             "fill_id": "fill-2",
             "order_id": "ord-2",
+
             "market": "BTC-USD",
             "symbol": "BTC-USD",
             "fill_ts": datetime(2024, 5, 1, 1, 15, tzinfo=timezone.utc),
+
             "price": 110,
             "size": 1,
             "fee": 0.6,
@@ -165,9 +179,11 @@ def sample_session() -> RecordingSession:
         {
             "fill_id": "fill-3",
             "order_id": "ord-3",
+
             "market": "ETH-USD",
             "symbol": "ETH-USD",
             "fill_ts": datetime(2024, 5, 1, 2, 15, tzinfo=timezone.utc),
+
             "price": 50,
             "size": 2,
             "fee": 0.4,
@@ -223,6 +239,7 @@ def test_generate_daily_pnl_creates_audit_log_entries(tmp_path: Path, sample_ses
     )
     assert len(keys) == 1
     assert len(sample_session.audit_entries) == 1
+
     audit_metadata = json.loads(sample_session.audit_entries[0]["metadata"])
     assert "daily_pnl/2024-05-01.csv" in audit_metadata["object_key"]
 
@@ -230,6 +247,7 @@ def test_generate_daily_pnl_creates_audit_log_entries(tmp_path: Path, sample_ses
 def test_daily_pnl_queries_use_symbol_and_timestamp_columns(
     tmp_path: Path, sample_session: RecordingSession
 ) -> None:
+
     storage = ArtifactStorage(tmp_path)
     generate_daily_pnl(
         sample_session,
@@ -237,5 +255,7 @@ def test_daily_pnl_queries_use_symbol_and_timestamp_columns(
         report_date=date(2024, 5, 1),
         output_formats=("csv",),
     )
+
     assert any("f.symbol" in query and "f.fill_ts" in query for query in sample_session.queries)
     assert any("o.symbol" in query and "o.submitted_ts" in query for query in sample_session.queries)
+

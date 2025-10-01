@@ -8,7 +8,7 @@ import pytest
 fastapi = pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
-from services.common.adapters import TimescaleAdapter
+from services.common.adapters import KrakenSecretManager, TimescaleAdapter
 from services.secrets.main import app
 from shared import k8s
 from shared.k8s import KrakenSecretStore
@@ -60,3 +60,20 @@ def test_status_returns_rotation_metadata(monkeypatch: pytest.MonkeyPatch) -> No
     assert status_body["secret_name"] == "kraken-keys-admin-eu"
     assert status_body["created_at"] == rotation_metadata["created_at"]
     assert status_body["rotated_at"] == rotation_metadata["rotated_at"]
+
+    store = KrakenSecretStore(core_v1=SimpleNamespace())
+    store.write_credentials(
+        "admin-eu", api_key="rotated-key", api_secret="rotated-secret"
+    )
+    manager = KrakenSecretManager(account_id="admin-eu", secret_store=store)
+    credentials = manager.get_credentials()
+    assert credentials["metadata"]["secret_name"] == "kraken-keys-admin-eu"
+    assert credentials["metadata"]["api_key"] == "***"
+    assert credentials["metadata"]["api_secret"] == "***"
+
+    events = TimescaleAdapter(account_id="admin-eu").credential_events()
+    assert events
+    access_event = events[-1]
+    assert access_event["event_type"] == "kraken.credentials.access"
+    assert access_event["metadata"]["secret_name"] == "kraken-keys-admin-eu"
+    assert access_event["metadata"]["material_present"] is True

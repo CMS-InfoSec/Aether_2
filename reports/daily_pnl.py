@@ -104,6 +104,7 @@ def fetch_daily_orders(
     order_to_instrument: Dict[str, str] = {}
     for order in orders:
         order_id = str(order["order_id"])
+
         instrument = (
             order.get("instrument")
             or order.get("symbol")
@@ -111,6 +112,7 @@ def fetch_daily_orders(
             or "UNKNOWN"
         )
         order_to_instrument[order_id] = str(instrument)
+
     LOGGER.debug("Fetched %d orders between %s and %s", len(orders), start, end)
     return order_to_instrument
 
@@ -126,7 +128,9 @@ def compute_daily_pnl(
         account_id = str(fill["account_id"])
         order_id = str(fill["order_id"])
         instrument = str(
+
             fill.get("instrument") or order_instruments.get(order_id, "UNKNOWN")
+
         )
         side = str(fill["side"]).upper()
         quantity = float(fill["size"])
