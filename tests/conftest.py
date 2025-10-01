@@ -15,7 +15,10 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
 
-pytest_plugins = ["tests.fixtures.backends"]
+pytest_plugins = [
+    "tests.fixtures.backends",
+    "tests.fixtures.mock_kraken",
+]
 
 
 def _install_sqlalchemy_stub() -> None:
