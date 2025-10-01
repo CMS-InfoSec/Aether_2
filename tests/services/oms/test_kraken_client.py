@@ -31,3 +31,23 @@ def test_kraken_ws_client_loads_credentials_from_kubernetes_secret() -> None:
     assert metadata["api_key"] == "***"
     assert metadata["api_secret"] == "***"
     assert metadata["material_present"] is True
+
+
+def test_kraken_secret_manager_rotation_status_includes_created_at() -> None:
+    account_id = "rotation-account"
+
+    KubernetesSecretClient.reset()
+    TimescaleAdapter.reset()
+
+    manager = KrakenSecretManager(account_id)
+
+    manager.rotate_credentials(api_key="first", api_secret="secret")
+    first_status = manager.status()
+    assert first_status is not None
+    assert first_status["created_at"] == first_status["rotated_at"]
+
+    manager.rotate_credentials(api_key="second", api_secret="secret")
+    second_status = manager.status()
+    assert second_status is not None
+    assert second_status["created_at"] == first_status["created_at"]
+    assert second_status["rotated_at"] != first_status["rotated_at"]

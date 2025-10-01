@@ -75,11 +75,24 @@ class TimescaleAdapter:
         return list(self._telemetry.get(self.account_id, []))
 
     def record_credential_rotation(self, *, secret_name: str, rotated_at: datetime) -> None:
+        existing_events = self._credential_events[self.account_id]
+        rotation_events = [
+            event for event in existing_events if event.get("event") == "rotation"
+        ]
+        if rotation_events:
+            first_rotation = rotation_events[0]
+            created_at = first_rotation.get("created_at") or first_rotation.get("rotated_at")
+            if "created_at" not in first_rotation and created_at is not None:
+                first_rotation["created_at"] = created_at
+        else:
+            created_at = rotated_at
+
         payload = {
             "event": "rotation",
             "secret_name": secret_name,
             "rotated_at": rotated_at,
             "timestamp": rotated_at,
+            "created_at": created_at,
         }
         self._credential_events[self.account_id].append(deepcopy(payload))
 
@@ -104,7 +117,11 @@ class TimescaleAdapter:
         ]
         if not events:
             return None
-        return deepcopy(events[-1])
+        created_at = events[0].get("created_at") or events[0].get("rotated_at")
+        latest = deepcopy(events[-1])
+        if "created_at" not in latest and created_at is not None:
+            latest["created_at"] = created_at
+        return latest
 
     def credential_events(self) -> List[Dict[str, Any]]:
         return [deepcopy(event) for event in self._credential_events.get(self.account_id, [])]
