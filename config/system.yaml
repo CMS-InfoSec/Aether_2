@@ -1,0 +1,3 @@
+# Global system configuration for runtime toggles.
+enable_audit_mode: false
+auditor_accounts: [auditor]
