@@ -1,0 +1,51 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: egress-ingress-restrictions
+  labels:
+    app.kubernetes.io/component: network
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow intra-namespace traffic between pods.
+    - from:
+        - podSelector: {}
+    # Allow traffic from the ingress controller namespace only.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+  egress:
+    # Allow intra-namespace communication.
+    - to:
+        - podSelector: {}
+    # Allow DNS queries for hostname resolution.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Allow HTTPS traffic to Kraken endpoints (Cloudflare).
+    - to:
+        - ipBlock:
+            cidr: 104.16.0.0/13
+      ports:
+        - protocol: TCP
+          port: 443
+    # Allow HTTPS traffic to api.coingecko.com (Cloudflare).
+    - to:
+        - ipBlock:
+            cidr: 172.64.0.0/13
+      ports:
+        - protocol: TCP
+          port: 443
