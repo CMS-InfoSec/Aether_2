@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping
@@ -39,7 +40,9 @@ class RecordingSession:
         params = params or {}
         normalized_query = " ".join(query.lower().split())
         self.queries.append(query.strip())
+
         if "insert into audit_log" in normalized_query:
+
             self.audit_entries.append(params)
             return FakeResult([])
 
@@ -214,5 +217,5 @@ def test_generate_daily_pnl_creates_audit_log_entries(tmp_path: Path, sample_ses
     )
     assert len(keys) == 1
     assert len(sample_session.audit_entries) == 1
-    audit_metadata = sample_session.audit_entries[0]["metadata"]
-    assert "daily_pnl/2024-05-01.csv" in audit_metadata
+    payload = json.loads(sample_session.audit_entries[0]["payload"])
+    assert "daily_pnl/2024-05-01.csv" in payload["object_key"]
