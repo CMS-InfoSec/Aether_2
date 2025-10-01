@@ -14,9 +14,9 @@ dependencies = [
     "email-validator>=2.1",
     "prometheus-client>=0.20",
 
-    "httpx>=0.27",
-    "SQLAlchemy>=2.0.25",
-    "asyncpg>=0.29.0",
+
+    "aiokafka>=0.10",
+
 
 ]
 
