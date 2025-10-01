@@ -1,42 +1,47 @@
-"""Simplified backtest engine with order-book execution logic.
+"""Advanced backtest engine with order-book execution, fee tiers and stress testing.
 
-This module provides a :class:`Backtester` that consumes historical bar and
-order-book event streams together with an intent generator (``Policy``).  The
-implementation focuses on the bookkeeping necessary for analysing execution
-quality – queue position, maker/taker routing, fee attribution and PnL curves –
-while leaving concrete strategy or data integrations to be implemented by the
-caller.
-
-The goal of this file is to offer a well documented, NumPy/pandas powered
-backtesting harness that can later be extended with production ready data
-adapters.
+This module exposes a :class:`Backtester` that replays bar and book events while
+consulting a :class:`Policy` for trading intents.  The simulator aims to mimic
+realistic exchange behaviour including queue positioning, time-in-force rules,
+stop logic and halts.  It also provides stress scenario tooling and rich
+performance attribution so that downstream unit tests can focus on individual
+components.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Protocol, Tuple
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any, Deque, Dict, Iterable, Iterator, List, Optional, Protocol, Tuple
 
 import numpy as np
 import pandas as pd
 
 
 class Policy(Protocol):
-    """Minimal protocol expected from a strategy intent generator.
-
-    Implementations should inspect the current market state and return an
-    iterable of :class:`OrderIntent` objects describing the desired actions.
-    """
+    """Minimal protocol expected from a strategy intent generator."""
 
     def generate(self, timestamp: pd.Timestamp, market_state: Dict[str, Any]) -> Iterable["OrderIntent"]:
         ...
 
+    def reset(self) -> None:  # pragma: no cover - optional protocol
+        """Optional hook allowing stateful policies to reset between runs."""
+        raise NotImplementedError
+
 
 @dataclass
 class FeeSchedule:
-    """Simple maker/taker fee representation (expressed in decimals)."""
+    """Maker/taker fee schedule expressed in decimals."""
 
     maker: float = 0.0
     taker: float = 0.0
+
+
+@dataclass
+class FeeTier:
+    """Rolling notional fee tier configuration."""
+
+    threshold: float
+    schedule: FeeSchedule
 
 
 @dataclass
@@ -47,18 +52,32 @@ class OrderIntent:
     quantity: float
     price: Optional[float] = None
     order_type: str = "limit"  # "limit" or "market"
+    time_in_force: str = "GTC"  # "GTC", "IOC", "FOK"
     allow_partial: bool = True
     queue_position: float = 0.0  # 0 == front of queue, 1 == back of queue
+    post_only: bool = False
+    stop_price: Optional[float] = None
+    trailing_offset: Optional[float] = None
 
     def __post_init__(self) -> None:
         self.side = self.side.lower()
+        if self.side not in {"buy", "sell"}:
+            raise ValueError(f"Unsupported side: {self.side}")
+        self.order_type = self.order_type.lower()
         if self.order_type not in {"limit", "market"}:
             raise ValueError(f"Unsupported order_type: {self.order_type}")
+        self.time_in_force = self.time_in_force.upper()
+        if self.time_in_force not in {"GTC", "IOC", "FOK"}:
+            raise ValueError(f"Unsupported time_in_force: {self.time_in_force}")
+        if self.queue_position < 0.0 or self.queue_position > 1.0:
+            raise ValueError("queue_position must be within [0, 1]")
+        if self.trailing_offset is not None and self.trailing_offset <= 0:
+            raise ValueError("trailing_offset must be positive")
 
 
 @dataclass
 class Order:
-    """Internal order representation used while simulating execution."""
+    """Internal order representation used during simulation."""
 
     order_id: int
     intent: OrderIntent
@@ -66,8 +85,10 @@ class Order:
     remaining: float
     filled: float = 0.0
     status: str = "open"  # "open", "filled", "cancelled"
-    is_taker: bool = False
     fee_paid: float = 0.0
+    triggered: bool = False
+    active: bool = True
+    trigger_reference: Optional[float] = None
 
     def record_fill(self, quantity: float) -> None:
         self.remaining = max(self.remaining - quantity, 0.0)
@@ -87,6 +108,70 @@ class Fill:
     liquidity_flag: str  # "maker" or "taker"
 
 
+@dataclass
+class SimulationState:
+    """Mutable state maintained while running a simulation."""
+
+    cash: float
+    rng: np.random.Generator
+    orders: Dict[int, Order] = field(default_factory=dict)
+    fills: List[Fill] = field(default_factory=list)
+    equity_curve: List[Tuple[pd.Timestamp, float]] = field(default_factory=list)
+    position: float = 0.0
+    maker_target_qty: float = 0.0
+    maker_fill_qty: float = 0.0
+    total_notional: float = 0.0
+    total_fee: float = 0.0
+    slippage_sum_bps: float = 0.0
+    slippage_samples: int = 0
+    best_bid: Optional[float] = None
+    best_ask: Optional[float] = None
+    bid_size: float = 0.0
+    ask_size: float = 0.0
+    mid_price: Optional[float] = None
+    halted: bool = False
+
+
+class RollingFeeModel:
+    """Maintains a rolling 30-day notional to determine applicable fee tiers."""
+
+    def __init__(self, base_schedule: FeeSchedule, tiers: Optional[List[FeeTier]] = None) -> None:
+        self.base_schedule = base_schedule
+        self.tiers = sorted(tiers or [], key=lambda tier: tier.threshold)
+        self.window = pd.Timedelta(days=30)
+        self._notional_history: Deque[Tuple[pd.Timestamp, float]] = deque()
+        self._rolling_notional: float = 0.0
+
+    def _purge(self, now: pd.Timestamp) -> None:
+        cutoff = now - self.window
+        while self._notional_history and self._notional_history[0][0] < cutoff:
+            _, notional = self._notional_history.popleft()
+            self._rolling_notional -= notional
+
+    def current_schedule(self, now: pd.Timestamp) -> FeeSchedule:
+        self._purge(now)
+        schedule = self.base_schedule
+        for tier in self.tiers:
+            if self._rolling_notional >= tier.threshold:
+                schedule = tier.schedule
+            else:
+                break
+        return schedule
+
+    def calculate_fee(self, timestamp: pd.Timestamp, price: float, quantity: float, liquidity_flag: str) -> Tuple[float, float]:
+        schedule = self.current_schedule(timestamp)
+        rate = schedule.taker if liquidity_flag == "taker" else schedule.maker
+        notional = abs(price * quantity)
+        fee = notional * rate
+        self._register_notional(timestamp, notional)
+        return fee, rate
+
+    def _register_notional(self, timestamp: pd.Timestamp, notional: float) -> None:
+        self._purge(timestamp)
+        self._notional_history.append((timestamp, notional))
+        self._rolling_notional += notional
+
+
 class Backtester:
     """Order-book based execution simulator producing portfolio statistics."""
 
@@ -98,33 +183,22 @@ class Backtester:
         fee_schedule: Optional[FeeSchedule] = None,
         slippage_bps: float = 0.0,
         initial_cash: float = 0.0,
+        fee_tiers: Optional[List[FeeTier]] = None,
+        seed: Optional[int] = None,
     ) -> None:
         self.policy = policy
-        self.fee_schedule = fee_schedule or FeeSchedule()
+        self.base_fee_schedule = fee_schedule or FeeSchedule()
+        self.fee_tiers = fee_tiers or []
         self.slippage_bps = slippage_bps
-        self.initial_cash = initial_cash
+        self.initial_cash = float(initial_cash)
+        self.seed = seed
 
-        self._orders: Dict[int, Order] = {}
-        self._fills: List[Fill] = []
-        self._equity_curve: List[Tuple[pd.Timestamp, float]] = []
-        self._order_id_counter: int = 0
-
-        self._bar_events = list(self._normalise_stream(bar_events, "bar"))
-        self._book_events = list(self._normalise_stream(book_events, "book"))
-        self._events = sorted(self._bar_events + self._book_events, key=lambda item: item["timestamp"])
-
-        self._position: float = 0.0
-        self._cash: float = float(initial_cash)
-
-        self._best_bid: Optional[float] = None
-        self._best_ask: Optional[float] = None
-        self._bid_size: float = 0.0
-        self._ask_size: float = 0.0
+        bar_stream = list(self._normalise_stream(bar_events, "bar"))
+        book_stream = list(self._normalise_stream(book_events, "book"))
+        self._base_events = sorted(bar_stream + book_stream, key=lambda item: item["timestamp"])
 
     @staticmethod
     def _normalise_stream(events: Iterable[Dict[str, Any]], event_type: str) -> Iterator[Dict[str, Any]]:
-        """Ensure each event has a ``timestamp`` and ``type`` key."""
-
         for payload in events:
             record = dict(payload)
             if "timestamp" not in record:
@@ -137,139 +211,299 @@ class Backtester:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def run(self) -> Dict[str, float]:
-        """Execute the simulation and return aggregated performance metrics."""
+    def run(self) -> Dict[str, Any]:
+        """Execute the simulation returning performance metrics and stress runs."""
 
-        for event in self._events:
+        base_metrics = self._run_once(self._base_events)
+        stress_metrics = {
+            name: self._run_once(self._apply_stress(name)) for name in [
+                "flash_crash",
+                "spread_blowout",
+                "liquidity_halving",
+                "feed_gap",
+            ]
+        }
+        result: Dict[str, Any] = dict(base_metrics)
+        result["stress"] = stress_metrics
+        return result
+
+    # ------------------------------------------------------------------
+    # Core simulation loop
+    # ------------------------------------------------------------------
+    def _run_once(self, events: List[Dict[str, Any]]) -> Dict[str, float]:
+        self._reset_policy()
+        rng = np.random.default_rng(self.seed)
+        state = SimulationState(cash=self.initial_cash, rng=rng)
+        fee_model = RollingFeeModel(self.base_fee_schedule, self.fee_tiers)
+
+        for event in events:
             timestamp: pd.Timestamp = event["timestamp"]
             if event["type"] == "book":
-                self._handle_book_event(event)
+                self._handle_book_event(event, state, fee_model)
             elif event["type"] == "bar":
-                self._handle_bar_event(event)
+                self._handle_bar_event(event, state, fee_model)
+            self._mark_to_market(timestamp, state)
 
-            self._mark_to_market(timestamp)
+        return self._compute_performance(state)
 
-        metrics = self._compute_performance()
-        return metrics
+    def _reset_policy(self) -> None:
+        reset_fn = getattr(self.policy, "reset", None)
+        if callable(reset_fn):
+            reset_fn()
 
     # ------------------------------------------------------------------
     # Event handlers
     # ------------------------------------------------------------------
-    def _handle_book_event(self, event: Dict[str, Any]) -> None:
-        self._best_bid = event.get("bid")
-        self._best_ask = event.get("ask")
-        self._bid_size = float(event.get("bid_size", np.inf))
-        self._ask_size = float(event.get("ask_size", np.inf))
-
-        if self._best_bid is None or self._best_ask is None:
-            return
-
-        self._match_orders(event["timestamp"])
-
-    def _handle_bar_event(self, event: Dict[str, Any]) -> None:
+    def _handle_bar_event(self, event: Dict[str, Any], state: SimulationState, fee_model: RollingFeeModel) -> None:
         timestamp = event["timestamp"]
         market_state = {
             "bar": event,
-            "best_bid": self._best_bid,
-            "best_ask": self._best_ask,
-            "position": self._position,
-            "cash": self._cash,
+            "best_bid": state.best_bid,
+            "best_ask": state.best_ask,
+            "position": state.position,
+            "cash": state.cash,
         }
-        intents = list(self.policy.generate(timestamp, market_state))
-        for intent in intents:
-            self._submit_order(intent, timestamp)
+        for intent in self.policy.generate(timestamp, market_state):
+            self._submit_order(intent, timestamp, state, fee_model)
+
+    def _handle_book_event(self, event: Dict[str, Any], state: SimulationState, fee_model: RollingFeeModel) -> None:
+        state.best_bid = event.get("bid", state.best_bid)
+        state.best_ask = event.get("ask", state.best_ask)
+        state.bid_size = float(event.get("bid_size", state.bid_size or 0.0))
+        state.ask_size = float(event.get("ask_size", state.ask_size or 0.0))
+        state.halted = bool(event.get("halted", state.halted))
+
+        if state.best_bid is not None and state.best_ask is not None:
+            state.mid_price = (state.best_bid + state.best_ask) / 2.0
+
+        self._update_trailing_orders(state)
+        self._activate_stop_orders(state)
+        if not state.halted:
+            self._match_orders(state, event["timestamp"], fee_model)
 
     # ------------------------------------------------------------------
     # Order management
     # ------------------------------------------------------------------
-    def _submit_order(self, intent: OrderIntent, timestamp: pd.Timestamp) -> None:
-        self._order_id_counter += 1
+    def _submit_order(
+        self,
+        intent: OrderIntent,
+        timestamp: pd.Timestamp,
+        state: SimulationState,
+        fee_model: RollingFeeModel,
+    ) -> None:
+        order_id = len(state.orders) + len(state.fills) + 1
         order = Order(
-            order_id=self._order_id_counter,
+            order_id=order_id,
             intent=intent,
             timestamp=timestamp,
             remaining=float(intent.quantity),
+            triggered=not (intent.stop_price or intent.trailing_offset),
+            active=not (intent.stop_price or intent.trailing_offset),
         )
-        # Market orders execute immediately as taker
-        if intent.order_type == "market":
-            order.is_taker = True
-            self._orders[order.order_id] = order
-            self._execute_market_order(order, timestamp)
-        else:
-            self._orders[order.order_id] = order
-            self._attempt_limit_cross(order, timestamp)
 
-    def _execute_market_order(self, order: Order, timestamp: pd.Timestamp) -> None:
-        if self._best_bid is None or self._best_ask is None:
-            # No liquidity snapshot – treat as no fill but keep order open for future book events
+        crosses_book = False
+        if intent.order_type == "limit" and intent.price is not None:
+            if intent.side == "buy" and state.best_ask is not None and intent.price >= state.best_ask:
+                crosses_book = True
+            if intent.side == "sell" and state.best_bid is not None and intent.price <= state.best_bid:
+                crosses_book = True
+
+        if intent.trailing_offset is not None:
+            order.active = False
+            reference = state.best_bid if intent.side == "sell" else state.best_ask
+            order.trigger_reference = reference
+            order.intent.stop_price = reference - intent.trailing_offset if intent.side == "sell" else reference + intent.trailing_offset
+
+        state.orders[order.order_id] = order
+
+        if intent.order_type == "limit" and not intent.post_only and crosses_book:
+            order.triggered = True
+            order.active = True
+
+        if intent.post_only and intent.price is not None:
+            if intent.side == "buy" and state.best_ask is not None and intent.price >= state.best_ask:
+                order.status = "cancelled"
+                order.active = False
+                return
+            if intent.side == "sell" and state.best_bid is not None and intent.price <= state.best_bid:
+                order.status = "cancelled"
+                order.active = False
+                return
+
+        if intent.order_type == "limit" and intent.price is not None and not crosses_book:
+            state.maker_target_qty += intent.quantity
+
+        if order.triggered and order.active:
+            self._execute_order(order, timestamp, state, fee_model)
+            if order.status == "filled":
+                state.orders.pop(order.order_id, None)
+            self._handle_time_in_force(order, state)
+
+    def _handle_time_in_force(self, order: Order, state: SimulationState) -> None:
+        if order.intent.time_in_force == "GTC":
             return
+        if order.status == "filled":
+            return
+        if order.intent.time_in_force == "FOK":
+            order.status = "cancelled"
+            order.remaining = 0.0
+            order.active = False
+            state.orders.pop(order.order_id, None)
+        elif order.intent.time_in_force == "IOC":
+            order.status = "cancelled"
+            order.remaining = 0.0
+            order.active = False
+            state.orders.pop(order.order_id, None)
 
-        target_price = self._best_ask if order.intent.side == "buy" else self._best_bid
-        slipped_price = self._apply_slippage(target_price, order.intent.side)
-        liquidity_flag = "taker"
-        available = self._ask_size if order.intent.side == "buy" else self._bid_size
+    def _update_trailing_orders(self, state: SimulationState) -> None:
+        if state.best_bid is None or state.best_ask is None:
+            return
+        for order in state.orders.values():
+            intent = order.intent
+            if intent.trailing_offset is None or order.status != "open":
+                continue
+            if intent.side == "sell":
+                reference = state.best_bid
+                if order.trigger_reference is None or reference > order.trigger_reference:
+                    order.trigger_reference = reference
+                intent.stop_price = order.trigger_reference - intent.trailing_offset
+            else:
+                reference = state.best_ask
+                if order.trigger_reference is None or reference < order.trigger_reference:
+                    order.trigger_reference = reference
+                intent.stop_price = order.trigger_reference + intent.trailing_offset
+
+    def _activate_stop_orders(self, state: SimulationState) -> None:
+        if state.best_bid is None or state.best_ask is None:
+            return
+        for order in state.orders.values():
+            if order.triggered or order.status != "open":
+                continue
+            stop_price = order.intent.stop_price
+            if stop_price is None:
+                continue
+            if order.intent.side == "buy" and state.best_ask <= stop_price:
+                order.triggered = True
+            elif order.intent.side == "sell" and state.best_bid >= stop_price:
+                order.triggered = True
+            if order.triggered:
+                order.active = True
+                if order.intent.order_type == "limit" and order.intent.price is None:
+                    order.intent.price = stop_price
+
+    def _match_orders(self, state: SimulationState, timestamp: pd.Timestamp, fee_model: RollingFeeModel) -> None:
+        for order in list(state.orders.values()):
+            if order.status != "open" or not order.active:
+                continue
+            self._execute_order(order, timestamp, state, fee_model)
+            if order.status == "filled":
+                state.orders.pop(order.order_id, None)
+            else:
+                prev_status = order.status
+                self._handle_time_in_force(order, state)
+                if prev_status != order.status and order.status != "open":
+                    state.orders.pop(order.order_id, None)
+
+    def _execute_order(
+        self,
+        order: Order,
+        timestamp: pd.Timestamp,
+        state: SimulationState,
+        fee_model: Optional[RollingFeeModel],
+    ) -> None:
+        if order.intent.order_type == "market":
+            self._execute_market_order(order, timestamp, state, fee_model)
+        else:
+            self._execute_limit_order(order, timestamp, state, fee_model)
+
+    def _execute_market_order(
+        self,
+        order: Order,
+        timestamp: pd.Timestamp,
+        state: SimulationState,
+        fee_model: Optional[RollingFeeModel],
+    ) -> None:
+        if state.best_bid is None or state.best_ask is None:
+            return
+        available = state.ask_size if order.intent.side == "buy" else state.bid_size
+        if available <= 0:
+            return
         fill_qty = min(order.remaining, available)
         if fill_qty <= 0:
             return
+        if order.intent.time_in_force == "FOK" and fill_qty < order.remaining:
+            return
+        price = state.best_ask if order.intent.side == "buy" else state.best_bid
+        exec_price = self._apply_slippage(price, order.intent.side, state)
+        self._register_fill(order, timestamp, exec_price, fill_qty, "taker", state, fee_model)
+        if order.intent.side == "buy":
+            state.ask_size = max(0.0, state.ask_size - fill_qty)
+        else:
+            state.bid_size = max(0.0, state.bid_size - fill_qty)
+        if order.intent.time_in_force in {"FOK", "IOC"} and order.status != "filled":
+            self._handle_time_in_force(order, state)
 
-        self._register_fill(order, timestamp, slipped_price, fill_qty, liquidity_flag)
-
-    def _attempt_limit_cross(self, order: Order, timestamp: pd.Timestamp) -> None:
-        if self._best_bid is None or self._best_ask is None:
+    def _execute_limit_order(
+        self,
+        order: Order,
+        timestamp: pd.Timestamp,
+        state: SimulationState,
+        fee_model: Optional[RollingFeeModel],
+    ) -> None:
+        if state.best_bid is None or state.best_ask is None:
+            return
+        price = order.intent.price
+        if price is None:
             return
 
-        crossed = False
-        target_price: Optional[float] = None
-        liquidity_flag = "maker"
-
         if order.intent.side == "buy":
-            if order.intent.price is not None and order.intent.price >= self._best_ask:
-                crossed = True
-                target_price = self._best_ask
-        else:  # sell
-            if order.intent.price is not None and order.intent.price <= self._best_bid:
-                crossed = True
-                target_price = self._best_bid
+            crossed = price >= state.best_ask
+            maker_liquidity = max(state.ask_size * (1.0 - order.intent.queue_position), 0.0)
+            taker_liquidity = state.ask_size
+        else:
+            crossed = price <= state.best_bid
+            maker_liquidity = max(state.bid_size * (1.0 - order.intent.queue_position), 0.0)
+            taker_liquidity = state.bid_size
 
         if not crossed:
             return
 
-        # If the order crosses we treat it as taking liquidity unless queue position indicates maker participation.
-        maker_fraction = max(0.0, min(1.0, 1.0 - order.intent.queue_position))
+        if crossed:
+            maker_fraction = max(0.0, min(1.0, 1.0 - order.intent.queue_position))
+        else:
+            maker_fraction = 1.0
+
         taker_qty = order.remaining * (1.0 - maker_fraction)
         maker_qty = order.remaining - taker_qty
 
-        fills: List[Tuple[float, str]] = []
         if taker_qty > 0:
-            liquidity_flag = "taker"
-            fills.append((taker_qty, liquidity_flag))
+            available = taker_liquidity
+            fill_qty = min(taker_qty, available)
+            if order.intent.time_in_force == "FOK" and fill_qty < order.remaining:
+                return
+            if fill_qty > 0:
+                exec_price = self._apply_slippage(state.best_ask if order.intent.side == "buy" else state.best_bid, order.intent.side, state)
+                self._register_fill(order, timestamp, exec_price, fill_qty, "taker", state, fee_model)
+                if order.intent.side == "buy":
+                    state.ask_size = max(0.0, state.ask_size - fill_qty)
+                else:
+                    state.bid_size = max(0.0, state.bid_size - fill_qty)
+
         if maker_qty > 0:
-            liquidity_flag = "maker"
-            fills.append((maker_qty, liquidity_flag))
-
-        for qty, flag in fills:
-            if qty <= 0:
-                continue
-            available = self._ask_size if order.intent.side == "buy" else self._bid_size
-            available *= max(0.0, 1.0 - order.intent.queue_position)
-            fill_qty = min(qty, available)
+            available = maker_liquidity
+            fill_qty = min(maker_qty, available)
             if fill_qty <= 0:
-                continue
-            if fill_qty < qty and not order.intent.allow_partial:
-                continue
-            exec_price = target_price if target_price is not None else self._best_ask
-            if flag == "taker":
-                exec_price = self._apply_slippage(exec_price, order.intent.side)
-            self._register_fill(order, timestamp, exec_price, fill_qty, flag)
-
-    def _match_orders(self, timestamp: pd.Timestamp) -> None:
-        for order in list(self._orders.values()):
-            if order.status != "open":
-                continue
-            if order.intent.order_type == "market":
-                self._execute_market_order(order, timestamp)
+                return
+            if fill_qty < maker_qty and not order.intent.allow_partial:
+                return
+            if order.intent.time_in_force == "FOK" and fill_qty < order.remaining:
+                return
+            exec_price = price
+            self._register_fill(order, timestamp, exec_price, fill_qty, "maker", state, fee_model)
+            if order.intent.side == "buy":
+                state.ask_size = max(0.0, state.ask_size - fill_qty)
             else:
-                self._attempt_limit_cross(order, timestamp)
+                state.bid_size = max(0.0, state.bid_size - fill_qty)
 
     def _register_fill(
         self,
@@ -278,13 +512,20 @@ class Backtester:
         price: float,
         quantity: float,
         liquidity_flag: str,
+        state: SimulationState,
+        fee_model: Optional[RollingFeeModel],
     ) -> None:
         if quantity <= 0:
             return
 
-        fee_rate = self.fee_schedule.taker if liquidity_flag == "taker" else self.fee_schedule.maker
-        fee = abs(price * quantity) * fee_rate
-        self._fills.append(
+        fee = 0.0
+        if fee_model is not None:
+            fee, _ = fee_model.calculate_fee(timestamp, price, quantity, liquidity_flag)
+        state.total_fee += fee
+        notional = abs(price * quantity)
+        state.total_notional += notional
+
+        state.fills.append(
             Fill(
                 order_id=order.order_id,
                 timestamp=timestamp,
@@ -295,61 +536,92 @@ class Backtester:
                 liquidity_flag=liquidity_flag,
             )
         )
-
         order.record_fill(quantity)
         order.fee_paid += fee
-        if order.status == "filled":
-            self._orders.pop(order.order_id, None)
 
         if order.intent.side == "buy":
-            self._position += quantity
-            self._cash -= price * quantity + fee
+            state.position += quantity
+            state.cash -= price * quantity + fee
         else:
-            self._position -= quantity
-            self._cash += price * quantity - fee
+            state.position -= quantity
+            state.cash += price * quantity - fee
+
+        if liquidity_flag == "maker":
+            state.maker_fill_qty += quantity
+
+        if state.mid_price is not None and state.mid_price > 0:
+            signed = 1 if order.intent.side == "buy" else -1
+            slippage = (price - state.mid_price) / state.mid_price * 10_000 * signed
+            state.slippage_sum_bps += slippage
+            state.slippage_samples += 1
+
+        if order.status == "filled":
+            order.active = False
 
     # ------------------------------------------------------------------
     # Portfolio analytics
     # ------------------------------------------------------------------
-    def _apply_slippage(self, price: float, side: str) -> float:
-        adjustment = price * (self.slippage_bps / 10_000.0)
-        return price + adjustment if side == "buy" else price - adjustment
-
-    def _mark_to_market(self, timestamp: pd.Timestamp) -> None:
-        if self._best_bid is None or self._best_ask is None:
-            equity = self._cash
+    def _mark_to_market(self, timestamp: pd.Timestamp, state: SimulationState) -> None:
+        if state.mid_price is None:
+            equity = state.cash
         else:
-            mid_price = (self._best_bid + self._best_ask) / 2.0
-            equity = self._cash + self._position * mid_price
-        self._equity_curve.append((timestamp, equity))
+            equity = state.cash + state.position * state.mid_price
+        state.equity_curve.append((timestamp, equity))
 
-    def _compute_performance(self) -> Dict[str, float]:
-        if not self._equity_curve:
+    def _compute_performance(self, state: SimulationState) -> Dict[str, float]:
+        if not state.equity_curve:
             return {
+                "net_pnl": 0.0,
                 "sharpe": 0.0,
-                "max_drawdown": 0.0,
-                "fee_spend": 0.0,
+                "sortino": 0.0,
+                "max_dd": 0.0,
+                "cvar_95": 0.0,
                 "turnover": 0.0,
+                "fee_bps": 0.0,
+                "maker_hit_rate": 0.0,
+                "slippage_attrib": 0.0,
             }
 
-        curve = pd.DataFrame(self._equity_curve, columns=["timestamp", "equity"]).set_index("timestamp").sort_index()
+        curve = pd.DataFrame(state.equity_curve, columns=["timestamp", "equity"]).set_index("timestamp").sort_index()
         returns = curve["equity"].pct_change().fillna(0.0)
         sharpe = self._sharpe_ratio(returns)
+        sortino = self._sortino_ratio(returns)
         max_dd = self._max_drawdown(curve["equity"])
-        fee_spend = float(sum(fill.fee for fill in self._fills))
-        turnover = float(sum(abs(fill.quantity) for fill in self._fills))
+        cvar_95 = self._cvar(returns, 0.95)
+        final_equity = float(curve["equity"].iloc[-1])
+        net_pnl = final_equity - self.initial_cash
+        turnover = state.total_notional
+        fee_bps = (state.total_fee / state.total_notional * 10_000) if state.total_notional > 0 else 0.0
+        maker_hit_rate = (state.maker_fill_qty / state.maker_target_qty) if state.maker_target_qty > 0 else 0.0
+        slippage_attrib = (state.slippage_sum_bps / state.slippage_samples) if state.slippage_samples > 0 else 0.0
         return {
+            "net_pnl": net_pnl,
             "sharpe": sharpe,
-            "max_drawdown": max_dd,
-            "fee_spend": fee_spend,
+            "sortino": sortino,
+            "max_dd": max_dd,
+            "cvar_95": cvar_95,
             "turnover": turnover,
+            "fee_bps": fee_bps,
+            "maker_hit_rate": maker_hit_rate,
+            "slippage_attrib": slippage_attrib,
         }
 
     @staticmethod
     def _sharpe_ratio(returns: pd.Series, periods: int = 252) -> float:
-        if returns.std(ddof=0) == 0:
+        vol = returns.std(ddof=0)
+        if vol == 0:
             return 0.0
-        return np.sqrt(periods) * returns.mean() / returns.std(ddof=0)
+        return float(np.sqrt(periods) * returns.mean() / vol)
+
+    @staticmethod
+    def _sortino_ratio(returns: pd.Series, periods: int = 252) -> float:
+        downside = returns[returns < 0]
+        if downside.empty:
+            return 0.0
+        downside_vol = downside.std(ddof=0)
+        if downside_vol == 0:
+            return 0.0
+        return float(np.sqrt(periods) * returns.mean() / downside_vol)
 
     @staticmethod
     def _max_drawdown(equity: pd.Series) -> float:
@@ -357,29 +629,65 @@ class Backtester:
         drawdown = equity / running_max - 1.0
         return float(drawdown.min())
 
-    # ------------------------------------------------------------------
-    # Convenience accessors
-    # ------------------------------------------------------------------
-    @property
-    def fills(self) -> pd.DataFrame:
-        return pd.DataFrame([fill.__dict__ for fill in self._fills])
+    @staticmethod
+    def _cvar(returns: pd.Series, confidence: float) -> float:
+        if returns.empty:
+            return 0.0
+        sorted_returns = returns.sort_values()
+        cutoff_index = int(np.ceil((1 - confidence) * len(sorted_returns)))
+        if cutoff_index <= 0:
+            return 0.0
+        tail = sorted_returns.iloc[:cutoff_index]
+        return float(tail.mean())
 
-    @property
-    def equity_curve(self) -> pd.DataFrame:
-        return pd.DataFrame(self._equity_curve, columns=["timestamp", "equity"]).set_index("timestamp")
+    def _apply_slippage(self, price: float, side: str, state: SimulationState) -> float:
+        direction = 1 if side == "buy" else -1
+        base = price * (self.slippage_bps / 10_000.0) * direction
+        noise = price * (self.slippage_bps / 20_000.0) * state.rng.normal()
+        return price + base + noise
 
+    # ------------------------------------------------------------------
+    # Stress scenarios
+    # ------------------------------------------------------------------
+    def _apply_stress(self, scenario: str) -> List[Dict[str, Any]]:
+        events = [dict(event) for event in self._base_events]
+        book_indices = [idx for idx, event in enumerate(events) if event["type"] == "book"]
+        if not book_indices:
+            return events
+
+        if scenario == "flash_crash":
+            window = book_indices[len(book_indices) // 2 : len(book_indices) // 2 + 5]
+            for idx in window:
+                event = events[idx]
+                if event.get("bid") is not None:
+                    event["bid"] *= 0.7
+                if event.get("ask") is not None:
+                    event["ask"] *= 0.72
+                event["bid_size"] = float(event.get("bid_size", 1.0)) * 0.5
+                event["ask_size"] = float(event.get("ask_size", 1.0)) * 0.5
+        elif scenario == "spread_blowout":
+            for idx in book_indices[len(book_indices) // 3 : len(book_indices) // 3 + 5]:
+                event = events[idx]
+                bid = event.get("bid")
+                ask = event.get("ask")
+                if bid is not None and ask is not None:
+                    mid = (bid + ask) / 2
+                    event["bid"] = mid * 0.98
+                    event["ask"] = mid * 1.02
+        elif scenario == "liquidity_halving":
+            for idx in book_indices[::2]:
+                event = events[idx]
+                event["bid_size"] = float(event.get("bid_size", 1.0)) * 0.5
+                event["ask_size"] = float(event.get("ask_size", 1.0)) * 0.5
+        elif scenario == "feed_gap":
+            gap_indices = book_indices[len(book_indices) // 4 : len(book_indices) // 4 + 3]
+            for idx in sorted(gap_indices, reverse=True):
+                events.pop(idx)
+        return events
+
+    # ------------------------------------------------------------------
+    # Convenience accessors (intended for unit tests)
+    # ------------------------------------------------------------------
     @property
-    def orders(self) -> pd.DataFrame:
-        return pd.DataFrame([
-            {
-                "order_id": order.order_id,
-                "side": order.intent.side,
-                "quantity": order.intent.quantity,
-                "filled": order.filled,
-                "remaining": order.remaining,
-                "status": order.status,
-                "fee_paid": order.fee_paid,
-                "timestamp": order.timestamp,
-            }
-            for order in self._orders.values()
-        ])
+    def base_events(self) -> List[Dict[str, Any]]:
+        return list(self._base_events)
