@@ -6,6 +6,19 @@ import pytest
 from services.common.adapters import TimescaleAdapter
 
 
+def test_timescale_adapter_initializes_exposure_cache() -> None:
+    account_id = "test"
+    TimescaleAdapter._instrument_exposures.pop(account_id, None)
+
+    adapter = TimescaleAdapter(account_id=account_id)
+
+    assert adapter.account_id == account_id
+    assert account_id in TimescaleAdapter._instrument_exposures
+    assert TimescaleAdapter._instrument_exposures[account_id] == {}
+
+    TimescaleAdapter._instrument_exposures.pop(account_id, None)
+
+
 @pytest.fixture
 def adapter() -> TimescaleAdapter:
     TimescaleAdapter.reset()
