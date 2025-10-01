@@ -12,6 +12,7 @@ from auth.service import AdminRepository, AuthService, SessionStore
 from services.alert_manager import setup_alerting
 from alert_prioritizer import router as alert_prioritizer_router
 from services.report_service import router as reports_router
+from multiformat_export import router as log_export_router
 
 from services.models.meta_learner import router as meta_router
 from services.models.model_zoo import router as models_router
@@ -44,7 +45,9 @@ def create_app() -> FastAPI:
     app.include_router(alert_prioritizer_router)
 
     app.include_router(models_router)
-    app.include_router(meta_router)
+
+    app.include_router(log_export_router)
+
 
 
     app.state.audit_store = audit_store
