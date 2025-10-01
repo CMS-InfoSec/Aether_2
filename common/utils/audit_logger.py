@@ -31,6 +31,19 @@ _CORE_FIELDS: Iterable[str] = (
 )
 
 
+def hash_ip(value: Optional[str]) -> Optional[str]:
+    """Return a stable SHA-256 hash of the provided IP address."""
+
+    if value is None:
+        return None
+
+    stripped = value.strip()
+    if not stripped:
+        return None
+
+    return hashlib.sha256(stripped.encode("utf-8")).hexdigest()
+
+
 def _database_dsn() -> str:
     """Return the database connection string for audit logging."""
 
@@ -147,8 +160,17 @@ def log_audit(
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO audit_log (actor, action, entity, before_json, after_json, ts)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO audit_log (
+                    actor,
+                    action,
+                    entity,
+                    before_json,
+                    after_json,
+                    ts,
+                    hash,
+                    prev_hash
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 """.strip(),
                 (
                     actor,
@@ -157,6 +179,8 @@ def log_audit(
                     before_json,
                     after_json,
                     timestamp,
+                    entry_hash,
+                    prev_hash,
                 ),
             )
 
@@ -243,5 +267,5 @@ if __name__ == "__main__":  # pragma: no cover - manual execution entry point
     sys.exit(main())
 
 
-__all__ = ["log_audit", "verify_audit_chain", "main"]
+__all__ = ["log_audit", "verify_audit_chain", "main", "hash_ip"]
 

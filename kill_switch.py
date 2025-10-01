@@ -2,16 +2,28 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import logging
 from enum import Enum
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 
 from kill_alerts import dispatch_notifications
 from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
 from services.common.security import require_admin_account
 
+try:  # pragma: no cover - optional audit dependency
+    from common.utils.audit_logger import hash_ip, log_audit
+except Exception:  # pragma: no cover - degrade gracefully
+    log_audit = None  # type: ignore[assignment]
+
+    def hash_ip(_: Optional[str]) -> Optional[str]:  # type: ignore[override]
+        return None
+
 app = FastAPI(title="Kill Switch Service")
+
+
+LOGGER = logging.getLogger("kill_switch")
 
 
 class KillSwitchReason(str, Enum):
@@ -44,6 +56,7 @@ def trigger_kill_switch(
     account_id: str = Query(..., min_length=1),
     reason_code: KillSwitchReason = Query(KillSwitchReason.LOSS_CAP_BREACH),
     actor_account: str = Depends(require_admin_account),
+    request: Request,
 ) -> Dict[str, Any]:
     """Trigger the kill switch for the provided account."""
 
@@ -84,6 +97,26 @@ def trigger_kill_switch(
         triggered_at=activation_ts,
         channels_sent=channels_sent,
     )
+
+    if log_audit is not None:
+        try:
+            log_audit(
+                actor=actor_account,
+                action="kill_switch.triggered",
+                entity=normalized_account,
+                before={},
+                after={
+                    "reason_code": reason_code.value,
+                    "reason": reason_description,
+                    "channels_sent": channels_sent,
+                    "triggered_at": activation_ts.isoformat(),
+                },
+                ip_hash=hash_ip(request.client.host if request.client else None),
+            )
+        except Exception:  # pragma: no cover - defensive best effort
+            LOGGER.exception(
+                "Failed to record audit log for kill switch activation on %s", normalized_account
+            )
 
     return {
         "status": "ok",
