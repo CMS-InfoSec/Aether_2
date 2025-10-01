@@ -283,16 +283,11 @@ class TimescaleAdapter:
 @dataclass
 class RedisFeastAdapter:
     account_id: str
-    repository: UniverseRepository | None = None
-    _repository: UniverseRepository = field(init=False, repr=False)
+
+    repository: Optional[UniverseRepository] = field(default=None, repr=False)
 
 
-    def __post_init__(self) -> None:
-        if self.repository is not None:
-            self._repository = self.repository
-        else:
-            self._repository = UniverseRepository(account_id=self.account_id)
-
+    _repository: Optional[UniverseRepository] = field(init=False, repr=False, default=None)
 
     _features: ClassVar[Dict[str, Dict[str, Any]]] = {
         "admin-eu": {"approved": ["BTC-USD", "ETH-USD"], "fees": {"BTC-USD": {"maker": 0.1, "taker": 0.2}}},
@@ -324,24 +319,18 @@ class RedisFeastAdapter:
 
 
     def __post_init__(self) -> None:
-        self._repository = UniverseRepository(account_id=self.account_id)
+
+        repository = self.repository or UniverseRepository(account_id=self.account_id)
+        self._repository = repository
 
     def approved_instruments(self) -> List[str]:
-        instruments = self._repository.approved_universe()
-        if instruments:
-            return instruments
-        account_config = self._features.get(self.account_id, {})
-        return list(account_config.get("approved", []))
+        assert self._repository is not None
+        return self._repository.approved_universe()
 
     def fee_override(self, instrument: str) -> Dict[str, Any] | None:
-        override = self._repository.fee_override(instrument)
-        if override is not None:
-            return override
-        account_config = self._features.get(self.account_id, {})
-        fees = account_config.get("fees", {})
-        if instrument not in fees:
-            return None
-        return dict(fees[instrument])
+        assert self._repository is not None
+        return self._repository.fee_override(instrument)
+
 
     def fetch_online_features(self, instrument: str) -> Dict[str, Any]:
         account_store = self._online_feature_store.get(self.account_id, {})
