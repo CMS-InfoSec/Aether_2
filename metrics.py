@@ -1,175 +1,227 @@
-"""Prometheus metrics helpers shared across microservices."""
+"""Shared Prometheus metrics and tracing helpers for microservices."""
 
 from __future__ import annotations
 
-from typing import Dict
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
+from typing import Dict, Generator, Optional
+from uuid import uuid4
 
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Request, Response
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
     CollectorRegistry,
     Counter,
     Gauge,
+    Histogram,
     generate_latest,
 )
+from starlette.middleware.base import BaseHTTPMiddleware
+
+try:  # pragma: no cover - OpenTelemetry may be optional in some deployments
+    from opentelemetry import trace
+    from opentelemetry.trace import Span, SpanKind
+except Exception:  # pragma: no cover - fall back to no-op tracing
+    trace = None  # type: ignore
+    Span = object  # type: ignore
+    SpanKind = None  # type: ignore
+
 
 _REGISTRY = CollectorRegistry()
 
-_ws_latency_ms = Gauge(
-    "ws_latency_ms",
-    "Latency of websocket interactions in milliseconds.",
-    labelnames=("account_id", "symbol"),
+_trades_submitted_total = Counter(
+    "trades_submitted_total",
+    "Total number of trades successfully submitted.",
     registry=_REGISTRY,
 )
 
-_oms_submit_ack_ms = Gauge(
-    "oms_submit_ack_ms",
-    "End-to-end latency between OMS submit and acknowledgement in milliseconds.",
-    labelnames=("account_id", "symbol"),
+_trades_rejected_total = Counter(
+    "trades_rejected_total",
+    "Total number of trades rejected during validation.",
+    registry=_REGISTRY,
+)
+
+_oms_errors_total = Counter(
+    "oms_errors_total",
+    "Total number of errors returned by the OMS.",
     registry=_REGISTRY,
 )
 
 _oms_latency_ms = Gauge(
     "oms_latency_ms",
-    "Latency of OMS order placement by transport in milliseconds.",
-    labelnames=("account_id", "symbol", "transport"),
+    "Current latency of OMS interactions in milliseconds.",
     registry=_REGISTRY,
 )
 
-_oms_error_count = Counter(
-    "oms_error_count",
-    "Count of OMS transport errors by account, symbol and transport.",
-    labelnames=("account_id", "symbol", "transport"),
+_pipeline_latency_ms = Gauge(
+    "pipeline_latency_ms",
+    "Current latency of the trading decision pipeline in milliseconds.",
     registry=_REGISTRY,
 )
 
-_oms_child_orders_total = Counter(
-    "oms_child_orders_total",
-    "Number of OMS child orders created per account and symbol.",
-    labelnames=("account_id", "symbol"),
+_policy_inference_latency = Histogram(
+    "policy_inference_latency",
+    "Latency distribution for policy inference in milliseconds.",
     registry=_REGISTRY,
+    buckets=(5, 10, 25, 50, 100, 250, 500, 1000, float("inf")),
 )
 
-_trade_rejections_total = Counter(
-    "trade_rejections_total",
-    "Count of rejected trades by account and symbol.",
-    labelnames=("account_id", "symbol"),
+_risk_validation_latency = Histogram(
+    "risk_validation_latency",
+    "Latency distribution for risk validation in milliseconds.",
     registry=_REGISTRY,
+    buckets=(5, 10, 25, 50, 100, 250, 500, 1000, float("inf")),
 )
 
-_fees_nav_pct = Gauge(
-    "fees_nav_pct",
-    "Fees paid as a percentage of NAV by account and symbol.",
-    labelnames=("account_id", "symbol"),
-    registry=_REGISTRY,
-)
-
-_drift_score = Gauge(
-    "drift_score",
-    "Model drift score by account and symbol.",
-    labelnames=("account_id", "symbol"),
-    registry=_REGISTRY,
-)
-
-_abstention_rate = Gauge(
-    "abstention_rate",
-    "Observed abstention rate for policy decisions by account and symbol.",
-    labelnames=("account_id", "symbol"),
-    registry=_REGISTRY,
-)
-
-_METRICS: Dict[str, Gauge | Counter] = {
-    "ws_latency_ms": _ws_latency_ms,
-    "oms_submit_ack_ms": _oms_submit_ack_ms,
+_METRICS: Dict[str, Counter | Gauge | Histogram] = {
+    "trades_submitted_total": _trades_submitted_total,
+    "trades_rejected_total": _trades_rejected_total,
+    "oms_errors_total": _oms_errors_total,
     "oms_latency_ms": _oms_latency_ms,
-    "oms_error_count": _oms_error_count,
-    "oms_child_orders_total": _oms_child_orders_total,
-    "trade_rejections_total": _trade_rejections_total,
-    "fees_nav_pct": _fees_nav_pct,
-    "drift_score": _drift_score,
-    "abstention_rate": _abstention_rate,
+    "pipeline_latency_ms": _pipeline_latency_ms,
+    "policy_inference_latency": _policy_inference_latency,
+    "risk_validation_latency": _risk_validation_latency,
 }
 
 _INITIALISED = False
+_SERVICE_NAME = "service"
+_REQUEST_ID: ContextVar[Optional[str]] = ContextVar("request_id", default=None)
 
 
-def init_metrics() -> Dict[str, Gauge | Counter]:
-    """Ensure metrics are initialised before use."""
+class RequestTracingMiddleware(BaseHTTPMiddleware):
+    """Starlette middleware that wires request IDs and tracing spans."""
 
-    global _INITIALISED
+    def __init__(self, app: FastAPI, service_name: str):
+        super().__init__(app)
+        self._service_name = service_name
+        self._tracer = trace.get_tracer(service_name) if trace else None
+        self._span_kind = SpanKind.SERVER if SpanKind else None
+
+    async def dispatch(self, request: Request, call_next):
+        request_id = request.headers.get("x-request-id") or str(uuid4())
+        token = _REQUEST_ID.set(request_id)
+
+        span_cm = (
+            self._tracer.start_as_current_span(
+                f"{self._service_name}.request", kind=self._span_kind
+            )
+            if self._tracer
+            else nullcontext(None)
+        )
+
+        with span_cm as span:  # type: ignore[assignment]
+            if span:
+                span.set_attribute("service.name", self._service_name)
+                span.set_attribute("request.id", request_id)
+                span.set_attribute("http.method", request.method)
+                span.set_attribute("http.url", str(request.url))
+
+            response = await call_next(request)
+            if span:
+                span.set_attribute("http.status_code", response.status_code)
+
+        _REQUEST_ID.reset(token)
+        response.headers["x-request-id"] = request_id
+        return response
+
+
+def init_metrics(service_name: str = "service") -> Dict[str, Counter | Gauge | Histogram]:
+    """Initialise metrics once and store the configured service name."""
+
+    global _INITIALISED, _SERVICE_NAME
     if not _INITIALISED:
         _INITIALISED = True
+    _SERVICE_NAME = service_name
     return _METRICS
 
 
-def setup_metrics(app: FastAPI) -> None:
-    """Attach the Prometheus metrics endpoint and initialise counters."""
+def setup_metrics(app: FastAPI, service_name: str = "service") -> None:
+    """Attach Prometheus /metrics endpoint and tracing middleware."""
 
-    init_metrics()
+    init_metrics(service_name)
 
-    @app.on_event("startup")
-    async def _setup_metrics() -> None:  # pragma: no cover - FastAPI lifecycle
-        init_metrics()
+    if not any(
+        getattr(middleware, "cls", None) is RequestTracingMiddleware
+        for middleware in app.user_middleware
+    ):
+        app.add_middleware(RequestTracingMiddleware, service_name=service_name)
 
     if not any(route.path == "/metrics" for route in app.routes):
         @app.get("/metrics")
         async def metrics_endpoint() -> Response:  # pragma: no cover - simple I/O
-            init_metrics()
             payload = generate_latest(_REGISTRY)
             return Response(payload, media_type=CONTENT_TYPE_LATEST)
 
 
-def record_ws_latency(account_id: str, symbol: str, latency_ms: float) -> None:
-    init_metrics()
-    _ws_latency_ms.labels(account_id=account_id, symbol=symbol).set(latency_ms)
+def increment_trades_submitted(amount: float = 1.0) -> None:
+    init_metrics(_SERVICE_NAME)
+    _trades_submitted_total.inc(amount)
 
 
-def record_oms_submit_ack(account_id: str, symbol: str, latency_ms: float) -> None:
-    init_metrics()
-    _oms_submit_ack_ms.labels(account_id=account_id, symbol=symbol).set(latency_ms)
+def increment_trades_rejected(amount: float = 1.0) -> None:
+    init_metrics(_SERVICE_NAME)
+    _trades_rejected_total.inc(amount)
 
 
-def record_oms_latency(account_id: str, symbol: str, transport: str, latency_ms: float) -> None:
-    init_metrics()
-    _oms_latency_ms.labels(
-        account_id=account_id, symbol=symbol, transport=transport
-    ).set(latency_ms)
+def increment_oms_errors(amount: float = 1.0) -> None:
+    init_metrics(_SERVICE_NAME)
+    _oms_errors_total.inc(amount)
 
 
-def increment_oms_error_count(account_id: str, symbol: str, transport: str) -> None:
-    init_metrics()
-    _oms_error_count.labels(
-        account_id=account_id, symbol=symbol, transport=transport
-    ).inc()
+def set_oms_latency(latency_ms: float) -> None:
+    init_metrics(_SERVICE_NAME)
+    _oms_latency_ms.set(latency_ms)
 
 
-def increment_oms_child_orders_total(account_id: str, symbol: str, count: int) -> None:
-    init_metrics()
-    _oms_child_orders_total.labels(account_id=account_id, symbol=symbol).inc(count)
+def set_pipeline_latency(latency_ms: float) -> None:
+    init_metrics(_SERVICE_NAME)
+    _pipeline_latency_ms.set(latency_ms)
 
 
-def increment_trade_rejection(account_id: str, symbol: str) -> None:
-    init_metrics()
-    _trade_rejections_total.labels(account_id=account_id, symbol=symbol).inc()
+def observe_policy_inference_latency(latency_ms: float) -> None:
+    init_metrics(_SERVICE_NAME)
+    _policy_inference_latency.observe(latency_ms)
 
 
-def record_fees_nav_pct(account_id: str, symbol: str, pct: float) -> None:
-    init_metrics()
-    _fees_nav_pct.labels(account_id=account_id, symbol=symbol).set(pct)
+def observe_risk_validation_latency(latency_ms: float) -> None:
+    init_metrics(_SERVICE_NAME)
+    _risk_validation_latency.observe(latency_ms)
 
 
-def record_drift_score(account_id: str, symbol: str, score: float) -> None:
-    init_metrics()
-    _drift_score.labels(account_id=account_id, symbol=symbol).set(score)
+def get_request_id() -> Optional[str]:
+    """Return the current request identifier, if available."""
+
+    return _REQUEST_ID.get()
 
 
-def record_abstention_rate(account_id: str, symbol: str, rate: float) -> None:
-    init_metrics()
-    _abstention_rate.labels(account_id=account_id, symbol=symbol).set(rate)
+@contextmanager
+def traced_span(name: str, **attributes: object) -> Generator[Optional[Span], None, None]:
+    """Create a child span that automatically injects the request ID."""
+
+    tracer = trace.get_tracer(_SERVICE_NAME) if trace else None
+    if tracer is None:
+        yield None
+        return
+
+    with tracer.start_as_current_span(name) as span:
+        request_id = get_request_id()
+        if request_id:
+            span.set_attribute("request.id", request_id)
+        for key, value in attributes.items():
+            span.set_attribute(key, value)
+        yield span
 
 
-def get_registry() -> CollectorRegistry:
-    """Expose the CollectorRegistry for advanced customisation or testing."""
-
-    init_metrics()
-    return _REGISTRY
+__all__ = [
+    "init_metrics",
+    "setup_metrics",
+    "increment_trades_submitted",
+    "increment_trades_rejected",
+    "increment_oms_errors",
+    "set_oms_latency",
+    "set_pipeline_latency",
+    "observe_policy_inference_latency",
+    "observe_risk_validation_latency",
+    "get_request_id",
+    "traced_span",
+]
