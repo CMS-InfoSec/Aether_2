@@ -3,18 +3,23 @@
 This module collects the versions of deployed services, machine learning models,
 and configuration records so that we can pin an entire release to a reproducible
 state.  The data is stored in the ``release_manifests`` table which persists a
-JSON payload for each manifest along with the timestamp when it was recorded.
+JSON payload for each manifest, a cryptographic hash for integrity, and the
+timestamp when it was recorded.  The CLI can export both JSON and Markdown
+summaries for downstream consumers.
 
 Usage
 -----
     python release_manifest.py create [--id <manifest-id>]
     python release_manifest.py list [--limit 10]
     python release_manifest.py rollback --id <manifest-id>
+    python release_manifest.py verify --id <manifest-id>
 
 The ``create`` command writes the manifest both to the database and, by default,
-updates ``release_manifest_current.json`` with the latest payload.  The
-``rollback`` command fetches a previous manifest and re-promotes it as the
-current manifest file so that other systems can pick up the rollback.
+updates ``release_manifest_current.json`` and ``release_manifest_current.md``
+with the latest payload.  The ``rollback`` command fetches a previous manifest
+and re-promotes it as the current manifest files so that other systems can pick
+up the rollback.  ``verify`` compares the active deployment against a stored
+manifest and reports discrepancies.
 """
 
 from __future__ import annotations
@@ -29,7 +34,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional
 
-from sqlalchemy import JSON, Column, DateTime, MetaData, String, Table, create_engine, func, select
+from sqlalchemy import (
+    JSON,
+    Column,
+    DateTime,
+    MetaData,
+    String,
+    Table,
+    create_engine,
+    func,
+    inspect,
+    select,
+    text,
+)
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import NoSuchTableError, SQLAlchemyError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
@@ -48,6 +65,7 @@ DEFAULT_CONFIG_DB_URL = os.getenv("CONFIG_DATABASE_URL", "sqlite+pysqlite:////tm
 DEFAULT_SERVICES_DIR = Path("deploy/k8s/base/aether-services")
 DEFAULT_MODELS_DIR = Path("ml/models")
 DEFAULT_MANIFEST_FILE = Path("release_manifest_current.json")
+DEFAULT_MANIFEST_MARKDOWN = Path("release_manifest_current.md")
 
 
 Base = declarative_base()
@@ -60,6 +78,7 @@ class ReleaseManifest(Base):
 
     manifest_id = Column(String, primary_key=True)
     manifest_json = Column(JSON, nullable=False)
+    manifest_hash = Column(String, nullable=True)
     ts = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
 
@@ -70,12 +89,14 @@ class Manifest:
     manifest_id: str
     payload: Dict[str, Dict[str, str]]
     ts: datetime
+    manifest_hash: Optional[str] = None
 
     def to_dict(self) -> Dict[str, object]:
         return {
             "manifest_id": self.manifest_id,
             "ts": self.ts.isoformat(),
             "payload": self.payload,
+            "hash": self.manifest_hash,
         }
 
 
@@ -92,8 +113,63 @@ def _create_engine(url: str) -> Engine:
 
 
 release_engine = _create_engine(DEFAULT_RELEASE_DB_URL)
-SessionLocal = sessionmaker(bind=release_engine, autoflush=False, autocommit=False, expire_on_commit=False)
 Base.metadata.create_all(bind=release_engine)
+
+
+def _ensure_manifest_hash_column(engine: Engine) -> None:
+    """Ensure the ``manifest_hash`` column exists for backwards compatibility."""
+
+    try:
+        inspector = inspect(engine)
+        columns = {col["name"] for col in inspector.get_columns("release_manifests")}
+    except SQLAlchemyError:  # pragma: no cover - introspection failure
+        return
+    if "manifest_hash" in columns:
+        return
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE release_manifests ADD COLUMN manifest_hash VARCHAR"))
+    except SQLAlchemyError:  # pragma: no cover - alteration failure
+        return
+
+
+_ensure_manifest_hash_column(release_engine)
+SessionLocal = sessionmaker(bind=release_engine, autoflush=False, autocommit=False, expire_on_commit=False)
+
+
+def _backfill_manifest_hashes() -> None:
+    """Populate missing manifest hashes for existing records."""
+
+    with SessionLocal() as session:
+        try:
+            records = (
+                session.query(ReleaseManifest)
+                .filter((ReleaseManifest.manifest_hash.is_(None)) | (ReleaseManifest.manifest_hash == ""))
+                .all()
+            )
+        except SQLAlchemyError:  # pragma: no cover - query failure
+            return
+        changed = False
+        for record in records:
+            if not isinstance(record.manifest_json, dict):
+                continue
+            record.manifest_hash = compute_manifest_hash(record.manifest_json)
+            changed = True
+        if changed:
+            try:
+                session.commit()
+            except SQLAlchemyError:  # pragma: no cover - commit failure
+                session.rollback()
+
+
+def compute_manifest_hash(payload: Dict[str, Dict[str, str]]) -> str:
+    """Return a deterministic hash for a manifest payload."""
+
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+_backfill_manifest_hashes()
 
 
 # ---------------------------------------------------------------------------
@@ -260,11 +336,22 @@ def collect_config_versions(database_url: str = DEFAULT_CONFIG_DB_URL) -> Dict[s
 def save_manifest(session: Session, manifest_id: str, payload: Dict[str, Dict[str, str]]) -> Manifest:
     """Persist a manifest payload in the database."""
 
-    record = ReleaseManifest(manifest_id=manifest_id, manifest_json=payload, ts=datetime.now(timezone.utc))
+    payload_hash = compute_manifest_hash(payload)
+    record = ReleaseManifest(
+        manifest_id=manifest_id,
+        manifest_json=payload,
+        manifest_hash=payload_hash,
+        ts=datetime.now(timezone.utc),
+    )
     session.add(record)
     session.commit()
     session.refresh(record)
-    return Manifest(manifest_id=record.manifest_id, payload=record.manifest_json, ts=record.ts)
+    return Manifest(
+        manifest_id=record.manifest_id,
+        payload=record.manifest_json,
+        ts=record.ts,
+        manifest_hash=record.manifest_hash,
+    )
 
 
 def fetch_manifest(session: Session, manifest_id: str) -> Optional[Manifest]:
@@ -273,7 +360,12 @@ def fetch_manifest(session: Session, manifest_id: str) -> Optional[Manifest]:
     record: Optional[ReleaseManifest] = session.get(ReleaseManifest, manifest_id)
     if not record:
         return None
-    return Manifest(manifest_id=record.manifest_id, payload=record.manifest_json, ts=record.ts)
+    return Manifest(
+        manifest_id=record.manifest_id,
+        payload=record.manifest_json,
+        ts=record.ts,
+        manifest_hash=record.manifest_hash,
+    )
 
 
 def list_manifests(session: Session, limit: Optional[int] = None) -> List[Manifest]:
@@ -283,16 +375,116 @@ def list_manifests(session: Session, limit: Optional[int] = None) -> List[Manife
     if limit is not None:
         stmt = stmt.limit(limit)
     records = session.execute(stmt).scalars().all()
-    return [Manifest(manifest_id=r.manifest_id, payload=r.manifest_json, ts=r.ts) for r in records]
+    return [
+        Manifest(manifest_id=r.manifest_id, payload=r.manifest_json, ts=r.ts, manifest_hash=r.manifest_hash)
+        for r in records
+    ]
 
 
-def write_manifest_file(payload: Dict[str, Dict[str, str]], path: Path = DEFAULT_MANIFEST_FILE) -> None:
+def write_manifest_file(manifest: Manifest, path: Path = DEFAULT_MANIFEST_FILE) -> None:
     """Serialise the manifest payload to a JSON file for downstream consumers."""
 
     try:
-        path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+        path.write_text(json.dumps(manifest.to_dict(), indent=2, sort_keys=True))
     except OSError:  # pragma: no cover - filesystem failure
         pass
+
+
+def write_manifest_markdown(manifest: Manifest, path: Path = DEFAULT_MANIFEST_MARKDOWN) -> None:
+    """Write a Markdown summary of the manifest contents."""
+
+    lines = [
+        f"# Release Manifest {manifest.manifest_id}",
+        "",
+        f"- Timestamp: {manifest.ts.isoformat()}",
+        f"- Hash: {manifest.manifest_hash or 'unknown'}",
+        "",
+    ]
+
+    def _append_table(title: str, items: Dict[str, str]) -> None:
+        lines.extend([f"## {title}", ""])
+        if not items:
+            lines.append("No entries recorded.")
+            lines.append("")
+            return
+        lines.extend(["| Name | Version |", "| --- | --- |"])
+        for name, version in sorted(items.items()):
+            lines.append(f"| {name} | {version} |")
+        lines.append("")
+
+    _append_table("Services", _coerce_str_mapping(manifest.payload.get("services")))
+    _append_table("Models", _coerce_str_mapping(manifest.payload.get("models")))
+    _append_table("Configs", _coerce_str_mapping(manifest.payload.get("configs")))
+
+    try:
+        path.write_text("\n".join(lines))
+    except OSError:  # pragma: no cover - filesystem failure
+        pass
+
+
+def verify_release_manifest(
+    manifest: Manifest,
+    services_dir: Path,
+    models_dir: Path,
+    config_db_url: str,
+) -> List[str]:
+    """Return a list of verification error messages for the given manifest."""
+
+    mismatches: List[str] = []
+
+    expected_services = _coerce_str_mapping(manifest.payload.get("services"))
+    actual_services = {k: str(v) for k, v in collect_service_versions(services_dir).items()}
+    mismatches.extend(_diff_versions("services", expected_services, actual_services))
+
+    expected_models = _coerce_str_mapping(manifest.payload.get("models"))
+    actual_models = {k: str(v) for k, v in collect_model_versions(models_dir).items()}
+    mismatches.extend(_diff_versions("models", expected_models, actual_models))
+
+    expected_configs = _coerce_str_mapping(manifest.payload.get("configs"))
+    actual_configs = {k: str(v) for k, v in collect_config_versions(config_db_url).items()}
+    mismatches.extend(_diff_versions("configs", expected_configs, actual_configs))
+
+    if manifest.manifest_hash:
+        current_hash = compute_manifest_hash(manifest.payload)
+        if current_hash != manifest.manifest_hash:
+            mismatches.append(
+                "manifest hash mismatch: stored hash"
+                f" {manifest.manifest_hash} does not match recomputed {current_hash}"
+            )
+
+    return mismatches
+
+
+def _diff_versions(category: str, expected: Dict[str, str], actual: Dict[str, str]) -> List[str]:
+    """Compare expected and actual mappings and return human readable diffs."""
+
+    messages: List[str] = []
+    missing = sorted(set(expected) - set(actual))
+    extra = sorted(set(actual) - set(expected))
+    changed = sorted({key for key in expected if key in actual and expected[key] != actual[key]})
+
+    for key in missing:
+        messages.append(f"{category}: missing '{key}' (expected {expected[key]!r})")
+    for key in extra:
+        messages.append(f"{category}: unexpected entry '{key}' with version {actual[key]!r}")
+    for key in changed:
+        messages.append(
+            f"{category}: version mismatch for '{key}' (expected {expected[key]!r}, found {actual[key]!r})"
+        )
+    return messages
+
+
+def _coerce_str_mapping(value: Optional[Dict[str, object]]) -> Dict[str, str]:
+    """Normalise payload fragments that may be missing or loosely typed."""
+
+    if not isinstance(value, dict):
+        return {}
+    normalised: Dict[str, str] = {}
+    for key, val in value.items():
+        if key is None or val is None:
+            continue
+        normalised[str(key)] = str(val)
+    return normalised
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +508,9 @@ def create_command(args: argparse.Namespace) -> int:
         manifest = save_manifest(session, manifest_id, payload)
 
     if args.output:
-        write_manifest_file(payload, Path(args.output))
+        write_manifest_file(manifest, Path(args.output))
+    if args.markdown_output:
+        write_manifest_markdown(manifest, Path(args.markdown_output))
 
     print(json.dumps(manifest.to_dict(), indent=2))
     return 0
@@ -344,7 +538,33 @@ def rollback_command(args: argparse.Namespace) -> int:
         raise SystemExit(f"Manifest '{args.id}' was not found")
 
     if args.output:
-        write_manifest_file(manifest.payload, Path(args.output))
+        write_manifest_file(manifest, Path(args.output))
+    if args.markdown_output:
+        write_manifest_markdown(manifest, Path(args.markdown_output))
+    print(json.dumps(manifest.to_dict(), indent=2))
+    return 0
+
+
+def verify_command(args: argparse.Namespace) -> int:
+    """Handle the ``verify`` sub-command."""
+
+    with SessionLocal() as session:
+        manifest = fetch_manifest(session, args.id)
+    if manifest is None:
+        raise SystemExit(f"Manifest '{args.id}' was not found")
+
+    mismatches = verify_release_manifest(
+        manifest,
+        Path(args.services_dir),
+        Path(args.models_dir),
+        args.config_db,
+    )
+
+    if mismatches:
+        for message in mismatches:
+            print(message)
+        return 1
+
     print(json.dumps(manifest.to_dict(), indent=2))
     return 0
 
@@ -353,6 +573,7 @@ COMMAND_HANDLERS = {
     "create": create_command,
     "list": list_command,
     "rollback": rollback_command,
+    "verify": verify_command,
 }
 
 
@@ -377,10 +598,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_CONFIG_DB_URL,
         help="SQLAlchemy database URL for the configuration service",
     )
+    create_parser.add_argument("--output", default=str(DEFAULT_MANIFEST_FILE), help="JSON file for manifest export")
     create_parser.add_argument(
-        "--output",
-        default=str(DEFAULT_MANIFEST_FILE),
-        help="Optional file to update with the latest manifest payload",
+        "--markdown-output",
+        default=str(DEFAULT_MANIFEST_MARKDOWN),
+        help="Markdown file for manifest summary",
     )
 
     list_parser = subparsers.add_parser("list", help="List stored manifests")
@@ -388,10 +610,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     rollback_parser = subparsers.add_parser("rollback", help="Re-promote an existing manifest")
     rollback_parser.add_argument("--id", required=False, help="Identifier of the manifest to rollback to")
+    rollback_parser.add_argument("--output", default=str(DEFAULT_MANIFEST_FILE), help="JSON file to update")
     rollback_parser.add_argument(
-        "--output",
-        default=str(DEFAULT_MANIFEST_FILE),
-        help="File to update with the manifest payload",
+        "--markdown-output",
+        default=str(DEFAULT_MANIFEST_MARKDOWN),
+        help="Markdown summary file to update",
+    )
+
+    verify_parser = subparsers.add_parser("verify", help="Verify that the live deployment matches a manifest")
+    verify_parser.add_argument("--id", required=True, help="Identifier of the manifest to verify against")
+    verify_parser.add_argument(
+        "--services-dir",
+        default=str(DEFAULT_SERVICES_DIR),
+        help="Directory containing Kubernetes deployment manifests",
+    )
+    verify_parser.add_argument(
+        "--models-dir",
+        default=str(DEFAULT_MODELS_DIR),
+        help="Directory containing model definition files",
+    )
+    verify_parser.add_argument(
+        "--config-db",
+        default=DEFAULT_CONFIG_DB_URL,
+        help="SQLAlchemy database URL for the configuration service",
     )
 
     return parser
