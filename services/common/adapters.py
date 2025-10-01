@@ -163,6 +163,29 @@ class TimescaleAdapter:
         )
         return deepcopy(config)
 
+    def set_kill_switch(
+        self,
+        *,
+        engaged: bool,
+        reason: str | None = None,
+        actor: str | None = None,
+    ) -> None:
+        """Engage or release the kill switch for the account."""
+
+        config = self._risk_configs.setdefault(
+            self.account_id, deepcopy(self._default_risk_config)
+        )
+        config["kill_switch"] = bool(engaged)
+
+        event_payload: Dict[str, Any] = {"state": "engaged" if engaged else "released"}
+        if reason:
+            event_payload["reason"] = reason
+        if actor:
+            event_payload["actor"] = actor
+
+        event_type = "kill_switch_engaged" if engaged else "kill_switch_released"
+        self.record_event(event_type, event_payload)
+
     def get_daily_usage(self) -> Dict[str, float]:
         date_key = datetime.now(timezone.utc).date().isoformat()
         usage = self._daily_usage.setdefault(self.account_id, {})
