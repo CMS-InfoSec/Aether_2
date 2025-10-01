@@ -16,7 +16,7 @@ from typing import Callable, Dict, Iterable, Iterator, List, Optional
 
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, model_validator
 from sqlalchemy import Column, DateTime, Float, Integer, String, create_engine
 from sqlalchemy.engine import Engine
@@ -30,6 +30,8 @@ from metrics import (
     setup_metrics,
 )
 from services.common.security import require_admin_account
+
+from cost_throttler import CostThrottler
 
 
 logger = logging.getLogger(__name__)
@@ -485,6 +487,7 @@ class RiskLimitsResponse(BaseModel):
 
 app = FastAPI(title="Risk Validation Service", version="1.0.0")
 setup_metrics(app)
+COST_THROTTLER = CostThrottler()
 
 
 
@@ -593,6 +596,16 @@ async def get_risk_limits(
     return response.dict()
 
 
+@app.get("/risk/throttle/status")
+async def get_throttle_status(
+    account_id: str = Depends(require_admin_account),
+) -> Dict[str, Optional[str]]:
+    """Expose the current cost based throttling status for ``account_id``."""
+
+    status = COST_THROTTLER.evaluate(account_id)
+    return {"active": status.active, "reason": status.reason}
+
+
 def _load_account_limits(account_id: str) -> AccountRiskLimit:
     with get_session() as session:
         limits = session.get(AccountRiskLimit, account_id)
@@ -633,6 +646,23 @@ def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
             nonlocal cooldown_until
             cooldown_until = cooldown_until or _determine_cooldown(limits)
         _audit_violation(context, message, details)
+
+    throttle_status = COST_THROTTLER.evaluate(context.request.account_id)
+    if throttle_status.active:
+        details = {
+            "action": throttle_status.action,
+            "cost_ratio": throttle_status.cost_ratio,
+            "infra_cost": throttle_status.infra_cost,
+            "recent_pnl": throttle_status.recent_pnl,
+        }
+        _register_violation(
+            throttle_status.reason
+            or "Account operations throttled due to infrastructure cost overruns",
+            cooldown=True,
+            details=details,
+        )
+        if 0.0 not in suggested_quantities:
+            suggested_quantities.append(0.0)
 
     allocator_state = _query_allocator_state(context.request.account_id)
     if allocator_state:
