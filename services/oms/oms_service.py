@@ -6,17 +6,20 @@ import contextlib
 import json
 import logging
 import os
+
 import time
 import uuid
 from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_EVEN, ROUND_UP
+
 from pathlib import Path
 from typing import Any, Awaitable, Deque, Dict, Iterable, List, Optional, Set, Tuple
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
 
+from services.oms.impact_store import ImpactAnalyticsStore, impact_store
 from services.oms.kraken_rest import KrakenRESTClient, KrakenRESTError
 from services.oms.kraken_ws import (
     KrakenWSError,
@@ -79,6 +82,13 @@ class OMSPlaceRequest(BaseModel):
         description="Trailing stop offset",
     )
 
+    pre_trade_mid_px: Optional[Decimal] = Field(
+        default=None,
+        gt=Decimal("0"),
+        description="Observed mid price immediately before order placement",
+
+    )
+
     @field_validator("side")
     @classmethod
     def _validate_side(cls, value: str) -> str:
@@ -131,6 +141,18 @@ class OMSPlaceResponse(OMSOrderStatusResponse):
     reused: bool = Field(
         default=False, description="True when the idempotency cache satisfied the request"
     )
+    shadow: bool = Field(default=False, description="True when the order executed in shadow mode")
+
+
+class ImpactCurvePoint(BaseModel):
+    size: float
+    impact_bps: float
+
+
+class ImpactCurveResponse(BaseModel):
+    symbol: str
+    points: List[ImpactCurvePoint]
+    as_of: datetime
 
 
 class _IdempotencyStore:
@@ -171,6 +193,7 @@ class OrderRecord:
     client_id: str
     result: OMSOrderStatusResponse
     transport: str
+
     children: List["ChildOrderRecord"] | None = None
 
 
@@ -179,6 +202,7 @@ class ChildOrderRecord:
     client_id: str
     exchange_order_id: str
     transport: str
+
 
 
 class _PrecisionValidator:
@@ -673,6 +697,9 @@ class AccountContext:
         self._child_results: Dict[str, OMSOrderStatusResponse] = {}
         self._latency_tracker = _TransportLatencyTracker()
 
+        self._impact_store: ImpactAnalyticsStore = impact_store
+
+
     async def start(self) -> None:
         async with self._startup_lock:
             await self.credentials.start()
@@ -714,6 +741,7 @@ class AccountContext:
             errors=state.errors or None,
         )
         async with self._orders_lock:
+
             existing = self._orders.get(parent_key)
             children = list(existing.children) if existing and existing.children else None
             self._child_results[key] = result
@@ -767,10 +795,12 @@ class AccountContext:
                 children=children,
             )
 
+
     async def place_order(self, request: OMSPlaceRequest) -> OMSPlaceResponse:
         await self.start()
 
         async def _execute() -> OMSOrderStatusResponse:
+
             assert self.ws_client is not None
             assert self.rest_client is not None
 
@@ -841,9 +871,12 @@ class AccountContext:
             )
             aggregate_transport = self._aggregate_transport(transports_used)
 
+
             async with self._orders_lock:
+
                 self._orders[request.client_id] = OrderRecord(
                     client_id=request.client_id,
+
                     result=aggregated_result,
                     transport=aggregate_transport,
                     children=child_records,
@@ -860,11 +893,14 @@ class AccountContext:
                 self._update_child_mapping(request.client_id, child_records)
             return aggregated_result
 
+
         cache_key = f"place:{request.client_id}"
         result, reused = await self.idempotency.get_or_create(cache_key, _execute())
         async with self._orders_lock:
             record = self._orders.get(request.client_id)
         transport = record.transport if record else "websocket"
+        if record is not None:
+            await self._record_trade_impact(record)
         return OMSPlaceResponse(
             exchange_order_id=result.exchange_order_id,
             status=result.status,
@@ -873,6 +909,7 @@ class AccountContext:
             errors=result.errors,
             transport=transport,
             reused=reused,
+            shadow=request.shadow,
         )
 
     async def cancel_order(self, request: OMSCancelRequest) -> OMSOrderStatusResponse:
@@ -946,8 +983,11 @@ class AccountContext:
             aggregate_transport = self._aggregate_transport(set(transports_used))
 
             async with self._orders_lock:
+
+                existing = self._orders.get(request.client_id)
                 self._orders[request.client_id] = OrderRecord(
                     client_id=request.client_id,
+
                     result=aggregated,
                     transport=aggregate_transport,
                     children=(record.children if record and record.children else child_records),
@@ -966,6 +1006,7 @@ class AccountContext:
                 else:
                     self._update_child_mapping(request.client_id, child_records)
             return aggregated
+
 
         cache_key = f"cancel:{request.client_id}"
         result, _ = await self.idempotency.get_or_create(cache_key, _execute_cancel())
@@ -1275,6 +1316,51 @@ class AccountContext:
             return self._orders.get(client_id)
 
 
+    async def _record_trade_impact(self, record: OrderRecord) -> None:
+        if record.pre_trade_mid is None:
+            return
+        if record.result.filled_qty <= 0:
+            return
+        if record.result.avg_price <= 0:
+            return
+        if record.recorded_qty >= record.result.filled_qty:
+            return
+        if not record.symbol:
+            return
+
+        filled_qty = record.result.filled_qty
+        avg_price = record.result.avg_price
+        mid_px = record.pre_trade_mid
+        if mid_px is None or mid_px <= 0:
+            return
+
+        normalized_side = record.side.lower()
+        if normalized_side not in {"buy", "sell"}:
+            return
+
+        direction = Decimal("1") if normalized_side == "buy" else Decimal("-1")
+        impact_ratio = (avg_price - mid_px) / mid_px
+        impact_bps = float((impact_ratio * direction * Decimal("10000")))
+
+        await self._impact_store.record_fill(
+            account_id=self.account_id,
+            client_order_id=record.client_id,
+            symbol=record.symbol,
+            side=record.side,
+            filled_qty=float(filled_qty),
+            avg_price=float(avg_price),
+            pre_trade_mid=float(mid_px),
+            impact_bps=impact_bps,
+            recorded_at=datetime.now(timezone.utc),
+        )
+
+        async with self._orders_lock:
+            current = self._orders.get(record.client_id)
+            if current:
+                current.recorded_qty = filled_qty
+
+
+
 class OMSManager:
     def __init__(self) -> None:
         self._accounts: Dict[str, AccountContext] = {}
@@ -1356,5 +1442,20 @@ async def get_status(
     if not record:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown order")
     return record.result
+
+
+
+@app.get("/oms/impact_curve", response_model=ImpactCurveResponse)
+async def get_impact_curve(
+    symbol: str,
+    account_id: str = Depends(require_account_id),
+) -> ImpactCurveResponse:
+    points_raw = await impact_store.impact_curve(account_id=account_id, symbol=symbol)
+    points = [
+        ImpactCurvePoint(size=point["size"], impact_bps=point["impact_bps"])
+        for point in points_raw
+    ]
+    return ImpactCurveResponse(symbol=symbol, points=points, as_of=datetime.now(timezone.utc))
+
 
 

@@ -21,7 +21,15 @@ if "metrics" not in sys.modules:
 
 import policy_service
 
-from services.common.schemas import ActionTemplate, ConfidenceMetrics, PolicyDecisionResponse
+from services.common.schemas import (
+    ActionTemplate,
+    BookSnapshot,
+    ConfidenceMetrics,
+    FeeBreakdown,
+    PolicyDecisionRequest,
+    PolicyDecisionResponse,
+    PolicyState,
+)
 
 from services.models.model_server import Intent
 
@@ -71,9 +79,10 @@ def _validate_response(payload: dict) -> PolicyDecisionResponse:
     return PolicyDecisionResponse.model_validate(payload)
 
 def test_policy_decide_approves_when_edge_beats_costs(
-    monkeypatch: pytest.MonkeyPatch, client: TestClient, account_id: str
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
     recorded: List[dict[str, object]] = []
+    dispatched: List[dict[str, object]] = []
 
     async def _fake_fee(account_id: str, symbol: str, liquidity: str, notional: float) -> float:
         recorded.append(
@@ -92,6 +101,13 @@ def test_policy_decide_approves_when_edge_beats_costs(
         "predict_intent",
         lambda **_: _intent(edge_bps=22.0, approved=True, selected="maker"),
     )
+
+    async def _fake_dispatch(
+        request_obj: PolicyDecisionRequest, response_obj: PolicyDecisionResponse
+    ) -> None:
+        dispatched.append({"order_id": request_obj.order_id, "approved": response_obj.approved})
+
+    monkeypatch.setattr(policy_service, "_dispatch_shadow_orders", _fake_dispatch)
 
     payload = {
 
@@ -150,7 +166,42 @@ def test_policy_decide_approves_when_edge_beats_costs(
             "notional": pytest.approx(expected_notional),
         },
     ]
+    assert dispatched == [{"order_id": "abc-123", "approved": True}]
 
+
+def test_policy_decide_honours_request_risk_overrides(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    async def _fake_fee(account_id: str, symbol: str, liquidity: str, notional: float) -> float:
+        return 4.5
+
+    monkeypatch.setattr(policy_service, "_fetch_effective_fee", _fake_fee)
+    monkeypatch.setattr(
+        policy_service,
+        "predict_intent",
+        lambda **_: _intent(edge_bps=24.0, approved=True, selected="maker"),
+    )
+
+    payload = {
+        "account_id": "company",
+        "order_id": "abc-456",
+        "instrument": "BTC-USD",
+        "side": "SELL",
+        "quantity": 0.5,
+        "price": 20000.0,
+        "fee": {"currency": "USD", "maker": 4.0, "taker": 6.0},
+        "features": [0.2, 0.0, 1.5],
+        "book_snapshot": {"mid_price": 20010.0, "spread_bps": 3.0, "imbalance": -0.02},
+        "take_profit_bps": 18.0,
+        "stop_loss_bps": 9.0,
+    }
+
+    response = client.post("/policy/decide", json=payload)
+    assert response.status_code == 200
+
+    body = _validate_response(response.json())
+    assert body.take_profit_bps == pytest.approx(18.0)
+    assert body.stop_loss_bps == pytest.approx(9.0)
 
 
 def test_policy_decide_rejects_unknown_account(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
@@ -222,6 +273,127 @@ def test_policy_decide_rejects_when_costs_exceed_edge(
 
     maker_template = next(template for template in body.action_templates if template.name == "maker")
     assert maker_template.edge_bps <= 0.0
+
+
+@pytest.mark.anyio("asyncio")
+async def test_dispatch_shadow_orders_invokes_shadow_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    submitted: List[dict[str, object]] = []
+
+    async def _fake_submit(
+        request_obj: PolicyDecisionRequest,
+        response_obj: PolicyDecisionResponse,
+        *,
+        shadow: bool,
+    ) -> None:
+        submitted.append({
+            "shadow": shadow,
+            "client_id": request_obj.order_id,
+        })
+
+    monkeypatch.setattr(policy_service, "_submit_execution", _fake_submit)
+    monkeypatch.setattr(policy_service, "ENABLE_SHADOW_EXECUTION", True, raising=False)
+
+    state = PolicyState(regime="bull", volatility=0.1, liquidity_score=0.2, conviction=0.3)
+    book = BookSnapshot(mid_price=20000.0, spread_bps=2.0, imbalance=0.1)
+    request_obj = PolicyDecisionRequest(
+        account_id="company",
+        order_id="order-1",
+        instrument="BTC-USD",
+        side="BUY",
+        quantity=0.5,
+        price=20050.0,
+        fee=FeeBreakdown(currency="USD", maker=4.0, taker=6.0),
+        features=[0.1, 0.2],
+        book_snapshot=book,
+        state=state,
+    )
+    response_obj = PolicyDecisionResponse(
+        approved=True,
+        reason=None,
+        effective_fee=request_obj.fee,
+        expected_edge_bps=12.0,
+        fee_adjusted_edge_bps=8.0,
+        selected_action="maker",
+        action_templates=[
+            ActionTemplate(name="maker", venue_type="maker", edge_bps=8.0, fee_bps=4.0, confidence=0.9),
+            ActionTemplate(name="taker", venue_type="taker", edge_bps=6.0, fee_bps=6.0, confidence=0.85),
+        ],
+        confidence=ConfidenceMetrics(
+            model_confidence=0.9,
+            state_confidence=0.9,
+            execution_confidence=0.9,
+            overall_confidence=0.9,
+        ),
+        features=request_obj.features,
+        book_snapshot=book,
+        state=state,
+        take_profit_bps=20.0,
+        stop_loss_bps=10.0,
+    )
+
+    await policy_service._dispatch_shadow_orders(request_obj, response_obj)
+
+    assert submitted == [
+        {"shadow": False, "client_id": "order-1"},
+        {"shadow": True, "client_id": "order-1"},
+    ]
+
+
+@pytest.mark.anyio("asyncio")
+async def test_dispatch_shadow_orders_skips_when_not_approved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called: List[bool] = []
+
+    async def _fake_submit(*args: object, **kwargs: object) -> None:
+        called.append(True)
+
+    monkeypatch.setattr(policy_service, "_submit_execution", _fake_submit)
+    monkeypatch.setattr(policy_service, "ENABLE_SHADOW_EXECUTION", True, raising=False)
+
+    state = PolicyState(regime="bear", volatility=0.5, liquidity_score=0.1, conviction=0.2)
+    book = BookSnapshot(mid_price=15000.0, spread_bps=3.0, imbalance=-0.05)
+    request_obj = PolicyDecisionRequest(
+        account_id="company",
+        order_id="order-2",
+        instrument="ETH-USD",
+        side="SELL",
+        quantity=1.25,
+        price=14950.0,
+        fee=FeeBreakdown(currency="USD", maker=3.0, taker=5.0),
+        features=[-0.1, 0.3],
+        book_snapshot=book,
+        state=state,
+    )
+    response_obj = PolicyDecisionResponse(
+        approved=False,
+        reason="Risk rejected",
+        effective_fee=request_obj.fee,
+        expected_edge_bps=5.0,
+        fee_adjusted_edge_bps=-1.0,
+        selected_action="abstain",
+        action_templates=[
+            ActionTemplate(name="maker", venue_type="maker", edge_bps=-1.0, fee_bps=3.0, confidence=0.7),
+            ActionTemplate(name="taker", venue_type="taker", edge_bps=-2.0, fee_bps=5.0, confidence=0.6),
+        ],
+        confidence=ConfidenceMetrics(
+            model_confidence=0.7,
+            state_confidence=0.6,
+            execution_confidence=0.5,
+            overall_confidence=0.6,
+        ),
+        features=request_obj.features,
+        book_snapshot=book,
+        state=state,
+        take_profit_bps=0.0,
+        stop_loss_bps=0.0,
+    )
+
+    await policy_service._dispatch_shadow_orders(request_obj, response_obj)
+
+    assert called == []
 
 
 @pytest.mark.anyio("asyncio")

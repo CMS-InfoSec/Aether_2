@@ -137,6 +137,16 @@ class KrakenSecretStatus(BaseModel):
     last_rotated_at: datetime = Field(..., description="Timestamp of the latest rotation")
 
 
+class KrakenForceRotateRequest(BaseModel):
+    """Request payload for manually updating rotation metadata."""
+
+    account_id: str = Field(..., description="Trading account identifier")
+
+    @validator("account_id")
+    def validate_account_id(cls, value: str) -> str:
+        return KrakenSecretRequest._ensure(_ACCOUNT_ID_PATTERN, value, "account_id")
+
+
 def ensure_secure_transport(request: Request) -> None:
     """Reject requests that are not routed through TLS."""
 
@@ -239,6 +249,56 @@ def _read_secret_metadata(api: CoreV1Api, *, name: str, namespace: str) -> Dict[
     return _extract_metadata(secret)
 
 
+def _fetch_secret(api: CoreV1Api, *, name: str, namespace: str) -> Any | None:
+    try:
+        return api.read_namespaced_secret(name=name, namespace=namespace)
+    except ApiException as exc:
+        if getattr(exc, "status", None) == 404:
+            return None
+        LOGGER.error("Failed to fetch Kubernetes secret %s/%s", namespace, name, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Unable to read secret metadata",
+        ) from exc
+    except Exception as exc:  # pragma: no cover - defensive guard
+        LOGGER.exception("Unexpected error fetching secret %s/%s", namespace, name)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Unable to read secret metadata",
+        ) from exc
+
+
+def _apply_rotation_annotation(
+    api: CoreV1Api,
+    *,
+    name: str,
+    namespace: str,
+    annotations: Dict[str, str],
+) -> None:
+    patch_body = {"metadata": {"annotations": annotations}}
+    try:
+        api.patch_namespaced_secret(name=name, namespace=namespace, body=patch_body)
+    except ApiException as exc:
+        if getattr(exc, "status", None) == 404:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Kraken credentials secret not found",
+            ) from exc
+        LOGGER.error(
+            "Failed to update annotations on Kubernetes secret %s/%s", namespace, name, exc_info=True
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Unable to update Kubernetes secret",
+        ) from exc
+    except Exception as exc:  # pragma: no cover - additional guard
+        LOGGER.exception("Unexpected error updating annotations for %s/%s", namespace, name)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Unable to update Kubernetes secret",
+        ) from exc
+
+
 def _upsert_secret(
     api: CoreV1Api,
     *,
@@ -313,7 +373,7 @@ def _upsert_secret(
 
 @app.post(
     "/secrets/kraken",
-    status_code=status.HTTP_204_NO_CONTENT,
+    status_code=status.HTTP_200_OK,
     dependencies=[Depends(ensure_secure_transport)],
 )
 def rotate_kraken_secret(
@@ -379,10 +439,91 @@ def rotate_kraken_secret(
         },
     )
 
-    response = Response(status_code=status.HTTP_204_NO_CONTENT)
+    payload = {
+        "secret_name": updated_metadata["secret_name"],
+        "last_rotated_at": updated_metadata["last_rotated_at"].isoformat(),
+    }
+
+    response = JSONResponse(status_code=status.HTTP_200_OK, content=payload)
     response.headers[
         "X-OMS-Watcher"
     ] = "Kraken credentials rotated; OMS hot-reloads when secret annotations change."
+    return response
+
+
+@app.post(
+    "/secrets/kraken/force_rotate",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(ensure_secure_transport)],
+)
+def force_rotate_kraken_secret(
+    payload: KrakenForceRotateRequest,
+    request: Request,
+    actor_account: str = Depends(require_admin_account),
+    _: str = Depends(require_mfa_context),
+    api: CoreV1Api = Depends(get_core_v1_api),
+) -> Response:
+    if payload.account_id != actor_account:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account mismatch between header and payload",
+        )
+
+    secret_name = _secret_name(actor_account)
+    secret = _fetch_secret(api, name=secret_name, namespace=KRAKEN_SECRET_NAMESPACE)
+    if secret is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Kraken credentials not found for account",
+        )
+
+    metadata = _extract_metadata(secret)
+    now = datetime.now(timezone.utc)
+    created_at = metadata.get("created_at") or now
+    if isinstance(created_at, datetime):
+        created_iso = created_at.isoformat()
+    elif isinstance(created_at, str):
+        created_iso = created_at
+    else:
+        created_iso = now.isoformat()
+
+    raw_annotations = getattr(getattr(secret, "metadata", None), "annotations", None) or {}
+    updated_annotations = dict(raw_annotations)
+    updated_annotations[ANNOTATION_CREATED_AT] = created_iso
+    updated_annotations[ANNOTATION_ROTATED_AT] = now.isoformat()
+
+    _apply_rotation_annotation(
+        api,
+        name=secret_name,
+        namespace=KRAKEN_SECRET_NAMESPACE,
+        annotations=updated_annotations,
+    )
+
+    before_for_audit = _serialize_metadata_for_audit(metadata)
+    after_for_audit = {
+        "account_id": actor_account,
+        "actor": actor_account,
+        "secret_name": secret_name,
+        "rotated_at": now.isoformat(),
+        "ip_hash": _hash_ip(request.client.host if request.client else None),
+    }
+
+    _auditor.record(
+        action="kraken.secret.force_rotate",
+        actor_id=actor_account,
+        before=before_for_audit,
+        after=after_for_audit,
+    )
+
+    LOGGER.info(
+        "Force rotation triggered for Kraken credentials; OMS watchers notified",
+        extra={"account_id": actor_account, "secret_name": secret_name},
+    )
+
+    response = Response(status_code=status.HTTP_204_NO_CONTENT)
+    response.headers[
+        "X-OMS-Watcher"
+    ] = "Kraken credentials force-rotated; OMS hot-reloads when secret annotations change."
     return response
 
 
@@ -449,7 +590,9 @@ __all__ = [
     "app",
     "KrakenSecretRequest",
     "KrakenSecretStatus",
+    "KrakenForceRotateRequest",
     "rotate_kraken_secret",
+    "force_rotate_kraken_secret",
     "kraken_secret_status",
     "test_kraken_secret",
     "validate_kraken_credentials",
