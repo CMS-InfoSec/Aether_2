@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import datetime as dt
-import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -9,7 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import audit_logger
+from common.utils import audit_logger
 
 
 class _FakeDatetime(dt.datetime):
@@ -47,7 +46,7 @@ def _call_log_audit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **kwargs: A
 def test_log_audit_inserts_and_logs(monkeypatch, tmp_path, capsys):
     before = {"status": "pending"}
     after = {"status": "approved"}
-    hashed_ip = hashlib.sha256("192.0.2.1".encode()).hexdigest()
+    hashed_ip = audit_logger.hash_ip("192.0.2.1")
     conn, cursor = _call_log_audit(
         monkeypatch,
         tmp_path,
@@ -78,7 +77,7 @@ def test_log_audit_inserts_and_logs(monkeypatch, tmp_path, capsys):
     cursor.execute.assert_called_once()
     sql, params = cursor.execute.call_args[0]
     assert "INSERT INTO audit_log" in sql
-    assert params == (
+    assert params[:6] == (
         "alice",
         "approve",
         "order-9",
@@ -86,6 +85,10 @@ def test_log_audit_inserts_and_logs(monkeypatch, tmp_path, capsys):
         json.dumps(after, separators=(",", ":"), sort_keys=True),
         dt.datetime(2023, 1, 1, 12, 0, tzinfo=dt.timezone.utc),
     )
+
+    db_entry_hash, db_prev_hash = params[6:]
+    assert db_prev_hash == audit_logger._GENESIS_HASH  # pylint: disable=protected-access
+    assert db_entry_hash == payload["hash"]
 
 
 def test_log_audit_allows_missing_ip(monkeypatch, tmp_path, capsys):
@@ -111,7 +114,7 @@ def test_log_audit_allows_missing_ip(monkeypatch, tmp_path, capsys):
     assert lines[0]["ip_hash"] is None
 
     params = cursor.execute.call_args[0][1]
-    assert len(params) == 6
+    assert len(params) == 8
 
 
 def test_log_audit_requires_database_url(monkeypatch):
@@ -130,7 +133,7 @@ def test_log_audit_requires_database_url(monkeypatch):
 
 
 def test_verify_audit_chain(tmp_path, monkeypatch, capsys):
-    hashed_ip = hashlib.sha256(b"1.2.3.4").hexdigest()
+    hashed_ip = audit_logger.hash_ip("1.2.3.4")
     monkeypatch.setenv("AUDIT_DATABASE_URL", "postgresql://audit:audit@localhost:5432/audit")
     monkeypatch.setenv("AUDIT_CHAIN_LOG", str(tmp_path / "chain.log"))
     monkeypatch.setenv("AUDIT_CHAIN_STATE", str(tmp_path / "chain_state.json"))

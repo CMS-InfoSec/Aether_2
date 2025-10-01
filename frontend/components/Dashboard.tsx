@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { FormEvent, useEffect, useMemo, useState } from "react";
 
 interface ExposureBreakdown {
   asset: string;
@@ -10,6 +10,7 @@ interface ExposureBreakdown {
 interface TradeExplorerRow {
   intent: string;
   decision: string;
+  order: string;
   fill: string;
   pnl: string;
 }
@@ -22,8 +23,11 @@ interface RiskForecastResponse {
   exposures?: ExposureBreakdown[];
 }
 
-interface FeesEffectiveResponse {
-  totalFees?: number;
+interface FeesAccountSummaryResponse {
+  account_id?: string;
+  total_fees?: number;
+  realized_fees?: number;
+  unrealized_fees?: number;
   components?: Record<string, number>;
 }
 
@@ -40,10 +44,23 @@ interface UniverseApprovedResponse {
   thresholds: UniverseThresholds;
 }
 
+interface SafeModeStatusResponse {
+  active: boolean;
+  reason?: string | null;
+  since?: string | null;
+  actor?: string | null;
+}
+
+interface KrakenRotationResponse {
+  rotated_at?: string;
+  secret_name?: string;
+}
+
 interface DashboardState {
   risk: RiskForecastResponse | null;
-  fees: FeesEffectiveResponse | null;
+  fees: FeesAccountSummaryResponse | null;
   universe: UniverseApprovedResponse | null;
+  safeMode: SafeModeStatusResponse | null;
   reportGeneratedAt: string | null;
 }
 
@@ -53,6 +70,7 @@ const defaultState: DashboardState = {
   risk: null,
   fees: null,
   universe: null,
+  safeMode: null,
   reportGeneratedAt: null,
 };
 
@@ -142,6 +160,9 @@ const extractTradeRows = (csv: string): TradeExplorerRow[] => {
   const decisionIndex = lowerHeader.findIndex((column) =>
     ["decision", "trade_decision"].includes(column)
   );
+  const orderIndex = lowerHeader.findIndex((column) =>
+    ["order", "order_id", "order_action"].includes(column)
+  );
   const fillIndex = lowerHeader.findIndex((column) =>
     ["fill", "fill_price", "fill_qty", "fill_amount"].includes(column)
   );
@@ -149,7 +170,12 @@ const extractTradeRows = (csv: string): TradeExplorerRow[] => {
     ["pnl", "p&l", "profit", "profit_loss"].includes(column)
   );
 
-  if (intentIndex === -1 || decisionIndex === -1 || fillIndex === -1 || pnlIndex === -1) {
+  if (
+    intentIndex === -1 ||
+    decisionIndex === -1 ||
+    fillIndex === -1 ||
+    pnlIndex === -1
+  ) {
     return [];
   }
 
@@ -158,10 +184,11 @@ const extractTradeRows = (csv: string): TradeExplorerRow[] => {
     .map((row) => ({
       intent: row[intentIndex] ?? "",
       decision: row[decisionIndex] ?? "",
+      order: orderIndex !== -1 ? row[orderIndex] ?? "" : "",
       fill: row[fillIndex] ?? "",
       pnl: row[pnlIndex] ?? "",
     }))
-    .filter((row) => row.intent || row.decision || row.fill || row.pnl);
+    .filter((row) => row.intent || row.decision || row.order || row.fill || row.pnl);
 };
 
 const Dashboard: React.FC = () => {
@@ -169,6 +196,11 @@ const Dashboard: React.FC = () => {
   const [trades, setTrades] = useState<TradeExplorerRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [apiKey, setApiKey] = useState("");
+  const [apiSecret, setApiSecret] = useState("");
+  const [rotationMessage, setRotationMessage] = useState<string | null>(null);
+  const [rotationError, setRotationError] = useState<string | null>(null);
+  const [rotationSubmitting, setRotationSubmitting] = useState(false);
 
   useEffect(() => {
     let isMounted = true;
@@ -187,14 +219,15 @@ const Dashboard: React.FC = () => {
         }
       );
 
-      const feesRequest = fetch("/fees/effective", { signal: controller.signal }).then(
-        async (response) => {
-          if (!response.ok) {
-            throw new Error("Effective fees unavailable");
-          }
-          return response.json() as Promise<FeesEffectiveResponse>;
+      const feesRequest = fetch(
+        `/fees/account_summary?account_id=${encodeURIComponent(DEFAULT_ACCOUNT_ID)}`,
+        { signal: controller.signal }
+      ).then(async (response) => {
+        if (!response.ok) {
+          throw new Error("Account fee summary unavailable");
         }
-      );
+        return response.json() as Promise<FeesAccountSummaryResponse>;
+      });
 
       const universeRequest = fetch("/universe/approved", { signal: controller.signal }).then(
         async (response) => {
@@ -202,6 +235,15 @@ const Dashboard: React.FC = () => {
             throw new Error("Approved universe unavailable");
           }
           return response.json() as Promise<UniverseApprovedResponse>;
+        }
+      );
+
+      const safeModeRequest = fetch("/safe_mode/status", { signal: controller.signal }).then(
+        async (response) => {
+          if (!response.ok) {
+            throw new Error("Safe mode status unavailable");
+          }
+          return response.json() as Promise<SafeModeStatusResponse>;
         }
       );
 
@@ -216,12 +258,14 @@ const Dashboard: React.FC = () => {
       });
 
       try {
-        const [riskResult, feesResult, universeResult, reportResult] = await Promise.allSettled([
-          riskRequest,
-          feesRequest,
-          universeRequest,
-          reportRequest,
-        ]);
+        const [riskResult, feesResult, universeResult, safeModeResult, reportResult] =
+          await Promise.allSettled([
+            riskRequest,
+            feesRequest,
+            universeRequest,
+            safeModeRequest,
+            reportRequest,
+          ]);
 
         if (!isMounted) {
           return;
@@ -231,6 +275,7 @@ const Dashboard: React.FC = () => {
           risk: riskResult.status === "fulfilled" ? riskResult.value : null,
           fees: feesResult.status === "fulfilled" ? feesResult.value : null,
           universe: universeResult.status === "fulfilled" ? universeResult.value : null,
+          safeMode: safeModeResult.status === "fulfilled" ? safeModeResult.value : null,
           reportGeneratedAt:
             reportResult.status === "fulfilled" ? new Date().toISOString() : null,
         };
@@ -243,20 +288,30 @@ const Dashboard: React.FC = () => {
           setTrades([]);
         }
 
-        const failures = [riskResult, feesResult, universeResult, reportResult]
+        const failures = [
+          riskResult,
+          feesResult,
+          universeResult,
+          safeModeResult,
+          reportResult,
+        ]
           .map((result) => (result.status === "rejected" ? result.reason : null))
           .filter(Boolean) as Error[];
 
         if (failures.length) {
           setError(
             failures
-              .map((failure) => (failure instanceof Error ? failure.message : String(failure)))
+              .map((failure) =>
+                failure instanceof Error ? failure.message : String(failure)
+              )
               .join("; ")
           );
         }
       } catch (err) {
         if (isMounted) {
-          setError(err instanceof Error ? err.message : "Unable to load dashboard data");
+          setError(
+            err instanceof Error ? err.message : "Unable to load dashboard data"
+          );
           setState(defaultState);
           setTrades([]);
         }
@@ -279,7 +334,10 @@ const Dashboard: React.FC = () => {
     if (!state.risk?.exposures?.length) {
       return undefined;
     }
-    return state.risk.exposures.reduce((acc, exposure) => acc + Math.abs(exposure.netExposure), 0);
+    return state.risk.exposures.reduce(
+      (acc, exposure) => acc + Math.abs(exposure.netExposure),
+      0
+    );
   }, [state.risk?.exposures]);
 
   const csvContent = useMemo(() => {
@@ -287,15 +345,99 @@ const Dashboard: React.FC = () => {
       return "";
     }
 
-    const header = ["Intent", "Decision", "Fill", "PnL"].join(",");
+    const header = ["Intent", "Decision", "Order", "Fill", "PnL"].join(",");
     const rows = trades.map((trade) =>
-      [trade.intent, trade.decision, trade.fill, trade.pnl]
+      [trade.intent, trade.decision, trade.order, trade.fill, trade.pnl]
         .map((value) => `"${(value ?? "").replace(/"/g, '""')}"`)
         .join(",")
     );
 
     return [header, ...rows].join("\n");
   }, [trades]);
+
+  const feeComponents = useMemo(() => {
+    if (!state.fees) {
+      return [] as { label: string; value: number }[];
+    }
+
+    const items: { label: string; value: number }[] = [];
+    if (state.fees.realized_fees !== undefined) {
+      items.push({ label: "Realized Fees", value: state.fees.realized_fees });
+    }
+    if (state.fees.unrealized_fees !== undefined) {
+      items.push({ label: "Accrued Fees", value: state.fees.unrealized_fees });
+    }
+
+    if (state.fees.components) {
+      Object.entries(state.fees.components).forEach(([key, value]) => {
+        items.push({ label: toTitle(key), value });
+      });
+    }
+
+    return items;
+  }, [state.fees]);
+
+  const handleRotateSecrets = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!apiKey || !apiSecret) {
+      setRotationError("API key and secret are required");
+      setRotationMessage(null);
+      return;
+    }
+
+    setRotationSubmitting(true);
+    setRotationError(null);
+    setRotationMessage(null);
+
+    try {
+      const response = await fetch("/secrets/rotate", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          account_id: DEFAULT_ACCOUNT_ID,
+          api_key: apiKey,
+          api_secret: apiSecret,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error("Rotation failed");
+      }
+
+      const payload = (await response.json()) as KrakenRotationResponse;
+      const rotatedAt = payload.rotated_at
+        ? new Date(payload.rotated_at).toLocaleString()
+        : null;
+
+      setRotationMessage(
+        rotatedAt
+          ? `Kraken credentials rotated successfully at ${rotatedAt}.`
+          : "Kraken credentials rotated successfully."
+      );
+      setApiKey("");
+      setApiSecret("");
+    } catch (err) {
+      setRotationError(
+        err instanceof Error ? err.message : "Unable to rotate Kraken credentials"
+      );
+    } finally {
+      setRotationSubmitting(false);
+    }
+  };
+
+  const safeModeStatusLabel = useMemo(() => {
+    if (!state.safeMode) {
+      return "Safe mode status unknown";
+    }
+    if (state.safeMode.active) {
+      return `Safe mode active${
+        state.safeMode.reason ? `: ${state.safeMode.reason}` : ""
+      }`;
+    }
+    return "Safe mode inactive";
+  }, [state.safeMode]);
 
   const handleExportCsv = () => {
     if (!csvContent) return;
@@ -330,6 +472,20 @@ const Dashboard: React.FC = () => {
       <nav className="sticky top-0 z-10 flex flex-wrap items-center justify-between gap-4 border-b border-slate-800 bg-slate-950/80 px-6 py-4 backdrop-blur">
         <div className="text-lg font-semibold">Risk Intelligence Dashboard</div>
         <div className="flex flex-wrap items-center gap-3 text-sm text-slate-300">
+          <span
+            className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-medium ${
+              state.safeMode?.active
+                ? "border-amber-400/60 bg-amber-400/10 text-amber-200"
+                : "border-emerald-500/40 bg-emerald-500/10 text-emerald-200"
+            }`}
+          >
+            <span
+              className={`h-2 w-2 rounded-full ${
+                state.safeMode?.active ? "bg-amber-400" : "bg-emerald-400"
+              }`}
+            />
+            {safeModeStatusLabel}
+          </span>
           {state.reportGeneratedAt && (
             <span>
               Report synced {new Date(state.reportGeneratedAt).toLocaleString()}
@@ -366,8 +522,8 @@ const Dashboard: React.FC = () => {
           {metricCard("Total Exposure", totalExposure, currencyFormatter)}
         </section>
 
-        <section className="grid gap-4 lg:grid-cols-3">
-          <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-6 lg:col-span-2">
+        <section className="grid gap-4 xl:grid-cols-3">
+          <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-6 xl:col-span-2">
             <h2 className="text-lg font-semibold text-white">Exposure Breakdown</h2>
             <div className="mt-4 overflow-hidden rounded-lg border border-slate-800">
               <table className="min-w-full divide-y divide-slate-800 text-sm">
@@ -383,7 +539,8 @@ const Dashboard: React.FC = () => {
                   {state.risk?.exposures?.length ? (
                     state.risk.exposures.map((exposure) => {
                       const derivedDirection =
-                        exposure.direction ?? (exposure.netExposure >= 0 ? "long" : "short");
+                        exposure.direction ??
+                        (exposure.netExposure >= 0 ? "long" : "short");
                       return (
                         <tr key={exposure.asset} className="hover:bg-slate-900/40">
                           <td className="px-4 py-3 text-slate-200">{exposure.asset}</td>
@@ -415,26 +572,26 @@ const Dashboard: React.FC = () => {
 
           <div className="space-y-4">
             <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-6">
-              <h2 className="text-lg font-semibold text-white">Effective Fees</h2>
+              <h2 className="text-lg font-semibold text-white">Fees Overview</h2>
               <div className="mt-4 space-y-3 text-sm">
                 <div className="flex items-center justify-between">
                   <span className="text-slate-300">Total Fees</span>
                   <span className="font-semibold text-white">
-                    {state.fees?.totalFees !== undefined
-                      ? currencyFormatter.format(state.fees.totalFees)
+                    {state.fees?.total_fees !== undefined
+                      ? currencyFormatter.format(state.fees.total_fees)
                       : "--"}
                   </span>
                 </div>
-                {state.fees?.components && (
+                {feeComponents.length > 0 && (
                   <div className="space-y-2">
-                    {Object.entries(state.fees.components).map(([key, value]) => (
+                    {feeComponents.map((component) => (
                       <div
-                        key={key}
+                        key={component.label}
                         className="flex items-center justify-between rounded-lg bg-slate-900/80 px-3 py-2"
                       >
-                        <span className="text-slate-400">{toTitle(key)}</span>
+                        <span className="text-slate-400">{component.label}</span>
                         <span className="font-medium text-slate-100">
-                          {currencyFormatter.format(value)}
+                          {currencyFormatter.format(component.value)}
                         </span>
                       </div>
                     ))}
@@ -507,43 +664,183 @@ const Dashboard: React.FC = () => {
           </div>
         </section>
 
-        <section className="rounded-xl border border-slate-800 bg-slate-900/60 p-6">
-          <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
-            <h2 className="text-lg font-semibold text-white">Trade Explorer</h2>
-            <div className="text-sm text-slate-400">
-              {trades.length} trade{trades.length === 1 ? "" : "s"}
+        <section className="grid gap-4 lg:grid-cols-[2fr_1fr]">
+          <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-6">
+            <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+              <h2 className="text-lg font-semibold text-white">Trade Explorer</h2>
+              <div className="text-sm text-slate-400">
+                {trades.length} trade{trades.length === 1 ? "" : "s"}
+              </div>
+            </div>
+
+            <div className="mt-4 overflow-x-auto">
+              <table className="min-w-full divide-y divide-slate-800 text-sm">
+                <thead className="bg-slate-900/80">
+                  <tr>
+                    <th className="px-4 py-3 text-left font-medium text-slate-300">Intent</th>
+                    <th className="px-4 py-3 text-left font-medium text-slate-300">Decision</th>
+                    <th className="px-4 py-3 text-left font-medium text-slate-300">Order</th>
+                    <th className="px-4 py-3 text-left font-medium text-slate-300">Fill</th>
+                    <th className="px-4 py-3 text-left font-medium text-slate-300">PnL</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800">
+                  {trades.length ? (
+                    trades.map((trade, index) => (
+                      <tr
+                        key={`${trade.intent}-${trade.decision}-${index}`}
+                        className="hover:bg-slate-900/40"
+                      >
+                        <td className="px-4 py-3 text-slate-200">{trade.intent || "--"}</td>
+                        <td className="px-4 py-3 text-slate-200">{trade.decision || "--"}</td>
+                        <td className="px-4 py-3 text-slate-200">{trade.order || "--"}</td>
+                        <td className="px-4 py-3 text-slate-200">{trade.fill || "--"}</td>
+                        <td className="px-4 py-3 text-slate-200">{trade.pnl || "--"}</td>
+                      </tr>
+                    ))
+                  ) : (
+                    <tr>
+                      <td colSpan={5} className="px-4 py-6 text-center text-slate-400">
+                        No trade history available.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
             </div>
           </div>
 
-          <div className="mt-4 overflow-x-auto">
-            <table className="min-w-full divide-y divide-slate-800 text-sm">
-              <thead className="bg-slate-900/80">
-                <tr>
-                  <th className="px-4 py-3 text-left font-medium text-slate-300">Intent</th>
-                  <th className="px-4 py-3 text-left font-medium text-slate-300">Decision</th>
-                  <th className="px-4 py-3 text-left font-medium text-slate-300">Fill</th>
-                  <th className="px-4 py-3 text-left font-medium text-slate-300">PnL</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-800">
-                {trades.length ? (
-                  trades.map((trade, index) => (
-                    <tr key={`${trade.intent}-${index}`} className="hover:bg-slate-900/40">
-                      <td className="px-4 py-3 text-slate-200">{trade.intent || "--"}</td>
-                      <td className="px-4 py-3 text-slate-200">{trade.decision || "--"}</td>
-                      <td className="px-4 py-3 text-slate-200">{trade.fill || "--"}</td>
-                      <td className="px-4 py-3 text-slate-200">{trade.pnl || "--"}</td>
-                    </tr>
-                  ))
-                ) : (
-                  <tr>
-                    <td colSpan={4} className="px-4 py-6 text-center text-slate-400">
-                      No trade history available.
-                    </td>
-                  </tr>
+          <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-6">
+            <h2 className="text-lg font-semibold text-white">Safe Mode &amp; Credentials</h2>
+            <div className="mt-4 space-y-6 text-sm text-slate-300">
+              <div className="space-y-2 rounded-lg border border-slate-800 bg-slate-900/70 p-4">
+                <div className="flex items-center justify-between">
+                  <span className="font-medium text-white">Safe Mode</span>
+                  <span
+                    className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs ${
+                      state.safeMode?.active
+                        ? "bg-amber-400/10 text-amber-200"
+                        : "bg-emerald-400/10 text-emerald-200"
+                    }`}
+                  >
+                    <span
+                      className={`h-2 w-2 rounded-full ${
+                        state.safeMode?.active ? "bg-amber-400" : "bg-emerald-400"
+                      }`}
+                    />
+                    {state.safeMode?.active ? "Active" : "Inactive"}
+                  </span>
+                </div>
+                <dl className="grid grid-cols-1 gap-3 text-xs text-slate-400">
+                  <div>
+                    <dt className="uppercase tracking-wide">Reason</dt>
+                    <dd className="text-slate-200">{state.safeMode?.reason || "--"}</dd>
+                  </div>
+                  <div>
+                    <dt className="uppercase tracking-wide">Engaged By</dt>
+                    <dd className="text-slate-200">{state.safeMode?.actor || "--"}</dd>
+                  </div>
+                  <div>
+                    <dt className="uppercase tracking-wide">Since</dt>
+                    <dd className="text-slate-200">
+                      {state.safeMode?.since
+                        ? new Date(state.safeMode.since).toLocaleString()
+                        : "--"}
+                    </dd>
+                  </div>
+                </dl>
+              </div>
+
+              <form onSubmit={handleRotateSecrets} className="space-y-3">
+                <div className="text-xs uppercase tracking-wide text-slate-500">
+                  Rotate Kraken API Keys
+                </div>
+                <label className="block text-xs text-slate-400">
+                  API Key
+                  <input
+                    type="text"
+                    value={apiKey}
+                    onChange={(event) => setApiKey(event.target.value)}
+                    className="mt-1 w-full rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-white outline-none focus:border-emerald-500"
+                    placeholder="Enter new API key"
+                    autoComplete="off"
+                  />
+                </label>
+                <label className="block text-xs text-slate-400">
+                  API Secret
+                  <input
+                    type="password"
+                    value={apiSecret}
+                    onChange={(event) => setApiSecret(event.target.value)}
+                    className="mt-1 w-full rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-white outline-none focus:border-emerald-500"
+                    placeholder="Enter new API secret"
+                    autoComplete="off"
+                  />
+                </label>
+                <button
+                  type="submit"
+                  disabled={rotationSubmitting}
+                  className="w-full rounded-md bg-emerald-500 px-3 py-2 text-sm font-semibold text-slate-950 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-slate-800 disabled:text-slate-400"
+                >
+                  {rotationSubmitting ? "Rotating..." : "Rotate Credentials"}
+                </button>
+                {rotationError && (
+                  <div className="rounded-md border border-rose-500/40 bg-rose-950/40 px-3 py-2 text-xs text-rose-200">
+                    {rotationError}
+                  </div>
                 )}
-              </tbody>
-            </table>
+                {rotationMessage && (
+                  <div className="rounded-md border border-emerald-500/40 bg-emerald-950/30 px-3 py-2 text-xs text-emerald-200">
+                    {rotationMessage}
+                  </div>
+                )}
+              </form>
+            </div>
+          </div>
+        </section>
+
+        <section className="rounded-xl border border-slate-800 bg-slate-900/60 p-6">
+          <h2 className="text-lg font-semibold text-white">Trade Pipeline</h2>
+          <div className="mt-6 space-y-6">
+            {trades.length ? (
+              trades.map((trade, index) => (
+                <div
+                  key={`${trade.intent}-${trade.order}-${trade.fill}-${index}`}
+                  className="space-y-4 rounded-lg border border-slate-800 bg-slate-900/50 p-4"
+                >
+                  <div className="flex flex-col gap-2 text-sm md:flex-row md:items-center md:justify-between">
+                    <div className="font-semibold text-white">{trade.intent || "Unnamed Intent"}</div>
+                    <div className="text-xs uppercase tracking-wide text-slate-500">
+                      PnL: <span className="font-medium text-slate-200">{trade.pnl || "--"}</span>
+                    </div>
+                  </div>
+                  <div className="grid gap-4 md:grid-cols-4">
+                    {[
+                      { title: "Intent", value: trade.intent },
+                      { title: "Decision", value: trade.decision },
+                      { title: "Order", value: trade.order },
+                      { title: "Fill", value: trade.fill },
+                    ].map((step) => (
+                      <div
+                        key={step.title}
+                        className="space-y-2 rounded-md border border-slate-800 bg-slate-900/60 p-3"
+                      >
+                        <div className="text-xs uppercase tracking-wide text-slate-400">
+                          {step.title}
+                        </div>
+                        <div className="text-sm text-slate-100">
+                          {step.value || "--"}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))
+            ) : (
+              <div className="rounded-md border border-slate-800 bg-slate-900/50 p-6 text-center text-sm text-slate-400">
+                No trade pipeline data available.
+              </div>
+            )}
           </div>
         </section>
       </main>

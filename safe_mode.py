@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from threading import Lock
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 from fastapi import Body, FastAPI, Header, HTTPException, status
 
@@ -66,6 +68,82 @@ class SafeModeStatus:
 
 
 # ---------------------------------------------------------------------------
+# Persistence helpers
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SafeModePersistedState:
+    """Serializable representation of the safe mode state."""
+
+    active: bool
+    reason: Optional[str]
+    timestamp: Optional[datetime]
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "active": self.active,
+            "reason": self.reason,
+            "timestamp": self.timestamp.isoformat() if self.timestamp else None,
+        }
+
+    @staticmethod
+    def from_dict(payload: Dict[str, object]) -> "SafeModePersistedState":
+        raw_ts = payload.get("timestamp")
+        ts: Optional[datetime]
+        if isinstance(raw_ts, str):
+            try:
+                ts = datetime.fromisoformat(raw_ts)
+            except ValueError:
+                ts = None
+        else:
+            ts = None
+        return SafeModePersistedState(
+            active=bool(payload.get("active", False)),
+            reason=payload.get("reason") if isinstance(payload.get("reason"), str) else None,
+            timestamp=ts,
+        )
+
+
+class SafeModeStateStore:
+    """Persist safe mode state to disk for crash recovery."""
+
+    def __init__(self, path: Optional[Union[str, Path]] = None) -> None:
+        self._path = Path(path) if path is not None else Path("safe_mode_state.json")
+        self._lock = Lock()
+
+    def load(self) -> SafeModePersistedState:
+        with self._lock:
+            if not self._path.exists():
+                return SafeModePersistedState(active=False, reason=None, timestamp=None)
+            try:
+                payload = json.loads(self._path.read_text())
+            except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+                return SafeModePersistedState(active=False, reason=None, timestamp=None)
+            if not isinstance(payload, dict):
+                return SafeModePersistedState(active=False, reason=None, timestamp=None)
+            return SafeModePersistedState.from_dict(payload)
+
+    def save(self, state: SafeModePersistedState) -> None:
+        with self._lock:
+            try:
+                if self._path.parent and not self._path.parent.exists():
+                    self._path.parent.mkdir(parents=True, exist_ok=True)
+                self._path.write_text(json.dumps(state.to_dict()))
+            except OSError:
+                return
+
+    def clear(self) -> None:
+        with self._lock:
+            try:
+                self._path.unlink()
+            except FileNotFoundError:
+                return
+            except OSError:
+                return
+
+
+# ---------------------------------------------------------------------------
 # Safe mode logging helpers
 # ---------------------------------------------------------------------------
 
@@ -118,22 +196,22 @@ class OrderControls:
     def __init__(self) -> None:
         self.open_orders: List[str] = []
         self.cancelled_orders: List[str] = []
-        self.only_hedging: bool = False
+        self.hedging_only: bool = False
 
     def cancel_open_orders(self) -> None:
         self.cancelled_orders.extend(self.open_orders)
         self.open_orders.clear()
 
     def restrict_to_hedging(self) -> None:
-        self.only_hedging = True
+        self.hedging_only = True
 
     def lift_restrictions(self) -> None:
-        self.only_hedging = False
+        self.hedging_only = False
 
     def reset(self) -> None:
         self.open_orders.clear()
         self.cancelled_orders.clear()
-        self.only_hedging = False
+        self.hedging_only = False
 
 
 class IntentGuard:
@@ -150,6 +228,10 @@ class IntentGuard:
 
     def reset(self) -> None:
         self.allow_new_intents = True
+
+    def assert_allowed(self) -> None:
+        if not self.allow_new_intents:
+            raise RuntimeError("Safe mode active; new trading intents are blocked")
 
 
 class KafkaSafeModePublisher:
@@ -212,12 +294,22 @@ class SafeModeController:
         intent_guard: Optional[IntentGuard] = None,
         publisher: Optional[KafkaSafeModePublisher] = None,
         logger: Optional[SafeModeLogger] = None,
+        state_store: Optional[SafeModeStateStore] = None,
     ) -> None:
         self.order_controls = order_controls or OrderControls()
         self.intent_guard = intent_guard or IntentGuard()
         self._publisher = publisher or KafkaSafeModePublisher()
         self._logger = logger or SafeModeLogger()
-        self._state = _SafeModeInternalState()
+        self._state_store = state_store or SafeModeStateStore()
+        persisted = self._state_store.load()
+        self._state = _SafeModeInternalState(
+            active=persisted.active,
+            reason=persisted.reason,
+            since=persisted.timestamp,
+        )
+        if persisted.active:
+            self.intent_guard.disable()
+            self.order_controls.restrict_to_hedging()
         self._lock = Lock()
 
     # Public API ---------------------------------------------------------
@@ -231,6 +323,15 @@ class SafeModeController:
         entered = False
         with self._lock:
             if self._state.active:
+                self.intent_guard.disable()
+                self.order_controls.restrict_to_hedging()
+                self._state_store.save(
+                    SafeModePersistedState(
+                        active=True,
+                        reason=self._state.reason or normalized_reason,
+                        timestamp=self._state.since or ts,
+                    )
+                )
                 return SafeModeEvent(
                     reason=self._state.reason or normalized_reason,
                     ts=self._state.since or ts,
@@ -247,7 +348,9 @@ class SafeModeController:
                 since=ts,
                 actor=actor,
             )
+
             entered = True
+
 
         event = SafeModeEvent(reason=normalized_reason, ts=ts, state="entered", actor=actor)
         if entered:
@@ -266,6 +369,9 @@ class SafeModeController:
             self.intent_guard.enable()
             self.order_controls.lift_restrictions()
             self._state = _SafeModeInternalState(active=False, actor=actor)
+            self._state_store.save(
+                SafeModePersistedState(active=False, reason=None, timestamp=None)
+            )
 
         event = SafeModeEvent(reason=reason, ts=ts, state="exited", actor=actor)
         self._publisher.publish(event)
@@ -288,6 +394,12 @@ class SafeModeController:
         self.intent_guard.reset()
         if hasattr(self._publisher, "reset"):
             self._publisher.reset()
+        self._state_store.clear()
+
+    def guard_new_intent(self) -> None:
+        """Raise if new trading intents should not be produced."""
+
+        self.intent_guard.assert_allowed()
 
     def kafka_history(self) -> List[Dict[str, object]]:
         if hasattr(self._publisher, "history"):

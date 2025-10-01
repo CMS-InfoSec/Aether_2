@@ -1,0 +1,375 @@
+"""Trading sequencer enforcing the policy → risk → OMS execution loop."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+import uuid
+from dataclasses import asdict, dataclass, is_dataclass
+from datetime import datetime, timezone
+from typing import Any, AsyncIterator, Callable, Dict, Iterable, Mapping, MutableMapping, Optional, Protocol
+
+from pydantic import BaseModel
+from sqlalchemy import Column, DateTime, Float, MetaData, String, Table, create_engine
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session, sessionmaker
+
+from common.schemas.contracts import FillEvent, IntentEvent, OrderEvent, RiskDecisionEvent
+from services.common.adapters import KafkaNATSAdapter
+from services.common.config import TimescaleSession, get_timescale_session
+
+LOGGER = logging.getLogger(__name__)
+
+
+class RiskServiceClient(Protocol):
+    """Minimal client interface for the risk service."""
+
+    async def validate_intent(
+        self, intent: IntentEvent, *, correlation_id: str
+    ) -> Mapping[str, Any]:
+        """Validate a policy intent and return the risk decision payload."""
+
+    async def handle_fill(self, fill: FillEvent, *, correlation_id: str) -> None:
+        """Forward an execution fill back into the risk service."""
+
+
+class OMSClient(Protocol):
+    """Order management client used by the trading sequencer."""
+
+    async def place_order(
+        self,
+        intent: IntentEvent,
+        decision: Mapping[str, Any],
+        *,
+        correlation_id: str,
+    ) -> Mapping[str, Any]:
+        """Place an order derived from *intent* and return the OMS acknowledgement."""
+
+    def stream_fills(
+        self,
+        order: Mapping[str, Any],
+        *,
+        correlation_id: str,
+    ) -> AsyncIterator[Mapping[str, Any]]:
+        """Yield fill payloads for the submitted *order*."""
+
+
+class FillSink(Protocol):
+    """Destination that consumes fills for downstream accounting."""
+
+    async def handle_fill(self, fill: FillEvent, *, correlation_id: str) -> None:
+        """Process a fill emitted by the sequencer."""
+
+
+@dataclass(slots=True)
+class SequencerResult:
+    """Summary of a sequencer run for a single intent."""
+
+    correlation_id: str
+    account_id: str
+    symbol: str
+    status: str
+    started_at: datetime
+    completed_at: datetime
+    latency_ms: float
+    intent: Dict[str, Any]
+    decision: Optional[Dict[str, Any]]
+    order: Optional[Dict[str, Any]]
+    fills: Iterable[Dict[str, Any]]
+    error: Optional[str] = None
+
+
+class _LatencyRecorder:
+    """Persist round-trip latency samples to the ``latency_metrics`` table."""
+
+    def __init__(self, session: TimescaleSession) -> None:
+        self._session = session
+        self._engine: Engine = create_engine(session.dsn, pool_pre_ping=True, future=True)
+        self._Session = sessionmaker(bind=self._engine, expire_on_commit=False, future=True)
+
+        metadata = MetaData(schema=session.account_schema)
+        self._table = Table(
+            "latency_metrics",
+            metadata,
+            Column("service", String, nullable=False),
+            Column("endpoint", String, nullable=False),
+            Column("p50", Float, nullable=False),
+            Column("p95", Float, nullable=False),
+            Column("p99", Float, nullable=False),
+            Column("ts", DateTime(timezone=True), nullable=False),
+            schema=session.account_schema,
+        )
+        metadata.create_all(self._engine, checkfirst=True)
+
+    async def record(self, *, endpoint: str, latency_ms: float, ts: datetime) -> None:
+        """Persist a latency sample for the sequencer."""
+
+        async def _write() -> None:
+            try:
+                with self._Session() as db:  # type: Session
+                    db.execute(
+                        self._table.insert(),
+                        [
+                            {
+                                "service": "sequencer",
+                                "endpoint": endpoint,
+                                "p50": latency_ms,
+                                "p95": latency_ms,
+                                "p99": latency_ms,
+                                "ts": ts,
+                            }
+                        ],
+                    )
+                    db.commit()
+            except SQLAlchemyError:
+                LOGGER.exception("Failed to persist sequencer latency for schema %s", self._session.account_schema)
+
+        await asyncio.to_thread(_write)
+
+
+class TradingSequencer:
+    """Enforce the policy → risk → OMS trading loop with strict ordering."""
+
+    def __init__(
+        self,
+        *,
+        risk_service: RiskServiceClient,
+        oms: OMSClient,
+        pnl_tracker: FillSink | None = None,
+        kafka_factory: Callable[..., KafkaNATSAdapter] = KafkaNATSAdapter,
+    ) -> None:
+        self._risk_service = risk_service
+        self._oms = oms
+        self._pnl_tracker = pnl_tracker
+        self._kafka_factory = kafka_factory
+        self._latency_recorders: MutableMapping[str, _LatencyRecorder] = {}
+
+    async def process_intent(self, event: IntentEvent) -> SequencerResult:
+        """Process a single :class:`IntentEvent` through the trading pipeline."""
+
+        started_at = datetime.now(timezone.utc)
+        start_perf = time.perf_counter()
+        correlation_id = str(uuid.uuid4())
+        adapter = self._kafka_factory(account_id=event.account_id)
+
+        decision_payload: Optional[Dict[str, Any]] = None
+        order_payload: Optional[Dict[str, Any]] = None
+        order_event: Optional[OrderEvent] = None
+        fills: list[Dict[str, Any]] = []
+        status = "pending"
+        error: Optional[str] = None
+        completed_at = started_at
+        latency_ms = 0.0
+
+        await self._publish(adapter, "intent", event.account_id, _with_correlation(event.model_dump(), correlation_id))
+
+        try:
+            decision_payload = _to_dict(
+                await self._risk_service.validate_intent(event, correlation_id=correlation_id)
+            )
+            decision_event = RiskDecisionEvent(
+                account_id=event.account_id,
+                symbol=event.symbol,
+                decision=decision_payload,
+                ts=datetime.now(timezone.utc),
+            )
+            await self._publish(
+                adapter,
+                "decision",
+                event.account_id,
+                _with_correlation(decision_event.model_dump(mode="json"), correlation_id),
+            )
+
+            approved = bool(
+                decision_payload.get("approved")
+                or decision_payload.get("valid")
+                or decision_payload.get("status") == "approved"
+            )
+
+            if not approved:
+                status = "rejected"
+            else:
+                order_payload = _to_dict(
+                    await self._oms.place_order(event, decision_payload, correlation_id=correlation_id)
+                )
+                order_event = OrderEvent(
+                    account_id=event.account_id,
+                    symbol=event.symbol,
+                    order_id=str(
+                        order_payload.get("order_id")
+                        or order_payload.get("client_order_id")
+                        or order_payload.get("id")
+                        or uuid.uuid4()
+                    ),
+                    status=str(order_payload.get("status") or "submitted"),
+                    ts=datetime.now(timezone.utc),
+                )
+                order_dump = order_event.model_dump(mode="json")
+                order_dump["details"] = dict(order_payload)
+                await self._publish(
+                    adapter,
+                    "order",
+                    event.account_id,
+                    _with_correlation(order_dump, correlation_id),
+                )
+
+                async for raw_fill in self._oms.stream_fills(order_payload, correlation_id=correlation_id):
+                    fill_payload = _to_dict(raw_fill)
+                    fill_event = self._build_fill_event(event, fill_payload)
+                    fill_dump = fill_event.model_dump(mode="json")
+                    fill_dump["details"] = fill_payload
+                    await self._publish(
+                        adapter,
+                        "fill",
+                        event.account_id,
+                        _with_correlation(fill_dump, correlation_id),
+                    )
+
+                    await self._risk_service.handle_fill(fill_event, correlation_id=correlation_id)
+                    destinations = ["risk"]
+                    if self._pnl_tracker is not None:
+                        await self._pnl_tracker.handle_fill(fill_event, correlation_id=correlation_id)
+                        destinations.append("pnl")
+
+                    update_payload = {
+                        "account_id": event.account_id,
+                        "symbol": event.symbol,
+                        "order_id": order_event.order_id,
+                        "destinations": destinations,
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                    }
+                    await self._publish(
+                        adapter,
+                        "update",
+                        event.account_id,
+                        _with_correlation(update_payload, correlation_id),
+                    )
+                    fills.append(fill_dump)
+
+                status = "filled" if fills else order_event.status
+        except Exception as exc:
+            error = str(exc)
+            status = "error"
+            await self._publish(
+                adapter,
+                "error",
+                event.account_id,
+                {
+                    "account_id": event.account_id,
+                    "symbol": event.symbol,
+                    "correlation_id": correlation_id,
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "error": error,
+                },
+            )
+            raise
+        finally:
+            completed_at = datetime.now(timezone.utc)
+            latency_ms = (time.perf_counter() - start_perf) * 1000.0
+            recorder = await self._latency_recorder(event.account_id)
+            await recorder.record(
+                endpoint=f"trade_roundtrip.{event.symbol}",
+                latency_ms=latency_ms,
+                ts=completed_at,
+            )
+
+        return SequencerResult(
+            correlation_id=correlation_id,
+            account_id=event.account_id,
+            symbol=event.symbol,
+            status=status,
+            started_at=started_at,
+            completed_at=completed_at,
+            latency_ms=latency_ms,
+            intent=event.model_dump(mode="json"),
+            decision=decision_payload,
+            order=order_payload,
+            fills=fills,
+            error=error,
+        )
+
+    async def _latency_recorder(self, account_id: str) -> _LatencyRecorder:
+        recorder = self._latency_recorders.get(account_id)
+        if recorder is None:
+            session = get_timescale_session(account_id)
+            recorder = _LatencyRecorder(session)
+            self._latency_recorders[account_id] = recorder
+        return recorder
+
+    async def _publish(
+        self,
+        adapter: KafkaNATSAdapter,
+        stage: str,
+        account_id: str,
+        payload: Mapping[str, Any],
+    ) -> None:
+        topic = f"sequencer.{stage}"
+        enriched = dict(payload)
+        enriched.setdefault("account_id", account_id)
+        await asyncio.to_thread(adapter.publish, topic, enriched)
+
+    def _build_fill_event(
+        self, intent: IntentEvent, payload: Mapping[str, Any]
+    ) -> FillEvent:
+        qty = _coerce_float(payload, ["qty", "quantity", "filled_qty", "size"], default=0.0)
+        price = _coerce_float(payload, ["price", "px", "avg_price", "fill_price"], default=0.0)
+        fee = _coerce_float(payload, ["fee", "fees", "commission"], default=0.0)
+        liquidity = str(payload.get("liquidity") or payload.get("liquidity_flag") or "unknown")
+        ts_value = payload.get("ts") or payload.get("timestamp")
+        if isinstance(ts_value, str):
+            try:
+                ts = datetime.fromisoformat(ts_value)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+            except ValueError:
+                ts = datetime.now(timezone.utc)
+        elif isinstance(ts_value, datetime):
+            ts = ts_value if ts_value.tzinfo else ts_value.replace(tzinfo=timezone.utc)
+        else:
+            ts = datetime.now(timezone.utc)
+        return FillEvent(
+            account_id=intent.account_id,
+            symbol=intent.symbol,
+            qty=qty,
+            price=price,
+            fee=max(fee, 0.0),
+            liquidity=liquidity,
+            ts=ts,
+        )
+
+
+def _with_correlation(payload: Mapping[str, Any], correlation_id: str) -> Dict[str, Any]:
+    enriched = dict(payload)
+    enriched["correlation_id"] = correlation_id
+    return enriched
+
+
+def _coerce_float(payload: Mapping[str, Any], keys: Iterable[str], *, default: float) -> float:
+    for key in keys:
+        value = payload.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return float(default)
+
+
+def _to_dict(value: Any) -> Dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    if is_dataclass(value):
+        return asdict(value)
+    if isinstance(value, Mapping):
+        return dict(value)
+    if isinstance(value, Iterable) and not isinstance(value, (str, bytes)):
+        return {"values": list(value)}
+    return {"value": value}
+
+
+__all__ = ["SequencerResult", "TradingSequencer"]
