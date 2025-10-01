@@ -1,0 +1,60 @@
+apiVersion: argoproj.io/v1alpha1
+kind: CronWorkflow
+metadata:
+  name: coingecko-nightly
+  labels:
+    workflow-type: batch-ingestion
+spec:
+  schedule: "0 2 * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  workflowSpec:
+    entrypoint: main
+    templates:
+      - name: main
+        dag:
+          tasks:
+            - name: ingest
+              template: ingest-task
+            - name: validate
+              dependencies: [ingest]
+              template: validation-task
+      - name: ingest-task
+        inputs:
+          parameters:
+            - name: database_url
+        container:
+          image: python:3.11-slim
+          command: ["python", "data/ingest/coingecko_job.py"]
+          args:
+            - "--database-url"
+            - "{{workflow.parameters.database_url}}"
+            - "--whitelist-path"
+            - "/data/output/nightly_whitelist.json"
+          workingDir: /workspace
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+      - name: validation-task
+        container:
+          image: python:3.11-slim
+          command: ["great_expectations", "checkpoint", "run", "nightly_ingest"]
+          workingDir: /workspace/data/great_expectations
+          env:
+            - name: GE_DATA_CONTEXT_ROOT_DIR
+              value: /workspace/data/great_expectations
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+    volumeClaimTemplates:
+      - metadata:
+          name: workspace
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 5Gi
+    arguments:
+      parameters:
+        - name: database_url
+          value: postgresql+psycopg2://feast:feast@timescaledb:5432/aether

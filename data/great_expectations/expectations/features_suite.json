@@ -1,0 +1,35 @@
+{
+  "data_asset_type": "SqlAlchemyDataset",
+  "expectation_suite_name": "features_suite",
+  "expectations": [
+    {
+      "expectation_type": "expect_column_to_exist",
+      "kwargs": {"column": "feature_name"}
+    },
+    {
+      "expectation_type": "expect_column_to_exist",
+      "kwargs": {"column": "symbol"}
+    },
+    {
+      "expectation_type": "expect_column_to_exist",
+      "kwargs": {"column": "event_ts"}
+    },
+    {
+      "expectation_type": "expect_column_values_to_not_be_null",
+      "kwargs": {"column": "value"}
+    },
+    {
+      "expectation_type": "expect_column_values_to_match_regex",
+      "kwargs": {"column": "feature_name", "regex": "^coingecko\\..+"},
+      "meta": {"notes": "CoinGecko ingestion should only populate coingecko.* features."}
+    }
+  ],
+  "meta": {
+    "citations": [
+      {
+        "citation_date": "2024-01-01",
+        "comment": "Generated for Aether data quality checks"
+      }
+    ]
+  }
+}
