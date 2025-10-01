@@ -1,20 +1,34 @@
-"""Audit logging utilities for structured logging and database persistence."""
+"""Tamper-evident audit logging utilities."""
 from __future__ import annotations
 
+import argparse
 import datetime as dt
 import hashlib
 import json
 import os
 import sys
-from typing import Dict, Optional
+from pathlib import Path
+from typing import Any, Dict, Iterable, Optional
 
-try:  # pragma: no cover - exercised implicitly in unit tests.
-    import psycopg
-except Exception as exc:  # pragma: no cover - handled at runtime if psycopg is missing.
+try:  # pragma: no cover - import is validated in unit tests indirectly
+    import psycopg  # type: ignore
+except Exception as exc:  # pragma: no cover - handled at runtime when psycopg is unavailable
     psycopg = None  # type: ignore
     _PSYCOPG_IMPORT_ERROR = exc
 else:  # pragma: no cover
     _PSYCOPG_IMPORT_ERROR = None
+
+
+_GENESIS_HASH = "0" * 64
+_CORE_FIELDS: Iterable[str] = (
+    "actor",
+    "action",
+    "entity",
+    "before",
+    "after",
+    "ip_hash",
+    "ts",
+)
 
 
 def _database_dsn() -> str:
@@ -28,56 +42,113 @@ def _database_dsn() -> str:
     return dsn
 
 
-def _hash_ip(ip: Optional[str]) -> Optional[str]:
-    if not ip:
-        return None
-    digest = hashlib.sha256(ip.encode("utf-8")).hexdigest()
-    return digest
+def _chain_state_path() -> Path:
+    path = os.getenv("AUDIT_CHAIN_STATE")
+    if path:
+        return Path(path).expanduser()
+    return Path.home() / ".cache" / "audit_chain_state.json"
+
+
+def _chain_log_path() -> Path:
+    path = os.getenv("AUDIT_CHAIN_LOG")
+    if path:
+        return Path(path).expanduser()
+    return Path.home() / ".cache" / "audit_chain.log"
+
+
+def _ensure_parent(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _read_last_hash(state_path: Path) -> str:
+    try:
+        with state_path.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except FileNotFoundError:
+        return _GENESIS_HASH
+    except json.JSONDecodeError:  # pragma: no cover - indicates manual tampering
+        return _GENESIS_HASH
+    return payload.get("last_hash", _GENESIS_HASH)
+
+
+def _write_last_hash(state_path: Path, entry_hash: str) -> None:
+    _ensure_parent(state_path)
+    payload = {"last_hash": entry_hash}
+    with state_path.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, separators=(",", ":"))
+
+
+def _append_chain_log(log_path: Path, entry: Dict[str, Any]) -> None:
+    _ensure_parent(log_path)
+    with log_path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry, separators=(",", ":"), sort_keys=True) + "\n")
+
+
+def _canonical_payload(entry: Dict[str, Any]) -> Dict[str, Any]:
+    return {field: entry[field] for field in _CORE_FIELDS}
+
+
+def _canonical_serialized(entry: Dict[str, Any]) -> str:
+    return json.dumps(entry, separators=(",", ":"), sort_keys=True)
 
 
 def log_audit(
     actor: str,
     action: str,
     entity: str,
-    before: Dict,
-    after: Dict,
-    ip: Optional[str],
+    before: Dict[str, Any],
+    after: Dict[str, Any],
+    ip_hash: Optional[str],
 ) -> None:
-    """Record an audit trail entry.
+    """Record an audit entry.
 
-    The function both emits a structured JSON log line and persists the same entry
-    into the ``audit_log`` PostgreSQL table.
+    The entry is:
+    * Emitted to stdout as a structured JSON payload.
+    * Inserted into the ``audit_log`` PostgreSQL table.
+    * Chained via SHA-256 digests for tamper-evident verification.
     """
 
-    if psycopg is None:  # pragma: no cover - tested indirectly by raising error.
+    if psycopg is None:  # pragma: no cover - import verified via runtime guard in tests
         raise RuntimeError("psycopg is required for audit logging") from _PSYCOPG_IMPORT_ERROR
 
     timestamp = dt.datetime.now(dt.timezone.utc)
-    ip_hash = _hash_ip(ip)
+    timestamp_iso = timestamp.isoformat()
 
-    log_record = {
+    core_payload: Dict[str, Any] = {
         "actor": actor,
         "action": action,
         "entity": entity,
         "before": before,
         "after": after,
         "ip_hash": ip_hash,
-        "ts": timestamp.isoformat(),
+        "ts": timestamp_iso,
     }
 
-    sys.stdout.write(json.dumps(log_record, separators=(",", ":")) + "\n")
+    state_path = _chain_state_path()
+    prev_hash = _read_last_hash(state_path)
+    canonical_serialized = _canonical_serialized(core_payload)
+    entry_hash = hashlib.sha256((prev_hash + canonical_serialized).encode("utf-8")).hexdigest()
 
-    before_json = json.dumps(before, separators=(",", ":"))
-    after_json = json.dumps(after, separators=(",", ":"))
+    chained_payload = dict(core_payload)
+    chained_payload["prev_hash"] = prev_hash
+    chained_payload["hash"] = entry_hash
+
+    sys.stdout.write(_canonical_serialized(chained_payload) + "\n")
+
+    _append_chain_log(_chain_log_path(), chained_payload)
+    _write_last_hash(state_path, entry_hash)
+
+    before_json = json.dumps(before, separators=(",", ":"), sort_keys=True)
+    after_json = json.dumps(after, separators=(",", ":"), sort_keys=True)
 
     dsn = _database_dsn()
 
-    with psycopg.connect(dsn) as conn:
+    with psycopg.connect(dsn) as conn:  # pragma: no cover - integration behaviour
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO audit_log (actor, action, entity, before_json, after_json, ts, ip_hash)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO audit_log (actor, action, entity, before_json, after_json, ts)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 """.strip(),
                 (
                     actor,
@@ -86,10 +157,91 @@ def log_audit(
                     before_json,
                     after_json,
                     timestamp,
-                    ip_hash,
                 ),
             )
 
 
-__all__ = ["log_audit"]
+def verify_audit_chain() -> bool:
+    """Validate the audit chain log for tamper evidence.
+
+    Returns ``True`` when the chain is valid, otherwise ``False``.
+    """
+
+    log_path = _chain_log_path()
+    if not log_path.exists():
+        print("No audit chain entries found.")
+        return True
+
+    prev_hash = _GENESIS_HASH
+    valid = True
+
+    with log_path.open("r", encoding="utf-8") as fh:
+        for line_number, line in enumerate(fh, start=1):
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                print(f"Invalid JSON at line {line_number}")
+                valid = False
+                break
+
+            try:
+                entry_prev = entry["prev_hash"]
+                entry_hash = entry["hash"]
+            except KeyError as exc:
+                print(f"Missing key {exc.args[0]!r} at line {line_number}")
+                valid = False
+                break
+
+            if entry_prev != prev_hash:
+                print(
+                    f"Chain break at line {line_number}: expected prev_hash {prev_hash}, got {entry_prev}"
+                )
+                valid = False
+                break
+
+            canonical_payload = _canonical_payload(entry)
+            recalculated = hashlib.sha256(
+                (prev_hash + _canonical_serialized(canonical_payload)).encode("utf-8")
+            ).hexdigest()
+
+            if recalculated != entry_hash:
+                print(
+                    f"Hash mismatch at line {line_number}: expected {entry_hash}, calculated {recalculated}"
+                )
+                valid = False
+                break
+
+            prev_hash = entry_hash
+
+    if valid:
+        print("Audit chain verified successfully.")
+    return valid
+
+
+def _build_cli() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Audit logger utilities")
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.required = True
+    subparsers.add_parser("verify", help="Verify the audit chain integrity")
+    return parser
+
+
+def main(argv: Optional[Iterable[str]] = None) -> int:
+    parser = _build_cli()
+    args = parser.parse_args(list(argv) if argv is not None else None)
+
+    if args.command == "verify":
+        return 0 if verify_audit_chain() else 1
+
+    parser.print_help()
+    return 1
+
+
+if __name__ == "__main__":  # pragma: no cover - manual execution entry point
+    sys.exit(main())
+
+
+__all__ = ["log_audit", "verify_audit_chain", "main"]
 
