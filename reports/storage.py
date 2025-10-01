@@ -86,9 +86,10 @@ class ArtifactStorage:
         target_path.write_bytes(data)
         checksum = hashlib.sha256(data).hexdigest()
         created_at = datetime.now(timezone.utc)
+        relative_path = str(target_path.relative_to(self.base_path))
         audit_payload = {
             "account_id": account_id,
-            "object_key": str(target_path.relative_to(self.base_path)),
+            "object_key": relative_path,
             "checksum": checksum,
             "size_bytes": len(data),
             "content_type": content_type,
@@ -106,13 +107,15 @@ class ArtifactStorage:
         try:
             session.execute(
                 """
-                INSERT INTO audit_log (account_id, action, metadata)
-                VALUES (%(account_id)s, %(action)s, %(metadata)s::jsonb)
+                INSERT INTO audit_logs (actor, action, target, payload, created_at)
+                VALUES (%(actor)s, %(action)s, %(target)s, %(payload)s::jsonb, %(created_at)s)
                 """,
                 {
-                    "account_id": account_id,
+                    "actor": account_id,
                     "action": "report_artifact_stored",
-                    "metadata": json.dumps(audit_payload),
+                    "target": relative_path,
+                    "payload": json.dumps(audit_payload),
+                    "created_at": created_at,
                 },
             )
             if hasattr(session, "commit"):
