@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 
+import base64
+import logging
 from copy import deepcopy
 from dataclasses import dataclass, field
 
@@ -10,6 +12,17 @@ from typing import Any, ClassVar, Dict, List, Optional
 from shared.k8s import KrakenSecretStore
 
 from services.universe.repository import UniverseRepository
+
+
+logger = logging.getLogger(__name__)
+
+
+def _mask_secret(value: str) -> str:
+    if not value:
+        return "***"
+    if len(value) <= 4:
+        return "*" * len(value)
+    return f"{value[:2]}{'*' * (len(value) - 4)}{value[-2:]}"
 
 
 @dataclass
@@ -308,6 +321,84 @@ class KrakenSecretManager:
         assert self.secret_store is not None
         return self.secret_store.secret_name(self.account_id)
 
+    def _decode_secret_payload(self, secret: Any) -> Dict[str, str]:
+        if secret is None:
+            return {}
+        data_sources: List[tuple[str, Dict[str, Any]]] = []
+        if isinstance(secret, dict):
+            for attr in ("stringData", "data"):
+                payload = secret.get(attr)
+                if isinstance(payload, dict):
+                    data_sources.append((attr, payload))
+        else:
+            for attr in ("stringData", "data"):
+                payload = getattr(secret, attr, None)
+                if isinstance(payload, dict):
+                    data_sources.append((attr, payload))
+        for attr, payload in data_sources:
+            decoded: Dict[str, str] = {}
+            for field in ("api_key", "api_secret"):
+                value = payload.get(field)
+                if not isinstance(value, str):
+                    continue
+                if attr == "data":
+                    try:
+                        value = base64.b64decode(value).decode()
+                    except Exception:
+                        pass
+                decoded[field] = value
+            if set(decoded) >= {"api_key", "api_secret"}:
+                return decoded
+        return {}
+
+    def _read_from_kubernetes(self) -> Dict[str, str]:
+        assert self.secret_store is not None
+        core_v1 = getattr(self.secret_store, "core_v1", None)
+        if not hasattr(core_v1, "read_namespaced_secret"):
+            return {}
+        try:
+            secret = core_v1.read_namespaced_secret(  # type: ignore[call-arg]
+                name=self.secret_name,
+                namespace=self.namespace,
+            )
+        except Exception as exc:  # pragma: no cover - depends on external cluster
+            raise RuntimeError(
+                f"Failed to read Kraken credentials for account '{self.account_id}': {exc}"
+            ) from exc
+        return self._decode_secret_payload(secret)
+
+    def get_credentials(self) -> Dict[str, str]:
+        assert self.secret_store is not None
+        assert self.timescale is not None
+
+        credentials = self.secret_store.read_credentials(self.account_id)
+        if not credentials:
+            credentials = self._read_from_kubernetes()
+
+        api_key = credentials.get("api_key") if credentials else None
+        api_secret = credentials.get("api_secret") if credentials else None
+
+        if not api_key or not api_secret:
+            raise RuntimeError(
+                f"Kraken API credentials are not configured for account '{self.account_id}'."
+            )
+
+        masked = {"api_key": _mask_secret(api_key), "api_secret": _mask_secret(api_secret)}
+        logger.info(
+            "Loaded Kraken credentials for account %s from secret %s",
+            self.account_id,
+            self.secret_name,
+            extra={"credentials": masked},
+        )
+
+        metadata = {
+            "secret_name": self.secret_name,
+            "accessed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.timescale.record_event("kraken.credentials.access", metadata)
+
+        return {"api_key": api_key, "api_secret": api_secret}
+
     def rotate_credentials(self, *, api_key: str, api_secret: str) -> Dict[str, Any]:
         assert self.secret_store is not None  # for type checkers
         assert self.timescale is not None
@@ -332,3 +423,4 @@ class KrakenSecretManager:
 
 def default_fee(currency: str = "USD") -> Dict[str, float | str]:
     return {"currency": currency, "maker": 0.1, "taker": 0.2}
+
