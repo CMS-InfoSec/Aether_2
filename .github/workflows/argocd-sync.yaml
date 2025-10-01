@@ -24,7 +24,7 @@ jobs:
           ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
           ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_TOKEN }}
         run: |
-          argocd login $ARGOCD_SERVER --username token --password $ARGOCD_AUTH_TOKEN --insecure
+          argocd login $ARGOCD_SERVER --auth-token $ARGOCD_AUTH_TOKEN --insecure
       - name: Sync Applications
         run: |
           argocd app sync aether-risk-staging

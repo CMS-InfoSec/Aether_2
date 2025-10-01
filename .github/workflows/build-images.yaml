@@ -58,6 +58,9 @@ jobs:
       - name: Build Risk API with Buildah
         run: |
           buildah bud -f services/risk-api/Dockerfile -t ghcr.io/aether/risk-api:${{ github.sha }} .
+      - name: Build Ingestor with Buildah
+        run: |
+          buildah bud -f services/risk-ingestor/Dockerfile -t ghcr.io/aether/risk-ingestor:${{ github.sha }} .
       - name: Generate SBOMs
         run: |
           syft ghcr.io/aether/risk-api:${{ github.sha }} -o json > sbom-risk-api.json
