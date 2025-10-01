@@ -2,7 +2,7 @@ from __future__ import annotations
 
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from datetime import datetime, timezone
 from typing import Any, ClassVar, Dict, List, Optional
