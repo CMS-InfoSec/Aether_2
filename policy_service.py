@@ -12,24 +12,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from services.models.model_server import Intent, predict_intent
 
-FEES_SERVICE_URL = os.getenv("FEES_SERVICE_URL", "http://localhost:8000")
-FEES_REQUEST_TIMEOUT = float(os.getenv("FEES_SERVICE_TIMEOUT", "3.0"))
 
-KRAKEN_PRECISION: Dict[str, Dict[str, float]] = {
-    "BTC-USD": {"tick": 0.1, "lot": 0.0001},
-    "ETH-USD": {"tick": 0.01, "lot": 0.001},
-    "SOL-USD": {"tick": 0.001, "lot": 0.01},
-}
+from metrics import record_abstention_rate, record_drift_score, setup_metrics
 
 
-def _snap(value: float, step: float) -> float:
-    """Snap a numeric value to the closest Kraken-supported increment."""
-
-    if step <= 0:
-        return value
-    quant = Decimal(str(step))
-    snapped = (Decimal(str(value)) / quant).to_integral_value(rounding=ROUND_HALF_UP) * quant
-    return float(snapped)
 
 
 class BookSnapshotPayload(BaseModel):
@@ -184,6 +170,10 @@ class PolicyDecisionResponse(BaseModel):
     )
 
 
+app = FastAPI(title="Policy Service")
+setup_metrics(app)
+
+
 app = FastAPI(title="Policy Service", version="2.0.0")
 
 
@@ -300,78 +290,31 @@ async def decide_policy(request: PolicyDecisionRequest) -> PolicyDecisionRespons
             detail="Snapped price or quantity is non-positive",
         )
 
-    features_vector = request.features_vector
-    intent = predict_intent(
-        account_id=request.account_id,
-        symbol=request.symbol,
-        features=features_vector,
-        book_snapshot=request.book_snapshot.model_dump(),
-    )
 
-    liquidity = intent.selected_action or "maker"
-    template = _select_template(intent, liquidity)
-    template_edge = (
-        float(template.edge_bps)
-        if hasattr(template, "edge_bps")
-        else float(intent.edge_bps)
-    )
+    try:
+        response = PolicyDecisionResponse(**result)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Model response failed validation",
+        ) from exc
 
-    effective_fee_bps = await _fetch_effective_fee(
-        account_id=request.account_id,
-        symbol=request.symbol,
-        liquidity=liquidity,
-        notional=snapped_price * snapped_qty,
-    )
+    drift = 0.0
+    account_state = request.account_state or {}
+    if isinstance(account_state, dict):
+        raw = account_state.get("drift_score", 0.0)
+        try:
+            drift = float(raw)
+        except (TypeError, ValueError):
+            drift = 0.0
+    record_drift_score(request.account_id, request.symbol, drift)
 
-    spread_bps = float(request.book_snapshot.spread_bps)
-    impact_bps = float(request.impact_bps)
-    expected_edge_bps = float(template_edge)
-    expected_cost_bps = spread_bps + effective_fee_bps + impact_bps
-
-    gate_passed = expected_edge_bps > expected_cost_bps
-    approved = bool(intent.approved and gate_passed)
-
-    if approved:
-        action = liquidity.lower()
-        side = request.side.lower()
-        order_type = "limit"
-        limit_px = snapped_price
-        reason = intent.reason
-        qty = snapped_qty
-    else:
-        action = "hold"
-        side = "none"
-        order_type = "none"
-        limit_px = None
-        qty = 0.0
-        if not intent.approved and intent.reason:
-            reason = intent.reason
-        elif not gate_passed:
-            reason = "Fee-adjusted edge non-positive"
-        else:
-            reason = "Intent rejected"
-
-    response = PolicyDecisionResponse(
-        account_id=request.account_id,
-        symbol=request.symbol,
-        action=action,
-        side=side,
-        order_type=order_type,
-        qty=round(qty, 8),
-        price=round(snapped_price, 8),
-        limit_px=limit_px,
-        tif=None,
-        take_profit_bps=float(getattr(intent, "take_profit_bps", 0.0)),
-        stop_loss_bps=float(getattr(intent, "stop_loss_bps", 0.0)),
-        expected_edge_bps=round(expected_edge_bps, 4),
-        spread_bps=round(spread_bps, 4),
-        effective_fee_bps=round(effective_fee_bps, 4),
-        impact_bps=round(impact_bps, 4),
-        expected_cost_bps=round(expected_cost_bps, 4),
-        confidence=round(_confidence(intent), 4),
-        approved=approved,
-        reason=reason,
-    )
+    abstain = 0.0
+    action = (response.action or "").lower()
+    side = (response.side or "").lower()
+    if action in {"hold", "abstain"} or side in {"none", "flat"}:
+        abstain = 1.0
+    record_abstention_rate(request.account_id, request.symbol, abstain)
 
     return response
 
