@@ -180,6 +180,7 @@ class TimescaleAdapter:
     def record_event(self, event_type: str, payload: Dict[str, Any]) -> None:
         entry = {
             "type": event_type,
+            "event_type": event_type,
             "payload": deepcopy(payload),
             "timestamp": datetime.now(timezone.utc),
         }
@@ -221,6 +222,7 @@ class TimescaleAdapter:
         events.append(
             {
                 "event": "rotation",
+                "event_type": "kraken.credentials.rotation",
                 "secret_name": secret_name,
                 "metadata": deepcopy(metadata),
                 "timestamp": rotated_at,
@@ -270,10 +272,15 @@ class TimescaleAdapter:
     def record_credential_access(self, *, secret_name: str, metadata: Dict[str, Any]) -> None:
         sanitized = deepcopy(metadata)
         for key in ("api_key", "api_secret"):
-            if key in sanitized:
+            if key in sanitized and sanitized[key]:
                 sanitized[key] = "***"
+        if "material_present" not in sanitized:
+            sanitized["material_present"] = bool(
+                sanitized.get("api_key") and sanitized.get("api_secret")
+            )
         payload = {
             "event": "access",
+            "event_type": "kraken.credentials.access",
             "secret_name": secret_name,
             "metadata": sanitized,
             "timestamp": datetime.now(timezone.utc),
@@ -409,44 +416,15 @@ class KrakenSecretManager:
             "before": before_status,
         }
 
-    def get_credentials(self) -> Dict[str, str]:
-        """Return the stored Kraken API credentials for the account.
-
-        Raises:
-            RuntimeError: If no credentials have been provisioned for the account
-                in the configured namespace.
-        """
-
-        assert self.secret_store is not None
-
-        credentials = self.secret_store.read_credentials(self.account_id)
-        if not credentials:
-            raise RuntimeError(
-                "No Kraken API credentials are provisioned for account"
-                f" '{self.account_id}'. Use the secrets service to rotate keys"
-                " before attempting to trade."
-            )
-
-        missing_fields = [
-            field for field in ("api_key", "api_secret") if not credentials.get(field)
-        ]
-        if missing_fields:
-            fields = ", ".join(sorted(missing_fields))
-            raise RuntimeError(
-                "Incomplete Kraken credentials for account"
-                f" '{self.account_id}': missing {fields}."
-            )
-
-        return {"api_key": credentials["api_key"], "api_secret": credentials["api_secret"]}
-
     def status(self) -> Optional[Dict[str, Any]]:
         assert self.timescale is not None
         return self.timescale.credential_rotation_status()
 
-    def get_credentials(self) -> Dict[str, Any]:
-        """Load Kraken API credentials for the account from Kubernetes."""
+    def get_credentials(self) -> Dict[str, str]:
+        """Load Kraken API credentials for the account from the secret store."""
 
         assert self.secret_store is not None
+        assert self.timescale is not None
 
         secret_payload = self.secret_store.get_secret(self.secret_name)
         if not secret_payload:
@@ -464,13 +442,29 @@ class KrakenSecretManager:
             )
 
         metadata = deepcopy(secret_payload.get("metadata") or {})
-        for sensitive_field in ("api_key", "api_secret"):
-            if sensitive_field in metadata:
-                metadata[sensitive_field] = "***"
         metadata.setdefault("secret_name", self.secret_name)
         metadata.setdefault("namespace", self.namespace)
+        metadata["material_present"] = True
 
-        return {"api_key": api_key, "api_secret": api_secret, "metadata": metadata}
+        sanitized_metadata = deepcopy(metadata)
+        for sensitive_field in ("api_key", "api_secret"):
+            if sensitive_field in sanitized_metadata and sanitized_metadata[sensitive_field]:
+                sanitized_metadata[sensitive_field] = "***"
+
+        self.timescale.record_credential_access(
+            secret_name=self.secret_name,
+            metadata=sanitized_metadata,
+        )
+
+        self.timescale.record_event(
+            "kraken.credentials.access",
+            {
+                "secret_name": self.secret_name,
+                "metadata": sanitized_metadata,
+            },
+        )
+
+        return {"api_key": api_key, "api_secret": api_secret}
 
 
 def default_fee(currency: str = "USD") -> Dict[str, float | str]:

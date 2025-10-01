@@ -86,7 +86,7 @@ def test_manager_rotate_credentials_includes_metadata() -> None:
 
     rotation_events = timescale.credential_events()
     assert any(
-        event["event"] == "rotation"
+        event["event_type"] == "kraken.credentials.rotation"
         and event["metadata"]["secret_name"] == "kraken-keys-admin-eu"
         for event in rotation_events
     )
