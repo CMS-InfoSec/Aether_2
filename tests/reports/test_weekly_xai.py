@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+
 import json
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -17,6 +18,7 @@ from reports.weekly_xai import (
 from reports.storage import ArtifactStorage
 
 
+
 class FakeResult:
     def __init__(self, rows: Iterable[Mapping[str, Any]]):
         self._rows = list(rows)
@@ -26,6 +28,7 @@ class FakeResult:
 
     def __iter__(self):
         return iter(self._rows)
+
 
 
 class ShapRecordingSession:
@@ -176,3 +179,4 @@ def test_shap_query_targets_expected_table() -> None:
     normalized = " ".join(SHAP_QUERY.lower().split())
     assert "from ml_shap_outputs" in normalized
     assert "where inference_time" in normalized
+
