@@ -9,6 +9,8 @@ components.
 """
 from __future__ import annotations
 
+import argparse
+import json
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, Iterable, Iterator, List, Optional, Protocol, Tuple
@@ -127,6 +129,8 @@ class SimulationState:
     slippage_sum_bps: float = 0.0
     slippage_samples: int = 0
     slippage_cost_total: float = 0.0
+    orders_submitted: int = 0
+    orders_hit: int = 0
     best_bid: Optional[float] = None
     best_ask: Optional[float] = None
     bid_size: float = 0.0
@@ -223,8 +227,8 @@ class Backtester:
             name: self._run_once(self._apply_stress(name)) for name in [
                 "flash_crash",
                 "spread_widen",
+                "liquidity_halt",
                 "liquidity_halving",
-                "feed_outage",
             ]
         }
         result: Dict[str, Any] = dict(base_metrics)
@@ -351,6 +355,7 @@ class Backtester:
             order.trigger_reference = reference
             order.intent.stop_price = reference - intent.trailing_offset if intent.side == "sell" else reference + intent.trailing_offset
 
+        state.orders_submitted += 1
         state.orders[order.order_id] = order
 
         if intent.order_type == "limit" and not intent.post_only and crosses_book:
@@ -645,8 +650,12 @@ class Backtester:
                 slippage_bps=slippage_bps,
             )
         )
+        first_fill = order.filled == 0
         order.record_fill(quantity)
         order.fee_paid += fee
+
+        if first_fill:
+            state.orders_hit += 1
 
         if order.intent.side == "buy":
             state.position += quantity
@@ -679,15 +688,20 @@ class Backtester:
     def _compute_performance(self, state: SimulationState) -> Dict[str, float]:
         if not state.equity_curve:
             return {
+                "pnl": 0.0,
                 "net_pnl": 0.0,
                 "sharpe": 0.0,
                 "sortino": 0.0,
                 "max_dd": 0.0,
+                "var95": 0.0,
+                "var_95": 0.0,
+                "cvar95": 0.0,
                 "cvar_95": 0.0,
                 "turnover": 0.0,
                 "fee_bps": 0.0,
                 "maker_hit_rate": 0.0,
                 "slippage_attrib": 0.0,
+                "hit_rate": 0.0,
             }
 
         curve = pd.DataFrame(state.equity_curve, columns=["timestamp", "equity"]).set_index("timestamp").sort_index()
@@ -695,6 +709,7 @@ class Backtester:
         sharpe = self._sharpe_ratio(returns)
         sortino = self._sortino_ratio(returns)
         max_dd = self._max_drawdown(curve["equity"])
+        var_95 = self._var(returns, 0.95)
         cvar_95 = self._cvar(returns, 0.95)
         final_equity = float(curve["equity"].iloc[-1])
         net_pnl = final_equity - self.initial_cash
@@ -702,16 +717,22 @@ class Backtester:
         fee_bps = (state.total_fee / state.total_notional * 10_000) if state.total_notional > 0 else 0.0
         maker_hit_rate = (state.maker_fill_qty / state.maker_target_qty) if state.maker_target_qty > 0 else 0.0
         slippage_attrib = (state.slippage_sum_bps / state.slippage_samples) if state.slippage_samples > 0 else 0.0
+        hit_rate = (state.orders_hit / state.orders_submitted) if state.orders_submitted > 0 else 0.0
         return {
+            "pnl": net_pnl,
             "net_pnl": net_pnl,
             "sharpe": sharpe,
             "sortino": sortino,
             "max_dd": max_dd,
+            "var95": var_95,
+            "var_95": var_95,
+            "cvar95": cvar_95,
             "cvar_95": cvar_95,
             "turnover": turnover,
             "fee_bps": fee_bps,
             "maker_hit_rate": maker_hit_rate,
             "slippage_attrib": slippage_attrib,
+            "hit_rate": hit_rate,
         }
 
     @staticmethod
@@ -738,15 +759,21 @@ class Backtester:
         return float(drawdown.min())
 
     @staticmethod
+    def _var(returns: pd.Series, confidence: float) -> float:
+        if returns.empty:
+            return 0.0
+        quantile = float(returns.quantile(1 - confidence))
+        return max(0.0, -quantile)
+
+    @staticmethod
     def _cvar(returns: pd.Series, confidence: float) -> float:
         if returns.empty:
             return 0.0
-        sorted_returns = returns.sort_values()
-        cutoff_index = int(np.ceil((1 - confidence) * len(sorted_returns)))
-        if cutoff_index <= 0:
+        threshold = float(returns.quantile(1 - confidence))
+        tail = returns[returns <= threshold]
+        if tail.empty:
             return 0.0
-        tail = sorted_returns.iloc[:cutoff_index]
-        return float(tail.mean())
+        return max(0.0, float(-tail.mean()))
 
     def _apply_slippage(
         self,
@@ -779,7 +806,7 @@ class Backtester:
         injectors = {
             "flash_crash": flash_crash,
             "spread_widen": spread_widen,
-            "feed_outage": feed_outage,
+            "liquidity_halt": liquidity_halt,
         }
         if scenario in injectors:
             return injectors[scenario](events)
@@ -849,7 +876,7 @@ def spread_widen(events: List[Dict[str, Any]], widen_bps: float = 75.0) -> List[
     return events
 
 
-def feed_outage(events: List[Dict[str, Any]], gap_events: int = 3) -> List[Dict[str, Any]]:
+def liquidity_halt(events: List[Dict[str, Any]], gap_events: int = 3) -> List[Dict[str, Any]]:
     book_indices = _book_event_indices(events)
     if len(book_indices) < gap_events:
         return events
@@ -862,4 +889,204 @@ def feed_outage(events: List[Dict[str, Any]], gap_events: int = 3) -> List[Dict[
         event["bid_size"] = 0.0
         event["ask_size"] = 0.0
         event["halted"] = True
+    resume_idx = outage[-1] + 1 if outage else None
+    if resume_idx is not None and resume_idx < len(events):
+        resume_event = events[resume_idx]
+        resume_event["halted"] = False
+        resume_event["bid_size"] = float(resume_event.get("bid_size", 1.0)) * 0.25
+        resume_event["ask_size"] = float(resume_event.get("ask_size", 1.0)) * 0.25
     return events
+
+
+def feed_outage(events: List[Dict[str, Any]], gap_events: int = 3) -> List[Dict[str, Any]]:
+    """Backward compatible alias for :func:`liquidity_halt`."""
+
+    return liquidity_halt(events, gap_events=gap_events)
+
+
+class ExamplePolicy:
+    """Lightweight mean-reversion policy used for the CLI demo."""
+
+    def __init__(self, seed: Optional[int] = None) -> None:
+        self.rng = np.random.default_rng(seed)
+        self.last_close: Optional[float] = None
+
+    def reset(self) -> None:
+        self.last_close = None
+
+    def generate(self, timestamp: pd.Timestamp, market_state: Dict[str, Any]) -> Iterable[OrderIntent]:
+        bar = market_state.get("bar", {})
+        close = float(bar.get("close", 0.0) or 0.0)
+        best_bid = market_state.get("best_bid")
+        best_ask = market_state.get("best_ask")
+        orders: List[OrderIntent] = []
+
+        if self.last_close and close > 0:
+            change = (close - self.last_close) / self.last_close
+            if change <= -0.003 and best_ask is not None:
+                orders.append(
+                    OrderIntent(
+                        side="buy",
+                        quantity=0.25,
+                        price=float(best_ask),
+                        order_type="limit",
+                        time_in_force="IOC",
+                    )
+                )
+            elif change >= 0.003 and best_bid is not None:
+                orders.append(
+                    OrderIntent(
+                        side="sell",
+                        quantity=0.25,
+                        price=float(best_bid),
+                        order_type="limit",
+                        time_in_force="FOK",
+                    )
+                )
+
+        if best_bid is not None and best_ask is not None:
+            spread = max(best_ask - best_bid, 1e-6)
+            if float(self.rng.random()) < 0.05:
+                orders.append(
+                    OrderIntent(
+                        side="buy",
+                        quantity=0.1,
+                        price=float(best_bid - spread * 0.25),
+                        order_type="limit",
+                        time_in_force="GTC",
+                        post_only=True,
+                    )
+                )
+            if float(self.rng.random()) < 0.05:
+                orders.append(
+                    OrderIntent(
+                        side="sell",
+                        quantity=0.1,
+                        price=float(best_ask + spread * 0.25),
+                        order_type="limit",
+                        time_in_force="GTC",
+                        post_only=True,
+                    )
+                )
+            if float(self.rng.random()) < 0.02:
+                orders.append(
+                    OrderIntent(
+                        side="sell",
+                        quantity=0.15,
+                        order_type="market",
+                        time_in_force="IOC",
+                        trailing_offset=float(spread * 0.75),
+                    )
+                )
+        self.last_close = close if close > 0 else self.last_close
+        return orders
+
+
+def _generate_synthetic_events(
+    symbol: str,
+    years: int,
+    seed: Optional[int] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    periods = max(years * 365 * 24, 48)
+    start = pd.Timestamp.utcnow().normalize() - pd.Timedelta(hours=periods)
+    timeline = pd.date_range(start=start, periods=periods, freq="h")
+    rng = np.random.default_rng(seed)
+    price = 20_000.0
+    prev_price = price
+    bars: List[Dict[str, Any]] = []
+    books: List[Dict[str, Any]] = []
+
+    for ts in timeline:
+        drift = float(rng.normal(0, price * 0.002))
+        price = max(50.0, price + drift)
+        spread = max(price * 0.0005, float(rng.normal(price * 0.0008, price * 0.0002)))
+        bid = price - spread / 2.0
+        ask = price + spread / 2.0
+        bid_size = float(max(0.5, rng.lognormal(mean=0.0, sigma=0.4)))
+        ask_size = float(max(0.5, rng.lognormal(mean=0.0, sigma=0.4)))
+        books.append(
+            {
+                "timestamp": ts,
+                "type": "book",
+                "symbol": symbol,
+                "bid": bid,
+                "ask": ask,
+                "bid_size": bid_size,
+                "ask_size": ask_size,
+                "halted": False,
+            }
+        )
+
+        high = max(price, ask) + abs(float(rng.normal(0, spread * 0.5)))
+        low = min(price, bid) - abs(float(rng.normal(0, spread * 0.5)))
+        volume = float(max(1.0, rng.lognormal(mean=2.0, sigma=0.5)))
+        bars.append(
+            {
+                "timestamp": ts,
+                "type": "bar",
+                "symbol": symbol,
+                "open": prev_price,
+                "high": high,
+                "low": low,
+                "close": price,
+                "volume": volume,
+            }
+        )
+        prev_price = price
+
+    return bars, books
+
+
+def _serialise_for_json(payload: Any) -> Any:
+    if isinstance(payload, dict):
+        return {key: _serialise_for_json(value) for key, value in payload.items()}
+    if isinstance(payload, list):
+        return [_serialise_for_json(value) for value in payload]
+    if isinstance(payload, pd.Timestamp):
+        return payload.isoformat()
+    if isinstance(payload, np.generic):
+        return payload.item()
+    return payload
+
+
+def _run_cli(args: argparse.Namespace) -> None:
+    bars, books = _generate_synthetic_events(args.symbol, args.years, seed=args.seed)
+    base_fee = FeeSchedule(maker=0.0002, taker=0.0007)
+    tiers = [
+        FeeTier(threshold=10_000_000.0, schedule=FeeSchedule(maker=0.0001, taker=0.0005)),
+        FeeTier(threshold=25_000_000.0, schedule=FeeSchedule(maker=0.00005, taker=0.0004)),
+    ]
+    policy = ExamplePolicy(seed=args.seed)
+    engine = Backtester(
+        bar_events=bars,
+        book_events=books,
+        policy=policy,
+        fee_schedule=base_fee,
+        slippage_bps=1.0,
+        initial_cash=1_000_000.0,
+        fee_tiers=tiers,
+        seed=args.seed,
+    )
+    metrics = engine.run()
+    print(json.dumps(_serialise_for_json(metrics), indent=2))
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    parser = argparse.ArgumentParser(description="Backtest engine CLI")
+    subparsers = parser.add_subparsers(dest="command")
+
+    run_parser = subparsers.add_parser("run", help="Execute a demo backtest")
+    run_parser.add_argument("--symbol", required=True, help="Symbol to simulate, e.g. BTC/USD")
+    run_parser.add_argument("--years", type=int, default=1, help="Number of years of hourly data to simulate")
+    run_parser.add_argument("--seed", type=int, default=7, help="Random seed for reproducibility")
+    run_parser.set_defaults(func=_run_cli)
+
+    args = parser.parse_args(argv)
+    if not hasattr(args, "func"):
+        parser.print_help()
+        return
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
