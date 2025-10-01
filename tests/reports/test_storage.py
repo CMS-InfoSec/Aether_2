@@ -44,23 +44,38 @@ def test_store_artifact_writes_expected_audit_log(tmp_path: Path) -> None:
     query, params = session.executions[0]
     assert "INSERT INTO audit_logs" in query
     expected_columns = """
+                event_id,
+                entity_type,
+                entity_id,
                 actor,
                 action,
-                target,
-                created_at,
+                event_time,
                 payload
     """.strip()
     assert expected_columns in query
-    assert set(params) == {"action", "actor", "created_at", "payload", "target"}
+    assert set(params) == {
+        "event_id",
+        "entity_type",
+        "entity_id",
+        "actor",
+        "action",
+        "event_time",
+        "payload",
+    }
 
     assert params["action"] == "report.artifact.stored"
-    assert params["target"] == artifact.object_key
+    assert params["entity_type"] == "report_artifact"
+    assert params["entity_id"] == artifact.object_key
     assert params["actor"] == "acct-123"
 
-    created_at = params["created_at"]
+    created_at = params["event_time"]
     assert isinstance(created_at, datetime)
     assert created_at.tzinfo is timezone.utc
     assert created_at == artifact.created_at
+
+    event_id = params["event_id"]
+    assert isinstance(event_id, str)
+    assert len(event_id) == 64
 
     payload = json.loads(params["payload"])
     assert payload["entity"] == {"type": "report_artifact", "id": artifact.object_key}
