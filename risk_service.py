@@ -32,6 +32,7 @@ from metrics import (
     record_fees_nav_pct,
     setup_metrics,
 )
+from esg_filter import ESG_REASON, esg_filter
 from services.common.compliance import (
     SanctionRecord,
     ensure_sanctions_schema,
@@ -685,6 +686,24 @@ def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
             cooldown_until = cooldown_until or _determine_cooldown(limits)
         _audit_violation(context, message, details)
 
+    esg_allowed, esg_entry = esg_filter.evaluate(str(intent.instrument_id))
+    if not esg_allowed:
+        esg_details: Dict[str, object] = {"reason": ESG_REASON}
+        if esg_entry is not None:
+            esg_details["esg_flag"] = esg_entry.flag
+            esg_details["esg_score"] = esg_entry.score
+            if esg_entry.reason:
+                esg_details["esg_note"] = esg_entry.reason
+        _register_violation(
+            "Instrument blocked by ESG compliance policy",
+            cooldown=True,
+            details=esg_details,
+        )
+        esg_filter.log_rejection(
+            context.request.account_id,
+            str(intent.instrument_id),
+            esg_entry,
+        )
 
     throttle_status = COST_THROTTLER.evaluate(context.request.account_id)
     if throttle_status.active:
