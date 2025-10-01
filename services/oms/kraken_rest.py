@@ -57,6 +57,21 @@ class KrakenRESTClient:
         response = await self._request("/private/CancelOrder", payload)
         return self._parse_response(response)
 
+    async def open_orders(self) -> Dict[str, Any]:
+        return await self._request("/private/OpenOrders", {})
+
+    async def own_trades(self, *, start: Optional[int] = None, end: Optional[int] = None) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"trades": True}
+        if start is not None:
+            payload["start"] = int(start)
+        if end is not None:
+            payload["end"] = int(end)
+        return await self._request("/private/TradesHistory", payload)
+
+    async def open_positions(self, *, docalcs: bool = True) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"docalcs": bool(docalcs)}
+        return await self._request("/private/OpenPositions", payload)
+
     async def _request(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         credentials = await self._credential_getter()
         session = await self._session_or_create()

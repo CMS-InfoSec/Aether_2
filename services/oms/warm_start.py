@@ -200,10 +200,12 @@ class WarmStartCoordinator:
                 continue
 
             orders = await self._resync_account(account)
-            fills = await self._replay_account_fills(account)
+            await self._resync_positions(account)
+            trade_fills = await self._replay_account_trades(account)
+            kafka_fills = await self._replay_account_fills(account)
             async with self._status_lock:
                 self._orders_resynced += orders
-                self._fills_replayed += fills
+                self._fills_replayed += trade_fills + kafka_fills
 
     async def status(self) -> Dict[str, int]:
         async with self._status_lock:
@@ -221,6 +223,34 @@ class WarmStartCoordinator:
             account_id = getattr(account, "account_id", "<unknown>")
             logger.warning(
                 "Warm start order resync failed for account %s: %s",
+                account_id,
+                exc,
+            )
+            return 0
+
+    async def _resync_positions(self, account: Any) -> int:
+        if not hasattr(account, "resync_positions"):
+            return 0
+        try:
+            return int(await account.resync_positions())
+        except Exception as exc:
+            account_id = getattr(account, "account_id", "<unknown>")
+            logger.warning(
+                "Warm start position resync failed for account %s: %s",
+                account_id,
+                exc,
+            )
+            return 0
+
+    async def _replay_account_trades(self, account: Any) -> int:
+        if not hasattr(account, "resync_trades"):
+            return 0
+        try:
+            return int(await account.resync_trades())
+        except Exception as exc:
+            account_id = getattr(account, "account_id", "<unknown>")
+            logger.warning(
+                "Warm start trade resync failed for account %s: %s",
                 account_id,
                 exc,
             )

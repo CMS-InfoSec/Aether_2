@@ -671,6 +671,8 @@ class AccountContext:
         self._stream_task: Optional[asyncio.Task[None]] = None
         self._child_parent: Dict[str, str] = {}
         self._child_results: Dict[str, OMSOrderStatusResponse] = {}
+        self._positions: Dict[str, Dict[str, Decimal]] = {}
+        self._positions_lock = asyncio.Lock()
         self.routing = LatencyRouter(account_id)
 
         self._impact_store: ImpactAnalyticsStore = impact_store
@@ -780,17 +782,90 @@ class AccountContext:
         if self.ws_client is None:
             return 0
 
+        snapshot: Iterable[Dict[str, Any]] = []
+
+        if self.ws_client is not None:
+            try:
+                snapshot = await self.ws_client.fetch_open_orders_snapshot()
+            except (KrakenWSError, KrakenWSTimeout) as exc:
+                logger.warning(
+                    "Warm start failed to fetch open orders via websocket for account %s: %s",
+                    self.account_id,
+                    exc,
+                )
+
+        if not snapshot and self.rest_client is not None:
+            try:
+                payload = await self.rest_client.open_orders()
+                snapshot = self._parse_rest_open_orders(payload)
+            except KrakenRESTError as exc:
+                logger.warning(
+                    "Warm start failed to fetch open orders via REST for account %s: %s",
+                    self.account_id,
+                    exc,
+                )
+                snapshot = []
+
+        return await self._apply_open_order_snapshot(snapshot)
+
+    async def resync_positions(self) -> int:
+        await self.start()
+
+        if self.rest_client is None:
+            return 0
+
         try:
-            snapshot = await self.ws_client.fetch_open_orders_snapshot()
-        except (KrakenWSError, KrakenWSTimeout) as exc:
+            payload = await self.rest_client.open_positions()
+        except KrakenRESTError as exc:
             logger.warning(
-                "Warm start failed to fetch open orders for account %s: %s",
+                "Warm start failed to fetch open positions for account %s: %s",
                 self.account_id,
                 exc,
             )
             return 0
 
-        return await self._apply_open_order_snapshot(snapshot)
+        positions = self._parse_rest_open_positions(payload)
+        return await self._apply_open_positions_snapshot(positions)
+
+    async def resync_trades(self) -> int:
+        await self.start()
+
+        trades: Iterable[Dict[str, Any]] = []
+
+        if self.ws_client is not None:
+            try:
+                trades = await self.ws_client.fetch_own_trades_snapshot()
+            except (KrakenWSError, KrakenWSTimeout) as exc:
+                logger.warning(
+                    "Warm start failed to fetch own trades via websocket for account %s: %s",
+                    self.account_id,
+                    exc,
+                )
+
+        if not trades and self.rest_client is not None:
+            try:
+                payload = await self.rest_client.own_trades()
+                trades = self._parse_rest_trades(payload)
+            except KrakenRESTError as exc:
+                logger.warning(
+                    "Warm start failed to fetch own trades via REST for account %s: %s",
+                    self.account_id,
+                    exc,
+                )
+                trades = []
+
+        applied = 0
+        for trade in trades:
+            try:
+                if await self.apply_fill_event(trade):
+                    applied += 1
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.warning(
+                    "Warm start failed to apply trade snapshot for account %s: %s",
+                    self.account_id,
+                    exc,
+                )
+        return applied
 
     async def apply_fill_event(self, payload: Dict[str, Any]) -> bool:
         state = self._state_from_payload(payload, default_status="filled", transport="kafka")
@@ -850,6 +925,116 @@ class AccountContext:
                         record.pre_trade_mid = pre_trade_mid
             applied += 1
         return applied
+
+    async def _apply_open_positions_snapshot(self, positions: Iterable[Dict[str, Any]] | None) -> int:
+        if not positions:
+            async with self._positions_lock:
+                self._positions.clear()
+            return 0
+
+        applied = 0
+        snapshot: Dict[str, Dict[str, Decimal]] = {}
+        for entry in positions:
+            if not isinstance(entry, dict):
+                continue
+            symbol = self._extract_symbol(entry)
+            if not symbol:
+                symbol = str(entry.get("pair") or entry.get("symbol") or "")
+            if not symbol:
+                continue
+            quantity_value: Any = (
+                entry.get("volume")
+                or entry.get("vol")
+                or entry.get("possize")
+                or entry.get("quantity")
+            )
+            quantity = self._extract_decimal(quantity_value)
+            if quantity is None:
+                continue
+            avg_price_value: Any = entry.get("avg_price") or entry.get("price")
+            if avg_price_value is None:
+                cost = self._extract_decimal(entry.get("cost"))
+                if cost is not None and quantity != 0:
+                    avg_price_value = cost / quantity
+            avg_price = self._extract_decimal(avg_price_value)
+            if avg_price is None:
+                avg_price = Decimal("0")
+            snapshot[symbol] = {
+                "quantity": quantity,
+                "avg_price": avg_price,
+            }
+            applied += 1
+
+        async with self._positions_lock:
+            self._positions.clear()
+            self._positions.update(snapshot)
+        return applied
+
+    def _parse_rest_open_orders(self, payload: Dict[str, Any] | None) -> List[Dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return []
+
+        orders: List[Dict[str, Any]] = []
+        result = payload.get("result")
+        if isinstance(result, dict):
+            open_section = result.get("open")
+            if isinstance(open_section, list):
+                orders.extend(order for order in open_section if isinstance(order, dict))
+            elif isinstance(open_section, dict):
+                orders.extend(order for order in open_section.values() if isinstance(order, dict))
+        else:
+            open_section = payload.get("open")
+            if isinstance(open_section, list):
+                orders.extend(order for order in open_section if isinstance(order, dict))
+            elif isinstance(open_section, dict):
+                orders.extend(order for order in open_section.values() if isinstance(order, dict))
+        return orders
+
+    def _parse_rest_trades(self, payload: Dict[str, Any] | None) -> List[Dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return []
+
+        trades: List[Dict[str, Any]] = []
+        result = payload.get("result")
+        if isinstance(result, dict):
+            trades_section = result.get("trades")
+            if isinstance(trades_section, list):
+                trades.extend(trade for trade in trades_section if isinstance(trade, dict))
+            elif isinstance(trades_section, dict):
+                for trade in trades_section.values():
+                    if isinstance(trade, dict):
+                        trades.append(trade)
+        else:
+            trades_section = payload.get("trades")
+            if isinstance(trades_section, list):
+                trades.extend(trade for trade in trades_section if isinstance(trade, dict))
+            elif isinstance(trades_section, dict):
+                trades.extend(trade for trade in trades_section.values() if isinstance(trade, dict))
+        return trades
+
+    def _parse_rest_open_positions(self, payload: Dict[str, Any] | None) -> List[Dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return []
+
+        positions: List[Dict[str, Any]] = []
+        result = payload.get("result")
+        if isinstance(result, dict):
+            for key, value in result.items():
+                if isinstance(value, dict):
+                    enriched = dict(value)
+                    enriched.setdefault("position_id", key)
+                    positions.append(enriched)
+        else:
+            positions_section = payload.get("positions") or payload.get("open_positions")
+            if isinstance(positions_section, list):
+                positions.extend(
+                    position for position in positions_section if isinstance(position, dict)
+                )
+            elif isinstance(positions_section, dict):
+                positions.extend(
+                    position for position in positions_section.values() if isinstance(position, dict)
+                )
+        return positions
 
     def _state_from_payload(
         self,
