@@ -4,6 +4,8 @@ metadata:
   name: ml-drift-monitoring
   labels:
     workflows.argoproj.io/controller-instanceid: ml-platform
+  annotations:
+    slo.aether.dev/reference: docs/slo.md
 spec:
   schedule: "0 6 * * *"
   concurrencyPolicy: Forbid

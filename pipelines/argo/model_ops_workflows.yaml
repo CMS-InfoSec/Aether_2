@@ -2,6 +2,8 @@ apiVersion: argoproj.io/v1alpha1
 kind: WorkflowTemplate
 metadata:
   name: aether-ml-ops
+  annotations:
+    slo.aether.dev/model-canary: "p95<=45m (docs/slo.md)"
 spec:
   entrypoint: daily-retraining
   templates:

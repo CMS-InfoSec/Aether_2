@@ -20,3 +20,13 @@ Feast/Redis for feature serving.
 
 Refer to the inline documentation within each component for detailed usage
 instructions and configuration parameters.
+
+## Operational Readiness
+
+- [Service Level Objectives](docs/slo.md) summarise latency and response targets
+  for the OMS, WebSocket gateway, kill-switch, and model canary workflows.
+- Runbooks in [`docs/runbooks/`](docs/runbooks) provide incident response playbooks
+  for exchange outages, WebSocket desync, model rollback, secret rotation
+  failures, and kill-switch activation.
+- Administrators can use the [on-call readiness checklist](docs/checklists/oncall.md)
+  to attest to review preparedness.

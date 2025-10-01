@@ -4,6 +4,8 @@ metadata:
   name: ml-canary-deployment
   labels:
     workflows.argoproj.io/controller-instanceid: ml-platform
+  annotations:
+    slo.aether.dev/model-canary: "p95<=45m (see docs/slo.md)"
 spec:
   entrypoint: canary
   templates:
