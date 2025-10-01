@@ -9,12 +9,11 @@ import os
 
 import time
 import uuid
-from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_EVEN, ROUND_UP
 
 from pathlib import Path
-from typing import Any, Awaitable, Deque, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Awaitable, Dict, Iterable, List, Optional, Set, Tuple
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
@@ -28,7 +27,9 @@ from services.oms.kraken_ws import (
     OrderAck,
     OrderState,
 )
-from services.oms.shadow_oms import _ShadowPnLTracker
+
+from services.oms.routing import LatencyRouter
+
 
 import websockets
 
@@ -478,37 +479,6 @@ class KrakenOrderBookStore:
                 await task
 
 
-class _TransportLatencyTracker:
-    def __init__(self, window: int = 50) -> None:
-        self._window = window
-        self._samples: Dict[str, Deque[float]] = {
-            "websocket": deque(maxlen=window),
-            "rest": deque(maxlen=window),
-        }
-
-    def record(self, transport: str, latency_ms: float) -> None:
-        if transport not in self._samples:
-            self._samples[transport] = deque(maxlen=self._window)
-        self._samples[transport].append(latency_ms)
-
-    def preferred(self) -> str:
-        ws_avg = self._average("websocket")
-        rest_avg = self._average("rest")
-        if ws_avg is None and rest_avg is None:
-            return "websocket"
-        if rest_avg is None:
-            return "websocket"
-        if ws_avg is None:
-            return "rest"
-        return "websocket" if ws_avg <= rest_avg else "rest"
-
-    def _average(self, key: str) -> Optional[float]:
-        samples = self._samples.get(key)
-        if not samples:
-            return None
-        return sum(samples) / len(samples)
-
-
 order_book_store = KrakenOrderBookStore()
 
 AGGREGATE_PRICE_PRECISION = Decimal("0.00000001")
@@ -696,7 +666,7 @@ class AccountContext:
         self._stream_task: Optional[asyncio.Task[None]] = None
         self._child_parent: Dict[str, str] = {}
         self._child_results: Dict[str, OMSOrderStatusResponse] = {}
-        self._latency_tracker = _TransportLatencyTracker()
+        self.routing = LatencyRouter(account_id)
 
         self._impact_store: ImpactAnalyticsStore = impact_store
 
@@ -715,8 +685,10 @@ class AccountContext:
 
             await self.ws_client.ensure_connected()
             await self.ws_client.subscribe_private(["openOrders", "ownTrades"])
+            await self.routing.start(self.ws_client, self.rest_client)
 
     async def close(self) -> None:
+        await self.routing.stop()
         if self.ws_client is not None:
             await self.ws_client.close()
         if self._stream_task is not None:
@@ -1174,7 +1146,8 @@ class AccountContext:
         assert self.rest_client is not None
 
         base_payload = dict(payload)
-        preferred = self._latency_tracker.preferred()
+        self.routing.update_probe_template(base_payload)
+        preferred = self.routing.preferred_path
         transports = [preferred]
         fallback = "rest" if preferred == "websocket" else "websocket"
         if fallback not in transports:
@@ -1220,7 +1193,7 @@ class AccountContext:
                 continue
 
             latency_ms = (time.perf_counter() - start) * 1000.0
-            self._latency_tracker.record(transport, latency_ms)
+            self.routing.record_latency(transport, latency_ms)
             record_oms_latency(self.account_id, symbol, transport, latency_ms)
             logger.info(
                 "Order latency account=%s symbol=%s transport=%s latency=%.2fms",
@@ -1245,7 +1218,7 @@ class AccountContext:
                     detail=str(rest_exc),
                 ) from rest_exc
             latency_ms = (time.perf_counter() - start) * 1000.0
-            self._latency_tracker.record("rest", latency_ms)
+            self.routing.record_latency("rest", latency_ms)
             record_oms_latency(self.account_id, symbol, "rest", latency_ms)
             logger.info(
                 "Order latency account=%s symbol=%s transport=rest latency=%.2fms",
@@ -1315,6 +1288,9 @@ class AccountContext:
     async def lookup(self, client_id: str) -> OrderRecord | None:
         async with self._orders_lock:
             return self._orders.get(client_id)
+
+    def routing_status(self) -> Dict[str, Optional[float] | str]:
+        return self.routing.status()
 
 
     async def _record_trade_impact(self, record: OrderRecord) -> None:
@@ -1444,6 +1420,17 @@ async def get_status(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown order")
     return record.result
 
+
+@app.get("/oms/routing/status")
+async def get_routing_status(
+    account_id: str,
+    header_account: str = Depends(require_account_id),
+) -> Dict[str, Optional[float] | str]:
+    if account_id != header_account:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account mismatch")
+
+    account = await manager.get_account(account_id)
+    return account.routing_status()
 
 
 @app.get("/oms/impact_curve", response_model=ImpactCurveResponse)

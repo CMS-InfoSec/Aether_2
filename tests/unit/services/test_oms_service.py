@@ -49,6 +49,13 @@ class FakeAccount:
     async def close(self) -> None:  # pragma: no cover
         return None
 
+    def routing_status(self) -> Dict[str, float | str | None]:
+        return {
+            "ws_latency": 5.0,
+            "rest_latency": 7.5,
+            "preferred_path": "websocket",
+        }
+
 
 class FakeManager:
     def __init__(self) -> None:
@@ -132,3 +139,31 @@ def test_status_returns_last_known_result(oms_client: TestClient) -> None:
     )
     assert status_response.status_code == 200
     assert status_response.json()["status"] == "placed"
+
+
+def test_routing_status_requires_auth(oms_client: TestClient) -> None:
+    response = oms_client.get("/oms/routing/status", params={"account_id": "ACC1"})
+    assert response.status_code == 401
+
+    response = oms_client.get(
+        "/oms/routing/status",
+        params={"account_id": "ACC1"},
+        headers={"X-Account-ID": "ACC2"},
+    )
+    assert response.status_code == 403
+
+
+def test_routing_status_returns_router_state(oms_client: TestClient) -> None:
+    headers = {"X-Account-ID": "ACC1"}
+    response = oms_client.get(
+        "/oms/routing/status",
+        params={"account_id": "ACC1"},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body == {
+        "ws_latency": 5.0,
+        "rest_latency": 7.5,
+        "preferred_path": "websocket",
+    }
