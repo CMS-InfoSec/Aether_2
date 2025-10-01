@@ -37,6 +37,8 @@ class RiskEngine:
             "var_95": request.var_95,
             "spread_bps": request.spread_bps,
             "latency_ms": request.latency_ms,
+            "loss_to_date": request.portfolio_state.loss_to_date,
+            "fee_to_date": request.portfolio_state.fee_to_date,
         }
 
         if self._config.get("kill_switch", False):
@@ -84,9 +86,8 @@ class RiskEngine:
         reasons: List[str],
         context: Dict[str, Any],
     ) -> None:
-        usage = self.timescale.get_daily_usage()
         loss_cap = float(self._config.get("loss_cap", 0.0))
-        projected_loss = usage["loss"] + request.projected_loss
+        projected_loss = request.portfolio_state.loss_to_date + request.projected_loss
         if loss_cap and projected_loss > loss_cap:
             reason = (
                 f"Projected daily loss {projected_loss:,.2f} exceeds configured cap {loss_cap:,.2f}"
@@ -95,7 +96,7 @@ class RiskEngine:
             self._record_event("loss_cap_breach", reason, {**context, "projected_loss": projected_loss})
 
         fee_cap = float(self._config.get("fee_cap", 0.0))
-        projected_fee = usage["fee"] + request.projected_fee
+        projected_fee = request.portfolio_state.fee_to_date + request.projected_fee
         if fee_cap and projected_fee > fee_cap:
             reason = (
                 f"Projected daily fee usage {projected_fee:,.2f} exceeds configured cap {fee_cap:,.2f}"
@@ -103,7 +104,7 @@ class RiskEngine:
             reasons.append(reason)
             self._record_event("fee_cap_breach", reason, {**context, "projected_fee": projected_fee})
 
-        nav = max(float(self._config.get("nav", 1.0)), 1.0)
+        nav = max(float(request.portfolio_state.nav), 1.0)
         max_nav_percent = float(self._config.get("max_nav_percent", 1.0))
         exposure_ratio = abs(request.net_exposure) / nav
         if exposure_ratio > max_nav_percent:
@@ -152,9 +153,11 @@ class RiskEngine:
         if limit_percent is None:
             return
 
-        nav = max(float(self._config.get("nav", 1.0)), 1.0)
-        current_exposure = self.timescale.instrument_exposure(request.instrument)
-        projected_exposure = current_exposure + request.gross_notional
+        nav = max(float(request.portfolio_state.nav), 1.0)
+        current_exposure = float(
+            request.portfolio_state.instrument_exposure.get(request.instrument, 0.0)
+        )
+        projected_exposure = current_exposure + abs(request.gross_notional)
         exposure_ratio = projected_exposure / nav
         if exposure_ratio > float(limit_percent):
             reason = (

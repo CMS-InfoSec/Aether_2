@@ -47,21 +47,93 @@ def reset_state() -> Generator[None, None, None]:
 
 
 
-def make_request(**overrides: float | str | dict[str, float]) -> RiskValidationRequest:
-    payload: dict[str, float | str | dict[str, float]] = {
-        "account_id": "admin-eu",
-        "instrument": "ETH-USD",
-        "net_exposure": 100_000.0,
-        "gross_notional": 25_000.0,
-        "projected_loss": 10_000.0,
-        "projected_fee": 1_000.0,
-        "var_95": 50_000.0,
-        "spread_bps": 10.0,
-        "latency_ms": 100.0,
-        "fee": {"currency": "USD", "maker": 0.1, "taker": 0.2},
+def make_request(
+    *,
+    account_id: str = "admin-eu",
+    instrument: str = "ETH-USD",
+    net_exposure: float = 100_000.0,
+    gross_notional: float = 25_000.0,
+    projected_loss: float = 10_000.0,
+    projected_fee: float = 1_000.0,
+    var_95: float = 50_000.0,
+    spread_bps: float = 10.0,
+    latency_ms: float = 100.0,
+    loss_to_date: float = 5_000.0,
+    fee_to_date: float = 500.0,
+) -> RiskValidationRequest:
+    price = 2_000.0
+    quantity = max(gross_notional / price, 0.0001)
+    fee = {"currency": "USD", "maker": 0.1, "taker": 0.2}
+
+    payload: dict[str, object] = {
+        "account_id": account_id,
+        "intent": {
+            "policy_decision": {
+                "request": {
+                    "account_id": account_id,
+                    "order_id": "order-001",
+                    "instrument": instrument,
+                    "side": "BUY",
+                    "quantity": quantity,
+                    "price": price,
+                    "fee": fee,
+                },
+                "response": {
+                    "approved": True,
+                    "reason": None,
+                    "effective_fee": fee,
+                    "expected_edge_bps": 25.0,
+                    "fee_adjusted_edge_bps": 24.5,
+                    "selected_action": "maker",
+                    "action_templates": [
+                        {
+                            "name": "maker",
+                            "venue_type": "maker",
+                            "edge_bps": 25.0,
+                            "fee_bps": 5.0,
+                            "confidence": 0.9,
+                        }
+                    ],
+                    "confidence": {
+                        "model_confidence": 0.9,
+                        "state_confidence": 0.85,
+                        "execution_confidence": 0.88,
+                    },
+                    "features": [0.1, 0.2, 0.3],
+                    "book_snapshot": {
+                        "mid_price": price,
+                        "spread_bps": spread_bps,
+                        "imbalance": 0.05,
+                    },
+                    "state": {
+                        "regime": "normal",
+                        "volatility": 0.4,
+                        "liquidity_score": 0.8,
+                        "conviction": 0.6,
+                    },
+                    "take_profit_bps": 30.0,
+                    "stop_loss_bps": 15.0,
+                },
+            },
+            "metrics": {
+                "net_exposure": net_exposure,
+                "gross_notional": gross_notional,
+                "projected_loss": projected_loss,
+                "projected_fee": projected_fee,
+                "var_95": var_95,
+                "spread_bps": spread_bps,
+                "latency_ms": latency_ms,
+            },
+        },
+        "portfolio_state": {
+            "nav": 1_000_000.0,
+            "loss_to_date": loss_to_date,
+            "fee_to_date": fee_to_date,
+            "instrument_exposure": {instrument: 100_000.0},
+        },
     }
-    payload.update(overrides)
-    return RiskValidationRequest(**payload)  # type: ignore[arg-type]
+
+    return RiskValidationRequest(**payload)
 
 
 def test_engine_accepts_trade_within_limits() -> None:
@@ -119,23 +191,16 @@ def test_engine_flags_var_breach_and_records_event() -> None:
 def test_engine_honors_kill_switch_and_short_circuits() -> None:
     account = "admin-eu"
     adapter = TimescaleAdapter(account_id=account)
-
     original_config = adapter.load_risk_config()
     try:
         TimescaleAdapter._risk_configs[account]["kill_switch"] = True  # type: ignore[attr-defined]
         engine = RiskEngine(account_id=account)
         request = make_request(account_id=account)
 
+        response = engine.validate(request)
 
-    engine = RiskEngine(account_id=account)
-    request = make_request(account_id=account)
-
-    response = engine.validate(request)
-
-
-    assert response.valid is False
-    assert response.reasons == ["Risk kill switch engaged for account"]
-
+        assert response.valid is False
+        assert response.reasons == ["Risk kill switch engaged for account"]
 
         events = TimescaleAdapter(account_id=account).events()
         assert any(event["type"] == "kill_switch_triggered" for event in events["events"])
