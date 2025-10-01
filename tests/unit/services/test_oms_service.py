@@ -167,3 +167,10 @@ def test_routing_status_returns_router_state(oms_client: TestClient) -> None:
         "rest_latency": 7.5,
         "preferred_path": "websocket",
     }
+
+
+def test_warm_start_status_endpoint(oms_client: TestClient) -> None:
+    response = oms_client.get("/oms/warm_start/status")
+    assert response.status_code == 200
+    body = response.json()
+    assert body == {"orders_resynced": 0, "fills_replayed": 0}
