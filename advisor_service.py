@@ -130,6 +130,12 @@ def fetch_recent_risk_events(*, lookback_hours: int = 24) -> List[Dict[str, Any]
     recent: List[Dict[str, Any]] = []
     for event in events:
         timestamp = event.get("timestamp") or event.get("ts")
+        if not timestamp:
+            continue
+        if isinstance(timestamp, str):
+            timestamp = timestamp.strip()
+            if timestamp.lower().endswith("z"):
+                timestamp = f"{timestamp[:-1]}+00:00"
         try:
             event_ts = datetime.fromisoformat(timestamp)
         except Exception:  # pragma: no cover - defensive branch
