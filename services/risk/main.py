@@ -1,15 +1,23 @@
 
 from fastapi import Depends, FastAPI, HTTPException, status
 
+import time
+
 from services.common.schemas import RiskValidationRequest, RiskValidationResponse
 from services.common.security import require_admin_account
 from services.risk.engine import RiskEngine
 from services.risk.cvar_forecast import router as cvar_router
 
-from metrics import increment_trade_rejection, record_fees_nav_pct, setup_metrics
+from metrics import (
+    increment_trade_rejection,
+    observe_risk_validation_latency,
+    record_fees_nav_pct,
+    setup_metrics,
+    traced_span,
+)
 
 app = FastAPI(title="Risk Service")
-setup_metrics(app)
+setup_metrics(app, service_name="risk-service")
 
 
 app.include_router(cvar_router)
@@ -28,10 +36,12 @@ def validate_risk(
         )
 
     engine = RiskEngine(account_id=account_id)
-    decision = engine.validate(request)
-
-    symbol = request.instrument or request.intent.policy_decision.request.instrument
-    symbol = str(symbol)
+    raw_symbol = request.instrument or request.intent.policy_decision.request.instrument
+    symbol = str(raw_symbol)
+    with traced_span("risk.validate", account_id=account_id, symbol=symbol):
+        start = time.perf_counter()
+        decision = engine.validate(request)
+    observe_risk_validation_latency((time.perf_counter() - start) * 1000.0)
     if not decision.valid:
         increment_trade_rejection(account_id, symbol)
 

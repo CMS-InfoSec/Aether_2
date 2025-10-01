@@ -53,3 +53,71 @@ data:
         }
       ]
     }
+  trading-pipeline-observability.json: |
+    {
+      "title": "Trading Pipeline Observability",
+      "timezone": "browser",
+      "panels": [
+        {
+          "type": "timeseries",
+          "title": "Stage Latency P95 (ms)",
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.95, sum(rate(policy_inference_latency_bucket[5m])) by (le))",
+              "legendFormat": "Policy"
+            },
+            {
+              "expr": "histogram_quantile(0.95, sum(rate(risk_validation_latency_bucket[5m])) by (le))",
+              "legendFormat": "Risk"
+            },
+            {
+              "expr": "histogram_quantile(0.95, sum(rate(oms_submit_latency_bucket[5m])) by (le, transport))",
+              "legendFormat": "{{transport}} OMS"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ms"
+            }
+          }
+        },
+        {
+          "type": "timeseries",
+          "title": "Trades Submitted per Minute",
+          "targets": [
+            {
+              "expr": "sum(rate(trades_submitted_total[5m]))",
+              "legendFormat": "Trades"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops"
+            }
+          }
+        },
+        {
+          "type": "table",
+          "title": "Intent Rejections by Stage (5m)",
+          "targets": [
+            {
+              "expr": "sum(increase(rejected_intents_total[5m])) by (stage, reason)",
+              "format": "table"
+            }
+          ],
+          "options": {
+            "showHeader": true
+          }
+        },
+        {
+          "type": "timeseries",
+          "title": "OMS Errors per Minute",
+          "targets": [
+            {
+              "expr": "sum(rate(oms_errors_total[5m])) by (transport)",
+              "legendFormat": "{{transport}}"
+            }
+          ]
+        }
+      ]
+    }

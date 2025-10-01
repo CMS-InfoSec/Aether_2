@@ -9,6 +9,7 @@ import os
 
 import math
 
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -31,8 +32,10 @@ from statistics import mean
 from exchange_adapter import get_exchange_adapter
 from metrics import (
     increment_trade_rejection,
+    observe_risk_validation_latency,
     record_fees_nav_pct,
     setup_metrics,
+    traced_span,
 )
 from esg_filter import ESG_REASON, esg_filter
 from services.common.compliance import (
@@ -527,7 +530,7 @@ class BattleModeToggleRequest(BaseModel):
 
 
 app = FastAPI(title="Risk Validation Service", version="1.0.0")
-setup_metrics(app)
+setup_metrics(app, service_name="risk-service")
 COST_THROTTLER = CostThrottler()
 EXCHANGE_ADAPTER = get_exchange_adapter(DEFAULT_EXCHANGE)
 
@@ -577,9 +580,17 @@ async def validate_risk(request: RiskValidationRequest) -> RiskValidationRespons
 
 
     context = RiskEvaluationContext(request=request, limits=limits)
+    symbol = str(context.request.intent.instrument_id)
 
     try:
-        decision = await _evaluate(context)
+        with traced_span(
+            "risk.evaluate",
+            account_id=account_id,
+            symbol=symbol,
+        ):
+            evaluation_start = time.perf_counter()
+            decision = await _evaluate(context)
+        observe_risk_validation_latency((time.perf_counter() - evaluation_start) * 1000.0)
     except Exception as exc:  # pragma: no cover - defensive programming
         logger.exception("Risk evaluation failed for account %s", account_id)
         raise HTTPException(status_code=500, detail="Internal risk evaluation failure") from exc
@@ -589,7 +600,6 @@ async def validate_risk(request: RiskValidationRequest) -> RiskValidationRespons
         account_id,
         decision.pass_,
     )
-    symbol = str(context.request.intent.instrument_id)
 
     if not decision.pass_:
         _audit_failure(context, decision)

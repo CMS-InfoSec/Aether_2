@@ -13,7 +13,12 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 
 from common.schemas.contracts import FillEvent
-from metrics import increment_oms_error_count, record_oms_latency, setup_metrics
+from metrics import (
+    increment_oms_error_count,
+    record_oms_latency,
+    setup_metrics,
+    traced_span,
+)
 from services.common.adapters import KafkaNATSAdapter
 from services.oms.kraken_rest import KrakenRESTClient, KrakenRESTError
 from services.oms.kraken_ws import (
@@ -29,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 
 app = FastAPI(title="Kraken OMS Service")
-setup_metrics(app)
+setup_metrics(app, service_name="oms-service")
 
 
 _OMS_ACTIVITY_LOG: List[Dict[str, Any]] = []
@@ -435,7 +440,13 @@ class OMSService:
         cache_key = f"place:{request.account_id}:{request.client_id}"
 
         async def execute() -> Tuple[PlaceOrderResponse, bool]:
-            ack, transport = await session.place_order(payload, context)
+            with traced_span(
+                "oms.place_order",
+                account_id=request.account_id,
+                symbol=request.symbol,
+                client_id=request.client_id,
+            ):
+                ack, transport = await session.place_order(payload, context)
             exchange_id = ack.exchange_order_id or session.resolve_order_id(request.client_id) or request.client_id
             response = PlaceOrderResponse(
                 order_id=exchange_id,
@@ -467,7 +478,13 @@ class OMSService:
         symbol = context.symbol if context else "unknown"
 
         async def execute() -> Tuple[CancelOrderResponse, bool]:
-            ack, transport = await session.cancel_order(request.order_id, symbol)
+            with traced_span(
+                "oms.cancel_order",
+                account_id=request.account_id,
+                order_id=request.order_id,
+                symbol=symbol,
+            ):
+                ack, transport = await session.cancel_order(request.order_id, symbol)
             exchange_id = ack.exchange_order_id or request.order_id
             response = CancelOrderResponse(
                 order_id=exchange_id,

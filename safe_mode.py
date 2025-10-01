@@ -11,7 +11,11 @@ from typing import Dict, List, Optional, Union
 
 from fastapi import Body, FastAPI, Header, HTTPException, status
 
+from metrics import increment_safe_mode_triggers, setup_metrics
+
+
 app = FastAPI(title="Safe Mode Service")
+setup_metrics(app, service_name="safe-mode")
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +320,7 @@ class SafeModeController:
             raise ValueError("reason must not be empty")
 
         ts = _utcnow()
+        entered = False
         with self._lock:
             if self._state.active:
                 self.intent_guard.disable()
@@ -343,11 +348,13 @@ class SafeModeController:
                 since=ts,
                 actor=actor,
             )
-            self._state_store.save(
-                SafeModePersistedState(active=True, reason=normalized_reason, timestamp=ts)
-            )
+
+            entered = True
+
 
         event = SafeModeEvent(reason=normalized_reason, ts=ts, state="entered", actor=actor)
+        if entered:
+            increment_safe_mode_triggers(normalized_reason)
         self._publisher.publish(event)
         self._logger.log(event)
         return event

@@ -20,7 +20,7 @@ from services.policy.model_server import predict_intent
 from metrics import record_abstention_rate, record_drift_score, setup_metrics
 
 app = FastAPI(title="Policy Service")
-setup_metrics(app)
+setup_metrics(app, service_name="policy-service")
 
 
 
