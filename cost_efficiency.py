@@ -1,3 +1,4 @@
+
 """Lightweight helpers exposing infrastructure cost efficiency telemetry.
 
 This module intentionally keeps the interface extremely small so that other
@@ -8,9 +9,11 @@ are out of line with the recent profitability for an account.
 The helpers here can easily be swapped out for a real implementation that
 queries a data warehouse or metrics backend.  For the test environment we keep
 the information entirely in memory and provide convenience setters.
+
 """
 
 from __future__ import annotations
+
 
 from dataclasses import dataclass
 from datetime import datetime
@@ -55,4 +58,5 @@ def clear_cost_metrics() -> None:
     """
 
     _METRICS.clear()
+
 

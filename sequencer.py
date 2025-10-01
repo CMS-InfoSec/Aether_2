@@ -18,6 +18,7 @@ from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
 
 from services.common.adapters import KafkaNATSAdapter
+from override_service import OverrideDecision, OverrideRecord, latest_override
 
 
 LOGGER = logging.getLogger("sequencer")
@@ -475,6 +476,40 @@ async def risk_rollback(result: StageResult, ctx: PipelineContext) -> None:
     )
 
 
+async def override_handler(payload: Dict[str, Any], ctx: PipelineContext) -> StageResult:
+    record: Optional[OverrideRecord] = await asyncio.to_thread(latest_override, ctx.intent_id)
+    artifact: Dict[str, Any] = {"overridden": record is not None}
+    new_payload = dict(payload)
+
+    if record is not None:
+        artifact.update(
+            {
+                "intent_id": record.intent_id,
+                "account_id": record.account_id,
+                "actor": record.actor,
+                "decision": record.decision.value,
+                "reason": record.reason,
+                "ts": record.ts.isoformat(),
+            }
+        )
+        new_payload["override_decision"] = artifact
+        if record.decision == OverrideDecision.REJECT:
+            raise StageFailedError("override", f"Trade rejected by human decision: {record.reason}")
+
+    return StageResult(payload=new_payload, artifact=artifact)
+
+
+async def override_rollback(result: StageResult, ctx: PipelineContext) -> None:
+    await ctx.publisher.publish_event(
+        "override",
+        "rollback",
+        run_id=ctx.run_id,
+        intent_id=ctx.intent_id,
+        account_id=ctx.account_id,
+        data=result.artifact,
+    )
+
+
 async def oms_handler(payload: Dict[str, Any], ctx: PipelineContext) -> StageResult:
     risk = payload.get("risk_validation", {})
     if not risk.get("valid", False):
@@ -523,6 +558,12 @@ pipeline = SequencerPipeline(
             handler=risk_handler,
             rollback=risk_rollback,
             timeout=DEFAULT_RISK_TIMEOUT,
+        ),
+        Stage(
+            name="override",
+            handler=override_handler,
+            rollback=override_rollback,
+            timeout=DEFAULT_POLICY_TIMEOUT,
         ),
         Stage(
             name="oms",
