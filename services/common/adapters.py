@@ -43,6 +43,8 @@ class TimescaleAdapter:
     _metrics: ClassVar[Dict[str, Dict[str, float]]] = {}
 
     _telemetry: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
+    _events: ClassVar[Dict[str, Dict[str, List[Dict[str, Any]]]]] = {}
+    _credential_events: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
 
 
     def __post_init__(self) -> None:
@@ -50,6 +52,7 @@ class TimescaleAdapter:
         self._telemetry.setdefault(self.account_id, [])
 
         self._events.setdefault(self.account_id, {"acks": [], "fills": []})
+        self._credential_events.setdefault(self.account_id, [])
 
 
     def record_usage(self, notional: float) -> None:
@@ -70,6 +73,54 @@ class TimescaleAdapter:
 
     def telemetry(self) -> List[Dict[str, Any]]:
         return list(self._telemetry.get(self.account_id, []))
+
+    def record_credential_rotation(self, *, secret_name: str, rotated_at: datetime) -> None:
+        payload = {
+            "event": "rotation",
+            "secret_name": secret_name,
+            "rotated_at": rotated_at,
+            "timestamp": rotated_at,
+        }
+        self._credential_events[self.account_id].append(deepcopy(payload))
+
+    def record_credential_access(self, *, secret_name: str, metadata: Dict[str, Any]) -> None:
+        sanitized = deepcopy(metadata)
+        for key in ("api_key", "api_secret"):
+            if key in sanitized:
+                sanitized[key] = "***"
+        payload = {
+            "event": "access",
+            "secret_name": secret_name,
+            "metadata": sanitized,
+            "timestamp": datetime.now(timezone.utc),
+        }
+        self._credential_events[self.account_id].append(deepcopy(payload))
+
+    def credential_rotation_status(self) -> Optional[Dict[str, Any]]:
+        events = [
+            event
+            for event in self._credential_events.get(self.account_id, [])
+            if event.get("event") == "rotation"
+        ]
+        if not events:
+            return None
+        return deepcopy(events[-1])
+
+    def credential_events(self) -> List[Dict[str, Any]]:
+        return [deepcopy(event) for event in self._credential_events.get(self.account_id, [])]
+
+    @classmethod
+    def reset(cls, account_id: str | None = None) -> None:
+        if account_id is None:
+            cls._metrics.clear()
+            cls._telemetry.clear()
+            cls._events.clear()
+            cls._credential_events.clear()
+            return
+        cls._metrics.pop(account_id, None)
+        cls._telemetry.pop(account_id, None)
+        cls._events.pop(account_id, None)
+        cls._credential_events.pop(account_id, None)
 
 
 
@@ -137,6 +188,34 @@ class KrakenSecretManager:
     @property
     def secret_name(self) -> str:
         return f"{self.secret_prefix}-{self.account_id}"
+
+    def get_credentials(self) -> Dict[str, str]:
+        assert self.k8s_client is not None
+        assert self.timescale is not None
+
+        secret = self.k8s_client.get_secret(self.secret_name)
+        if not secret:
+            raise RuntimeError(
+                f"Credential secret '{self.secret_name}' not found in namespace '{self.namespace}'"
+            )
+
+        missing = [field for field in ("api_key", "api_secret") if not secret.get(field)]
+        if missing:
+            formatted = ", ".join(sorted(missing))
+            raise RuntimeError(
+                f"Credential secret '{self.secret_name}' is missing required field(s): {formatted}"
+            )
+
+        credentials = {"api_key": secret["api_key"], "api_secret": secret["api_secret"]}
+
+        audit_metadata = {
+            "api_key": credentials["api_key"],
+            "api_secret": credentials["api_secret"],
+            "material_present": True,
+        }
+        self.timescale.record_credential_access(secret_name=self.secret_name, metadata=audit_metadata)
+
+        return credentials
 
     def rotate_credentials(self, *, api_key: str, api_secret: str) -> Dict[str, Any]:
         assert self.k8s_client is not None  # for type checkers
