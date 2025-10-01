@@ -3,16 +3,15 @@
 from __future__ import annotations
 
 
+import logging
 import math
-
 import os
-
-import math
 from collections import defaultdict
+from dataclasses import dataclass
 
 from decimal import ROUND_HALF_UP, Decimal
 from threading import Lock
-from typing import Dict, List, MutableMapping, Sequence
+from typing import TYPE_CHECKING, Dict, List, MutableMapping, Sequence
 
 import httpx
 from fastapi import FastAPI, HTTPException, status
@@ -27,7 +26,6 @@ from services.common.schemas import (
     PolicyDecisionResponse,
     PolicyState,
 )
-from services.models.model_server import Intent, predict_intent
 from services.policy.adaptive_horizon import get_horizon
 
 
@@ -69,6 +67,22 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Policy Service", version="2.0.0")
 setup_metrics(app, service_name="policy-service")
 EXCHANGE_ADAPTER = get_exchange_adapter(DEFAULT_EXCHANGE)
+
+
+if TYPE_CHECKING:  # pragma: no cover - type checking only
+    from services.models.model_server import Intent
+
+
+def _predict_intent(**kwargs) -> "Intent":
+    from services.models.model_server import predict_intent as _predict
+
+    return _predict(**kwargs)
+
+
+def predict_intent(**kwargs) -> "Intent":
+    """Compatibility wrapper for callers patching predict_intent."""
+
+    return _predict_intent(**kwargs)
 
 
 @app.get("/exchange/adapters", tags=["exchange"])
@@ -455,11 +469,13 @@ async def health() -> Dict[str, str]:
 
 @app.get("/ready", tags=["health"])
 async def ready() -> Dict[str, str]:
-    if predict_intent is None:  # pragma: no cover - defensive guard
+    try:
+        from services.models.model_server import predict_intent as _predict  # noqa: F401
+    except ImportError as exc:  # pragma: no cover - defensive guard
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Model server unavailable",
-        )
+        ) from exc
     return {"status": "ready"}
 
 
@@ -523,7 +539,7 @@ async def decide_policy(request: PolicyDecisionRequest) -> PolicyDecisionRespons
     raw_weights = _model_sharpe_weights()
     weights = _normalize_weights(raw_weights)
 
-    intents: Dict[str, Intent] = {}
+    intents: Dict[str, "Intent"] = {}
     for variant in MODEL_VARIANTS:
         intents[variant] = predict_intent(
             account_id=request.account_id,
@@ -565,8 +581,9 @@ async def decide_policy(request: PolicyDecisionRequest) -> PolicyDecisionRespons
     for variant, intent in intents.items():
         expected_edge += weights.get(variant, 0.0) * float(intent.edge_bps or 0.0)
 
-    maker_edge = round(expected_edge - effective_fee.maker, 4)
-    taker_edge = round(expected_edge - effective_fee.taker, 4)
+    slippage_bps = float(request.slippage_bps or 0.0)
+    maker_edge = round(expected_edge - (effective_fee.maker + slippage_bps), 4)
+    taker_edge = round(expected_edge - (effective_fee.taker + slippage_bps), 4)
 
     template_confidences = _blend_template_confidences(intents, weights)
     maker_confidence = _clamp(template_confidences.get("maker", confidence.execution_confidence))
@@ -646,7 +663,9 @@ async def decide_policy(request: PolicyDecisionRequest) -> PolicyDecisionRespons
     selected_action = winning_action if winning_action in {"maker", "taker"} else "abstain"
     if not approved:
 
-        if entropy > 0.3:
+        if fee_adjusted_edge <= 0:
+            reason = "Fee-adjusted edge non-positive"
+        elif entropy > 0.3:
             reason = "High ensemble entropy"
         elif winning_action not in {"maker", "taker"}:
             reason = "Ensemble voted to abstain"

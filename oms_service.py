@@ -71,6 +71,16 @@ class PlaceOrderRequest(BaseModel):
     flags: List[str] = Field(default_factory=list, description="Additional Kraken oflags")
     post_only: bool = Field(False, description="Whether the order is post-only")
     reduce_only: bool = Field(False, description="Whether the order is reduce-only")
+    expected_fee_bps: Optional[float] = Field(
+        None,
+        ge=0.0,
+        description="Fee estimate in basis points provided by the caller",
+    )
+    expected_slippage_bps: Optional[float] = Field(
+        None,
+        ge=0.0,
+        description="Slippage estimate in basis points provided by the caller",
+    )
 
     @field_validator("side")
     @classmethod
@@ -208,6 +218,9 @@ class OrderContext:
     post_only: bool
     reduce_only: bool
     tif: Optional[str]
+    price: Optional[float] = None
+    expected_fee_bps: float = 0.0
+    expected_slippage_bps: float = 0.0
     last_filled: float = 0.0
     last_fee: float = 0.0
 
@@ -397,6 +410,29 @@ class KrakenSession:
                     liquidity = "maker"
                 elif liquidity_hint in {"taker", "t"}:
                     liquidity = "taker"
+        avg_price = state.avg_price if state.avg_price is not None else context.price or 0.0
+        notional = max(delta * float(avg_price), 0.0)
+        estimated_fee_bps = max(context.expected_fee_bps, 0.0)
+        estimated_fee_usd = notional * (estimated_fee_bps / 10_000) if notional > 0 else 0.0
+        actual_fee_usd = max(fee, 0.0)
+        actual_fee_bps = (actual_fee_usd / notional * 10_000) if notional > 0 else 0.0
+        discrepancy_bps = actual_fee_bps - estimated_fee_bps
+        logger.info(
+            "oms_fee_reconciliation",
+            extra={
+                "order_id": exchange_id,
+                "account_id": self.account_id,
+                "symbol": context.symbol,
+                "liquidity": liquidity,
+                "notional_usd": notional,
+                "estimated_fee_bps": estimated_fee_bps,
+                "actual_fee_bps": actual_fee_bps,
+                "estimated_fee_usd": estimated_fee_usd,
+                "actual_fee_usd": actual_fee_usd,
+                "expected_slippage_bps": context.expected_slippage_bps,
+                "discrepancy_bps": discrepancy_bps,
+            },
+        )
         event = FillEvent(
             account_id=self.account_id,
             symbol=context.symbol,
@@ -436,6 +472,9 @@ class OMSService:
             post_only=request.post_only,
             reduce_only=request.reduce_only,
             tif=request.tif,
+            price=request.limit_px,
+            expected_fee_bps=float(request.expected_fee_bps or 0.0),
+            expected_slippage_bps=float(request.expected_slippage_bps or 0.0),
         )
         cache_key = f"place:{request.account_id}:{request.client_id}"
 

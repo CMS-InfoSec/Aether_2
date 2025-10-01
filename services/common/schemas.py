@@ -122,6 +122,11 @@ class PolicyDecisionRequest(BaseModel):
         None,
         description="Caller expected edge in basis points prior to policy adjustments",
     )
+    slippage_bps: Optional[float] = Field(
+        None,
+        ge=0.0,
+        description="Expected slippage cost in basis points applied during execution",
+    )
     take_profit_bps: Optional[float] = Field(
         None, description="Target take-profit distance in basis points"
     )

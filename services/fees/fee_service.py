@@ -1,10 +1,11 @@
 """FastAPI service exposing the venue fee schedule and volume metrics."""
 from __future__ import annotations
 
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Iterator, List, Sequence
+from typing import Iterator, List, Sequence, Tuple
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field
@@ -14,7 +15,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from services.common.security import require_admin_account
 from services.fees.fee_optimizer import FeeOptimizer
-from services.fees.models import AccountVolume30d, Base, FeeTier
+from services.fees.models import AccountFill, AccountVolume30d, Base, FeeTier
 
 
 DEFAULT_DATABASE_URL = "sqlite:///./fees.db"
@@ -38,6 +39,9 @@ SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False
 
 
 app = FastAPI(title="Fee Schedule Service")
+
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_KRAKEN_SCHEDULE: Sequence[dict[str, Decimal | str]] = (
@@ -110,6 +114,14 @@ class Volume30dResponse(BaseModel):
     updated_at: datetime
 
 
+class AccountSummaryResponse(BaseModel):
+    account_id: str = Field(..., description="Account identifier")
+    tier: str = Field(..., description="Matched Kraken fee tier")
+    volume_usd: float = Field(..., ge=0.0, description="Rolling 30-day USD volume")
+    effective_fee_bps: float = Field(..., ge=0.0, description="Realized effective fee in basis points")
+    basis_ts: datetime = Field(..., description="Timestamp anchoring the rolling window")
+
+
 class NextTierStatusResponse(BaseModel):
     current_tier: str = Field(..., description="Identifier of the active fee tier")
     next_tier: str | None = Field(
@@ -125,6 +137,14 @@ def _fee_amount(notional: Decimal, bps: Decimal) -> Decimal:
     return raw_fee.quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
 
 
+def _to_decimal(value: Decimal | float | int | None) -> Decimal:
+    if value is None:
+        return Decimal("0")
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
+
+
 optimizer = FeeOptimizer(
     alert_threshold=NEXT_TIER_ALERT_THRESHOLD,
     policy_service_url=POLICY_SERVICE_URL,
@@ -137,6 +157,56 @@ def _ordered_tiers(session: Session) -> list[FeeTier]:
     """Return the configured fee tiers ordered by threshold."""
 
     return optimizer.ordered_tiers(session)
+
+
+def _rolling_window(as_of: datetime | None = None) -> Tuple[datetime, datetime]:
+    now = as_of or datetime.now(timezone.utc)
+    start = now - timedelta(days=30)
+    return start, now
+
+
+def _rolling_volume(
+    session: Session, account_id: str, as_of: datetime | None = None
+) -> Tuple[Decimal, datetime]:
+    window_start, window_end = _rolling_window(as_of)
+    stmt = (
+        select(
+            func.coalesce(func.sum(AccountFill.notional_usd), Decimal("0")),
+            func.max(AccountFill.fill_ts),
+        )
+        .where(AccountFill.account_id == account_id)
+        .where(AccountFill.fill_ts >= window_start)
+        .where(AccountFill.fill_ts <= window_end)
+    )
+    total_notional, basis_ts = session.execute(stmt).one()
+    volume = _to_decimal(total_notional)
+    basis = basis_ts or window_end
+    return volume, basis
+
+
+def _realized_fee_bps(session: Session, account_id: str, as_of: datetime | None = None) -> Decimal:
+    window_start, window_end = _rolling_window(as_of)
+    stmt = (
+        select(
+            func.coalesce(func.sum(AccountFill.notional_usd), Decimal("0")),
+            func.coalesce(func.sum(AccountFill.actual_fee_usd), Decimal("0")),
+            func.coalesce(func.sum(AccountFill.estimated_fee_usd), Decimal("0")),
+        )
+        .where(AccountFill.account_id == account_id)
+        .where(AccountFill.fill_ts >= window_start)
+        .where(AccountFill.fill_ts <= window_end)
+    )
+    total_notional, actual_fee_total, estimated_fee_total = session.execute(stmt).one()
+    notional = _to_decimal(total_notional)
+    if notional <= 0:
+        return Decimal("0")
+    actual_total = _to_decimal(actual_fee_total)
+    if actual_total > 0:
+        return (actual_total / notional) * Decimal("10000")
+    estimated_total = _to_decimal(estimated_fee_total)
+    if estimated_total > 0:
+        return (estimated_total / notional) * Decimal("10000")
+    return Decimal("0")
 
 
 @app.get("/fees/effective", response_model=EffectiveFeeResponse)
@@ -154,13 +224,7 @@ def get_effective_fee(
     if not tiers:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Fee schedule is not configured")
 
-    volume_row = session.get(AccountVolume30d, account_id)
-    if volume_row is None:
-        basis_ts = datetime.now(timezone.utc)
-        rolling_volume = Decimal("0")
-    else:
-        basis_ts = volume_row.updated_at or datetime.now(timezone.utc)
-        rolling_volume = Decimal(volume_row.notional_usd_30d or 0)
+    rolling_volume, basis_ts = _rolling_volume(session, account_id)
 
     try:
         tier = optimizer.determine_tier(tiers, rolling_volume)
@@ -204,16 +268,36 @@ def get_volume_30d(
     session: Session = Depends(get_session),
     account_id: str = Depends(require_admin_account),
 ) -> Volume30dResponse:
-    record = session.get(AccountVolume30d, account_id)
-    if record is None:
-        return Volume30dResponse(
-            notional_usd_30d=0.0,
-            updated_at=datetime.now(timezone.utc),
-        )
-
+    volume, basis_ts = _rolling_volume(session, account_id)
     return Volume30dResponse(
-        notional_usd_30d=float(record.notional_usd_30d or 0),
-        updated_at=record.updated_at,
+        notional_usd_30d=float(volume),
+        updated_at=basis_ts,
+    )
+
+
+@app.get("/fees/account_summary", response_model=AccountSummaryResponse)
+def get_account_summary(
+    account_id: str = Query(..., min_length=1, max_length=64, description="Account identifier"),
+    session: Session = Depends(get_session),
+    _: str = Depends(require_admin_account),
+) -> AccountSummaryResponse:
+    tiers = _ordered_tiers(session)
+    if not tiers:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Fee schedule is not configured")
+
+    volume, basis_ts = _rolling_volume(session, account_id)
+    try:
+        tier = optimizer.determine_tier(tiers, volume)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    effective_fee = _realized_fee_bps(session, account_id, basis_ts)
+    return AccountSummaryResponse(
+        account_id=account_id,
+        tier=tier.tier_id,
+        volume_usd=float(volume),
+        effective_fee_bps=float(effective_fee),
+        basis_ts=basis_ts,
     )
 
 
@@ -239,30 +323,82 @@ def update_account_volume_30d(
     account_id: str,
     fill_notional_usd: float,
     fill_time: datetime | None = None,
+    liquidity: str | None = None,
+    estimated_fee_bps: float | None = None,
+    actual_fee_usd: float | None = None,
 ) -> AccountVolume30d:
     """Update the rolling 30-day volume using a newly observed fill."""
 
     timestamp = fill_time or datetime.now(timezone.utc)
-    notional_delta = Decimal(str(fill_notional_usd))
+    notional_delta = _to_decimal(fill_notional_usd)
+
+    if notional_delta < 0:
+        raise ValueError("fill_notional_usd must be non-negative")
+
+    estimated_bps = Decimal(str(estimated_fee_bps)) if estimated_fee_bps is not None else None
+    estimated_fee_usd = (
+        _fee_amount(notional_delta, estimated_bps) if estimated_bps is not None else None
+    )
+    actual_fee = Decimal(str(actual_fee_usd)) if actual_fee_usd is not None else None
+
+    session.add(
+        AccountFill(
+            account_id=account_id,
+            liquidity=liquidity,
+            notional_usd=notional_delta,
+            estimated_fee_bps=estimated_bps,
+            estimated_fee_usd=estimated_fee_usd,
+            actual_fee_usd=actual_fee,
+            fill_ts=timestamp,
+        )
+    )
+    session.flush()
+
+    prune_before = timestamp - timedelta(days=60)
+    session.execute(
+        AccountFill.__table__
+        .delete()
+        .where(AccountFill.__table__.c.account_id == account_id)
+        .where(AccountFill.__table__.c.fill_ts < prune_before)
+    )
+
+    rolling_volume, basis_ts = _rolling_volume(session, account_id, timestamp)
 
     record = session.get(AccountVolume30d, account_id)
     if record is None:
         record = AccountVolume30d(
             account_id=account_id,
-            notional_usd_30d=notional_delta,
-            updated_at=timestamp,
+            notional_usd_30d=rolling_volume,
+            updated_at=basis_ts,
         )
         session.add(record)
     else:
-        if record.updated_at is None or timestamp - record.updated_at >= timedelta(days=30):
-            new_total = notional_delta
-        else:
-            new_total = Decimal(record.notional_usd_30d or 0) + notional_delta
-        record.notional_usd_30d = new_total
-        record.updated_at = timestamp
+        record.notional_usd_30d = rolling_volume
+        record.updated_at = basis_ts
 
     session.commit()
     session.refresh(record)
+
+    if actual_fee is not None and estimated_fee_usd is not None and notional_delta > 0:
+        actual_bps = (actual_fee / notional_delta) * Decimal("10000") if actual_fee > 0 else Decimal("0")
+        estimated_bps_value = estimated_bps if estimated_bps is not None else Decimal("0")
+        discrepancy = actual_fee - estimated_fee_usd
+        logger.info(
+            "fee_reconciliation",
+            extra={
+                "account_id": account_id,
+                "liquidity": liquidity,
+                "notional_usd": float(notional_delta),
+                "estimated_fee_bps": float(estimated_bps_value),
+                "actual_fee_bps": float(actual_bps),
+                "estimated_fee_usd": float(estimated_fee_usd),
+                "actual_fee_usd": float(actual_fee),
+                "discrepancy_bps": float(
+                    actual_bps - estimated_bps_value if notional_delta > 0 else Decimal("0")
+                ),
+                "discrepancy_usd": float(discrepancy),
+            },
+        )
 
     optimizer.monitor_account(
         session,
