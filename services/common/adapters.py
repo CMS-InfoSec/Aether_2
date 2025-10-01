@@ -7,7 +7,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 
 from datetime import datetime, timezone
-from typing import Any, ClassVar, Dict, List, Optional
+from typing import Any, Callable, ClassVar, Dict, List, Optional
 
 from shared.k8s import KrakenSecretStore
 
@@ -54,21 +54,26 @@ class TimescaleAdapter:
     account_id: str
 
     _metrics: ClassVar[Dict[str, Dict[str, float]]] = {}
-    _daily_usage: ClassVar[Dict[str, Dict[str, float]]] = {}
-    _instrument_exposure: ClassVar[Dict[str, Dict[str, float]]] = {}
+
+    _telemetry: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
+
     _events: ClassVar[Dict[str, Dict[str, List[Dict[str, Any]]]]] = {}
     _risk_configs: ClassVar[Dict[str, Dict[str, Any]]] = {}
     _credential_rotations: ClassVar[Dict[str, Dict[str, Any]]] = {}
 
-    _telemetry: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
+    _risk_configs: ClassVar[Dict[str, Dict[str, Any]]] = {}
+    _daily_usage: ClassVar[Dict[str, Dict[str, Dict[str, float]]]] = {}
+    _instrument_exposures: ClassVar[Dict[str, Dict[str, float]]] = {}
 
-    _DEFAULT_RISK_CONFIG: ClassVar[Dict[str, Any]] = {
-        "nav": 2_500_000.0,
-        "loss_cap": 150_000.0,
-        "fee_cap": 50_000.0,
-        "max_nav_percent": 0.25,
-        "var_limit": 120_000.0,
-        "spread_limit_bps": 50.0,
+    _default_risk_config: ClassVar[Dict[str, Any]] = {
+        "kill_switch": False,
+        "loss_cap": 50_000.0,
+        "fee_cap": 5_000.0,
+        "nav": 1_000_000.0,
+        "max_nav_percent": 0.20,
+        "var_limit": 250_000.0,
+        "spread_limit_bps": 25.0,
+
         "latency_limit_ms": 250.0,
         "diversification_rules": {"max_single_instrument_percent": 0.35},
         "kill_switch": False,
@@ -82,14 +87,17 @@ class TimescaleAdapter:
 
 
         account_events = self._events.setdefault(
-            self.account_id, {"acks": [], "fills": [], "risk": []}
+            self.account_id,
+            {"acks": [], "fills": [], "events": [], "credential_rotations": []},
         )
         account_events.setdefault("acks", [])
         account_events.setdefault("fills", [])
-        account_events.setdefault("risk", [])
+        account_events.setdefault("events", [])
+        account_events.setdefault("credential_rotations", [])
 
-        self._risk_configs.setdefault(self.account_id, deepcopy(self._DEFAULT_RISK_CONFIG))
-
+        self._risk_configs.setdefault(self.account_id, deepcopy(self._default_risk_config))
+        self._daily_usage.setdefault(self.account_id, {})
+        self._instrument_exposures.setdefault(self.account_id, {})
 
         self._credential_rotations.setdefault(self.account_id, {})
         self._risk_configs.setdefault(
@@ -107,147 +115,107 @@ class TimescaleAdapter:
             },
         )
 
-
+    # ------------------------------------------------------------------
+    # OMS-inspired metrics
+    # ------------------------------------------------------------------
     def record_usage(self, notional: float) -> None:
-        self._metrics[self.account_id]["usage"] += notional
+        self._metrics[self.account_id]["usage"] += float(notional)
 
     def check_limits(self, notional: float) -> bool:
-        projected = self._metrics[self.account_id]["usage"] + notional
+        projected = self._metrics[self.account_id]["usage"] + float(notional)
         return projected <= self._metrics[self.account_id]["limit"]
 
-
     def record_ack(self, payload: Dict[str, Any]) -> None:
-        event = dict(payload)
-        event.setdefault("timestamp", datetime.now(timezone.utc))
-        self._events[self.account_id]["acks"].append(event)
+        record = {"payload": deepcopy(payload), "recorded_at": datetime.now(timezone.utc)}
+        self._events[self.account_id]["acks"].append(record)
 
     def record_fill(self, payload: Dict[str, Any]) -> None:
-        event = dict(payload)
-        event.setdefault("timestamp", datetime.now(timezone.utc))
-        self._events[self.account_id]["fills"].append(event)
+        record = {"payload": deepcopy(payload), "recorded_at": datetime.now(timezone.utc)}
+        self._events[self.account_id]["fills"].append(record)
 
     def events(self) -> Dict[str, List[Dict[str, Any]]]:
 
-        stored = self._events.get(self.account_id, {"acks": [], "fills": [], "risk": []})
+        stored = self._events.get(
+            self.account_id,
+            {"acks": [], "fills": [], "events": [], "credential_rotations": []},
+        )
         return {
-            "acks": list(stored.get("acks", [])),
-            "fills": list(stored.get("fills", [])),
-            "risk": list(stored.get("risk", [])),
+            "acks": [
+                {**deepcopy(entry["payload"]), "recorded_at": entry["recorded_at"]}
+                for entry in stored.get("acks", [])
+            ],
+            "fills": [
+                {**deepcopy(entry["payload"]), "recorded_at": entry["recorded_at"]}
+                for entry in stored.get("fills", [])
+            ],
+            "events": [deepcopy(entry) for entry in stored.get("events", [])],
+            "credential_rotations": [
+                deepcopy(entry) for entry in stored.get("credential_rotations", [])
+            ],
+
         }
 
-
-    @classmethod
-    def reset(cls, account_id: str | None = None) -> None:
-        if account_id is None:
-            cls._metrics.clear()
-            cls._daily_usage.clear()
-            cls._instrument_exposure.clear()
-            cls._events.clear()
-            cls._risk_configs.clear()
-            cls._credential_rotations.clear()
-            cls._telemetry.clear()
-            return
-        cls._metrics.pop(account_id, None)
-        cls._daily_usage.pop(account_id, None)
-        cls._instrument_exposure.pop(account_id, None)
-        cls._events.pop(account_id, None)
-        cls._risk_configs.pop(account_id, None)
-        cls._credential_rotations.pop(account_id, None)
-        cls._telemetry.pop(account_id, None)
-
+    # ------------------------------------------------------------------
+    # Timescale-inspired risk state helpers
+    # ------------------------------------------------------------------
 
     def load_risk_config(self) -> Dict[str, Any]:
-
         config = self._risk_configs.setdefault(
-            self.account_id, deepcopy(self._DEFAULT_RISK_CONFIG)
+            self.account_id, deepcopy(self._default_risk_config)
         )
-
         return deepcopy(config)
 
     def get_daily_usage(self) -> Dict[str, float]:
-        return deepcopy(self._daily_usage[self.account_id])
+        date_key = datetime.now(timezone.utc).date().isoformat()
+        usage = self._daily_usage.setdefault(self.account_id, {})
+        day_usage = usage.setdefault(date_key, {"loss": 0.0, "fee": 0.0})
+        return deepcopy(day_usage)
 
-    def record_daily_usage(self, projected_loss: float, projected_fee: float) -> Dict[str, float]:
-        usage = self._daily_usage[self.account_id]
-        usage["loss"] += float(projected_loss)
-        usage["fee"] += float(projected_fee)
-        return deepcopy(usage)
+    def record_daily_usage(self, loss: float, fee: float) -> None:
+        date_key = datetime.now(timezone.utc).date().isoformat()
+        usage = self._daily_usage.setdefault(self.account_id, {})
+        day_usage = usage.setdefault(date_key, {"loss": 0.0, "fee": 0.0})
+        day_usage["loss"] += float(loss)
+        day_usage["fee"] += float(fee)
 
-    def record_instrument_exposure(self, instrument: str, notional: float) -> Dict[str, float]:
-        exposure = self._instrument_exposure[self.account_id]
-        exposure[instrument] = exposure.get(instrument, 0.0) + float(notional)
-        return deepcopy(exposure)
+    def record_instrument_exposure(self, instrument: str, notional: float) -> None:
+        exposures = self._instrument_exposures.setdefault(self.account_id, {})
+        exposures[instrument] = exposures.get(instrument, 0.0) + float(notional)
 
     def instrument_exposure(self, instrument: str) -> float:
-        exposure = self._instrument_exposure[self.account_id]
-        return float(exposure.get(instrument, 0.0))
+        exposures = self._instrument_exposures.get(self.account_id, {})
+        return float(exposures.get(instrument, 0.0))
 
-    def record_event(self, event_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        event = {
+    def record_event(self, event_type: str, payload: Dict[str, Any]) -> None:
+        entry = {
             "type": event_type,
             "payload": deepcopy(payload),
             "timestamp": datetime.now(timezone.utc),
         }
-        self._events[self.account_id]["risk"].append(event)
-        return deepcopy(event)
+        self._events[self.account_id]["events"].append(entry)
 
-    def record_daily_usage(self, loss: float, fee: float) -> Dict[str, float]:
-        usage = self._daily_usage.setdefault(self.account_id, {"loss": 0.0, "fee": 0.0})
-        usage["loss"] += float(loss)
-        usage["fee"] += float(fee)
-        return dict(usage)
-
-    def record_instrument_exposure(self, instrument: str, notional: float) -> float:
-        exposures = self._instrument_exposure.setdefault(self.account_id, {})
-        exposures[instrument] = exposures.get(instrument, 0.0) + float(notional)
-        return exposures[instrument]
-
-    def instrument_exposure(self, instrument: str) -> float:
-        exposures = self._instrument_exposure.get(self.account_id, {})
-        return float(exposures.get(instrument, 0.0))
-
-    def record_event(self, event_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        event = {
-            "type": event_type,
-            "payload": dict(payload),
-            "timestamp": datetime.now(timezone.utc),
-        }
-        account_events = self._events.setdefault(
-            self.account_id, {"acks": [], "fills": [], "risk": []}
-        )
-        account_events.setdefault("risk", []).append(event)
-        return dict(event)
-
-
+    # ------------------------------------------------------------------
+    # Telemetry helpers
+    # ------------------------------------------------------------------
     def record_decision(self, order_id: str, payload: Dict[str, Any]) -> None:
         entry = {
             "order_id": order_id,
-            "payload": payload,
+            "payload": deepcopy(payload),
             "timestamp": datetime.now(timezone.utc),
         }
         self._telemetry[self.account_id].append(entry)
 
     def telemetry(self) -> List[Dict[str, Any]]:
-        return list(self._telemetry.get(self.account_id, []))
+        return [deepcopy(entry) for entry in self._telemetry.get(self.account_id, [])]
 
     # ------------------------------------------------------------------
-
-    # Timescale-inspired risk state helpers
+    # Credential rotation tracking
     # ------------------------------------------------------------------
-
-    def record_credential_rotation(self, *, secret_name: str) -> Dict[str, Any]:
-        rotated_at = datetime.now(timezone.utc)
-        record = self._credential_rotations[self.account_id]
-        if not record:
-            record.update({
-                "secret_name": secret_name,
-                "created_at": rotated_at,
-                "rotated_at": rotated_at,
-            })
-        else:
-            record["secret_name"] = secret_name
-            record["rotated_at"] = rotated_at
-            record.setdefault("created_at", rotated_at)
+    def record_credential_rotation(
+        self, *, secret_name: str, rotated_at: datetime
+    ) -> Dict[str, Any]:
+        record = {"secret_name": secret_name, "rotated_at": rotated_at}
+        self._events[self.account_id]["credential_rotations"].append(record)
         return deepcopy(record)
 
 
@@ -264,18 +232,25 @@ class TimescaleAdapter:
     # ------------------------------------------------------------------
     @classmethod
 
-    def reset_rotation_state(cls, account_id: str | None = None) -> None:
+    def reset(cls, account_id: str | None = None) -> None:
         if account_id is None:
+            cls._metrics.clear()
+            cls._telemetry.clear()
+            cls._risk_configs.clear()
+            cls._daily_usage.clear()
+            cls._instrument_exposures.clear()
+            cls._events.clear()
             cls._credential_rotations.clear()
             return
+
+        cls._metrics.pop(account_id, None)
+        cls._telemetry.pop(account_id, None)
+        cls._risk_configs.pop(account_id, None)
+        cls._daily_usage.pop(account_id, None)
+        cls._instrument_exposures.pop(account_id, None)
+        cls._events.pop(account_id, None)
         cls._credential_rotations.pop(account_id, None)
 
-    def update_risk_config(self, **overrides: Any) -> Dict[str, Any]:
-        config = self._risk_configs.setdefault(
-            self.account_id, deepcopy(self._DEFAULT_RISK_CONFIG)
-        )
-        config.update(overrides)
-        return deepcopy(config)
 
 
 
@@ -283,11 +258,13 @@ class TimescaleAdapter:
 @dataclass
 class RedisFeastAdapter:
     account_id: str
+    repository_factory: Callable[[str], UniverseRepository] = field(
+        default=UniverseRepository, repr=False
+    )
 
-    repository: Optional[UniverseRepository] = field(default=None, repr=False)
 
+    _repository: UniverseRepository = field(init=False, repr=False)
 
-    _repository: Optional[UniverseRepository] = field(init=False, repr=False, default=None)
 
     _features: ClassVar[Dict[str, Dict[str, Any]]] = {
         "admin-eu": {"approved": ["BTC-USD", "ETH-USD"], "fees": {"BTC-USD": {"maker": 0.1, "taker": 0.2}}},
@@ -320,8 +297,8 @@ class RedisFeastAdapter:
 
     def __post_init__(self) -> None:
 
-        repository = self.repository or UniverseRepository(account_id=self.account_id)
-        self._repository = repository
+        self._repository = self.repository_factory(self.account_id)
+
 
     def approved_instruments(self) -> List[str]:
         assert self._repository is not None
@@ -357,83 +334,9 @@ class KrakenSecretManager:
         return self.secret_store.secret_name(self.account_id)
 
 
-    def _decode_secret_payload(self, secret: Any) -> Dict[str, str]:
-        if secret is None:
-            return {}
-        data_sources: List[tuple[str, Dict[str, Any]]] = []
-        if isinstance(secret, dict):
-            for attr in ("stringData", "data"):
-                payload = secret.get(attr)
-                if isinstance(payload, dict):
-                    data_sources.append((attr, payload))
-        else:
-            for attr in ("stringData", "data"):
-                payload = getattr(secret, attr, None)
-                if isinstance(payload, dict):
-                    data_sources.append((attr, payload))
-        for attr, payload in data_sources:
-            decoded: Dict[str, str] = {}
-            for field in ("api_key", "api_secret"):
-                value = payload.get(field)
-                if not isinstance(value, str):
-                    continue
-                if attr == "data":
-                    try:
-                        value = base64.b64decode(value).decode()
-                    except Exception:
-                        pass
-                decoded[field] = value
-            if set(decoded) >= {"api_key", "api_secret"}:
-                return decoded
-        return {}
-
-    def _read_from_kubernetes(self) -> Dict[str, str]:
-        assert self.secret_store is not None
-        core_v1 = getattr(self.secret_store, "core_v1", None)
-        if not hasattr(core_v1, "read_namespaced_secret"):
-            return {}
-        try:
-            secret = core_v1.read_namespaced_secret(  # type: ignore[call-arg]
-                name=self.secret_name,
-                namespace=self.namespace,
-            )
-        except Exception as exc:  # pragma: no cover - depends on external cluster
-            raise RuntimeError(
-                f"Failed to read Kraken credentials for account '{self.account_id}': {exc}"
-            ) from exc
-        return self._decode_secret_payload(secret)
-
     def get_credentials(self) -> Dict[str, str]:
         assert self.secret_store is not None
-        assert self.timescale is not None
-
-        credentials = self.secret_store.read_credentials(self.account_id)
-        if not credentials:
-            credentials = self._read_from_kubernetes()
-
-        api_key = credentials.get("api_key") if credentials else None
-        api_secret = credentials.get("api_secret") if credentials else None
-
-        if not api_key or not api_secret:
-            raise RuntimeError(
-                f"Kraken API credentials are not configured for account '{self.account_id}'."
-            )
-
-        masked = {"api_key": _mask_secret(api_key), "api_secret": _mask_secret(api_secret)}
-        logger.info(
-            "Loaded Kraken credentials for account %s from secret %s",
-            self.account_id,
-            self.secret_name,
-            extra={"credentials": masked},
-        )
-
-        metadata = {
-            "secret_name": self.secret_name,
-            "accessed_at": datetime.now(timezone.utc).isoformat(),
-        }
-        self.timescale.record_event("kraken.credentials.access", metadata)
-
-        return {"api_key": api_key, "api_secret": api_secret}
+        return self.secret_store.read_credentials(self.account_id)
 
 
     def rotate_credentials(self, *, api_key: str, api_secret: str) -> Dict[str, Any]:
