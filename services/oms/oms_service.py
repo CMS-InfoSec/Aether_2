@@ -670,6 +670,7 @@ class AccountContext:
         self._startup_lock = asyncio.Lock()
         self._stream_task: Optional[asyncio.Task[None]] = None
         self._child_parent: Dict[str, str] = {}
+        self._child_results: Dict[str, OMSOrderStatusResponse] = {}
         self._latency_tracker = _TransportLatencyTracker()
 
     async def start(self) -> None:
@@ -698,6 +699,7 @@ class AccountContext:
         if self.rest_client is not None:
             await self.rest_client.close()
         self._child_parent.clear()
+        self._child_results.clear()
 
     async def _apply_stream_state(self, state: OrderState) -> None:
         if not state.client_order_id:
@@ -714,6 +716,7 @@ class AccountContext:
         async with self._orders_lock:
             existing = self._orders.get(parent_key)
             children = list(existing.children) if existing and existing.children else None
+            self._child_results[key] = result
             if children:
                 for idx, child in enumerate(children):
                     if child.client_id == key:
@@ -723,8 +726,40 @@ class AccountContext:
                             transport=state.transport,
                         )
                         break
-            transport = existing.transport if existing else state.transport
-            aggregate_result = result if parent_key == key else (existing.result if existing else result)
+            transports: Set[str] = set()
+            if children:
+                transports = {child.transport for child in children if child.transport}
+            transport = (
+                self._aggregate_transport(transports)
+                if transports
+                else (existing.transport if existing else state.transport)
+            )
+
+            aggregate_result: OMSOrderStatusResponse
+            if children:
+                child_results: List[OMSOrderStatusResponse] = []
+                for child in children:
+                    child_result = self._child_results.get(child.client_id)
+                    if child_result is None:
+                        child_results = []
+                        break
+                    child_results.append(child_result)
+                if child_results and len(child_results) == len(children):
+                    aggregate_result = self._aggregate_child_results(
+                        parent_key, child_results, children
+                    )
+                else:
+                    aggregate_result = existing.result if existing else result
+            else:
+                aggregate_result = result
+
+            if parent_key != key:
+                self._orders[key] = OrderRecord(
+                    client_id=key,
+                    result=result,
+                    transport=state.transport,
+                    children=None,
+                )
             self._orders[parent_key] = OrderRecord(
                 client_id=parent_key,
                 result=aggregate_result,
@@ -813,6 +848,15 @@ class AccountContext:
                     transport=aggregate_transport,
                     children=child_records,
                 )
+                for child_result, child_record in zip(child_results, child_records):
+                    self._child_results[child_record.client_id] = child_result
+                    if child_record.client_id != request.client_id:
+                        self._orders[child_record.client_id] = OrderRecord(
+                            client_id=child_record.client_id,
+                            result=child_result,
+                            transport=child_record.transport,
+                            children=None,
+                        )
                 self._update_child_mapping(request.client_id, child_records)
             return aggregated_result
 
@@ -908,6 +952,15 @@ class AccountContext:
                     transport=aggregate_transport,
                     children=(record.children if record and record.children else child_records),
                 )
+                for child_result, child_record in zip(cancel_results, child_records):
+                    self._child_results[child_record.client_id] = child_result
+                    if child_record.client_id != request.client_id:
+                        self._orders[child_record.client_id] = OrderRecord(
+                            client_id=child_record.client_id,
+                            result=child_result,
+                            transport=child_record.transport,
+                            children=None,
+                        )
                 if record and record.children:
                     self._update_child_mapping(request.client_id, record.children)
                 else:
