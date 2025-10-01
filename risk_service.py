@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+
 from statistics import mean
 from typing import Dict, Iterable, List, Optional
 
@@ -13,11 +14,13 @@ from pydantic import BaseModel, Field, PositiveFloat, root_validator
 from sqlalchemy import Column, Float, Integer, String
 from sqlalchemy.orm import declarative_base
 
+
 from metrics import (
     increment_trade_rejection,
     record_fees_nav_pct,
     setup_metrics,
 )
+from services.common.security import require_admin_account
 
 
 logger = logging.getLogger(__name__)
@@ -279,6 +282,9 @@ class RiskEvaluationContext(BaseModel):
     def intended_notional(self) -> float:
         return float(self.request.intent.notional)
 
+    class Config:
+        arbitrary_types_allowed = True
+
 
 class AccountUsage(BaseModel):
     account_id: str
@@ -318,16 +324,30 @@ app = FastAPI(title="Risk Validation Service", version="1.0.0")
 setup_metrics(app)
 
 
-@app.post("/risk/validate", response_model=RiskValidationResponse)
-async def validate_risk(request: RiskValidationRequest) -> RiskValidationResponse:
+@app.post("/risk/validate")
+async def validate_risk(
+    payload: Dict[str, Any] = Body(...),
+    account_id: str = Depends(require_admin_account),
+) -> Dict[str, Any]:
     """Validate a trading intent against account level risk limits."""
 
-    logger.info("Received risk validation request for account %s", request.account_id)
+    try:
+        request = RiskValidationRequest.parse_obj(payload)
+    except ValidationError as exc:  # pragma: no cover - FastAPI handles validation
+        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+
+    if request.account_id != account_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account mismatch between header and payload.",
+        )
+
+    logger.info("Received risk validation request for account %s", account_id)
 
     try:
-        limits = _load_account_limits(request.account_id)
+        limits = _load_account_limits(account_id)
     except ConfigError as exc:
-        logger.exception("Unable to load risk limits for account %s", request.account_id)
+        logger.exception("Unable to load risk limits for account %s", account_id)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     context = RiskEvaluationContext(request=request, limits=limits)
@@ -335,12 +355,12 @@ async def validate_risk(request: RiskValidationRequest) -> RiskValidationRespons
     try:
         decision = _evaluate(context)
     except Exception as exc:  # pragma: no cover - defensive programming
-        logger.exception("Risk evaluation failed for account %s", request.account_id)
+        logger.exception("Risk evaluation failed for account %s", account_id)
         raise HTTPException(status_code=500, detail="Internal risk evaluation failure") from exc
 
     logger.info(
         "Risk evaluation completed for account %s: passed=%s",
-        request.account_id,
+        account_id,
         decision.pass_,
     )
     symbol = str(context.request.intent.instrument_id)
@@ -348,7 +368,7 @@ async def validate_risk(request: RiskValidationRequest) -> RiskValidationRespons
     if not decision.pass_:
         _audit_failure(context, decision)
         increment_trade_rejection(
-            request.account_id,
+            account_id,
             symbol,
         )
 
@@ -357,16 +377,18 @@ async def validate_risk(request: RiskValidationRequest) -> RiskValidationRespons
     fees = float(state.fees_paid) if state.fees_paid else 0.0
     fees_pct = (fees / nav * 100.0) if nav else 0.0
     record_fees_nav_pct(
-        request.account_id,
+        account_id,
         symbol,
         fees_pct,
     )
 
-    return decision
+    return decision.dict(by_alias=True)
 
 
-@app.get("/risk/limits", response_model=RiskLimitsResponse)
-async def get_risk_limits(account_id: str = Query(..., description="Account identifier")) -> RiskLimitsResponse:
+@app.get("/risk/limits")
+async def get_risk_limits(
+    account_id: str = Depends(require_admin_account),
+) -> Dict[str, Any]:
     try:
         limits = _load_account_limits(account_id)
     except ConfigError as exc:
@@ -392,7 +414,7 @@ async def get_risk_limits(account_id: str = Query(..., description="Account iden
 
     response = RiskLimitsResponse(account_id=account_id, limits=limit_model, usage=usage)
     logger.info("Retrieved risk limits for account %s", account_id)
-    return response
+    return response.dict()
 
 
 def _load_account_limits(account_id: str) -> AccountRiskLimit:
