@@ -1,0 +1,5 @@
+# Default hourly infrastructure rates in USD.
+rates:
+  training: 9.5
+  inference: 4.0
+  backtest: 2.5
