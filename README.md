@@ -28,5 +28,5 @@ instructions and configuration parameters.
 - Runbooks in [`docs/runbooks/`](docs/runbooks) provide incident response playbooks
   for exchange outages, WebSocket desync, model rollback, secret rotation
   failures, and kill-switch activation.
-- Administrators can use the [on-call readiness checklist](docs/checklists/oncall.md)
-  to attest to review preparedness.
+- Administrators can use the [on-call readiness and compliance checklist](docs/checklists/oncall.md)
+  to attest to operational readiness and file regulatory attestations.

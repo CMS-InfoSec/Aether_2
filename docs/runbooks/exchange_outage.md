@@ -8,6 +8,10 @@ Guide on-call responders through diagnosing and mitigating upstream exchange out
 - Access to Kubernetes cluster with permissions to restart ingestion/OMS deployments.
 - Slack access to #ops-trading and #exchange-relations channels.
 
+## Related SLOs
+- [OMS Latency SLO](../slo.md#oms-latency) — 99th percentile acknowledgement latency must remain ≤ 150 ms.
+- [Kill-Switch Response SLO](../slo.md#kill-switch-response) — ensure circuit breakers remain responsive during failovers.
+
 ## Detection
 1. Confirm alert context: `exchange_connectivity_total` dropping below 80% success for 5 minutes or OMS fill latency breaching the 150 ms SLO budget.
 2. Check the exchange public status page and incident communications for acknowledged outages.
@@ -22,7 +26,7 @@ Guide on-call responders through diagnosing and mitigating upstream exchange out
 
 ## Recovery Validation
 - Exchange status page indicates resolution and connectivity metric returns above 98% for 10 continuous minutes.
-- OMS latency metrics fall back under the 150 ms SLO threshold as documented in `../slo.md`.
+- OMS latency metrics fall back under the 150 ms SLO threshold as documented in [`docs/slo.md`](../slo.md).
 - Ingestion pods show sustained successful heartbeats with no socket errors for 5 minutes.
 
 ## Communication

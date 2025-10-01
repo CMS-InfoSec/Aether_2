@@ -22,10 +22,10 @@ SELECT
     f.size,
     f.price,
     f.fee,
-    o.market
+    f.symbol AS instrument
 FROM fills AS f
 JOIN orders AS o ON o.order_id = f.order_id
-WHERE f.fill_time >= %(start)s AND f.fill_time < %(end)s
+WHERE f.fill_ts >= %(start)s AND f.fill_ts < %(end)s
 {account_filter}
 """
 
@@ -33,11 +33,11 @@ ORDER_QUERY = """
 SELECT
     o.order_id,
     o.account_id,
-    o.market,
+    o.symbol AS instrument,
     o.size,
-    o.submitted_at
+    o.submitted_ts
 FROM orders AS o
-WHERE o.submitted_at >= %(start)s AND o.submitted_at < %(end)s
+WHERE o.submitted_ts >= %(start)s AND o.submitted_ts < %(end)s
 {account_filter}
 """
 
@@ -101,18 +101,25 @@ def fetch_daily_orders(
         params["account_ids"] = list(account_ids)
     query = ORDER_QUERY.format(account_filter=account_filter)
     orders = _fetch_rows(session, query, params)
-    order_to_market: Dict[str, str] = {}
+    order_to_instrument: Dict[str, str] = {}
     for order in orders:
         order_id = str(order["order_id"])
-        market = order.get("market")
-        order_to_market[order_id] = str(market) if market is not None else "UNKNOWN"
+
+        instrument = (
+            order.get("instrument")
+            or order.get("symbol")
+            or order.get("market")
+            or "UNKNOWN"
+        )
+        order_to_instrument[order_id] = str(instrument)
+
     LOGGER.debug("Fetched %d orders between %s and %s", len(orders), start, end)
-    return order_to_market
+    return order_to_instrument
 
 
 def compute_daily_pnl(
     fills: Iterable[Mapping[str, Any]],
-    order_markets: Mapping[str, str],
+    order_instruments: Mapping[str, str],
 ) -> List[DailyPnlRow]:
     aggregates: MutableMapping[tuple[str, str], Dict[str, float]] = defaultdict(
         lambda: {"executed_quantity": 0.0, "gross_pnl": 0.0, "fees": 0.0}
@@ -121,7 +128,9 @@ def compute_daily_pnl(
         account_id = str(fill["account_id"])
         order_id = str(fill["order_id"])
         instrument = str(
-            fill.get("market") or order_markets.get(order_id, "UNKNOWN")
+
+            fill.get("instrument") or order_instruments.get(order_id, "UNKNOWN")
+
         )
         side = str(fill["side"]).upper()
         quantity = float(fill["size"])
@@ -198,10 +207,10 @@ def generate_daily_pnl(
     start = datetime.combine(report_date, datetime.min.time(), tzinfo=timezone.utc)
     end = start + timedelta(days=1)
     fills = fetch_daily_fills(session, start=start, end=end, account_ids=account_ids)
-    order_markets = fetch_daily_orders(
+    order_instruments = fetch_daily_orders(
         session, start=start, end=end, account_ids=account_ids
     )
-    rows = compute_daily_pnl(fills, order_markets)
+    rows = compute_daily_pnl(fills, order_instruments)
 
     metadata = {
         "report_date": report_date.isoformat(),

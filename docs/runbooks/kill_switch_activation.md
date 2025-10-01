@@ -3,6 +3,10 @@
 ## Purpose
 Describe the controlled process for activating and deactivating the trading kill switch to mitigate catastrophic risk while meeting the 60-second response SLO.
 
+## Related SLOs
+- [Kill-Switch Response SLO](../slo.md#kill-switch-response) — activation to full halt must complete within 60 seconds.
+- [OMS Latency SLO](../slo.md#oms-latency) — confirm post-activation recovery keeps latency within the 150 ms budget.
+
 ## Preconditions
 - Trigger condition: kill-switch Prometheus alert `kill_switch_response_seconds` predicting SLO breach or manual directive from Head of Trading/Security.
 - Access to OMS admin CLI and ArgoCD application controls.

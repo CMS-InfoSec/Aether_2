@@ -22,6 +22,11 @@ Use this checklist during weekly reviews to verify operational readiness and doc
 - [ ] Update the on-call schedule and escalation matrix if personnel changes occurred.
 - [ ] Record checklist completion in the operations log with timestamp and reviewer signature.
 
+## Compliance Attestation
+- [ ] Confirm SOC 2 control evidences for kill-switch activation, secret rotation, and model rollback are up to date and linked to the latest incident tickets.
+- [ ] Ensure quarterly access reviews for observability tooling (Prometheus, Grafana, Loki) are completed and archived.
+- [ ] Submit signed attestation of checklist completion to compliance via the governance portal.
+
 ---
 
 **Reviewer Name:** ____________________  
