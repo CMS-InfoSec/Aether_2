@@ -210,9 +210,11 @@ def _kraken_volume_24h(session: Session) -> Dict[str, float]:
     for market, volume in rows:
         if volume is None:
             continue
+
         normalized = _normalize_market(market)
         if normalized is None:
             continue
+
         volumes[normalized] = max(volumes.get(normalized, 0.0), float(volume))
     return volumes
 
@@ -310,26 +312,34 @@ def _evaluate_universe(session: Session) -> List[str]:
     volumes = _kraken_volume_24h(session)
     overrides = _latest_manual_overrides(session)
 
-    approved = set()
+    approved: set[str] = set()
 
     for pair, cap_feature in caps.items():
+        canonical_pair = _normalize_market(pair)
+        if canonical_pair is None:
+            continue
+
         market_cap = float(cap_feature.value or 0.0)
-        vol_feature = vols.get(pair)
+        vol_feature = vols.get(canonical_pair)
         volatility = float(vol_feature.value) if vol_feature and vol_feature.value is not None else 0.0
-        kraken_volume = volumes.get(pair, 0.0)
+        kraken_volume = volumes.get(canonical_pair, 0.0)
 
         if (
             market_cap >= MARKET_CAP_THRESHOLD
             and kraken_volume >= VOLUME_THRESHOLD
             and volatility >= VOLATILITY_THRESHOLD
         ):
-            approved.add(pair)
+            approved.add(canonical_pair)
 
     for pair, override in overrides.items():
+        canonical_pair = _normalize_market(pair)
+        if canonical_pair is None:
+            continue
+
         if override.approved:
-            approved.add(pair)
+            approved.add(canonical_pair)
         else:
-            approved.discard(pair)
+            approved.discard(canonical_pair)
 
     return sorted(approved)
 
