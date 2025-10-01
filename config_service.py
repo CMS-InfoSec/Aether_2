@@ -1,362 +1,326 @@
-"""FastAPI application exposing guarded configuration management endpoints."""
+"""FastAPI service for configuration management with optional dual sign-off."""
+
 from __future__ import annotations
 
-import uuid
-from dataclasses import dataclass, field
+import os
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, ClassVar, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Generator, Iterable, List, Optional, Set, Tuple
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-
-from shared.audit import AuditLogEntry, AuditLogStore, TimescaleAuditLogger
+from sqlalchemy import JSON, Column, DateTime, Integer, String, UniqueConstraint, create_engine, func, select
+from sqlalchemy.orm import Session, declarative_base, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 
 # ---------------------------------------------------------------------------
-# Domain models representing pending changes and applied versions
+# Database configuration
 # ---------------------------------------------------------------------------
+
+
+DEFAULT_DATABASE_URL = "sqlite+pysqlite:////tmp/config.db"
+
+
+def _create_engine(database_url: str):
+    connect_args: Dict[str, Any] = {}
+    engine_kwargs: Dict[str, Any] = {"future": True}
+    if database_url.startswith("sqlite"):  # pragma: no cover - defensive branch
+        connect_args["check_same_thread"] = False
+        engine_kwargs["connect_args"] = connect_args
+        if ":memory:" in database_url:
+            engine_kwargs["poolclass"] = StaticPool
+    return create_engine(database_url, **engine_kwargs)
+
+
+DATABASE_URL = os.getenv("CONFIG_DATABASE_URL", DEFAULT_DATABASE_URL)
+engine = _create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+
+Base = declarative_base()
+
+
+class ConfigVersion(Base):
+    """ORM model representing committed configuration versions."""
+
+    __tablename__ = "config_versions"
+
+    id = Column(Integer, primary_key=True)
+    account_id = Column(String, nullable=False, default="global")
+    key = Column(String, nullable=False)
+    value_json = Column(JSON, nullable=False)
+    version = Column(Integer, nullable=False)
+    approvers = Column(JSON, nullable=False, default=list)
+    ts = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        UniqueConstraint("account_id", "key", "version", name="uq_config_version"),
+    )
+
+
+Base.metadata.create_all(bind=engine)
+
+
+# ---------------------------------------------------------------------------
+# Guarded key management
+# ---------------------------------------------------------------------------
+
+
+GUARDED_KEYS: Set[str] = {
+    "risk.max_notional",
+    "trading.kill_switch",
+}
 
 
 @dataclass
-class PendingConfigChange:
-    """In-memory representation of a ``config_pending`` table row."""
+class PendingGuardedChange:
+    """Represents the interim state for a guarded configuration change."""
 
-    request_id: str
-    key: str
-    new_value: Any
-    requested_by: str
-    approvals: List[str] = field(default_factory=list)
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    applied: bool = False
-    applied_at: Optional[datetime] = None
-
-    def add_initial_signature(self, author: str) -> None:
-        if author not in self.approvals:
-            self.approvals.append(author)
-
-    def approve(self, author: str) -> None:
-        if author in self.approvals:
-            raise PermissionError("duplicate_approval")
-        self.approvals.append(author)
-
-    def mark_applied(self) -> None:
-        self.applied = True
-        self.applied_at = datetime.now(timezone.utc)
-
-    def to_payload(self, requires_second_approval: bool) -> Dict[str, Any]:
-        return {
-            "request_id": self.request_id,
-            "key": self.key,
-            "new_value": self.new_value,
-            "requested_by": self.requested_by,
-            "approvals": list(self.approvals),
-            "created_at": self.created_at,
-            "applied": self.applied,
-            "applied_at": self.applied_at,
-            "requires_second_approval": requires_second_approval,
-        }
-
-
-@dataclass(frozen=True)
-class ConfigVersionRecord:
-    """Representation of a ``config_versions`` table row."""
-
-    config_key: str
-    version: int
     value: Any
-    applied_at: datetime
-    approvals: Tuple[str, ...]
-    applied_by: str
+    author: str
+    created_at: datetime
+
+
+PendingKey = Tuple[str, str]
+_pending_guarded: Dict[PendingKey, PendingGuardedChange] = {}
+
+
+def set_guarded_keys(keys: Iterable[str]) -> None:
+    """Override the guarded keys collection (primarily for testing)."""
+
+    GUARDED_KEYS.clear()
+    GUARDED_KEYS.update(keys)
+
+
+def guarded_keys() -> Set[str]:
+    return set(GUARDED_KEYS)
+
+
+def reset_state() -> None:
+    """Reset in-memory and database state (used in tests)."""
+
+    Base.metadata.drop_all(bind=engine)
+    Base.metadata.create_all(bind=engine)
+    _pending_guarded.clear()
 
 
 # ---------------------------------------------------------------------------
-# Persistence layer (in-memory for testing) orchestrating audit logging
+# Utility helpers
 # ---------------------------------------------------------------------------
 
 
-class ConfigChangeStore:
-    """Coordinator for pending config changes and applied versions."""
+def get_session() -> Generator[Session, None, None]:
+    session = SessionLocal()
+    try:
+        yield session
+    finally:
+        session.close()
 
-    _guarded_keys: ClassVar[Tuple[str, ...]] = (
-        "risk.max_notional",
-        "risk.max_drawdown",
-        "trading.kill_switch",
+
+def _next_version(session: Session, *, account_id: str, key: str) -> int:
+    stmt = select(func.max(ConfigVersion.version)).where(
+        ConfigVersion.account_id == account_id, ConfigVersion.key == key
     )
-    _pending: ClassVar[Dict[str, PendingConfigChange]] = {}
-    _config_versions: ClassVar[List[ConfigVersionRecord]] = []
-    _audit_store: ClassVar[AuditLogStore] = AuditLogStore()
-    _audit_logger: ClassVar[TimescaleAuditLogger] = TimescaleAuditLogger(_audit_store)
+    max_version: Optional[int] = session.execute(stmt).scalar()
+    return (max_version or 0) + 1
 
-    # ------------------------------------------------------------------
-    # Guard list management (used in testing)
-    # ------------------------------------------------------------------
-    @classmethod
-    def set_guarded_keys(cls, keys: Iterable[str]) -> None:
-        cls._guarded_keys = tuple(sorted(set(keys)))
 
-    @classmethod
-    def guarded_keys(cls) -> Tuple[str, ...]:
-        return cls._guarded_keys
-
-    # ------------------------------------------------------------------
-    # Utilities
-    # ------------------------------------------------------------------
-    @classmethod
-    def reset(cls) -> None:
-        cls._pending = {}
-        cls._config_versions = []
-        cls._audit_store = AuditLogStore()
-        cls._audit_logger = TimescaleAuditLogger(cls._audit_store)
-
-    @classmethod
-    def audit_entries(cls) -> Tuple[AuditLogEntry, ...]:
-        return tuple(cls._audit_store.all())
-
-    @classmethod
-    def requires_dual_signature(cls, key: str) -> bool:
-        return key in cls._guarded_keys
-
-    @classmethod
-    def _current_value(cls, key: str) -> Any:
-        for record in reversed(cls._config_versions):
-            if record.config_key == key:
-                return record.value
-        return None
-
-    @classmethod
-    def _next_version(cls, key: str) -> int:
-        versions = [record.version for record in cls._config_versions if record.config_key == key]
-        return max(versions, default=0) + 1
-
-    @classmethod
-    def _ensure_no_pending(cls, key: str) -> None:
-        for change in cls._pending.values():
-            if change.key == key and not change.applied:
-                raise RuntimeError("pending_change_exists")
-
-    # ------------------------------------------------------------------
-    # Core workflows
-    # ------------------------------------------------------------------
-    @classmethod
-    def request_change(cls, key: str, new_value: Any, author: str) -> Tuple[PendingConfigChange, Optional[ConfigVersionRecord]]:
-        cls._ensure_no_pending(key)
-
-        request_id = str(uuid.uuid4())
-        change = PendingConfigChange(
-            request_id=request_id,
-            key=key,
-            new_value=new_value,
-            requested_by=author,
-        )
-        change.add_initial_signature(author)
-        cls._pending[request_id] = change
-
-        cls._audit_logger.record(
-            action="config_update_requested",
-            actor_id=author,
-            before={"key": key, "current_value": cls._current_value(key)},
-            after={
-                "key": key,
-                "new_value": new_value,
-                "request_id": request_id,
-                "approvals": list(change.approvals),
-            },
-        )
-
-        applied_record: Optional[ConfigVersionRecord] = None
-        if not cls.requires_dual_signature(key):
-            applied_record = cls._apply_change(change, actor=author)
-
-        return change, applied_record
-
-    @classmethod
-    def approve_change(
-        cls,
-        request_id: str,
-        author: str,
-    ) -> Tuple[PendingConfigChange, Optional[ConfigVersionRecord]]:
-        change = cls._pending.get(request_id)
-        if not change:
-            raise KeyError("change_missing")
-        if change.applied:
-            raise PermissionError("change_already_applied")
-
-        before = {"approvals": list(change.approvals)}
-        change.approve(author)
-        cls._audit_logger.record(
-            action="config_update_approved",
-            actor_id=author,
-            before={"request_id": request_id, **before},
-            after={
-                "request_id": request_id,
-                "approvals": list(change.approvals),
-            },
-        )
-
-        applied_record: Optional[ConfigVersionRecord] = None
-        if not cls.requires_dual_signature(change.key) or len(change.approvals) >= 2:
-            applied_record = cls._apply_change(change, actor=author)
-
-        return change, applied_record
-
-    @classmethod
-    def pending_changes(cls) -> Tuple[PendingConfigChange, ...]:
-        return tuple(change for change in cls._pending.values() if not change.applied)
-
-    @classmethod
-    def config_versions(cls) -> Tuple[ConfigVersionRecord, ...]:
-        return tuple(cls._config_versions)
-
-    @classmethod
-    def _apply_change(cls, change: PendingConfigChange, actor: str) -> ConfigVersionRecord:
-        before = {
-            "key": change.key,
-            "current_value": cls._current_value(change.key),
-        }
-        change.mark_applied()
-        cls._pending.pop(change.request_id, None)
-
-        record = ConfigVersionRecord(
-            config_key=change.key,
-            version=cls._next_version(change.key),
-            value=change.new_value,
-            applied_at=change.applied_at or datetime.now(timezone.utc),
-            approvals=tuple(change.approvals),
-            applied_by=actor,
-        )
-        cls._config_versions.append(record)
-
-        cls._audit_logger.record(
-            action="config_update_applied",
-            actor_id=actor,
-            before=before,
-            after={
-                "key": change.key,
-                "value": change.new_value,
-                "version": record.version,
-                "approvals": list(change.approvals),
-            },
-        )
-        return record
+def _serialize_config(record: ConfigVersion) -> "ConfigEntry":
+    return ConfigEntry(
+        id=record.id,
+        account_id=record.account_id,
+        key=record.key,
+        value=record.value_json,
+        version=record.version,
+        approvers=list(record.approvers or []),
+        ts=record.ts,
+    )
 
 
 # ---------------------------------------------------------------------------
-# API schema definitions
+# API schemas
 # ---------------------------------------------------------------------------
 
 
 class ConfigUpdateRequest(BaseModel):
-    key: str
-    new_value: Any
-    author: str
+    key: str = Field(..., description="Configuration key to update")
+    value: Any = Field(..., description="JSON-serialisable value for the configuration key")
+    author: str = Field(..., description="User requesting the change")
 
 
-class ConfigChangeResponse(BaseModel):
-    request_id: str
+class ConfigEntry(BaseModel):
+    id: int
+    account_id: str
     key: str
-    new_value: Any
-    approvals: List[str]
-    requested_by: str
+    value: Any
+    version: int
+    approvers: List[str]
+    ts: datetime
+
+
+class ConfigUpdateResponse(BaseModel):
     status: str = Field(..., pattern="^(pending|applied)$")
-    requires_second_approval: bool
-    version: Optional[int] = None
-    applied_at: Optional[datetime] = None
-    created_at: datetime
-
-
-class ConfigApproveRequest(BaseModel):
-    request_id: str
-    author: str
+    account_id: str
+    key: str
+    value: Any
+    approvers: List[str]
+    version: Optional[int]
+    ts: Optional[datetime]
+    required_approvals: int
 
 
 # ---------------------------------------------------------------------------
-# FastAPI wiring
+# FastAPI application setup
 # ---------------------------------------------------------------------------
 
 
 app = FastAPI(title="Config Service")
 
 
-def _response_from_change(
-    change: PendingConfigChange,
+def _pending_key(account_id: str, key: str) -> PendingKey:
+    return account_id, key
+
+
+def _commit_version(
+    session: Session,
     *,
-    requires_second_approval: bool,
-    applied_record: Optional[ConfigVersionRecord],
-) -> ConfigChangeResponse:
-    status_value = "applied" if applied_record else "pending"
-    version = applied_record.version if applied_record else None
-    applied_at = applied_record.applied_at if applied_record else change.applied_at
-    return ConfigChangeResponse(
-        request_id=change.request_id,
-        key=change.key,
-        new_value=change.new_value,
-        approvals=list(change.approvals),
-        requested_by=change.requested_by,
-        status=status_value,
-        requires_second_approval=requires_second_approval,
+    account_id: str,
+    key: str,
+    value: Any,
+    approvers: List[str],
+) -> ConfigVersion:
+    version = _next_version(session, account_id=account_id, key=key)
+    record = ConfigVersion(
+        account_id=account_id,
+        key=key,
+        value_json=value,
         version=version,
-        applied_at=applied_at,
-        created_at=change.created_at,
+        approvers=list(approvers),
+        ts=datetime.now(timezone.utc),
+    )
+    session.add(record)
+    session.commit()
+    session.refresh(record)
+    return record
+
+
+@app.get("/config/current", response_model=Dict[str, ConfigEntry])
+def get_current_config(
+    account_id: str = Query("global", description="Account identifier"),
+    session: Session = Depends(get_session),
+) -> Dict[str, ConfigEntry]:
+    stmt = (
+        select(ConfigVersion)
+        .where(ConfigVersion.account_id == account_id)
+        .order_by(ConfigVersion.key.asc(), ConfigVersion.version.desc())
+    )
+    results = session.execute(stmt).scalars().all()
+    latest: Dict[str, ConfigEntry] = {}
+    for record in results:
+        if record.key not in latest:
+            latest[record.key] = _serialize_config(record)
+    return latest
+
+
+@app.post("/config/update", response_model=ConfigUpdateResponse)
+def update_config(
+    payload: ConfigUpdateRequest,
+    account_id: str = Query("global", description="Account identifier"),
+    session: Session = Depends(get_session),
+):
+    key = payload.key
+    pending_identifier = _pending_key(account_id, key)
+    required_approvals = 2 if key in GUARDED_KEYS else 1
+
+    if key in GUARDED_KEYS:
+        pending = _pending_guarded.get(pending_identifier)
+        if pending is None:
+            _pending_guarded[pending_identifier] = PendingGuardedChange(
+                value=payload.value,
+                author=payload.author,
+                created_at=datetime.now(timezone.utc),
+            )
+            response = ConfigUpdateResponse(
+                status="pending",
+                account_id=account_id,
+                key=key,
+                value=payload.value,
+                approvers=[payload.author],
+                version=None,
+                ts=None,
+                required_approvals=required_approvals,
+            )
+            return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=response.model_dump())
+
+        if pending.author == payload.author:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="second_author_required")
+        if pending.value != payload.value:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="value_mismatch")
+
+        record = _commit_version(
+            session,
+            account_id=account_id,
+            key=key,
+            value=payload.value,
+            approvers=[pending.author, payload.author],
+        )
+        _pending_guarded.pop(pending_identifier, None)
+        return ConfigUpdateResponse(
+            status="applied",
+            account_id=record.account_id,
+            key=record.key,
+            value=record.value_json,
+            approvers=list(record.approvers or []),
+            version=record.version,
+            ts=record.ts,
+            required_approvals=required_approvals,
+        )
+
+    record = _commit_version(
+        session,
+        account_id=account_id,
+        key=key,
+        value=payload.value,
+        approvers=[payload.author],
+    )
+    return ConfigUpdateResponse(
+        status="applied",
+        account_id=record.account_id,
+        key=record.key,
+        value=record.value_json,
+        approvers=list(record.approvers or []),
+        version=record.version,
+        ts=record.ts,
+        required_approvals=required_approvals,
     )
 
 
-@app.post("/config/update", response_model=ConfigChangeResponse)
-def request_config_change(payload: ConfigUpdateRequest) -> ConfigChangeResponse:
-    try:
-        change, applied_record = ConfigChangeStore.request_change(
-            payload.key,
-            payload.new_value,
-            payload.author,
-        )
-    except RuntimeError as exc:
-        if str(exc) == "pending_change_exists":
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="pending_change_exists",
-            ) from exc
-        raise
-
-    requires_second = ConfigChangeStore.requires_dual_signature(payload.key)
-    return _response_from_change(change, requires_second_approval=requires_second, applied_record=applied_record)
-
-
-@app.get("/config/pending", response_model=List[ConfigChangeResponse])
-def list_pending_changes() -> List[ConfigChangeResponse]:
-    responses: List[ConfigChangeResponse] = []
-    for change in ConfigChangeStore.pending_changes():
-        requires_second = ConfigChangeStore.requires_dual_signature(change.key)
-        responses.append(
-            _response_from_change(change, requires_second_approval=requires_second, applied_record=None)
-        )
-    return responses
-
-
-@app.post("/config/approve", response_model=ConfigChangeResponse)
-def approve_config_change(payload: ConfigApproveRequest) -> ConfigChangeResponse:
-    try:
-        change, applied_record = ConfigChangeStore.approve_change(payload.request_id, payload.author)
-    except KeyError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="change_missing") from exc
-    except PermissionError as exc:
-        detail = str(exc)
-        status_code = status.HTTP_400_BAD_REQUEST
-        if detail == "change_already_applied":
-            status_code = status.HTTP_409_CONFLICT
-        raise HTTPException(status_code=status_code, detail=detail) from exc
-
-    requires_second = ConfigChangeStore.requires_dual_signature(change.key)
-    if requires_second and applied_record is None:
-        # Guarded keys require two distinct approvals; ensure the payload reflects pending status.
-        return _response_from_change(change, requires_second_approval=True, applied_record=None)
-
-    return _response_from_change(change, requires_second_approval=requires_second, applied_record=applied_record)
+@app.get("/config/history", response_model=List[ConfigEntry])
+def get_config_history(
+    key: str = Query(..., description="Configuration key"),
+    account_id: str = Query("global", description="Account identifier"),
+    session: Session = Depends(get_session),
+) -> List[ConfigEntry]:
+    stmt = (
+        select(ConfigVersion)
+        .where(ConfigVersion.account_id == account_id, ConfigVersion.key == key)
+        .order_by(ConfigVersion.version.asc())
+    )
+    records = session.execute(stmt).scalars().all()
+    entries = [_serialize_config(record) for record in records]
+    return entries
 
 
 __all__ = [
     "app",
-    "ConfigChangeStore",
+    "ConfigVersion",
     "ConfigUpdateRequest",
-    "ConfigApproveRequest",
-    "ConfigChangeResponse",
+    "ConfigEntry",
+    "ConfigUpdateResponse",
+    "get_session",
+    "reset_state",
+    "set_guarded_keys",
+    "guarded_keys",
 ]
 
