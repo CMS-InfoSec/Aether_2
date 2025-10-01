@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -33,25 +34,29 @@ def _set_fixed_datetime(monkeypatch):
     monkeypatch.setattr(audit_logger.dt, "datetime", dt.datetime)
 
 
-def _call_log_audit(monkeypatch: pytest.MonkeyPatch, **kwargs: Any):
+def _call_log_audit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **kwargs: Any):
     conn, cursor = _make_connection_mock()
     monkeypatch.setenv("AUDIT_DATABASE_URL", "postgresql://audit:audit@localhost:5432/audit")
+    monkeypatch.setenv("AUDIT_CHAIN_LOG", str(tmp_path / "chain.log"))
+    monkeypatch.setenv("AUDIT_CHAIN_STATE", str(tmp_path / "chain_state.json"))
     monkeypatch.setattr(audit_logger, "psycopg", MagicMock(connect=MagicMock(return_value=conn)))
     audit_logger.log_audit(**kwargs)
     return conn, cursor
 
 
-def test_log_audit_inserts_and_logs(monkeypatch, capsys):
+def test_log_audit_inserts_and_logs(monkeypatch, tmp_path, capsys):
     before = {"status": "pending"}
     after = {"status": "approved"}
+    hashed_ip = hashlib.sha256("192.0.2.1".encode()).hexdigest()
     conn, cursor = _call_log_audit(
         monkeypatch,
+        tmp_path,
         actor="alice",
         action="approve",
         entity="order-9",
         before=before,
         after=after,
-        ip="192.0.2.1",
+        ip_hash=hashed_ip,
     )
 
     captured = capsys.readouterr().out.strip()
@@ -64,9 +69,10 @@ def test_log_audit_inserts_and_logs(monkeypatch, capsys):
     assert payload["before"] == before
     assert payload["after"] == after
 
-    expected_hash = hashlib.sha256("192.0.2.1".encode()).hexdigest()
-    assert payload["ip_hash"] == expected_hash
+    assert payload["ip_hash"] == hashed_ip
     assert payload["ts"] == "2023-01-01T12:00:00+00:00"
+    assert payload["prev_hash"] == audit_logger._GENESIS_HASH  # pylint: disable=protected-access
+    assert "hash" in payload
 
     assert audit_logger.psycopg.connect.called
     cursor.execute.assert_called_once()
@@ -76,30 +82,36 @@ def test_log_audit_inserts_and_logs(monkeypatch, capsys):
         "alice",
         "approve",
         "order-9",
-        json.dumps(before, separators=(",", ":")),
-        json.dumps(after, separators=(",", ":")),
+        json.dumps(before, separators=(",", ":"), sort_keys=True),
+        json.dumps(after, separators=(",", ":"), sort_keys=True),
         dt.datetime(2023, 1, 1, 12, 0, tzinfo=dt.timezone.utc),
-        expected_hash,
     )
 
 
-def test_log_audit_allows_missing_ip(monkeypatch, capsys):
+def test_log_audit_allows_missing_ip(monkeypatch, tmp_path, capsys):
     _, cursor = _call_log_audit(
         monkeypatch,
+        tmp_path,
         actor="bob",
         action="delete",
         entity="session-1",
         before={},
         after={},
-        ip=None,
+        ip_hash=None,
     )
 
     captured = capsys.readouterr().out.strip()
     payload = json.loads(captured)
     assert payload["ip_hash"] is None
 
+    chain_file = tmp_path / "chain.log"
+    with chain_file.open("r", encoding="utf-8") as fh:
+        lines = [json.loads(line) for line in fh if line.strip()]
+    assert len(lines) == 1
+    assert lines[0]["ip_hash"] is None
+
     params = cursor.execute.call_args[0][1]
-    assert params[-1] is None
+    assert len(params) == 6
 
 
 def test_log_audit_requires_database_url(monkeypatch):
@@ -113,5 +125,30 @@ def test_log_audit_requires_database_url(monkeypatch):
             entity="profile",
             before={},
             after={},
-            ip=None,
+            ip_hash=None,
         )
+
+
+def test_verify_audit_chain(tmp_path, monkeypatch, capsys):
+    hashed_ip = hashlib.sha256(b"1.2.3.4").hexdigest()
+    monkeypatch.setenv("AUDIT_DATABASE_URL", "postgresql://audit:audit@localhost:5432/audit")
+    monkeypatch.setenv("AUDIT_CHAIN_LOG", str(tmp_path / "chain.log"))
+    monkeypatch.setenv("AUDIT_CHAIN_STATE", str(tmp_path / "chain_state.json"))
+
+    conn, cursor = _make_connection_mock()
+    monkeypatch.setattr(audit_logger, "psycopg", MagicMock(connect=MagicMock(return_value=conn)))
+
+    audit_logger.log_audit(
+        actor="dave",
+        action="create",
+        entity="ticket",
+        before={},
+        after={"status": "open"},
+        ip_hash=hashed_ip,
+    )
+
+    capsys.readouterr()
+
+    assert audit_logger.verify_audit_chain() is True
+    out = capsys.readouterr().out
+    assert "Audit chain verified successfully." in out
