@@ -338,9 +338,12 @@ class RedisFeastAdapter:
 
 
     _features: ClassVar[Dict[str, Dict[str, Any]]] = {
-        "admin-eu": {"approved": ["BTC-USD", "ETH-USD"], "fees": {"BTC-USD": {"maker": 0.1, "taker": 0.2}}},
+        "admin-eu": {
+            "approved": ["BTC-USD", "ETH-USD"],
+            "fees": {"BTC-USD": {"maker": 0.1, "taker": 0.2}},
+        },
         "admin-us": {"approved": ["SOL-USD"], "fees": {}},
-        "admin-apac": {"approved": ["BTC-USDT", "ETH-USDT"], "fees": {}},
+        "admin-apac": {"approved": ["BTC-USD", "ETH-USD"], "fees": {}},
     }
     _online_feature_store: ClassVar[Dict[str, Dict[str, Dict[str, Any]]]] = {
         "admin-eu": {
@@ -373,7 +376,13 @@ class RedisFeastAdapter:
 
     def approved_instruments(self) -> List[str]:
         assert self._repository is not None
-        return self._repository.approved_universe()
+
+        instruments = self._repository.approved_universe()
+        if not instruments:
+            fallback = self._features.get(self.account_id, {}).get("approved", [])
+            instruments = list(fallback)
+
+        return [symbol for symbol in instruments if symbol.endswith("-USD")]
 
     def fee_override(self, instrument: str) -> Dict[str, Any] | None:
         assert self._repository is not None
