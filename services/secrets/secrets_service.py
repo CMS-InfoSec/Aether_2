@@ -72,8 +72,7 @@ class KrakenSecretStatus(BaseModel):
 def ensure_secure_transport(request: Request) -> None:
     """Reject requests that are not routed through TLS."""
 
-    forwarded_proto = request.headers.get("X-Forwarded-Proto")
-    scheme = forwarded_proto.split(",", 1)[0].strip() if forwarded_proto else request.url.scheme
+    scheme = request.url.scheme
     if scheme.lower() != "https":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
