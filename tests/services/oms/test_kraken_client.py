@@ -17,7 +17,9 @@ def test_kraken_ws_client_loads_credentials_from_kubernetes_secret() -> None:
     client.write_credentials(account_id, api_key="test-key", api_secret="test-secret")
 
     ws_client = KrakenWSClient(account_id)
-    assert ws_client._credentials == {"api_key": "test-key", "api_secret": "test-secret"}
+    assert ws_client._credentials["api_key"] == "test-key"
+    assert ws_client._credentials["api_secret"] == "test-secret"
+    assert ws_client._credentials["metadata"]["material_present"] is True
 
     manager = KrakenSecretManager(account_id)
     events = manager.timescale.credential_events() if manager.timescale else []

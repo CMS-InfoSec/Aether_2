@@ -1,533 +1,325 @@
+
+"""Kraken OMS credential hot-reload utilities."""
+
 from __future__ import annotations
 
-import asyncio
-import base64
-import hashlib
-import hmac
 import json
 import logging
 import os
+import threading
 import time
-import uuid
-from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional
-from urllib.parse import urlencode
-
-import aiohttp
-import websockets
-from aiohttp import ClientError
-from websockets.client import WebSocketClientProtocol
-from websockets.exceptions import ConnectionClosed, InvalidStatusCode
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from services.common.adapters import KrakenSecretManager
 
-logger = logging.getLogger(__name__)
-
-WS_AUTH_URL = "wss://ws-auth.kraken.com/"
-REST_BASE_URL = "https://api.kraken.com"
-REST_TOKEN_PATH = "/0/private/GetWebSocketsToken"
-REST_ADD_ORDER_PATH = "/0/private/AddOrder"
-REST_CANCEL_ORDER_PATH = "/0/private/CancelOrder"
-
-ACK_TIMEOUT = 5.0
-HEARTBEAT = 10.0
-DEFAULT_MONITOR_TIMEOUT = 60.0
-RECONNECT_BACKOFF = 2.0
-MAX_RECONNECT_ATTEMPTS = 3
+try:  # pragma: no cover - optional dependency in some environments
+    from watchdog.events import FileSystemEventHandler
+    from watchdog.observers import Observer
+    from watchdog.observers.polling import PollingObserver
+except Exception:  # pragma: no cover - watchdog is optional during tests
+    FileSystemEventHandler = object  # type: ignore[misc, assignment]
+    Observer = None  # type: ignore[assignment]
+    PollingObserver = None  # type: ignore[assignment]
 
 
-@dataclass
-class OrderState:
-    """Mutable order state tracked while awaiting fills."""
-
-    exchange_order_id: Optional[str] = None
-    status: str = "pending"
-    filled_qty: float = 0.0
-    avg_price: float = 0.0
-    errors: List[str] = field(default_factory=list)
-
-    def register_fill(self, qty: float, price: float) -> None:
-        if qty <= 0:
-            return
-        notional = self.avg_price * self.filled_qty
-        notional += price * qty
-        self.filled_qty += qty
-        if self.filled_qty > 0:
-            self.avg_price = notional / self.filled_qty
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "exchange_order_id": self.exchange_order_id,
-            "status": self.status,
-            "filled_qty": self.filled_qty,
-            "avg_price": self.avg_price,
-            "errors": list(self.errors),
-        }
+LOGGER = logging.getLogger(__name__)
 
 
-def _load_credentials(account_id: str) -> Dict[str, str]:
-    api_key = os.getenv("KRAKEN_API_KEY")
-    api_secret = os.getenv("KRAKEN_API_SECRET")
-    if api_key and api_secret:
-        return {"api_key": api_key, "api_secret": api_secret}
+def _default_secret_path(account_id: str) -> Optional[Path]:
+    """Resolve the default credential mount path for an account."""
 
-    manager = KrakenSecretManager(account_id=account_id)
-    credentials = manager.get_credentials()
-    return {
-        "api_key": credentials.get("api_key") or "",
-        "api_secret": credentials.get("api_secret") or "",
-    }
-
-
-def _kraken_signature(path: str, data: Mapping[str, Any], secret: str) -> str:
-    postdata = urlencode(data)
-    nonce = str(data.get("nonce", ""))
-    message = (nonce + postdata).encode()
-    try:
-        decoded_secret = base64.b64decode(secret)
-    except Exception:
-        decoded_secret = secret.encode()
-    sha_hash = hashlib.sha256(message).digest()
-    mac = hmac.new(decoded_secret, path.encode() + sha_hash, hashlib.sha512)
-    return base64.b64encode(mac.digest()).decode()
+    env_key = f"AETHER_{account_id.upper()}_KRAKEN_SECRET_PATH"
+    raw_path = os.getenv(env_key) or os.getenv("KRAKEN_SECRET_PATH")
+    if not raw_path:
+        return None
+    path = Path(raw_path)
+    if path.is_dir():
+        path = path / "kraken.json"
+    return path
 
 
-async def _private_request(
-    session: aiohttp.ClientSession,
-    path: str,
-    credentials: Mapping[str, str],
-    data: Optional[MutableMapping[str, Any]] = None,
-) -> Dict[str, Any]:
-    payload: MutableMapping[str, Any] = dict(data or {})
-    payload["nonce"] = payload.get("nonce") or str(int(time.time() * 1000))
-    headers = {
-        "API-Key": credentials.get("api_key", ""),
-        "API-Sign": _kraken_signature(path, payload, credentials.get("api_secret", "")),
-        "User-Agent": "AetherOMS/1.0",
-    }
-    url = f"{REST_BASE_URL}{path}"
-    try:
-        async with session.post(url, data=payload, headers=headers) as response:
-            try:
-                response.raise_for_status()
-            except aiohttp.ClientResponseError as exc:  # type: ignore[attr-defined]
-                raise RuntimeError(f"Kraken REST error: {exc}") from exc
-            try:
-                return await response.json(content_type=None)
-            except Exception as exc:  # pragma: no cover - defensive
-                text = await response.text()
-                raise RuntimeError(f"Invalid Kraken REST response: {text}") from exc
-    except ClientError as exc:
-        raise RuntimeError(f"Kraken REST transport error: {exc}") from exc
+def _default_observer_factory() -> Optional[Any]:
+    """Return the preferred watchdog observer implementation."""
+
+    if Observer is not None:  # pragma: no branch - preference order
+        return Observer()
+    if PollingObserver is not None:
+        return PollingObserver()
+    return None
 
 
-async def _fetch_ws_token(credentials: Mapping[str, str]) -> str:
-    token = os.getenv("KRAKEN_WS_TOKEN")
-    if token:
-        return token
+def _sanitize_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a sanitized copy of metadata with credentials masked."""
 
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-        payload = await _private_request(session, REST_TOKEN_PATH, credentials, {})
-    errors = payload.get("error") or []
-    if errors:
-        raise RuntimeError(
-            "Failed to obtain Kraken websocket token: " + "; ".join(map(str, errors))
-        )
-    result = payload.get("result") or {}
-    token_value = result.get("token")
-    if not token_value:
-        raise RuntimeError("Kraken websocket token missing in response")
-    return str(token_value)
+    sanitized = dict(metadata)
+    for key in ("api_key", "api_secret", "secret", "key"):
+        if key in sanitized and sanitized[key]:
+            sanitized[key] = "***"
+    return sanitized
 
 
-def _build_ws_payload(intent: Mapping[str, Any], client_order_id: str) -> Dict[str, Any]:
-    pair = intent.get("instrument") or intent.get("pair")
-    if not pair:
-        raise ValueError("Order intent is missing 'instrument' or 'pair'.")
-    if "-" in pair:
-        pair = pair.replace("-", "/")
+class _SecretChangeHandler(FileSystemEventHandler):
+    """Watchdog handler that notifies a callback when the secret changes."""
 
-    quantity = float(intent.get("qty") or intent.get("quantity") or 0)
-    if quantity <= 0:
-        raise ValueError("Order quantity must be positive")
+    def __init__(self, target: Path, callback: Callable[[], None]) -> None:
+        super().__init__()
+        self._target = target.resolve()
+        self._callback = callback
 
-    payload: Dict[str, Any] = {
-        "event": "addOrder",
-        "ordertype": intent.get("order_type", "limit"),
-        "type": str(intent.get("side", "")).lower(),
-        "volume": str(quantity),
-        "pair": pair,
-        "clientOrderId": client_order_id,
-    }
-    price = intent.get("price")
-    if price is not None:
-        payload["price"] = str(price)
-
-    tif = intent.get("tif") or intent.get("time_in_force")
-    if tif:
-        payload["timeInForce"] = tif
-
-    flags = intent.get("flags")
-    if isinstance(flags, str):
-        payload["oflags"] = flags
-    elif isinstance(flags, Iterable):
-        payload["oflags"] = ",".join(str(flag) for flag in flags)
-
-    post_only = intent.get("post_only")
-    reduce_only = intent.get("reduce_only")
-    if post_only and "oflags" not in payload:
-        payload["oflags"] = "post"
-    elif post_only and payload.get("oflags"):
-        payload["oflags"] += ",post"
-    if reduce_only and payload.get("oflags"):
-        payload["oflags"] += ",reduce_only"
-    elif reduce_only:
-        payload["oflags"] = "reduce_only"
-
-    return payload
-
-
-def _prepare_rest_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
-    rest_payload = {
-        "ordertype": payload.get("ordertype"),
-        "type": payload.get("type"),
-        "pair": payload.get("pair"),
-        "volume": payload.get("volume"),
-    }
-    if payload.get("price") is not None:
-        rest_payload["price"] = payload.get("price")
-    if payload.get("timeInForce"):
-        rest_payload["timeinforce"] = payload.get("timeInForce")
-    if payload.get("oflags"):
-        rest_payload["oflags"] = payload.get("oflags")
-    if payload.get("clientOrderId"):
-        rest_payload["userref"] = payload.get("clientOrderId")
-    return rest_payload
-
-
-async def _rest_add_order(credentials: Mapping[str, str], payload: Mapping[str, Any]) -> Dict[str, Any]:
-    rest_payload = _prepare_rest_payload(payload)
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-        response = await _private_request(session, REST_ADD_ORDER_PATH, credentials, rest_payload)
-    return response
-
-
-async def _rest_cancel_order(
-    credentials: Mapping[str, str],
-    order_ids: Iterable[str],
-) -> Dict[str, Any]:
-    data: Dict[str, Any] = {"txid": ",".join(order_ids)}
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-        return await _private_request(session, REST_CANCEL_ORDER_PATH, credentials, data)
-
-
-async def _connect_with_retry() -> WebSocketClientProtocol:
-    delay = 1.0
-    last_error: Optional[Exception] = None
-    for attempt in range(1, MAX_RECONNECT_ATTEMPTS + 1):
+    # ``watchdog`` emits multiple event types – treat any relevant one as a
+    # refresh signal. ``FileSystemEventHandler`` uses snake_case names on
+    # Python, but attribute access falls back to ``__getattr__`` in tests.
+    def on_any_event(self, event: Any) -> None:  # pragma: no cover - thin wrapper
         try:
-            return await websockets.connect(
-                WS_AUTH_URL,
-                ping_interval=HEARTBEAT,
-                ping_timeout=HEARTBEAT,
-                close_timeout=1,
-                max_queue=None,
-            )
-        except (OSError, InvalidStatusCode, ConnectionClosed) as exc:
-            last_error = exc
-            logger.warning("Kraken websocket connection failed (attempt %s): %s", attempt, exc)
-            await asyncio.sleep(delay)
-            delay *= RECONNECT_BACKOFF
-    raise RuntimeError(f"Unable to connect to Kraken websocket: {last_error}")
+            if getattr(event, "is_directory", False):
+                return
+            candidates: List[str] = []
+            src_path = getattr(event, "src_path", None)
+            if src_path:
+                candidates.append(src_path)
+            dest_path = getattr(event, "dest_path", None)
+            if dest_path:
+                candidates.append(dest_path)
+            for candidate in candidates:
+                if Path(candidate).resolve() == self._target:
+                    self._callback()
+                    return
+        except Exception:  # pragma: no cover - defensive logging
+            LOGGER.exception("Failed to handle secret change event")
 
 
-async def _send_json(ws: WebSocketClientProtocol, message: Mapping[str, Any]) -> None:
-    await ws.send(json.dumps(message))
+def _material_changed(old: Dict[str, Any], new: Dict[str, Any]) -> bool:
+    """Return ``True`` when the credential material differs."""
 
-
-async def _subscribe(ws: WebSocketClientProtocol, token: str, *channels: str) -> None:
-    for channel in channels:
-        await _send_json(
-            ws,
-            {
-                "event": "subscribe",
-                "subscription": {"name": channel, "token": token},
-            },
-        )
-
-
-def _is_order_message(message: Any, client_order_id: str, exchange_order_id: Optional[str]) -> bool:
-    if isinstance(message, Mapping):
-        if message.get("clientOrderId") == client_order_id:
-            return True
-        if exchange_order_id and message.get("txid") == exchange_order_id:
+    for key in ("api_key", "api_secret"):
+        if old.get(key) != new.get(key):
             return True
     return False
 
 
-def _extract_fills(message: Mapping[str, Any]) -> Iterable[Mapping[str, Any]]:
-    if "trades" in message and isinstance(message["trades"], Iterable):
-        for trade in message["trades"]:
-            if isinstance(trade, Mapping):
-                yield trade
-    if "fills" in message and isinstance(message["fills"], Iterable):
-        for fill in message["fills"]:
-            if isinstance(fill, Mapping):
-                yield fill
+@dataclass
+class _CredentialSnapshot:
+    version: int
+    payload: Dict[str, Any]
 
 
-def _update_state_from_message(
-    state: OrderState,
-    message: Mapping[str, Any],
-    *,
-    client_order_id: str,
-    expected_qty: float,
-) -> None:
-    if not _is_order_message(message, client_order_id, state.exchange_order_id):
-        return
+class KrakenCredentialWatcher:
+    """Monitors Kraken credential mounts and refreshes when they change."""
 
-    if message.get("txid") and not state.exchange_order_id:
-        state.exchange_order_id = str(message["txid"])
+    _instances: Dict[str, "KrakenCredentialWatcher"] = {}
+    _instances_lock = threading.Lock()
 
-    status = message.get("status") or message.get("orderStatus")
-    if status:
-        state.status = str(status).lower()
+    def __init__(
+        self,
+        account_id: str,
+        *,
+        secret_path: Optional[Path] = None,
+        manager: Optional[KrakenSecretManager] = None,
+        observer_factory: Optional[Callable[[], Any]] = None,
+        refresh_interval: float = 30.0,
+        debounce_seconds: float = 0.5,
+    ) -> None:
+        self.account_id = account_id
+        self._manager = manager or KrakenSecretManager(account_id)
+        self._secret_path = secret_path or _default_secret_path(account_id)
+        self._refresh_interval = refresh_interval
+        self._debounce_seconds = debounce_seconds
+        self._observer_factory = observer_factory or _default_observer_factory
 
-    filled = message.get("filled") or message.get("vol_exec")
-    price = message.get("avg_price") or message.get("price")
-    if filled is not None:
-        try:
-            qty = float(filled)
-        except (TypeError, ValueError):
-            qty = 0.0
-        fill_price = 0.0
-        if price is not None:
-            try:
-                fill_price = float(price)
-            except (TypeError, ValueError):
-                fill_price = 0.0
-        if qty > 0:
-            incremental = max(qty - state.filled_qty, 0.0)
-            if incremental > 0:
-                state.register_fill(incremental, fill_price or state.avg_price)
-
-    for fill in _extract_fills(message):
-        try:
-            qty = float(fill.get("vol") or fill.get("qty") or 0.0)
-        except (TypeError, ValueError):
-            qty = 0.0
-        try:
-            price_value = float(fill.get("price") or 0.0)
-        except (TypeError, ValueError):
-            price_value = 0.0
-        if qty > 0:
-            state.register_fill(qty, price_value)
-
-    if state.filled_qty >= expected_qty and expected_qty > 0:
-        state.status = "filled"
-
-
-async def _await_ack(
-    ws: WebSocketClientProtocol,
-    client_order_id: str,
-    timeout: float = ACK_TIMEOUT,
-) -> Mapping[str, Any]:
-    deadline = asyncio.get_event_loop().time() + timeout
-    while True:
-        remaining = deadline - asyncio.get_event_loop().time()
-        if remaining <= 0:
-            raise asyncio.TimeoutError("Timed out awaiting Kraken acknowledgement")
-        message = await asyncio.wait_for(ws.recv(), timeout=remaining)
-        try:
-            payload = json.loads(message)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(payload, Mapping) and _is_order_message(payload, client_order_id, None):
-            return payload
-        if isinstance(payload, list) and len(payload) >= 2 and isinstance(payload[1], Mapping):
-            if _is_order_message(payload[1], client_order_id, None):
-                return payload[1]
-
-
-async def _monitor_order(
-    ws: WebSocketClientProtocol,
-    *,
-    token: str,
-    state: OrderState,
-    client_order_id: str,
-    expected_qty: float,
-    timeout: float,
-    cancel_after: Optional[float] = None,
-) -> None:
-    await _subscribe(ws, token, "openOrders", "ownTrades")
-    start = time.time()
-    last_activity = time.time()
-    while True:
-        try:
-            message = await asyncio.wait_for(ws.recv(), timeout=HEARTBEAT)
-            last_activity = time.time()
-        except asyncio.TimeoutError:
-            await _send_json(ws, {"event": "ping"})
-            if cancel_after and (time.time() - start) > cancel_after:
-                state.status = "cancelled"
-                state.errors.append("Canceled due to cancel_after timeout")
-                return
-            if (time.time() - start) > timeout:
-                state.errors.append("Order monitoring timeout reached")
-                return
-            continue
-
-        try:
-            payload = json.loads(message)
-        except json.JSONDecodeError:
-            continue
-
-        if isinstance(payload, Mapping):
-            if payload.get("event") == "heartbeat":
-                continue
-            if payload.get("event") == "systemStatus":
-                continue
-            if payload.get("event") == "subscriptionStatus" and payload.get("status") != "subscribed":
-                state.errors.append(f"Subscription failed: {payload}")
-                continue
-            _update_state_from_message(
-                state,
-                payload,
-                client_order_id=client_order_id,
-                expected_qty=expected_qty,
-            )
-        elif isinstance(payload, list) and len(payload) >= 2 and isinstance(payload[1], Mapping):
-            _update_state_from_message(
-                state,
-                payload[1],
-                client_order_id=client_order_id,
-                expected_qty=expected_qty,
-            )
-
-        if state.status in {"filled", "canceled", "cancelled", "rejected", "expired"}:
-            return
-
-        if cancel_after and (time.time() - start) > cancel_after:
-            state.status = "cancelled"
-            state.errors.append("Canceled due to cancel_after timeout")
-            return
-        if (time.time() - start) > timeout:
-            state.errors.append("Order monitoring timeout reached")
-            return
-        if (time.time() - last_activity) > HEARTBEAT * 3:
-            await _send_json(ws, {"event": "ping"})
-
-
-async def execute_order(account_id: str, intent: Mapping[str, Any]) -> Dict[str, Any]:
-    credentials = _load_credentials(account_id)
-    client_order_id = str(intent.get("client_order_id") or intent.get("clientOrderId") or uuid.uuid4())
-    ws_payload = _build_ws_payload(intent, client_order_id)
-    raw_expected_qty = intent.get("qty") or intent.get("quantity") or ws_payload.get("volume")
-    try:
-        expected_qty = float(raw_expected_qty) if raw_expected_qty is not None else 0.0
-    except (TypeError, ValueError):
-        expected_qty = 0.0
-
-    state = OrderState(status="pending")
-    cancel_ids: List[str] = []
-    if intent.get("cancel_order_id"):
-        cancel_ids.append(str(intent["cancel_order_id"]))
-    if intent.get("cancel_order_ids"):
-        cancel_ids.extend(str(value) for value in intent["cancel_order_ids"])
-    if intent.get("replace_order_id"):
-        cancel_ids.append(str(intent["replace_order_id"]))
-    if cancel_ids:
-        cancel_ids = list(dict.fromkeys(cancel_ids))
-
-    timeout = float(intent.get("monitor_timeout") or DEFAULT_MONITOR_TIMEOUT)
-    cancel_after = intent.get("cancel_after")
-    cancel_after_value: Optional[float]
-    if cancel_after is None:
-        cancel_after_value = None
-    else:
-        try:
-            cancel_after_value = float(cancel_after)
-        except (TypeError, ValueError):
-            state.errors.append(f"Invalid cancel_after value: {cancel_after}")
-            cancel_after_value = None
-
-    ws: Optional[WebSocketClientProtocol] = None
-    token: Optional[str] = None
-    ack: Optional[Mapping[str, Any]] = None
-
-    try:
-        token = await _fetch_ws_token(credentials)
-        ws = await _connect_with_retry()
-
-        if cancel_ids:
-            cancel_message = {"event": "cancelOrder", "token": token, "txid": cancel_ids}
-            await _send_json(ws, cancel_message)
-
-        ws_payload_with_token = dict(ws_payload)
-        ws_payload_with_token["token"] = token
-
-        await _send_json(ws, ws_payload_with_token)
-        try:
-            ack = await _await_ack(ws, client_order_id)
-        except asyncio.TimeoutError as exc:
-            raise RuntimeError("Kraken websocket acknowledgement timeout") from exc
-
-        _update_state_from_message(
-            state,
-            dict(ack),
-            client_order_id=client_order_id,
-            expected_qty=expected_qty,
+        self._lock = threading.RLock()
+        self._snapshot = _CredentialSnapshot(version=0, payload={})
+        self._listeners: List[Callable[[Dict[str, Any], int], None]] = []
+        self._stop_event = threading.Event()
+        self._reload_signal = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"kraken-credential-watcher-{account_id}",
+            daemon=True,
         )
 
-        if state.status in {"error", "rejected"}:
-            state.errors.append(f"Order rejected by websocket: {ack}")
-            return state.to_dict()
+        self._observer: Any | None = None
+        self._load_initial_snapshot()
+        self._start_observer()
+        self._thread.start()
 
-        await _monitor_order(
-            ws,
-            token=token,
-            state=state,
-            client_order_id=client_order_id,
-            expected_qty=expected_qty,
-            timeout=timeout,
-            cancel_after=cancel_after_value,
-        )
-    except Exception as exc:
-        logger.warning("Kraken websocket flow failed, attempting REST fallback: %s", exc)
-        state.errors.append(str(exc))
-        if cancel_ids:
+    # ------------------------------------------------------------------
+    # Lifecycle helpers
+    # ------------------------------------------------------------------
+    @classmethod
+    def instance(cls, account_id: str) -> "KrakenCredentialWatcher":
+        """Return a shared watcher for the provided account."""
+
+        with cls._instances_lock:
+            watcher = cls._instances.get(account_id)
+            if watcher is None:
+                watcher = cls(account_id)
+                cls._instances[account_id] = watcher
+            return watcher
+
+    @classmethod
+    def reset_instances(cls) -> None:
+        """Dispose all shared watchers (used in tests)."""
+
+        with cls._instances_lock:
+            instances = list(cls._instances.values())
+            cls._instances.clear()
+        for watcher in instances:
+            watcher.close()
+
+    def close(self) -> None:
+        """Stop the watcher and associated resources."""
+
+        if self._stop_event.is_set():
+            return
+        self._stop_event.set()
+        self._reload_signal.set()
+        if self._observer is not None:
             try:
-                await _rest_cancel_order(credentials, cancel_ids)
-            except Exception as cancel_exc:
-                state.errors.append(f"Cancel fallback failed: {cancel_exc}")
+                self._observer.stop()
+                self._observer.join(timeout=2.0)
+            except Exception:  # pragma: no cover - observer specific errors
+                LOGGER.exception("Failed stopping watchdog observer")
+        if self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        with self._instances_lock:
+            for key, watcher in list(self._instances.items()):
+                if watcher is self:
+                    self._instances.pop(key, None)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def subscribe(self, callback: Callable[[Dict[str, Any], int], None]) -> Callable[[], None]:
+        """Register a callback invoked when credentials change."""
+
+        with self._lock:
+            self._listeners.append(callback)
+
+        def _unsubscribe() -> None:
+            with self._lock:
+                try:
+                    self._listeners.remove(callback)
+                except ValueError:
+                    pass
+
+        return _unsubscribe
+
+    def snapshot(self) -> Tuple[Dict[str, Any], int]:
+        """Return the latest credential payload and its version."""
+
+        with self._lock:
+            return dict(self._snapshot.payload), self._snapshot.version
+
+    def trigger_refresh(self) -> None:
+        """Force a credential refresh (used in tests or manual rotation)."""
+
+        self._reload_signal.set()
+
+    def wait_for_version(self, target_version: int, timeout: float = 5.0) -> bool:
+        """Block until the watcher observes ``target_version`` or timeout."""
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self._lock:
+                if self._snapshot.version >= target_version:
+                    return True
+            time.sleep(0.05)
+        return False
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _load_initial_snapshot(self) -> None:
         try:
-            rest_response = await _rest_add_order(credentials, ws_payload)
-        except Exception as rest_exc:
-            state.errors.append(f"REST fallback failed: {rest_exc}")
-            state.status = "error"
-            return state.to_dict()
+            payload = self._load_credentials()
+        except Exception as exc:  # pragma: no cover - initialization errors
+            LOGGER.exception("Unable to load Kraken credentials: %s", exc)
+            payload = {}
+        with self._lock:
+            self._snapshot = _CredentialSnapshot(version=0, payload=payload)
 
-        result = rest_response.get("result") or {}
-        txids = result.get("txid") or result.get("txids") or []
-        if isinstance(txids, list) and txids:
-            state.exchange_order_id = txids[0]
-        elif isinstance(txids, str):
-            state.exchange_order_id = txids
-        state.status = "accepted" if not rest_response.get("error") else "error"
-        errors = rest_response.get("error") or []
-        state.errors.extend(str(err) for err in errors)
-        return state.to_dict()
-    finally:
-        if ws is not None:
+    def _start_observer(self) -> None:
+        if self._secret_path is None:
+            return
+        if not self._secret_path.exists():
+            return
+        observer = self._observer_factory() if callable(self._observer_factory) else None
+        if observer is None:
+            return
+        handler = _SecretChangeHandler(self._secret_path, self._reload_signal.set)
+        try:
+            observer.schedule(handler, str(self._secret_path.parent), recursive=False)
+        except Exception:  # pragma: no cover - observer scheduling issues
+            LOGGER.exception("Failed to schedule watchdog observer")
+            return
+        observer.daemon = True
+        observer.start()
+        self._observer = observer
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            triggered = self._reload_signal.wait(timeout=self._refresh_interval)
+            if self._stop_event.is_set():
+                break
+            if triggered:
+                self._reload_signal.clear()
+            if self._debounce_seconds:
+                time.sleep(self._debounce_seconds)
             try:
-                await ws.close()
-            except Exception:  # pragma: no cover - best effort
-                logger.debug("Failed to close Kraken websocket cleanly", exc_info=True)
+                self._refresh_credentials()
+            except Exception:  # pragma: no cover - handled with logging
+                LOGGER.exception("Failed refreshing Kraken credentials")
 
-    if not state.exchange_order_id and ack:
-        state.exchange_order_id = str(ack.get("txid") or ack.get("orderId") or "") or None
+    def _refresh_credentials(self) -> None:
+        if self._stop_event.is_set():
+            return
+        if (
+            self._observer is None
+            and self._secret_path is not None
+            and self._secret_path.exists()
+        ):
+            self._start_observer()
+        payload = self._load_credentials()
+        with self._lock:
+            if not self._snapshot.payload or _material_changed(self._snapshot.payload, payload):
+                version = self._snapshot.version + 1
+                self._snapshot = _CredentialSnapshot(version=version, payload=payload)
+                listeners = list(self._listeners)
+            else:
+                listeners = []
+                version = self._snapshot.version
+        for callback in listeners:
+            try:
+                callback(dict(payload), version)
+            except Exception:  # pragma: no cover - listeners handle their own errors
+                LOGGER.exception("Credential listener failed for account %s", self.account_id)
 
-    if state.status in {"pending", "open"}:
-        state.status = "working"
+    def _load_credentials(self) -> Dict[str, Any]:
+        if self._secret_path and self._secret_path.exists():
+            return self._load_from_file(self._secret_path)
+        # Fallback to secret manager lookup
+        payload = self._manager.get_credentials()
+        payload.setdefault("metadata", {})
+        payload["metadata"] = _sanitize_metadata(dict(payload["metadata"]))
+        return payload
 
-    return state.to_dict()
+    def _load_from_file(self, path: Path) -> Dict[str, Any]:
+        data = json.loads(path.read_text())
+        key = data.get("api_key") or data.get("key")
+        secret = data.get("api_secret") or data.get("secret")
+        if not key or not secret:
+            raise ValueError(f"Credential file at {path} missing key/secret")
+        metadata = _sanitize_metadata({
+            "secret_path": str(path),
+            "material_present": True,
+            "api_key": key,
+            "api_secret": secret,
+        })
+        return {"api_key": key, "api_secret": secret, "metadata": metadata}
+
+
+__all__ = ["KrakenCredentialWatcher"]
+
+

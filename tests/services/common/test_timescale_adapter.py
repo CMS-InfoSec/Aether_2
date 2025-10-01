@@ -117,3 +117,48 @@ def test_credential_rotation_status_returns_latest_entry(adapter: TimescaleAdapt
         "rotated_at": later_rotation,
     }
     assert latest_status is not status
+
+
+def test_reset_clears_global_rolling_volume_cache() -> None:
+    TimescaleAdapter.reset()
+    TimescaleAdapter.seed_rolling_volume(
+        {
+            "acct-1": {
+                "BTC-USD": {
+                    "notional": 123.45,
+                    "basis_ts": datetime.now(timezone.utc),
+                }
+            }
+        }
+    )
+
+    assert TimescaleAdapter._rolling_volume
+
+    TimescaleAdapter.reset()
+
+    assert TimescaleAdapter._rolling_volume == {}
+
+
+def test_reset_clears_account_rolling_volume_cache_only_for_target_account() -> None:
+    TimescaleAdapter.reset()
+    TimescaleAdapter.seed_rolling_volume(
+        {
+            "acct-1": {
+                "BTC-USD": {
+                    "notional": 123.45,
+                    "basis_ts": datetime.now(timezone.utc),
+                }
+            },
+            "acct-2": {
+                "ETH-USD": {
+                    "notional": 678.9,
+                    "basis_ts": datetime.now(timezone.utc),
+                }
+            },
+        }
+    )
+
+    TimescaleAdapter.reset(account_id="acct-1")
+
+    assert "acct-1" not in TimescaleAdapter._rolling_volume
+    assert "acct-2" in TimescaleAdapter._rolling_volume
