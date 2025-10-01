@@ -96,14 +96,56 @@ spec:
       rules:
         - record: trading:latency:availability
           expr: 1 - (sum(rate(order_gateway_request_errors_total[5m])) / sum(rate(order_gateway_requests_total[5m])))
-        - alert: TradingSLOBreach
-          expr: trading:latency:availability < 0.995
-          for: 15m
+        - alert: oms_latency_slo_breach
+          expr: |
+            histogram_quantile(0.99, sum(rate(oms_order_latency_seconds_bucket[5m])) by (le)) > 0.12
+          for: 10m
           labels:
             severity: critical
+            slo_target: "p99<=0.150s"
           annotations:
-            summary: SLO breach on trading availability
-            description: Investigate upstream dependencies.
+            summary: OMS latency approaching 150 ms SLO budget
+            description: Investigate exchange connectivity or OMS backpressure.
+            runbook: docs/runbooks/exchange_outage.md
+            slo_reference: docs/slo.md#oms-latency
+        - alert: ws_latency_slo_breach
+          expr: |
+            histogram_quantile(0.99, sum(rate(ws_delivery_latency_seconds_bucket[5m])) by (le)) > 0.25
+          for: 15m
+          labels:
+            severity: warning
+            slo_target: "p99<=0.300s"
+          annotations:
+            summary: WebSocket delivery latency nearing 300 ms SLO
+            description: Validate gateway consumers and cache warmers.
+            runbook: docs/runbooks/websocket_desync.md
+            slo_reference: docs/slo.md#websocket-ingest-latency
+        - alert: kill_switch_slo_warning
+          expr: max_over_time(kill_switch_response_seconds[5m]) > 45
+          for: 1m
+          labels:
+            severity: critical
+            slo_target: "response<=60s"
+          annotations:
+            summary: Kill-switch response time exceeded 45 s warning threshold
+            description: Confirm automation is halting order flow fast enough.
+            runbook: docs/runbooks/kill_switch_activation.md
+            slo_reference: docs/slo.md#kill-switch-response
+        - alert: model_canary_promotion_slow
+          expr: |
+            (sum(increase(model_canary_promotion_duration_minutes_count[24h])) > 0)
+            and ignoring(job)
+            (sum(increase(model_canary_promotion_duration_minutes_bucket{le="30"}[24h]))
+             < sum(increase(model_canary_promotion_duration_minutes_count[24h])))
+          for: 5m
+          labels:
+            severity: warning
+            slo_target: "p95<=45m"
+          annotations:
+            summary: Consecutive canary promotions exceeding 30 minute alert threshold
+            description: Inspect canary validation and feature pipelines.
+            runbook: docs/runbooks/model_rollback.md
+            slo_reference: docs/slo.md#model-canary-promotion
 ---
 apiVersion: v1
 kind: ConfigMap

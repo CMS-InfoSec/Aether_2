@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping
@@ -44,17 +45,18 @@ class QuarterlyRecordingSession:
             self.audit_entries.append(params)
             return FakeResult([])
 
-        if "from orders" in normalized_query and "submitted_at" in normalized_query:
+        if "from orders" in normalized_query and "submitted_ts" in normalized_query:
+            assert "symbol as instrument" in normalized_query
             start = params.get("start")
             end = params.get("end")
             aggregates: Dict[tuple[str, str], Dict[str, Any]] = {}
             for order in self._orders.values():
-                submitted = order["submitted_at"]
+                submitted = order["submitted_ts"]
                 if start and submitted < start:
                     continue
                 if end and submitted >= end:
                     continue
-                key = (order["account_id"], order["market"])
+                key = (order["account_id"], order["symbol"])
                 bucket = aggregates.setdefault(
                     key, {"order_count": 0, "submitted_qty": 0.0}
                 )
@@ -65,26 +67,27 @@ class QuarterlyRecordingSession:
             rows = [
                 {
                     "account_id": account_id,
-                    "instrument": market,
+                    "instrument": symbol,
                     "order_count": values["order_count"],
                     "submitted_qty": values["submitted_qty"],
                 }
-                for (account_id, market), values in aggregates.items()
+                for (account_id, symbol), values in aggregates.items()
             ]
             return FakeResult(rows)
 
-        if "from fills" in normalized_query and "join orders" in normalized_query:
+        if "from fills" in normalized_query and "fill_ts" in normalized_query:
+            assert "f.symbol as instrument" in normalized_query
             start = params.get("start")
             end = params.get("end")
             aggregates: Dict[tuple[str, str], Dict[str, Any]] = {}
             for fill in self._fills:
-                fill_time = fill["fill_time"]
+                fill_time = fill["fill_ts"]
                 if start and fill_time < start:
                     continue
                 if end and fill_time >= end:
                     continue
                 order = self._orders[fill["order_id"]]
-                key = (order["account_id"], fill.get("market", order["market"]))
+                key = (order["account_id"], fill.get("symbol", order["symbol"]))
                 bucket = aggregates.setdefault(key, {"fill_count": 0, "notional": 0.0})
                 bucket["fill_count"] += 1
                 bucket["notional"] += float(fill.get("size", 0.0)) * float(
@@ -93,25 +96,30 @@ class QuarterlyRecordingSession:
             rows = [
                 {
                     "account_id": account_id,
-                    "instrument": market,
+                    "instrument": symbol,
                     "fill_count": values["fill_count"],
                     "notional": values["notional"],
                 }
-                for (account_id, market), values in aggregates.items()
+                for (account_id, symbol), values in aggregates.items()
             ]
             return FakeResult(rows)
 
         if "from audit_logs" in normalized_query:
+
             start = params.get("start")
             end = params.get("end")
             rows = []
             for entry in self._audits:
+
                 created_at = entry["created_at"]
                 if start and created_at < start:
+
                     continue
                 if end and created_at >= end:
                     continue
+
                 rows.append({"account_id": entry["actor"], "created_at": created_at})
+
             return FakeResult(rows)
 
         raise AssertionError(f"Unexpected query: {query}")
@@ -123,47 +131,47 @@ def quarterly_session() -> QuarterlyRecordingSession:
         {
             "order_id": "ord-1",
             "account_id": "alpha",
-            "market": "BTC-USD",
+            "symbol": "BTC-USD",
             "size": 1,
-            "submitted_at": datetime(2024, 4, 2, 0, 0, tzinfo=timezone.utc),
+            "submitted_ts": datetime(2024, 4, 2, 0, 0, tzinfo=timezone.utc),
         },
         {
             "order_id": "ord-2",
             "account_id": "alpha",
-            "market": "BTC-USD",
+            "symbol": "BTC-USD",
             "size": 1,
-            "submitted_at": datetime(2024, 5, 1, 0, 0, tzinfo=timezone.utc),
+            "submitted_ts": datetime(2024, 5, 1, 0, 0, tzinfo=timezone.utc),
         },
         {
             "order_id": "ord-3",
             "account_id": "beta",
-            "market": "ETH-USD",
+            "symbol": "ETH-USD",
             "size": 2,
-            "submitted_at": datetime(2024, 5, 5, 0, 0, tzinfo=timezone.utc),
+            "submitted_ts": datetime(2024, 5, 5, 0, 0, tzinfo=timezone.utc),
         },
     ]
     fills = [
         {
             "fill_id": "fill-1",
             "order_id": "ord-1",
-            "market": "BTC-USD",
-            "fill_time": datetime(2024, 4, 2, 0, 5, tzinfo=timezone.utc),
+            "symbol": "BTC-USD",
+            "fill_ts": datetime(2024, 4, 2, 0, 5, tzinfo=timezone.utc),
             "price": 100,
             "size": 1,
         },
         {
             "fill_id": "fill-2",
             "order_id": "ord-2",
-            "market": "BTC-USD",
-            "fill_time": datetime(2024, 5, 1, 0, 5, tzinfo=timezone.utc),
+            "symbol": "BTC-USD",
+            "fill_ts": datetime(2024, 5, 1, 0, 5, tzinfo=timezone.utc),
             "price": 110,
             "size": 1,
         },
         {
             "fill_id": "fill-3",
             "order_id": "ord-3",
-            "market": "ETH-USD",
-            "fill_time": datetime(2024, 5, 5, 0, 5, tzinfo=timezone.utc),
+            "symbol": "ETH-USD",
+            "fill_ts": datetime(2024, 5, 5, 0, 5, tzinfo=timezone.utc),
             "price": 50,
             "size": 2,
         },
@@ -173,16 +181,19 @@ def quarterly_session() -> QuarterlyRecordingSession:
             "audit_id": "audit-1",
             "actor": "alpha",
             "created_at": datetime(2024, 4, 15, 0, 0, tzinfo=timezone.utc),
+
         },
         {
             "audit_id": "audit-2",
             "actor": "alpha",
             "created_at": datetime(2024, 5, 20, 0, 0, tzinfo=timezone.utc),
+
         },
         {
             "audit_id": "audit-3",
             "actor": "beta",
             "created_at": datetime(2024, 4, 20, 0, 0, tzinfo=timezone.utc),
+
         },
     ]
     return QuarterlyRecordingSession(orders, fills, audits)

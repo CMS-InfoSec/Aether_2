@@ -53,7 +53,7 @@ class RecordingSession:
             end = params.get("end")
             rows: List[Dict[str, Any]] = []
             for fill in self._fills:
-                fill_ts = fill["fill_time"]
+                fill_ts = fill["fill_ts"]
                 if start and fill_ts < start:
                     continue
                 if end and fill_ts >= end:
@@ -70,17 +70,21 @@ class RecordingSession:
                         "size": fill["size"],
                         "price": fill["price"],
                         "fee": fill.get("fee"),
-                        "market": order["market"],
+
+                        "instrument": fill.get("symbol")
+                        or order.get("symbol")
+                        or order.get("market"),
+
                     }
                 )
             return FakeResult(rows)
 
-        if "o.submitted_at" in normalized_query:
+        if "o.submitted_ts" in normalized_query:
             start = params.get("start")
             end = params.get("end")
             rows = []
             for order in self._orders.values():
-                submitted = order["submitted_at"]
+                submitted = order["submitted_ts"]
                 if start and submitted < start:
                     continue
                 if end and submitted >= end:
@@ -92,9 +96,11 @@ class RecordingSession:
                     {
                         "order_id": order["order_id"],
                         "account_id": account_id,
-                        "market": order["market"],
+
+                        "instrument": order.get("symbol") or order.get("market"),
+
                         "size": order["size"],
-                        "submitted_at": submitted,
+                        "submitted_ts": submitted,
                     }
                 )
             return FakeResult(rows)
@@ -114,34 +120,46 @@ def sample_session() -> RecordingSession:
         {
             "order_id": "ord-1",
             "account_id": "alpha",
+
             "market": "BTC-USD",
+
+            "symbol": "BTC-USD",
             "side": "BUY",
             "size": 1,
-            "submitted_at": datetime(2024, 5, 1, 0, 0, tzinfo=timezone.utc),
+            "submitted_ts": datetime(2024, 5, 1, 0, 0, tzinfo=timezone.utc),
         },
         {
             "order_id": "ord-2",
             "account_id": "alpha",
+
             "market": "BTC-USD",
+
+            "symbol": "BTC-USD",
             "side": "SELL",
             "size": 1,
-            "submitted_at": datetime(2024, 5, 1, 1, 0, tzinfo=timezone.utc),
+            "submitted_ts": datetime(2024, 5, 1, 1, 0, tzinfo=timezone.utc),
         },
         {
             "order_id": "ord-3",
             "account_id": "beta",
+
             "market": "ETH-USD",
+
+            "symbol": "ETH-USD",
             "side": "SELL",
             "size": 2,
-            "submitted_at": datetime(2024, 5, 1, 2, 0, tzinfo=timezone.utc),
+            "submitted_ts": datetime(2024, 5, 1, 2, 0, tzinfo=timezone.utc),
         },
     ]
     fills = [
         {
             "fill_id": "fill-1",
             "order_id": "ord-1",
+
             "market": "BTC-USD",
-            "fill_time": datetime(2024, 5, 1, 0, 15, tzinfo=timezone.utc),
+            "symbol": "BTC-USD",
+            "fill_ts": datetime(2024, 5, 1, 0, 15, tzinfo=timezone.utc),
+
             "price": 100,
             "size": 1,
             "fee": 0.5,
@@ -149,8 +167,11 @@ def sample_session() -> RecordingSession:
         {
             "fill_id": "fill-2",
             "order_id": "ord-2",
+
             "market": "BTC-USD",
-            "fill_time": datetime(2024, 5, 1, 1, 15, tzinfo=timezone.utc),
+            "symbol": "BTC-USD",
+            "fill_ts": datetime(2024, 5, 1, 1, 15, tzinfo=timezone.utc),
+
             "price": 110,
             "size": 1,
             "fee": 0.6,
@@ -158,8 +179,11 @@ def sample_session() -> RecordingSession:
         {
             "fill_id": "fill-3",
             "order_id": "ord-3",
+
             "market": "ETH-USD",
-            "fill_time": datetime(2024, 5, 1, 2, 15, tzinfo=timezone.utc),
+            "symbol": "ETH-USD",
+            "fill_ts": datetime(2024, 5, 1, 2, 15, tzinfo=timezone.utc),
+
             "price": 50,
             "size": 2,
             "fee": 0.4,
@@ -215,5 +239,7 @@ def test_generate_daily_pnl_creates_audit_log_entries(tmp_path: Path, sample_ses
     )
     assert len(keys) == 1
     assert len(sample_session.audit_entries) == 1
+
     payload = json.loads(sample_session.audit_entries[0]["payload"])
     assert "daily_pnl/2024-05-01.csv" in payload["metadata"]["object_key"]
+

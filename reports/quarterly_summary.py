@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import io
+import json
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
@@ -17,28 +18,30 @@ LOGGER = logging.getLogger(__name__)
 ORDER_QUERY = """
 SELECT
     account_id,
-    market AS instrument,
+    symbol AS instrument,
     COALESCE(SUM(size), 0) AS submitted_qty,
     COUNT(*) AS order_count
 FROM orders
-WHERE submitted_at >= %(start)s AND submitted_at < %(end)s
-GROUP BY account_id, market
+WHERE submitted_ts >= %(start)s AND submitted_ts < %(end)s
+GROUP BY account_id, symbol
 """
 
 FILL_QUERY = """
 SELECT
     o.account_id,
-    f.market AS instrument,
+    f.symbol AS instrument,
     COALESCE(SUM(f.size * f.price), 0) AS notional,
     COUNT(*) AS fill_count
 FROM fills AS f
 JOIN orders AS o ON o.order_id = f.order_id
-WHERE f.fill_time >= %(start)s AND f.fill_time < %(end)s
-GROUP BY o.account_id, f.market
+WHERE f.fill_ts >= %(start)s AND f.fill_ts < %(end)s
+GROUP BY o.account_id, f.symbol
 """
 
 AUDIT_QUERY = """
+
 SELECT actor AS account_id, created_at
+
 FROM audit_logs
 WHERE created_at >= %(start)s AND created_at < %(end)s
 """
@@ -99,6 +102,14 @@ def merge_quarterly_metrics(
 
     audit_counts: Dict[str, int] = defaultdict(int)
     for audit in audits:
+        payload = audit.get("payload")
+        if isinstance(payload, str) and payload:
+            try:
+                audit["payload"] = json.loads(payload)
+            except json.JSONDecodeError:
+                LOGGER.debug("Failed to decode audit payload", exc_info=True)
+        elif payload is None:
+            audit.setdefault("payload", {})
         account_id = audit.get("account_id") or audit.get("actor")
         if account_id is None:
             continue
