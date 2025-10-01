@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, ClassVar, Dict, List
+
+from services.universe.repository import UniverseRepository
 
 
 @dataclass
@@ -43,17 +45,16 @@ class TimescaleAdapter:
 class RedisFeastAdapter:
     account_id: str
 
-    _features: ClassVar[Dict[str, Dict[str, Any]]] = {
-        "admin-eu": {"approved": ["BTC-USD", "ETH-USD"], "fees": {"BTC-USD": {"maker": 0.1, "taker": 0.2}}},
-        "admin-us": {"approved": ["SOL-USD"], "fees": {}},
-        "admin-apac": {"approved": ["BTC-USDT", "ETH-USDT"], "fees": {}},
-    }
+    _repository: UniverseRepository = field(init=False)
+
+    def __post_init__(self) -> None:
+        self._repository = UniverseRepository(account_id=self.account_id)
 
     def approved_instruments(self) -> List[str]:
-        return list(self._features.get(self.account_id, {}).get("approved", []))
+        return self._repository.approved_universe()
 
     def fee_override(self, instrument: str) -> Dict[str, Any] | None:
-        return self._features.get(self.account_id, {}).get("fees", {}).get(instrument)
+        return self._repository.fee_override(instrument)
 
 
 @dataclass

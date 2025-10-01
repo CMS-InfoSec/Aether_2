@@ -4,11 +4,23 @@ from __future__ import annotations
 import logging
 import uuid
 from contextvars import ContextVar
-from typing import Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
-from fastapi import Request
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.types import ASGIApp
+try:  # pragma: no cover - optional dependency for test environments
+    from fastapi import Request
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.types import ASGIApp
+except ImportError:  # pragma: no cover - fallback for unit tests without FastAPI
+    Request = Any  # type: ignore
+
+    class BaseHTTPMiddleware:  # type: ignore
+        def __init__(self, app: Any) -> None:
+            self.app = app
+
+        async def dispatch(self, request: Any, call_next: Callable[[Any], Awaitable]) -> Any:
+            return await call_next(request)
+
+    ASGIApp = Any  # type: ignore
 
 logger = logging.getLogger(__name__)
 
