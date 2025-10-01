@@ -79,8 +79,10 @@ class TimescaleAdapter:
 
     def __post_init__(self) -> None:
         self._metrics.setdefault(self.account_id, {"limit": 1_000_000.0, "usage": 0.0})
+
         self._telemetry.setdefault(self.account_id, [])
         self._credential_events.setdefault(self.account_id, [])
+
 
         account_events = self._events.setdefault(
             self.account_id,
@@ -91,10 +93,12 @@ class TimescaleAdapter:
         account_events.setdefault("events", [])
         account_events.setdefault("credential_rotations", [])
 
+
         self._risk_configs.setdefault(self.account_id, deepcopy(self._default_risk_config))
         self._daily_usage.setdefault(self.account_id, {})
         self._instrument_exposures.setdefault(self.account_id, {})
         self._credential_rotations.setdefault(self.account_id, {})
+
 
     # ------------------------------------------------------------------
     # OMS-inspired metrics
@@ -189,14 +193,14 @@ class TimescaleAdapter:
     def telemetry(self) -> List[Dict[str, Any]]:
         return [deepcopy(entry) for entry in self._telemetry.get(self.account_id, [])]
 
-    # ------------------------------------------------------------------
-    # Credential rotation tracking
-    # ------------------------------------------------------------------
 
-
+    # ------------------------------------------------------------------
+    # Credential rotation tracking & test helpers
+    # ------------------------------------------------------------------
     def record_credential_rotation(
-        self, *, secret_name: str, rotated_at: datetime | None = None
+        self, *, secret_name: str, rotated_at: Optional[datetime] = None
     ) -> Dict[str, Any]:
+
         timestamp = rotated_at or datetime.now(timezone.utc)
         record = self._credential_rotations.setdefault(self.account_id, {})
         record.setdefault("created_at", timestamp)
@@ -228,6 +232,7 @@ class TimescaleAdapter:
         if not events:
             return None
 
+
         created_at = events[0].get("created_at") or events[0].get("rotated_at")
         latest = deepcopy(events[-1])
         if "created_at" not in latest and created_at is not None:
@@ -237,6 +242,7 @@ class TimescaleAdapter:
             "created_at": latest.get("created_at"),
             "rotated_at": latest.get("rotated_at"),
         }
+
 
     def record_credential_access(self, *, secret_name: str, metadata: Dict[str, Any]) -> None:
         sanitized = deepcopy(metadata)
@@ -249,7 +255,9 @@ class TimescaleAdapter:
             "metadata": sanitized,
             "timestamp": datetime.now(timezone.utc),
         }
-        self._credential_events[self.account_id].append(deepcopy(payload))
+        events = self._credential_events.setdefault(self.account_id, [])
+        events.append(deepcopy(payload))
+
 
     def credential_events(self) -> List[Dict[str, Any]]:
         return [deepcopy(event) for event in self._credential_events.get(self.account_id, [])]
@@ -270,6 +278,7 @@ class TimescaleAdapter:
             cls._events.clear()
             cls._credential_rotations.clear()
             cls._credential_events.clear()
+            cls._credential_rotations.clear()
             return
 
         cls._metrics.pop(account_id, None)
@@ -280,6 +289,17 @@ class TimescaleAdapter:
         cls._events.pop(account_id, None)
         cls._credential_rotations.pop(account_id, None)
         cls._credential_events.pop(account_id, None)
+        cls._credential_rotations.pop(account_id, None)
+
+    @classmethod
+    def reset_rotation_state(cls, account_id: str | None = None) -> None:
+        if account_id is None:
+            cls._credential_events.clear()
+            cls._credential_rotations.clear()
+            return
+
+        cls._credential_events.pop(account_id, None)
+        cls._credential_rotations.pop(account_id, None)
 
 
 
@@ -289,12 +309,16 @@ class RedisFeastAdapter:
     repository_factory: Callable[[str], UniverseRepository] = field(
         default=UniverseRepository, repr=False
     )
+    repository: UniverseRepository | None = field(default=None, repr=False)
 
 
     _features: ClassVar[Dict[str, Dict[str, Any]]] = {
-        "admin-eu": {"approved": ["BTC-USD", "ETH-USD"], "fees": {"BTC-USD": {"maker": 0.1, "taker": 0.2}}},
+        "admin-eu": {
+            "approved": ["BTC-USD", "ETH-USD"],
+            "fees": {"BTC-USD": {"maker": 0.1, "taker": 0.2}},
+        },
         "admin-us": {"approved": ["SOL-USD"], "fees": {}},
-        "admin-apac": {"approved": ["BTC-USDT", "ETH-USDT"], "fees": {}},
+        "admin-apac": {"approved": ["BTC-USD", "ETH-USD"], "fees": {}},
     }
     _online_feature_store: ClassVar[Dict[str, Dict[str, Dict[str, Any]]]] = {
         "admin-eu": {
@@ -322,14 +346,24 @@ class RedisFeastAdapter:
 
     def __post_init__(self) -> None:
 
-        self._repository = self.repository or UniverseRepository(account_id=self.account_id)
+        if self.repository is not None:
+            self._repository = self.repository
+        else:
+            self._repository = self.repository_factory(self.account_id)
+
+
 
     def approved_instruments(self) -> List[str]:
+
+        assert self._repository is not None
+
         instruments = self._repository.approved_universe()
-        if instruments:
-            return list(instruments)
-        account_config = self._features.get(self.account_id, {})
-        return list(account_config.get("approved", []))
+        if not instruments:
+            fallback = self._features.get(self.account_id, {}).get("approved", [])
+            instruments = list(fallback)
+
+        return [symbol for symbol in instruments if symbol.endswith("-USD")]
+
 
     def fee_override(self, instrument: str) -> Dict[str, Any] | None:
         override = self._repository.fee_override(instrument)

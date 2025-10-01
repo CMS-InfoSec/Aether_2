@@ -1,3 +1,9 @@
+"""Universe service exposing USD-quoted trading books.
+
+Even when upstream Timescale data is unavailable, the service filters any
+fallback instruments to ensure only USD-quoted pairs are returned to clients.
+This guarantee protects downstream systems that assume a USD quote currency.
+"""
 
 from fastapi import Depends, FastAPI
 
