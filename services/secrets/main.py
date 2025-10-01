@@ -1,4 +1,7 @@
 
+from datetime import datetime, timezone
+from typing import Any, Dict
+
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 
 from services.common.adapters import KrakenSecretManager
@@ -15,6 +18,27 @@ app = FastAPI(title="Secrets Service")
 _audit_store = AuditLogStore()
 _audit_logger = TimescaleAuditLogger(_audit_store)
 _auditor = SensitiveActionRecorder(_audit_logger)
+
+
+def _normalize_metadata(metadata: Dict[str, Any], *, fallback_secret_name: str) -> Dict[str, Any]:
+    normalized = dict(metadata)
+    secret_name = normalized.get("secret_name", fallback_secret_name)
+    created_at = normalized.get("created_at")
+    rotated_at = normalized.get("rotated_at")
+
+    if created_at is None and rotated_at is None:
+        now = datetime.now(timezone.utc)
+        created_at = rotated_at = now
+    else:
+        if created_at is None:
+            created_at = rotated_at
+        if rotated_at is None:
+            rotated_at = created_at
+
+    normalized["secret_name"] = secret_name
+    normalized["created_at"] = created_at
+    normalized["rotated_at"] = rotated_at
+    return normalized
 
 
 @app.post("/secrets/kraken", response_model=KrakenCredentialResponse)
@@ -39,7 +63,7 @@ def upsert_kraken_secret(
         after=rotation["metadata"],
     )
 
-    metadata = rotation["metadata"]
+    metadata = _normalize_metadata(rotation.get("metadata", {}), fallback_secret_name=manager.secret_name)
 
     return KrakenCredentialResponse(
         account_id=account_id,
@@ -69,10 +93,12 @@ def kraken_secret_status(
             detail="No Kraken credential rotation metadata found.",
         )
 
+    metadata = _normalize_metadata(status_payload, fallback_secret_name=manager.secret_name)
+
     return KrakenSecretStatusResponse(
         account_id=account_id,
-        secret_name=status_payload["secret_name"],
-        created_at=status_payload["created_at"],
-        rotated_at=status_payload["rotated_at"],
+        secret_name=metadata["secret_name"],
+        created_at=metadata["created_at"],
+        rotated_at=metadata["rotated_at"],
     )
 

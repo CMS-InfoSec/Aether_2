@@ -194,9 +194,7 @@ class TimescaleAdapter:
     def telemetry(self) -> List[Dict[str, Any]]:
         return [deepcopy(entry) for entry in self._telemetry.get(self.account_id, [])]
 
-    # ------------------------------------------------------------------
-    # Credential rotation tracking
-    # ------------------------------------------------------------------
+
     # ------------------------------------------------------------------
     # Credential rotation tracking & test helpers
     # ------------------------------------------------------------------
@@ -292,15 +290,16 @@ class RedisFeastAdapter:
     repository_factory: Callable[[str], UniverseRepository] = field(
         default=UniverseRepository, repr=False
     )
-
-
-    _repository: UniverseRepository = field(init=False, repr=False)
+    repository: UniverseRepository | None = field(default=None, repr=False)
 
 
     _features: ClassVar[Dict[str, Dict[str, Any]]] = {
-        "admin-eu": {"approved": ["BTC-USD", "ETH-USD"], "fees": {"BTC-USD": {"maker": 0.1, "taker": 0.2}}},
+        "admin-eu": {
+            "approved": ["BTC-USD", "ETH-USD"],
+            "fees": {"BTC-USD": {"maker": 0.1, "taker": 0.2}},
+        },
         "admin-us": {"approved": ["SOL-USD"], "fees": {}},
-        "admin-apac": {"approved": ["BTC-USDT", "ETH-USDT"], "fees": {}},
+        "admin-apac": {"approved": ["BTC-USD", "ETH-USD"], "fees": {}},
     }
     _online_feature_store: ClassVar[Dict[str, Dict[str, Dict[str, Any]]]] = {
         "admin-eu": {
@@ -328,16 +327,34 @@ class RedisFeastAdapter:
 
     def __post_init__(self) -> None:
 
-        self._repository = self.repository_factory(self.account_id)
+        if self.repository is not None:
+            self._repository = self.repository
+        else:
+            self._repository = self.repository_factory(self.account_id)
+
 
 
     def approved_instruments(self) -> List[str]:
+
         assert self._repository is not None
-        return self._repository.approved_universe()
+
+        instruments = self._repository.approved_universe()
+        if not instruments:
+            fallback = self._features.get(self.account_id, {}).get("approved", [])
+            instruments = list(fallback)
+
+        return [symbol for symbol in instruments if symbol.endswith("-USD")]
+
 
     def fee_override(self, instrument: str) -> Dict[str, Any] | None:
-        assert self._repository is not None
-        return self._repository.fee_override(instrument)
+        override = self._repository.fee_override(instrument)
+        if override:
+            return dict(override)
+        account_config = self._features.get(self.account_id, {})
+        fees = account_config.get("fees", {})
+        if instrument not in fees:
+            return None
+        return dict(fees[instrument])
 
 
     def fetch_online_features(self, instrument: str) -> Dict[str, Any]:
@@ -365,50 +382,26 @@ class KrakenSecretManager:
         return self.secret_store.secret_name(self.account_id)
 
 
-    def get_credentials(self) -> Dict[str, str]:
-        assert self.secret_store is not None
-        return self.secret_store.read_credentials(self.account_id)
-
-
-    def get_credentials(self) -> Dict[str, str]:
-        assert self.k8s_client is not None
-        assert self.timescale is not None
-
-        secret = self.k8s_client.get_secret(self.secret_name)
-        if not secret:
-            raise RuntimeError(
-                f"Credential secret '{self.secret_name}' not found in namespace '{self.namespace}'"
-            )
-
-        missing = [field for field in ("api_key", "api_secret") if not secret.get(field)]
-        if missing:
-            formatted = ", ".join(sorted(missing))
-            raise RuntimeError(
-                f"Credential secret '{self.secret_name}' is missing required field(s): {formatted}"
-            )
-
-        credentials = {"api_key": secret["api_key"], "api_secret": secret["api_secret"]}
-
-        audit_metadata = {
-            "api_key": credentials["api_key"],
-            "api_secret": credentials["api_secret"],
-            "material_present": True,
-        }
-        self.timescale.record_credential_access(secret_name=self.secret_name, metadata=audit_metadata)
-
-        return credentials
-
     def rotate_credentials(self, *, api_key: str, api_secret: str) -> Dict[str, Any]:
         assert self.secret_store is not None  # for type checkers
         assert self.timescale is not None
 
         before_status = self.timescale.credential_rotation_status()
+        rotated_at = datetime.now(timezone.utc)
         self.secret_store.write_credentials(
             self.account_id,
             api_key=api_key,
             api_secret=api_secret,
         )
-        metadata = self.timescale.record_credential_rotation(secret_name=self.secret_name)
+        metadata = self.timescale.record_credential_rotation(
+            secret_name=self.secret_name,
+            rotated_at=rotated_at,
+        )
+        metadata = {
+            "secret_name": metadata.get("secret_name", self.secret_name),
+            "created_at": metadata.get("created_at", rotated_at),
+            "rotated_at": metadata.get("rotated_at", rotated_at),
+        }
 
         return {
             "metadata": metadata,
@@ -416,11 +409,34 @@ class KrakenSecretManager:
         }
 
     def get_credentials(self) -> Dict[str, str]:
+        """Return the stored Kraken API credentials for the account.
+
+        Raises:
+            RuntimeError: If no credentials have been provisioned for the account
+                in the configured namespace.
+        """
+
         assert self.secret_store is not None
+
         credentials = self.secret_store.read_credentials(self.account_id)
-        if credentials:
-            return credentials
-        return {"api_key": f"demo-key-{self.account_id}", "api_secret": f"demo-secret-{self.account_id}"}
+        if not credentials:
+            raise RuntimeError(
+                "No Kraken API credentials are provisioned for account"
+                f" '{self.account_id}'. Use the secrets service to rotate keys"
+                " before attempting to trade."
+            )
+
+        missing_fields = [
+            field for field in ("api_key", "api_secret") if not credentials.get(field)
+        ]
+        if missing_fields:
+            fields = ", ".join(sorted(missing_fields))
+            raise RuntimeError(
+                "Incomplete Kraken credentials for account"
+                f" '{self.account_id}': missing {fields}."
+            )
+
+        return {"api_key": credentials["api_key"], "api_secret": credentials["api_secret"]}
 
     def status(self) -> Optional[Dict[str, Any]]:
         assert self.timescale is not None

@@ -62,8 +62,10 @@ def test_credential_rotation_status_round_trip() -> None:
     status = adapter.credential_rotation_status()
 
     assert status == record
+
     assert set(status.keys()) == {"secret_name", "created_at", "rotated_at"}
     assert status["created_at"] == status["rotated_at"]
+
 
     TimescaleAdapter.reset_rotation_state(account_id="admin-eu")
     assert adapter.credential_rotation_status() is None

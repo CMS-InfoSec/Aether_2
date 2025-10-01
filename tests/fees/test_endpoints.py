@@ -59,6 +59,32 @@ def test_get_effective_fees_rejects_non_admin(client: TestClient) -> None:
     assert response.status_code == 403
 
 
+def test_get_effective_fees_handles_missing_repository_override(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    class StubRepository:
+        def __init__(self, account_id: str) -> None:
+            self.account_id = account_id
+
+        def approved_universe(self) -> list[str]:
+            return []
+
+        def fee_override(self, instrument: str) -> dict[str, float | str] | None:
+            return None
+
+    monkeypatch.setattr("services.common.adapters.UniverseRepository", StubRepository)
+
+    response = client.get(
+        "/fees/effective",
+        params={"isolation_segment": "seg-fees", "fee_tier": "standard"},
+        headers={"X-Account-Id": "admin-eu"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["fee"] == {"currency": "USD", "maker": 0.1, "taker": 0.2}
+
+
 def test_get_effective_fees_uses_repository_override(monkeypatch, client: TestClient) -> None:
     class StubRepository:
         def __init__(self) -> None:
