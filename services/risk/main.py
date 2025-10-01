@@ -1,9 +1,9 @@
 
 from fastapi import Depends, FastAPI, HTTPException, status
 
-from services.common.adapters import TimescaleAdapter
 from services.common.schemas import RiskValidationRequest, RiskValidationResponse
 from services.common.security import require_admin_account
+from services.risk.engine import RiskEngine
 
 app = FastAPI(title="Risk Service")
 
@@ -21,13 +21,7 @@ def validate_risk(
             detail="Account mismatch between header and payload.",
         )
 
-    timescale = TimescaleAdapter(account_id=account_id)
-    notional = request.gross_notional
-    within_limits = timescale.check_limits(notional)
-    reasons = [] if within_limits else ["Projected usage exceeds configured limits"]
-
-    if within_limits:
-        timescale.record_usage(notional)
-
-    return RiskValidationResponse(valid=within_limits, reasons=reasons, fee=request.fee)
+    engine = RiskEngine(account_id=account_id)
+    decision = engine.validate(request)
+    return decision
 

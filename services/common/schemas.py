@@ -35,8 +35,14 @@ class PolicyDecisionResponse(BaseModel):
 
 class RiskValidationRequest(BaseModel):
     account_id: str = Field(..., description="Trading account identifier")
+    instrument: str = Field(..., description="Instrument identifier for the intent")
     net_exposure: float = Field(..., description="Net exposure after order")
-    gross_notional: float = Field(..., description="Gross notional value of the order")
+    gross_notional: float = Field(..., ge=0.0, description="Gross notional value of the order")
+    projected_loss: float = Field(..., ge=0.0, description="Projected incremental loss for the trading day")
+    projected_fee: float = Field(..., ge=0.0, description="Projected incremental fees for the trading day")
+    var_95: float = Field(..., ge=0.0, description="Projected 95% VaR for the intent")
+    spread_bps: float = Field(..., ge=0.0, description="Expected spread in basis points")
+    latency_ms: float = Field(..., ge=0.0, description="Observed order latency in milliseconds")
     fee: FeeBreakdown = Field(..., description="Fees associated with the order")
 
 
@@ -100,13 +106,21 @@ class ApprovedUniverseResponse(BaseModel):
     )
 
 
-class KrakenCredentialRequest(BaseModel):
+class KrakenSecretRotationRequest(BaseModel):
     account_id: str = Field(..., description="Trading account identifier")
+    api_key: str = Field(..., description="Rotated Kraken API key")
+    api_secret: str = Field(..., description="Rotated Kraken API secret")
 
 
-class KrakenCredentialResponse(BaseModel):
+class KrakenSecretRotationResponse(BaseModel):
     account_id: str = Field(..., description="Trading account identifier")
-    api_key: str = Field(..., description="Kraken API key")
-    api_secret: str = Field(..., description="Kraken API secret")
-    fee: FeeBreakdown = Field(..., description="Fee context for credential usage")
+    secret_name: str = Field(..., description="Kubernetes secret storing credentials")
+    rotated_at: datetime = Field(..., description="Timestamp of the last rotation event")
+
+
+class KrakenSecretStatusResponse(BaseModel):
+    account_id: str = Field(..., description="Trading account identifier")
+    secret_name: str = Field(..., description="Kubernetes secret storing credentials")
+    created_at: datetime = Field(..., description="First time the secret was written")
+    rotated_at: datetime = Field(..., description="Most recent rotation timestamp")
 

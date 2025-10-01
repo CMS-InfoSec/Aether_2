@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import os
@@ -10,3 +11,4 @@ def token_hex(nbytes: Optional[int] = None) -> str:
     if nbytes is None:
         nbytes = 32
     return os.urandom(nbytes).hex()
+
