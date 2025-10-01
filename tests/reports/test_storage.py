@@ -43,6 +43,7 @@ def test_store_artifact_writes_expected_audit_log(tmp_path: Path) -> None:
     assert "INSERT INTO audit_log" in query
     assert set(params) == {
         "event_id",
+        "action",
         "entity_type",
         "entity_id",
         "actor",
@@ -51,6 +52,7 @@ def test_store_artifact_writes_expected_audit_log(tmp_path: Path) -> None:
     }
 
     assert isinstance(params["event_id"], UUID)
+    assert params["action"] == "report.artifact.stored"
     assert params["entity_type"] == "report_artifact"
     assert params["entity_id"] == artifact.object_key
     assert params["actor"] == "acct-123"
