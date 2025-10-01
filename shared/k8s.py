@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, ClassVar, Dict, Optional
 
@@ -12,6 +13,10 @@ try:  # pragma: no cover - optional dependency for real clusters
 except ImportError:  # pragma: no cover - fallback for tests/local
     client = None  # type: ignore
     config = None  # type: ignore
+
+
+ANNOTATION_CREATED_AT = "aether.kraken/createdAt"
+ANNOTATION_ROTATED_AT = "aether.kraken/lastRotatedAt"
 
 
 def _in_memory_store() -> Dict[str, Dict[str, Dict[str, str]]]:
@@ -54,6 +59,7 @@ class KrakenSecretStore:
 
         name = self.secret_name(account_id)
         payload = {"stringData": {"api_key": api_key, "api_secret": api_secret}}
+        now_iso = datetime.now(timezone.utc).isoformat()
 
         if hasattr(self.core_v1, "patch_namespaced_secret"):
             try:  # pragma: no branch - handled for ApiException absence
@@ -80,7 +86,17 @@ class KrakenSecretStore:
 
         # Fall back to in-memory store when the Kubernetes client is unavailable
         namespace_store = self._store.setdefault(self.namespace, {})
-        namespace_store[name] = {"api_key": api_key, "api_secret": api_secret}
+        record = namespace_store.get(name, {})
+        created_at = record.get("created_at") or now_iso
+        record.update(
+            {
+                "api_key": api_key,
+                "api_secret": api_secret,
+                "created_at": created_at,
+                "rotated_at": now_iso,
+            }
+        )
+        namespace_store[name] = record
 
     def get_secret(self, name: str) -> Dict[str, Any]:
         """Return the raw secret payload for the provided name."""
@@ -130,7 +146,16 @@ class KrakenSecretStore:
             "namespace": self.namespace,
             "api_key": secret.get("api_key"),
             "api_secret": secret.get("api_secret"),
+            "created_at": secret.get("created_at"),
+            "rotated_at": secret.get("rotated_at"),
         }
+        annotations = {}
+        if secret.get("created_at"):
+            annotations[ANNOTATION_CREATED_AT] = secret["created_at"]
+        if secret.get("rotated_at"):
+            annotations[ANNOTATION_ROTATED_AT] = secret["rotated_at"]
+        if annotations:
+            metadata["annotations"] = annotations
         return {"metadata": metadata, "data": dict(secret)}
 
     def read_credentials(self, account_id: str) -> Dict[str, str]:

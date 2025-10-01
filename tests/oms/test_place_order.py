@@ -5,6 +5,8 @@ from typing import Any, Dict, List
 import pytest
 from fastapi.testclient import TestClient
 
+from datetime import datetime, timezone
+
 from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
 from services.oms import main
 from services.oms.kraken_client import KrakenWSClient, KrakenWebsocketTimeout
@@ -27,6 +29,10 @@ def reset_state() -> None:
 def _seed_credentials(account_id: str) -> None:
     store = KrakenSecretStore()
     store.write_credentials(account_id, api_key="test-key", api_secret="test-secret")
+    TimescaleAdapter(account_id=account_id).record_credential_rotation(
+        secret_name=store.secret_name(account_id),
+        rotated_at=datetime.now(timezone.utc),
+    )
 
 
 @pytest.fixture(name="client")

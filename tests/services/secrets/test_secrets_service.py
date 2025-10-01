@@ -9,6 +9,7 @@ import pytest
 fastapi = pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
+from services.common import security
 from services.secrets import secrets_service
 
 
@@ -19,9 +20,11 @@ MFA_HEADERS = {"X-MFA-Context": "verified"}
 def kubernetes_core() -> MagicMock:
     core = MagicMock()
     secrets_service.app.dependency_overrides[secrets_service.get_core_v1_api] = lambda: core
+    security.ADMIN_ACCOUNTS.add("admin-eu")
     try:
         yield core
     finally:
+        security.ADMIN_ACCOUNTS.discard("admin-eu")
         secrets_service.app.dependency_overrides.pop(secrets_service.get_core_v1_api, None)
 
 
@@ -93,6 +96,54 @@ def test_status_returns_rotation_timestamp(
     assert payload["account_id"] == "admin-eu"
     assert payload["secret_name"] == secret_name
     assert datetime.fromisoformat(payload["last_rotated_at"].replace("Z", "+00:00")) == rotated_at
+
+
+def test_force_rotate_updates_annotations(
+    secure_api_client: tuple[TestClient, MagicMock]
+) -> None:
+    client, core = secure_api_client
+
+    secret_name = "kraken-keys-admin-eu"
+    original_rotated = "2024-01-01T00:00:00+00:00"
+    annotations = {
+        secrets_service.ANNOTATION_CREATED_AT: "2024-01-01T00:00:00+00:00",
+        secrets_service.ANNOTATION_ROTATED_AT: original_rotated,
+    }
+    metadata = SimpleNamespace(name=secret_name, annotations=annotations)
+    core.read_namespaced_secret.return_value = SimpleNamespace(metadata=metadata)
+
+    response = client.post(
+        "/secrets/kraken/force_rotate",
+        json={"account_id": "admin-eu"},
+        headers={"X-Account-ID": "admin-eu", **MFA_HEADERS},
+    )
+
+    assert response.status_code == 204
+    patch_kwargs = core.patch_namespaced_secret.call_args.kwargs
+    assert patch_kwargs["name"] == secret_name
+    annotations = patch_kwargs["body"]["metadata"]["annotations"]
+    assert annotations[secrets_service.ANNOTATION_CREATED_AT] == "2024-01-01T00:00:00+00:00"
+    new_rotated = annotations[secrets_service.ANNOTATION_ROTATED_AT]
+    assert new_rotated != original_rotated
+    parsed_rotated = datetime.fromisoformat(new_rotated.replace("Z", "+00:00"))
+    assert parsed_rotated > datetime.fromisoformat(original_rotated.replace("Z", "+00:00"))
+
+
+def test_force_rotate_missing_secret_returns_not_found(
+    secure_api_client: tuple[TestClient, MagicMock]
+) -> None:
+    client, core = secure_api_client
+
+    core.read_namespaced_secret.return_value = None
+
+    response = client.post(
+        "/secrets/kraken/force_rotate",
+        json={"account_id": "admin-eu"},
+        headers={"X-Account-ID": "admin-eu", **MFA_HEADERS},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Kraken credentials not found for account"
 
 
 def test_rejects_insecure_transport(kubernetes_core: MagicMock) -> None:

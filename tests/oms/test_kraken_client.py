@@ -1,12 +1,22 @@
 from __future__ import annotations
 
 import json
+import queue
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List
+from types import SimpleNamespace
+from typing import Any, Dict, List
+
+import pytest
 
 from services.common.adapters import TimescaleAdapter
-from services.oms.kraken_client import KrakenWSClient, _LoopbackSession
-from services.oms.oms_kraken import KrakenCredentialWatcher
+from services.oms.kraken_client import (
+    KrakenCredentialExpired,
+    KrakenWSClient,
+    _LoopbackSession,
+)
+from services.oms.oms_kraken import ANNOTATION_ROTATED_AT, KrakenCredentialWatcher
 from shared.k8s import KrakenSecretStore, KubernetesSecretClient
 
 
@@ -14,6 +24,21 @@ def setup_function() -> None:
     KrakenSecretStore.reset()
     TimescaleAdapter.reset()
     KrakenCredentialWatcher.reset_instances()
+
+
+def test_ws_client_rejects_expired_credentials() -> None:
+    rotated_at = datetime.now(timezone.utc) - timedelta(days=91)
+    client = KrakenWSClient(
+        "company",
+        credentials={
+            "api_key": "key",
+            "api_secret": "secret",
+            "metadata": {"rotated_at": rotated_at},
+        },
+    )
+
+    with pytest.raises(KrakenCredentialExpired):
+        client.add_order({"clientOrderId": "EXPIRED"})
 
 
 def test_ws_client_loads_credentials() -> None:
@@ -68,6 +93,71 @@ def test_client_reloads_credentials_on_secret_change(tmp_path: Path) -> None:
         assert len(session_credentials) == 2
     finally:
         client.close()
+        watcher.close()
+
+
+def test_kubernetes_watch_triggers_refresh() -> None:
+    class StubCoreV1:
+        def list_namespaced_secret(self, namespace: str, field_selector: str | None = None, timeout_seconds: int | None = None) -> List[Dict[str, str]]:
+            return []
+
+    class StubManager:
+        def __init__(self) -> None:
+            self.secret_store = SimpleNamespace(
+                namespace="aether-secrets",
+                core_v1=StubCoreV1(),
+            )
+            self.secret_name = "kraken-keys-company"
+            self._counter = 0
+
+        def get_credentials(self) -> Dict[str, Any]:  # type: ignore[override]
+            self._counter += 1
+            rotated = (datetime.now(timezone.utc) + timedelta(seconds=self._counter)).isoformat()
+            return {
+                "api_key": f"key-{self._counter}",
+                "api_secret": f"secret-{self._counter}",
+                "metadata": {
+                    "annotations": {ANNOTATION_ROTATED_AT: rotated},
+                },
+            }
+
+    class StubWatch:
+        def __init__(self) -> None:
+            self._queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
+            self._stopped = False
+
+        def stream(self, func: Any, *args: Any, **kwargs: Any):  # noqa: ANN001 - signature matches kubernetes watch
+            while not self._stopped:
+                try:
+                    event = self._queue.get(timeout=0.1)
+                except queue.Empty:
+                    if self._stopped:
+                        break
+                    continue
+                yield event
+
+        def stop(self) -> None:
+            self._stopped = True
+
+        def emit(self, event: Dict[str, Any]) -> None:
+            self._queue.put(event)
+
+    stub_watch = StubWatch()
+    manager = StubManager()
+    watcher = KrakenCredentialWatcher(
+        "company",
+        manager=manager,
+        watch_factory=lambda: stub_watch,
+        refresh_interval=30.0,
+        debounce_seconds=0.0,
+    )
+
+    try:
+        time.sleep(0.1)
+        initial_version = watcher.snapshot()[1]
+        stub_watch.emit({"type": "MODIFIED", "object": {"metadata": {"name": manager.secret_name}}})
+        assert watcher.wait_for_version(initial_version + 1, timeout=2.0)
+    finally:
         watcher.close()
 
 

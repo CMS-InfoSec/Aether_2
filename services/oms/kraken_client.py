@@ -3,10 +3,14 @@ from __future__ import annotations
 import random
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Optional
 
 from services.common.adapters import KrakenSecretManager
 from services.oms.oms_kraken import KrakenCredentialWatcher
+
+
+SECRET_MAX_AGE = timedelta(days=90)
 
 
 class KrakenWebsocketError(RuntimeError):
@@ -15,6 +19,10 @@ class KrakenWebsocketError(RuntimeError):
 
 class KrakenWebsocketTimeout(TimeoutError):
     """Raised when the websocket stalls beyond the configured timeout."""
+
+
+class KrakenCredentialExpired(RuntimeError):
+    """Raised when Kraken credentials exceed the enforced rotation window."""
 
 
 @dataclass
@@ -97,6 +105,34 @@ class KrakenWSClient:
         self._session_stale = True
 
     # session helpers -------------------------------------------------
+    def _credentials_expired(self) -> bool:
+        metadata = self._credentials.get("metadata") if isinstance(self._credentials, dict) else None
+        rotated_at = None
+        if isinstance(metadata, dict):
+            rotated_at = metadata.get("rotated_at") or metadata.get("last_rotated_at")
+            if rotated_at is None:
+                annotations = metadata.get("annotations") if isinstance(metadata.get("annotations"), dict) else {}
+                rotated_at = annotations.get("aether.kraken/lastRotatedAt")
+
+        if rotated_at is None:
+            return True
+
+        if isinstance(rotated_at, datetime):
+            ts = rotated_at
+        elif isinstance(rotated_at, str):
+            try:
+                ts = datetime.fromisoformat(rotated_at.replace("Z", "+00:00"))
+            except ValueError:
+                return True
+        else:
+            return True
+
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+
+        now = datetime.now(timezone.utc)
+        return now - ts > SECRET_MAX_AGE
+
     def _session_or_connect(self) -> Any:
         if (
             self._session is None
@@ -106,6 +142,10 @@ class KrakenWSClient:
                 and self._session_version != self._credential_version
             )
         ):
+            if self._credentials_expired():
+                raise KrakenCredentialExpired(
+                    "Kraken API credentials have expired; rotation required before trading."
+                )
             if self._session is not None:
                 self._close_session()
             self._session = self._session_factory(self._credentials)
