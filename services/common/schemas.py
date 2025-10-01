@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 
 from pydantic import BaseModel, Field, model_serializer, model_validator
@@ -153,17 +153,155 @@ class PolicyDecisionResponse(BaseModel):
     stop_loss_bps: float = Field(..., description="Configured stop-loss distance")
 
 
-class RiskValidationRequest(BaseModel):
-    account_id: str = Field(..., description="Trading account identifier")
-    instrument: str = Field(..., description="Instrument identifier for the intent")
-    net_exposure: float = Field(..., description="Net exposure after order")
-    gross_notional: float = Field(..., ge=0.0, description="Gross notional value of the order")
+class RiskIntentMetrics(BaseModel):
+    """Risk metrics produced by the policy engine for a specific intent."""
+
+    net_exposure: float = Field(..., description="Projected net exposure after applying the intent")
+    gross_notional: float = Field(..., ge=0.0, description="Gross notional value for the intent")
     projected_loss: float = Field(..., ge=0.0, description="Projected incremental loss for the trading day")
     projected_fee: float = Field(..., ge=0.0, description="Projected incremental fees for the trading day")
     var_95: float = Field(..., ge=0.0, description="Projected 95% VaR for the intent")
     spread_bps: float = Field(..., ge=0.0, description="Expected spread in basis points")
-    latency_ms: float = Field(..., ge=0.0, description="Observed order latency in milliseconds")
-    fee: FeeBreakdown = Field(..., description="Fees associated with the order")
+    latency_ms: float = Field(..., ge=0.0, description="Observed decision latency in milliseconds")
+
+
+class PolicyDecisionPayload(BaseModel):
+    """Container for the policy decision request/response pair."""
+
+    request: PolicyDecisionRequest = Field(..., description="Original policy decision request")
+    response: Optional[PolicyDecisionResponse] = Field(
+        None, description="Optional policy decision response produced by the policy engine"
+    )
+
+    def resolved_fee(self) -> FeeBreakdown:
+        if self.response is not None:
+            return self.response.effective_fee
+        return self.request.fee
+
+
+class RiskIntentPayload(BaseModel):
+    """Full policy intent envelope supplied to the risk service."""
+
+    policy_decision: PolicyDecisionPayload = Field(
+        ..., description="Policy decision request/response context for the intent"
+    )
+    metrics: RiskIntentMetrics = Field(..., description="Risk-related metrics for the intent")
+    book_snapshot: Optional[BookSnapshot] = Field(
+        None, description="Book snapshot aligned with the policy evaluation"
+    )
+    state: Optional[PolicyState] = Field(
+        None, description="Policy state context aligned with the decision"
+    )
+    confidence: Optional[ConfidenceMetrics] = Field(
+        None, description="Confidence metrics carried from the policy engine"
+    )
+
+    @model_validator(mode="after")
+    def _populate_defaults(self) -> "RiskIntentPayload":  # type: ignore[override]
+        if self.book_snapshot is None:
+            if self.policy_decision.response is not None:
+                self.book_snapshot = self.policy_decision.response.book_snapshot
+            elif self.policy_decision.request.book_snapshot is not None:
+                self.book_snapshot = self.policy_decision.request.book_snapshot
+
+        if self.state is None:
+            if self.policy_decision.response is not None:
+                self.state = self.policy_decision.response.state
+            elif self.policy_decision.request.state is not None:
+                self.state = self.policy_decision.request.state
+
+        if self.confidence is None and self.policy_decision.response is not None:
+            self.confidence = self.policy_decision.response.confidence
+
+        return self
+
+
+class PortfolioState(BaseModel):
+    """Snapshot of the portfolio used to contextualise risk checks."""
+
+    nav: float = Field(..., gt=0.0, description="Total net asset value for the account")
+    loss_to_date: float = Field(..., ge=0.0, description="Realised losses accrued today")
+    fee_to_date: float = Field(..., ge=0.0, description="Fees accrued today")
+    instrument_exposure: Dict[str, float] = Field(
+        default_factory=dict,
+        description="Existing gross exposure by instrument prior to this intent",
+    )
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Optional additional portfolio metadata for auditing",
+    )
+
+
+class RiskValidationRequest(BaseModel):
+    account_id: str = Field(..., description="Trading account identifier")
+    intent: RiskIntentPayload = Field(..., description="Policy intent and metrics for validation")
+    portfolio_state: PortfolioState = Field(..., description="Current portfolio state summary")
+
+    instrument: Optional[str] = Field(
+        None, description="Instrument identifier for the intent"
+    )
+    net_exposure: Optional[float] = Field(
+        None, description="Net exposure after order"
+    )
+    gross_notional: Optional[float] = Field(
+        None, ge=0.0, description="Gross notional value of the order"
+    )
+    projected_loss: Optional[float] = Field(
+        None, ge=0.0, description="Projected incremental loss for the trading day"
+    )
+    projected_fee: Optional[float] = Field(
+        None, ge=0.0, description="Projected incremental fees for the trading day"
+    )
+    var_95: Optional[float] = Field(
+        None, ge=0.0, description="Projected 95% VaR for the intent"
+    )
+    spread_bps: Optional[float] = Field(
+        None, ge=0.0, description="Expected spread in basis points"
+    )
+    latency_ms: Optional[float] = Field(
+        None, ge=0.0, description="Observed order latency in milliseconds"
+    )
+    fee: Optional[FeeBreakdown] = Field(
+        None, description="Fees associated with the order"
+    )
+
+    @model_validator(mode="after")
+    def _populate_summaries(self) -> "RiskValidationRequest":  # type: ignore[override]
+        decision = self.intent.policy_decision
+        metrics = self.intent.metrics
+
+        if self.instrument is None:
+            self.instrument = decision.request.instrument
+
+        scalar_defaults = {
+            "net_exposure": metrics.net_exposure,
+            "gross_notional": metrics.gross_notional,
+            "projected_loss": metrics.projected_loss,
+            "projected_fee": metrics.projected_fee,
+            "var_95": metrics.var_95,
+            "spread_bps": metrics.spread_bps,
+            "latency_ms": metrics.latency_ms,
+        }
+
+        for field_name, default_value in scalar_defaults.items():
+            if getattr(self, field_name) is None:
+                setattr(self, field_name, default_value)
+
+        if self.fee is None:
+            self.fee = decision.resolved_fee()
+
+        missing = [
+            name
+            for name in ["instrument", *scalar_defaults.keys(), "fee"]
+            if getattr(self, name) is None
+        ]
+        if missing:
+            raise ValueError(
+                "Missing required scalar summaries derived from intent: "
+                + ", ".join(sorted(missing))
+            )
+
+        return self
 
 
 class RiskValidationResponse(BaseModel):
