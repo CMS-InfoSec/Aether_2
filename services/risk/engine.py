@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Sequence
 
+from compliance_filter import COMPLIANCE_REASON, compliance_filter
 from services.common.adapters import RedisFeastAdapter, TimescaleAdapter
 from services.common.schemas import RiskValidationRequest, RiskValidationResponse
 
@@ -46,6 +47,15 @@ class RiskEngine:
             self._record_event("kill_switch_triggered", reason, context)
             return RiskValidationResponse(valid=False, reasons=[reason], fee=request.fee)
 
+        self._validate_compliance(request, reasons, context)
+        if reasons:
+            self._record_event(
+                "risk_rejected",
+                "Intent rejected by risk engine",
+                {"reasons": list(reasons), **context},
+            )
+            return RiskValidationResponse(valid=False, reasons=reasons, fee=request.fee)
+
         self._validate_universe(request, reasons, context)
         self._validate_caps(request, reasons, context)
         self._validate_market_health(request, reasons, context)
@@ -62,6 +72,26 @@ class RiskEngine:
     # ------------------------------------------------------------------
     # Validation helpers
     # ------------------------------------------------------------------
+    def _validate_compliance(
+        self,
+        request: RiskValidationRequest,
+        reasons: List[str],
+        context: Dict[str, Any],
+    ) -> None:
+        allowed, entry = compliance_filter.evaluate(request.instrument)
+        if allowed:
+            return
+
+        note = entry.reason if entry is not None else None
+        message = f"Instrument {request.instrument} is restricted by compliance"
+        reasons.append(message)
+
+        enriched_context = {**context, "reason": COMPLIANCE_REASON}
+        if note:
+            enriched_context["compliance_note"] = note
+        self._record_event("compliance_rejection", message, enriched_context)
+        compliance_filter.log_rejection(self.account_id, request.instrument, entry)
+
     def _validate_universe(
         self,
         request: RiskValidationRequest,
