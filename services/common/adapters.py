@@ -273,14 +273,6 @@ class RedisFeastAdapter:
     repository: UniverseRepository | None = None
     _repository: UniverseRepository = field(init=False, repr=False)
 
-
-    def __post_init__(self) -> None:
-        if self.repository is not None:
-            self._repository = self.repository
-        else:
-            self._repository = UniverseRepository(account_id=self.account_id)
-
-
     _features: ClassVar[Dict[str, Dict[str, Any]]] = {
         "admin-eu": {"approved": ["BTC-USD", "ETH-USD"], "fees": {"BTC-USD": {"maker": 0.1, "taker": 0.2}}},
         "admin-us": {"approved": ["SOL-USD"], "fees": {}},
@@ -311,19 +303,19 @@ class RedisFeastAdapter:
 
 
     def __post_init__(self) -> None:
-        self._repository = UniverseRepository(account_id=self.account_id)
+        self._repository = self.repository or UniverseRepository(account_id=self.account_id)
 
     def approved_instruments(self) -> List[str]:
         instruments = self._repository.approved_universe()
         if instruments:
-            return instruments
+            return list(instruments)
         account_config = self._features.get(self.account_id, {})
         return list(account_config.get("approved", []))
 
     def fee_override(self, instrument: str) -> Dict[str, Any] | None:
         override = self._repository.fee_override(instrument)
-        if override is not None:
-            return override
+        if override:
+            return dict(override)
         account_config = self._features.get(self.account_id, {})
         fees = account_config.get("fees", {})
         if instrument not in fees:
