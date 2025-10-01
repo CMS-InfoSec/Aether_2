@@ -21,11 +21,9 @@ MFA_HEADER = {"X-MFA-Context": "verified"}
 @pytest.fixture(autouse=True)
 def _reset_state() -> None:
     KrakenSecretStore.reset()
-    TimescaleAdapter.reset_rotation_state()
     TimescaleAdapter.reset()
     yield
     KrakenSecretStore.reset()
-    TimescaleAdapter.reset_rotation_state()
     TimescaleAdapter.reset()
 
 
