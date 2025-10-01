@@ -29,6 +29,27 @@ _oms_submit_ack_ms = Gauge(
     registry=_REGISTRY,
 )
 
+_oms_latency_ms = Gauge(
+    "oms_latency_ms",
+    "Latency of OMS order placement by transport in milliseconds.",
+    labelnames=("account_id", "symbol", "transport"),
+    registry=_REGISTRY,
+)
+
+_oms_error_count = Counter(
+    "oms_error_count",
+    "Count of OMS transport errors by account, symbol and transport.",
+    labelnames=("account_id", "symbol", "transport"),
+    registry=_REGISTRY,
+)
+
+_oms_child_orders_total = Counter(
+    "oms_child_orders_total",
+    "Number of OMS child orders created per account and symbol.",
+    labelnames=("account_id", "symbol"),
+    registry=_REGISTRY,
+)
+
 _trade_rejections_total = Counter(
     "trade_rejections_total",
     "Count of rejected trades by account and symbol.",
@@ -60,6 +81,9 @@ _abstention_rate = Gauge(
 _METRICS: Dict[str, Gauge | Counter] = {
     "ws_latency_ms": _ws_latency_ms,
     "oms_submit_ack_ms": _oms_submit_ack_ms,
+    "oms_latency_ms": _oms_latency_ms,
+    "oms_error_count": _oms_error_count,
+    "oms_child_orders_total": _oms_child_orders_total,
     "trade_rejections_total": _trade_rejections_total,
     "fees_nav_pct": _fees_nav_pct,
     "drift_score": _drift_score,
@@ -103,6 +127,25 @@ def record_ws_latency(account_id: str, symbol: str, latency_ms: float) -> None:
 def record_oms_submit_ack(account_id: str, symbol: str, latency_ms: float) -> None:
     init_metrics()
     _oms_submit_ack_ms.labels(account_id=account_id, symbol=symbol).set(latency_ms)
+
+
+def record_oms_latency(account_id: str, symbol: str, transport: str, latency_ms: float) -> None:
+    init_metrics()
+    _oms_latency_ms.labels(
+        account_id=account_id, symbol=symbol, transport=transport
+    ).set(latency_ms)
+
+
+def increment_oms_error_count(account_id: str, symbol: str, transport: str) -> None:
+    init_metrics()
+    _oms_error_count.labels(
+        account_id=account_id, symbol=symbol, transport=transport
+    ).inc()
+
+
+def increment_oms_child_orders_total(account_id: str, symbol: str, count: int) -> None:
+    init_metrics()
+    _oms_child_orders_total.labels(account_id=account_id, symbol=symbol).inc(count)
 
 
 def increment_trade_rejection(account_id: str, symbol: str) -> None:
