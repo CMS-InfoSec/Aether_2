@@ -8,7 +8,7 @@ import pytest
 fastapi = pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
-from services.common.adapters import TimescaleAdapter
+from services.common.adapters import KrakenSecretManager, TimescaleAdapter
 from services.secrets.main import app
 from shared import k8s
 from shared.k8s import KrakenSecretStore
@@ -96,3 +96,17 @@ def test_status_requires_authorized_account(monkeypatch: pytest.MonkeyPatch) -> 
     )
 
     assert response.status_code == 403
+
+
+def test_manager_rotation_updates_status_metadata() -> None:
+    manager = KrakenSecretManager(account_id="admin-eu")
+
+    first_rotation = manager.rotate_credentials(api_key="first", api_secret="secret")
+    second_rotation = manager.rotate_credentials(api_key="second", api_secret="secret-2")
+
+    status = manager.status()
+
+    assert status is not None
+    assert status["secret_name"] == manager.secret_name
+    assert status["created_at"] == first_rotation["metadata"]["created_at"]
+    assert status["rotated_at"] == second_rotation["metadata"]["rotated_at"]

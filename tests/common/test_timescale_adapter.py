@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 
+from datetime import datetime, timezone
+
 import pytest
 
 from services.common.adapters import TimescaleAdapter
@@ -58,7 +60,10 @@ def test_record_event_publishes_to_risk_stream() -> None:
 def test_credential_rotation_status_round_trip() -> None:
     adapter = TimescaleAdapter(account_id="admin-eu")
 
-    record = adapter.record_credential_rotation(secret_name="kraken-keys-admin-eu")
+    rotation_time = datetime.now(timezone.utc)
+    record = adapter.record_credential_rotation(
+        secret_name="kraken-keys-admin-eu", rotated_at=rotation_time
+    )
     status = adapter.credential_rotation_status()
 
     assert status == record
