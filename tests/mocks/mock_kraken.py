@@ -1,0 +1,524 @@
+"""High fidelity Kraken exchange simulator for OMS integration tests.
+
+This module exposes a small in-memory exchange that mimics the behaviour of
+Kraken's private WebSocket and REST APIs.  The implementation is intentionally
+stateful so that tests can validate workflow orchestration across both
+transports without relying on any external services.
+
+Features provided by the mock:
+
+* Shared order book between the simulated WebSocket and REST transports.
+* Deterministic partial fills with configurable fill schedules.
+* Latency simulation for both synchronous (WS) and asynchronous (REST) paths.
+* Random as well as scheduled error injection to exercise retry paths.
+* Pytest fixtures that expose the mock in a convenient form for integration
+  tests.
+
+The mock focuses on the subset of the Kraken API that is used by the OMS:
+``place_order``/``cancel_order`` over both transports and helper endpoints for
+balances and trade history.  The return payloads follow the real API loosely –
+only the fields that are consumed by tests are modelled.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Deque, Dict, Iterable, Iterator, List, Optional, Tuple
+
+import pytest
+
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+
+class MockKrakenError(RuntimeError):
+    """Base class for mock Kraken failures."""
+
+
+class MockKrakenTransportClosed(MockKrakenError):
+    """Raised when a closed session is used."""
+
+
+class MockKrakenRandomError(MockKrakenError):
+    """Raised when a probabilistic failure is triggered."""
+
+
+# ---------------------------------------------------------------------------
+# Configuration containers
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class MockKrakenConfig:
+    """Runtime configuration used to construct :class:`MockKrakenExchange`."""
+
+    balances: Dict[str, Dict[str, float]] = field(
+        default_factory=lambda: {
+            "company": {"USD": 1_000_000.0, "BTC": 25.0, "ETH": 2_500.0},
+            "shadow": {"USD": 50_000.0, "BTC": 1.5},
+        }
+    )
+    base_prices: Dict[str, float] = field(
+        default_factory=lambda: {
+            "BTC/USD": 30_000.0,
+            "ETH/USD": 2_000.0,
+        }
+    )
+    latency: Tuple[float, float] = (0.0, 0.0)
+    error_rate: float = 0.0
+    error_schedule: Dict[str, Iterable[Exception]] = field(default_factory=dict)
+    default_fill: List[float] = field(default_factory=lambda: [1.0])
+    seed: Optional[int] = 11
+
+
+@dataclass(slots=True)
+class MockOrder:
+    order_id: str
+    account: str
+    pair: str
+    side: str
+    price: Optional[float]
+    volume: float
+    remaining: float
+    status: str
+    created_at: datetime
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "order_id": self.order_id,
+            "account": self.account,
+            "pair": self.pair,
+            "side": self.side,
+            "price": self.price,
+            "volume": self.volume,
+            "remaining": self.remaining,
+            "status": self.status,
+            "created_at": self.created_at.isoformat(),
+        }
+
+
+@dataclass(slots=True)
+class MockTrade:
+    trade_id: str
+    order_id: str
+    account: str
+    pair: str
+    side: str
+    price: float
+    volume: float
+    executed_at: datetime
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "trade_id": self.trade_id,
+            "order_id": self.order_id,
+            "account": self.account,
+            "pair": self.pair,
+            "side": self.side,
+            "price": self.price,
+            "volume": self.volume,
+            "executed_at": self.executed_at.isoformat(),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Core exchange simulator
+# ---------------------------------------------------------------------------
+
+
+class MockKrakenExchange:
+    """Stateful simulation of the Kraken exchange used in OMS tests."""
+
+    def __init__(self, config: Optional[MockKrakenConfig] = None) -> None:
+        import random
+
+        self.config = config or MockKrakenConfig()
+        self._balances: Dict[str, Dict[str, float]] = {
+            account: dict(balances) for account, balances in self.config.balances.items()
+        }
+        self._order_counter = 1
+        self._trade_counter = 1
+        self._orders: Dict[str, MockOrder] = {}
+        self._trades: List[MockTrade] = []
+        self._random = random.Random(self.config.seed)
+        self._error_queues: Dict[str, Deque[Exception]] = {
+            key: deque(errors)
+            for key, errors in self.config.error_schedule.items()
+        }
+        self._fill_schedules: Dict[str, Deque[List[float]]] = {}
+
+    # ------------------------------------------------------------------
+    # Configuration helpers
+    # ------------------------------------------------------------------
+    def schedule_fill_sequence(self, sequence: Iterable[float], *, pair: Optional[str] = None) -> None:
+        """Enqueue a specific fill sequence for the next order.
+
+        The sequence is expressed as fractional fills of the submitted quantity.
+        For example ``[0.4, 0.6]`` results in two fills, the first for 40% of the
+        requested size and the second for the remaining 60%.
+        """
+
+        target = pair or "*"
+        queue = self._fill_schedules.setdefault(target, deque())
+        queue.append(list(sequence))
+
+    def schedule_error(self, method: str, exc: Exception) -> None:
+        """Arrange for *exc* to be raised the next time ``method`` is invoked."""
+
+        self._error_queues.setdefault(method, deque()).append(exc)
+
+    def reset(self) -> None:
+        """Restore balances and clear orders/trades."""
+
+        self._balances = {
+            account: dict(balances) for account, balances in self.config.balances.items()
+        }
+        self._orders.clear()
+        self._trades.clear()
+        self._order_counter = 1
+        self._trade_counter = 1
+        for queue in self._error_queues.values():
+            queue.clear()
+        self._fill_schedules.clear()
+
+    # ------------------------------------------------------------------
+    # Public API used by transports
+    # ------------------------------------------------------------------
+    def place_order_ws(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        self._simulate_latency_sync()
+        self._maybe_raise("place_order")
+        return self._execute_order(payload, transport="websocket")
+
+    async def place_order_rest(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        await self._simulate_latency_async()
+        self._maybe_raise("place_order")
+        return self._execute_order(payload, transport="rest")
+
+    def cancel_order_ws(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        self._simulate_latency_sync()
+        self._maybe_raise("cancel_order")
+        return self._cancel_order(payload, transport="websocket")
+
+    async def cancel_order_rest(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        await self._simulate_latency_async()
+        self._maybe_raise("cancel_order")
+        return self._cancel_order(payload, transport="rest")
+
+    def open_orders(self, *, account: Optional[str] = None) -> Dict[str, Any]:
+        orders = [
+            order.to_dict()
+            for order in self._orders.values()
+            if order.remaining > 0
+            and (account is None or order.account == account)
+            and order.status in {"open", "partially_filled"}
+        ]
+        return {"open": orders, "count": len(orders)}
+
+    async def get_balance(self, account: str = "company") -> Dict[str, float]:
+        await self._simulate_latency_async()
+        self._maybe_raise("get_balance")
+        return dict(self._balances.setdefault(account, {}))
+
+    async def get_trades(
+        self,
+        *,
+        account: Optional[str] = None,
+        pair: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        await self._simulate_latency_async()
+        self._maybe_raise("get_trades")
+        trades: Iterable[MockTrade] = self._trades
+        if account is not None:
+            trades = [trade for trade in trades if trade.account == account]
+        if pair is not None:
+            trades = [trade for trade in trades if trade.pair == pair]
+        return [trade.to_dict() for trade in trades]
+
+    # ------------------------------------------------------------------
+    # Internal mechanics
+    # ------------------------------------------------------------------
+    def _execute_order(self, payload: Dict[str, Any], *, transport: str) -> Dict[str, Any]:
+        account = str(payload.get("account") or payload.get("userref") or "company")
+        pair = self._normalise_pair(str(payload.get("pair") or payload.get("instrument") or "BTC/USD"))
+        side = str(payload.get("type") or payload.get("side") or "buy").lower()
+        if side not in {"buy", "sell"}:
+            raise ValueError(f"Unsupported order side: {side}")
+
+        raw_volume = payload.get("volume") or payload.get("quantity") or payload.get("size")
+        if raw_volume is None:
+            raise ValueError("Order payload missing volume/quantity/size")
+        volume = float(raw_volume)
+        price_value = payload.get("price") or payload.get("limit_price")
+        price = float(price_value) if price_value is not None else self.config.base_prices.get(pair, 0.0)
+
+        order_id = f"MO{self._order_counter:05d}"
+        self._order_counter += 1
+        order = MockOrder(
+            order_id=order_id,
+            account=account,
+            pair=pair,
+            side=side,
+            price=price,
+            volume=volume,
+            remaining=volume,
+            status="open",
+            created_at=datetime.now(timezone.utc),
+        )
+
+        fills = self._generate_fills(order)
+        filled_volume = sum(trade.volume for trade in fills)
+
+        if order.remaining <= 0:
+            order.status = "filled"
+        elif filled_volume > 0:
+            order.status = "partially_filled"
+            self._orders[order.order_id] = order
+        else:
+            order.status = "open"
+            self._orders[order.order_id] = order
+
+        response = {
+            "status": order.status,
+            "txid": order.order_id,
+            "transport": transport,
+            "filled": round(filled_volume, 10),
+            "remaining": round(max(order.remaining, 0.0), 10),
+            "fills": [trade.to_dict() for trade in fills],
+        }
+        return response
+
+    def _cancel_order(self, payload: Dict[str, Any], *, transport: str) -> Dict[str, Any]:
+        order_id = str(payload.get("txid") or payload.get("order_id") or "")
+        order = self._orders.get(order_id)
+        if order is None or order.remaining <= 0:
+            return {"status": "not_found", "txid": order_id or None, "transport": transport}
+
+        order.status = "cancelled"
+        order.remaining = 0.0
+        self._orders.pop(order_id, None)
+        return {"status": "cancelled", "txid": order_id, "transport": transport}
+
+    def _generate_fills(self, order: MockOrder) -> List[MockTrade]:
+        plan = self._next_fill_plan(order.pair)
+        fills: List[MockTrade] = []
+        remaining = order.volume
+
+        for fraction in plan:
+            if remaining <= 0:
+                break
+            fraction = max(0.0, min(1.0, float(fraction)))
+            fill_volume = min(remaining, order.volume * fraction)
+            if fill_volume <= 0:
+                continue
+            remaining -= fill_volume
+            order.remaining = remaining
+            trade = self._record_trade(order, fill_volume)
+            fills.append(trade)
+
+        return fills
+
+    def _record_trade(self, order: MockOrder, volume: float) -> MockTrade:
+        price = order.price or self.config.base_prices.get(order.pair, 0.0)
+        timestamp = datetime.now(timezone.utc)
+        trade = MockTrade(
+            trade_id=f"T{self._trade_counter:05d}",
+            order_id=order.order_id,
+            account=order.account,
+            pair=order.pair,
+            side=order.side,
+            price=price,
+            volume=volume,
+            executed_at=timestamp,
+        )
+        self._trade_counter += 1
+        self._trades.append(trade)
+        self._apply_fill(order.account, order.pair, order.side, price, volume)
+        return trade
+
+    def _apply_fill(self, account: str, pair: str, side: str, price: float, volume: float) -> None:
+        base, quote = self._split_pair(pair)
+        balances = self._balances.setdefault(account, {})
+        balances.setdefault(base, 0.0)
+        balances.setdefault(quote, 0.0)
+
+        if side == "buy":
+            balances[quote] -= price * volume
+            balances[base] += volume
+        else:
+            balances[base] -= volume
+            balances[quote] += price * volume
+
+    # ------------------------------------------------------------------
+    # Utilities
+    # ------------------------------------------------------------------
+    def _next_fill_plan(self, pair: str) -> List[float]:
+        if pair in self._fill_schedules and self._fill_schedules[pair]:
+            return list(self._fill_schedules[pair].popleft())
+        if "*" in self._fill_schedules and self._fill_schedules["*"]:
+            return list(self._fill_schedules["*"].popleft())
+
+        # If no deterministic plan is configured generate a random plan when
+        # partial fills are requested via ``error_rate`` or latency exercises.
+        if len(self.config.default_fill) == 1 and self.config.default_fill[0] == 1.0:
+            # Possibly return a random partial fill when the error rate is used
+            # to exercise retries.
+            if self._random.random() < 0.25:
+                first = round(self._random.uniform(0.2, 0.7), 4)
+                return [first, 1.0 - first]
+        return list(self.config.default_fill)
+
+    def _simulate_latency_sync(self) -> None:
+        delay = self._latency_value()
+        if delay > 0:
+            time.sleep(delay)
+
+    async def _simulate_latency_async(self) -> None:
+        delay = self._latency_value()
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    def _latency_value(self) -> float:
+        low, high = self.config.latency
+        if high <= 0:
+            return 0.0
+        if high < low:
+            low, high = high, low
+        return self._random.uniform(low, high)
+
+    def _maybe_raise(self, method: str) -> None:
+        queue = self._error_queues.get(method)
+        if queue:
+            raise queue.popleft()
+        if self.config.error_rate and self._random.random() < self.config.error_rate:
+            raise MockKrakenRandomError(f"Random failure injected for {method}")
+
+    @staticmethod
+    def _normalise_pair(pair: str) -> str:
+        if "-" in pair and "/" not in pair:
+            base, quote = pair.split("-", 1)
+            return f"{base}/{quote}"
+        return pair
+
+    @staticmethod
+    def _split_pair(pair: str) -> Tuple[str, str]:
+        if "/" in pair:
+            base, quote = pair.split("/", 1)
+            return base, quote
+        if "-" in pair:
+            base, quote = pair.split("-", 1)
+            return base, quote
+        if len(pair) >= 6:
+            return pair[:-3], pair[-3:]
+        raise ValueError(f"Cannot split trading pair {pair!r}")
+
+
+# ---------------------------------------------------------------------------
+# Transport facades used directly by tests
+# ---------------------------------------------------------------------------
+
+
+class MockKrakenWSSession:
+    """Synchronous facade mimicking the behaviour of the Kraken WS session."""
+
+    def __init__(self, exchange: MockKrakenExchange) -> None:
+        self._exchange = exchange
+        self._closed = False
+
+    def request(self, channel: str, payload: Dict[str, Any], timeout: float | None = None) -> Dict[str, Any]:
+        if self._closed:
+            raise MockKrakenTransportClosed("websocket session closed")
+        if channel == "add_order":
+            return self._exchange.place_order_ws(payload)
+        if channel == "cancel_order":
+            return self._exchange.cancel_order_ws(payload)
+        if channel == "openOrders":
+            account = payload.get("account") or payload.get("userref")
+            return self._exchange.open_orders(account=account)
+        if channel == "ownTrades":
+            account = payload.get("account") or payload.get("userref")
+            trades = [
+                trade
+                for trade in self._exchange._trades
+                if account is None or trade.account == account
+            ]
+            return {"trades": [trade.to_dict() for trade in trades]}
+        if channel == "getBalance":
+            account = payload.get("account") or payload.get("userref") or "company"
+            return {"balances": self._exchange._balances.get(account, {})}
+        raise ValueError(f"Unsupported channel: {channel}")
+
+    def close(self) -> None:
+        self._closed = True
+
+
+class MockKrakenRESTClient:
+    """Async REST facade that proxies through to :class:`MockKrakenExchange`."""
+
+    def __init__(self, exchange: MockKrakenExchange) -> None:
+        self._exchange = exchange
+
+    async def add_order(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return await self._exchange.place_order_rest(payload)
+
+    async def cancel_order(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return await self._exchange.cancel_order_rest(payload)
+
+    async def open_orders(self, *, account: Optional[str] = None) -> Dict[str, Any]:
+        await self._exchange._simulate_latency_async()
+        return self._exchange.open_orders(account=account)
+
+    async def balance(self, account: str = "company") -> Dict[str, float]:
+        return await self._exchange.get_balance(account)
+
+    async def trades(
+        self,
+        *,
+        account: Optional[str] = None,
+        pair: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        return await self._exchange.get_trades(account=account, pair=pair)
+
+    async def close(self) -> None:  # pragma: no cover - symmetry with aiohttp
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Pytest fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def mock_kraken_exchange() -> Iterator[MockKrakenExchange]:
+    """Yield a resettable :class:`MockKrakenExchange` instance."""
+
+    exchange = MockKrakenExchange()
+    try:
+        yield exchange
+    finally:
+        exchange.reset()
+
+
+@pytest.fixture
+def mock_kraken_ws_session_factory(
+    mock_kraken_exchange: MockKrakenExchange,
+) -> Iterator[Any]:
+    """Fixture returning a factory compatible with ``KrakenWSClient``."""
+
+    def factory(_creds: Dict[str, str]) -> MockKrakenWSSession:
+        return MockKrakenWSSession(mock_kraken_exchange)
+
+    yield factory
+
+
+@pytest.fixture
+def mock_kraken_rest_client(mock_kraken_exchange: MockKrakenExchange) -> MockKrakenRESTClient:
+    """Fixture returning the asynchronous REST facade for the mock exchange."""
+
+    return MockKrakenRESTClient(mock_kraken_exchange)
+
