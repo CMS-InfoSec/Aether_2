@@ -8,13 +8,17 @@ from typing import Dict, List, Union
 
 import httpx
 from fastapi import FastAPI, HTTPException, status
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from metrics import record_abstention_rate, record_drift_score, setup_metrics
+from services.common.precision import KRAKEN_PRECISION
 from services.models.model_server import Intent, predict_intent
+
 
 
 from metrics import record_abstention_rate, record_drift_score, setup_metrics
 from services.common.security import ADMIN_ACCOUNTS
+
 
 
 
@@ -177,16 +181,27 @@ class PolicyDecisionResponse(BaseModel):
         }
     )
 
-
-app = FastAPI(title="Policy Service")
-setup_metrics(app)
-
-
 app = FastAPI(title="Policy Service", version="2.0.0")
+setup_metrics(app)
 
 
 def _resolve_precision(symbol: str) -> Dict[str, float]:
     return KRAKEN_PRECISION.get(symbol.upper(), {"tick": 0.01, "lot": 0.0001})
+
+
+def _snap(value: float, step: float) -> float:
+    """Snap a numeric value to the nearest precision increment."""
+
+    if step <= 0:
+        return float(value)
+
+    decimal_value = Decimal(str(value))
+    decimal_step = Decimal(str(step))
+    snapped = (
+        (decimal_value / decimal_step).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        * decimal_step
+    )
+    return float(snapped)
 
 
 async def _fetch_effective_fee(
@@ -298,30 +313,86 @@ async def decide_policy(request: PolicyDecisionRequest) -> PolicyDecisionRespons
             detail="Snapped price or quantity is non-positive",
         )
 
+    intent = predict_intent(
+        account_id=request.account_id,
+        symbol=request.symbol,
+        features=request.features_vector,
+        book_snapshot=request.book_snapshot.model_dump(),
+    )
+
+    template = _select_template(intent, intent.selected_action)
+    expected_edge = float(template.edge_bps) if template else float(intent.edge_bps)
+    liquidity = (getattr(template, "name", None) or intent.selected_action or "maker").lower()
+    if liquidity not in {"maker", "taker"}:
+        liquidity = "maker"
+
+    notional = float(
+        Decimal(str(snapped_price)) * Decimal(str(snapped_qty))
+    )
+    effective_fee_bps = await _fetch_effective_fee(
+        request.account_id, request.symbol, liquidity, notional
+    )
+
+    spread_bps = float(request.book_snapshot.spread_bps)
+    impact_bps = float(request.impact_bps)
+    expected_cost_bps = float(
+        Decimal(str(spread_bps))
+        + Decimal(str(effective_fee_bps))
+        + Decimal(str(impact_bps))
+    )
+    net_edge = expected_edge - expected_cost_bps
+
+    approved = bool(intent.approved and net_edge > 0)
+    action = (intent.selected_action or "").lower()
+    side = request.side.lower()
+    order_type = "limit" if action == "maker" else "market" if action == "taker" else "none"
+    limit_px = snapped_price if action == "maker" and approved else None
+    tif = "GTC" if action == "maker" and approved else None
+    qty = snapped_qty if approved else 0.0
+    reason = intent.reason
+
+    if not approved:
+        action = "hold"
+        side = "none"
+        order_type = "none"
+        limit_px = None
+        tif = None
+        if reason is None:
+            reason = "Fee-adjusted edge non-positive" if net_edge <= 0 else "Model rejected decision"
+
+    decision_payload = {
+        "account_id": request.account_id,
+        "symbol": request.symbol,
+        "action": action,
+        "side": side,
+        "order_type": order_type,
+        "qty": qty,
+        "price": snapped_price,
+        "limit_px": limit_px,
+        "tif": tif,
+        "take_profit_bps": float(intent.take_profit_bps),
+        "stop_loss_bps": float(intent.stop_loss_bps),
+        "expected_edge_bps": expected_edge,
+        "spread_bps": spread_bps,
+        "effective_fee_bps": effective_fee_bps,
+        "impact_bps": impact_bps,
+        "expected_cost_bps": expected_cost_bps,
+        "confidence": _confidence(intent),
+        "approved": approved,
+        "reason": reason,
+    }
 
     try:
-        response = PolicyDecisionResponse(**result)
+        response = PolicyDecisionResponse(**decision_payload)
     except ValidationError as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Model response failed validation",
         ) from exc
 
-    drift = 0.0
-    account_state = request.account_state or {}
-    if isinstance(account_state, dict):
-        raw = account_state.get("drift_score", 0.0)
-        try:
-            drift = float(raw)
-        except (TypeError, ValueError):
-            drift = 0.0
-    record_drift_score(request.account_id, request.symbol, drift)
+    record_drift_score(request.account_id, request.symbol, 0.0)
 
-    abstain = 0.0
-    action = (response.action or "").lower()
-    side = (response.side or "").lower()
-    if action in {"hold", "abstain"} or side in {"none", "flat"}:
-        abstain = 1.0
+    abstain = 1.0 if action in {"hold", "abstain"} or side in {"none", "flat"} else 0.0
     record_abstention_rate(request.account_id, request.symbol, abstain)
 
     return response

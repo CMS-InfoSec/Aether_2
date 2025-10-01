@@ -72,6 +72,20 @@ def test_universe_api_returns_canonical_symbols_for_kraken_pairs(session: Sessio
                 value=0.5,
                 attributes={},
             ),
+            Feature(
+                feature_name="coingecko.market_cap",
+                entity_id="eth/eur",
+                event_timestamp=now,
+                value=3_000_000_000.0,
+                attributes={},
+            ),
+            Feature(
+                feature_name="coingecko.volatility_30d",
+                entity_id="eth/eur",
+                event_timestamp=now,
+                value=0.6,
+                attributes={},
+            ),
         ]
     )
     session.add(
@@ -85,10 +99,22 @@ def test_universe_api_returns_canonical_symbols_for_kraken_pairs(session: Sessio
             volume=150_000_000.0,
         )
     )
+    session.add(
+        OhlcvBar(
+            market="ETH/EUR",
+            bucket_start=now - timedelta(hours=1),
+            open=1.0,
+            high=1.0,
+            low=1.0,
+            close=1.0,
+            volume=250_000_000.0,
+        )
+    )
     session.commit()
 
     volumes = _kraken_volume_24h(session)
     assert volumes["BTC-USD"] == pytest.approx(150_000_000.0)
+    assert "ETH-EUR" not in volumes
 
     approved = _evaluate_universe(session)
     assert approved == ["BTC-USD"]
@@ -98,6 +124,7 @@ def test_universe_api_returns_canonical_symbols_for_kraken_pairs(session: Sessio
     assert response.status_code == 200
     payload = response.json()
     assert payload["symbols"] == ["BTC-USD"]
+    assert all(symbol.endswith("-USD") for symbol in payload["symbols"])
 
 
 def test_manual_override_migrates_legacy_symbols(session: Session) -> None:
@@ -122,6 +149,9 @@ def test_manual_override_migrates_legacy_symbols(session: Session) -> None:
     overrides = _latest_manual_overrides(session)
     assert list(overrides.keys()) == ["BTC-USD"]
     assert overrides["BTC-USD"].asset_id == "BTC-USD"
+
+    approved = _evaluate_universe(session)
+    assert approved == ["BTC-USD"]
 
     audit_entries = session.query(AuditLog).all()
     assert audit_entries

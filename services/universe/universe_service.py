@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 DATABASE_URL = os.getenv(
     "TIMESCALE_DATABASE_URI",
-    os.getenv("DATABASE_URL", "postgresql+psycopg://timescale:password@localhost:5432/aether"),
+    os.getenv("DATABASE_URL", "postgresql+psycopg2://timescale:password@localhost:5432/aether"),
 )
 
 
@@ -82,8 +82,21 @@ class AuditLog(Base):
     attributes = Column("metadata", JSONB, default=dict)
 
 
+def _normalize_database_url(url: str) -> str:
+    """Ensure PostgreSQL URLs use the psycopg2 dialect."""
+
+    if url.startswith("postgresql+psycopg://"):
+        return "postgresql+psycopg2://" + url[len("postgresql+psycopg://") :]
+    if url.startswith("postgresql://"):
+        return "postgresql+psycopg2://" + url[len("postgresql://") :]
+    if url.startswith("postgres://"):
+        return "postgresql+psycopg2://" + url[len("postgres://") :]
+    return url
+
+
 def _create_engine() -> Engine:
-    return create_engine(DATABASE_URL, future=True)
+    database_url = _normalize_database_url(DATABASE_URL)
+    return create_engine(database_url, future=True)
 
 
 ENGINE = _create_engine()
@@ -197,9 +210,11 @@ def _kraken_volume_24h(session: Session) -> Dict[str, float]:
     for market, volume in rows:
         if volume is None:
             continue
+
         normalized = _normalize_market(market)
         if normalized is None:
             continue
+
         volumes[normalized] = max(volumes.get(normalized, 0.0), float(volume))
     return volumes
 
@@ -297,26 +312,34 @@ def _evaluate_universe(session: Session) -> List[str]:
     volumes = _kraken_volume_24h(session)
     overrides = _latest_manual_overrides(session)
 
-    approved = set()
+    approved: set[str] = set()
 
     for pair, cap_feature in caps.items():
+        canonical_pair = _normalize_market(pair)
+        if canonical_pair is None:
+            continue
+
         market_cap = float(cap_feature.value or 0.0)
-        vol_feature = vols.get(pair)
+        vol_feature = vols.get(canonical_pair)
         volatility = float(vol_feature.value) if vol_feature and vol_feature.value is not None else 0.0
-        kraken_volume = volumes.get(pair, 0.0)
+        kraken_volume = volumes.get(canonical_pair, 0.0)
 
         if (
             market_cap >= MARKET_CAP_THRESHOLD
             and kraken_volume >= VOLUME_THRESHOLD
             and volatility >= VOLATILITY_THRESHOLD
         ):
-            approved.add(pair)
+            approved.add(canonical_pair)
 
     for pair, override in overrides.items():
+        canonical_pair = _normalize_market(pair)
+        if canonical_pair is None:
+            continue
+
         if override.approved:
-            approved.add(pair)
+            approved.add(canonical_pair)
         else:
-            approved.discard(pair)
+            approved.discard(canonical_pair)
 
     return sorted(approved)
 

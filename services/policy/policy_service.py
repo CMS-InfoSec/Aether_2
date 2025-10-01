@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict, is_dataclass
 from typing import Any, Dict, List, Optional, Union
 
 from fastapi import FastAPI, HTTPException, status
@@ -97,6 +98,13 @@ def decide_policy_intent(request: PolicyDecisionRequest) -> PolicyIntent:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to generate policy intent.",
         ) from exc
+
+    if is_dataclass(intent_payload):
+        intent_payload = asdict(intent_payload)
+    elif hasattr(intent_payload, "model_dump") and callable(intent_payload.model_dump):
+        intent_payload = intent_payload.model_dump()
+    elif hasattr(intent_payload, "dict") and callable(intent_payload.dict):
+        intent_payload = intent_payload.dict()
 
     if not isinstance(intent_payload, dict):
         raise HTTPException(
