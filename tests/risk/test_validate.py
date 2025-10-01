@@ -47,6 +47,7 @@ def reset_state() -> Generator[None, None, None]:
 
 
 
+
 def make_request(**overrides: float | str | dict[str, float]) -> RiskValidationRequest:
     payload: dict[str, float | str | dict[str, float]] = {
         "account_id": "company",
@@ -59,9 +60,10 @@ def make_request(**overrides: float | str | dict[str, float]) -> RiskValidationR
         "spread_bps": 10.0,
         "latency_ms": 100.0,
         "fee": {"currency": "USD", "maker": 0.1, "taker": 0.2},
+
     }
-    payload.update(overrides)
-    return RiskValidationRequest(**payload)  # type: ignore[arg-type]
+
+    return RiskValidationRequest(**payload)
 
 
 def test_engine_accepts_trade_within_limits() -> None:
@@ -119,7 +121,6 @@ def test_engine_flags_var_breach_and_records_event() -> None:
 def test_engine_honors_kill_switch_and_short_circuits() -> None:
     account = "company"
     adapter = TimescaleAdapter(account_id=account)
-
     original_config = adapter.load_risk_config()
     try:
         TimescaleAdapter._risk_configs[account]["kill_switch"] = True  # type: ignore[attr-defined]

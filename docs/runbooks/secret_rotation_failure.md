@@ -33,3 +33,4 @@ Outline remediation actions when automated secret rotations fail or leave servic
 - Document root cause and add regression tests or policy checks where applicable.
 - Review rotation frequency and adjust SLO targets if the workload changed.
 - Ensure all credentials rotated during the incident are flagged for follow-up verification.
+- Coordinate with compliance to document credential handling per SOC 2 requirements and attach the signed attestation to the incident record.

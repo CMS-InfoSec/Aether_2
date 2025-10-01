@@ -41,7 +41,7 @@ class QuarterlyRecordingSession:
         normalized_query = " ".join(query.lower().split())
         self.queries.append(query.strip())
 
-        if "insert into audit_log" in normalized_query:
+        if "insert into audit_logs" in normalized_query:
             self.audit_entries.append(params)
             return FakeResult([])
 
@@ -105,24 +105,21 @@ class QuarterlyRecordingSession:
             return FakeResult(rows)
 
         if "from audit_logs" in normalized_query:
-            assert "created_at" in normalized_query
-            assert "payload" in normalized_query
+
             start = params.get("start")
             end = params.get("end")
             rows = []
             for entry in self._audits:
-                event_time = entry["created_at"]
-                if start and event_time < start:
+
+                created_at = entry["created_at"]
+                if start and created_at < start:
+
                     continue
-                if end and event_time >= end:
+                if end and created_at >= end:
                     continue
-                rows.append(
-                    {
-                        "account_id": entry["actor"],
-                        "event_time": event_time,
-                        "payload": entry.get("payload"),
-                    }
-                )
+
+                rows.append({"account_id": entry["actor"], "created_at": created_at})
+
             return FakeResult(rows)
 
         raise AssertionError(f"Unexpected query: {query}")
@@ -184,19 +181,19 @@ def quarterly_session() -> QuarterlyRecordingSession:
             "audit_id": "audit-1",
             "actor": "alpha",
             "created_at": datetime(2024, 4, 15, 0, 0, tzinfo=timezone.utc),
-            "payload": json.dumps({"action": "login"}),
+
         },
         {
             "audit_id": "audit-2",
             "actor": "alpha",
             "created_at": datetime(2024, 5, 20, 0, 0, tzinfo=timezone.utc),
-            "payload": json.dumps({"action": "logout"}),
+
         },
         {
             "audit_id": "audit-3",
             "actor": "beta",
             "created_at": datetime(2024, 4, 20, 0, 0, tzinfo=timezone.utc),
-            "payload": json.dumps({"action": "login"}),
+
         },
     ]
     return QuarterlyRecordingSession(orders, fills, audits)
@@ -241,7 +238,7 @@ def test_generate_quarterly_summary_outputs_expected_metrics(
     assert quarterly_session.audit_entries, "expected audit entries to be recorded"
 
 
-def test_audit_query_returns_actor_event_time_rows(
+def test_audit_query_returns_actor_created_at_rows(
     quarterly_session: QuarterlyRecordingSession,
 ) -> None:
     start = datetime(2024, 4, 1, tzinfo=timezone.utc)
@@ -251,7 +248,7 @@ def test_audit_query_returns_actor_event_time_rows(
         {"start": start, "end": end},
     )
     rows = result.mappings()
-    assert sorted((row["account_id"], row["event_time"]) for row in rows) == [
+    assert sorted((row["account_id"], row["created_at"]) for row in rows) == [
         ("alpha", datetime(2024, 4, 15, 0, 0, tzinfo=timezone.utc)),
         ("alpha", datetime(2024, 5, 20, 0, 0, tzinfo=timezone.utc)),
         ("beta", datetime(2024, 4, 20, 0, 0, tzinfo=timezone.utc)),

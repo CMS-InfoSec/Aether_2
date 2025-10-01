@@ -7,7 +7,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 
 from datetime import datetime, timezone
-from typing import Any, Callable, ClassVar, Dict, List, Optional
+from typing import Any, Callable, ClassVar, Dict, Iterable, List, Mapping, Optional
 
 from shared.k8s import KrakenSecretStore
 
@@ -62,6 +62,7 @@ class TimescaleAdapter:
     _credential_rotations: ClassVar[Dict[str, Dict[str, Any]]] = {}
     _daily_usage: ClassVar[Dict[str, Dict[str, Dict[str, float]]]] = {}
     _instrument_exposures: ClassVar[Dict[str, Dict[str, float]]] = {}
+    _rolling_volume: ClassVar[Dict[str, Dict[str, Dict[str, Any]]]] = {}
 
     _default_risk_config: ClassVar[Dict[str, Any]] = {
         "kill_switch": False,
@@ -104,6 +105,7 @@ class TimescaleAdapter:
         self._daily_usage.setdefault(self.account_id, {})
         self._instrument_exposures.setdefault(self.account_id, {})
         self._credential_rotations.setdefault(self.account_id, {})
+        self._rolling_volume.setdefault(self.account_id, {})
 
 
     # ------------------------------------------------------------------
@@ -176,6 +178,38 @@ class TimescaleAdapter:
     def instrument_exposure(self, instrument: str) -> float:
         exposures = self._instrument_exposures.get(self.account_id, {})
         return float(exposures.get(instrument, 0.0))
+
+    # ------------------------------------------------------------------
+    # Rolling volume helpers
+    # ------------------------------------------------------------------
+    def rolling_volume(self, pair: str) -> Dict[str, Any]:
+        account_payload = self._rolling_volume.setdefault(self.account_id, {})
+        volume_entry = account_payload.get(pair)
+        if volume_entry is None:
+            volume_entry = {
+                "notional": 0.0,
+                "basis_ts": datetime.now(timezone.utc),
+            }
+            account_payload[pair] = deepcopy(volume_entry)
+        return {
+            "notional": float(volume_entry.get("notional", 0.0)),
+            "basis_ts": volume_entry.get("basis_ts", datetime.now(timezone.utc)),
+        }
+
+    @classmethod
+    def seed_rolling_volume(
+        cls, payload: Mapping[str, Mapping[str, Dict[str, Any]]]
+    ) -> None:
+        cls._rolling_volume = {
+            account: {
+                pair: {
+                    "notional": float(entry.get("notional", 0.0)),
+                    "basis_ts": entry.get("basis_ts", datetime.now(timezone.utc)),
+                }
+                for pair, entry in pairs.items()
+            }
+            for account, pairs in payload.items()
+        }
 
     def record_event(self, event_type: str, payload: Dict[str, Any]) -> None:
         entry = {
@@ -310,6 +344,17 @@ class RedisFeastAdapter:
         "director-1": {"approved": ["SOL-USD"], "fees": {}},
         "director-2": {"approved": ["BTC-USD", "ETH-USD"], "fees": {}},
     }
+    _fee_tiers: ClassVar[Dict[str, List[Dict[str, Any]]]] = {
+        "default": [
+            {
+                "tier_id": "base",
+                "volume_threshold": 0.0,
+                "maker_bps": 1.0,
+                "taker_bps": 1.5,
+                "currency": "USD",
+            }
+        ]
+    }
     _online_feature_store: ClassVar[Dict[str, Dict[str, Dict[str, Any]]]] = {
         "company": {
             "BTC-USD": {
@@ -365,6 +410,17 @@ class RedisFeastAdapter:
         if instrument not in fees:
             return None
         return dict(fees[instrument])
+
+    def fee_tiers(self, pair: str) -> List[Dict[str, Any]]:
+        tiers = self._fee_tiers.get(pair) or self._fee_tiers.get("default", [])
+        return [dict(tier) for tier in tiers]
+
+    @classmethod
+    def seed_fee_tiers(cls, tiers: Mapping[str, Iterable[Mapping[str, Any]]]) -> None:
+        cls._fee_tiers = {
+            pair: [dict(entry) for entry in entries]
+            for pair, entries in tiers.items()
+        }
 
 
     def fetch_online_features(self, instrument: str) -> Dict[str, Any]:
