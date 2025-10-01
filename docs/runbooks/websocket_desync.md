@@ -3,6 +3,9 @@
 ## Purpose
 Provide a deterministic response plan when downstream consumers observe desynchronization between WebSocket streams and canonical order book snapshots.
 
+## Related SLOs
+- [WebSocket Ingest Latency SLO](../slo.md#websocket-ingest-latency) — 99th percentile delta propagation must remain ≤ 300 ms.
+
 ## Preconditions
 - Alert from `ws_sequence_gap_ratio` exceeding 2% for 3 consecutive evaluation periods.
 - Access to Redis cache, Kafka topics, and WebSocket gateway pods.

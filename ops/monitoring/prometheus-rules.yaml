@@ -20,6 +20,7 @@ spec:
           annotations:
             summary: OMS latency approaching 150 ms SLO budget
             runbook: docs/runbooks/exchange_outage.md
+            slo_reference: docs/slo.md#oms-latency
     - name: websocket.slo
       rules:
         - alert: ws_latency_slo_breach
@@ -32,6 +33,7 @@ spec:
           annotations:
             summary: WebSocket delivery latency nearing 300 ms SLO
             runbook: docs/runbooks/websocket_desync.md
+            slo_reference: docs/slo.md#websocket-ingest-latency
     - name: risk-controls.slo
       rules:
         - alert: kill_switch_slo_warning
@@ -43,6 +45,7 @@ spec:
           annotations:
             summary: Kill-switch response time exceeded 45s threshold
             runbook: docs/runbooks/kill_switch_activation.md
+            slo_reference: docs/slo.md#kill-switch-response
     - name: model-canary.slo
       rules:
         - alert: model_canary_promotion_slow
@@ -58,3 +61,4 @@ spec:
           annotations:
             summary: Consecutive canary promotions exceeding 30 minute alert threshold
             runbook: docs/runbooks/model_rollback.md
+            slo_reference: docs/slo.md#model-canary-promotion
