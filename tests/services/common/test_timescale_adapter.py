@@ -88,11 +88,19 @@ def test_credential_rotation_status_returns_latest_entry(adapter: TimescaleAdapt
     adapter.record_credential_rotation(secret_name="kraken-unit-test", rotated_at=rotation_time)
 
     status = adapter.credential_rotation_status()
-    assert status == {"secret_name": "kraken-unit-test", "rotated_at": rotation_time}
+    assert status == {
+        "secret_name": "kraken-unit-test",
+        "created_at": rotation_time,
+        "rotated_at": rotation_time,
+    }
 
     later_rotation = rotation_time + timedelta(hours=1)
     adapter.record_credential_rotation(secret_name="kraken-unit-test", rotated_at=later_rotation)
 
     latest_status = adapter.credential_rotation_status()
-    assert latest_status == {"secret_name": "kraken-unit-test", "rotated_at": later_rotation}
+    assert latest_status == {
+        "secret_name": "kraken-unit-test",
+        "created_at": rotation_time,
+        "rotated_at": later_rotation,
+    }
     assert latest_status is not status
