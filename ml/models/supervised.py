@@ -1,149 +1,392 @@
-"""Supervised learning trainers with fee-aware objectives."""
+
+"""Supervised learning trainers for portfolio forecasting models."""
 from __future__ import annotations
 
-import importlib
+import abc
+import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+
 
 import numpy as np
 import pandas as pd
 
-from .base import TrainingResult, UncertaintyGate
+
+from ml.experiment_tracking.mlflow_utils import MLFlowExperiment
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
-class SupervisedTrainerConfig:
-    model_type: str
-    fee_bps: float
-    uncertainty_threshold: float = 0.5
-    model_params: Dict[str, Any] = field(default_factory=dict)
+class SupervisedDataset:
+    """Container for features and labels used by supervised trainers."""
+
+    features: pd.DataFrame
+    labels: pd.Series
+
+    def to_numpy(self) -> Tuple[np.ndarray, np.ndarray]:
+        return self.features.to_numpy(), self.labels.to_numpy()
 
 
-class SupervisedTrainer:
-    """Dispatcher for supported supervised model families."""
+class SupervisedTrainer(abc.ABC):
+    """Common interface implemented by all supervised learning trainers."""
 
-    def __init__(self, config: SupervisedTrainerConfig) -> None:
-        self.config = config
-        self.uncertainty_gate = UncertaintyGate(config.uncertainty_threshold)
-        self.model = self._initialise_model()
+    name: str = "base"
 
-    def _initialise_model(self) -> Any:
-        model_type = self.config.model_type.lower()
-        params = self.config.model_params
-        if model_type == "lightgbm":
-            lightgbm = importlib.import_module("lightgbm")
-            return lightgbm.LGBMRegressor(**params)
-        if model_type == "xgboost":
-            xgb = importlib.import_module("xgboost")
-            return xgb.XGBRegressor(**params)
-        if model_type == "tcn":
-            torch = importlib.import_module("torch")
-            nn = importlib.import_module("torch.nn")
+    def __init__(self, experiment: Optional[MLFlowExperiment] = None) -> None:
+        self.experiment = experiment
 
-            class TemporalConvNet(nn.Module):
-                def __init__(self, input_size: int, hidden_size: int, output_size: int) -> None:
-                    super().__init__()
-                    self.network = nn.Sequential(
-                        nn.Conv1d(input_size, hidden_size, kernel_size=3, padding=1),
-                        nn.ReLU(),
-                        nn.Conv1d(hidden_size, hidden_size, kernel_size=3, padding=1),
-                        nn.ReLU(),
-                        nn.Conv1d(hidden_size, output_size, kernel_size=1),
+    @abc.abstractmethod
+    def fit(self, dataset: SupervisedDataset, **kwargs: Any) -> Any:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def predict(self, features: pd.DataFrame) -> np.ndarray:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def save(self, path: Path) -> None:
+        raise NotImplementedError
+
+    def log_metrics(self, metrics: Mapping[str, float]) -> None:
+        if not self.experiment:
+            return
+        for key, value in metrics.items():
+            self.experiment.log_metric(key, value)
+
+    def log_params(self, params: Mapping[str, Any]) -> None:
+        if not self.experiment:
+            return
+        self.experiment.log_params(dict(params))
+
+
+@dataclass
+class LightGBMTrainer(SupervisedTrainer):
+    """Wrapper around LightGBM models."""
+
+    params: Dict[str, Any] = field(default_factory=dict)
+    _model: Any = None
+
+    name: str = "lightgbm"
+
+    def fit(self, dataset: SupervisedDataset, **kwargs: Any) -> Any:  # type: ignore[override]
+        try:
+            import lightgbm as lgb
+        except ImportError as exc:  # pragma: no cover - dependency optional.
+            raise ImportError("lightgbm must be installed to use LightGBMTrainer") from exc
+
+        train_set = lgb.Dataset(dataset.features, label=dataset.labels)
+        all_params = {**self.params, **kwargs}
+        self.log_params(all_params)
+        self._model = lgb.train(all_params, train_set)
+        LOGGER.info("Trained LightGBM model with %d features", dataset.features.shape[1])
+        return self._model
+
+    def predict(self, features: pd.DataFrame) -> np.ndarray:  # type: ignore[override]
+        if self._model is None:
+            raise RuntimeError("Model has not been trained yet")
+        return self._model.predict(features)
+
+    def save(self, path: Path) -> None:  # type: ignore[override]
+        if self._model is None:
+            raise RuntimeError("Model has not been trained yet")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._model.save_model(str(path))
+        LOGGER.info("Saved LightGBM model to %s", path)
+        if self.experiment:
+            self.experiment.log_artifact(path)
+
+
+@dataclass
+class XGBoostTrainer(SupervisedTrainer):
+    """Wrapper around XGBoost models."""
+
+    params: Dict[str, Any] = field(default_factory=dict)
+    num_boost_round: int = 200
+    _model: Any = None
+    name: str = "xgboost"
+
+    def fit(self, dataset: SupervisedDataset, **kwargs: Any) -> Any:  # type: ignore[override]
+        try:
+            import xgboost as xgb
+        except ImportError as exc:  # pragma: no cover - dependency optional.
+            raise ImportError("xgboost must be installed to use XGBoostTrainer") from exc
+
+        dtrain = xgb.DMatrix(dataset.features, label=dataset.labels)
+        all_params = {**self.params, **kwargs}
+        self.log_params(all_params)
+        self._model = xgb.train(all_params, dtrain, num_boost_round=self.num_boost_round)
+        LOGGER.info("Trained XGBoost model with %d boosting rounds", self.num_boost_round)
+        return self._model
+
+    def predict(self, features: pd.DataFrame) -> np.ndarray:  # type: ignore[override]
+        if self._model is None:
+            raise RuntimeError("Model has not been trained yet")
+        import xgboost as xgb  # Safe import – only executed after fit.
+
+        dmatrix = xgb.DMatrix(features)
+        return self._model.predict(dmatrix)
+
+    def save(self, path: Path) -> None:  # type: ignore[override]
+        if self._model is None:
+            raise RuntimeError("Model has not been trained yet")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._model.save_model(str(path))
+        LOGGER.info("Saved XGBoost model to %s", path)
+        if self.experiment:
+            self.experiment.log_artifact(path)
+
+
+@dataclass
+class TemporalConvNetTrainer(SupervisedTrainer):
+    """Temporal Convolutional Network trainer implemented with PyTorch."""
+
+    input_channels: int
+    output_size: int
+    hidden_channels: Iterable[int]
+    kernel_size: int = 3
+    dropout: float = 0.1
+    epochs: int = 20
+    learning_rate: float = 1e-3
+    batch_size: int = 64
+    _model: Any = None
+    name: str = "tcn"
+
+    def _build_model(self) -> Any:
+        import torch
+        import torch.nn as nn
+
+        class TemporalConvNet(nn.Module):
+            def __init__(
+                self,
+                num_inputs: int,
+                num_channels: Iterable[int],
+                kernel_size: int,
+                dropout: float,
+                output_size: int,
+            ) -> None:
+                super().__init__()
+                layers: List[nn.Module] = []
+                prev_channels = num_inputs
+                for channels in num_channels:
+                    layers.append(
+                        nn.Sequential(
+                            nn.Conv1d(prev_channels, channels, kernel_size, padding="same"),
+                            nn.ReLU(),
+                            nn.Dropout(dropout),
+                        )
                     )
+                    prev_channels = channels
+                self.network = nn.Sequential(*layers)
+                self.head = nn.Linear(prev_channels, output_size)
 
-                def forward(self, x: Any) -> Any:
-                    return self.network(x).mean(dim=-1)
+            def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+                y = self.network(x)
+                y = y.mean(dim=-1)
+                return self.head(y)
 
-            return TemporalConvNet(
-                input_size=params.get("input_size", 32),
-                hidden_size=params.get("hidden_size", 64),
-                output_size=params.get("output_size", 1),
-            )
-        if model_type == "transformer":
-            torch = importlib.import_module("torch")
-            nn = importlib.import_module("torch.nn")
-
-            class TransformerRegressor(nn.Module):
-                def __init__(self, d_model: int = 32, nhead: int = 4, num_layers: int = 2) -> None:
-                    super().__init__()
-                    encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead)
-                    self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-                    self.linear = nn.Linear(d_model, 1)
-
-                def forward(self, x: Any) -> Any:
-                    encoded = self.encoder(x)
-                    return self.linear(encoded.mean(dim=0))
-
-            return TransformerRegressor(
-                d_model=params.get("d_model", 32),
-                nhead=params.get("nhead", 4),
-                num_layers=params.get("num_layers", 2),
-            )
-        raise ValueError(f"Unsupported model type: {self.config.model_type}")
-
-    def train(self, features: pd.DataFrame, labels: pd.Series) -> TrainingResult:
-        model_type = self.config.model_type.lower()
-        if model_type in {"lightgbm", "xgboost"}:
-            self.model.fit(features, labels)
-            predictions = self.model.predict(features)
-            mse = float(np.mean((predictions - labels) ** 2))
-            return TrainingResult(metrics={"mse": mse}, model=self.model)
-
-        torch = importlib.import_module("torch")
-        optim = importlib.import_module("torch.optim")
-        dataset = torch.utils.data.TensorDataset(
-            torch.tensor(features.values, dtype=torch.float32),
-            torch.tensor(labels.values, dtype=torch.float32).unsqueeze(-1),
+        return TemporalConvNet(
+            num_inputs=self.input_channels,
+            num_channels=list(self.hidden_channels),
+            kernel_size=self.kernel_size,
+            dropout=self.dropout,
+            output_size=self.output_size,
         )
-        loader = torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=True)
-        optimizer = optim.Adam(self.model.parameters(), lr=self.config.model_params.get("lr", 1e-3))
-        loss_fn = torch.nn.MSELoss()
-        self.model.train()
-        for _ in range(self.config.model_params.get("epochs", 5)):
+
+    def fit(self, dataset: SupervisedDataset, **kwargs: Any) -> Any:  # type: ignore[override]
+        import torch
+        import torch.nn as nn
+        from torch.utils.data import DataLoader, TensorDataset
+
+        features, labels = dataset.to_numpy()
+        features = torch.tensor(features, dtype=torch.float32)
+        labels = torch.tensor(labels, dtype=torch.float32)
+        ds = TensorDataset(features, labels)
+        loader = DataLoader(ds, batch_size=self.batch_size, shuffle=True)
+
+        model = self._build_model()
+        criterion = nn.MSELoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=self.learning_rate)
+        self.log_params(
+            {
+                "kernel_size": self.kernel_size,
+                "dropout": self.dropout,
+                "epochs": self.epochs,
+                "learning_rate": self.learning_rate,
+                "batch_size": self.batch_size,
+            }
+        )
+        model.train()
+        for epoch in range(self.epochs):
+            epoch_loss = 0.0
             for batch_features, batch_labels in loader:
                 optimizer.zero_grad()
-                outputs = self.model(batch_features)
-                loss = loss_fn(outputs, batch_labels)
+                preds = model(batch_features.unsqueeze(-1).transpose(1, 2))
+                loss = criterion(preds.squeeze(), batch_labels)
                 loss.backward()
                 optimizer.step()
-        return TrainingResult(metrics={"loss": float(loss.item())}, model=self.model)
+                epoch_loss += loss.item()
+            self.log_metrics({f"train_loss_epoch_{epoch}": epoch_loss / len(loader)})
+        self._model = model
+        LOGGER.info("Finished training TCN for %d epochs", self.epochs)
+        return model
 
-    def predict(self, features: pd.DataFrame) -> np.ndarray:
-        model_type = self.config.model_type.lower()
-        if model_type in {"lightgbm", "xgboost"}:
-            predictions = np.asarray(self.model.predict(features))
-            uncertainties = np.abs(predictions) * 0.05
-            return self.uncertainty_gate.apply(predictions, uncertainties)
+    def predict(self, features: pd.DataFrame) -> np.ndarray:  # type: ignore[override]
+        if self._model is None:
+            raise RuntimeError("Model has not been trained yet")
+        import torch
 
-        torch = importlib.import_module("torch")
-        self.model.eval()
+        self._model.eval()
+        tensor = torch.tensor(features.to_numpy(), dtype=torch.float32)
         with torch.no_grad():
-            predictions_tensor = self.model(torch.tensor(features.values, dtype=torch.float32))
-            predictions = predictions_tensor.squeeze(-1).numpy()
-        uncertainties = np.abs(predictions) * 0.1
-        return self.uncertainty_gate.apply(predictions, uncertainties)
+            preds = self._model(tensor.unsqueeze(-1).transpose(1, 2))
+        return preds.squeeze().numpy()
+
+    def save(self, path: Path) -> None:  # type: ignore[override]
+        if self._model is None:
+            raise RuntimeError("Model has not been trained yet")
+        import torch
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(self._model.state_dict(), path)
+        LOGGER.info("Saved TCN model to %s", path)
+        if self.experiment:
+            self.experiment.log_artifact(path)
 
 
-def fee_adjusted_metric(returns: Iterable[float], turnovers: Iterable[float], fee_bps: float) -> Dict[str, float]:
-    returns_arr = np.asarray(list(returns), dtype=float)
-    turnovers_arr = np.asarray(list(turnovers), dtype=float)
-    fees = turnovers_arr * fee_bps / 10_000.0
-    net_returns = returns_arr - fees
-    sharpe = float(np.mean(net_returns) / (np.std(net_returns) + 1e-8))
-    downside = net_returns[net_returns < 0]
-    downside_std = float(np.std(downside)) if downside.size else 1e-8
-    sortino = float(np.mean(net_returns) / (downside_std + 1e-8))
-    cumulative = np.cumsum(net_returns)
-    running_max = np.maximum.accumulate(cumulative)
-    drawdowns = cumulative - running_max
-    max_drawdown = float(drawdowns.min() if drawdowns.size else 0.0)
-    turnover = float(np.mean(turnovers_arr))
-    return {
-        "sharpe": sharpe,
-        "sortino": sortino,
-        "max_drawdown": max_drawdown,
-        "turnover": turnover,
-    }
+@dataclass
+class TransformerTrainer(SupervisedTrainer):
+    """Transformer-based sequence regression model."""
+
+    d_model: int = 128
+    nhead: int = 4
+    num_layers: int = 2
+    dim_feedforward: int = 256
+    dropout: float = 0.1
+    epochs: int = 30
+    learning_rate: float = 1e-3
+    batch_size: int = 64
+    _model: Any = None
+    name: str = "transformer"
+
+    def _build_model(self, feature_dim: int) -> Any:
+        import torch
+        import torch.nn as nn
+
+        class TransformerRegressor(nn.Module):
+            def __init__(self, feature_dim: int, config: "TransformerTrainer") -> None:
+                super().__init__()
+                self.input_projection = nn.Linear(feature_dim, config.d_model)
+                encoder_layer = nn.TransformerEncoderLayer(
+                    d_model=config.d_model,
+                    nhead=config.nhead,
+                    dim_feedforward=config.dim_feedforward,
+                    dropout=config.dropout,
+                    batch_first=True,
+                )
+                self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=config.num_layers)
+                self.head = nn.Linear(config.d_model, 1)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+                z = self.input_projection(x)
+                z = self.encoder(z)
+                return self.head(z[:, -1, :])
+
+        return TransformerRegressor(feature_dim, self)
+
+    def fit(self, dataset: SupervisedDataset, sequence_length: int, **kwargs: Any) -> Any:  # type: ignore[override]
+        import torch
+        import torch.nn as nn
+        from torch.utils.data import DataLoader, TensorDataset
+
+        features, labels = dataset.to_numpy()
+        if features.shape[0] < sequence_length:
+            raise ValueError("Not enough samples to form sequences of the requested length")
+        sequences = []
+        targets = []
+        for idx in range(sequence_length, len(features)):
+            sequences.append(features[idx - sequence_length : idx])
+            targets.append(labels[idx])
+        seq_tensor = torch.tensor(np.stack(sequences), dtype=torch.float32)
+        label_tensor = torch.tensor(np.array(targets), dtype=torch.float32)
+        ds = TensorDataset(seq_tensor, label_tensor)
+        loader = DataLoader(ds, batch_size=self.batch_size, shuffle=True)
+
+        model = self._build_model(feature_dim=features.shape[1])
+        criterion = nn.MSELoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=self.learning_rate)
+        self.log_params(
+            {
+                "d_model": self.d_model,
+                "nhead": self.nhead,
+                "num_layers": self.num_layers,
+                "dim_feedforward": self.dim_feedforward,
+                "dropout": self.dropout,
+                "epochs": self.epochs,
+                "learning_rate": self.learning_rate,
+                "batch_size": self.batch_size,
+                "sequence_length": sequence_length,
+            }
+        )
+        model.train()
+        for epoch in range(self.epochs):
+            epoch_loss = 0.0
+            for seq_batch, label_batch in loader:
+                optimizer.zero_grad()
+                preds = model(seq_batch)
+                loss = criterion(preds.squeeze(), label_batch)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+            self.log_metrics({f"train_loss_epoch_{epoch}": epoch_loss / len(loader)})
+        self._model = model
+        LOGGER.info("Finished training Transformer for %d epochs", self.epochs)
+        return model
+
+    def predict(self, features: pd.DataFrame, sequence_length: int) -> np.ndarray:  # type: ignore[override]
+        if self._model is None:
+            raise RuntimeError("Model has not been trained yet")
+        import torch
+
+        feature_array = features.to_numpy()
+        if feature_array.shape[0] < sequence_length:
+            raise ValueError("Not enough samples to form sequences of the requested length")
+        sequences = []
+        for idx in range(sequence_length, len(feature_array) + 1):
+            sequences.append(feature_array[idx - sequence_length : idx])
+        seq_tensor = torch.tensor(np.stack(sequences), dtype=torch.float32)
+        self._model.eval()
+        with torch.no_grad():
+            preds = self._model(seq_tensor)
+        return preds.squeeze().numpy()
+
+    def save(self, path: Path) -> None:  # type: ignore[override]
+        if self._model is None:
+            raise RuntimeError("Model has not been trained yet")
+        import torch
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(self._model.state_dict(), path)
+        LOGGER.info("Saved Transformer model to %s", path)
+        if self.experiment:
+            self.experiment.log_artifact(path)
 
 
-__all__ = ["SupervisedTrainer", "SupervisedTrainerConfig", "fee_adjusted_metric"]
+TRAINER_REGISTRY: Dict[str, type[SupervisedTrainer]] = {
+    LightGBMTrainer.name: LightGBMTrainer,
+    XGBoostTrainer.name: XGBoostTrainer,
+    TemporalConvNetTrainer.name: TemporalConvNetTrainer,
+    TransformerTrainer.name: TransformerTrainer,
+}
+
+
+def load_trainer(name: str, **kwargs: Any) -> SupervisedTrainer:
+    """Instantiate a trainer by name."""
+
+    try:
+        trainer_cls = TRAINER_REGISTRY[name]
+    except KeyError as exc:  # pragma: no cover - defensive guard.
+        raise ValueError(f"Unknown trainer '{name}'") from exc
+    return trainer_cls(**kwargs)
+
