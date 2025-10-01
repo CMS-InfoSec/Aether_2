@@ -1,0 +1,114 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: aether-ml-ops
+spec:
+  entrypoint: daily-retraining
+  templates:
+    - name: daily-retraining
+      steps:
+        - - name: fetch-data
+            template: fetch-data
+        - - name: train-models
+            template: train-models
+        - - name: evaluate-and-log
+            template: evaluate-and-log
+        - - name: canary-deploy
+            template: canary-deploy
+    - name: fetch-data
+      container:
+        image: '{{workflow.parameters.feature_image}}'
+        command: ["python", "-m", "ml.data_loader"]
+        env:
+          - name: TIMESCALE_URI
+            valueFrom:
+              secretKeyRef:
+                name: timescale-credentials
+                key: uri
+          - name: FEAST_REPO_PATH
+            value: /feast_repo
+        volumeMounts:
+          - name: feast-repo
+            mountPath: /feast_repo
+    - name: train-models
+      dag:
+        tasks:
+          - name: train-supervised
+            template: train-supervised
+          - name: train-rl
+            template: train-rl
+    - name: train-supervised
+      container:
+        image: '{{workflow.parameters.training_image}}'
+        command: ["python", "-m", "ml.training.supervised_runner"]
+        envFrom:
+          - configMapRef:
+              name: model-training-config
+    - name: train-rl
+      container:
+        image: '{{workflow.parameters.training_image}}'
+        command: ["python", "-m", "ml.training.rl_runner"]
+        envFrom:
+          - configMapRef:
+              name: model-training-config
+    - name: evaluate-and-log
+      container:
+        image: '{{workflow.parameters.training_image}}'
+        command: ["python", "-m", "ml.evaluation.evaluate"]
+        env:
+          - name: MLFLOW_TRACKING_URI
+            valueFrom:
+              configMapKeyRef:
+                name: mlflow-config
+                key: tracking_uri
+    - name: canary-deploy
+      steps:
+        - - name: promote-canary
+            template: promote-canary
+        - - name: monitor-drift
+            template: monitor-drift
+        - - name: finalize-or-rollback
+            template: finalize-or-rollback
+    - name: promote-canary
+      container:
+        image: '{{workflow.parameters.ops_image}}'
+        command: ["python", "-m", "ml.ops.canary", "promote"]
+        envFrom:
+          - secretRef:
+              name: registry-credentials
+    - name: monitor-drift
+      container:
+        image: '{{workflow.parameters.ops_image}}'
+        command: ["python", "-m", "ml.monitoring.drift"]
+        env:
+          - name: PSI_THRESHOLD
+            value: "0.2"
+          - name: KS_THRESHOLD
+            value: "0.05"
+    - name: finalize-or-rollback
+      container:
+        image: '{{workflow.parameters.ops_image}}'
+        command: ["python", "-m", "ml.ops.rollout", "finalize"]
+        env:
+          - name: ROLLBACK_WORKFLOW
+            value: rollback-workflow
+    - name: rollback-workflow
+      steps:
+        - - name: rollback
+            template: rollback
+    - name: rollback
+      container:
+        image: '{{workflow.parameters.ops_image}}'
+        command: ["python", "-m", "ml.ops.rollout", "rollback"]
+        envFrom:
+          - secretRef:
+              name: registry-credentials
+  volumes:
+    - name: feast-repo
+      persistentVolumeClaim:
+        claimName: feast-repo-pvc
+  arguments:
+    parameters:
+      - name: feature_image
+      - name: training_image
+      - name: ops_image
