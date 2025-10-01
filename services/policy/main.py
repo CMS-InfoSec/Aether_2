@@ -16,7 +16,10 @@ from services.common.security import require_admin_account
 from shared.models.registry import get_model_registry
 from services.policy.model_server import predict_intent
 
+from metrics import record_abstention_rate, record_drift_score, setup_metrics
+
 app = FastAPI(title="Policy Service")
+setup_metrics(app)
 
 
 
@@ -185,7 +188,7 @@ def decide_policy(
         },
     )
 
-    return PolicyDecisionResponse(
+    response = PolicyDecisionResponse(
         approved=approved,
         reason=reason,
         effective_fee=request.fee,
@@ -200,4 +203,20 @@ def decide_policy(
         take_profit_bps=round(take_profit_bps, 4),
         stop_loss_bps=round(stop_loss_bps, 4),
     )
+
+    drift_value = 0.0
+    drift_source = online_features.get("drift_score") if isinstance(online_features, dict) else None
+    if drift_source is None and isinstance(request.state, PolicyState):
+        drift_source = getattr(request.state, "conviction", None)
+    if drift_source is not None:
+        try:
+            drift_value = float(drift_source)
+        except (TypeError, ValueError):
+            drift_value = 0.0
+    record_drift_score(account_id, request.instrument, drift_value)
+
+    abstain = 0.0 if response.approved and response.selected_action != "abstain" else 1.0
+    record_abstention_rate(account_id, request.instrument, abstain)
+
+    return response
 

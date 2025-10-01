@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 import asyncio
 import contextlib
 import json
@@ -21,6 +22,7 @@ from services.oms.kraken_ws import (
     OrderAck,
     OrderState,
 )
+
 
 
 logger = logging.getLogger(__name__)
@@ -610,6 +612,7 @@ async def place_order(
     return result
 
 
+
 @app.post("/oms/cancel", response_model=OMSOrderStatusResponse)
 async def cancel_order(
     payload: OMSCancelRequest,
@@ -621,6 +624,7 @@ async def cancel_order(
     account = await manager.get_account(payload.account_id)
     result = await account.cancel_order(payload)
     return result
+
 
 
 @app.get("/oms/status", response_model=OMSOrderStatusResponse)
@@ -637,4 +641,5 @@ async def get_status(
     if not record:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown order")
     return record.result
+
 

@@ -5,7 +5,10 @@ from services.common.schemas import RiskValidationRequest, RiskValidationRespons
 from services.common.security import require_admin_account
 from services.risk.engine import RiskEngine
 
+from metrics import increment_trade_rejection, record_fees_nav_pct, setup_metrics
+
 app = FastAPI(title="Risk Service")
+setup_metrics(app)
 
 
 
@@ -23,5 +26,16 @@ def validate_risk(
 
     engine = RiskEngine(account_id=account_id)
     decision = engine.validate(request)
+
+    symbol = request.instrument or request.intent.policy_decision.request.instrument
+    symbol = str(symbol)
+    if not decision.valid:
+        increment_trade_rejection(account_id, symbol)
+
+    nav = float(request.portfolio_state.nav) if request.portfolio_state.nav else 0.0
+    fees = float(request.portfolio_state.fee_to_date) if request.portfolio_state.fee_to_date else 0.0
+    fees_pct = (fees / nav * 100.0) if nav else 0.0
+    record_fees_nav_pct(account_id, symbol, fees_pct)
+
     return decision
 
