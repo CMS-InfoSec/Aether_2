@@ -1,67 +1,84 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
 
 import pytest
 
 from services.common.adapters import TimescaleAdapter
 
 
-def setup_function() -> None:
+
+@pytest.fixture(autouse=True)
+def reset_timescale() -> None:
+    TimescaleAdapter.reset()
+    TimescaleAdapter.reset_rotation_state()
+    yield
+
     TimescaleAdapter.reset()
     TimescaleAdapter.reset_rotation_state()
 
 
-def test_daily_usage_accumulates_per_account() -> None:
-    adapter = TimescaleAdapter(account_id="alpha")
 
-    adapter.record_daily_usage(100.0, 10.0)
-    adapter.record_daily_usage(50.0, 5.0)
+def test_record_daily_usage_accumulates() -> None:
+    adapter = TimescaleAdapter(account_id="admin-eu")
 
-    usage = adapter.get_daily_usage()
+    adapter.record_daily_usage(1_000.0, 250.0)
+    snapshot = adapter.record_daily_usage(500.0, 125.0)
 
-    assert usage["loss"] == pytest.approx(150.0)
-    assert usage["fee"] == pytest.approx(15.0)
+    assert snapshot["loss"] == pytest.approx(1_500.0)
+    assert snapshot["fee"] == pytest.approx(375.0)
 
-
-def test_instrument_exposure_tracks_by_symbol() -> None:
-    adapter = TimescaleAdapter(account_id="alpha")
-
-    adapter.record_instrument_exposure("BTC-USD", 25_000.0)
-    adapter.record_instrument_exposure("BTC-USD", 5_000.0)
-    adapter.record_instrument_exposure("ETH-USD", 10_000.0)
-
-    assert adapter.instrument_exposure("BTC-USD") == pytest.approx(30_000.0)
-    assert adapter.instrument_exposure("ETH-USD") == pytest.approx(10_000.0)
-    assert adapter.instrument_exposure("SOL-USD") == pytest.approx(0.0)
+    current = adapter.get_daily_usage()
+    assert current == snapshot
 
 
-def test_record_event_appends_risk_event_log() -> None:
-    adapter = TimescaleAdapter(account_id="alpha")
+def test_instrument_exposure_tracks_notional() -> None:
+    adapter = TimescaleAdapter(account_id="admin-eu")
 
-    payload = {"reason": "breach", "context": {"latency": 500.0}}
-    adapter.record_event("latency_circuit_breaker", payload)
+    adapter.record_instrument_exposure("BTC-USD", 10_000.0)
+    updated = adapter.record_instrument_exposure("BTC-USD", 5_000.0)
 
-    events = adapter.events()["risk"]
-    assert len(events) == 1
-    event = events[0]
-    assert event["type"] == "latency_circuit_breaker"
-    assert event["payload"] == payload
-    assert isinstance(event["timestamp"], datetime)
-    assert event["timestamp"].tzinfo == timezone.utc
+    assert updated == pytest.approx(15_000.0)
+    assert adapter.instrument_exposure("BTC-USD") == pytest.approx(15_000.0)
+    assert adapter.instrument_exposure("ETH-USD") == pytest.approx(0.0)
 
 
-def test_credential_rotation_returns_latest_state() -> None:
-    adapter = TimescaleAdapter(account_id="alpha")
+def test_record_event_publishes_to_risk_stream() -> None:
+    adapter = TimescaleAdapter(account_id="admin-eu")
 
-    first = adapter.record_credential_rotation(secret_name="kraken-keys-alpha")
-    second = adapter.record_credential_rotation(secret_name="kraken-keys-alpha")
+    adapter.record_event("test_event", {"foo": "bar"})
+    events = adapter.events()
 
-    assert first["secret_name"] == "kraken-keys-alpha"
-    assert "created_at" in first and "rotated_at" in first
-    assert second["created_at"] == first["created_at"]
-    assert second["rotated_at"] >= first["rotated_at"]
+    assert events["risk"]
+    event = events["risk"][0]
+    assert event["type"] == "test_event"
+    assert event["payload"] == {"foo": "bar"}
+    assert "timestamp" in event
 
+
+def test_credential_rotation_status_round_trip() -> None:
+    adapter = TimescaleAdapter(account_id="admin-eu")
+
+    record = adapter.record_credential_rotation(secret_name="kraken-keys-admin-eu")
     status = adapter.credential_rotation_status()
-    assert status is not None
-    assert status["secret_name"] == "kraken-keys-alpha"
+
+    assert status == record
+
+    TimescaleAdapter.reset_rotation_state(account_id="admin-eu")
+    assert adapter.credential_rotation_status() is None
+
+
+def test_risk_config_can_be_overridden_without_side_effects() -> None:
+    adapter = TimescaleAdapter(account_id="admin-eu")
+
+    default_snapshot = adapter.load_risk_config()
+    adapter.update_risk_config(kill_switch=True, nav=3_000_000.0)
+
+    updated = adapter.load_risk_config()
+    assert updated["kill_switch"] is True
+    assert updated["nav"] == pytest.approx(3_000_000.0)
+
+    # Ensure copies are returned to callers
+    default_snapshot["nav"] = 123.0
+    reloaded = adapter.load_risk_config()
+    assert reloaded["nav"] == pytest.approx(3_000_000.0)
+

@@ -1,43 +1,21 @@
 from __future__ import annotations
 
-from typing import Iterable
-
 import pytest
 
 from services.common.adapters import TimescaleAdapter
 from services.common.schemas import RiskValidationRequest
 from services.risk.engine import RiskEngine
-from services.universe.repository import MarketSnapshot, UniverseRepository
+
 
 
 @pytest.fixture(autouse=True)
-def reset_state() -> Iterable[None]:
-    accounts = ["admin-eu", "admin-us"]
-    UniverseRepository.reset()
-    UniverseRepository.seed_market_snapshots(
-        [
-            MarketSnapshot(
-                base_asset="ETH",
-                quote_asset="USD",
-                market_cap=5.0e11,
-                volume_24h=3.5e10,
-                volatility_30d=0.5,
-            ),
-            MarketSnapshot(
-                base_asset="BTC",
-                quote_asset="USD",
-                market_cap=1.2e12,
-                volume_24h=6.0e10,
-                volatility_30d=0.55,
-            ),
-        ]
-    )
-    for account in accounts:
-        TimescaleAdapter.reset(account)
+def reset_state() -> None:
+    TimescaleAdapter.reset()
+    TimescaleAdapter.reset_rotation_state()
     yield
-    for account in accounts:
-        TimescaleAdapter.reset(account)
-    UniverseRepository.reset()
+    TimescaleAdapter.reset()
+    TimescaleAdapter.reset_rotation_state()
+
 
 
 def make_request(**overrides: float | str | dict[str, float]) -> RiskValidationRequest:
@@ -110,6 +88,7 @@ def test_engine_honors_kill_switch_and_short_circuits() -> None:
     request = make_request(account_id=account)
 
     response = engine.validate(request)
+
 
     assert response.valid is False
     assert response.reasons == ["Risk kill switch engaged for account"]
