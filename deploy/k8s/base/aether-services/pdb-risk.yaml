@@ -1,0 +1,11 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: risk-service
+  labels:
+    app: risk-service
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: risk-service

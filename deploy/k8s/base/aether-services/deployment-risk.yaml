@@ -1,0 +1,103 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: risk-service
+  labels:
+    app: risk-service
+    app.kubernetes.io/name: risk-service
+    app.kubernetes.io/component: api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: risk-service
+  template:
+    metadata:
+      labels:
+        app: risk-service
+        app.kubernetes.io/name: risk-service
+        app.kubernetes.io/component: api
+      annotations:
+        checksum/kraken-secrets: "$(KRAKEN_SECRET_HASH)"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 2000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: risk-service
+          image: ghcr.io/aether/risk-service:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: KRAKEN_SECRETS_BASE
+              value: /var/run/secrets/kraken
+            - name: AETHER_COMPANY_KRAKEN_SECRET_PATH
+              value: /var/run/secrets/kraken/company/credentials.json
+            - name: AETHER_DIRECTOR_1_KRAKEN_SECRET_PATH
+              value: /var/run/secrets/kraken/director-1/credentials.json
+            - name: AETHER_DIRECTOR_2_KRAKEN_SECRET_PATH
+              value: /var/run/secrets/kraken/director-2/credentials.json
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+          volumeMounts:
+            - name: kraken-credentials
+              mountPath: /var/run/secrets/kraken
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+      volumes:
+        - name: kraken-credentials
+          projected:
+            defaultMode: 0440
+            sources:
+              - secret:
+                  name: kraken-keys-company
+                  items:
+                    - key: credentials.json
+                      path: company/credentials.json
+                  optional: true
+              - secret:
+                  name: kraken-keys-director-1
+                  items:
+                    - key: credentials.json
+                      path: director-1/credentials.json
+                  optional: true
+              - secret:
+                  name: kraken-keys-director-2
+                  items:
+                    - key: credentials.json
+                      path: director-2/credentials.json
+                  optional: true
+        - name: tmp
+          emptyDir: {}

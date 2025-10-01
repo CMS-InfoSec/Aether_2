@@ -35,3 +35,6 @@ patches:
         path: /data/environment
         value: staging
 
+patchesStrategicMerge:
+  - patches/aether-services.yaml
+

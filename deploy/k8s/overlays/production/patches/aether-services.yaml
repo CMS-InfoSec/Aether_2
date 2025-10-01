@@ -1,0 +1,155 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: policy-service
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+        - name: policy-service
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 750m
+              memory: 1536Mi
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: policy-service
+spec:
+  minReplicas: 3
+  maxReplicas: 8
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: risk-service
+spec:
+  replicas: 4
+  template:
+    spec:
+      containers:
+        - name: risk-service
+          resources:
+            requests:
+              cpu: 400m
+              memory: 768Mi
+            limits:
+              cpu: 1500m
+              memory: 2Gi
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: risk-service
+spec:
+  minReplicas: 4
+  maxReplicas: 12
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oms-service
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+        - name: oms-service
+          resources:
+            requests:
+              cpu: 300m
+              memory: 512Mi
+            limits:
+              cpu: 900m
+              memory: 1536Mi
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: oms-service
+spec:
+  minReplicas: 3
+  maxReplicas: 9
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fees-service
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: fees-service
+          resources:
+            requests:
+              cpu: 200m
+              memory: 384Mi
+            limits:
+              cpu: 600m
+              memory: 1Gi
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: fees-service
+spec:
+  minReplicas: 2
+  maxReplicas: 6
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secrets-service
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: secrets-service
+          resources:
+            requests:
+              cpu: 200m
+              memory: 384Mi
+            limits:
+              cpu: 600m
+              memory: 1Gi
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: secrets-service
+spec:
+  minReplicas: 2
+  maxReplicas: 6
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: universe-service
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+        - name: universe-service
+          resources:
+            requests:
+              cpu: 280m
+              memory: 512Mi
+            limits:
+              cpu: 840m
+              memory: 1280Mi
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: universe-service
+spec:
+  minReplicas: 3
+  maxReplicas: 9

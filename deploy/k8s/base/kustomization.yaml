@@ -10,6 +10,7 @@ resources:
   - fastapi
   - ingress
   - networkpolicies
+  - aether-services
 commonLabels:
   app.kubernetes.io/part-of: aether-risk
 
