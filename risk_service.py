@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import contextmanager
 from datetime import datetime, timedelta
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, Iterator, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field, PositiveFloat, root_validator
-from sqlalchemy import Column, Float, Integer, String
-from sqlalchemy.orm import declarative_base
+from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, model_validator
+from sqlalchemy import Column, DateTime, Float, Integer, String, create_engine
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session, declarative_base, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from metrics import (
     increment_trade_rejection,
@@ -25,6 +28,20 @@ logging.basicConfig(level=logging.INFO)
 
 
 Base = declarative_base()
+
+
+class AccountRiskUsage(Base):
+    """Persisted account level usage metrics backing the service responses."""
+
+    __tablename__ = "account_risk_usage"
+
+    account_id = Column(String, primary_key=True)
+    realized_daily_loss = Column(Float, nullable=False, default=0.0)
+    fees_paid = Column(Float, nullable=False, default=0.0)
+    net_asset_value = Column(Float, nullable=False, default=0.0)
+    var_95 = Column(Float, nullable=True)
+    var_99 = Column(Float, nullable=True)
+    updated_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class ConfigError(RuntimeError):
@@ -74,68 +91,154 @@ class AccountRiskLimit(Base):
         return [token.strip() for token in self.instrument_whitelist.split(",") if token.strip()]
 
 
-class StubSession:
-    """Minimal stand-in for a SQLAlchemy session used in tests."""
-
-    def __enter__(self) -> "StubSession":
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        return None
-
-    def get(self, model: Base, pk: str) -> Optional[AccountRiskLimit]:
-        row = _STUB_RISK_LIMITS.get(pk)
-        if not row:
-            return None
-        return model(**row)
+DEFAULT_DATABASE_URL = "sqlite:///./risk.db"
 
 
-@contextmanager
-def get_session():
-    yield StubSession()
+def _database_url() -> str:
+    url = os.getenv("RISK_DATABASE_URL") or os.getenv("TIMESCALE_DSN") or os.getenv(
+        "DATABASE_URL", DEFAULT_DATABASE_URL
+    )
+    if url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
+    return url
 
 
-_STUB_RISK_LIMITS: Dict[str, Dict[str, float]] = {
-    "ACC-DEFAULT": {
-        "account_id": "ACC-DEFAULT",
+def _engine_options(url: str) -> Dict[str, object]:
+    options: Dict[str, object] = {"future": True}
+    if url.startswith("sqlite://"):
+        options.setdefault("connect_args", {"check_same_thread": False})
+        if url == "sqlite:///:memory:" or url.endswith(":memory:"):
+            options["poolclass"] = StaticPool
+    return options
+
+
+_DB_URL = _database_url()
+ENGINE: Engine = create_engine(_DB_URL, **_engine_options(_DB_URL))
+SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
+
+
+_DEFAULT_LIMITS: List[Dict[str, object]] = [
+    {
+        "account_id": "company",
+        "max_daily_loss": 150_000.0,
+        "fee_budget": 35_000.0,
+        "max_nav_pct_per_trade": 0.35,
+        "notional_cap": 7_500_000.0,
+        "cooldown_minutes": 60,
+        "instrument_whitelist": ["BTC-USD", "ETH-USD"],
+        "var_95_limit": 250_000.0,
+        "var_99_limit": 450_000.0,
+        "spread_threshold_bps": 15.0,
+        "latency_stall_seconds": 2.0,
+        "exchange_outage_block": 0,
+    },
+    {
+        "account_id": "director-1",
         "max_daily_loss": 50_000.0,
         "fee_budget": 10_000.0,
         "max_nav_pct_per_trade": 0.25,
-        "notional_cap": 1_000_000.0,
+        "notional_cap": 1_500_000.0,
         "cooldown_minutes": 120,
-        "instrument_whitelist": "AAPL,MSFT,GOOG",
-        "var_95_limit": 35_000.0,
-        "var_99_limit": 65_000.0,
-        "spread_threshold_bps": 15.0,
-        "latency_stall_seconds": 2.5,
+        "instrument_whitelist": ["SOL-USD"],
+        "var_95_limit": 100_000.0,
+        "var_99_limit": 175_000.0,
+        "spread_threshold_bps": 20.0,
+        "latency_stall_seconds": 3.0,
         "exchange_outage_block": 1,
     },
-    "ACC-AGGR": {
-        "account_id": "ACC-AGGR",
-        "max_daily_loss": 150_000.0,
-        "fee_budget": 25_000.0,
-        "max_nav_pct_per_trade": 0.4,
-        "notional_cap": 5_000_000.0,
-        "cooldown_minutes": 60,
-        "instrument_whitelist": "ES_F,CL_F",
-        "var_95_limit": 100_000.0,
-        "var_99_limit": 180_000.0,
-        "spread_threshold_bps": 10.0,
-        "latency_stall_seconds": 1.5,
+    {
+        "account_id": "director-2",
+        "max_daily_loss": 100_000.0,
+        "fee_budget": 20_000.0,
+        "max_nav_pct_per_trade": 0.3,
+        "notional_cap": 3_500_000.0,
+        "cooldown_minutes": 90,
+        "instrument_whitelist": ["BTC-USD", "ETH-USD"],
+        "var_95_limit": 180_000.0,
+        "var_99_limit": 320_000.0,
+        "spread_threshold_bps": 18.0,
+        "latency_stall_seconds": 2.5,
         "exchange_outage_block": 0,
     },
-}
+]
 
 
-_STUB_ACCOUNT_USAGE: Dict[str, Dict[str, float]] = {
-    "ACC-DEFAULT": {
-        "realized_daily_loss": 15_000.0,
-        "fees_paid": 4_000.0,
-        "net_asset_value": 350_000.0,
-        "var_95": 30_000.0,
-        "var_99": 55_000.0,
-    }
-}
+def _seed_default_limits(session: Session) -> None:
+    for payload in _DEFAULT_LIMITS:
+        record = session.get(AccountRiskLimit, payload["account_id"])
+        whitelist = payload.get("instrument_whitelist", [])
+        whitelist_blob = ",".join(sorted(whitelist)) if whitelist else None
+        if record is None:
+            record = AccountRiskLimit(
+                account_id=payload["account_id"],
+                max_daily_loss=float(payload["max_daily_loss"]),
+                fee_budget=float(payload["fee_budget"]),
+                max_nav_pct_per_trade=float(payload["max_nav_pct_per_trade"]),
+                notional_cap=float(payload["notional_cap"]),
+                cooldown_minutes=int(payload["cooldown_minutes"]),
+                instrument_whitelist=whitelist_blob,
+                var_95_limit=float(payload["var_95_limit"])
+                if payload.get("var_95_limit") is not None
+                else None,
+                var_99_limit=float(payload["var_99_limit"])
+                if payload.get("var_99_limit") is not None
+                else None,
+                spread_threshold_bps=float(payload["spread_threshold_bps"])
+                if payload.get("spread_threshold_bps") is not None
+                else None,
+                latency_stall_seconds=float(payload["latency_stall_seconds"])
+                if payload.get("latency_stall_seconds") is not None
+                else None,
+                exchange_outage_block=int(payload["exchange_outage_block"]),
+            )
+            session.add(record)
+        else:
+            record.max_daily_loss = float(payload["max_daily_loss"])
+            record.fee_budget = float(payload["fee_budget"])
+            record.max_nav_pct_per_trade = float(payload["max_nav_pct_per_trade"])
+            record.notional_cap = float(payload["notional_cap"])
+            record.cooldown_minutes = int(payload["cooldown_minutes"])
+            record.instrument_whitelist = whitelist_blob
+            record.var_95_limit = (
+                float(payload["var_95_limit"])
+                if payload.get("var_95_limit") is not None
+                else None
+            )
+            record.var_99_limit = (
+                float(payload["var_99_limit"])
+                if payload.get("var_99_limit") is not None
+                else None
+            )
+            record.spread_threshold_bps = (
+                float(payload["spread_threshold_bps"])
+                if payload.get("spread_threshold_bps") is not None
+                else None
+            )
+            record.latency_stall_seconds = (
+                float(payload["latency_stall_seconds"])
+                if payload.get("latency_stall_seconds") is not None
+                else None
+            )
+            record.exchange_outage_block = int(payload["exchange_outage_block"])
+
+
+def _bootstrap_storage() -> None:
+    Base.metadata.create_all(bind=ENGINE)
+    with get_session() as session:
+        _seed_default_limits(session)
+
+
+@contextmanager
+def get_session() -> Iterator[Session]:
+    session = SessionLocal()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 
 _STUB_MARKET_TELEMETRY: Dict[str, Dict[str, float]] = {
@@ -157,21 +260,21 @@ class TradeIntent(BaseModel):
 
     policy_id: str = Field(..., description="Identifier for the originating policy or strategy")
     instrument_id: str = Field(..., description="Instrument or symbol to be traded")
-    side: str = Field(..., regex="^(buy|sell)$", description="Trade direction")
+    side: str = Field(..., pattern="^(buy|sell)$", description="Trade direction")
     quantity: PositiveFloat = Field(..., description="Requested trade quantity")
     price: PositiveFloat = Field(..., description="Reference price used for risk checks")
     notional: Optional[PositiveFloat] = Field(
         None, description="Explicit notional value, overrides quantity * price when provided"
     )
 
-    @root_validator
-    def compute_notional(cls, values):
-        quantity = values.get("quantity")
-        price = values.get("price")
-        notional = values.get("notional")
+    @model_validator(mode="after")
+    def compute_notional(cls, model: "TradeIntent") -> "TradeIntent":
+        quantity = model.quantity
+        price = model.price
+        notional = model.notional
         if notional is None and quantity is not None and price is not None:
-            values["notional"] = quantity * price
-        return values
+            model.notional = quantity * price
+        return model
 
     @property
     def notional_per_unit(self) -> float:
@@ -221,13 +324,14 @@ class RiskValidationResponse(BaseModel):
         description="Timestamp until which trading is halted due to hard limits",
     )
 
-    class Config:
-        allow_population_by_field_name = True
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class RiskEvaluationContext(BaseModel):
     request: RiskValidationRequest
     limits: AccountRiskLimit
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     @property
     def current_notional(self) -> float:
@@ -261,8 +365,7 @@ class AccountRiskLimitModel(BaseModel):
     latency_stall_seconds: Optional[float] = None
     exchange_outage_block: bool = False
 
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class RiskLimitsResponse(BaseModel):
@@ -275,6 +378,14 @@ app = FastAPI(title="Risk Validation Service", version="1.0.0")
 setup_metrics(app)
 
 
+@app.on_event("startup")
+def _on_startup() -> None:
+    _bootstrap_storage()
+
+
+_bootstrap_storage()
+
+
 @app.post("/risk/validate", response_model=RiskValidationResponse)
 async def validate_risk(request: RiskValidationRequest) -> RiskValidationResponse:
     """Validate a trading intent against account level risk limits."""
@@ -285,7 +396,7 @@ async def validate_risk(request: RiskValidationRequest) -> RiskValidationRespons
         limits = _load_account_limits(request.account_id)
     except ConfigError as exc:
         logger.exception("Unable to load risk limits for account %s", request.account_id)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     context = RiskEvaluationContext(request=request, limits=limits)
 
@@ -559,38 +670,56 @@ def _audit_failure(context: RiskEvaluationContext, decision: RiskValidationRespo
 
 
 def set_stub_limits(records: Iterable[AccountRiskLimit]) -> None:
-    """Utility used in testing to override the in-memory limits table."""
+    """Utility used in testing to override the persisted limits table."""
 
-    _STUB_RISK_LIMITS.clear()
-    for record in records:
-        _STUB_RISK_LIMITS[record.account_id] = {
-            "account_id": record.account_id,
-            "max_daily_loss": record.max_daily_loss,
-            "fee_budget": record.fee_budget,
-            "max_nav_pct_per_trade": record.max_nav_pct_per_trade,
-            "notional_cap": record.notional_cap,
-            "cooldown_minutes": record.cooldown_minutes,
-            "instrument_whitelist": ",".join(record.whitelist),
-            "var_95_limit": record.var_95_limit,
-            "var_99_limit": record.var_99_limit,
-            "spread_threshold_bps": record.spread_threshold_bps,
-            "latency_stall_seconds": record.latency_stall_seconds,
-            "exchange_outage_block": 1 if record.exchange_outage_block else 0,
-        }
+    with get_session() as session:
+        for record in records:
+            stored = session.get(AccountRiskLimit, record.account_id)
+            if stored is None:
+                stored = AccountRiskLimit(account_id=record.account_id)
+            stored.max_daily_loss = float(record.max_daily_loss)
+            stored.fee_budget = float(record.fee_budget)
+            stored.max_nav_pct_per_trade = float(record.max_nav_pct_per_trade)
+            stored.notional_cap = float(record.notional_cap)
+            stored.cooldown_minutes = int(record.cooldown_minutes)
+            stored.instrument_whitelist = ",".join(sorted(record.whitelist)) or None
+            stored.var_95_limit = float(record.var_95_limit) if record.var_95_limit is not None else None
+            stored.var_99_limit = float(record.var_99_limit) if record.var_99_limit is not None else None
+            stored.spread_threshold_bps = (
+                float(record.spread_threshold_bps)
+                if record.spread_threshold_bps is not None
+                else None
+            )
+            stored.latency_stall_seconds = (
+                float(record.latency_stall_seconds)
+                if record.latency_stall_seconds is not None
+                else None
+            )
+            stored.exchange_outage_block = 1 if record.exchange_outage_block else 0
+            session.add(stored)
 
 
 def _load_account_usage(account_id: str) -> AccountUsage:
-    usage = _STUB_ACCOUNT_USAGE.get(account_id, {})
-    nav = usage.get("net_asset_value", 0.0)
-    if nav <= 0:
-        nav = _STUB_ACCOUNT_USAGE.setdefault(account_id, {}).get("net_asset_value", 0.0)
+    with get_session() as session:
+        record = session.get(AccountRiskUsage, account_id)
+
+    if record is None:
+        return AccountUsage(
+            account_id=account_id,
+            realized_daily_loss=0.0,
+            fees_paid=0.0,
+            net_asset_value=0.0,
+            var_95=None,
+            var_99=None,
+        )
+
     return AccountUsage(
         account_id=account_id,
-        realized_daily_loss=usage.get("realized_daily_loss", 0.0),
-        fees_paid=usage.get("fees_paid", 0.0),
-        net_asset_value=nav,
-        var_95=usage.get("var_95"),
-        var_99=usage.get("var_99"),
+        realized_daily_loss=float(record.realized_daily_loss or 0.0),
+        fees_paid=float(record.fees_paid or 0.0),
+        net_asset_value=float(record.net_asset_value or 0.0),
+        var_95=float(record.var_95) if record.var_95 is not None else None,
+        var_99=float(record.var_99) if record.var_99 is not None else None,
     )
 
 
@@ -609,7 +738,16 @@ def _read_prometheus_latency(instrument_id: str) -> Optional[float]:
 
 
 def set_stub_account_usage(account_id: str, usage: Dict[str, float]) -> None:
-    _STUB_ACCOUNT_USAGE[account_id] = usage
+    with get_session() as session:
+        record = session.get(AccountRiskUsage, account_id)
+        if record is None:
+            record = AccountRiskUsage(account_id=account_id)
+        record.realized_daily_loss = float(usage.get("realized_daily_loss", 0.0) or 0.0)
+        record.fees_paid = float(usage.get("fees_paid", 0.0) or 0.0)
+        record.net_asset_value = float(usage.get("net_asset_value", 0.0) or 0.0)
+        record.var_95 = float(usage["var_95"]) if usage.get("var_95") is not None else None
+        record.var_99 = float(usage["var_99"]) if usage.get("var_99") is not None else None
+        session.add(record)
 
 
 def set_stub_market_telemetry(instrument_id: str, telemetry: Dict[str, float]) -> None:
