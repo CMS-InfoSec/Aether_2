@@ -125,8 +125,8 @@ class ArtifactStorage:
         content_type:
             MIME type describing the payload.
         metadata:
-            Optional structured metadata that will be JSON-encoded and stored in
-            the audit log entry.
+            Optional structured metadata that will be JSON-encoded and stored as
+            ``jsonb`` in the audit log entry.
         """
 
         account_root = self.base_path / account_id
