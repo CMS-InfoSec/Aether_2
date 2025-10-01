@@ -9,7 +9,9 @@ Features provided by the mock:
 
 * Shared order book between the simulated WebSocket and REST transports.
 * Deterministic partial fills with configurable fill schedules.
+* Behaviour toggles for probabilistic partial fills, rejections and cancels.
 * Latency simulation for both synchronous (WS) and asynchronous (REST) paths.
+* Random latency spikes and WebSocket failure simulation.
 * Random as well as scheduled error injection to exercise retry paths.
 * Pytest fixtures that expose the mock in a convenient form for integration
   tests.
@@ -25,7 +27,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Deque, Dict, Iterable, Iterator, List, Optional, Tuple
 
@@ -71,9 +73,14 @@ class MockKrakenConfig:
         }
     )
     latency: Tuple[float, float] = (0.0, 0.0)
+    random_latency_chance: float = 0.0
+    random_latency: Tuple[float, float] = (0.0, 0.0)
     error_rate: float = 0.0
     error_schedule: Dict[str, Iterable[Exception]] = field(default_factory=dict)
     default_fill: List[float] = field(default_factory=lambda: [1.0])
+    partial_fill_probability: float = 0.0
+    rejection_rate: float = 0.0
+    cancel_rate: float = 0.0
     seed: Optional[int] = 11
 
 
@@ -152,6 +159,14 @@ class MockKrakenExchange:
             for key, errors in self.config.error_schedule.items()
         }
         self._fill_schedules: Dict[str, Deque[List[float]]] = {}
+        self._rejection_reasons: Deque[str] = deque()
+        self._cancel_reasons: Deque[str] = deque()
+        self._partial_fill_probability = self.config.partial_fill_probability
+        self._rejection_rate = self.config.rejection_rate
+        self._cancel_rate = self.config.cancel_rate
+        self._random_latency_chance = self.config.random_latency_chance
+        self._random_latency = self.config.random_latency
+        self._ws_sessions: set["MockKrakenWSSession"] = set()
 
     # ------------------------------------------------------------------
     # Configuration helpers
@@ -173,6 +188,51 @@ class MockKrakenExchange:
 
         self._error_queues.setdefault(method, deque()).append(exc)
 
+    def schedule_rejection(self, reason: str = "EOrder:Rejected") -> None:
+        """Reject the next order with ``reason`` instead of accepting it."""
+
+        self._rejection_reasons.append(reason)
+
+    def schedule_cancel(self, reason: str = "ECancel:Cancelled") -> None:
+        """Cancel the next accepted order after any fills have been applied."""
+
+        self._cancel_reasons.append(reason)
+
+    def configure_behaviour(
+        self,
+        *,
+        partial_fill_probability: Optional[float] = None,
+        rejection_rate: Optional[float] = None,
+        cancel_rate: Optional[float] = None,
+        random_latency_chance: Optional[float] = None,
+        random_latency: Optional[Tuple[float, float]] = None,
+    ) -> None:
+        """Adjust runtime behaviour knobs without recreating the exchange."""
+
+        if partial_fill_probability is not None:
+            self._partial_fill_probability = max(0.0, min(1.0, float(partial_fill_probability)))
+        if rejection_rate is not None:
+            self._rejection_rate = max(0.0, min(1.0, float(rejection_rate)))
+        if cancel_rate is not None:
+            self._cancel_rate = max(0.0, min(1.0, float(cancel_rate)))
+        if random_latency_chance is not None:
+            self._random_latency_chance = max(0.0, min(1.0, float(random_latency_chance)))
+        if random_latency is not None:
+            low, high = random_latency
+            if high < low:
+                low, high = high, low
+            self._random_latency = (float(low), float(high))
+
+    def simulate_ws_failure(self) -> int:
+        """Force-close every active WebSocket session and return the count."""
+
+        closed = 0
+        for session in list(self._ws_sessions):
+            session._force_close()
+            closed += 1
+        self._ws_sessions.clear()
+        return closed
+
     def reset(self) -> None:
         """Restore balances and clear orders/trades."""
 
@@ -186,6 +246,14 @@ class MockKrakenExchange:
         for queue in self._error_queues.values():
             queue.clear()
         self._fill_schedules.clear()
+        self._rejection_reasons.clear()
+        self._cancel_reasons.clear()
+        self._partial_fill_probability = self.config.partial_fill_probability
+        self._rejection_rate = self.config.rejection_rate
+        self._cancel_rate = self.config.cancel_rate
+        self._random_latency_chance = self.config.random_latency_chance
+        self._random_latency = self.config.random_latency
+        self.simulate_ws_failure()
 
     # ------------------------------------------------------------------
     # Public API used by transports
@@ -257,6 +325,19 @@ class MockKrakenExchange:
         price_value = payload.get("price") or payload.get("limit_price")
         price = float(price_value) if price_value is not None else self.config.base_prices.get(pair, 0.0)
 
+        rejection_reason = self._pop_rejection_reason()
+        if (
+            rejection_reason is not None
+            or (self._rejection_rate and self._random.random() < self._rejection_rate)
+        ):
+            reason = rejection_reason or "EOrder:Rejected"
+            return {
+                "status": "rejected",
+                "txid": None,
+                "transport": transport,
+                "error": [reason],
+            }
+
         order_id = f"MO{self._order_counter:05d}"
         self._order_counter += 1
         order = MockOrder(
@@ -283,6 +364,21 @@ class MockKrakenExchange:
             order.status = "open"
             self._orders[order.order_id] = order
 
+        cancel_reason = self._pop_cancel_reason()
+        if (
+            order.status != "filled"
+            and (
+                cancel_reason is not None
+                or (self._cancel_rate and self._random.random() < self._cancel_rate)
+            )
+        ):
+            order.status = "cancelled"
+            order.remaining = 0.0
+            self._orders.pop(order.order_id, None)
+            reason = cancel_reason or "ECancel:Cancelled"
+        else:
+            reason = None
+
         response = {
             "status": order.status,
             "txid": order.order_id,
@@ -291,6 +387,8 @@ class MockKrakenExchange:
             "remaining": round(max(order.remaining, 0.0), 10),
             "fills": [trade.to_dict() for trade in fills],
         }
+        if reason:
+            response["error"] = [reason]
         return response
 
     def _cancel_order(self, payload: Dict[str, Any], *, transport: str) -> Dict[str, Any]:
@@ -364,11 +462,10 @@ class MockKrakenExchange:
             return list(self._fill_schedules["*"].popleft())
 
         # If no deterministic plan is configured generate a random plan when
-        # partial fills are requested via ``error_rate`` or latency exercises.
+        # partial fills are requested by the behaviour controller.
         if len(self.config.default_fill) == 1 and self.config.default_fill[0] == 1.0:
-            # Possibly return a random partial fill when the error rate is used
-            # to exercise retries.
-            if self._random.random() < 0.25:
+            probability = self._partial_fill_probability
+            if probability and self._random.random() < probability:
                 first = round(self._random.uniform(0.2, 0.7), 4)
                 return [first, 1.0 - first]
         return list(self.config.default_fill)
@@ -385,11 +482,17 @@ class MockKrakenExchange:
 
     def _latency_value(self) -> float:
         low, high = self.config.latency
-        if high <= 0:
-            return 0.0
         if high < low:
             low, high = high, low
-        return self._random.uniform(low, high)
+        base = 0.0
+        if low != 0.0 or high != 0.0:
+            base = self._random.uniform(low, high)
+        if self._random_latency_chance and self._random.random() < self._random_latency_chance:
+            jitter_low, jitter_high = self._random_latency
+            if jitter_high < jitter_low:
+                jitter_low, jitter_high = jitter_high, jitter_low
+            base += self._random.uniform(jitter_low, jitter_high)
+        return max(0.0, base)
 
     def _maybe_raise(self, method: str) -> None:
         queue = self._error_queues.get(method)
@@ -397,6 +500,16 @@ class MockKrakenExchange:
             raise queue.popleft()
         if self.config.error_rate and self._random.random() < self.config.error_rate:
             raise MockKrakenRandomError(f"Random failure injected for {method}")
+
+    def _pop_rejection_reason(self) -> Optional[str]:
+        if self._rejection_reasons:
+            return self._rejection_reasons.popleft()
+        return None
+
+    def _pop_cancel_reason(self) -> Optional[str]:
+        if self._cancel_reasons:
+            return self._cancel_reasons.popleft()
+        return None
 
     @staticmethod
     def _normalise_pair(pair: str) -> str:
@@ -429,6 +542,7 @@ class MockKrakenWSSession:
     def __init__(self, exchange: MockKrakenExchange) -> None:
         self._exchange = exchange
         self._closed = False
+        self._exchange._ws_sessions.add(self)
 
     def request(self, channel: str, payload: Dict[str, Any], timeout: float | None = None) -> Dict[str, Any]:
         if self._closed:
@@ -455,6 +569,11 @@ class MockKrakenWSSession:
 
     def close(self) -> None:
         self._closed = True
+        self._exchange._ws_sessions.discard(self)
+
+    def _force_close(self) -> None:
+        self._closed = True
+        self._exchange._ws_sessions.discard(self)
 
 
 class MockKrakenRESTClient:
@@ -493,11 +612,52 @@ class MockKrakenRESTClient:
 # ---------------------------------------------------------------------------
 
 
+class MockKrakenControls:
+    """Helper used in fixtures to adjust the mock exchange behaviour on demand."""
+
+    def __init__(self, exchange: MockKrakenExchange) -> None:
+        self._exchange = exchange
+
+    def enable_partial_fills(self, probability: float = 1.0) -> None:
+        self._exchange.configure_behaviour(partial_fill_probability=probability)
+
+    def disable_partial_fills(self) -> None:
+        self._exchange.configure_behaviour(partial_fill_probability=0.0)
+
+    def set_rejection_rate(self, rate: float) -> None:
+        self._exchange.configure_behaviour(rejection_rate=rate)
+
+    def set_cancel_rate(self, rate: float) -> None:
+        self._exchange.configure_behaviour(cancel_rate=rate)
+
+    def set_random_latency(self, chance: float, low: float, high: float) -> None:
+        self._exchange.configure_behaviour(
+            random_latency_chance=chance, random_latency=(low, high)
+        )
+
+    def reject_next_order(self, reason: str = "EOrder:Rejected") -> None:
+        self._exchange.schedule_rejection(reason)
+
+    def cancel_next_order(self, reason: str = "ECancel:Cancelled") -> None:
+        self._exchange.schedule_cancel(reason)
+
+    def simulate_ws_failure(self) -> int:
+        return self._exchange.simulate_ws_failure()
+
+
 @pytest.fixture
-def mock_kraken_exchange() -> Iterator[MockKrakenExchange]:
+def mock_kraken_exchange(request: pytest.FixtureRequest) -> Iterator[MockKrakenExchange]:
     """Yield a resettable :class:`MockKrakenExchange` instance."""
 
-    exchange = MockKrakenExchange()
+    param = getattr(request, "param", None)
+    if isinstance(param, MockKrakenConfig):
+        config = param
+    elif isinstance(param, dict):
+        config = replace(MockKrakenConfig(), **param)
+    else:
+        config = MockKrakenConfig()
+
+    exchange = MockKrakenExchange(config)
     try:
         yield exchange
     finally:
@@ -521,4 +681,11 @@ def mock_kraken_rest_client(mock_kraken_exchange: MockKrakenExchange) -> MockKra
     """Fixture returning the asynchronous REST facade for the mock exchange."""
 
     return MockKrakenRESTClient(mock_kraken_exchange)
+
+
+@pytest.fixture
+def mock_kraken_controls(mock_kraken_exchange: MockKrakenExchange) -> MockKrakenControls:
+    """Fixture exposing helpers to adjust the exchange behaviour during tests."""
+
+    return MockKrakenControls(mock_kraken_exchange)
 
