@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 import logging
 import time
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from fastapi import Depends, FastAPI, HTTPException, status
 
@@ -15,6 +16,7 @@ from services.oms.kraken_client import (
     KrakenWSClient,
     KrakenWebsocketError,
 )
+from services.oms.shadow_oms import shadow_oms
 
 from metrics import (
     increment_trade_rejection,
@@ -207,6 +209,51 @@ def place_order(
         timescale.record_fill(fill_payload)
         kafka.publish(topic="oms.executions", payload=fill_payload)
 
+        trade_side = str(trade.get("side", request.side)).lower()
+        trade_qty = Decimal(str(trade.get("quantity", snapped_quantity)))
+        trade_price = Decimal(str(trade.get("price", snapped_price)))
+        trade_ts: datetime | None = None
+        raw_ts = trade.get("time")
+        if raw_ts is not None:
+            try:
+                trade_ts = datetime.fromtimestamp(float(raw_ts), tz=timezone.utc)
+            except (TypeError, ValueError):
+                trade_ts = None
+        shadow_oms.record_real_fill(
+            account_id=account_id,
+            symbol=request.instrument,
+            side=trade_side,
+            quantity=trade_qty,
+            price=trade_price,
+            timestamp=trade_ts,
+            fee=float(trade.get("fee", 0.0) or 0.0),
+            slippage_bps=float(trade.get("slippage_bps", 0.0) or 0.0),
+        )
+
+    shadow_fills = shadow_oms.generate_shadow_fills(
+        account_id=account_id,
+        symbol=request.instrument,
+        side=request.side,
+        quantity=Decimal(str(snapped_quantity)),
+        price=Decimal(str(snapped_price)),
+        timestamp=datetime.now(timezone.utc),
+    )
+    for shadow_fill in shadow_fills:
+        timescale.record_shadow_fill(shadow_fill)
+
     venue = "kraken"
     return OrderPlacementResponse(accepted=True, routed_venue=venue, fee=request.fee)
+
+
+@app.get("/oms/shadow_pnl")
+def get_shadow_pnl(
+    account_id: str,
+    header_account: str = Depends(require_admin_account),
+) -> Dict[str, Any]:
+    if account_id != header_account:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account mismatch between header and payload.",
+        )
+    return shadow_oms.snapshot(account_id)
 

@@ -28,6 +28,7 @@ from services.oms.kraken_ws import (
     OrderAck,
     OrderState,
 )
+from services.oms.shadow_oms import _ShadowPnLTracker
 
 import websockets
 
