@@ -41,19 +41,40 @@ class TimescaleAdapter:
     account_id: str
 
     _metrics: ClassVar[Dict[str, Dict[str, float]]] = {}
-
+    _daily_usage: ClassVar[Dict[str, Dict[str, float]]] = {}
+    _instrument_exposure: ClassVar[Dict[str, Dict[str, float]]] = {}
     _events: ClassVar[Dict[str, Dict[str, List[Dict[str, Any]]]]] = {}
+    _risk_configs: ClassVar[Dict[str, Dict[str, Any]]] = {}
     _credential_rotations: ClassVar[Dict[str, Dict[str, Any]]] = {}
-
 
     _telemetry: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
 
+    _DEFAULT_RISK_CONFIG: ClassVar[Dict[str, Any]] = {
+        "nav": 2_500_000.0,
+        "loss_cap": 150_000.0,
+        "fee_cap": 50_000.0,
+        "max_nav_percent": 0.25,
+        "var_limit": 120_000.0,
+        "spread_limit_bps": 50.0,
+        "latency_limit_ms": 250.0,
+        "diversification_rules": {"max_single_instrument_percent": 0.35},
+        "kill_switch": False,
+    }
 
     def __post_init__(self) -> None:
         self._metrics.setdefault(self.account_id, {"limit": 1_000_000.0, "usage": 0.0})
+        self._daily_usage.setdefault(self.account_id, {"loss": 0.0, "fee": 0.0})
+        self._instrument_exposure.setdefault(self.account_id, {})
         self._telemetry.setdefault(self.account_id, [])
 
-        self._events.setdefault(self.account_id, {"acks": [], "fills": []})
+        account_events = self._events.setdefault(
+            self.account_id, {"acks": [], "fills": [], "risk": []}
+        )
+        account_events.setdefault("acks", [])
+        account_events.setdefault("fills", [])
+        account_events.setdefault("risk", [])
+
+        self._risk_configs.setdefault(self.account_id, deepcopy(self._DEFAULT_RISK_CONFIG))
 
         self._credential_rotations.setdefault(self.account_id, {})
 
@@ -77,41 +98,69 @@ class TimescaleAdapter:
         self._events[self.account_id]["fills"].append(event)
 
     def events(self) -> Dict[str, List[Dict[str, Any]]]:
-        stored = self._events.get(self.account_id, {"acks": [], "fills": []})
-        return {"acks": list(stored["acks"]), "fills": list(stored["fills"])}
+        stored = self._events.get(self.account_id, {"acks": [], "fills": [], "risk": []})
+        return {
+            "acks": list(stored.get("acks", [])),
+            "fills": list(stored.get("fills", [])),
+            "risk": list(stored.get("risk", [])),
+        }
 
     @classmethod
     def reset(cls, account_id: str | None = None) -> None:
         if account_id is None:
             cls._metrics.clear()
+            cls._daily_usage.clear()
+            cls._instrument_exposure.clear()
             cls._events.clear()
+            cls._risk_configs.clear()
             cls._credential_rotations.clear()
+            cls._telemetry.clear()
             return
         cls._metrics.pop(account_id, None)
+        cls._daily_usage.pop(account_id, None)
+        cls._instrument_exposure.pop(account_id, None)
         cls._events.pop(account_id, None)
+        cls._risk_configs.pop(account_id, None)
         cls._credential_rotations.pop(account_id, None)
+        cls._telemetry.pop(account_id, None)
 
 
     def load_risk_config(self) -> Dict[str, Any]:
         config = self._risk_configs.setdefault(
-            self.account_id,
-            {
-                "nav": 2_500_000.0,
-                "loss_cap": 150_000.0,
-                "fee_cap": 50_000.0,
-                "max_nav_percent": 0.25,
-                "var_limit": 120_000.0,
-                "spread_limit_bps": 50.0,
-                "latency_limit_ms": 250.0,
-                "diversification_rules": {"max_single_instrument_percent": 0.35},
-                "kill_switch": False,
-            },
+            self.account_id, deepcopy(self._DEFAULT_RISK_CONFIG)
         )
         return deepcopy(config)
 
     def get_daily_usage(self) -> Dict[str, float]:
         usage = self._daily_usage.setdefault(self.account_id, {"loss": 0.0, "fee": 0.0})
         return dict(usage)
+
+    def record_daily_usage(self, loss: float, fee: float) -> Dict[str, float]:
+        usage = self._daily_usage.setdefault(self.account_id, {"loss": 0.0, "fee": 0.0})
+        usage["loss"] += float(loss)
+        usage["fee"] += float(fee)
+        return dict(usage)
+
+    def record_instrument_exposure(self, instrument: str, notional: float) -> float:
+        exposures = self._instrument_exposure.setdefault(self.account_id, {})
+        exposures[instrument] = exposures.get(instrument, 0.0) + float(notional)
+        return exposures[instrument]
+
+    def instrument_exposure(self, instrument: str) -> float:
+        exposures = self._instrument_exposure.get(self.account_id, {})
+        return float(exposures.get(instrument, 0.0))
+
+    def record_event(self, event_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        event = {
+            "type": event_type,
+            "payload": dict(payload),
+            "timestamp": datetime.now(timezone.utc),
+        }
+        account_events = self._events.setdefault(
+            self.account_id, {"acks": [], "fills": [], "risk": []}
+        )
+        account_events.setdefault("risk", []).append(event)
+        return dict(event)
 
 
     def record_decision(self, order_id: str, payload: Dict[str, Any]) -> None:
@@ -150,14 +199,25 @@ class TimescaleAdapter:
         return dict(record)
 
     @classmethod
-    def reset_rotation_state(cls) -> None:
-        cls._credential_rotations.clear()
+    def reset_rotation_state(cls, account_id: str | None = None) -> None:
+        if account_id is None:
+            cls._credential_rotations.clear()
+            return
+        cls._credential_rotations.pop(account_id, None)
+
+    def update_risk_config(self, **overrides: Any) -> Dict[str, Any]:
+        config = self._risk_configs.setdefault(
+            self.account_id, deepcopy(self._DEFAULT_RISK_CONFIG)
+        )
+        config.update(overrides)
+        return deepcopy(config)
 
 
 
 @dataclass
 class RedisFeastAdapter:
     account_id: str
+    _repository: UniverseRepository = field(init=False)
 
 
     _features: ClassVar[Dict[str, Dict[str, Any]]] = {
@@ -189,11 +249,25 @@ class RedisFeastAdapter:
     }
 
 
+    def __post_init__(self) -> None:
+        self._repository = UniverseRepository(account_id=self.account_id)
+
     def approved_instruments(self) -> List[str]:
-        return self._repository.approved_universe()
+        instruments = self._repository.approved_universe()
+        if instruments:
+            return instruments
+        account_config = self._features.get(self.account_id, {})
+        return list(account_config.get("approved", []))
 
     def fee_override(self, instrument: str) -> Dict[str, Any] | None:
-        return self._repository.fee_override(instrument)
+        override = self._repository.fee_override(instrument)
+        if override is not None:
+            return override
+        account_config = self._features.get(self.account_id, {})
+        fees = account_config.get("fees", {})
+        if instrument not in fees:
+            return None
+        return dict(fees[instrument])
 
     def fetch_online_features(self, instrument: str) -> Dict[str, Any]:
         account_store = self._online_feature_store.get(self.account_id, {})
@@ -218,6 +292,10 @@ class KrakenSecretManager:
     def secret_name(self) -> str:
         assert self.secret_store is not None
         return self.secret_store.secret_name(self.account_id)
+
+    def get_credentials(self) -> Dict[str, str]:
+        assert self.secret_store is not None
+        return self.secret_store.read_credentials(self.account_id)
 
     def rotate_credentials(self, *, api_key: str, api_secret: str) -> Dict[str, Any]:
         assert self.secret_store is not None  # for type checkers
