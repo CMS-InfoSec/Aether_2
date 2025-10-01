@@ -17,6 +17,7 @@ CREATE_TABLE_STATEMENTS = [
         created_at TIMESTAMPTZ NOT NULL,
         updated_at TIMESTAMPTZ NOT NULL,
         status TEXT NOT NULL,
+        admin_slug TEXT,
         attributes JSONB DEFAULT '{}'::jsonb,
         PRIMARY KEY (account_id, created_at)
     );
