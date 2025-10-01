@@ -20,6 +20,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
 
 from services.oms.impact_store import ImpactAnalyticsStore, impact_store
+from services.oms import reconcile as _oms_reconcile
 from services.oms.kraken_rest import KrakenRESTClient, KrakenRESTError
 from services.oms.kraken_ws import (
     KrakenWSError,
@@ -1829,6 +1830,10 @@ class OMSManager:
             accounts = list(self._accounts.values())
         await asyncio.gather(*(account.close() for account in accounts), return_exceptions=True)
 
+    async def list_accounts(self) -> List[AccountContext]:
+        async with self._lock:
+            return list(self._accounts.values())
+
 
 manager = OMSManager()
 warm_start = WarmStartCoordinator(lambda: manager)
@@ -1928,5 +1933,7 @@ async def get_impact_curve(
     ]
     return ImpactCurveResponse(symbol=symbol, points=points, as_of=datetime.now(timezone.utc))
 
+
+_oms_reconcile.register(app, manager)
 
 
