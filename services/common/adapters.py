@@ -83,14 +83,9 @@ class TimescaleAdapter:
 
     def __post_init__(self) -> None:
         self._metrics.setdefault(self.account_id, {"limit": 1_000_000.0, "usage": 0.0})
-        self._daily_usage.setdefault(self.account_id, {"loss": 0.0, "fee": 0.0})
-        self._instrument_exposure.setdefault(self.account_id, {})
+        self._daily_usage.setdefault(self.account_id, {})
+        self._instrument_exposures.setdefault(self.account_id, {})
         self._telemetry.setdefault(self.account_id, [])
-
-
-        self._events.setdefault(self.account_id, {"acks": [], "fills": []})
-        self._credential_events.setdefault(self.account_id, [])
-
 
         account_events = self._events.setdefault(
             self.account_id,
@@ -101,25 +96,10 @@ class TimescaleAdapter:
         account_events.setdefault("events", [])
         account_events.setdefault("credential_rotations", [])
 
-        self._risk_configs.setdefault(self.account_id, deepcopy(self._default_risk_config))
-        self._daily_usage.setdefault(self.account_id, {})
-        self._instrument_exposures.setdefault(self.account_id, {})
-
+        self._credential_events.setdefault(self.account_id, [])
         self._credential_rotations.setdefault(self.account_id, {})
-        self._risk_configs.setdefault(
-            self.account_id,
-            {
-                "nav": 2_500_000.0,
-                "loss_cap": 150_000.0,
-                "fee_cap": 50_000.0,
-                "max_nav_percent": 0.25,
-                "var_limit": 120_000.0,
-                "spread_limit_bps": 50.0,
-                "latency_limit_ms": 250.0,
-                "diversification_rules": {"max_single_instrument_percent": 0.35},
-                "kill_switch": False,
-            },
-        )
+
+        self._risk_configs.setdefault(self.account_id, deepcopy(self._default_risk_config))
 
     # ------------------------------------------------------------------
     # OMS-inspired metrics
@@ -214,69 +194,26 @@ class TimescaleAdapter:
     def telemetry(self) -> List[Dict[str, Any]]:
         return [deepcopy(entry) for entry in self._telemetry.get(self.account_id, [])]
 
-    # ------------------------------------------------------------------
-    # Credential rotation tracking
-    # ------------------------------------------------------------------
 
-
+    # ------------------------------------------------------------------
+    # Credential rotation tracking & test helpers
+    # ------------------------------------------------------------------
     def record_credential_rotation(
-        self, *, secret_name: str, rotated_at: datetime | None = None
+        self, *, secret_name: str, rotated_at: Optional[datetime] = None
     ) -> Dict[str, Any]:
-        timestamp = rotated_at or datetime.now(timezone.utc)
-        record = self._credential_rotations.setdefault(self.account_id, {})
-        record.setdefault("created_at", timestamp)
-        record["secret_name"] = secret_name
-        record["rotated_at"] = timestamp
+        if rotated_at is None:
+            rotated_at = datetime.now(timezone.utc)
 
-        return deepcopy(record)
+        rotation_state = self._credential_rotations.setdefault(self.account_id, {})
 
-
-    def credential_rotation_status(self) -> Optional[Dict[str, Any]]:
-        record = self._credential_rotations.get(self.account_id)
-        if not record:
-            return None
-
-        return deepcopy(record)
-
-
-    # ------------------------------------------------------------------
-    # Test helpers
-    # ------------------------------------------------------------------
-    @classmethod
-
-    def reset(cls, account_id: str | None = None) -> None:
-        if account_id is None:
-            cls._metrics.clear()
-            cls._telemetry.clear()
-            cls._risk_configs.clear()
-            cls._daily_usage.clear()
-            cls._instrument_exposures.clear()
-            cls._events.clear()
-            cls._credential_rotations.clear()
-            return
-
-        cls._metrics.pop(account_id, None)
-        cls._telemetry.pop(account_id, None)
-        cls._risk_configs.pop(account_id, None)
-        cls._daily_usage.pop(account_id, None)
-        cls._instrument_exposures.pop(account_id, None)
-        cls._events.pop(account_id, None)
-        cls._credential_rotations.pop(account_id, None)
-
-
-
-    def record_credential_rotation(self, *, secret_name: str, rotated_at: datetime) -> None:
-        existing_events = self._credential_events[self.account_id]
-        rotation_events = [
-            event for event in existing_events if event.get("event") == "rotation"
-        ]
-        if rotation_events:
-            first_rotation = rotation_events[0]
-            created_at = first_rotation.get("created_at") or first_rotation.get("rotated_at")
-            if "created_at" not in first_rotation and created_at is not None:
-                first_rotation["created_at"] = created_at
-        else:
-            created_at = rotated_at
+        created_at = rotation_state.get("created_at") or rotated_at
+        rotation_state.update(
+            {
+                "secret_name": secret_name,
+                "created_at": created_at,
+                "rotated_at": rotated_at,
+            }
+        )
 
         payload = {
             "event": "rotation",
@@ -285,7 +222,10 @@ class TimescaleAdapter:
             "timestamp": rotated_at,
             "created_at": created_at,
         }
-        self._credential_events[self.account_id].append(deepcopy(payload))
+        events = self._credential_events.setdefault(self.account_id, [])
+        events.append(deepcopy(payload))
+
+        return deepcopy(rotation_state)
 
     def record_credential_access(self, *, secret_name: str, metadata: Dict[str, Any]) -> None:
         sanitized = deepcopy(metadata)
@@ -298,21 +238,14 @@ class TimescaleAdapter:
             "metadata": sanitized,
             "timestamp": datetime.now(timezone.utc),
         }
-        self._credential_events[self.account_id].append(deepcopy(payload))
+        events = self._credential_events.setdefault(self.account_id, [])
+        events.append(deepcopy(payload))
 
     def credential_rotation_status(self) -> Optional[Dict[str, Any]]:
-        events = [
-            event
-            for event in self._credential_events.get(self.account_id, [])
-            if event.get("event") == "rotation"
-        ]
-        if not events:
+        metadata = self._credential_rotations.get(self.account_id)
+        if not metadata:
             return None
-        created_at = events[0].get("created_at") or events[0].get("rotated_at")
-        latest = deepcopy(events[-1])
-        if "created_at" not in latest and created_at is not None:
-            latest["created_at"] = created_at
-        return latest
+        return deepcopy(metadata)
 
     def credential_events(self) -> List[Dict[str, Any]]:
         return [deepcopy(event) for event in self._credential_events.get(self.account_id, [])]
@@ -322,13 +255,32 @@ class TimescaleAdapter:
         if account_id is None:
             cls._metrics.clear()
             cls._telemetry.clear()
+            cls._risk_configs.clear()
+            cls._daily_usage.clear()
+            cls._instrument_exposures.clear()
             cls._events.clear()
             cls._credential_events.clear()
+            cls._credential_rotations.clear()
             return
+
         cls._metrics.pop(account_id, None)
         cls._telemetry.pop(account_id, None)
+        cls._risk_configs.pop(account_id, None)
+        cls._daily_usage.pop(account_id, None)
+        cls._instrument_exposures.pop(account_id, None)
         cls._events.pop(account_id, None)
         cls._credential_events.pop(account_id, None)
+        cls._credential_rotations.pop(account_id, None)
+
+    @classmethod
+    def reset_rotation_state(cls, account_id: str | None = None) -> None:
+        if account_id is None:
+            cls._credential_events.clear()
+            cls._credential_rotations.clear()
+            return
+
+        cls._credential_events.pop(account_id, None)
+        cls._credential_rotations.pop(account_id, None)
 
 
 
