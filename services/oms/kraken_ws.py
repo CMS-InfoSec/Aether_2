@@ -224,6 +224,60 @@ class KrakenWSClient:
         except Exception as exc:  # pragma: no cover - network failure
             raise KrakenWSError(str(exc)) from exc
 
+    async def fetch_open_orders_snapshot(self) -> List[Dict[str, Any]]:
+        await self.ensure_connected()
+
+        methods = ["open_orders", "openOrders", "openOrdersStatus", "open_orders_status"]
+        last_error: Exception | None = None
+        for method in methods:
+            try:
+                payload = await self._request(method, {})
+            except (KrakenWSError, KrakenWSTimeout) as exc:
+                last_error = exc
+                continue
+            orders = self._parse_open_orders(payload)
+            if orders is not None:
+                return orders
+        if last_error is not None:
+            raise last_error
+        return list(self._open_orders.values())
+
+    def _parse_open_orders(self, payload: Dict[str, Any] | None) -> List[Dict[str, Any]] | None:
+        if not isinstance(payload, dict):
+            return None
+
+        candidates: List[Any] = []
+        data = payload.get("data")
+        if isinstance(data, list):
+            candidates.extend(data)
+
+        open_section = payload.get("open")
+        if isinstance(open_section, list):
+            candidates.extend(open_section)
+        elif isinstance(open_section, dict):
+            candidates.extend(open_section.values())
+
+        result = payload.get("result")
+        if isinstance(result, dict):
+            open_result = result.get("open")
+            if isinstance(open_result, list):
+                candidates.extend(open_result)
+            elif isinstance(open_result, dict):
+                candidates.extend(open_result.values())
+
+        orders: List[Dict[str, Any]] = []
+        for entry in candidates:
+            if isinstance(entry, dict):
+                orders.append(entry)
+
+        if orders:
+            self._open_orders.clear()
+            for order in orders:
+                txid = order.get("order_id") or order.get("txid") or order.get("id")
+                if txid is not None:
+                    self._open_orders[str(txid)] = order
+        return orders
+
     async def stream_handler(self) -> None:
         while True:
             state = await self._queue.get()

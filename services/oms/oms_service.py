@@ -29,6 +29,7 @@ from services.oms.kraken_ws import (
 )
 
 from services.oms.routing import LatencyRouter
+from services.oms.warm_start import WarmStartCoordinator
 
 
 import websockets
@@ -197,6 +198,10 @@ class OrderRecord:
     transport: str
 
     children: List["ChildOrderRecord"] | None = None
+    symbol: Optional[str] = None
+    side: Optional[str] = None
+    pre_trade_mid: Optional[Decimal] = None
+    recorded_qty: Decimal = Decimal("0")
 
 
 @dataclass
@@ -769,6 +774,210 @@ class AccountContext:
             )
 
 
+    async def resync_from_exchange(self) -> int:
+        await self.start()
+
+        if self.ws_client is None:
+            return 0
+
+        try:
+            snapshot = await self.ws_client.fetch_open_orders_snapshot()
+        except (KrakenWSError, KrakenWSTimeout) as exc:
+            logger.warning(
+                "Warm start failed to fetch open orders for account %s: %s",
+                self.account_id,
+                exc,
+            )
+            return 0
+
+        return await self._apply_open_order_snapshot(snapshot)
+
+    async def apply_fill_event(self, payload: Dict[str, Any]) -> bool:
+        state = self._state_from_payload(payload, default_status="filled", transport="kafka")
+        if state is None:
+            return False
+
+        await self._apply_stream_state(state)
+
+        parent_key = self._child_parent.get(state.client_order_id, state.client_order_id)
+
+        record: OrderRecord | None = None
+        async with self._orders_lock:
+            record = self._orders.get(parent_key)
+            if record:
+                symbol = self._extract_symbol(payload)
+                side = self._extract_side(payload)
+                pre_trade_mid = self._extract_pre_trade_mid(payload)
+                if symbol:
+                    record.symbol = symbol
+                if side:
+                    record.side = side
+                if pre_trade_mid is not None:
+                    record.pre_trade_mid = pre_trade_mid
+
+        if record is not None:
+            await self._record_trade_impact(record)
+
+        return True
+
+    async def _apply_open_order_snapshot(self, orders: Iterable[Dict[str, Any]]) -> int:
+        async with self._orders_lock:
+            self._orders.clear()
+            self._child_parent.clear()
+            self._child_results.clear()
+
+        if orders is None:
+            return 0
+
+        applied = 0
+        for order in orders:
+            state = self._state_from_payload(order, default_status="open", transport="websocket")
+            if state is None:
+                continue
+            await self._apply_stream_state(state)
+            parent_key = self._child_parent.get(state.client_order_id, state.client_order_id)
+            async with self._orders_lock:
+                record = self._orders.get(parent_key)
+                if record:
+                    symbol = self._extract_symbol(order)
+                    side = self._extract_side(order)
+                    pre_trade_mid = self._extract_pre_trade_mid(order)
+                    if symbol:
+                        record.symbol = symbol
+                    if side:
+                        record.side = side
+                    if pre_trade_mid is not None:
+                        record.pre_trade_mid = pre_trade_mid
+            applied += 1
+        return applied
+
+    def _state_from_payload(
+        self,
+        payload: Dict[str, Any],
+        *,
+        default_status: str,
+        transport: str,
+    ) -> OrderState | None:
+        client_id = self._extract_client_id(payload)
+        if client_id is None:
+            return None
+        exchange_id = self._extract_exchange_id(payload)
+        status_value = str(payload.get("status") or payload.get("state") or default_status)
+        filled = self._extract_float(payload, ["filled", "filled_qty", "vol_exec", "quantity", "volume"])
+        avg_price = self._extract_float(payload, ["avg_price", "price", "avg"])
+        return OrderState(
+            client_order_id=client_id,
+            exchange_order_id=exchange_id,
+            status=status_value,
+            filled_qty=filled,
+            avg_price=avg_price,
+            errors=None,
+            transport=transport,
+        )
+
+    def _extract_client_id(self, payload: Dict[str, Any]) -> str | None:
+        keys = [
+            "clientOrderId",
+            "client_order_id",
+            "client_id",
+            "userref",
+            "order_id",
+        ]
+        for key in keys:
+            value = payload.get(key)
+            if value is not None:
+                return str(value)
+        data = payload.get("order")
+        if isinstance(data, dict):
+            for key in keys:
+                value = data.get(key)
+                if value is not None:
+                    return str(value)
+        return None
+
+    def _extract_exchange_id(self, payload: Dict[str, Any]) -> str | None:
+        keys = ["order_id", "txid", "ordertxid", "orderid", "id"]
+        for key in keys:
+            value = payload.get(key)
+            if value is not None:
+                return str(value)
+        data = payload.get("order")
+        if isinstance(data, dict):
+            for key in keys:
+                value = data.get(key)
+                if value is not None:
+                    return str(value)
+        return None
+
+    def _extract_symbol(self, payload: Dict[str, Any]) -> str | None:
+        candidates = [
+            payload.get("symbol"),
+            payload.get("pair"),
+            payload.get("instrument"),
+        ]
+        descr = payload.get("descr")
+        if isinstance(descr, dict):
+            candidates.extend([descr.get("pair"), descr.get("symbol")])
+        order_payload = payload.get("order")
+        if isinstance(order_payload, dict):
+            candidates.extend([order_payload.get("symbol"), order_payload.get("pair")])
+        for value in candidates:
+            if value:
+                return str(value)
+        return None
+
+    def _extract_side(self, payload: Dict[str, Any]) -> str | None:
+        candidates = [payload.get("side"), payload.get("type")]
+        descr = payload.get("descr")
+        if isinstance(descr, dict):
+            candidates.append(descr.get("type"))
+        order_payload = payload.get("order")
+        if isinstance(order_payload, dict):
+            candidates.extend([order_payload.get("side"), order_payload.get("type")])
+        for value in candidates:
+            if value:
+                return str(value)
+        return None
+
+    def _extract_pre_trade_mid(self, payload: Dict[str, Any]) -> Decimal | None:
+        candidates = [
+            payload.get("pre_trade_mid"),
+            payload.get("pre_trade_mid_px"),
+            payload.get("mid_price"),
+            payload.get("mid_px"),
+            payload.get("reference_price"),
+        ]
+        for value in candidates:
+            if value is None:
+                continue
+            decimal_value = self._extract_decimal(value)
+            if decimal_value is not None:
+                return decimal_value
+        return None
+
+    def _extract_float(self, payload: Dict[str, Any], keys: List[str]) -> float | None:
+        for key in keys:
+            if key not in payload:
+                continue
+            value = payload.get(key)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _extract_decimal(self, value: Any) -> Decimal | None:
+        if value is None:
+            return None
+        if isinstance(value, Decimal):
+            return value
+        try:
+            return Decimal(str(value))
+        except Exception:
+            return None
+
     async def place_order(self, request: OMSPlaceRequest) -> OMSPlaceResponse:
         await self.start()
 
@@ -1304,6 +1513,8 @@ class AccountContext:
             return
         if not record.symbol:
             return
+        if not record.side:
+            return
 
         filled_qty = record.result.filled_qty
         avg_price = record.result.avg_price
@@ -1359,6 +1570,7 @@ class OMSManager:
 
 
 manager = OMSManager()
+warm_start = WarmStartCoordinator(lambda: manager)
 
 
 async def require_account_id(request: Request) -> str:
@@ -1372,6 +1584,11 @@ async def require_account_id(request: Request) -> str:
 async def _shutdown() -> None:
     await manager.shutdown()
     await order_book_store.stop()
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    await warm_start.run()
 
 
 @app.post("/oms/place", response_model=OMSPlaceResponse)
@@ -1431,6 +1648,11 @@ async def get_routing_status(
 
     account = await manager.get_account(account_id)
     return account.routing_status()
+
+
+@app.get("/oms/warm_start/status")
+async def get_warm_start_status() -> Dict[str, int]:
+    return await warm_start.status()
 
 
 @app.get("/oms/impact_curve", response_model=ImpactCurveResponse)

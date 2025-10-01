@@ -14,6 +14,7 @@ from services.common.schemas import (
 )
 from services.common.security import require_admin_account
 from shared.models.registry import get_model_registry
+from services.policy.adaptive_horizon import get_horizon
 from services.policy.model_server import predict_intent
 
 from metrics import record_abstention_rate, record_drift_score, setup_metrics
@@ -61,11 +62,30 @@ def decide_policy(
         state_payload if isinstance(state_payload, PolicyState) else PolicyState(**state_payload)
     )
 
+    state_dump = (
+        state_model.model_dump()
+        if hasattr(state_model, "model_dump")
+        else {
+            "regime": getattr(state_model, "regime", "unknown"),
+            "volatility": getattr(state_model, "volatility", 0.0),
+            "liquidity_score": getattr(state_model, "liquidity_score", 0.0),
+            "conviction": getattr(state_model, "conviction", 0.0),
+        }
+    )
+    horizon_context = {
+        "symbol": request.instrument,
+        "regime": state_dump.get("regime"),
+        "state": state_dump,
+        "features": list(features or []),
+    }
+    horizon_seconds = get_horizon(horizon_context)
+
     intent = predict_intent(
         account_id=account_id,
         symbol=request.instrument,
         features=features,
         book_snapshot=book_snapshot_model,
+        horizon=horizon_seconds,
     )
 
     base_confidence_payload = online_features.get("confidence") or {}

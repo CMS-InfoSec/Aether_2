@@ -73,13 +73,23 @@ class DummyPolicyModel:
         # Seed the RNG to provide deterministic behaviour per model key.
         self._rng = random.Random(hash(name) & 0xFFFF_FFFF)
 
-    def predict(self, features: Sequence[float], book_snapshot: BookSnapshot) -> Intent:
+    def predict(
+        self,
+        features: Sequence[float],
+        book_snapshot: BookSnapshot,
+        *,
+        horizon: int | None = None,
+    ) -> Intent:
         feature_score = self._average(features)
         spread_penalty = book_snapshot.spread_bps * 0.1
         imbalance_adjustment = book_snapshot.imbalance * 8.0
         noise = self._rng.uniform(-1.5, 1.5)
 
         edge = feature_score + imbalance_adjustment - spread_penalty + noise
+
+        if horizon:
+            horizon_scale = max(0.5, min(2.0, horizon / float(15 * 60)))
+            edge *= horizon_scale
 
         take_profit = max(5.0, abs(edge) * 1.2)
         stop_loss = max(5.0, abs(edge) * 0.6)
@@ -200,6 +210,8 @@ def predict_intent(
     features: Sequence[float],
     book_snapshot: BookSnapshot | Dict[str, float],
     model_variant: str | None = None,
+    *,
+    horizon: int | None = None,
 ) -> Intent:
     """Run inference against the latest MLflow model and return an intent.
 
@@ -214,8 +226,10 @@ def predict_intent(
             else BookSnapshot(**book_snapshot)
         )
         model_key = _model_name(account_id, symbol, model_variant)
+        if horizon:
+            model_key = f"{model_key}::h{int(horizon)}"
         model = _client.load_latest_model(model_key)
-        return model.predict(features, snapshot)
+        return model.predict(features, snapshot, horizon=horizon)
     except Exception:  # pragma: no cover - defensive safety net
         logger.exception("Failed to generate intent for account=%s symbol=%s", account_id, symbol)
         return Intent.null()

@@ -1,0 +1,514 @@
+"""Sentiment ingestion microservice for alternative data feeds.
+
+This module provides a lightweight ingestion loop that pulls public market
+sentiment signals from Twitter, Reddit, and generic news APIs.  When API
+credentials are unavailable it gracefully falls back to deterministic stub data
+so that downstream systems can still exercise the data flow.  All retrieved
+mentions are scored with a pretrained transformer sentiment model when
+available, otherwise a heuristic fallback is used.  The resulting observations
+are stored in a SQLite table named ``sentiment_scores`` and optionally pushed
+into the in-memory Feast façade that powers integration tests for the wider
+platform.
+
+The module also exposes a small FastAPI application with a single endpoint that
+returns the latest sentiment score for a requested symbol.  The intent is to
+provide both a data pipeline and an online serving surface suitable for model
+training as well as manual inspection.
+"""
+from __future__ import annotations
+
+import asyncio
+import dataclasses
+import datetime as dt
+import logging
+import os
+import sqlite3
+from pathlib import Path
+from typing import Iterable, List, Optional, Sequence, Tuple
+
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.routing import APIRouter
+from pydantic import BaseModel
+
+try:  # pragma: no cover - optional dependency for HTTP clients
+    import httpx
+except Exception:  # pragma: no cover - keep runtime light during tests
+    httpx = None  # type: ignore
+
+LOGGER = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+
+@dataclasses.dataclass(slots=True)
+class SocialPost:
+    """Container representing a market-related post or article."""
+
+    symbol: str
+    text: str
+    source: str
+    created_at: dt.datetime
+
+
+class SentimentModel:
+    """Wrapper around a HuggingFace sentiment pipeline with a safe fallback."""
+
+    _LABEL_MAPPING = {
+        "LABEL_0": "negative",
+        "LABEL_1": "neutral",
+        "LABEL_2": "positive",
+        "NEGATIVE": "negative",
+        "NEUTRAL": "neutral",
+        "POSITIVE": "positive",
+    }
+
+    def __init__(self, model_name: str | None = None) -> None:
+        self._model_name = model_name or "cardiffnlp/twitter-roberta-base-sentiment"
+        self._pipeline = self._load_pipeline()
+
+    def _load_pipeline(self):  # type: ignore[no-untyped-def]
+        try:
+            from transformers import pipeline  # type: ignore
+        except Exception:  # pragma: no cover - dependency optional in tests
+            LOGGER.warning("transformers not available; falling back to rule-based sentiment")
+            return None
+
+        try:
+            LOGGER.info("Loading sentiment model %s", self._model_name)
+            return pipeline("sentiment-analysis", model=self._model_name)
+        except Exception:  # pragma: no cover - handle model download failures
+            LOGGER.exception("Failed to load transformer model; falling back to rule-based sentiment")
+            return None
+
+    def classify(self, text: str) -> Tuple[str, float]:
+        """Return ``(label, score)`` for ``text``.
+
+        ``label`` is one of ``{"positive", "neutral", "negative"}`` while
+        ``score`` is mapped onto ``{-1.0, 0.0, 1.0}`` for convenient numeric use.
+        """
+
+        text = text.strip()
+        if not text:
+            return "neutral", 0.0
+
+        if self._pipeline is not None:
+            try:
+                result = self._pipeline(text, truncation=True)[0]
+                raw_label = str(result.get("label", "NEUTRAL")).upper()
+                label = self._LABEL_MAPPING.get(raw_label, raw_label.lower())
+            except Exception:  # pragma: no cover - runtime robustness
+                LOGGER.exception("Sentiment pipeline inference failed; using fallback heuristic")
+                label = self._fallback_label(text)
+        else:
+            label = self._fallback_label(text)
+
+        score_map = {"positive": 1.0, "neutral": 0.0, "negative": -1.0}
+        return label, score_map.get(label, 0.0)
+
+    def _fallback_label(self, text: str) -> str:
+        lowered = text.lower()
+        positive_keywords = {"rally", "bull", "bullish", "surge", "moon", "win"}
+        negative_keywords = {"dump", "bear", "bearish", "sell", "crash", "loss"}
+
+        if any(word in lowered for word in positive_keywords):
+            return "positive"
+        if any(word in lowered for word in negative_keywords):
+            return "negative"
+        return "neutral"
+
+
+class BaseSource:
+    """Abstract sentiment source."""
+
+    name: str
+
+    async def fetch(self, symbol: str) -> List[SocialPost]:
+        raise NotImplementedError
+
+    @staticmethod
+    def _stub_posts(symbol: str, source: str, samples: Sequence[str]) -> List[SocialPost]:
+        now = dt.datetime.now(tz=dt.timezone.utc)
+        return [
+            SocialPost(symbol=symbol.upper(), text=text.format(symbol=symbol.upper()), source=source, created_at=now)
+            for text in samples
+        ]
+
+
+class TwitterSource(BaseSource):
+    """Twitter (X) recent search client with graceful fallbacks."""
+
+    def __init__(self, api_key: Optional[str] = None, *, max_results: int = 10) -> None:
+        self.name = "twitter"
+        self._api_key = api_key
+        self._max_results = max_results
+
+    async def fetch(self, symbol: str) -> List[SocialPost]:
+        if not self._api_key or httpx is None:
+            samples = [
+                "{symbol} community feeling bullish after the latest rally",
+                "Traders debate whether {symbol} can sustain the momentum",
+            ]
+            return self._stub_posts(symbol, self.name, samples)
+
+        query = f"{symbol} (crypto OR stock) lang:en -is:retweet"
+        url = "https://api.twitter.com/2/tweets/search/recent"
+        params = {"query": query, "max_results": min(self._max_results, 100)}
+        headers = {"Authorization": f"Bearer {self._api_key}"}
+
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(url, params=params, headers=headers)
+                response.raise_for_status()
+                payload = response.json()
+        except Exception:
+            LOGGER.exception("Twitter API call failed; using stubbed posts")
+            samples = [
+                "{symbol} saw mixed interest among traders today",
+                "Speculation about regulatory moves keeps {symbol} investors cautious",
+            ]
+            return self._stub_posts(symbol, self.name, samples)
+
+        posts: List[SocialPost] = []
+        for entry in payload.get("data", [])[: self._max_results]:
+            text = entry.get("text", "")
+            created_at = entry.get("created_at")
+            timestamp = _parse_timestamp(created_at) or dt.datetime.now(tz=dt.timezone.utc)
+            posts.append(
+                SocialPost(
+                    symbol=symbol.upper(),
+                    text=text,
+                    source=self.name,
+                    created_at=timestamp,
+                )
+            )
+        return posts
+
+
+class RedditSource(BaseSource):
+    """Fetch Reddit submissions mentioning the target symbol."""
+
+    def __init__(self, client_id: Optional[str] = None, client_secret: Optional[str] = None) -> None:
+        self.name = "reddit"
+        self._client_id = client_id
+        self._client_secret = client_secret
+
+    async def fetch(self, symbol: str) -> List[SocialPost]:
+        if httpx is None:
+            return self._stub(symbol)
+
+        if not self._client_id or not self._client_secret:
+            return self._stub(symbol)
+
+        headers = {"User-Agent": "aether-sentiment/0.1"}
+        query = f"{symbol} crypto"
+        url = "https://www.reddit.com/search.json"
+        params = {"q": query, "limit": 10, "sort": "new"}
+
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(url, params=params, headers=headers)
+                response.raise_for_status()
+                payload = response.json()
+        except Exception:
+            LOGGER.exception("Reddit API call failed; using stubbed posts")
+            return self._stub(symbol)
+
+        posts: List[SocialPost] = []
+        for child in payload.get("data", {}).get("children", []):
+            data = child.get("data", {})
+            title = data.get("title", "")
+            selftext = data.get("selftext", "")
+            body = title if not selftext else f"{title}\n{selftext}"
+            created_utc = data.get("created_utc")
+            timestamp = _parse_timestamp(created_utc) or dt.datetime.now(tz=dt.timezone.utc)
+            posts.append(
+                SocialPost(
+                    symbol=symbol.upper(),
+                    text=body,
+                    source=self.name,
+                    created_at=timestamp,
+                )
+            )
+        return posts
+
+    def _stub(self, symbol: str) -> List[SocialPost]:
+        samples = [
+            "Retail chatter hints at a potential pump for {symbol}",
+            "Skepticism remains around {symbol} fundamentals despite hype",
+        ]
+        return self._stub_posts(symbol, self.name, samples)
+
+
+class NewsSource(BaseSource):
+    """Fetch finance news headlines mentioning the target symbol."""
+
+    def __init__(self, api_key: Optional[str] = None) -> None:
+        self.name = "news"
+        self._api_key = api_key
+
+    async def fetch(self, symbol: str) -> List[SocialPost]:
+        if not self._api_key or httpx is None:
+            samples = [
+                "Analysts publish a neutral report on {symbol} performance",
+                "Market recap: {symbol} featured amid broader risk sentiment",
+            ]
+            return self._stub_posts(symbol, self.name, samples)
+
+        url = "https://newsapi.org/v2/everything"
+        params = {"q": symbol, "language": "en", "pageSize": 10, "sortBy": "publishedAt"}
+        headers = {"Authorization": self._api_key}
+
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(url, params=params, headers=headers)
+                response.raise_for_status()
+                payload = response.json()
+        except Exception:
+            LOGGER.exception("News API call failed; using stubbed headlines")
+            samples = [
+                "Macro headwinds weigh on {symbol} outlook",
+                "Institutional flows lift {symbol} prospects",
+            ]
+            return self._stub_posts(symbol, self.name, samples)
+
+        posts: List[SocialPost] = []
+        for article in payload.get("articles", []):
+            title = article.get("title") or ""
+            description = article.get("description") or ""
+            text = f"{title}\n{description}".strip()
+            published_at = article.get("publishedAt")
+            timestamp = _parse_timestamp(published_at) or dt.datetime.now(tz=dt.timezone.utc)
+            posts.append(
+                SocialPost(
+                    symbol=symbol.upper(),
+                    text=text,
+                    source=self.name,
+                    created_at=timestamp,
+                )
+            )
+        return posts
+
+
+def _parse_timestamp(value: object) -> dt.datetime | None:
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)):
+        try:
+            return dt.datetime.fromtimestamp(float(value), tz=dt.timezone.utc)
+        except Exception:
+            return None
+
+    if isinstance(value, str):
+        for fmt in (dt.datetime.fromisoformat, _try_parse_iso8601):
+            try:
+                parsed = fmt(value)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=dt.timezone.utc)
+                return parsed.astimezone(dt.timezone.utc)
+            except Exception:
+                continue
+    return None
+
+
+def _try_parse_iso8601(value: str) -> dt.datetime:
+    return dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+class SentimentRepository:
+    """SQLite-backed storage for sentiment scores."""
+
+    def __init__(self, db_path: Path | str) -> None:
+        path = Path(db_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._connection = sqlite3.connect(path, check_same_thread=False)
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sentiment_scores (
+                symbol TEXT NOT NULL,
+                score TEXT NOT NULL,
+                source TEXT NOT NULL,
+                ts TIMESTAMP NOT NULL
+            )
+            """
+        )
+        self._connection.commit()
+        self._lock = asyncio.Lock()
+
+    async def insert(self, observation: SocialPost, label: str) -> None:
+        async with self._lock:
+            self._connection.execute(
+                "INSERT INTO sentiment_scores(symbol, score, source, ts) VALUES (?, ?, ?, ?)",
+                (
+                    observation.symbol,
+                    label,
+                    observation.source,
+                    observation.created_at.isoformat(),
+                ),
+            )
+            self._connection.commit()
+
+    async def latest(self, symbol: str) -> Optional[Tuple[str, str, str, dt.datetime]]:
+        async with self._lock:
+            cursor = self._connection.execute(
+                "SELECT symbol, score, source, ts FROM sentiment_scores WHERE symbol = ? ORDER BY ts DESC LIMIT 1",
+                (symbol.upper(),),
+            )
+            row = cursor.fetchone()
+        if not row:
+            return None
+        ts = _parse_timestamp(row[3]) or dt.datetime.now(tz=dt.timezone.utc)
+        return row[0], row[1], row[2], ts
+
+
+class FeastSentimentWriter:
+    """Optional bridge that stores sentiment labels inside the RedisFeastAdapter stub."""
+
+    def __init__(self, account_id: str = "company") -> None:
+        try:
+            from services.common.adapters import RedisFeastAdapter
+        except Exception:  # pragma: no cover - Feast adapter optional
+            LOGGER.info("RedisFeastAdapter unavailable; Feast integration disabled")
+            self._adapter = None
+        else:
+            self._adapter = RedisFeastAdapter(account_id=account_id)
+
+    def write(self, symbol: str, label: str, score: float) -> None:
+        if self._adapter is None:
+            return
+
+        try:
+            store = self._adapter._account_feature_store()  # type: ignore[attr-defined]
+        except Exception:
+            LOGGER.debug("Unable to access Feast store for sentiment updates")
+            return
+
+        instrument_store = store.setdefault(symbol.upper(), {})
+        sentiment_payload = instrument_store.setdefault("sentiment", {})
+        sentiment_payload.update({
+            "label": label,
+            "score": score,
+            "updated_at": dt.datetime.now(tz=dt.timezone.utc).isoformat(),
+        })
+
+
+class SentimentIngestService:
+    """Coordinates fetching posts, scoring sentiment, and persisting outputs."""
+
+    def __init__(
+        self,
+        *,
+        repository: SentimentRepository,
+        model: SentimentModel,
+        sources: Iterable[BaseSource],
+        feast_writer: FeastSentimentWriter | None = None,
+    ) -> None:
+        self._repository = repository
+        self._model = model
+        self._sources = list(sources)
+        self._feast_writer = feast_writer
+
+    async def ingest_symbol(self, symbol: str) -> None:
+        tasks = [source.fetch(symbol) for source in self._sources]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for source, result in zip(self._sources, results):
+            if isinstance(result, Exception):
+                LOGGER.exception("Source %s failed for symbol %s", source.name, symbol)
+                continue
+            for post in result:
+                label, score = self._model.classify(post.text)
+                await self._repository.insert(post, label)
+                if self._feast_writer is not None:
+                    self._feast_writer.write(post.symbol, label, score)
+
+    async def ingest_many(self, symbols: Sequence[str]) -> None:
+        for symbol in symbols:
+            await self.ingest_symbol(symbol)
+
+
+class SentimentResponse(BaseModel):
+    symbol: str
+    score: str
+    source: str
+    ts: dt.datetime
+
+
+class SentimentAPI:
+    """REST API wrapper exposing sentiment lookups."""
+
+    def __init__(self, service: SentimentIngestService, repository: SentimentRepository) -> None:
+        self._service = service
+        self._repository = repository
+        self.router = APIRouter(prefix="/sentiment", tags=["sentiment"])
+        self._register_routes()
+
+    def _register_routes(self) -> None:
+        @self.router.get("/latest", response_model=SentimentResponse)
+        async def latest(symbol: str = Query(..., description="Symbol ticker, e.g. BTC-USD")) -> SentimentResponse:
+            record = await self._repository.latest(symbol)
+            if record is None:
+                raise HTTPException(status_code=404, detail=f"No sentiment found for {symbol.upper()}")
+            return SentimentResponse(symbol=record[0], score=record[1], source=record[2], ts=record[3])
+
+        @self.router.post("/refresh")
+        async def refresh(symbols: List[str]) -> dict[str, str]:
+            await self._service.ingest_many(symbols)
+            return {"status": "ok", "symbols": ",".join(symbols)}
+
+
+def bootstrap_service(db_path: Path | str | None = None) -> Tuple[SentimentIngestService, SentimentRepository]:
+    db_path = db_path or Path("data/sentiment/sentiment.db")
+    repository = SentimentRepository(db_path)
+    model = SentimentModel()
+
+    twitter_source = TwitterSource(api_key=os.getenv("TWITTER_BEARER_TOKEN"))
+    reddit_source = RedditSource(
+        client_id=os.getenv("REDDIT_CLIENT_ID"),
+        client_secret=os.getenv("REDDIT_CLIENT_SECRET"),
+    )
+    news_source = NewsSource(api_key=os.getenv("NEWS_API_KEY"))
+
+    feast_writer = FeastSentimentWriter(account_id=os.getenv("ACCOUNT_ID", "company"))
+
+    service = SentimentIngestService(
+        repository=repository,
+        model=model,
+        sources=[twitter_source, reddit_source, news_source],
+        feast_writer=feast_writer,
+    )
+    return service, repository
+
+
+def create_app(
+    service: SentimentIngestService | None = None,
+    repository: SentimentRepository | None = None,
+) -> FastAPI:
+    if service is None or repository is None:
+        service, repository = bootstrap_service()
+
+    app = FastAPI(title="Aether Sentiment Service")
+    app.state.sentiment_service = service
+    app.state.sentiment_repository = repository
+
+    sentiment_api = SentimentAPI(service=service, repository=repository)
+    app.include_router(sentiment_api.router)
+
+    return app
+
+
+async def run_once(symbols: Sequence[str], *, db_path: Path | str | None = None) -> None:
+    service, _ = bootstrap_service(db_path)
+    await service.ingest_many(symbols)
+
+
+def _default_symbols() -> List[str]:
+    env_value = os.getenv("SENTIMENT_SYMBOLS")
+    if not env_value:
+        return ["BTC-USD", "ETH-USD", "SOL-USD"]
+    return [symbol.strip() for symbol in env_value.split(",") if symbol.strip()]
+
+
+if __name__ == "__main__":
+    symbols = _default_symbols()
+    LOGGER.info("Running one-off sentiment ingestion for symbols: %s", symbols)
+    asyncio.run(run_once(symbols))

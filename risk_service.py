@@ -18,7 +18,7 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, model_validator
-from sqlalchemy import Column, DateTime, Float, Integer, String, create_engine
+from sqlalchemy import Column, DateTime, Float, Integer, String, create_engine, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -29,6 +29,11 @@ from metrics import (
     increment_trade_rejection,
     record_fees_nav_pct,
     setup_metrics,
+)
+from services.common.compliance import (
+    SanctionRecord,
+    ensure_sanctions_schema,
+    is_blocking_status,
 )
 from services.common.security import require_admin_account
 from battle_mode import BattleModeController, create_battle_mode_tables
@@ -275,7 +280,9 @@ def _seed_default_limits(session: Session) -> None:
 
 def _bootstrap_storage() -> None:
     Base.metadata.create_all(bind=ENGINE)
+
     create_battle_mode_tables(ENGINE)
+
     with get_session() as session:
         _seed_default_limits(session)
 
@@ -652,6 +659,16 @@ def _load_account_limits(account_id: str) -> AccountRiskLimit:
         return limits
 
 
+def _load_sanction_hits(symbol: str) -> List[SanctionRecord]:
+    """Return active sanction records for the provided symbol."""
+
+    normalized_symbol = symbol.upper()
+    with get_session() as session:
+        stmt = select(SanctionRecord).where(SanctionRecord.symbol == normalized_symbol)
+        records = session.execute(stmt).scalars().all()
+    return [record for record in records if is_blocking_status(record.status)]
+
+
 def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
     reasons: List[str] = []
     suggested_quantities: List[float] = []
@@ -684,6 +701,22 @@ def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
             nonlocal cooldown_until
             cooldown_until = cooldown_until or _determine_cooldown(limits)
         _audit_violation(context, message, details)
+
+    sanction_hits = _load_sanction_hits(intent.instrument_id)
+    if sanction_hits:
+        sources = sorted({record.source for record in sanction_hits})
+        statuses = sorted({record.status.lower() for record in sanction_hits})
+        _register_violation(
+            "Instrument is present on compliance sanctions list",
+            cooldown=True,
+            details={"sources": sources, "statuses": statuses},
+        )
+        return RiskValidationResponse(
+            pass_=False,
+            reasons=reasons,
+            adjusted_qty=0.0,
+            cooldown=cooldown_until,
+        )
 
     allocator_state = _query_allocator_state(context.request.account_id)
     if allocator_state:
