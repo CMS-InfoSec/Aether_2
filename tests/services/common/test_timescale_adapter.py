@@ -50,7 +50,7 @@ def test_record_event_is_tracked(adapter: TimescaleAdapter) -> None:
     events = TimescaleAdapter._events[adapter.account_id]["events"]
     assert len(events) == 1
     event = events[0]
-    assert event["event_type"] == "nav_limit_breach"
+    assert event["type"] == "nav_limit_breach"
     assert event["payload"] == payload
     assert isinstance(event["timestamp"], datetime)
 
