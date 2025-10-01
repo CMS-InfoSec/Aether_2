@@ -10,24 +10,43 @@ spec:
     - Ingress
     - Egress
   ingress:
+    # Allow workloads within the namespace to communicate with each other.
     - from:
         - podSelector: {}
+    # Permit traffic originating from the ingress controller namespace so
+    # that user traffic can reach services exposed via Ingress objects.
     - from:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: ingress-nginx
   egress:
+    # Allow intra-namespace communication.
     - to:
         - podSelector: {}
+    # Allow DNS lookups so that external hostnames can be resolved.
     - to:
-        - ipBlock:
-            cidr: 52.32.0.0/11
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
       ports:
+        - protocol: UDP
+          port: 53
         - protocol: TCP
-          port: 443
+          port: 53
+    # Allow egress to Kraken endpoints hosted on Cloudflare.
     - to:
         - ipBlock:
             cidr: 104.16.0.0/13
+      ports:
+        - protocol: TCP
+          port: 443
+    # Allow egress to CoinGecko API endpoints (Cloudflare address space).
+    - to:
+        - ipBlock:
+            cidr: 172.64.0.0/13
       ports:
         - protocol: TCP
           port: 443
