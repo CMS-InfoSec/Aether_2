@@ -153,20 +153,34 @@ def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
         cooldown_until = cooldown_until or _determine_cooldown(limits)
 
     intended_notional = context.intended_notional
+    current_exposure = state.notional_exposure
+    requested_delta = intended_notional if intent.side == "buy" else -intended_notional
+    projected_exposure = max(current_exposure + requested_delta, 0.0)
     nav_cap = limits.max_nav_pct * state.net_asset_value
-    max_nav_increment = max(nav_cap - state.notional_exposure, 0.0)
-    max_notional_increment = max(limits.notional_cap - state.notional_exposure, 0.0)
-    allowable_increment = min(max_nav_increment, max_notional_increment)
+    notional_cap = limits.notional_cap
 
-    if intended_notional > allowable_increment:
+    breached_limits: List[str] = []
+    if projected_exposure > nav_cap:
+        breached_limits.append(f"nav_cap={nav_cap:.2f}")
+    if projected_exposure > notional_cap:
+        breached_limits.append(f"notional_cap={notional_cap:.2f}")
+
+    if breached_limits:
+        limits_clause = " ".join(breached_limits)
         reasons.append(
-            "Requested notional exceeds limits: "
-            f"requested={intended_notional:.2f} allowable={allowable_increment:.2f}"
+            "Projected notional exposure exceeds limits: "
+            f"projected={projected_exposure:.2f} current={current_exposure:.2f} {limits_clause}"
         )
-        if allowable_increment > 0 and intent.price > 0:
-            adjusted_quantity = round(allowable_increment / intent.notional_per_unit, 8)
-        else:
-            adjusted_quantity = 0.0
+        if intent.side == "buy":
+            allowable_target = min(nav_cap, notional_cap)
+            allowable_increment = max(allowable_target - current_exposure, 0.0)
+            if allowable_increment > 0 and intent.price > 0:
+                adjusted_quantity = round(
+                    allowable_increment / intent.notional_per_unit,
+                    8,
+                )
+            else:
+                adjusted_quantity = 0.0
 
     passed = len(reasons) == 0
     return RiskValidationResponse(
