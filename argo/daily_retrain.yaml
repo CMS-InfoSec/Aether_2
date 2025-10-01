@@ -1,0 +1,48 @@
+apiVersion: argoproj.io/v1alpha1
+kind: CronWorkflow
+metadata:
+  name: ml-daily-retrain
+  labels:
+    workflows.argoproj.io/controller-instanceid: ml-platform
+spec:
+  schedule: "0 2 * * *"
+  concurrencyPolicy: Replace
+  workflowSpec:
+    entrypoint: retrain
+    templates:
+      - name: retrain
+        steps:
+          - - name: load-data
+              template: load-data
+            - name: train-models
+              template: train-models
+            - name: register-model
+              template: register-model
+      - name: load-data
+        container:
+          image: ghcr.io/aether/ml-runtime:latest
+          command: ["python", "-m", "ml.data.load_daily_snapshot"]
+          env:
+            - name: FEATURE_REPO_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: ml-config
+                  key: feast_repo
+      - name: train-models
+        container:
+          image: ghcr.io/aether/ml-runtime:latest
+          command: ["python", "-m", "ml.training.train_all"]
+          envFrom:
+            - secretRef:
+                name: mlflow-credentials
+            - configMapRef:
+                name: ml-config
+      - name: register-model
+        container:
+          image: ghcr.io/aether/ml-runtime:latest
+          command: ["python", "-m", "ml.registry.register_latest", "--stage", "Staging"]
+          envFrom:
+            - secretRef:
+                name: mlflow-credentials
+            - configMapRef:
+                name: ml-config
