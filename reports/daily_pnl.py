@@ -22,7 +22,7 @@ SELECT
     f.size,
     f.price,
     f.fee,
-    o.market
+    f.symbol AS instrument
 FROM fills AS f
 JOIN orders AS o ON o.order_id = f.order_id
 WHERE f.fill_time >= %(start)s AND f.fill_time < %(end)s
@@ -33,7 +33,7 @@ ORDER_QUERY = """
 SELECT
     o.order_id,
     o.account_id,
-    o.market,
+    o.symbol AS instrument,
     o.size,
     o.submitted_at
 FROM orders AS o
@@ -104,7 +104,7 @@ def fetch_daily_orders(
     order_to_market: Dict[str, str] = {}
     for order in orders:
         order_id = str(order["order_id"])
-        market = order.get("market")
+        market = order.get("instrument") or order.get("symbol")
         order_to_market[order_id] = str(market) if market is not None else "UNKNOWN"
     LOGGER.debug("Fetched %d orders between %s and %s", len(orders), start, end)
     return order_to_market
@@ -121,7 +121,9 @@ def compute_daily_pnl(
         account_id = str(fill["account_id"])
         order_id = str(fill["order_id"])
         instrument = str(
-            fill.get("market") or order_markets.get(order_id, "UNKNOWN")
+            fill.get("instrument")
+            or fill.get("symbol")
+            or order_markets.get(order_id, "UNKNOWN")
         )
         side = str(fill["side"]).upper()
         quantity = float(fill["size"])
