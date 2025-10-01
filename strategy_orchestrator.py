@@ -17,7 +17,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from threading import RLock
-from typing import Dict, Iterable, List
+from typing import Any, Dict, Iterable, List
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -28,6 +28,7 @@ from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import NullPool
 
 from services.common.schemas import RiskValidationRequest, RiskValidationResponse
+from strategy_bus import StrategySignalBus, ensure_signal_tables
 
 LOGGER = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -229,6 +230,13 @@ class StrategyIntentRequest(BaseModel):
     request: RiskValidationRequest
 
 
+class StrategySignalResponse(BaseModel):
+    name: str
+    publisher: str
+    schema: Any
+    ts: datetime
+
+
 def _database_url() -> str:
     url = (
         os.getenv("STRATEGY_DATABASE_URL")
@@ -260,13 +268,19 @@ DEFAULT_STRATEGIES: List[tuple[str, str, float]] = [
 ]
 
 RISK_ENGINE_URL = os.getenv("RISK_ENGINE_URL", "http://localhost:8000")
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 
 Base.metadata.create_all(bind=ENGINE)
+ensure_signal_tables(ENGINE)
 
 REGISTRY = StrategyRegistry(
     SessionLocal,
     risk_engine_url=RISK_ENGINE_URL,
     default_strategies=DEFAULT_STRATEGIES,
+)
+SIGNAL_BUS = StrategySignalBus(
+    SessionLocal,
+    kafka_bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
 )
 
 app = FastAPI(title="Strategy Orchestrator", version="0.1.0")
@@ -304,4 +318,18 @@ async def route_intent(payload: StrategyIntentRequest) -> RiskValidationResponse
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except StrategyAllocationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/strategy/signals", response_model=List[StrategySignalResponse])
+async def strategy_signals() -> List[StrategySignalResponse]:
+    signals = SIGNAL_BUS.list_signals()
+    return [
+        StrategySignalResponse(
+            name=signal.name,
+            publisher=signal.publisher,
+            schema=signal.schema,
+            ts=signal.ts,
+        )
+        for signal in signals
+    ]
 
