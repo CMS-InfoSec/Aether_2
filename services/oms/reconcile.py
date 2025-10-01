@@ -102,28 +102,35 @@ class OMSReconciler:
         trades_payload = await self._fetch_trades(account)
         trade_mismatches = await self._apply_trade_mismatches(account, trades_payload)
 
-        orders_payload = await self._fetch_open_orders(account)
-        order_mismatches = await self._apply_order_mismatches(account, orders_payload)
+        orders_payload, has_remote_snapshot = await self._fetch_open_orders(account)
+        order_mismatches = await self._apply_order_mismatches(
+            account, orders_payload, has_remote_snapshot
+        )
 
         checked = len(trades_payload) + len(orders_payload)
         fixed = trade_mismatches + order_mismatches
 
         return checked, fixed
 
-    async def _fetch_open_orders(self, account: "AccountContext") -> List[Dict[str, object]]:
+    async def _fetch_open_orders(
+        self, account: "AccountContext"
+    ) -> Tuple[List[Dict[str, object]], bool]:
         orders: List[Dict[str, object]] = []
+        authoritative = False
         if account.ws_client is not None:
             try:
                 snapshot = await account.ws_client.fetch_open_orders_snapshot()
-                orders.extend(order for order in snapshot if isinstance(order, dict))
             except (KrakenWSError, KrakenWSTimeout) as exc:
                 logger.warning(
                     "Reconcile open orders via websocket failed for account %s: %s",
                     account.account_id,
                     exc,
                 )
+            else:
+                orders.extend(order for order in snapshot if isinstance(order, dict))
+                authoritative = True
 
-        if not orders and account.rest_client is not None:
+        if not authoritative and account.rest_client is not None:
             try:
                 payload = await account.rest_client.open_orders()
             except KrakenRESTError as exc:
@@ -134,8 +141,9 @@ class OMSReconciler:
                 )
             else:
                 orders.extend(account._parse_rest_open_orders(payload))
+                authoritative = True
 
-        return orders
+        return orders, authoritative
 
     async def _fetch_trades(self, account: "AccountContext") -> List[Dict[str, object]]:
         trades: List[Dict[str, object]] = []
@@ -215,6 +223,7 @@ class OMSReconciler:
         self,
         account: "AccountContext",
         orders: Iterable[Dict[str, object]],
+        snapshot_authoritative: bool,
     ) -> int:
         mismatches = 0
 
@@ -270,27 +279,35 @@ class OMSReconciler:
                     state.status,
                 )
 
-        local_open_ids = await _collect_open_local_orders(account)
-        stale_orders = [order_id for order_id in local_open_ids if order_id not in remote_ids]
+        if snapshot_authoritative:
+            local_open_ids = await _collect_open_local_orders(account)
+            stale_orders = [
+                order_id for order_id in local_open_ids if order_id not in remote_ids
+            ]
 
-        for order_id in stale_orders:
-            record = await account.lookup(order_id)
-            if record is None:
-                continue
-            mismatches += 1
-            state = OrderState(
-                client_order_id=order_id,
-                exchange_order_id=record.result.exchange_order_id,
-                status="closed",
-                filled_qty=float(record.result.filled_qty),
-                avg_price=float(record.result.avg_price),
-                errors=None,
-                transport="reconcile",
-            )
-            await account._apply_stream_state(state)
-            logger.info(
-                "Reconciler closed stale local order %s on account %s",
-                order_id,
+            for order_id in stale_orders:
+                record = await account.lookup(order_id)
+                if record is None:
+                    continue
+                mismatches += 1
+                state = OrderState(
+                    client_order_id=order_id,
+                    exchange_order_id=record.result.exchange_order_id,
+                    status="closed",
+                    filled_qty=float(record.result.filled_qty),
+                    avg_price=float(record.result.avg_price),
+                    errors=None,
+                    transport="reconcile",
+                )
+                await account._apply_stream_state(state)
+                logger.info(
+                    "Reconciler closed stale local order %s on account %s",
+                    order_id,
+                    account.account_id,
+                )
+        else:
+            logger.debug(
+                "Skipping stale-order pruning for account %s due to missing snapshot",
                 account.account_id,
             )
 
