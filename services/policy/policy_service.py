@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import asdict, is_dataclass
 from typing import Any, Dict, List, Optional, Union
 
@@ -13,7 +14,13 @@ try:  # pragma: no cover - optional dependency
 except ImportError:  # pragma: no cover - the inference module is optional at runtime
     models = None
 
-from metrics import record_abstention_rate, record_drift_score, setup_metrics
+from metrics import (
+    observe_policy_inference_latency,
+    record_abstention_rate,
+    record_drift_score,
+    setup_metrics,
+    traced_span,
+)
 from services.common.security import ADMIN_ACCOUNTS
 
 
@@ -72,7 +79,7 @@ class PolicyIntent(BaseModel):
 APP_VERSION = "2.0.0"
 
 app = FastAPI(title="Policy Service", version=APP_VERSION)
-setup_metrics(app)
+setup_metrics(app, service_name="policy-service")
 
 
 @app.post("/policy/decide", response_model=PolicyIntent, status_code=status.HTTP_200_OK)
@@ -86,13 +93,20 @@ def decide_policy_intent(request: PolicyDecisionRequest) -> PolicyIntent:
         )
 
     try:
-        intent_payload = models.predict_intent(
+        with traced_span(
+            "policy.inference",
             account_id=request.account_id,
             symbol=request.symbol,
-            features=request.features,
-            book_snapshot=request.book_snapshot,
-            account_state=request.account_state,
-        )
+        ):
+            inference_start = time.perf_counter()
+            intent_payload = models.predict_intent(
+                account_id=request.account_id,
+                symbol=request.symbol,
+                features=request.features,
+                book_snapshot=request.book_snapshot,
+                account_state=request.account_state,
+            )
+        observe_policy_inference_latency((time.perf_counter() - inference_start) * 1000.0)
     except HTTPException:
         raise
     except Exception as exc:  # pragma: no cover - defensive runtime check

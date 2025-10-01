@@ -67,7 +67,7 @@ logger = logging.getLogger(__name__)
 
 
 app = FastAPI(title="Policy Service", version="2.0.0")
-setup_metrics(app)
+setup_metrics(app, service_name="policy-service")
 EXCHANGE_ADAPTER = get_exchange_adapter(DEFAULT_EXCHANGE)
 
 

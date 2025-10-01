@@ -20,6 +20,17 @@ from pydantic import BaseModel, Field
 from services.common.adapters import KafkaNATSAdapter
 from override_service import OverrideDecision, OverrideRecord, latest_override
 
+from metrics import (
+    increment_rejected_intents,
+    increment_trades_submitted,
+    observe_oms_submit_latency,
+    observe_policy_inference_latency,
+    observe_risk_validation_latency,
+    set_pipeline_latency,
+    setup_metrics,
+    traced_span,
+)
+
 
 LOGGER = logging.getLogger("sequencer")
 
@@ -263,44 +274,66 @@ class SequencerPipeline:
         )
 
         try:
-            for stage in self._stages:
+            with traced_span(
+                "sequencer.pipeline",
+                run_id=run_id,
+                account_id=normalized_account,
+                intent_id=intent_id,
+            ):
+                for stage in self._stages:
+                    await publisher.publish_event(
+                        stage.name,
+                        "start",
+                        run_id=run_id,
+                        intent_id=intent_id,
+                        account_id=normalized_account,
+                        data={"payload": payload},
+                    )
+                    stage_start = time.perf_counter()
+                    with traced_span(
+                        f"sequencer.stage.{stage.name}",
+                        stage=stage.name,
+                        run_id=run_id,
+                        account_id=normalized_account,
+                        intent_id=intent_id,
+                    ):
+                        result = await stage.execute(payload, ctx)
+                    stage_latency = (time.perf_counter() - stage_start) * 1000.0
+                    stage_latencies[stage.name] = stage_latency
+                    if stage.name == "policy":
+                        observe_policy_inference_latency(stage_latency)
+                    elif stage.name == "risk":
+                        observe_risk_validation_latency(stage_latency)
+                    elif stage.name == "oms":
+                        artifact = result.artifact if isinstance(result.artifact, dict) else {}
+                        transport = str(artifact.get("transport") or "sequencer")
+                        observe_oms_submit_latency(stage_latency, transport=transport)
+                    payload = result.payload
+                    stage_artifacts[stage.name] = result.artifact
+                    executed.append((stage, result))
+                    await publisher.publish_event(
+                        stage.name,
+                        "complete",
+                        run_id=run_id,
+                        intent_id=intent_id,
+                        account_id=normalized_account,
+                        data=result.artifact,
+                    )
+
+                fill_event = await self._emit_fill_event(ctx, payload, stage_artifacts)
+                total_latency_snapshot = (time.perf_counter() - pipeline_start) * 1000.0
                 await publisher.publish_event(
-                    stage.name,
-                    "start",
-                    run_id=run_id,
-                    intent_id=intent_id,
-                    account_id=normalized_account,
-                    data={"payload": payload},
-                )
-                stage_start = time.perf_counter()
-                result = await stage.execute(payload, ctx)
-                stage_latency = (time.perf_counter() - stage_start) * 1000.0
-                stage_latencies[stage.name] = stage_latency
-                payload = result.payload
-                stage_artifacts[stage.name] = result.artifact
-                executed.append((stage, result))
-                await publisher.publish_event(
-                    stage.name,
+                    "pipeline",
                     "complete",
                     run_id=run_id,
                     intent_id=intent_id,
                     account_id=normalized_account,
-                    data=result.artifact,
+                    data={"fill_event": fill_event, "latency_ms": total_latency_snapshot},
                 )
-
-            fill_event = await self._emit_fill_event(ctx, payload, stage_artifacts)
-            total_latency_snapshot = (time.perf_counter() - pipeline_start) * 1000.0
-            await publisher.publish_event(
-                "pipeline",
-                "complete",
-                run_id=run_id,
-                intent_id=intent_id,
-                account_id=normalized_account,
-                data={"fill_event": fill_event, "latency_ms": total_latency_snapshot},
-            )
         except StageError as exc:
             status_value = "failed"
             error_message = f"{exc.stage}: {exc.message}"
+            increment_rejected_intents(exc.stage, exc.message)
             await publisher.publish_event(
                 exc.stage,
                 "failed",
@@ -335,6 +368,7 @@ class SequencerPipeline:
         finally:
             completed_at = datetime.now(timezone.utc)
             total_latency = (time.perf_counter() - pipeline_start) * 1000.0
+            set_pipeline_latency(total_latency)
             summary = PipelineRunSummary(
                 run_id=run_id,
                 account_id=normalized_account,
@@ -350,6 +384,8 @@ class SequencerPipeline:
 
         if fill_event is None:
             raise StageFailedError("pipeline", error_message or "Pipeline failed to produce fill event")
+
+        increment_trades_submitted()
 
         return PipelineResult(
             run_id=run_id,
@@ -576,6 +612,7 @@ pipeline = SequencerPipeline(
 )
 
 app = FastAPI(title="Sequencer Service", version="1.0.0")
+setup_metrics(app, service_name="sequencer")
 
 
 @app.post("/sequencer/submit_intent", response_model=SequencerResponse)
