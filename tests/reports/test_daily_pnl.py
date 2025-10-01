@@ -64,10 +64,10 @@ class RecordingSession:
             end = params.get("end")
             rows: List[Dict[str, Any]] = []
             for fill in self._fills:
-                fill_ts = fill["fill_ts"]
-                if start and fill_ts < start:
+                fill_time = fill["fill_time"]
+                if start and fill_time < start:
                     continue
-                if end and fill_ts >= end:
+                if end and fill_time >= end:
                     continue
                 order = self._orders[fill["order_id"]]
                 account_id = order["account_id"]
@@ -90,21 +90,21 @@ class RecordingSession:
                         "size": fill["size"],
                         "price": fill["price"],
                         "fee": fill.get("fee"),
-
-                        "instrument": fill.get("symbol")
-                        or order.get("symbol")
-                        or order.get("market"),
-
+                        "instrument": fill.get("market")
+                        or fill.get("symbol")
+                        or order.get("market")
+                        or order.get("symbol"),
+                        "fill_ts": fill_time,
                     }
                 )
             return FakeResult(rows)
 
-        if "o.submitted_ts" in normalized_query:
+        if "o.submitted_at" in normalized_query:
             start = params.get("start")
             end = params.get("end")
             rows = []
             for order in self._orders.values():
-                submitted = order["submitted_ts"]
+                submitted = order["submitted_at"]
                 if start and submitted < start:
                     continue
                 if end and submitted >= end:
@@ -125,9 +125,7 @@ class RecordingSession:
                     {
                         "order_id": order["order_id"],
                         "account_id": account_id,
-
-                        "instrument": order.get("symbol") or order.get("market"),
-
+                        "instrument": order.get("market") or order.get("symbol"),
                         "size": order["size"],
                         "submitted_ts": submitted,
                     }
@@ -149,46 +147,38 @@ def sample_session() -> RecordingSession:
         {
             "order_id": "ord-1",
             "account_id": 101,
-
             "market": "BTC-USD",
-
             "symbol": "BTC-USD",
             "side": "BUY",
             "size": 1,
-            "submitted_ts": datetime(2024, 5, 1, 0, 0, tzinfo=timezone.utc),
+            "submitted_at": datetime(2024, 5, 1, 0, 0, tzinfo=timezone.utc),
         },
         {
             "order_id": "ord-2",
             "account_id": 101,
-
             "market": "BTC-USD",
-
             "symbol": "BTC-USD",
             "side": "SELL",
             "size": 1,
-            "submitted_ts": datetime(2024, 5, 1, 1, 0, tzinfo=timezone.utc),
+            "submitted_at": datetime(2024, 5, 1, 1, 0, tzinfo=timezone.utc),
         },
         {
             "order_id": "ord-3",
             "account_id": 202,
-
             "market": "ETH-USD",
-
             "symbol": "ETH-USD",
             "side": "SELL",
             "size": 2,
-            "submitted_ts": datetime(2024, 5, 1, 2, 0, tzinfo=timezone.utc),
+            "submitted_at": datetime(2024, 5, 1, 2, 0, tzinfo=timezone.utc),
         },
     ]
     fills = [
         {
             "fill_id": "fill-1",
             "order_id": "ord-1",
-
             "market": "BTC-USD",
             "symbol": "BTC-USD",
-            "fill_ts": datetime(2024, 5, 1, 0, 15, tzinfo=timezone.utc),
-
+            "fill_time": datetime(2024, 5, 1, 0, 15, tzinfo=timezone.utc),
             "price": 100,
             "size": 1,
             "fee": 0.5,
@@ -196,11 +186,9 @@ def sample_session() -> RecordingSession:
         {
             "fill_id": "fill-2",
             "order_id": "ord-2",
-
             "market": "BTC-USD",
             "symbol": "BTC-USD",
-            "fill_ts": datetime(2024, 5, 1, 1, 15, tzinfo=timezone.utc),
-
+            "fill_time": datetime(2024, 5, 1, 1, 15, tzinfo=timezone.utc),
             "price": 110,
             "size": 1,
             "fee": 0.6,
@@ -208,11 +196,9 @@ def sample_session() -> RecordingSession:
         {
             "fill_id": "fill-3",
             "order_id": "ord-3",
-
             "market": "ETH-USD",
             "symbol": "ETH-USD",
-            "fill_ts": datetime(2024, 5, 1, 2, 15, tzinfo=timezone.utc),
-
+            "fill_time": datetime(2024, 5, 1, 2, 15, tzinfo=timezone.utc),
             "price": 50,
             "size": 2,
             "fee": 0.4,
@@ -286,6 +272,33 @@ def test_generate_daily_pnl_accepts_admin_slug_filter(
     for params in sample_session.params:
         if "account_ids" in params:
             assert all(isinstance(value, int) for value in params["account_ids"])
+
+
+def test_generate_daily_pnl_queries_use_real_columns(
+    tmp_path: Path, sample_session: RecordingSession
+) -> None:
+    storage = ArtifactStorage(tmp_path)
+    generate_daily_pnl(
+        sample_session,
+        storage,
+        report_date=date(2024, 5, 1),
+        output_formats=("csv",),
+    )
+
+    normalized_queries = [" ".join(query.lower().split()) for query in sample_session.queries]
+
+    fill_queries = [query for query in normalized_queries if "from fills" in query]
+    assert fill_queries
+    for query in fill_queries:
+        assert "f.market as instrument" in query
+        assert "where f.fill_time >= %(start)s and f.fill_time < %(end)s" in query
+
+    order_queries = [query for query in normalized_queries if "from orders" in query]
+    assert order_queries
+    for query in order_queries:
+        assert "o.market as instrument" in query
+        assert "o.submitted_at as submitted_ts" in query
+        assert "where o.submitted_at >= %(start)s and o.submitted_at < %(end)s" in query
 
 
 def test_generate_daily_pnl_creates_audit_log_entries(tmp_path: Path, sample_session: RecordingSession) -> None:

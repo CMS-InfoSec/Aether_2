@@ -22,11 +22,12 @@ SELECT
     f.size,
     f.price,
     f.fee,
-    f.symbol AS instrument
+    f.market AS instrument,
+    f.fill_time AS fill_ts
 FROM fills AS f
 JOIN orders AS o ON o.order_id = f.order_id
 {account_join}
-WHERE f.fill_ts >= %(start)s AND f.fill_ts < %(end)s
+WHERE f.fill_time >= %(start)s AND f.fill_time < %(end)s
 {account_filter}
 """
 
@@ -34,12 +35,12 @@ ORDER_QUERY = """
 SELECT
     o.order_id,
     o.account_id,
-    o.symbol AS instrument,
+    o.market AS instrument,
     o.size,
-    o.submitted_ts
+    o.submitted_at AS submitted_ts
 FROM orders AS o
 {account_join}
-WHERE o.submitted_ts >= %(start)s AND o.submitted_ts < %(end)s
+WHERE o.submitted_at >= %(start)s AND o.submitted_at < %(end)s
 {account_filter}
 """
 
