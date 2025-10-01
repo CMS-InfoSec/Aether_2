@@ -20,7 +20,6 @@ MFA_HEADER = {"X-MFA-Context": "verified"}
 
 def setup_function() -> None:
     KrakenSecretStore.reset()
-    TimescaleAdapter.reset_rotation_state()
     TimescaleAdapter.reset()
 
 

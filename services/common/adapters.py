@@ -245,37 +245,29 @@ class TimescaleAdapter:
     # Test helpers
     # ------------------------------------------------------------------
     @classmethod
-
     def reset(cls, account_id: str | None = None) -> None:
+        caches = (
+            cls._metrics,
+            cls._telemetry,
+            cls._risk_configs,
+            cls._daily_usage,
+            cls._instrument_exposures,
+            cls._events,
+            cls._credential_rotations,
+            cls._credential_events,
+        )
+
         if account_id is None:
-            cls._metrics.clear()
-            cls._telemetry.clear()
-            cls._risk_configs.clear()
-            cls._daily_usage.clear()
-            cls._instrument_exposures.clear()
-            cls._events.clear()
-            cls._credential_rotations.clear()
-            cls._credential_events.clear()
+            for cache in caches:
+                cache.clear()
             return
 
-        cls._metrics.pop(account_id, None)
-        cls._telemetry.pop(account_id, None)
-        cls._risk_configs.pop(account_id, None)
-        cls._daily_usage.pop(account_id, None)
-        cls._instrument_exposures.pop(account_id, None)
-        cls._events.pop(account_id, None)
-        cls._credential_rotations.pop(account_id, None)
-        cls._credential_events.pop(account_id, None)
+        for cache in caches:
+            cache.pop(account_id, None)
 
     @classmethod
     def reset_rotation_state(cls, account_id: str | None = None) -> None:
-        if account_id is None:
-            cls._credential_rotations.clear()
-            cls._credential_events.clear()
-            return
-
-        cls._credential_rotations.pop(account_id, None)
-        cls._credential_events.pop(account_id, None)
+        cls.reset(account_id=account_id)
 
 
 
