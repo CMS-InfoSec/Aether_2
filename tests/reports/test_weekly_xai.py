@@ -42,7 +42,7 @@ class ShapRecordingSession:
         normalized = " ".join(query.lower().split())
         self.queries.append(query.strip())
 
-        if "insert into audit_logs" in normalized:
+        if "insert into audit_log" in normalized:
             self.audit_entries.append(params)
             return FakeResult([])
 
@@ -143,8 +143,12 @@ def test_generate_weekly_xai_outputs_csv_and_audit_log(
     assert beta_row["sample_count"] == "3"
 
     assert session.audit_entries, "Expected audit log entries to be recorded"
-    payload = json.loads(session.audit_entries[0]["payload"])
-    assert payload["metadata"]["row_count"] == len(rows)
+    sha_path = tmp_path / "global" / f"{keys[0]}.sha256"
+    assert sha_path.exists()
+
+    payload = json.loads(session.audit_entries[0]["metadata"])
+    assert payload["row_count"] == len(rows)
+    assert payload["storage_backend"] == "filesystem"
 
 
 def test_generate_weekly_xai_scopes_account_specific_reports(

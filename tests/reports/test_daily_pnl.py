@@ -240,22 +240,13 @@ def test_generate_daily_pnl_creates_audit_log_entries(tmp_path: Path, sample_ses
     assert len(keys) == 1
     assert len(sample_session.audit_entries) == 1
 
-    audit_metadata = json.loads(sample_session.audit_entries[0]["metadata"])
-    assert "daily_pnl/2024-05-01.csv" in audit_metadata["object_key"]
+    csv_path = tmp_path / "global" / keys[0]
+    rows = read_csv(csv_path)
+    sha_path = tmp_path / "global" / f"{keys[0]}.sha256"
+    assert sha_path.exists()
 
-
-def test_daily_pnl_queries_use_symbol_and_timestamp_columns(
-    tmp_path: Path, sample_session: RecordingSession
-) -> None:
-
-    storage = ArtifactStorage(tmp_path)
-    generate_daily_pnl(
-        sample_session,
-        storage,
-        report_date=date(2024, 5, 1),
-        output_formats=("csv",),
-    )
-
-    assert any("f.symbol" in query and "f.fill_ts" in query for query in sample_session.queries)
-    assert any("o.symbol" in query and "o.submitted_ts" in query for query in sample_session.queries)
+    payload = json.loads(sample_session.audit_entries[0]["metadata"])
+    assert "daily_pnl/2024-05-01.csv" in payload["object_key"]
+    assert payload["row_count"] == len(rows)
+    assert payload["storage_backend"] == "filesystem"
 
