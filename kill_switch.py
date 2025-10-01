@@ -2,14 +2,29 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict
+from enum import Enum
+from typing import Any, Dict, List
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 
+from kill_alerts import dispatch_notifications
 from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
 from services.common.security import require_admin_account
 
 app = FastAPI(title="Kill Switch Service")
+
+
+class KillSwitchReason(str, Enum):
+    SPREAD_WIDENING = "spread_widening"
+    LATENCY_STALL = "latency_stall"
+    LOSS_CAP_BREACH = "loss_cap_breach"
+
+
+_REASON_DESCRIPTIONS = {
+    KillSwitchReason.SPREAD_WIDENING: "Spread widening beyond configured tolerance",
+    KillSwitchReason.LATENCY_STALL: "Order gateway latency stalled",
+    KillSwitchReason.LOSS_CAP_BREACH: "Daily loss cap breached",
+}
 
 
 def _normalize_account(account_id: str) -> str:
@@ -27,6 +42,7 @@ def _normalize_account(account_id: str) -> str:
 @app.post("/risk/kill")
 def trigger_kill_switch(
     account_id: str = Query(..., min_length=1),
+    reason_code: KillSwitchReason = Query(KillSwitchReason.LOSS_CAP_BREACH),
     actor_account: str = Depends(require_admin_account),
 ) -> Dict[str, Any]:
     """Trigger the kill switch for the provided account."""
@@ -34,11 +50,12 @@ def trigger_kill_switch(
     normalized_account = _normalize_account(account_id)
 
     activation_ts = datetime.now(timezone.utc)
+    reason_description = _REASON_DESCRIPTIONS.get(reason_code, "Kill switch engaged")
 
     timescale = TimescaleAdapter(account_id=normalized_account)
     timescale.set_kill_switch(
         engaged=True,
-        reason="Manual kill switch activation",
+        reason=reason_description,
         actor=actor_account,
     )
 
@@ -51,7 +68,55 @@ def trigger_kill_switch(
             "actor": actor_account,
             "timestamp": activation_ts.isoformat(),
             "actions": ["CANCEL_OPEN_ORDERS", "FLATTEN_POSITIONS"],
+            "reason_code": reason_code.value,
         },
     )
 
-    return {"status": "ok", "ts": activation_ts.isoformat()}
+    channels_sent: List[str] = dispatch_notifications(
+        account_id=normalized_account,
+        reason_code=reason_code.value,
+        triggered_at=activation_ts,
+        extra_metadata={"actor": actor_account},
+    )
+
+    timescale.record_kill_event(
+        reason_code=reason_code.value,
+        triggered_at=activation_ts,
+        channels_sent=channels_sent,
+    )
+
+    return {
+        "status": "ok",
+        "ts": activation_ts.isoformat(),
+        "reason_code": reason_code.value,
+        "channels_sent": channels_sent,
+    }
+
+
+@app.get("/risk/kill_events")
+def list_kill_events(
+    account_id: str | None = Query(default=None, min_length=1),
+    limit: int = Query(default=20, ge=1, le=100),
+    actor_account: str = Depends(require_admin_account),
+) -> List[Dict[str, Any]]:
+    """Return recent kill switch events for the organisation."""
+
+    _ = actor_account  # ensure dependency is enforced without lint noise
+
+    normalized: str | None = None
+    if account_id is not None:
+        normalized = _normalize_account(account_id)
+
+    events = TimescaleAdapter.all_kill_events(account_id=normalized, limit=limit)
+
+    response: List[Dict[str, Any]] = []
+    for event in events:
+        response.append(
+            {
+                "account_id": event["account_id"],
+                "reason": event["reason"],
+                "ts": event["ts"].isoformat(),
+                "channels_sent": list(event.get("channels_sent", [])),
+            }
+        )
+    return response
