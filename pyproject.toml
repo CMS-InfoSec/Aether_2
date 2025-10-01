@@ -16,9 +16,7 @@ dependencies = [
     "email-validator>=2.1",
     "prometheus-client>=0.20",
 
-
-    "aiokafka>=0.10",
-
+    "psycopg2-binary>=2.9",
 
 ]
 
