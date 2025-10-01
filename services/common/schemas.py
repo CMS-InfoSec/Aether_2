@@ -54,6 +54,29 @@ class OrderPlacementRequest(BaseModel):
     quantity: float = Field(..., gt=0.0, description="Order quantity")
     price: float = Field(..., gt=0.0, description="Limit price")
     fee: FeeBreakdown = Field(..., description="Fees applied at placement")
+    post_only: bool | None = Field(
+        default=None,
+        description="Whether the order should avoid taking liquidity",
+    )
+    reduce_only: bool | None = Field(
+        default=None,
+        description="Only reduce an existing position",
+    )
+    time_in_force: str | None = Field(
+        default=None,
+        pattern="^(GTC|IOC|GTD)$",
+        description="Time in force constraint",
+    )
+    take_profit: float | None = Field(
+        default=None,
+        gt=0.0,
+        description="Take profit trigger price",
+    )
+    stop_loss: float | None = Field(
+        default=None,
+        gt=0.0,
+        description="Stop loss trigger price",
+    )
 
 
 class OrderPlacementResponse(BaseModel):
