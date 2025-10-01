@@ -10,16 +10,19 @@ spec:
     - Ingress
     - Egress
   ingress:
-    # Allow intra-namespace traffic between pods.
-    - from:
-        - podSelector: {}
-    # Allow traffic from the ingress controller namespace only.
+    # Only allow ingress traffic proxied by the NGINX ingress controller over TLS.
     - from:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 443
   egress:
-    # Allow intra-namespace communication.
+    # Allow intra-namespace communication between pods.
     - to:
         - podSelector: {}
     # Allow DNS queries for hostname resolution.
@@ -35,17 +38,40 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
-    # Allow HTTPS traffic to Kraken endpoints (Cloudflare).
+    # Allow HTTPS traffic to Kraken endpoints (served via Cloudflare).
     - to:
         - ipBlock:
             cidr: 104.16.0.0/13
+        - ipBlock:
+            cidr: 104.24.0.0/14
+        - ipBlock:
+            cidr: 172.64.0.0/13
+        - ipBlock:
+            cidr: 131.0.72.0/22
       ports:
         - protocol: TCP
           port: 443
-    # Allow HTTPS traffic to api.coingecko.com (Cloudflare).
+    # Allow HTTPS traffic to api.coingecko.com (Cloudflare hosted).
     - to:
         - ipBlock:
+            cidr: 104.16.0.0/13
+        - ipBlock:
+            cidr: 104.24.0.0/14
+        - ipBlock:
             cidr: 172.64.0.0/13
+        - ipBlock:
+            cidr: 131.0.72.0/22
+      ports:
+        - protocol: TCP
+          port: 443
+    # Allow HTTPS traffic to Linode Object Storage endpoints.
+    - to:
+        - ipBlock:
+            cidr: 50.116.0.0/16
+        - ipBlock:
+            cidr: 97.107.128.0/17
+        - ipBlock:
+            cidr: 172.104.0.0/13
       ports:
         - protocol: TCP
           port: 443
