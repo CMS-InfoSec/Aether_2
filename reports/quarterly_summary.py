@@ -38,10 +38,10 @@ GROUP BY o.account_id, f.market
 """
 
 AUDIT_QUERY = """
-SELECT account_id, COUNT(*) AS audit_events
+SELECT actor AS account_id, COUNT(*) AS audit_events
 FROM audit_log
-WHERE created_at >= %(start)s AND created_at < %(end)s
-GROUP BY account_id
+WHERE event_time >= %(start)s AND event_time < %(end)s
+GROUP BY actor
 """
 
 

@@ -106,13 +106,13 @@ class QuarterlyRecordingSession:
             end = params.get("end")
             counts: Dict[str, int] = {}
             for entry in self._audits:
-                created = entry["created_at"]
-                if start and created < start:
+                event_time = entry["event_time"]
+                if start and event_time < start:
                     continue
-                if end and created >= end:
+                if end and event_time >= end:
                     continue
-                account_id = entry["account_id"]
-                counts[account_id] = counts.get(account_id, 0) + 1
+                actor = entry["actor"]
+                counts[actor] = counts.get(actor, 0) + 1
             rows = [
                 {"account_id": account_id, "audit_events": count}
                 for account_id, count in counts.items()
@@ -176,18 +176,18 @@ def quarterly_session() -> QuarterlyRecordingSession:
     audits = [
         {
             "audit_id": "audit-1",
-            "account_id": "alpha",
-            "created_at": datetime(2024, 4, 15, 0, 0, tzinfo=timezone.utc),
+            "actor": "alpha",
+            "event_time": datetime(2024, 4, 15, 0, 0, tzinfo=timezone.utc),
         },
         {
             "audit_id": "audit-2",
-            "account_id": "alpha",
-            "created_at": datetime(2024, 5, 20, 0, 0, tzinfo=timezone.utc),
+            "actor": "alpha",
+            "event_time": datetime(2024, 5, 20, 0, 0, tzinfo=timezone.utc),
         },
         {
             "audit_id": "audit-3",
-            "account_id": "beta",
-            "created_at": datetime(2024, 4, 20, 0, 0, tzinfo=timezone.utc),
+            "actor": "beta",
+            "event_time": datetime(2024, 4, 20, 0, 0, tzinfo=timezone.utc),
         },
     ]
     return QuarterlyRecordingSession(orders, fills, audits)
