@@ -41,51 +41,17 @@ class TimescaleAdapter:
     account_id: str
 
     _metrics: ClassVar[Dict[str, Dict[str, float]]] = {}
+
     _events: ClassVar[Dict[str, Dict[str, List[Dict[str, Any]]]]] = {}
     _credential_rotations: ClassVar[Dict[str, Dict[str, Any]]] = {}
 
-    _risk_configs: ClassVar[Dict[str, Dict[str, Any]]] = {
-        "admin-eu": {
-            "nav": 5_000_000.0,
-            "loss_cap": 250_000.0,
-            "fee_cap": 75_000.0,
-            "max_nav_percent": 0.25,
-            "var_limit": 200_000.0,
-            "spread_limit_bps": 50.0,
-            "latency_limit_ms": 250.0,
-            "diversification_rules": {"max_single_instrument_percent": 0.35},
-            "kill_switch": False,
-        },
-        "admin-us": {
-            "nav": 3_500_000.0,
-            "loss_cap": 200_000.0,
-            "fee_cap": 60_000.0,
-            "max_nav_percent": 0.3,
-            "var_limit": 150_000.0,
-            "spread_limit_bps": 45.0,
-            "latency_limit_ms": 200.0,
-            "diversification_rules": {"max_single_instrument_percent": 0.3},
-            "kill_switch": False,
-        },
-        "admin-apac": {
-            "nav": 4_000_000.0,
-            "loss_cap": 225_000.0,
-            "fee_cap": 70_000.0,
-            "max_nav_percent": 0.28,
-            "var_limit": 180_000.0,
-            "spread_limit_bps": 60.0,
-            "latency_limit_ms": 275.0,
-            "diversification_rules": {"max_single_instrument_percent": 0.4},
-            "kill_switch": False,
-        },
-    }
-    _daily_usage: ClassVar[Dict[str, Dict[str, float]]] = {}
-    _instrument_exposure: ClassVar[Dict[str, Dict[str, float]]] = {}
-    _events: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
+
+    _telemetry: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
 
 
     def __post_init__(self) -> None:
         self._metrics.setdefault(self.account_id, {"limit": 1_000_000.0, "usage": 0.0})
+        self._telemetry.setdefault(self.account_id, [])
 
         self._events.setdefault(self.account_id, {"acks": [], "fills": []})
 
@@ -98,6 +64,7 @@ class TimescaleAdapter:
     def check_limits(self, notional: float) -> bool:
         projected = self._metrics[self.account_id]["usage"] + notional
         return projected <= self._metrics[self.account_id]["limit"]
+
 
     def record_ack(self, payload: Dict[str, Any]) -> None:
         event = dict(payload)
@@ -146,29 +113,17 @@ class TimescaleAdapter:
         usage = self._daily_usage.setdefault(self.account_id, {"loss": 0.0, "fee": 0.0})
         return dict(usage)
 
-    def record_daily_usage(self, loss: float, fee: float) -> None:
-        usage = self._daily_usage.setdefault(self.account_id, {"loss": 0.0, "fee": 0.0})
-        usage["loss"] += loss
-        usage["fee"] += fee
 
-    def instrument_exposure(self, instrument: str) -> float:
-        exposure = self._instrument_exposure.setdefault(self.account_id, {})
-        return exposure.get(instrument, 0.0)
-
-    def record_instrument_exposure(self, instrument: str, notional: float) -> None:
-        exposure = self._instrument_exposure.setdefault(self.account_id, {})
-        exposure[instrument] = exposure.get(instrument, 0.0) + notional
-
-    def record_event(self, event_type: str, payload: Dict[str, Any]) -> None:
-        event = {
-            "type": event_type,
+    def record_decision(self, order_id: str, payload: Dict[str, Any]) -> None:
+        entry = {
+            "order_id": order_id,
             "payload": payload,
             "timestamp": datetime.now(timezone.utc),
         }
-        self._events.setdefault(self.account_id, []).append(event)
+        self._telemetry[self.account_id].append(entry)
 
-    def events(self) -> List[Dict[str, Any]]:
-        return list(self._events.get(self.account_id, []))
+    def telemetry(self) -> List[Dict[str, Any]]:
+        return list(self._telemetry.get(self.account_id, []))
 
     # ------------------------------------------------------------------
     # Credential rotation metadata helpers
@@ -204,16 +159,46 @@ class TimescaleAdapter:
 class RedisFeastAdapter:
     account_id: str
 
-    _repository: UniverseRepository = field(init=False)
 
-    def __post_init__(self) -> None:
-        self._repository = UniverseRepository(account_id=self.account_id)
+    _features: ClassVar[Dict[str, Dict[str, Any]]] = {
+        "admin-eu": {"approved": ["BTC-USD", "ETH-USD"], "fees": {"BTC-USD": {"maker": 0.1, "taker": 0.2}}},
+        "admin-us": {"approved": ["SOL-USD"], "fees": {}},
+        "admin-apac": {"approved": ["BTC-USDT", "ETH-USDT"], "fees": {}},
+    }
+    _online_feature_store: ClassVar[Dict[str, Dict[str, Dict[str, Any]]]] = {
+        "admin-eu": {
+            "BTC-USD": {
+                "features": [18.0, 4.0, -2.0],
+                "book_snapshot": {"mid_price": 30_000.0, "spread_bps": 3.0, "imbalance": 0.15},
+                "state": {
+                    "regime": "neutral",
+                    "volatility": 0.35,
+                    "liquidity_score": 0.75,
+                    "conviction": 0.6,
+                },
+                "expected_edge_bps": 14.0,
+                "take_profit_bps": 25.0,
+                "stop_loss_bps": 10.0,
+                "confidence": {
+                    "model_confidence": 0.62,
+                    "state_confidence": 0.58,
+                    "execution_confidence": 0.64,
+                },
+            }
+        }
+    }
+
 
     def approved_instruments(self) -> List[str]:
         return self._repository.approved_universe()
 
     def fee_override(self, instrument: str) -> Dict[str, Any] | None:
         return self._repository.fee_override(instrument)
+
+    def fetch_online_features(self, instrument: str) -> Dict[str, Any]:
+        account_store = self._online_feature_store.get(self.account_id, {})
+        feature_payload = account_store.get(instrument, {})
+        return dict(feature_payload)
 
 
 @dataclass
