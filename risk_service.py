@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional
 
 
 import httpx
@@ -27,6 +27,7 @@ from sqlalchemy.pool import StaticPool
 from statistics import mean
 
 
+from exchange_adapter import get_exchange_adapter
 from metrics import (
     increment_trade_rejection,
     record_fees_nav_pct,
@@ -52,6 +53,7 @@ _CAPITAL_ALLOCATOR_URL = os.getenv("CAPITAL_ALLOCATOR_URL")
 _CAPITAL_ALLOCATOR_TIMEOUT = float(os.getenv("CAPITAL_ALLOCATOR_TIMEOUT", "1.5"))
 _CAPITAL_ALLOCATOR_TOLERANCE = float(os.getenv("CAPITAL_ALLOCATOR_NAV_TOLERANCE", "0.02"))
 _BATTLE_MODE_VOL_THRESHOLD = float(os.getenv("BATTLE_MODE_VOL_THRESHOLD", "1.0"))
+DEFAULT_EXCHANGE = os.getenv("PRIMARY_EXCHANGE", "kraken")
 
 
 Base = declarative_base()
@@ -510,6 +512,7 @@ class BattleModeToggleRequest(BaseModel):
 app = FastAPI(title="Risk Validation Service", version="1.0.0")
 setup_metrics(app)
 COST_THROTTLER = CostThrottler()
+EXCHANGE_ADAPTER = get_exchange_adapter(DEFAULT_EXCHANGE)
 
 
 
@@ -554,7 +557,7 @@ async def validate_risk(request: RiskValidationRequest) -> RiskValidationRespons
     context = RiskEvaluationContext(request=request, limits=limits)
 
     try:
-        decision = _evaluate(context)
+        decision = await _evaluate(context)
     except Exception as exc:  # pragma: no cover - defensive programming
         logger.exception("Risk evaluation failed for account %s", account_id)
         raise HTTPException(status_code=500, detail="Internal risk evaluation failure") from exc
@@ -652,14 +655,14 @@ def _load_sanction_hits(symbol: str) -> List[SanctionRecord]:
     return [record for record in records if is_blocking_status(record.status)]
 
 
-def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
+async def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
     reasons: List[str] = []
     suggested_quantities: List[float] = []
     cooldown_until: Optional[datetime] = None
 
     limits = context.limits
     state = context.request.portfolio_state
-    _refresh_usage_from_fills(context.request.account_id, state)
+    await _refresh_usage_from_fills(context.request.account_id, state)
     intent = context.request.intent
     trade_notional = context.intended_notional
 
@@ -1378,9 +1381,9 @@ def _compute_historical_var(account_id: str, nav: float, window: int = 250) -> O
     return projected_loss
 
 
-def _load_recent_fills(account_id: str) -> List[Dict[str, object]]:
+async def _load_recent_fills(account_id: str) -> List[Dict[str, object]]:
     today = datetime.utcnow().date()
-    fills: List[Dict[str, object]] = []
+    fallback: List[Dict[str, object]] = []
     for record in _STUB_FILLS:
         if record.get("account_id") != account_id:
             continue
@@ -1395,12 +1398,37 @@ def _load_recent_fills(account_id: str) -> List[Dict[str, object]]:
         else:
             continue
         if timestamp_dt.date() == today:
-            fills.append(record)
-    return fills
+            fallback.append(record)
+
+    if not EXCHANGE_ADAPTER.supports("get_trades"):
+        return fallback
+
+    try:
+        trades = await EXCHANGE_ADAPTER.get_trades(account_id=account_id, limit=100)
+    except NotImplementedError:
+        return fallback
+    except Exception as exc:  # pragma: no cover - defensive guard for optional integrations
+        logger.debug(
+            "Exchange adapter trade fetch failed for account %s: %s",
+            account_id,
+            exc,
+        )
+        return fallback
+
+    normalized: List[Dict[str, object]] = []
+    for entry in trades:
+        if not isinstance(entry, Mapping):
+            continue
+        trade_account = entry.get("account_id")
+        if trade_account is not None and str(trade_account) != account_id:
+            continue
+        normalized.append(dict(entry))
+
+    return normalized or fallback
 
 
-def _refresh_usage_from_fills(account_id: str, state: AccountPortfolioState) -> None:
-    fills = _load_recent_fills(account_id)
+async def _refresh_usage_from_fills(account_id: str, state: AccountPortfolioState) -> None:
+    fills = await _load_recent_fills(account_id)
     if not fills:
         return
 

@@ -31,6 +31,7 @@ from services.models.model_server import Intent, predict_intent
 from services.policy.adaptive_horizon import get_horizon
 
 
+from exchange_adapter import get_exchange_adapter, get_exchange_adapters_status
 from metrics import record_abstention_rate, record_drift_score, setup_metrics
 from services.common.security import ADMIN_ACCOUNTS
 
@@ -38,15 +39,13 @@ from services.common.security import ADMIN_ACCOUNTS
 FEES_SERVICE_URL = os.getenv("FEES_SERVICE_URL", "http://fees-service")
 FEES_REQUEST_TIMEOUT = float(os.getenv("FEES_REQUEST_TIMEOUT", "1.0"))
 CONFIDENCE_THRESHOLD = float(os.getenv("POLICY_CONFIDENCE_THRESHOLD", "0.55"))
-OMS_SERVICE_URL = os.getenv("OMS_SERVICE_URL", "http://oms-service")
-PAPER_OMS_SERVICE_URL = os.getenv("PAPER_OMS_SERVICE_URL", "http://paper-oms-service")
-OMS_REQUEST_TIMEOUT = float(os.getenv("OMS_REQUEST_TIMEOUT", "1.0"))
 ENABLE_SHADOW_EXECUTION = os.getenv("ENABLE_SHADOW_EXECUTION", "true").lower() in {
     "1",
     "true",
     "yes",
 }
 SHADOW_CLIENT_SUFFIX = os.getenv("SHADOW_CLIENT_SUFFIX", "-shadow")
+DEFAULT_EXCHANGE = os.getenv("PRIMARY_EXCHANGE", "kraken")
 
 MODEL_VARIANTS: List[str] = ["trend_model", "meanrev_model", "vol_breakout"]
 DEFAULT_MODEL_SHARPES: Dict[str, float] = {
@@ -69,6 +68,14 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Policy Service", version="2.0.0")
 setup_metrics(app)
+EXCHANGE_ADAPTER = get_exchange_adapter(DEFAULT_EXCHANGE)
+
+
+@app.get("/exchange/adapters", tags=["exchange"])
+async def list_exchange_adapters() -> List[Dict[str, object]]:
+    """Expose discovery metadata for configured exchange adapters."""
+
+    return await get_exchange_adapters_status()
 
 
 @dataclass
@@ -718,10 +725,6 @@ async def _submit_execution(
 ) -> None:
     """Submit the execution payload to the configured OMS endpoint."""
 
-    base_url = PAPER_OMS_SERVICE_URL if shadow else OMS_SERVICE_URL
-    if not base_url:
-        return
-
     precision = _resolve_precision(request.instrument)
     snapped_price = _snap(request.price, precision["tick"])
     snapped_qty = _snap(request.quantity, precision["lot"])
@@ -746,18 +749,19 @@ async def _submit_execution(
     if order_type == "limit":
         payload["limit_px"] = snapped_price
 
-    headers = {"X-Account-ID": request.account_id}
-    timeout = httpx.Timeout(OMS_REQUEST_TIMEOUT)
-    async with httpx.AsyncClient(base_url=base_url, timeout=timeout) as client:
-        try:
-            response = await client.post("/oms/place", json=payload, headers=headers)
-            response.raise_for_status()
-        except httpx.HTTPError as exc:
-            if shadow:
-                raise
-            logger.error(
-                "Primary OMS submission failed for order %s: %s",
-                request.order_id,
-                exc,
-            )
+    if not EXCHANGE_ADAPTER.supports("place_order"):
+        raise RuntimeError(
+            f"Exchange adapter '{EXCHANGE_ADAPTER.name}' does not support order placement"
+        )
+
+    try:
+        await EXCHANGE_ADAPTER.place_order(request.account_id, payload, shadow=shadow)
+    except httpx.HTTPError as exc:
+        if shadow:
             raise
+        logger.error(
+            "Primary OMS submission failed for order %s: %s",
+            request.order_id,
+            exc,
+        )
+        raise
