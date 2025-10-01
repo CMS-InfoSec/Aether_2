@@ -10,7 +10,13 @@ from fastapi.testclient import TestClient
 
 if "metrics" not in sys.modules:
     metrics_stub = types.ModuleType("metrics")
-    metrics_stub.setup_metrics = lambda app: None
+    def _setup_metrics(app):
+        if not any(route.path == "/metrics" for route in app.routes):
+            @app.get("/metrics")  # pragma: no cover - simple stub endpoint
+            def _metrics_endpoint():
+                return {"status": "ok"}
+
+    metrics_stub.setup_metrics = _setup_metrics
     metrics_stub.record_abstention_rate = lambda *args, **kwargs: None
     metrics_stub.record_drift_score = lambda *args, **kwargs: None
     sys.modules["metrics"] = metrics_stub
@@ -83,3 +89,11 @@ def test_decide_policy_accepts_dataclass_intent(monkeypatch):
         "expected_cost_bps": expected_intent.expected_cost_bps,
         "confidence": expected_intent.confidence,
     }
+
+
+def test_metrics_endpoint_exposed_after_import():
+    client = TestClient(policy_service.app)
+
+    response = client.get("/metrics")
+
+    assert response.status_code == 200
