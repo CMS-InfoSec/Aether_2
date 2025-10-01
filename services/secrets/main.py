@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from services.common.adapters import KrakenSecretManager
 from services.common.schemas import (
@@ -11,9 +12,12 @@ from services.common.schemas import (
     KrakenSecretStatusResponse,
 )
 from services.common.security import require_admin_account, require_mfa_context
+from services.secrets.middleware import ForwardedSchemeMiddleware, TRUSTED_HOSTS
 from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
 
 app = FastAPI(title="Secrets Service")
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
+app.add_middleware(ForwardedSchemeMiddleware)
 
 _audit_store = AuditLogStore()
 _audit_logger = TimescaleAuditLogger(_audit_store)

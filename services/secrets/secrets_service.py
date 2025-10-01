@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field, SecretStr, validator
 
 try:  # pragma: no cover - optional dependency for runtime environment
@@ -34,12 +35,15 @@ except ImportError:  # pragma: no cover - fallback for testing environments
             self.status = status
 
 from services.common.security import require_admin_account, require_mfa_context
+from services.secrets.middleware import ForwardedSchemeMiddleware, TRUSTED_HOSTS
 from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
 
 
 LOGGER = logging.getLogger(__name__)
 
 app = FastAPI(title="Kraken Secrets Service")
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
+app.add_middleware(ForwardedSchemeMiddleware)
 
 _audit_store = AuditLogStore()
 _audit_logger = TimescaleAuditLogger(_audit_store)
@@ -132,8 +136,21 @@ class KrakenSecretStatus(BaseModel):
 def ensure_secure_transport(request: Request) -> None:
     """Reject requests that are not routed through TLS."""
 
-    scheme = request.url.scheme
-    if scheme.lower() != "https":
+    forwarded_headers = ("x-forwarded-proto", "x-forwarded-scheme")
+    scheme = None
+
+    for header in forwarded_headers:
+        header_value = request.headers.get(header)
+        if header_value:
+            forwarded_scheme = header_value.split(",")[0].strip().lower()
+            if forwarded_scheme:
+                scheme = forwarded_scheme
+                break
+
+    if scheme is None:
+        scheme = request.url.scheme.lower()
+
+    if scheme != "https":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="TLS termination required (https only).",
