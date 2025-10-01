@@ -9,6 +9,7 @@ from typing import Dict, List
 import httpx
 from fastapi import FastAPI, HTTPException, status
 
+
 from services.common.schemas import (
     ActionTemplate,
     BookSnapshot,
@@ -20,7 +21,10 @@ from services.common.schemas import (
 )
 from services.models.model_server import predict_intent
 
+
 from metrics import record_abstention_rate, record_drift_score, setup_metrics
+from services.common.security import ADMIN_ACCOUNTS
+
 
 FEES_SERVICE_URL = os.getenv("FEES_SERVICE_URL", "http://fees-service")
 FEES_REQUEST_TIMEOUT = float(os.getenv("FEES_REQUEST_TIMEOUT", "1.0"))
@@ -32,6 +36,7 @@ KRAKEN_PRECISION: Dict[str, Dict[str, float]] = {
     "SOL-USD": {"tick": 0.001, "lot": 0.01},
 }
 
+
 app = FastAPI(title="Policy Service", version="2.0.0")
 setup_metrics(app)
 
@@ -40,16 +45,19 @@ def _default_state() -> PolicyState:
     return PolicyState(regime="unknown", volatility=0.0, liquidity_score=0.0, conviction=0.0)
 
 
+
 def _resolve_precision(symbol: str) -> Dict[str, float]:
     return KRAKEN_PRECISION.get(symbol.upper(), {"tick": 0.01, "lot": 0.0001})
 
 
 def _snap(value: float, step: float) -> float:
+
     if step <= 0:
         return float(value)
     quant = Decimal(str(step))
     snapped = (Decimal(str(value)) / quant).to_integral_value(rounding=ROUND_HALF_UP) * quant
     return float(snapped)
+
 
 
 async def _fetch_effective_fee(account_id: str, symbol: str, liquidity: str, notional: float) -> float:
@@ -81,16 +89,14 @@ async def _fetch_effective_fee(account_id: str, symbol: str, liquidity: str, not
             ) from exc
 
     payload = response.json()
-    fee_payload = payload.get("fee") if isinstance(payload, dict) else None
-    if not isinstance(fee_payload, dict):
+    if not isinstance(payload, dict):
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Fee service response malformed",
         )
 
-    key = "maker" if liquidity_normalized == "maker" else "taker"
     try:
-        return float(fee_payload[key])
+        return float(payload["bps"])
     except (KeyError, TypeError, ValueError) as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -129,14 +135,18 @@ async def decide_policy(request: PolicyDecisionRequest) -> PolicyDecisionRespons
             detail="Snapped price or quantity is non-positive",
         )
 
+
     if request.book_snapshot is None:
+
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Book snapshot is required for policy evaluation",
         )
 
+
     book_snapshot = request.book_snapshot
     features: List[float] = [float(value) for value in request.features]
+
 
     intent = predict_intent(
         account_id=request.account_id,
