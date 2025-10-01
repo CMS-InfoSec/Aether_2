@@ -131,7 +131,7 @@ def _fee_amount(notional: Decimal, bps: Decimal) -> Decimal:
 def get_effective_fee(
     account_id: str = Query(..., description="Unique account identifier"),
     pair: str = Query(..., description="Trading pair symbol", min_length=3, max_length=32),
-    liquidity: str = Query(..., description="Requested liquidity side", pattern=r"^(?i)(maker|taker)$"),
+    liquidity: str = Query(..., description="Requested liquidity side", pattern=r"(?i)^(maker|taker)$"),
     notional: float = Query(..., gt=0.0, description="Order notional in USD"),
     session: Session = Depends(get_session),
 ) -> EffectiveFeeResponse:
