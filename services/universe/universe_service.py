@@ -132,6 +132,22 @@ VOLATILITY_THRESHOLD = 0.40
 MANUAL_OVERRIDE_SOURCE = "manual_override"
 
 
+KRAKEN_BASE_ALIASES = {
+    "XBT": "BTC",
+    "XXBT": "BTC",
+    "XXBTZ": "BTC",
+    "XDG": "DOGE",
+    "XXDG": "DOGE",
+    "XETH": "ETH",
+    "XETC": "ETC",
+}
+
+KRAKEN_QUOTE_ALIASES = {
+    "USD": "USD",
+    "ZUSD": "USD",
+}
+
+
 def _latest_feature_map(session: Session, feature_names: Sequence[str]) -> Dict[str, Feature]:
     """Return latest feature rows keyed by entity id with priority order."""
 
@@ -159,8 +175,10 @@ def _latest_feature_map(session: Session, feature_names: Sequence[str]) -> Dict[
         )
 
         for feature in rows:
-            symbol = feature.entity_id.upper()
-            results.setdefault(symbol, feature)
+            canonical = _normalize_market(feature.entity_id)
+            if canonical is None:
+                continue
+            results.setdefault(canonical, feature)
 
     return results
 
@@ -182,31 +200,74 @@ def _kraken_volume_24h(session: Session) -> Dict[str, float]:
         normalized = _normalize_market(market)
         if normalized is None:
             continue
-        base_symbol, quote_symbol = normalized
-        if quote_symbol != "USD":
-            continue
-        volumes[base_symbol] = max(volumes.get(base_symbol, 0.0), float(volume))
+        volumes[normalized] = max(volumes.get(normalized, 0.0), float(volume))
     return volumes
 
 
-def _normalize_market(market: str) -> Optional[tuple[str, str]]:
-    """Return (base, quote) from a Kraken market identifier."""
+def _normalize_market(market: str) -> Optional[str]:
+    """Return a canonical ``"BASE-USD"`` identifier for a Kraken market."""
 
     if not market:
         return None
-    market = market.upper()
-    if "-" in market:
-        base, _, quote = market.partition("-")
-        return base, quote
-    if market.endswith("USD"):
-        return market[:-3], "USD"
-    return None
+
+    token = market.strip().upper().replace("/", "-")
+    if not token:
+        return None
+
+    base: Optional[str] = None
+    quote: Optional[str] = None
+
+    if "-" in token:
+        base_part, _, quote_part = token.partition("-")
+        base = base_part
+        quote = quote_part
+    elif token.endswith("USD"):
+        base = token[:-3]
+        quote = "USD"
+    else:
+        base = token
+        quote = "USD"
+
+    if not base or not quote:
+        return None
+
+    base = _normalize_asset_symbol(base, is_quote=False)
+    quote = _normalize_asset_symbol(quote, is_quote=True)
+
+    if not base or quote != "USD":
+        return None
+
+    return f"{base}-USD"
 
 
-def _latest_manual_overrides(session: Session) -> Dict[str, UniverseWhitelist]:
+def _normalize_asset_symbol(symbol: str, *, is_quote: bool) -> str:
+    """Normalise Kraken specific asset aliases to canonical symbols."""
+
+    token = symbol.strip()
+    if not token:
+        return ""
+
+    aliases = KRAKEN_QUOTE_ALIASES if is_quote else KRAKEN_BASE_ALIASES
+
+    direct = aliases.get(token)
+    if direct:
+        token = direct
+
+    # Trim Kraken specific leading/trailing characters before retrying.
+    trimmed = token
+    while trimmed.endswith(("X", "Z")) and len(trimmed) > 3:
+        trimmed = trimmed[:-1]
+    while trimmed.startswith(("X", "Z")) and len(trimmed) > 3:
+        trimmed = trimmed[1:]
+
+    return aliases.get(trimmed, trimmed)
+
+
+def _latest_manual_overrides(session: Session, *, migrate: bool = False) -> Dict[str, UniverseWhitelist]:
     """Return the most recent manual override per asset."""
 
     overrides: Dict[str, UniverseWhitelist] = {}
+    migrated = False
     rows = session.execute(
         select(UniverseWhitelist)
         .where(UniverseWhitelist.source == MANUAL_OVERRIDE_SOURCE)
@@ -214,9 +275,16 @@ def _latest_manual_overrides(session: Session) -> Dict[str, UniverseWhitelist]:
     ).scalars()
 
     for record in rows:
-        symbol = record.asset_id.upper()
-        if symbol not in overrides:
-            overrides[symbol] = record
+        canonical = _normalize_market(record.asset_id)
+        if canonical is None:
+            continue
+        if migrate and record.asset_id != canonical:
+            record.asset_id = canonical
+            migrated = True
+        overrides.setdefault(canonical, record)
+
+    if migrate and migrated:
+        session.flush()
     return overrides
 
 
@@ -231,24 +299,24 @@ def _evaluate_universe(session: Session) -> List[str]:
 
     approved = set()
 
-    for symbol, cap_feature in caps.items():
+    for pair, cap_feature in caps.items():
         market_cap = float(cap_feature.value or 0.0)
-        vol_feature = vols.get(symbol)
+        vol_feature = vols.get(pair)
         volatility = float(vol_feature.value) if vol_feature and vol_feature.value is not None else 0.0
-        kraken_volume = volumes.get(symbol, 0.0)
+        kraken_volume = volumes.get(pair, 0.0)
 
         if (
             market_cap >= MARKET_CAP_THRESHOLD
             and kraken_volume >= VOLUME_THRESHOLD
             and volatility >= VOLATILITY_THRESHOLD
         ):
-            approved.add(symbol)
+            approved.add(pair)
 
-    for symbol, override in overrides.items():
+    for pair, override in overrides.items():
         if override.approved:
-            approved.add(symbol)
+            approved.add(pair)
         else:
-            approved.discard(symbol)
+            approved.discard(pair)
 
     return sorted(approved)
 
@@ -261,8 +329,8 @@ def approved_universe(session: Session = Depends(get_session)) -> UniverseRespon
 
 @app.post("/universe/override", response_model=OverrideResponse, status_code=201)
 def override_symbol(request: OverrideRequest, session: Session = Depends(get_session)) -> OverrideResponse:
-    symbol = request.symbol.strip().upper()
-    if not symbol:
+    raw_symbol = request.symbol.strip().upper()
+    if not raw_symbol:
         raise HTTPException(status_code=400, detail="Symbol must not be empty")
 
     if request.reason is not None and not request.reason.strip():
@@ -272,8 +340,12 @@ def override_symbol(request: OverrideRequest, session: Session = Depends(get_ses
     if not actor:
         raise HTTPException(status_code=400, detail="Actor must not be empty")
 
-    latest_overrides = _latest_manual_overrides(session)
-    previous = latest_overrides.get(symbol)
+    canonical_symbol = _normalize_market(raw_symbol)
+    if canonical_symbol is None:
+        raise HTTPException(status_code=400, detail="Symbol must be a USD-quoted market")
+
+    latest_overrides = _latest_manual_overrides(session, migrate=True)
+    previous = latest_overrides.get(canonical_symbol)
 
     now = datetime.now(timezone.utc)
     details: Dict[str, object] = {}
@@ -281,7 +353,7 @@ def override_symbol(request: OverrideRequest, session: Session = Depends(get_ses
         details["reason"] = request.reason
 
     override_record = UniverseWhitelist(
-        asset_id=symbol,
+        asset_id=canonical_symbol,
         as_of=now,
         source=MANUAL_OVERRIDE_SOURCE,
         approved=request.enabled,
@@ -303,7 +375,7 @@ def override_symbol(request: OverrideRequest, session: Session = Depends(get_ses
     audit_entry = AuditLog(
         event_id=uuid4(),
         entity_type="universe.symbol",
-        entity_id=symbol,
+        entity_id=canonical_symbol,
         actor=actor,
         action="universe.override.enabled" if request.enabled else "universe.override.disabled",
         event_time=now,
@@ -314,7 +386,7 @@ def override_symbol(request: OverrideRequest, session: Session = Depends(get_ses
     session.commit()
 
     return OverrideResponse(
-        symbol=symbol,
+        symbol=canonical_symbol,
         enabled=request.enabled,
         reason=request.reason,
         actor=actor,
