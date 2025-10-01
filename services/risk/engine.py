@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Sequence
 
 from compliance_filter import COMPLIANCE_REASON, compliance_filter
+from esg_filter import ESG_REASON, esg_filter
 from services.common.adapters import RedisFeastAdapter, TimescaleAdapter
 from services.common.schemas import RiskValidationRequest, RiskValidationResponse
 
@@ -48,6 +49,7 @@ class RiskEngine:
             return RiskValidationResponse(valid=False, reasons=[reason], fee=request.fee)
 
         self._validate_compliance(request, reasons, context)
+        self._validate_esg(request, reasons, context)
         if reasons:
             self._record_event(
                 "risk_rejected",
@@ -91,6 +93,29 @@ class RiskEngine:
             enriched_context["compliance_note"] = note
         self._record_event("compliance_rejection", message, enriched_context)
         compliance_filter.log_rejection(self.account_id, request.instrument, entry)
+
+    def _validate_esg(
+        self,
+        request: RiskValidationRequest,
+        reasons: List[str],
+        context: Dict[str, Any],
+    ) -> None:
+        allowed, entry = esg_filter.evaluate(request.instrument)
+        if allowed:
+            return
+
+        message = f"Instrument {request.instrument} is blocked by ESG policy"
+        reasons.append(message)
+
+        enriched_context = {**context, "reason": ESG_REASON}
+        if entry is not None:
+            enriched_context["esg_flag"] = entry.flag
+            enriched_context["esg_score"] = entry.score
+            if entry.reason:
+                enriched_context["esg_note"] = entry.reason
+
+        self._record_event("esg_rejection", message, enriched_context)
+        esg_filter.log_rejection(self.account_id, request.instrument, entry)
 
     def _validate_universe(
         self,
