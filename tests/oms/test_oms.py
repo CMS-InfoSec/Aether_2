@@ -31,7 +31,7 @@ def client_fixture() -> Iterator[TestClient]:
 
 def test_oms_place_authorized_accounts(client: TestClient) -> None:
     payload = {
-        "account_id": "admin-eu",
+        "account_id": "company",
         "order_id": "1",
         "instrument": "BTC-USD",
         "side": "BUY",

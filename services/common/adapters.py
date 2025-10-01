@@ -337,12 +337,12 @@ class RedisFeastAdapter:
 
 
     _features: ClassVar[Dict[str, Dict[str, Any]]] = {
-        "admin-eu": {
+        "company": {
             "approved": ["BTC-USD", "ETH-USD"],
             "fees": {"BTC-USD": {"maker": 0.1, "taker": 0.2}},
         },
-        "admin-us": {"approved": ["SOL-USD"], "fees": {}},
-        "admin-apac": {"approved": ["BTC-USD", "ETH-USD"], "fees": {}},
+        "director-1": {"approved": ["SOL-USD"], "fees": {}},
+        "director-2": {"approved": ["BTC-USD", "ETH-USD"], "fees": {}},
     }
     _fee_tiers: ClassVar[Dict[str, List[Dict[str, Any]]]] = {
         "default": [
@@ -356,7 +356,7 @@ class RedisFeastAdapter:
         ]
     }
     _online_feature_store: ClassVar[Dict[str, Dict[str, Dict[str, Any]]]] = {
-        "admin-eu": {
+        "company": {
             "BTC-USD": {
                 "features": [18.0, 4.0, -2.0],
                 "book_snapshot": {"mid_price": 30_000.0, "spread_bps": 3.0, "imbalance": 0.15},

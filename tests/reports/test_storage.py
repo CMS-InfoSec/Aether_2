@@ -51,11 +51,17 @@ def test_store_artifact_writes_expected_audit_log(tmp_path: Path) -> None:
                 payload
     """.strip()
     assert expected_columns in query
-    assert set(params) == {"action", "actor", "created_at", "payload", "target"}
+    assert set(params) == {
+        "actor",
+        "action",
+        "target",
+        "created_at",
+        "payload",
+    }
 
     assert params["action"] == "report.artifact.stored"
-    assert params["target"] == artifact.object_key
     assert params["actor"] == "acct-123"
+    assert params["target"] == artifact.object_key
 
     created_at = params["created_at"]
     assert isinstance(created_at, datetime)
@@ -64,6 +70,10 @@ def test_store_artifact_writes_expected_audit_log(tmp_path: Path) -> None:
 
     payload = json.loads(params["payload"])
     assert payload["entity"] == {"type": "report_artifact", "id": artifact.object_key}
+    event_id = payload["event_id"]
+    assert isinstance(event_id, str)
+    assert len(event_id) == 64
+    assert payload["event_time"] == created_at.isoformat()
     metadata_payload = payload["metadata"]
     assert metadata_payload["checksum"] == artifact.checksum
     assert metadata_payload["checksum_object_key"] == artifact.checksum_object_key

@@ -47,6 +47,9 @@ class AuditLogWriter:
     ) -> None:
         """Record an audit event describing a stored artifact."""
 
+        event_id = hashlib.sha256(
+            f"{entity_id}:{event_time.isoformat()}".encode("utf-8")
+        ).hexdigest()
         payload = json.dumps(
             {
                 "entity": {
@@ -54,6 +57,8 @@ class AuditLogWriter:
                     "id": entity_id,
                 },
                 "metadata": metadata,
+                "event_id": event_id,
+                "event_time": event_time.isoformat(),
             }
         )
         params = {
@@ -64,8 +69,7 @@ class AuditLogWriter:
             "payload": payload,
         }
 
-        self._session.execute(
-            """
+        insert_audit_log_sql = """
             INSERT INTO audit_logs (
                 actor,
                 action,
@@ -80,9 +84,9 @@ class AuditLogWriter:
                 %(created_at)s,
                 %(payload)s::jsonb
             )
-            """,
-            params,
-        )
+        """
+
+        self._session.execute(insert_audit_log_sql, params)
 
 
 @dataclass

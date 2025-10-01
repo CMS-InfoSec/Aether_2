@@ -1,11 +1,14 @@
 """Application factory wiring services, middleware, and routers."""
 from __future__ import annotations
 
+import os
+
 from fastapi import FastAPI
 
 from accounts.service import AccountsService
 from auth.routes import get_auth_service, router as auth_router
 from auth.service import AdminRepository, AuthService, SessionStore
+from services.alert_manager import setup_alerting
 from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
 from shared.correlation import CorrelationIdMiddleware
 
@@ -36,6 +39,9 @@ def create_app() -> FastAPI:
     app.state.session_store = session_store
     app.state.auth_service = auth_service
     app.state.accounts_service = accounts_service
+
+    alertmanager_url = os.getenv("ALERTMANAGER_URL")
+    setup_alerting(app, alertmanager_url=alertmanager_url)
 
     return app
 

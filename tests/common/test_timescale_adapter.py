@@ -19,7 +19,7 @@ def reset_timescale() -> None:
 
 
 def test_record_daily_usage_accumulates() -> None:
-    adapter = TimescaleAdapter(account_id="admin-eu")
+    adapter = TimescaleAdapter(account_id="company")
 
     adapter.record_daily_usage(1_000.0, 250.0)
     adapter.record_daily_usage(500.0, 125.0)
@@ -30,7 +30,7 @@ def test_record_daily_usage_accumulates() -> None:
 
 
 def test_instrument_exposure_tracks_notional() -> None:
-    adapter = TimescaleAdapter(account_id="admin-eu")
+    adapter = TimescaleAdapter(account_id="company")
 
     adapter.record_instrument_exposure("BTC-USD", 10_000.0)
     adapter.record_instrument_exposure("BTC-USD", 5_000.0)
@@ -40,7 +40,7 @@ def test_instrument_exposure_tracks_notional() -> None:
 
 
 def test_record_event_publishes_to_risk_stream() -> None:
-    adapter = TimescaleAdapter(account_id="admin-eu")
+    adapter = TimescaleAdapter(account_id="company")
 
     adapter.record_event("test_event", {"foo": "bar"})
     events = adapter.events()
@@ -53,11 +53,11 @@ def test_record_event_publishes_to_risk_stream() -> None:
 
 
 def test_credential_rotation_status_round_trip() -> None:
-    adapter = TimescaleAdapter(account_id="admin-eu")
+    adapter = TimescaleAdapter(account_id="company")
 
     rotation_time = datetime.now(timezone.utc)
     record = adapter.record_credential_rotation(
-        secret_name="kraken-keys-admin-eu", rotated_at=rotation_time
+        secret_name="kraken-keys-company", rotated_at=rotation_time
     )
     status = adapter.credential_rotation_status()
 
@@ -67,13 +67,13 @@ def test_credential_rotation_status_round_trip() -> None:
     assert status["created_at"] == status["rotated_at"]
 
 
-    TimescaleAdapter.reset(account_id="admin-eu")
+    TimescaleAdapter.reset(account_id="company")
     assert adapter.credential_rotation_status() is None
 
 
 def test_reset_clears_target_account_only() -> None:
-    europe = TimescaleAdapter(account_id="admin-eu")
-    us = TimescaleAdapter(account_id="admin-us")
+    europe = TimescaleAdapter(account_id="company")
+    us = TimescaleAdapter(account_id="director-1")
 
     europe.record_instrument_exposure("BTC-USD", 10_000.0)
     us.record_instrument_exposure("BTC-USD", 5_000.0)
@@ -82,10 +82,10 @@ def test_reset_clears_target_account_only() -> None:
     us.record_event("heartbeat", {"status": "ok"})
 
     rotation_time = datetime.now(timezone.utc)
-    europe.record_credential_rotation(secret_name="kraken-keys-admin-eu", rotated_at=rotation_time)
-    us.record_credential_rotation(secret_name="kraken-keys-admin-us", rotated_at=rotation_time)
+    europe.record_credential_rotation(secret_name="kraken-keys-company", rotated_at=rotation_time)
+    us.record_credential_rotation(secret_name="kraken-keys-director-1", rotated_at=rotation_time)
 
-    TimescaleAdapter.reset(account_id="admin-eu")
+    TimescaleAdapter.reset(account_id="company")
 
     assert europe.instrument_exposure("BTC-USD") == pytest.approx(0.0)
     assert europe.events()["events"] == []
@@ -97,7 +97,7 @@ def test_reset_clears_target_account_only() -> None:
 
 
 def test_risk_config_can_be_overridden_without_side_effects() -> None:
-    adapter = TimescaleAdapter(account_id="admin-eu")
+    adapter = TimescaleAdapter(account_id="company")
 
     default_snapshot = adapter.load_risk_config()
     TimescaleAdapter._risk_configs[adapter.account_id].update(

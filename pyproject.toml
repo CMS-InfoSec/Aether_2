@@ -12,6 +12,7 @@ dependencies = [
     "fastapi>=0.110",
     "pyotp>=2.9.0",
     "email-validator>=2.1",
+    "prometheus-client>=0.20",
 ]
 
 [project.optional-dependencies]

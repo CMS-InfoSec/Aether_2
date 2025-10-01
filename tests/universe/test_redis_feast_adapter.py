@@ -23,7 +23,7 @@ class StubUniverseRepository:
 
 def test_adapter_delegates_to_injected_repository() -> None:
     repository = StubUniverseRepository()
-    adapter = RedisFeastAdapter(account_id="admin-eu", repository=repository)
+    adapter = RedisFeastAdapter(account_id="company", repository=repository)
 
     instruments = adapter.approved_instruments()
     assert instruments == ["BTC-USD"]

@@ -24,7 +24,7 @@ client = TestClient(app)
 
 def test_policy_decide_all_admin_accounts_authorized():
     payload = {
-        "account_id": "admin-eu",
+        "account_id": "company",
         "order_id": "1",
         "instrument": "BTC-USD",
         "side": "BUY",

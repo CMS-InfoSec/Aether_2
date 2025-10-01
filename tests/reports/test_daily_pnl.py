@@ -30,23 +30,31 @@ class RecordingSession:
         orders: List[Dict[str, Any]],
         fills: List[Dict[str, Any]],
     ) -> None:
-        self._accounts = {account["account_id"]: account for account in accounts}
+        self._accounts_by_id = {account["account_id"]: account for account in accounts}
         self._orders = {order["order_id"]: order for order in orders}
         self._fills = fills
         self.audit_entries: List[Mapping[str, Any]] = []
         self.queries: List[str] = []
+        self.params: List[Mapping[str, Any]] = []
 
     def execute(self, query: str, params: Mapping[str, Any] | None = None) -> FakeResult:
         params = params or {}
         normalized_query = " ".join(query.lower().split())
         self.queries.append(query.strip())
+        self.params.append(dict(params))
+
+        account_ids_param = params.get("account_ids")
+        if account_ids_param is not None:
+            if any(not isinstance(value, int) for value in account_ids_param):
+                raise TypeError("operator does not exist: integer = text")
 
         if "insert into audit_logs" in normalized_query:
 
             self.audit_entries.append(params)
             return FakeResult([])
 
-        account_filter = params.get("account_ids")
+        account_filter_ids = params.get("account_ids") or []
+        account_filter_slugs = params.get("account_slugs") or []
 
         if "from fills" in normalized_query:
             start = params.get("start")
@@ -60,7 +68,16 @@ class RecordingSession:
                     continue
                 order = self._orders[fill["order_id"]]
                 account_id = order["account_id"]
-                if account_filter and account_id not in account_filter:
+                account = self._accounts_by_id[account_id]
+                slug = account.get("admin_slug")
+                match_numeric = account_filter_ids and account_id in account_filter_ids
+                match_slug = account_filter_slugs and slug in account_filter_slugs
+                if account_filter_ids and account_filter_slugs:
+                    if not (match_numeric or match_slug):
+                        continue
+                elif account_filter_ids and not match_numeric:
+                    continue
+                elif account_filter_slugs and not match_slug:
                     continue
                 rows.append(
                     {
@@ -90,7 +107,16 @@ class RecordingSession:
                 if end and submitted >= end:
                     continue
                 account_id = order["account_id"]
-                if account_filter and account_id not in account_filter:
+                account = self._accounts_by_id[account_id]
+                slug = account.get("admin_slug")
+                match_numeric = account_filter_ids and account_id in account_filter_ids
+                match_slug = account_filter_slugs and slug in account_filter_slugs
+                if account_filter_ids and account_filter_slugs:
+                    if not (match_numeric or match_slug):
+                        continue
+                elif account_filter_ids and not match_numeric:
+                    continue
+                elif account_filter_slugs and not match_slug:
                     continue
                 rows.append(
                     {
@@ -113,13 +139,13 @@ def sample_session() -> RecordingSession:
     from datetime import datetime, timezone
 
     accounts = [
-        {"account_id": "alpha"},
-        {"account_id": "beta"},
+        {"account_id": 101, "admin_slug": "alpha"},
+        {"account_id": 202, "admin_slug": "beta"},
     ]
     orders = [
         {
             "order_id": "ord-1",
-            "account_id": "alpha",
+            "account_id": 101,
 
             "market": "BTC-USD",
 
@@ -130,7 +156,7 @@ def sample_session() -> RecordingSession:
         },
         {
             "order_id": "ord-2",
-            "account_id": "alpha",
+            "account_id": 101,
 
             "market": "BTC-USD",
 
@@ -141,7 +167,7 @@ def sample_session() -> RecordingSession:
         },
         {
             "order_id": "ord-3",
-            "account_id": "beta",
+            "account_id": 202,
 
             "market": "ETH-USD",
 
@@ -209,7 +235,7 @@ def test_generate_daily_pnl_fee_attribution(tmp_path: Path, sample_session: Reco
     csv_path = tmp_path / "global" / keys[0]
     rows = read_csv(csv_path)
     assert len(rows) == 2
-    alpha_row = next(row for row in rows if row["account_id"] == "alpha")
+    alpha_row = next(row for row in rows if row["account_id"] == "101")
     assert pytest.approx(float(alpha_row["gross_pnl"])) == 10.0
     assert pytest.approx(float(alpha_row["fees"])) == 1.1
     assert pytest.approx(float(alpha_row["net_pnl"])) == 8.9
@@ -226,7 +252,29 @@ def test_generate_daily_pnl_account_isolation(tmp_path: Path, sample_session: Re
     )
     csv_path = tmp_path / "multi-account" / keys[0]
     rows = read_csv(csv_path)
-    assert {row["account_id"] for row in rows} == {"alpha"}
+    assert {row["account_id"] for row in rows} == {"101"}
+
+
+def test_generate_daily_pnl_accepts_admin_slug_filter(
+    tmp_path: Path, sample_session: RecordingSession
+) -> None:
+    storage = ArtifactStorage(tmp_path)
+    generate_daily_pnl(
+        sample_session,
+        storage,
+        report_date=date(2024, 5, 1),
+        account_ids=("alpha",),
+        output_formats=("csv",),
+    )
+
+    slug_params = [params for params in sample_session.params if "account_slugs" in params]
+    assert slug_params
+    for params in slug_params:
+        assert params["account_slugs"] == ["alpha"]
+
+    for params in sample_session.params:
+        if "account_ids" in params:
+            assert all(isinstance(value, int) for value in params["account_ids"])
 
 
 def test_generate_daily_pnl_creates_audit_log_entries(tmp_path: Path, sample_session: RecordingSession) -> None:

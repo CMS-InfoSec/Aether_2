@@ -36,19 +36,19 @@ def test_status_returns_rotation_metadata(monkeypatch: pytest.MonkeyPatch) -> No
     response = client.post(
         "/secrets/kraken",
         json={
-            "account_id": "admin-eu",
+            "account_id": "company",
             "api_key": "rotated-key",
             "api_secret": "rotated-secret",
         },
-        headers={"X-Account-ID": "admin-eu", **MFA_HEADER},
+        headers={"X-Account-ID": "company", **MFA_HEADER},
     )
 
     assert response.status_code == 200
 
     status_response = client.get(
         "/secrets/kraken/status",
-        params={"account_id": "admin-eu"},
-        headers={"X-Account-ID": "admin-eu", **MFA_HEADER},
+        params={"account_id": "company"},
+        headers={"X-Account-ID": "company", **MFA_HEADER},
     )
 
     assert status_response.status_code == 200
@@ -56,24 +56,24 @@ def test_status_returns_rotation_metadata(monkeypatch: pytest.MonkeyPatch) -> No
     rotation_metadata = response.json()
     status_body = status_response.json()
 
-    assert status_body["account_id"] == "admin-eu"
-    assert status_body["secret_name"] == "kraken-keys-admin-eu"
+    assert status_body["account_id"] == "company"
+    assert status_body["secret_name"] == "kraken-keys-company"
     assert status_body["created_at"] == rotation_metadata["created_at"]
     assert status_body["rotated_at"] == rotation_metadata["rotated_at"]
 
     store = KrakenSecretStore(core_v1=SimpleNamespace())
     store.write_credentials(
-        "admin-eu", api_key="rotated-key", api_secret="rotated-secret"
+        "company", api_key="rotated-key", api_secret="rotated-secret"
     )
-    manager = KrakenSecretManager(account_id="admin-eu", secret_store=store)
+    manager = KrakenSecretManager(account_id="company", secret_store=store)
     credentials = manager.get_credentials()
-    assert credentials["metadata"]["secret_name"] == "kraken-keys-admin-eu"
+    assert credentials["metadata"]["secret_name"] == "kraken-keys-company"
     assert credentials["metadata"]["api_key"] == "***"
     assert credentials["metadata"]["api_secret"] == "***"
 
-    events = TimescaleAdapter(account_id="admin-eu").credential_events()
+    events = TimescaleAdapter(account_id="company").credential_events()
     assert events
     access_event = events[-1]
     assert access_event["event_type"] == "kraken.credentials.access"
-    assert access_event["metadata"]["secret_name"] == "kraken-keys-admin-eu"
+    assert access_event["metadata"]["secret_name"] == "kraken-keys-company"
     assert access_event["metadata"]["material_present"] is True

@@ -14,6 +14,7 @@ from services.common.schemas import (
 )
 from services.common.security import require_admin_account
 from shared.models.registry import get_model_registry
+from services.policy.model_server import predict_intent
 
 app = FastAPI(title="Policy Service")
 
@@ -57,8 +58,15 @@ def decide_policy(
         state_payload if isinstance(state_payload, PolicyState) else PolicyState(**state_payload)
     )
 
+    intent = predict_intent(
+        account_id=account_id,
+        symbol=request.instrument,
+        features=features,
+        book_snapshot=book_snapshot_model,
+    )
+
     base_confidence_payload = online_features.get("confidence") or {}
-    model_confidence = ConfidenceMetrics(
+    baseline_confidence = ConfidenceMetrics(
         model_confidence=base_confidence_payload.get("model_confidence", 0.5),
         state_confidence=base_confidence_payload.get("state_confidence", 0.5),
         execution_confidence=base_confidence_payload.get("execution_confidence", 0.5),
@@ -66,31 +74,47 @@ def decide_policy(
 
     caller_confidence = request.confidence
     if caller_confidence is not None:
-        blended = ConfidenceMetrics(
-            model_confidence=min(1.0, (model_confidence.model_confidence + caller_confidence.model_confidence) / 2.0),
-            state_confidence=min(1.0, (model_confidence.state_confidence + caller_confidence.state_confidence) / 2.0),
-            execution_confidence=min(1.0, (model_confidence.execution_confidence + caller_confidence.execution_confidence) / 2.0),
+        baseline_confidence = ConfidenceMetrics(
+            model_confidence=min(
+                1.0,
+                (baseline_confidence.model_confidence + caller_confidence.model_confidence) / 2.0,
+            ),
+            state_confidence=min(
+                1.0,
+                (baseline_confidence.state_confidence + caller_confidence.state_confidence) / 2.0,
+            ),
+            execution_confidence=min(
+                1.0,
+                (baseline_confidence.execution_confidence + caller_confidence.execution_confidence) / 2.0,
+            ),
         )
-        model_confidence = blended
-
-    prediction = ensemble.predict(
-        features=features,
-        book_snapshot=book_snapshot_model.model_dump(),
-        state=state_model.model_dump(),
-        expected_edge_bps=expected_edge,
-    )
 
     confidence = ConfidenceMetrics(
-        model_confidence=max(model_confidence.model_confidence, prediction.confidence["model_confidence"]),
-        state_confidence=max(model_confidence.state_confidence, prediction.confidence["state_confidence"]),
-        execution_confidence=max(model_confidence.execution_confidence, prediction.confidence["execution_confidence"]),
+        model_confidence=max(baseline_confidence.model_confidence, intent.confidence.model_confidence),
+        state_confidence=max(baseline_confidence.state_confidence, intent.confidence.state_confidence),
+        execution_confidence=max(
+            baseline_confidence.execution_confidence, intent.confidence.execution_confidence
+        ),
+        overall_confidence=max(
+            baseline_confidence.overall_confidence or 0.0,
+            intent.confidence.overall_confidence or 0.0,
+        ),
     )
 
-    take_profit_bps = request.take_profit_bps or online_features.get("take_profit_bps") or prediction.take_profit_bps
-    stop_loss_bps = request.stop_loss_bps or online_features.get("stop_loss_bps") or prediction.stop_loss_bps
+    take_profit_bps = (
+        request.take_profit_bps
+        or online_features.get("take_profit_bps")
+        or intent.take_profit_bps
+    )
+    stop_loss_bps = (
+        request.stop_loss_bps
+        or online_features.get("stop_loss_bps")
+        or intent.stop_loss_bps
+    )
 
-    maker_edge = prediction.edge_bps - request.fee.maker
-    taker_edge = prediction.edge_bps - request.fee.taker
+    expected_edge = intent.edge_bps if intent.edge_bps is not None else expected_edge
+    maker_edge = expected_edge - request.fee.maker
+    taker_edge = expected_edge - request.fee.taker
 
     action_templates = [
         ActionTemplate(
@@ -110,20 +134,27 @@ def decide_policy(
     ]
 
     preferred_template = max(action_templates, key=lambda template: template.edge_bps)
-    approved = preferred_template.edge_bps > 0 and confidence.overall_confidence >= ensemble.confidence_threshold
+    approved = (
+        intent.approved
+        and preferred_template.edge_bps > 0
+        and confidence.overall_confidence >= ensemble.confidence_threshold
+    )
 
-    if not approved:
-        reason = (
-            "Confidence below threshold"
-            if confidence.overall_confidence < ensemble.confidence_threshold
-            else "Fee-adjusted edge non-positive"
-        )
-        selected_action = "abstain"
-        fee_adjusted_edge = min(preferred_template.edge_bps, 0.0)
-    else:
-        reason = None
+    if approved:
+        reason = intent.reason
         selected_action = preferred_template.name
         fee_adjusted_edge = preferred_template.edge_bps
+    else:
+        reason = intent.reason
+        if reason is None:
+            if confidence.overall_confidence < ensemble.confidence_threshold:
+                reason = "Confidence below threshold"
+            else:
+                reason = "Fee-adjusted edge non-positive"
+        if intent.is_null and intent.reason:
+            reason = intent.reason
+        selected_action = "abstain"
+        fee_adjusted_edge = min(preferred_template.edge_bps, 0.0)
 
     kafka = KafkaNATSAdapter(account_id=account_id)
     kafka.publish(
@@ -133,7 +164,7 @@ def decide_policy(
             "instrument": request.instrument,
             "approved": approved,
             "reason": reason,
-            "edge_bps": round(prediction.edge_bps, 4),
+            "edge_bps": round(expected_edge, 4),
             "fee_adjusted_edge_bps": round(fee_adjusted_edge, 4),
             "confidence": confidence.model_dump(),
             "selected_action": selected_action,
@@ -146,7 +177,7 @@ def decide_policy(
         order_id=request.order_id,
         payload={
             "instrument": request.instrument,
-            "edge_bps": prediction.edge_bps,
+            "edge_bps": expected_edge,
             "fee_adjusted_edge_bps": fee_adjusted_edge,
             "confidence": confidence.model_dump(),
             "approved": approved,
@@ -158,7 +189,7 @@ def decide_policy(
         approved=approved,
         reason=reason,
         effective_fee=request.fee,
-        expected_edge_bps=round(prediction.edge_bps, 4),
+        expected_edge_bps=round(expected_edge, 4),
         fee_adjusted_edge_bps=round(fee_adjusted_edge, 4),
         selected_action=selected_action,
         action_templates=action_templates,
