@@ -1,34 +1,26 @@
-"""FastAPI application for the universe service."""
-from __future__ import annotations
 
 from fastapi import Depends, FastAPI
 
-from services.common import config
-from services.common.schemas import UniverseApprovedResponse
+from services.common.adapters import RedisFeastAdapter
+from services.common.schemas import ApprovedUniverseResponse, FeeBreakdown
 from services.common.security import require_admin_account
 
-app = FastAPI(title="Universe Service", version="0.1.0")
+app = FastAPI(title="Universe Service")
 
 
-@app.get("/universe/approved", response_model=UniverseApprovedResponse)
-def get_universe(
-    isolation_segment: str,
-    fee_tier: str = "standard",
-    account_id: str = Depends(require_admin_account),
-) -> UniverseApprovedResponse:
-    feast_client = config.get_feast_client(account_id)
+@app.get("/universe/approved", response_model=ApprovedUniverseResponse)
+def approved_universe(account_id: str = Depends(require_admin_account)) -> ApprovedUniverseResponse:
+    redis = RedisFeastAdapter(account_id=account_id)
+    instruments = redis.approved_instruments()
+    fee_overrides = {}
+    for instrument in instruments:
+        override = redis.fee_override(instrument)
+        if override:
+            fee_overrides[instrument] = FeeBreakdown(
+                currency=override.get("currency", "USD"),
+                maker=override.get("maker", 0.0),
+                taker=override.get("taker", 0.0),
+            )
 
-    base_symbols = ["BTC-USD", "ETH-USD", "SOL-USD"]
-    if fee_tier != "standard":
-        base_symbols.append("ATOM-USD")
-    scoped_symbols = [f"{feast_client.account_namespace}:{symbol}" for symbol in base_symbols]
+    return ApprovedUniverseResponse(account_id=account_id, instruments=instruments, fee_overrides=fee_overrides)
 
-    return UniverseApprovedResponse(
-        account_id=account_id,
-        isolation_segment=isolation_segment,
-        symbols=scoped_symbols,
-        fee_tier=fee_tier,
-    )
-
-
-__all__ = ["app", "get_universe"]

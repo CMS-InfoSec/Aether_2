@@ -1,108 +1,89 @@
-"""Shared Pydantic schemas for service APIs."""
+
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional
+
 
 from pydantic import BaseModel, Field
 
 
-class AccountIsolation(BaseModel):
-    """Represents the account isolation attributes required on every payload."""
-
-    account_id: str = Field(..., description="Unique identifier for the account that owns the request.")
-    isolation_segment: str = Field(
-        ..., description="Logical isolation segment used to scope access to account-specific data."
-    )
-
-
-class FeeAware(BaseModel):
-    """Mixin providing fee related configuration for requests."""
-
-    fee_tier: str = Field(
-        default="standard",
-        description="Named fee tier used to evaluate maker/taker and rebate schedules.",
-    )
-    include_fees: bool = Field(
-        default=True,
-        description="Whether downstream services should include fee calculations in responses.",
-    )
-
 
 class FeeBreakdown(BaseModel):
-    maker_bps: float = Field(default=0.0, description="Maker fee in basis points.")
-    taker_bps: float = Field(default=0.0, description="Taker fee in basis points.")
-    rebates_bps: float = Field(default=0.0, description="Rebate schedule in basis points, if any.")
+    """Represents fees attributed to a trading action."""
+
+    currency: str = Field(..., description="Fee currency")
+    maker: float = Field(..., ge=0.0, description="Maker fee amount")
+    taker: float = Field(..., ge=0.0, description="Taker fee amount")
 
 
-class PolicyDecisionRequest(AccountIsolation, FeeAware):
-    instrument: str = Field(..., description="Instrument identifier for which the policy decision is requested.")
-    quantity: float = Field(..., description="Absolute notional quantity of the order candidate.")
-    price: float = Field(..., description="Price attached to the order candidate.")
+class PolicyDecisionRequest(BaseModel):
+    account_id: str = Field(..., description="Trading account identifier")
+    order_id: str = Field(..., description="Client order identifier")
+    instrument: str = Field(..., description="Instrument identifier")
+    side: str = Field(..., pattern="^(BUY|SELL)$", description="Order side")
+    quantity: float = Field(..., gt=0.0, description="Order quantity")
+    price: float = Field(..., gt=0.0, description="Limit price")
+    fee: FeeBreakdown = Field(..., description="Applicable fees for the order")
 
 
-class PolicyDecisionResponse(AccountIsolation):
-    approved: bool = Field(..., description="Whether the order candidate complies with policy.")
-    reason: str = Field(..., description="Explains the policy decision when disapproved.")
-    fee_tier: str = Field(..., description="Fee tier applied when computing total_fees.")
-    total_fees: float = Field(..., description="Estimated total fees for the candidate order.")
+class PolicyDecisionResponse(BaseModel):
+    approved: bool = Field(..., description="Whether the order is approved")
+    reason: Optional[str] = Field(None, description="Optional rejection reason")
+    effective_fee: FeeBreakdown = Field(..., description="Effective fees considered")
 
 
-class RiskValidationRequest(AccountIsolation, FeeAware):
-    net_exposure: float = Field(..., description="Projected net exposure after executing the trade.")
-    symbol: str = Field(..., description="Trading symbol under validation.")
+class RiskValidationRequest(BaseModel):
+    account_id: str = Field(..., description="Trading account identifier")
+    net_exposure: float = Field(..., description="Net exposure after order")
+    gross_notional: float = Field(..., description="Gross notional value of the order")
+    fee: FeeBreakdown = Field(..., description="Fees associated with the order")
 
 
-class RiskValidationResponse(AccountIsolation):
-    valid: bool = Field(..., description="Whether the risk check passed.")
-    reason: Optional[str] = Field(None, description="Additional context when the risk check fails.")
-    fee_tier: str = Field(..., description="Fee tier consulted when performing the validation.")
+class RiskValidationResponse(BaseModel):
+    valid: bool = Field(..., description="Whether the order passes risk checks")
+    reasons: List[str] = Field(default_factory=list, description="Reasons for any failure")
+    fee: FeeBreakdown = Field(..., description="Fees applied in validation")
 
 
-class OMSPlaceRequest(AccountIsolation, FeeAware):
-    order_id: str = Field(..., description="Client provided identifier for the order.")
-    side: str = Field(..., description="Order side (buy/sell).")
-    quantity: float = Field(..., description="Order quantity.")
-    price: Optional[float] = Field(None, description="Optional limit price when order is not a market order.")
+class OrderPlacementRequest(BaseModel):
+    account_id: str = Field(..., description="Trading account identifier")
+    order_id: str = Field(..., description="Order identifier")
+    instrument: str = Field(..., description="Instrument identifier")
+    side: str = Field(..., pattern="^(BUY|SELL)$", description="Order side")
+    quantity: float = Field(..., gt=0.0, description="Order quantity")
+    price: float = Field(..., gt=0.0, description="Limit price")
+    fee: FeeBreakdown = Field(..., description="Fees applied at placement")
 
 
-class OMSPlaceResponse(AccountIsolation):
-    status: str = Field(..., description="Resulting status of the order placement attempt.")
-    accepted: bool = Field(..., description="Whether the order was accepted by the OMS.")
-    fee_tier: str = Field(..., description="Fee tier assigned to the order for settlement.")
+class OrderPlacementResponse(BaseModel):
+    accepted: bool = Field(..., description="Whether the order was accepted by OMS")
+    routed_venue: str = Field(..., description="Venue to which the order is routed")
+    fee: FeeBreakdown = Field(..., description="Final fees for the order")
 
 
-class FeesEffectiveResponse(AccountIsolation):
-    fee_schedule: FeeBreakdown = Field(..., description="Fee schedule effective for the account.")
-    effective_at: datetime = Field(..., description="Timestamp when the fee schedule became effective.")
+class FeeScheduleResponse(BaseModel):
+    account_id: str = Field(..., description="Trading account identifier")
+    effective_from: datetime = Field(..., description="Timestamp when the fee schedule takes effect")
+    fee: FeeBreakdown = Field(..., description="Fee structure")
 
 
-class UniverseApprovedResponse(AccountIsolation):
-    symbols: List[str] = Field(default_factory=list, description="Universe of symbols approved for trading.")
-    fee_tier: str = Field(..., description="Fee tier that governs the trading universe.")
+class ApprovedUniverseResponse(BaseModel):
+    account_id: str = Field(..., description="Trading account identifier")
+    instruments: List[str] = Field(..., description="List of approved instruments")
+    fee_overrides: Dict[str, FeeBreakdown] = Field(
+        default_factory=dict,
+        description="Per-instrument fee overrides",
+    )
 
 
-class KrakenSecretRequest(AccountIsolation):
-    scope: str = Field(..., description="Scope of the Kraken secret being requested (e.g., trading, funding).")
+class KrakenCredentialRequest(BaseModel):
+    account_id: str = Field(..., description="Trading account identifier")
 
 
-class KrakenSecretResponse(AccountIsolation):
-    key: str = Field(..., description="API key extracted from the Kubernetes secret mount.")
-    secret: str = Field(..., description="API secret extracted from the Kubernetes secret mount.")
+class KrakenCredentialResponse(BaseModel):
+    account_id: str = Field(..., description="Trading account identifier")
+    api_key: str = Field(..., description="Kraken API key")
+    api_secret: str = Field(..., description="Kraken API secret")
+    fee: FeeBreakdown = Field(..., description="Fee context for credential usage")
 
-
-__all__ = [
-    "AccountIsolation",
-    "FeeAware",
-    "FeeBreakdown",
-    "PolicyDecisionRequest",
-    "PolicyDecisionResponse",
-    "RiskValidationRequest",
-    "RiskValidationResponse",
-    "OMSPlaceRequest",
-    "OMSPlaceResponse",
-    "FeesEffectiveResponse",
-    "UniverseApprovedResponse",
-    "KrakenSecretRequest",
-    "KrakenSecretResponse",
-]

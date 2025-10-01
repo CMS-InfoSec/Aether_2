@@ -1,37 +1,25 @@
-"""FastAPI application for the fees service."""
-from __future__ import annotations
 
 from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI
 
-from services.common import config
-from services.common.schemas import FeeBreakdown, FeesEffectiveResponse
+
+from services.common.adapters import RedisFeastAdapter
+from services.common.schemas import FeeBreakdown, FeeScheduleResponse
 from services.common.security import require_admin_account
 
-app = FastAPI(title="Fees Service", version="0.1.0")
+app = FastAPI(title="Fees Service")
 
 
-@app.get("/fees/effective", response_model=FeesEffectiveResponse)
-def get_effective_fees(
-    isolation_segment: str,
-    fee_tier: str = "standard",
-    account_id: str = Depends(require_admin_account),
-) -> FeesEffectiveResponse:
-    config.get_redis_client(account_id)
+@app.get("/fees/effective", response_model=FeeScheduleResponse)
+def get_effective_fees(account_id: str = Depends(require_admin_account)) -> FeeScheduleResponse:
+    redis = RedisFeastAdapter(account_id=account_id)
+    default_fee = redis.fee_override("default") or {"currency": "USD", "maker": 0.1, "taker": 0.2}
+    fee = FeeBreakdown(**default_fee)
 
-    fee_schedule = FeeBreakdown(
-        maker_bps=5.0 if fee_tier == "standard" else 3.0,
-        taker_bps=7.0 if fee_tier == "standard" else 5.5,
-        rebates_bps=1.0 if fee_tier != "standard" else 0.0,
-    )
-
-    return FeesEffectiveResponse(
+    return FeeScheduleResponse(
         account_id=account_id,
-        isolation_segment=isolation_segment,
-        fee_schedule=fee_schedule,
-        effective_at=datetime.now(tz=timezone.utc),
+        effective_from=datetime.now(timezone.utc),
+        fee=fee,
     )
 
-
-__all__ = ["app", "get_effective_fees"]

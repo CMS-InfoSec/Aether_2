@@ -1,38 +1,36 @@
-"""FastAPI application for the OMS service."""
-from __future__ import annotations
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, status
 
-from services.common import config
-from services.common.schemas import OMSPlaceRequest, OMSPlaceResponse
+from services.common.adapters import KafkaNATSAdapter
+from services.common.schemas import OrderPlacementRequest, OrderPlacementResponse
 from services.common.security import require_admin_account
 
-app = FastAPI(title="OMS Service", version="0.1.0")
+app = FastAPI(title="OMS Service")
 
 
-@app.post("/oms/place", response_model=OMSPlaceResponse)
+@app.post("/oms/place", response_model=OrderPlacementResponse)
 def place_order(
-    request: OMSPlaceRequest, account_id: str = Depends(require_admin_account)
-) -> OMSPlaceResponse:
+    request: OrderPlacementRequest,
+    account_id: str = Depends(require_admin_account),
+) -> OrderPlacementResponse:
     if request.account_id != account_id:
-        raise HTTPException(status_code=400, detail="Account isolation attributes do not match header context")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account mismatch between header and payload.",
+        )
 
-    config.get_kafka_producer(account_id)
-    config.get_nats_producer(account_id)
-
-    if request.side.lower() not in {"buy", "sell"}:
-        raise HTTPException(status_code=422, detail="Side must be 'buy' or 'sell'")
-
-    accepted = True
-    status = "accepted" if accepted else "rejected"
-
-    return OMSPlaceResponse(
-        account_id=account_id,
-        isolation_segment=request.isolation_segment,
-        status=status,
-        accepted=accepted,
-        fee_tier=request.fee_tier,
+    kafka = KafkaNATSAdapter(account_id=account_id)
+    kafka.publish(
+        topic="oms.orders",
+        payload={
+            "order_id": request.order_id,
+            "instrument": request.instrument,
+            "side": request.side,
+            "quantity": request.quantity,
+        },
     )
 
+    venue = "kraken" if request.instrument.endswith("USD") else "kraken-intl"
 
-__all__ = ["app", "place_order"]
+    return OrderPlacementResponse(accepted=True, routed_venue=venue, fee=request.fee)
+
