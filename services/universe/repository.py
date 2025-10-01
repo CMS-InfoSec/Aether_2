@@ -76,7 +76,7 @@ class UniverseRepository:
 
     MARKET_CAP_THRESHOLD: ClassVar[float] = 5.0e8
     VOLUME_THRESHOLD: ClassVar[float] = 2.5e7
-    VOLATILITY_THRESHOLD: ClassVar[float] = 0.25
+    VOLATILITY_THRESHOLD: ClassVar[float] = 0.40
     CONFIG_KEY_OVERRIDES: ClassVar[str] = "universe.manual_overrides"
 
     _market_snapshots: ClassVar[Dict[str, MarketSnapshot]] = {
@@ -165,7 +165,7 @@ class UniverseRepository:
                 continue
             if snapshot.volume_24h < self.VOLUME_THRESHOLD:
                 continue
-            if snapshot.volatility_30d > self.VOLATILITY_THRESHOLD:
+            if snapshot.volatility_30d < self.VOLATILITY_THRESHOLD:
                 continue
             approved[symbol] = snapshot
 
