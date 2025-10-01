@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any, ClassVar, Dict, Optional
 
 import base64
+from services.secrets.secure_secrets import EncryptedSecretEnvelope, EnvelopeEncryptor
 
 try:  # pragma: no cover - optional dependency for real clusters
     from kubernetes import client, config
@@ -57,9 +58,32 @@ class KrakenSecretStore:
     def write_credentials(self, account_id: str, *, api_key: str, api_secret: str) -> None:
         """Create or update the namespaced secret with Kraken credentials."""
 
+        encryptor = EnvelopeEncryptor()
+        envelope = encryptor.encrypt_credentials(
+            account_id,
+            api_key=api_key,
+            api_secret=api_secret,
+        )
+        self.write_encrypted_secret(account_id, envelope=envelope)
+
+    def write_encrypted_secret(
+        self, account_id: str, *, envelope: EncryptedSecretEnvelope
+    ) -> None:
+        """Persist envelope-encrypted credentials to the secret backend."""
+
         name = self.secret_name(account_id)
-        payload = {"stringData": {"api_key": api_key, "api_secret": api_secret}}
         now_iso = datetime.now(timezone.utc).isoformat()
+        annotations = {
+            ANNOTATION_CREATED_AT: now_iso,
+            ANNOTATION_ROTATED_AT: now_iso,
+        }
+        secret_data = envelope.to_secret_data()
+
+        payload = {
+            "metadata": {"annotations": annotations},
+            "data": secret_data,
+            "type": "Opaque",
+        }
 
         if hasattr(self.core_v1, "patch_namespaced_secret"):
             try:  # pragma: no branch - handled for ApiException absence
@@ -74,8 +98,12 @@ class KrakenSecretStore:
                     raise
         if hasattr(self.core_v1, "create_namespaced_secret"):
             body = {
-                "metadata": {"name": name, "namespace": self.namespace},
-                **payload,
+                "metadata": {
+                    "name": name,
+                    "namespace": self.namespace,
+                    "annotations": annotations,
+                },
+                "data": secret_data,
                 "type": "Opaque",
             }
             self.core_v1.create_namespaced_secret(  # type: ignore[call-arg]
@@ -84,16 +112,15 @@ class KrakenSecretStore:
             )
             return
 
-        # Fall back to in-memory store when the Kubernetes client is unavailable
         namespace_store = self._store.setdefault(self.namespace, {})
         record = namespace_store.get(name, {})
         created_at = record.get("created_at") or now_iso
+        record.update(secret_data)
         record.update(
             {
-                "api_key": api_key,
-                "api_secret": api_secret,
                 "created_at": created_at,
                 "rotated_at": now_iso,
+                "kms_key_id_plain": envelope.kms_key_id,
             }
         )
         namespace_store[name] = record
@@ -144,11 +171,18 @@ class KrakenSecretStore:
         metadata = {
             "name": name,
             "namespace": self.namespace,
-            "api_key": secret.get("api_key"),
-            "api_secret": secret.get("api_secret"),
             "created_at": secret.get("created_at"),
             "rotated_at": secret.get("rotated_at"),
+            "kms_key_id": secret.get("kms_key_id_plain") or secret.get("kms_key_id"),
         }
+        for sensitive_field in (
+            "api_key",
+            "api_secret",
+            "encrypted_api_key",
+            "encrypted_api_secret",
+        ):
+            if sensitive_field in secret:
+                metadata[sensitive_field] = secret.get(sensitive_field)
         annotations = {}
         if secret.get("created_at"):
             annotations[ANNOTATION_CREATED_AT] = secret["created_at"]

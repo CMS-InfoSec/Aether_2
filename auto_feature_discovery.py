@@ -472,6 +472,7 @@ class FeatureDiscoveryEngine:
         applied_views: List[FeatureView] = []
         for feature in features:
             view_name = feature.name
+
             feature_name_literal = feature.name.replace("'", "''")
             source = PostgreSQLSource(
                 name=f"{view_name}_source",
@@ -479,6 +480,7 @@ class FeatureDiscoveryEngine:
                     SELECT symbol, event_ts, feature_value
                     FROM auto_feature_values
                     WHERE feature_name = '{feature_name_literal}'
+
                 """,
                 timestamp_field="event_ts",
             )

@@ -25,6 +25,7 @@ dependencies = [
     "pyotp>=2.9.0",
     "email-validator>=2.1",
     "prometheus-client>=0.20",
+    "networkx>=3.2",
 ]
 
 [project.optional-dependencies]
@@ -60,5 +61,6 @@ asyncio_mode = "auto"
 markers = [
     "unit: unit test suite",
     "integration: integration test suite",
+    "slow: end-to-end trading pipeline checks",
 ]
 

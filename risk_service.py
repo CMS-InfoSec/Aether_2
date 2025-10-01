@@ -12,16 +12,19 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from typing import Callable, Dict, Iterable, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+
+from fastapi import Depends, FastAPI, HTTPException, Query
+
 from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, model_validator
-from sqlalchemy import Column, DateTime, Float, Integer, String, create_engine
+from sqlalchemy import Column, DateTime, Float, Integer, String, create_engine, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
+from statistics import mean
 
 
 from metrics import (
@@ -29,7 +32,15 @@ from metrics import (
     record_fees_nav_pct,
     setup_metrics,
 )
+from services.common.compliance import (
+    SanctionRecord,
+    ensure_sanctions_schema,
+    is_blocking_status,
+)
 from services.common.security import require_admin_account
+from battle_mode import BattleModeController, create_battle_mode_tables
+
+from cost_throttler import CostThrottler
 
 
 logger = logging.getLogger(__name__)
@@ -40,6 +51,7 @@ logging.basicConfig(level=logging.INFO)
 _CAPITAL_ALLOCATOR_URL = os.getenv("CAPITAL_ALLOCATOR_URL")
 _CAPITAL_ALLOCATOR_TIMEOUT = float(os.getenv("CAPITAL_ALLOCATOR_TIMEOUT", "1.5"))
 _CAPITAL_ALLOCATOR_TOLERANCE = float(os.getenv("CAPITAL_ALLOCATOR_NAV_TOLERANCE", "0.02"))
+_BATTLE_MODE_VOL_THRESHOLD = float(os.getenv("BATTLE_MODE_VOL_THRESHOLD", "1.0"))
 
 
 Base = declarative_base()
@@ -272,6 +284,9 @@ def _seed_default_limits(session: Session) -> None:
 
 def _bootstrap_storage() -> None:
     Base.metadata.create_all(bind=ENGINE)
+
+    create_battle_mode_tables(ENGINE)
+
     with get_session() as session:
         _seed_default_limits(session)
 
@@ -483,8 +498,18 @@ class RiskLimitsResponse(BaseModel):
     usage: AccountUsage
 
 
+class BattleModeToggleRequest(BaseModel):
+    account_id: str = Field(..., description="Account identifier to toggle battle mode for")
+    engage: Optional[bool] = Field(
+        None,
+        description="Explicit state to set. When omitted the state will be toggled.",
+    )
+    reason: str = Field(..., min_length=1, description="Audit reason for the toggle request")
+
+
 app = FastAPI(title="Risk Validation Service", version="1.0.0")
 setup_metrics(app)
+COST_THROTTLER = CostThrottler()
 
 
 
@@ -494,6 +519,10 @@ def _on_startup() -> None:
 
 
 _bootstrap_storage()
+
+battle_mode_controller = BattleModeController(
+    session_factory=get_session, threshold=_BATTLE_MODE_VOL_THRESHOLD
+)
 
 
 @app.post("/risk/validate", response_model=RiskValidationResponse)
@@ -593,12 +622,34 @@ async def get_risk_limits(
     return response.dict()
 
 
+
+@app.get("/risk/throttle/status")
+async def get_throttle_status(
+    account_id: str = Depends(require_admin_account),
+) -> Dict[str, Optional[str]]:
+    """Expose the current cost based throttling status for ``account_id``."""
+
+    status = COST_THROTTLER.evaluate(account_id)
+    return {"active": status.active, "reason": status.reason}
+
+
+
 def _load_account_limits(account_id: str) -> AccountRiskLimit:
     with get_session() as session:
         limits = session.get(AccountRiskLimit, account_id)
         if not limits:
             raise ConfigError(f"No risk limits configured for account '{account_id}'.")
         return limits
+
+
+def _load_sanction_hits(symbol: str) -> List[SanctionRecord]:
+    """Return active sanction records for the provided symbol."""
+
+    normalized_symbol = symbol.upper()
+    with get_session() as session:
+        stmt = select(SanctionRecord).where(SanctionRecord.symbol == normalized_symbol)
+        records = session.execute(stmt).scalars().all()
+    return [record for record in records if is_blocking_status(record.status)]
 
 
 def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
@@ -633,6 +684,25 @@ def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
             nonlocal cooldown_until
             cooldown_until = cooldown_until or _determine_cooldown(limits)
         _audit_violation(context, message, details)
+
+
+    throttle_status = COST_THROTTLER.evaluate(context.request.account_id)
+    if throttle_status.active:
+        details = {
+            "action": throttle_status.action,
+            "cost_ratio": throttle_status.cost_ratio,
+            "infra_cost": throttle_status.infra_cost,
+            "recent_pnl": throttle_status.recent_pnl,
+        }
+        _register_violation(
+            throttle_status.reason
+            or "Account operations throttled due to infrastructure cost overruns",
+            cooldown=True,
+            details=details,
+        )
+        if 0.0 not in suggested_quantities:
+            suggested_quantities.append(0.0)
+
 
     allocator_state = _query_allocator_state(context.request.account_id)
     if allocator_state:
@@ -685,6 +755,38 @@ def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
             scaled_notional_cap = base_size * float(target_vol) / current_vol
         elif nav_cap_for_trade:
             scaled_notional_cap = nav_cap_for_trade
+
+    volatility_metric: Optional[float] = None
+    volatility_source: Optional[str] = None
+    if atr_value is not None:
+        volatility_metric = atr_value
+        volatility_source = "atr"
+    else:
+        realized_vol = _compute_realized_volatility(state)
+        if realized_vol is not None:
+            volatility_metric = realized_vol
+            volatility_source = "realized_vol"
+
+    if volatility_metric is not None and volatility_source:
+        battle_mode_controller.auto_update(
+            context.request.account_id,
+            volatility_metric,
+            metric=volatility_source,
+            reason=f"{volatility_source}={volatility_metric:.6f}",
+        )
+
+    battle_status = battle_mode_controller.status(context.request.account_id)
+    if battle_status.engaged and not _is_position_reduction(intent, state, trade_notional):
+        _register_violation(
+            "Battle mode active: speculative trades are temporarily suspended",
+            cooldown=True,
+            details={
+                "threshold": battle_status.threshold,
+                "metric": battle_status.metric,
+                "volatility": battle_status.volatility,
+            },
+        )
+        suggested_quantities.append(0.0)
 
     # 3. Max NAV percentage per trade
     if trade_notional > nav_cap_for_trade:
@@ -1216,6 +1318,47 @@ def _compute_atr(instrument_id: str, window: int = 14) -> Optional[float]:
         return None
 
     return mean(true_ranges[-window:])
+
+
+def _compute_realized_volatility(state: AccountPortfolioState, window: int = 30) -> Optional[float]:
+    returns: List[float] = []
+    for series in (state.historical_returns or {}).values():
+        if not series:
+            continue
+        tail = series[-window:]
+        for value in tail:
+            if value is None:
+                continue
+            returns.append(float(value))
+
+    if len(returns) < 2:
+        return None
+
+    mean_return = sum(returns) / len(returns)
+    variance = sum((value - mean_return) ** 2 for value in returns) / (len(returns) - 1)
+    if variance < 0:
+        return 0.0
+    return math.sqrt(variance)
+
+
+def _is_position_reduction(
+    intent: TradeIntent, state: AccountPortfolioState, trade_notional: float
+) -> bool:
+    current_total = float(state.notional_exposure or 0.0)
+    tolerance = max(current_total * 1e-6, 1e-6)
+    if intent.side == "sell":
+        projected_total = max(current_total - trade_notional, 0.0)
+    else:
+        projected_total = current_total + trade_notional
+
+    if projected_total + tolerance < current_total:
+        return True
+
+    instrument_exposure = (state.instrument_exposure or {}).get(intent.instrument_id, 0.0)
+    if intent.side == "sell" and instrument_exposure > 0:
+        return True
+
+    return False
 
 
 def _compute_historical_var(account_id: str, nav: float, window: int = 250) -> Optional[float]:
