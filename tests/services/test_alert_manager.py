@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import pytest
+
+prometheus_client = pytest.importorskip("prometheus_client")
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from prometheus_client import CollectorRegistry
 
 from services.alert_manager import (
     AlertManager,
@@ -16,6 +19,33 @@ from services.alert_manager import (
     get_alert_metrics,
     setup_alerting,
 )
+
+
+CollectorRegistry = prometheus_client.CollectorRegistry
+
+
+class RecordingAlertManager(AlertManager):
+    """Test helper that records alerts pushed by the manager."""
+
+    def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        super().__init__(*args, **kwargs)
+        self.pushed_alerts: list[dict[str, object]] = []
+
+    def _push_alert(  # type: ignore[override]
+        self,
+        alert_name: str,
+        severity: str,
+        description: str,
+        labels: dict[str, str] | None = None,
+    ) -> None:
+        self.pushed_alerts.append(
+            {
+                "alert_name": alert_name,
+                "severity": severity,
+                "description": description,
+                "labels": labels or {},
+            }
+        )
 
 
 def test_handle_risk_event_increments_metric() -> None:
@@ -64,6 +94,21 @@ def test_handle_drift_signal_sets_gauge() -> None:
         {"detector": "ks", "model": "alpha"},
     )
     assert value == 0.7
+
+
+def test_handle_drift_signal_pushes_alert_above_threshold() -> None:
+    registry = CollectorRegistry()
+    metrics = configure_metrics(registry)
+    manager = RecordingAlertManager(metrics=metrics, alertmanager_url=None)
+
+    manager.handle_drift_signal(
+        DriftSignal(detector="ks", model="alpha", score=0.9, threshold=0.6)
+    )
+
+    assert len(manager.pushed_alerts) == 1
+    pushed = manager.pushed_alerts[0]
+    assert pushed["alert_name"] == "ModelDriftDetected"
+    assert pushed["severity"] == "warning"
 
 
 def test_helper_functions_record_metrics() -> None:

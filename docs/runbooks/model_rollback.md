@@ -17,6 +17,13 @@ Ensure rapid rollback to the last known good production model when a regression 
 2. Review ML monitoring dashboards (AUC, calibration, latency) for deviations beyond SLO error budgets.
 3. Confirm customer-facing impact via error logs or support tickets.
 
+## Drift Alert Routing
+- The alert manager emits `ModelDriftDetected` notifications with a `warning` severity by default. The default
+  `push_severities` configuration now includes `warning` so drift alerts are pushed without additional tuning.
+- To route drift alerts differently, provide a custom iterable to `AlertManager(push_severities=...)`. Ensure the
+  iterable contains the severity you want associated with model drift (for example `("critical", "warning")`) so
+  downstream routing policies receive the expected label.
+
 ## Containment and Response Steps
 1. **Freeze promotion**: Halt any active promotions with `argo terminate ml-canary-deployment`.
 2. **Promote last stable model**: Run `python -m ml.registry.promote --stage Production --model-version $(cat CURRENT_STABLE)` from the ops bastion.
