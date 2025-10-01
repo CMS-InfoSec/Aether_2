@@ -1,0 +1,188 @@
+apiVersion: argoproj.io/v1alpha1
+kind: CronWorkflow
+metadata:
+  name: reports-daily-pnl
+  labels:
+    workflow-type: reporting
+spec:
+  schedule: "15 0 * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  workflowSpec:
+    entrypoint: run
+    metrics:
+      prometheus:
+        - name: report_success_total
+          help: Number of successful report executions
+          labels:
+            - key: report
+              value: daily_pnl
+          counter:
+            value: "1"
+            condition: "{{workflow.status}} == Succeeded"
+        - name: report_failure_total
+          help: Number of failed report executions
+          labels:
+            - key: report
+              value: daily_pnl
+          counter:
+            value: "1"
+            condition: "{{workflow.status}} == Failed"
+    templates:
+      - name: run
+        container:
+          image: python:3.11-slim
+          command: ["python", "reports/daily_pnl.py"]
+          args:
+            - "--database-url"
+            - "{{workflow.parameters.database_url}}"
+            - "--report-date"
+            - "{{workflow.parameters.report_date}}"
+            - "--output-formats"
+            - "csv,parquet"
+          env:
+            - name: REPORT_STORAGE_PATH
+              value: /reports
+          volumeMounts:
+            - name: report-artifacts
+              mountPath: /reports
+    volumeClaimTemplates:
+      - metadata:
+          name: report-artifacts
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 1Gi
+    arguments:
+      parameters:
+        - name: database_url
+          value: postgresql://readonly:readonly@timescaledb:5432/aether
+        - name: report_date
+          value: "{{workflow.creationTimestamp | argo.date(\"2006-01-02\")}}"
+---
+apiVersion: argoproj.io/v1alpha1
+kind: CronWorkflow
+metadata:
+  name: reports-weekly-xai
+  labels:
+    workflow-type: reporting
+spec:
+  schedule: "30 1 * * 1"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  workflowSpec:
+    entrypoint: run
+    metrics:
+      prometheus:
+        - name: report_success_total
+          help: Number of successful report executions
+          labels:
+            - key: report
+              value: weekly_xai
+          counter:
+            value: "1"
+            condition: "{{workflow.status}} == Succeeded"
+        - name: report_failure_total
+          help: Number of failed report executions
+          labels:
+            - key: report
+              value: weekly_xai
+          counter:
+            value: "1"
+            condition: "{{workflow.status}} == Failed"
+    templates:
+      - name: run
+        container:
+          image: python:3.11-slim
+          command: ["python", "reports/weekly_xai.py"]
+          args:
+            - "--database-url"
+            - "{{workflow.parameters.database_url}}"
+            - "--week-ending"
+            - "{{workflow.parameters.week_ending}}"
+            - "--output-formats"
+            - "csv,parquet"
+          env:
+            - name: REPORT_STORAGE_PATH
+              value: /reports
+          volumeMounts:
+            - name: report-artifacts
+              mountPath: /reports
+    volumeClaimTemplates:
+      - metadata:
+          name: report-artifacts
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 1Gi
+    arguments:
+      parameters:
+        - name: database_url
+          value: postgresql://readonly:readonly@timescaledb:5432/aether
+        - name: week_ending
+          value: "{{workflow.creationTimestamp | argo.date(\"2006-01-02\")}}"
+---
+apiVersion: argoproj.io/v1alpha1
+kind: CronWorkflow
+metadata:
+  name: reports-quarterly-summary
+  labels:
+    workflow-type: reporting
+spec:
+  schedule: "0 2 1 */3 *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  workflowSpec:
+    entrypoint: run
+    metrics:
+      prometheus:
+        - name: report_success_total
+          help: Number of successful report executions
+          labels:
+            - key: report
+              value: quarterly_summary
+          counter:
+            value: "1"
+            condition: "{{workflow.status}} == Succeeded"
+        - name: report_failure_total
+          help: Number of failed report executions
+          labels:
+            - key: report
+              value: quarterly_summary
+          counter:
+            value: "1"
+            condition: "{{workflow.status}} == Failed"
+    templates:
+      - name: run
+        container:
+          image: python:3.11-slim
+          command: ["python", "reports/quarterly_summary.py"]
+          args:
+            - "--database-url"
+            - "{{workflow.parameters.database_url}}"
+            - "--quarter-ending"
+            - "{{workflow.parameters.quarter_ending}}"
+            - "--output-formats"
+            - "csv,parquet"
+          env:
+            - name: REPORT_STORAGE_PATH
+              value: /reports
+          volumeMounts:
+            - name: report-artifacts
+              mountPath: /reports
+    volumeClaimTemplates:
+      - metadata:
+          name: report-artifacts
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 2Gi
+    arguments:
+      parameters:
+        - name: database_url
+          value: postgresql://readonly:readonly@timescaledb:5432/aether
+        - name: quarter_ending
+          value: "{{workflow.creationTimestamp | argo.date(\"2006-01-02\")}}"
