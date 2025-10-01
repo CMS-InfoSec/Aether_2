@@ -1,13 +1,25 @@
-import React, { FormEvent, useEffect, useState } from "react";
+import React, { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 
 type KrakenStatusResponse = {
-  lastRotatedAt?: string | null;
+  rotated_at?: string | null;
 };
 
 type KrakenSecretPayload = {
-  apiKey: string;
-  apiSecret: string;
+  account_id: string;
+  api_key: string;
+  api_secret: string;
 };
+
+type AccountOption = {
+  label: string;
+  value: string;
+};
+
+const DEFAULT_ACCOUNT_OPTIONS: readonly AccountOption[] = [
+  { label: "Company", value: "company" },
+  { label: "Director 1", value: "director-1" },
+  { label: "Director 2", value: "director-2" },
+];
 
 const formatTimestamp = (timestamp?: string | null) => {
   if (!timestamp) {
@@ -26,69 +38,126 @@ const formatTimestamp = (timestamp?: string | null) => {
 const ApiKeyForm: React.FC = () => {
   const [apiKey, setApiKey] = useState("");
   const [apiSecret, setApiSecret] = useState("");
+  const [accountId, setAccountId] = useState<string>("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [statusLoading, setStatusLoading] = useState(true);
   const [statusError, setStatusError] = useState<string | null>(null);
   const [lastRotatedAt, setLastRotatedAt] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const accountOptions = useMemo(() => {
+    if (typeof window !== "undefined") {
+      const adminAccounts = (window as typeof window & {
+        __ADMIN_ACCOUNTS__?: string[];
+      }).__ADMIN_ACCOUNTS__;
 
-  useEffect(() => {
-    let isMounted = true;
-    const controller = new AbortController();
+      if (Array.isArray(adminAccounts) && adminAccounts.length > 0) {
+        return adminAccounts.map((value) => ({ label: value, value }));
+      }
+    }
 
-    const loadStatus = async () => {
+    return [...DEFAULT_ACCOUNT_OPTIONS];
+  }, []);
+
+  const loadStatus = useCallback(
+    async (signal: AbortSignal) => {
+      if (!accountId) {
+        setLastRotatedAt(null);
+        setStatusError(null);
+        setStatusLoading(false);
+        return;
+      }
+
       try {
         setStatusLoading(true);
-        const response = await fetch("/secrets/kraken/status", {
-          method: "GET",
-          headers: {
-            Accept: "application/json",
-          },
-          signal: controller.signal,
-        });
+        const response = await fetch(
+          `/secrets/kraken/status?account_id=${encodeURIComponent(accountId)}`,
+          {
+            method: "GET",
+            headers: {
+              Accept: "application/json",
+              "X-Account-ID": accountId,
+            },
+            signal,
+          }
+        );
 
         if (!response.ok) {
+          if (response.status === 404) {
+            setLastRotatedAt(null);
+            setStatusError(null);
+            return;
+          }
+
           throw new Error(`Failed to load status: ${response.status}`);
         }
 
         const data = (await response.json()) as KrakenStatusResponse;
-
-        if (isMounted) {
-          setLastRotatedAt(data.lastRotatedAt ?? null);
-          setStatusError(null);
-        }
+        setLastRotatedAt(data.rotated_at ?? null);
+        setStatusError(null);
       } catch (error) {
-        if (!isMounted || controller.signal.aborted) {
+        if (signal.aborted) {
           return;
         }
 
         console.error("Failed to fetch Kraken API key status", error);
         setStatusError("Unable to load the current rotation status.");
       } finally {
-        if (isMounted) {
+        if (!signal.aborted) {
           setStatusLoading(false);
         }
       }
-    };
+    },
+    [accountId]
+  );
 
-    loadStatus();
+  const refreshStatus = useCallback(async () => {
+    const controller = new AbortController();
+    try {
+      await loadStatus(controller.signal);
+    } finally {
+      controller.abort();
+    }
+  }, [loadStatus]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+
+    if (!accountId) {
+      setStatusLoading(false);
+      setLastRotatedAt(null);
+      setStatusError(null);
+      return () => {
+        controller.abort();
+      };
+    }
+
+    loadStatus(controller.signal).catch((error) => {
+      if (!controller.signal.aborted) {
+        console.error("Failed to initialize Kraken status", error);
+      }
+    });
 
     return () => {
-      isMounted = false;
       controller.abort();
     };
-  }, []);
+  }, [accountId, loadStatus]);
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (!accountId) {
+      setSubmitError("Please select an account before saving credentials.");
+      return;
+    }
+
     setIsSubmitting(true);
     setSubmitError(null);
     setSuccessMessage(null);
 
     const payload: KrakenSecretPayload = {
-      apiKey: apiKey.trim(),
-      apiSecret: apiSecret.trim(),
+      account_id: accountId,
+      api_key: apiKey.trim(),
+      api_secret: apiSecret.trim(),
     };
 
     try {
@@ -97,6 +166,7 @@ const ApiKeyForm: React.FC = () => {
         headers: {
           "Content-Type": "application/json",
           Accept: "application/json",
+          "X-Account-ID": accountId,
         },
         body: JSON.stringify(payload),
       });
@@ -109,7 +179,7 @@ const ApiKeyForm: React.FC = () => {
       setSuccessMessage("Kraken API credentials updated successfully.");
       setApiSecret("");
       setApiKey("");
-      setLastRotatedAt(new Date().toISOString());
+      await refreshStatus();
     } catch (error) {
       console.error("Failed to submit Kraken API credentials", error);
       setSubmitError(
@@ -126,18 +196,62 @@ const ApiKeyForm: React.FC = () => {
         Kraken API Credentials
       </h2>
 
-      <div className="mb-6">
+      <div className="mb-6" aria-live="polite">
         <h3 className="text-sm font-medium text-gray-700">Last Rotated</h3>
-        {statusLoading ? (
+        {!accountId ? (
+          <p className="text-sm text-gray-500">
+            Select an account to view the rotation status.
+          </p>
+        ) : statusLoading ? (
           <p className="text-sm text-gray-500">Loading status…</p>
         ) : statusError ? (
-          <p className="text-sm text-red-600">{statusError}</p>
+          <p className="text-sm text-red-600" role="alert">
+            {statusError}
+          </p>
         ) : (
           <p className="text-sm text-gray-900">{formatTimestamp(lastRotatedAt)}</p>
         )}
       </div>
 
       <form onSubmit={handleSubmit} className="space-y-4">
+        <div>
+          <label
+            htmlFor="accountId"
+            className="block text-sm font-medium text-gray-700 mb-1"
+          >
+            Account
+          </label>
+          <select
+            id="accountId"
+            name="accountId"
+            value={accountId}
+            onChange={(event) => {
+              const newAccountId = event.target.value;
+              setAccountId(newAccountId);
+              setSubmitError(null);
+              setSuccessMessage(null);
+              setStatusError(null);
+              if (!newAccountId) {
+                setStatusLoading(false);
+                setLastRotatedAt(null);
+              } else {
+                setStatusLoading(true);
+              }
+            }}
+            className="w-full rounded-md border border-gray-300 bg-white px-3 py-2 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-200"
+            required
+          >
+            <option value="" disabled>
+              Select an account
+            </option>
+            {accountOptions.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </div>
+
         <div>
           <label
             htmlFor="apiKey"
@@ -179,13 +293,20 @@ const ApiKeyForm: React.FC = () => {
         </div>
 
         {submitError && (
-          <div className="rounded-md bg-red-50 p-3 text-sm text-red-700">
+          <div
+            className="rounded-md bg-red-50 p-3 text-sm text-red-700"
+            role="alert"
+          >
             {submitError}
           </div>
         )}
 
         {successMessage && (
-          <div className="rounded-md bg-green-50 p-3 text-sm text-green-700">
+          <div
+            className="rounded-md bg-green-50 p-3 text-sm text-green-700"
+            role="status"
+            aria-live="polite"
+          >
             {successMessage}
           </div>
         )}
