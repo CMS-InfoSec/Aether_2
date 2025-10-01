@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 import policy_service
 from services.common.schemas import ActionTemplate, ConfidenceMetrics
+from services.common.security import ADMIN_ACCOUNTS
 from services.models.model_server import Intent
 
 
@@ -56,8 +57,9 @@ def _intent(
     )
 
 
+@pytest.mark.parametrize("account_id", sorted(ADMIN_ACCOUNTS))
 def test_policy_decide_approves_when_edge_beats_costs(
-    monkeypatch: pytest.MonkeyPatch, client: TestClient
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, account_id: str
 ) -> None:
     recorded: dict[str, object] = {}
 
@@ -86,7 +88,7 @@ def test_policy_decide_approves_when_edge_beats_costs(
     )
 
     payload = {
-        "account_id": "company",
+        "account_id": account_id,
         "symbol": "btc-usd",
         "side": "buy",
         "qty": 0.1234567,
@@ -112,11 +114,43 @@ def test_policy_decide_approves_when_edge_beats_costs(
 
     expected_notional = float(Decimal("30120.5") * Decimal("0.1235"))
     assert recorded == {
-        "account_id": "company",
+        "account_id": account_id,
         "symbol": "BTC-USD",
         "liquidity": "maker",
         "notional": pytest.approx(expected_notional),
     }
+
+
+def test_policy_decide_rejects_unknown_account(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
+    async def _fake_fee(*_: object, **__: object) -> float:
+        return 4.5
+
+    monkeypatch.setattr(policy_service, "_fetch_effective_fee", _fake_fee)
+    monkeypatch.setattr(
+        policy_service,
+        "predict_intent",
+        lambda **_: _intent(
+            edge_bps=22.0,
+            maker_edge=18.0,
+            taker_edge=12.0,
+            approved=True,
+            selected="maker",
+        ),
+    )
+
+    payload = {
+        "account_id": "shadow-account",
+        "symbol": "BTC-USD",
+        "side": "buy",
+        "qty": 0.1234567,
+        "price": 30120.4567,
+        "impact_bps": 1.0,
+        "features": [0.1, 0.2],
+        "book_snapshot": {"mid_price": 30125.4, "spread_bps": 2.4, "imbalance": 0.05},
+    }
+
+    response = client.post("/policy/decide", json=payload)
+    assert response.status_code == 422
 
 
 def test_policy_decide_rejects_when_costs_exceed_edge(
