@@ -1835,8 +1835,8 @@ async def get_routing_status(
     return account.routing_status()
 
 
-@app.get("/oms/warm_start/status")
-async def get_warm_start_status() -> Dict[str, int]:
+@app.get("/oms/warm_start/report")
+async def get_warm_start_report(_: str = Depends(require_account_id)) -> Dict[str, int]:
     return await warm_start.status()
 
 
