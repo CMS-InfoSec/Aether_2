@@ -13,13 +13,8 @@ from services.alert_manager import setup_alerting
 from alert_prioritizer import router as alert_prioritizer_router
 from services.report_service import router as reports_router
 from multiformat_export import router as log_export_router
-from scaling_controller import (
-    build_scaling_controller_from_env,
-    configure_scaling_controller,
-    router as scaling_router,
-)
 
-from canary_rollout import router as canary_router
+from pack_exporter import router as knowledge_router
 
 
 from services.models.meta_learner import router as meta_router
@@ -55,6 +50,7 @@ def create_app() -> FastAPI:
     app.include_router(models_router)
 
     app.include_router(log_export_router)
+    app.include_router(knowledge_router)
 
     scaling_controller = build_scaling_controller_from_env()
     configure_scaling_controller(scaling_controller)
