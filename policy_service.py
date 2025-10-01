@@ -12,6 +12,8 @@ try:  # pragma: no cover - registry may be optional in some environments
 except ImportError:  # pragma: no cover
     model_registry = None  # type: ignore
 
+from metrics import record_abstention_rate, record_drift_score, setup_metrics
+
 
 class PolicyDecisionRequest(BaseModel):
     """Request payload for the policy decision endpoint."""
@@ -66,6 +68,7 @@ class PolicyDecisionResponse(BaseModel):
 
 
 app = FastAPI(title="Policy Service")
+setup_metrics(app)
 
 
 @app.post(
@@ -141,9 +144,28 @@ async def decide_policy(request: PolicyDecisionRequest) -> PolicyDecisionRespons
         )
 
     try:
-        return PolicyDecisionResponse(**result)
+        response = PolicyDecisionResponse(**result)
     except ValidationError as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Model response failed validation",
         ) from exc
+
+    drift = 0.0
+    account_state = request.account_state or {}
+    if isinstance(account_state, dict):
+        raw = account_state.get("drift_score", 0.0)
+        try:
+            drift = float(raw)
+        except (TypeError, ValueError):
+            drift = 0.0
+    record_drift_score(request.account_id, request.symbol, drift)
+
+    abstain = 0.0
+    action = (response.action or "").lower()
+    side = (response.side or "").lower()
+    if action in {"hold", "abstain"} or side in {"none", "flat"}:
+        abstain = 1.0
+    record_abstention_rate(request.account_id, request.symbol, abstain)
+
+    return response

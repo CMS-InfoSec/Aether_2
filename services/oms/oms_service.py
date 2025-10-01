@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import time
 import uuid
 from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
+from metrics import record_oms_submit_ack, record_ws_latency, setup_metrics
 from services.oms.kraken_client import KrakenWSClient, KrakenWebsocketError
 
 
 app = FastAPI(title="Kraken OMS Service")
+setup_metrics(app)
 
 
 SUPPORTED_FLAGS = {
@@ -150,10 +153,16 @@ def place_order(request: OMSPlaceRequest) -> OMSPlaceResponse:
     exchange_order_id: str
     open_snapshot: Dict[str, object]
     trades_snapshot: Dict[str, object]
+    transport = "websocket"
+    latency_start = time.perf_counter()
     try:
         try:
             ack = client.add_order(payload, timeout=2.0)
         except KrakenWebsocketError:
+            ws_latency_ms = (time.perf_counter() - latency_start) * 1000.0
+            record_ws_latency(request.account_id, request.symbol, ws_latency_ms)
+            transport = "rest"
+            latency_start = time.perf_counter()
             ack = client.rest_add_order(payload)
 
         exchange_order_id = (
@@ -164,6 +173,11 @@ def place_order(request: OMSPlaceRequest) -> OMSPlaceResponse:
         trades_snapshot = client.own_trades(txid=exchange_order_id)
     finally:
         client.close()
+
+    ack_latency_ms = (time.perf_counter() - latency_start) * 1000.0
+    if transport == "websocket":
+        record_ws_latency(request.account_id, request.symbol, ack_latency_ms)
+    record_oms_submit_ack(request.account_id, request.symbol, ack_latency_ms)
 
     status = _derive_status(open_snapshot, trades_snapshot)
     if isinstance(ack.get("status"), str) and ack["status"]:

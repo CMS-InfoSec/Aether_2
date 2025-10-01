@@ -12,6 +12,12 @@ from pydantic import BaseModel, Field, PositiveFloat, root_validator
 from sqlalchemy import Column, Float, Integer, String
 from sqlalchemy.orm import declarative_base
 
+from metrics import (
+    increment_trade_rejection,
+    record_fees_nav_pct,
+    setup_metrics,
+)
+
 
 logger = logging.getLogger(__name__)
 audit_logger = logging.getLogger("risk.audit")
@@ -172,6 +178,7 @@ class RiskEvaluationContext(BaseModel):
 
 
 app = FastAPI(title="Risk Validation Service", version="1.0.0")
+setup_metrics(app)
 
 
 @app.post("/risk/validate", response_model=RiskValidationResponse)
@@ -199,8 +206,24 @@ async def validate_risk(request: RiskValidationRequest) -> RiskValidationRespons
         request.account_id,
         decision.pass_,
     )
+    symbol = str(context.request.intent.instrument_id)
+
     if not decision.pass_:
         _audit_failure(context, decision)
+        increment_trade_rejection(
+            request.account_id,
+            symbol,
+        )
+
+    state = context.request.portfolio_state
+    nav = float(state.net_asset_value) if state.net_asset_value else 0.0
+    fees = float(state.fees_paid) if state.fees_paid else 0.0
+    fees_pct = (fees / nav * 100.0) if nav else 0.0
+    record_fees_nav_pct(
+        request.account_id,
+        symbol,
+        fees_pct,
+    )
 
     return decision
 

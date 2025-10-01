@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 from decimal import Decimal, ROUND_HALF_UP
@@ -12,7 +11,15 @@ from services.common.schemas import OrderPlacementRequest, OrderPlacementRespons
 from services.common.security import require_admin_account
 from services.oms.kraken_client import KrakenWSClient, KrakenWebsocketError
 
+from metrics import (
+    increment_trade_rejection,
+    record_oms_submit_ack,
+    record_ws_latency,
+    setup_metrics,
+)
+
 app = FastAPI(title="OMS Service")
+setup_metrics(app)
 
 
 class CircuitBreaker:
@@ -136,11 +143,16 @@ def place_order(
         },
     )
 
+    start_time = time.perf_counter()
     try:
         ack = client.add_order(order_payload, timeout=1.0)
     except KrakenWebsocketError as exc:
         client.close()
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+
+    ack_latency_ms = (time.perf_counter() - start_time) * 1000.0
+    record_ws_latency(account_id, request.instrument, ack_latency_ms)
+    record_oms_submit_ack(account_id, request.instrument, ack_latency_ms)
 
     open_snapshot = client.open_orders()
     trades_snapshot = client.own_trades(txid=ack.get("txid"))
@@ -160,6 +172,10 @@ def place_order(
     timescale.record_usage(snapped_price * snapped_quantity)
 
     kafka.publish(topic="oms.acks", payload=ack_payload)
+
+    status_value = str(ack_payload.get("status", "")).lower()
+    if status_value and status_value not in {"ok", "accepted", "open"}:
+        increment_trade_rejection(account_id, request.instrument)
 
     for trade in trades_snapshot.get("trades", []):
         fill_payload = {

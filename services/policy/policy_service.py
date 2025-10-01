@@ -13,6 +13,8 @@ try:  # pragma: no cover - optional dependency
 except ImportError:  # pragma: no cover - the inference module is optional at runtime
     models = None
 
+from metrics import record_abstention_rate, record_drift_score, setup_metrics
+
 
 class PolicyDecisionRequest(BaseModel):
     """Request schema for the policy decision endpoint."""
@@ -60,6 +62,7 @@ class PolicyIntent(BaseModel):
 
 
 app = FastAPI(title="Policy Service")
+setup_metrics(app)
 
 
 @app.post("/policy/decide", response_model=PolicyIntent, status_code=status.HTTP_200_OK)
@@ -95,9 +98,25 @@ def decide_policy_intent(request: PolicyDecisionRequest) -> PolicyIntent:
         )
 
     try:
-        return PolicyIntent(**intent_payload)
+        response = PolicyIntent(**intent_payload)
     except Exception as exc:  # pragma: no cover - ensures schema compatibility
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Model response failed schema validation.",
         ) from exc
+
+    drift = 0.0
+    account_state = request.account_state or {}
+    if isinstance(account_state, dict):
+        raw = account_state.get("drift_score", 0.0)
+        try:
+            drift = float(raw)
+        except (TypeError, ValueError):
+            drift = 0.0
+    record_drift_score(str(request.account_id), request.symbol, drift)
+
+    action = (response.action or "").lower()
+    abstain = 1.0 if action in {"hold", "abstain"} else 0.0
+    record_abstention_rate(str(request.account_id), request.symbol, abstain)
+
+    return response
