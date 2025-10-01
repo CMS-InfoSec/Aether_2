@@ -1,331 +1,324 @@
-"""Safe mode control service for orchestrating emergency hedges.
-
-This module exposes a small FastAPI application that can automatically engage
-safe mode when the Kraken private WebSocket feed is unavailable for more than
-30 seconds. Engaging safe mode instructs downstream services to cancel any
-open orders and hedge residual positions back to USD. Operators can also
-manually enter or exit safe mode via the provided HTTP endpoints.
-"""
+"""Safe mode FastAPI service for orchestrating risk-off controls."""
 
 from __future__ import annotations
 
-import asyncio
-import os
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from threading import Lock
 from typing import Dict, List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
-
-from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
-from services.common.security import require_admin_account
+from fastapi import Body, FastAPI, Header, HTTPException, status
 
 app = FastAPI(title="Safe Mode Service")
 
 
-def _env_float(name: str, default: float) -> float:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    try:
-        return float(value)
-    except ValueError:
-        return default
+# ---------------------------------------------------------------------------
+# Support data structures
+# ---------------------------------------------------------------------------
 
 
-SAFE_MODE_WS_TIMEOUT_SECONDS = _env_float("SAFE_MODE_WS_TIMEOUT_SECONDS", 30.0)
-SAFE_MODE_MONITOR_INTERVAL_SECONDS = _env_float("SAFE_MODE_MONITOR_INTERVAL_SECONDS", 5.0)
-SAFE_MODE_AUTOMATION_ACTOR = "system"
-SAFE_MODE_OUTAGE_REASON = "kraken_ws_down"
+def _utcnow() -> datetime:
+    """Return a timezone aware ``datetime`` in UTC."""
+
+    return datetime.now(timezone.utc)
 
 
 @dataclass(frozen=True)
 class SafeModeEvent:
-    """Represents a safe mode state transition."""
+    """Represents a transition into or out of safe mode."""
 
-    account_id: str
     reason: str
     ts: datetime
     state: str
-    actor: Optional[str] = None
-    automatic: bool = False
+    actor: Optional[str]
 
-    def to_kafka_payload(self) -> Dict[str, object]:
+    def to_payload(self) -> Dict[str, object]:
         payload: Dict[str, object] = {
-            "event": "SAFE_MODE_ENTERED" if self.state == "entered" else "SAFE_MODE_EXITED",
-            "account_id": self.account_id,
-            "timestamp": self.ts.isoformat(),
             "reason": self.reason,
-            "automatic": self.automatic,
+            "timestamp": self.ts.isoformat(),
+            "state": self.state,
         }
-        if self.actor:
+        if self.actor is not None:
             payload["actor"] = self.actor
-        if self.state == "entered":
-            payload["actions"] = ["CANCEL_OPEN_ORDERS", "HEDGE_TO_USD"]
         return payload
+
+
+@dataclass
+class SafeModeStatus:
+    """Represents the current safe mode state."""
+
+    active: bool
+    reason: Optional[str] = None
+    since: Optional[datetime] = None
+    actor: Optional[str] = None
 
     def to_response(self) -> Dict[str, object]:
         return {
-            "account_id": self.account_id,
-            "state": "engaged" if self.state == "entered" else "released",
-            "engaged": self.state == "entered",
+            "active": self.active,
             "reason": self.reason,
-            "ts": self.ts.isoformat(),
-            "automatic": self.automatic,
+            "since": self.since.isoformat() if self.since else None,
             "actor": self.actor,
         }
 
 
-@dataclass
-class _SafeModeState:
-    engaged: bool
+# ---------------------------------------------------------------------------
+# Safe mode logging helpers
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SafeModeLogEntry:
     reason: str
-    engaged_at: datetime
-    automatic: bool
+    ts: datetime
+    actor: Optional[str]
+    state: str
+
+
+_SAFE_MODE_LOG: List[SafeModeLogEntry] = []
+
+
+def safe_mode_log(reason: str, ts: datetime, actor: Optional[str], state: str) -> None:
+    """Record a safe mode state transition in memory."""
+
+    _SAFE_MODE_LOG.append(SafeModeLogEntry(reason=reason, ts=ts, actor=actor, state=state))
+
+
+def get_safe_mode_log() -> List[Dict[str, object]]:
+    """Return a serialisable copy of the log for diagnostics/testing."""
+
+    return [
+        {
+            "reason": entry.reason,
+            "timestamp": entry.ts,
+            "actor": entry.actor,
+            "state": entry.state,
+        }
+        for entry in _SAFE_MODE_LOG
+    ]
+
+
+def clear_safe_mode_log() -> None:
+    """Reset the in-memory log (useful for tests)."""
+
+    _SAFE_MODE_LOG.clear()
+
+
+# ---------------------------------------------------------------------------
+# Trading control primitives
+# ---------------------------------------------------------------------------
+
+
+class OrderControls:
+    """Minimal representation of trading order controls."""
+
+    def __init__(self) -> None:
+        self.open_orders: List[str] = []
+        self.cancelled_orders: List[str] = []
+        self.only_hedging: bool = False
+
+    def cancel_open_orders(self) -> None:
+        self.cancelled_orders.extend(self.open_orders)
+        self.open_orders.clear()
+
+    def restrict_to_hedging(self) -> None:
+        self.only_hedging = True
+
+    def lift_restrictions(self) -> None:
+        self.only_hedging = False
+
+    def reset(self) -> None:
+        self.open_orders.clear()
+        self.cancelled_orders.clear()
+        self.only_hedging = False
+
+
+class IntentGuard:
+    """Tracks whether trading intents can be generated."""
+
+    def __init__(self) -> None:
+        self.allow_new_intents: bool = True
+
+    def disable(self) -> None:
+        self.allow_new_intents = False
+
+    def enable(self) -> None:
+        self.allow_new_intents = True
+
+    def reset(self) -> None:
+        self.allow_new_intents = True
+
+
+class KafkaSafeModePublisher:
+    """Publish safe mode events to Kafka (via the in-memory adapter)."""
+
+    def __init__(self, *, account_id: str = "safe_mode", topic: str = "ops.safe_mode") -> None:
+        self._account_id = account_id
+        self._topic = topic
+        self._history: List[Dict[str, object]] = []
+
+    def publish(self, event: SafeModeEvent) -> None:
+        payload = event.to_payload()
+        try:  # pragma: no cover - adapter import may fail in lightweight environments
+            from services.common.adapters import KafkaNATSAdapter  # type: ignore
+
+            KafkaNATSAdapter(account_id=self._account_id).publish(
+                topic=self._topic,
+                payload=payload,
+            )
+        except Exception:  # pragma: no cover - fall back to in-memory history
+            pass
+
+        self._history.append({"topic": self._topic, "payload": payload})
+
+    def history(self) -> List[Dict[str, object]]:
+        return list(self._history)
+
+    def reset(self) -> None:
+        self._history.clear()
+
+
+class SafeModeLogger:
+    """Glue layer around ``safe_mode_log`` for dependency injection."""
+
+    @staticmethod
+    def log(event: SafeModeEvent) -> None:
+        safe_mode_log(event.reason, event.ts, event.actor, event.state)
+
+
+# ---------------------------------------------------------------------------
+# Safe mode controller
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _SafeModeInternalState:
+    active: bool = False
+    reason: Optional[str] = None
+    since: Optional[datetime] = None
+    actor: Optional[str] = None
 
 
 class SafeModeController:
-    """Coordinates safe mode state across accounts."""
+    """Coordinates safe mode transitions and downstream side-effects."""
 
     def __init__(
         self,
         *,
-        downtime_threshold_seconds: float = SAFE_MODE_WS_TIMEOUT_SECONDS,
-        monitor_interval_seconds: float = SAFE_MODE_MONITOR_INTERVAL_SECONDS,
+        order_controls: Optional[OrderControls] = None,
+        intent_guard: Optional[IntentGuard] = None,
+        publisher: Optional[KafkaSafeModePublisher] = None,
+        logger: Optional[SafeModeLogger] = None,
     ) -> None:
-        self._downtime_threshold = float(max(0.0, downtime_threshold_seconds))
-        self._monitor_interval = float(max(0.1, monitor_interval_seconds))
-        self._last_heartbeat: Dict[str, datetime] = {}
-        self._states: Dict[str, _SafeModeState] = {}
+        self.order_controls = order_controls or OrderControls()
+        self.intent_guard = intent_guard or IntentGuard()
+        self._publisher = publisher or KafkaSafeModePublisher()
+        self._logger = logger or SafeModeLogger()
+        self._state = _SafeModeInternalState()
         self._lock = Lock()
-        self._task: Optional[asyncio.Task[None]] = None
 
-    @staticmethod
-    def _normalize_account(account_id: str) -> str:
-        normalized = account_id.strip().lower()
-        if not normalized:
-            raise ValueError("Account identifier must not be empty.")
-        return normalized
+    # Public API ---------------------------------------------------------
 
-    def record_heartbeat(
-        self, account_id: str, *, timestamp: Optional[datetime] = None
-    ) -> None:
-        """Record a Kraken private WebSocket heartbeat for ``account_id``."""
+    def enter(self, *, reason: str, actor: Optional[str]) -> SafeModeEvent:
+        normalized_reason = reason.strip()
+        if not normalized_reason:
+            raise ValueError("reason must not be empty")
 
-        normalized = self._normalize_account(account_id)
-        ts = timestamp or datetime.now(timezone.utc)
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
+        ts = _utcnow()
         with self._lock:
-            self._last_heartbeat[normalized] = ts
-
-    def enter(
-        self,
-        account_id: str,
-        *,
-        reason: str,
-        actor: Optional[str] = None,
-        automatic: bool = False,
-        timestamp: Optional[datetime] = None,
-    ) -> SafeModeEvent:
-        """Engage safe mode for ``account_id``."""
-
-        normalized = self._normalize_account(account_id)
-        ts = timestamp or datetime.now(timezone.utc)
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-
-        with self._lock:
-            self._states[normalized] = _SafeModeState(
-                engaged=True,
-                reason=reason,
-                engaged_at=ts,
-                automatic=automatic,
-            )
-
-        timescale = TimescaleAdapter(account_id=normalized)
-        timescale.set_safe_mode(engaged=True, reason=reason, actor=actor)
-
-        event = SafeModeEvent(
-            account_id=normalized,
-            reason=reason,
-            ts=ts,
-            state="entered",
-            actor=actor,
-            automatic=automatic,
-        )
-
-        KafkaNATSAdapter(account_id=normalized).publish(
-            topic="core.safe_mode",
-            payload=event.to_kafka_payload(),
-        )
-
-        return event
-
-    def exit(
-        self,
-        account_id: str,
-        *,
-        reason: str,
-        actor: Optional[str] = None,
-        timestamp: Optional[datetime] = None,
-    ) -> SafeModeEvent:
-        """Release safe mode for ``account_id``."""
-
-        normalized = self._normalize_account(account_id)
-        ts = timestamp or datetime.now(timezone.utc)
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-
-        with self._lock:
-            self._states[normalized] = _SafeModeState(
-                engaged=False,
-                reason=reason,
-                engaged_at=ts,
-                automatic=False,
-            )
-
-        TimescaleAdapter(account_id=normalized).set_safe_mode(
-            engaged=False,
-            reason=reason,
-            actor=actor,
-        )
-
-        event = SafeModeEvent(
-            account_id=normalized,
-            reason=reason,
-            ts=ts,
-            state="exited",
-            actor=actor,
-            automatic=False,
-        )
-
-        KafkaNATSAdapter(account_id=normalized).publish(
-            topic="core.safe_mode",
-            payload=event.to_kafka_payload(),
-        )
-
-        return event
-
-    def check_downtime(
-        self, *, current_time: Optional[datetime] = None
-    ) -> List[SafeModeEvent]:
-        """Check for websocket downtime and engage safe mode when required."""
-
-        now = current_time or datetime.now(timezone.utc)
-        if now.tzinfo is None:
-            now = now.replace(tzinfo=timezone.utc)
-
-        threshold = timedelta(seconds=self._downtime_threshold)
-        to_trigger: List[str] = []
-
-        with self._lock:
-            for account_id, heartbeat in list(self._last_heartbeat.items()):
-                state = self._states.get(account_id)
-                if state and state.engaged:
-                    continue
-                if now - heartbeat > threshold:
-                    to_trigger.append(account_id)
-
-        events: List[SafeModeEvent] = []
-        for account_id in to_trigger:
-            events.append(
-                self.enter(
-                    account_id,
-                    reason=SAFE_MODE_OUTAGE_REASON,
-                    actor=SAFE_MODE_AUTOMATION_ACTOR,
-                    automatic=True,
-                    timestamp=now,
+            if self._state.active:
+                return SafeModeEvent(
+                    reason=self._state.reason or normalized_reason,
+                    ts=self._state.since or ts,
+                    state="entered",
+                    actor=self._state.actor,
                 )
+
+            self.order_controls.cancel_open_orders()
+            self.order_controls.restrict_to_hedging()
+            self.intent_guard.disable()
+            self._state = _SafeModeInternalState(
+                active=True,
+                reason=normalized_reason,
+                since=ts,
+                actor=actor,
             )
-        return events
 
-    async def _run_loop(self) -> None:
-        try:
-            while True:
-                self.check_downtime()
-                await asyncio.sleep(self._monitor_interval)
-        except asyncio.CancelledError:  # pragma: no cover - cooperative cancellation
-            raise
+        event = SafeModeEvent(reason=normalized_reason, ts=ts, state="entered", actor=actor)
+        self._publisher.publish(event)
+        self._logger.log(event)
+        return event
 
-    async def start(self) -> None:
-        if self._task is None or self._task.done():
-            self._task = asyncio.create_task(self._run_loop(), name="safe-mode-monitor")
+    def exit(self, *, actor: Optional[str]) -> SafeModeEvent:
+        ts = _utcnow()
+        with self._lock:
+            if not self._state.active:
+                raise RuntimeError("Safe mode is not currently active")
 
-    async def stop(self) -> None:
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:  # pragma: no cover - cooperative cancellation
-                pass
-            self._task = None
+            reason = self._state.reason or "manual_exit"
+            self.intent_guard.enable()
+            self.order_controls.lift_restrictions()
+            self._state = _SafeModeInternalState(active=False, actor=actor)
+
+        event = SafeModeEvent(reason=reason, ts=ts, state="exited", actor=actor)
+        self._publisher.publish(event)
+        self._logger.log(event)
+        return event
+
+    def status(self) -> SafeModeStatus:
+        with self._lock:
+            return SafeModeStatus(
+                active=self._state.active,
+                reason=self._state.reason,
+                since=self._state.since,
+                actor=self._state.actor,
+            )
 
     def reset(self) -> None:
         with self._lock:
-            self._last_heartbeat.clear()
-            self._states.clear()
+            self._state = _SafeModeInternalState()
+        self.order_controls.reset()
+        self.intent_guard.reset()
+        if hasattr(self._publisher, "reset"):
+            self._publisher.reset()
+
+    def kafka_history(self) -> List[Dict[str, object]]:
+        if hasattr(self._publisher, "history"):
+            return self._publisher.history()
+        return []
 
 
 controller = SafeModeController()
 
 
-@app.on_event("startup")
-async def _startup_monitor() -> None:  # pragma: no cover - FastAPI lifecycle glue
-    await controller.start()
+# ---------------------------------------------------------------------------
+# FastAPI endpoints
+# ---------------------------------------------------------------------------
 
 
-@app.on_event("shutdown")
-async def _shutdown_monitor() -> None:  # pragma: no cover - FastAPI lifecycle glue
-    await controller.stop()
-
-
-def _handle_enter(
-    account_id: str,
-    *,
-    reason: str,
-    actor: str,
-    automatic: bool = False,
-) -> Dict[str, object]:
-    try:
-        event = controller.enter(
-            account_id,
-            reason=reason,
-            actor=actor,
-            automatic=automatic,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    return event.to_response()
-
-
-def _handle_exit(account_id: str, *, reason: str, actor: str) -> Dict[str, object]:
-    try:
-        event = controller.exit(account_id, reason=reason, actor=actor)
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    return event.to_response()
-
-
-@app.post("/core/safe_mode/enter")
+@app.post("/safe_mode/enter", response_model=Dict[str, object])
 def enter_safe_mode(
-    account_id: str = Query(..., min_length=1),
-    reason: str = Query("manual_override", min_length=1),
-    actor_account: str = Depends(require_admin_account),
+    payload: Dict[str, str] = Body(...),
+    actor: Optional[str] = Header(default="system", alias="X-Actor"),
 ) -> Dict[str, object]:
-    """Manually engage safe mode for an account."""
+    reason = payload.get("reason", "").strip()
+    try:
+        controller.enter(reason=reason, actor=actor)
+    except ValueError as exc:  # invalid reason
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    return controller.status().to_response()
 
-    return _handle_enter(account_id, reason=reason, actor=actor_account)
+
+@app.post("/safe_mode/exit", response_model=Dict[str, object])
+def exit_safe_mode(actor: Optional[str] = Header(default="system", alias="X-Actor")) -> Dict[str, object]:
+    try:
+        controller.exit(actor=actor)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    return controller.status().to_response()
 
 
-@app.post("/core/safe_mode/exit")
-def exit_safe_mode(
-    account_id: str = Query(..., min_length=1),
-    reason: str = Query("manual_release", min_length=1),
-    actor_account: str = Depends(require_admin_account),
-) -> Dict[str, object]:
-    """Manually release safe mode for an account."""
-
-    return _handle_exit(account_id, reason=reason, actor=actor_account)
-
+@app.get("/safe_mode/status", response_model=Dict[str, object])
+def safe_mode_status() -> Dict[str, object]:
+    return controller.status().to_response()
