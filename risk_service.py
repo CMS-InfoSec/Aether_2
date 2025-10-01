@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -10,9 +11,9 @@ import math
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Set
 
 
 import httpx
@@ -56,6 +57,10 @@ _CAPITAL_ALLOCATOR_TOLERANCE = float(os.getenv("CAPITAL_ALLOCATOR_NAV_TOLERANCE"
 _BATTLE_MODE_VOL_THRESHOLD = float(os.getenv("BATTLE_MODE_VOL_THRESHOLD", "1.0"))
 DEFAULT_EXCHANGE = os.getenv("PRIMARY_EXCHANGE", "kraken")
 
+_UNIVERSE_SERVICE_URL = os.getenv("UNIVERSE_SERVICE_URL", "http://localhost:9000")
+_UNIVERSE_SERVICE_TIMEOUT = float(os.getenv("UNIVERSE_SERVICE_TIMEOUT", "5.0"))
+_UNIVERSE_CACHE_TTL = int(os.getenv("UNIVERSE_CACHE_TTL", "300"))
+
 
 Base = declarative_base()
 
@@ -76,6 +81,17 @@ class AccountRiskUsage(Base):
 
 class ConfigError(RuntimeError):
     """Raised when account specific configuration cannot be loaded."""
+
+
+class UniverseServiceError(RuntimeError):
+    """Raised when the trading universe service cannot be queried."""
+
+
+@dataclass(frozen=True)
+class UniverseSnapshot:
+    symbols: Set[str]
+    generated_at: datetime
+    thresholds: Dict[str, Any]
 
 
 class AccountRiskLimit(Base):
@@ -516,6 +532,11 @@ COST_THROTTLER = CostThrottler()
 EXCHANGE_ADAPTER = get_exchange_adapter(DEFAULT_EXCHANGE)
 
 
+_UNIVERSE_CACHE_LOCK = asyncio.Lock()
+_UNIVERSE_CACHE_SNAPSHOT: Optional[UniverseSnapshot] = None
+_UNIVERSE_CACHE_EXPIRY: Optional[datetime] = None
+
+
 
 @app.on_event("startup")
 def _on_startup() -> None:
@@ -656,6 +677,64 @@ def _load_sanction_hits(symbol: str) -> List[SanctionRecord]:
     return [record for record in records if is_blocking_status(record.status)]
 
 
+async def _get_approved_universe() -> UniverseSnapshot:
+    """Fetch the approved trading universe from the dedicated service."""
+
+    global _UNIVERSE_CACHE_SNAPSHOT, _UNIVERSE_CACHE_EXPIRY
+
+    now = datetime.now(timezone.utc)
+    async with _UNIVERSE_CACHE_LOCK:
+        if (
+            _UNIVERSE_CACHE_SNAPSHOT is not None
+            and _UNIVERSE_CACHE_EXPIRY is not None
+            and now < _UNIVERSE_CACHE_EXPIRY
+        ):
+            return _UNIVERSE_CACHE_SNAPSHOT
+
+    url = f"{_UNIVERSE_SERVICE_URL.rstrip('/')}/universe/approved"
+    try:
+        async with httpx.AsyncClient(timeout=_UNIVERSE_SERVICE_TIMEOUT) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise UniverseServiceError(
+            f"Universe service returned status {exc.response.status_code}"
+        ) from exc
+    except httpx.RequestError as exc:
+        raise UniverseServiceError("Unable to reach universe service") from exc
+
+    try:
+        payload = response.json()
+    except ValueError as exc:  # pragma: no cover - defensive
+        raise UniverseServiceError("Universe service returned invalid JSON") from exc
+
+    symbols = {str(symbol).upper() for symbol in payload.get("symbols", []) if symbol}
+    if not symbols:
+        raise UniverseServiceError("Universe service returned an empty universe")
+
+    generated_raw = payload.get("generated_at")
+    generated_at = now
+    if isinstance(generated_raw, str):
+        try:
+            generated_at = datetime.fromisoformat(generated_raw)
+        except ValueError:
+            generated_at = now
+    elif isinstance(generated_raw, (int, float)):
+        generated_at = datetime.fromtimestamp(float(generated_raw), tz=timezone.utc)
+
+    if generated_at.tzinfo is None:
+        generated_at = generated_at.replace(tzinfo=timezone.utc)
+
+    thresholds = payload.get("thresholds") or {}
+    snapshot = UniverseSnapshot(symbols=symbols, generated_at=generated_at, thresholds=thresholds)
+
+    async with _UNIVERSE_CACHE_LOCK:
+        _UNIVERSE_CACHE_SNAPSHOT = snapshot
+        _UNIVERSE_CACHE_EXPIRY = datetime.now(timezone.utc) + timedelta(seconds=_UNIVERSE_CACHE_TTL)
+
+    return snapshot
+
+
 async def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
     reasons: List[str] = []
     suggested_quantities: List[float] = []
@@ -666,6 +745,7 @@ async def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
     await _refresh_usage_from_fills(context.request.account_id, state)
     intent = context.request.intent
     trade_notional = context.intended_notional
+    normalized_instrument = str(intent.instrument_id).upper()
 
     def _register_violation(
         message: str, *, cooldown: bool = False, details: Optional[Dict[str, object]] = None
@@ -688,6 +768,27 @@ async def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
             nonlocal cooldown_until
             cooldown_until = cooldown_until or _determine_cooldown(limits)
         _audit_violation(context, message, details)
+
+    universe_snapshot: Optional[UniverseSnapshot]
+    try:
+        universe_snapshot = await _get_approved_universe()
+    except UniverseServiceError as exc:
+        _register_violation(
+            "Unable to confirm instrument approval with universe service",
+            cooldown=True,
+            details={"error": str(exc)},
+        )
+        universe_snapshot = None
+    else:
+        if normalized_instrument not in universe_snapshot.symbols:
+            _register_violation(
+                "Instrument not approved by trading universe service",
+                cooldown=True,
+                details={
+                    "instrument": normalized_instrument,
+                    "universe_generated_at": universe_snapshot.generated_at.isoformat(),
+                },
+            )
 
     esg_allowed, esg_entry = esg_filter.evaluate(str(intent.instrument_id))
     if not esg_allowed:

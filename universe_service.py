@@ -12,7 +12,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import requests
 from fastapi import Depends, FastAPI, HTTPException, Response
@@ -39,11 +39,10 @@ class UniverseWhitelist(Base):
 
     symbol: str = Column(String, primary_key=True)
     enabled: bool = Column(Boolean, nullable=False, default=True)
-    reasons: List[str] = Column(JSON, nullable=False, default=list)
-    generated_at: datetime = Column(
+    metrics_json: Dict[str, float] = Column(JSON, nullable=False, default=dict)
+    ts: datetime = Column(
         DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
     )
-    metrics_json: Dict[str, float] = Column(JSON, nullable=False, default=dict)
 
 
 class AuditLog(Base):
@@ -93,7 +92,7 @@ class UniverseThresholds(BaseModel):
     cap: float = Field(..., description="Minimum required market capitalisation in USD.")
     volume_global: float = Field(..., description="Minimum required global trading volume in USD.")
     volume_kraken: float = Field(..., description="Minimum required Kraken specific volume in USD.")
-    ann_vol: float = Field(..., description="Maximum acceptable annualised volatility.")
+    ann_vol: float = Field(..., description="Minimum annualised volatility required to participate.")
 
 
 class UniverseResponse(BaseModel):
@@ -176,6 +175,29 @@ def fetch_annualised_volatility(symbols: Iterable[str]) -> Dict[str, float]:
     return {symbol: 0.45 for symbol in symbols}
 
 
+def _latest_manual_overrides(
+    session: Session, symbols: Iterable[str]
+) -> Dict[str, Tuple[bool, str, datetime]]:
+    """Return the most recent manual override per symbol."""
+
+    symbol_list = sorted({symbol.upper() for symbol in symbols})
+    if not symbol_list:
+        return {}
+
+    overrides: Dict[str, Tuple[bool, str, datetime]] = {}
+    stmt = (
+        select(AuditLog.symbol, AuditLog.enabled, AuditLog.reason, AuditLog.created_at)
+        .where(AuditLog.symbol.in_(symbol_list))
+        .order_by(AuditLog.symbol, AuditLog.created_at.desc())
+    )
+
+    for symbol, enabled, reason, created_at in session.execute(stmt):
+        if symbol not in overrides:
+            overrides[symbol] = (enabled, reason, created_at)
+
+    return overrides
+
+
 def _compute_universe(session: Session) -> datetime:
     """Compute and persist the approved trading universe.
 
@@ -183,8 +205,10 @@ def _compute_universe(session: Session) -> datetime:
     """
 
     market_data = fetch_coingecko_market_data()
-    kraken_volume = fetch_kraken_volume(market_data.keys())
-    annualised_vol = fetch_annualised_volatility(market_data.keys())
+    symbols = list(market_data.keys())
+    kraken_volume = fetch_kraken_volume(symbols)
+    annualised_vol = fetch_annualised_volatility(symbols)
+    overrides = _latest_manual_overrides(session, symbols)
     generated_at = datetime.now(timezone.utc)
 
     for symbol, metrics in market_data.items():
@@ -207,28 +231,18 @@ def _compute_universe(session: Session) -> datetime:
             entry = UniverseWhitelist(symbol=symbol)
             session.add(entry)
 
+        override_details = overrides.get(symbol)
+        override_enabled: Optional[bool] = None
+        if override_details is not None:
+            override_enabled, override_reason, override_ts = override_details
+            metrics_blob["override_reason"] = override_reason
+            metrics_blob["override_at"] = override_ts.isoformat()
+        metrics_blob["computed_enabled"] = passes_thresholds
+        metrics_blob["override_applied"] = override_enabled is not None
+
         entry.metrics_json = metrics_blob
-        entry.generated_at = generated_at
-        entry.enabled = passes_thresholds
-        if not passes_thresholds:
-            failure_reason = (
-                "Failed thresholds: "
-                + ", ".join(
-                    key
-                    for key, value in (
-                        ("cap", metrics_blob["cap"] >= MARKET_CAP_THRESHOLD),
-                        ("volume_global", metrics_blob["volume_global"] >= GLOBAL_VOLUME_THRESHOLD),
-                        ("volume_kraken", metrics_blob["volume_kraken"] >= KRAKEN_VOLUME_THRESHOLD),
-                        ("ann_vol", metrics_blob["ann_vol"] >= ANNUALISED_VOL_THRESHOLD),
-                    )
-                    if not value
-                )
-            )
-            reasons = list(entry.reasons or [])
-            reasons.append(failure_reason)
-            entry.reasons = reasons
-        else:
-            entry.reasons = [reason for reason in entry.reasons or [] if not reason.startswith("Failed thresholds")]
+        entry.ts = generated_at
+        entry.enabled = override_enabled if override_enabled is not None else passes_thresholds
 
     session.commit()
     return generated_at
@@ -269,7 +283,7 @@ def get_universe(session: Session = Depends(get_session)) -> UniverseResponse:
     symbols = sorted({entry.symbol for entry in entries})
 
     latest_generated = session.execute(
-        select(UniverseWhitelist.generated_at).order_by(UniverseWhitelist.generated_at.desc())
+        select(UniverseWhitelist.ts).order_by(UniverseWhitelist.ts.desc())
     ).scalars().first()
 
     if latest_generated is None:
@@ -292,13 +306,11 @@ def override_symbol(payload: OverrideRequest, session: Session = Depends(get_ses
     symbol = payload.symbol.upper()
     entry = session.get(UniverseWhitelist, symbol)
     if entry is None:
-        raise HTTPException(status_code=404, detail=f"Symbol {symbol} does not exist in the universe.")
+        entry = UniverseWhitelist(symbol=symbol, metrics_json={})
+        session.add(entry)
 
-    reasons = list(entry.reasons or [])
-    reasons.append(payload.reason)
-    entry.reasons = reasons
     entry.enabled = payload.enabled
-    entry.generated_at = datetime.now(timezone.utc)
+    entry.ts = datetime.now(timezone.utc)
 
     audit_row = AuditLog(symbol=symbol, enabled=payload.enabled, reason=payload.reason)
     session.add(audit_row)
