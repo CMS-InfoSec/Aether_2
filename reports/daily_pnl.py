@@ -15,16 +15,31 @@ from reports.storage import ArtifactStorage, TimescaleSession, build_storage_fro
 LOGGER = logging.getLogger(__name__)
 
 FILL_QUERY = """
-SELECT account_id, order_id, side, quantity, price, fee
-FROM trading_fills
-WHERE fill_time >= %(start)s AND fill_time < %(end)s
+SELECT
+    acct.name AS account_id,
+    f.order_id,
+    o.side,
+    f.size,
+    f.price,
+    f.fee,
+    o.symbol AS instrument
+FROM fills AS f
+JOIN orders AS o ON o.order_id = f.order_id
+JOIN accounts AS acct ON acct.account_id = o.account_id
+WHERE f.fill_ts >= %(start)s AND f.fill_ts < %(end)s
 {account_filter}
 """
 
 ORDER_QUERY = """
-SELECT id AS order_id, account_id, instrument, submitted_qty
-FROM trading_orders
-WHERE created_at >= %(start)s AND created_at < %(end)s
+SELECT
+    o.order_id,
+    acct.name AS account_id,
+    o.symbol AS instrument,
+    o.size,
+    o.submitted_ts
+FROM orders AS o
+JOIN accounts AS acct ON acct.account_id = o.account_id
+WHERE o.submitted_ts >= %(start)s AND o.submitted_ts < %(end)s
 {account_filter}
 """
 
@@ -66,7 +81,7 @@ def fetch_daily_fills(
     account_filter = ""
     params: Dict[str, Any] = {"start": start, "end": end}
     if account_ids:
-        account_filter = " AND account_id = ANY(%(account_ids)s)"
+        account_filter = " AND acct.name = ANY(%(account_ids)s)"
         params["account_ids"] = list(account_ids)
     query = FILL_QUERY.format(account_filter=account_filter)
     fills = _fetch_rows(session, query, params)
@@ -84,7 +99,7 @@ def fetch_daily_orders(
     account_filter = ""
     params: Dict[str, Any] = {"start": start, "end": end}
     if account_ids:
-        account_filter = " AND account_id = ANY(%(account_ids)s)"
+        account_filter = " AND acct.name = ANY(%(account_ids)s)"
         params["account_ids"] = list(account_ids)
     query = ORDER_QUERY.format(account_filter=account_filter)
     orders = _fetch_rows(session, query, params)
@@ -105,9 +120,9 @@ def compute_daily_pnl(
     for fill in fills:
         account_id = str(fill["account_id"])
         order_id = str(fill["order_id"])
-        instrument = order_instruments.get(order_id, "UNKNOWN")
+        instrument = fill.get("instrument") or order_instruments.get(order_id, "UNKNOWN")
         side = str(fill["side"]).upper()
-        quantity = float(fill["quantity"])
+        quantity = float(fill["size"])
         price = float(fill["price"])
         fee = float(fill.get("fee", 0.0))
         notional = quantity * price
