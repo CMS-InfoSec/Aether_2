@@ -53,50 +53,48 @@ class RecordingSession:
             end = params.get("end")
             rows: List[Dict[str, Any]] = []
             for fill in self._fills:
-                fill_ts = fill["fill_ts"]
+                fill_ts = fill["fill_time"]
                 if start and fill_ts < start:
                     continue
                 if end and fill_ts >= end:
                     continue
                 order = self._orders[fill["order_id"]]
-                account = self._accounts[order["account_id"]]
-                account_name = account["name"]
-                if account_filter and account_name not in account_filter:
+                account_id = order["account_id"]
+                if account_filter and account_id not in account_filter:
                     continue
                 rows.append(
                     {
-                        "account_id": account_name,
+                        "account_id": account_id,
                         "order_id": fill["order_id"],
                         "side": order["side"],
                         "size": fill["size"],
                         "price": fill["price"],
                         "fee": fill.get("fee"),
-                        "instrument": order["symbol"],
+                        "market": order["market"],
                     }
                 )
             return FakeResult(rows)
 
-        if "o.submitted_ts" in normalized_query:
+        if "o.submitted_at" in normalized_query:
             start = params.get("start")
             end = params.get("end")
             rows = []
             for order in self._orders.values():
-                submitted = order["submitted_ts"]
+                submitted = order["submitted_at"]
                 if start and submitted < start:
                     continue
                 if end and submitted >= end:
                     continue
-                account = self._accounts[order["account_id"]]
-                account_name = account["name"]
-                if account_filter and account_name not in account_filter:
+                account_id = order["account_id"]
+                if account_filter and account_id not in account_filter:
                     continue
                 rows.append(
                     {
                         "order_id": order["order_id"],
-                        "account_id": account_name,
-                        "instrument": order["symbol"],
+                        "account_id": account_id,
+                        "market": order["market"],
                         "size": order["size"],
-                        "submitted_ts": submitted,
+                        "submitted_at": submitted,
                     }
                 )
             return FakeResult(rows)
@@ -109,41 +107,41 @@ def sample_session() -> RecordingSession:
     from datetime import datetime, timezone
 
     accounts = [
-        {"account_id": 1, "name": "alpha"},
-        {"account_id": 2, "name": "beta"},
+        {"account_id": "alpha"},
+        {"account_id": "beta"},
     ]
     orders = [
         {
             "order_id": "ord-1",
-            "account_id": 1,
-            "symbol": "BTC-USD",
+            "account_id": "alpha",
+            "market": "BTC-USD",
             "side": "BUY",
             "size": 1,
-            "submitted_ts": datetime(2024, 5, 1, 0, 0, tzinfo=timezone.utc),
+            "submitted_at": datetime(2024, 5, 1, 0, 0, tzinfo=timezone.utc),
         },
         {
             "order_id": "ord-2",
-            "account_id": 1,
-            "symbol": "BTC-USD",
+            "account_id": "alpha",
+            "market": "BTC-USD",
             "side": "SELL",
             "size": 1,
-            "submitted_ts": datetime(2024, 5, 1, 1, 0, tzinfo=timezone.utc),
+            "submitted_at": datetime(2024, 5, 1, 1, 0, tzinfo=timezone.utc),
         },
         {
             "order_id": "ord-3",
-            "account_id": 2,
-            "symbol": "ETH-USD",
+            "account_id": "beta",
+            "market": "ETH-USD",
             "side": "SELL",
             "size": 2,
-            "submitted_ts": datetime(2024, 5, 1, 2, 0, tzinfo=timezone.utc),
+            "submitted_at": datetime(2024, 5, 1, 2, 0, tzinfo=timezone.utc),
         },
     ]
     fills = [
         {
             "fill_id": "fill-1",
             "order_id": "ord-1",
-            "symbol": "BTC-USD",
-            "fill_ts": datetime(2024, 5, 1, 0, 15, tzinfo=timezone.utc),
+            "market": "BTC-USD",
+            "fill_time": datetime(2024, 5, 1, 0, 15, tzinfo=timezone.utc),
             "price": 100,
             "size": 1,
             "fee": 0.5,
@@ -151,8 +149,8 @@ def sample_session() -> RecordingSession:
         {
             "fill_id": "fill-2",
             "order_id": "ord-2",
-            "symbol": "BTC-USD",
-            "fill_ts": datetime(2024, 5, 1, 1, 15, tzinfo=timezone.utc),
+            "market": "BTC-USD",
+            "fill_time": datetime(2024, 5, 1, 1, 15, tzinfo=timezone.utc),
             "price": 110,
             "size": 1,
             "fee": 0.6,
@@ -160,8 +158,8 @@ def sample_session() -> RecordingSession:
         {
             "fill_id": "fill-3",
             "order_id": "ord-3",
-            "symbol": "ETH-USD",
-            "fill_ts": datetime(2024, 5, 1, 2, 15, tzinfo=timezone.utc),
+            "market": "ETH-USD",
+            "fill_time": datetime(2024, 5, 1, 2, 15, tzinfo=timezone.utc),
             "price": 50,
             "size": 2,
             "fee": 0.4,

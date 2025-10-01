@@ -16,30 +16,28 @@ LOGGER = logging.getLogger(__name__)
 
 FILL_QUERY = """
 SELECT
-    acct.name AS account_id,
+    o.account_id,
     f.order_id,
     o.side,
     f.size,
     f.price,
     f.fee,
-    o.symbol AS instrument
+    o.market
 FROM fills AS f
 JOIN orders AS o ON o.order_id = f.order_id
-JOIN accounts AS acct ON acct.account_id = o.account_id
-WHERE f.fill_ts >= %(start)s AND f.fill_ts < %(end)s
+WHERE f.fill_time >= %(start)s AND f.fill_time < %(end)s
 {account_filter}
 """
 
 ORDER_QUERY = """
 SELECT
     o.order_id,
-    acct.name AS account_id,
-    o.symbol AS instrument,
+    o.account_id,
+    o.market,
     o.size,
-    o.submitted_ts
+    o.submitted_at
 FROM orders AS o
-JOIN accounts AS acct ON acct.account_id = o.account_id
-WHERE o.submitted_ts >= %(start)s AND o.submitted_ts < %(end)s
+WHERE o.submitted_at >= %(start)s AND o.submitted_at < %(end)s
 {account_filter}
 """
 
@@ -81,7 +79,7 @@ def fetch_daily_fills(
     account_filter = ""
     params: Dict[str, Any] = {"start": start, "end": end}
     if account_ids:
-        account_filter = " AND acct.name = ANY(%(account_ids)s)"
+        account_filter = " AND o.account_id = ANY(%(account_ids)s)"
         params["account_ids"] = list(account_ids)
     query = FILL_QUERY.format(account_filter=account_filter)
     fills = _fetch_rows(session, query, params)
@@ -99,20 +97,22 @@ def fetch_daily_orders(
     account_filter = ""
     params: Dict[str, Any] = {"start": start, "end": end}
     if account_ids:
-        account_filter = " AND acct.name = ANY(%(account_ids)s)"
+        account_filter = " AND o.account_id = ANY(%(account_ids)s)"
         params["account_ids"] = list(account_ids)
     query = ORDER_QUERY.format(account_filter=account_filter)
     orders = _fetch_rows(session, query, params)
-    order_to_instrument: Dict[str, str] = {
-        str(order["order_id"]): order["instrument"] for order in orders
-    }
+    order_to_market: Dict[str, str] = {}
+    for order in orders:
+        order_id = str(order["order_id"])
+        market = order.get("market")
+        order_to_market[order_id] = str(market) if market is not None else "UNKNOWN"
     LOGGER.debug("Fetched %d orders between %s and %s", len(orders), start, end)
-    return order_to_instrument
+    return order_to_market
 
 
 def compute_daily_pnl(
     fills: Iterable[Mapping[str, Any]],
-    order_instruments: Mapping[str, str],
+    order_markets: Mapping[str, str],
 ) -> List[DailyPnlRow]:
     aggregates: MutableMapping[tuple[str, str], Dict[str, float]] = defaultdict(
         lambda: {"executed_quantity": 0.0, "gross_pnl": 0.0, "fees": 0.0}
@@ -120,7 +120,9 @@ def compute_daily_pnl(
     for fill in fills:
         account_id = str(fill["account_id"])
         order_id = str(fill["order_id"])
-        instrument = fill.get("instrument") or order_instruments.get(order_id, "UNKNOWN")
+        instrument = str(
+            fill.get("market") or order_markets.get(order_id, "UNKNOWN")
+        )
         side = str(fill["side"]).upper()
         quantity = float(fill["size"])
         price = float(fill["price"])
@@ -196,10 +198,10 @@ def generate_daily_pnl(
     start = datetime.combine(report_date, datetime.min.time(), tzinfo=timezone.utc)
     end = start + timedelta(days=1)
     fills = fetch_daily_fills(session, start=start, end=end, account_ids=account_ids)
-    order_instruments = fetch_daily_orders(
+    order_markets = fetch_daily_orders(
         session, start=start, end=end, account_ids=account_ids
     )
-    rows = compute_daily_pnl(fills, order_instruments)
+    rows = compute_daily_pnl(fills, order_markets)
 
     metadata = {
         "report_date": report_date.isoformat(),

@@ -15,17 +15,26 @@ from reports.storage import ArtifactStorage, TimescaleSession, build_storage_fro
 LOGGER = logging.getLogger(__name__)
 
 ORDER_QUERY = """
-SELECT account_id, instrument, SUM(submitted_qty) AS submitted_qty, COUNT(*) AS order_count
-FROM trading_orders
-WHERE created_at >= %(start)s AND created_at < %(end)s
-GROUP BY account_id, instrument
+SELECT
+    account_id,
+    market AS instrument,
+    COALESCE(SUM(size), 0) AS submitted_qty,
+    COUNT(*) AS order_count
+FROM orders
+WHERE submitted_at >= %(start)s AND submitted_at < %(end)s
+GROUP BY account_id, market
 """
 
 FILL_QUERY = """
-SELECT account_id, instrument, SUM(quantity * price) AS notional, COUNT(*) AS fill_count
-FROM trading_fills
-WHERE fill_time >= %(start)s AND fill_time < %(end)s
-GROUP BY account_id, instrument
+SELECT
+    o.account_id,
+    f.market AS instrument,
+    COALESCE(SUM(f.size * f.price), 0) AS notional,
+    COUNT(*) AS fill_count
+FROM fills AS f
+JOIN orders AS o ON o.order_id = f.order_id
+WHERE f.fill_time >= %(start)s AND f.fill_time < %(end)s
+GROUP BY o.account_id, f.market
 """
 
 AUDIT_QUERY = """
