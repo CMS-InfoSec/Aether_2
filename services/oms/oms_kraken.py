@@ -9,6 +9,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -23,8 +24,15 @@ except Exception:  # pragma: no cover - watchdog is optional during tests
     Observer = None  # type: ignore[assignment]
     PollingObserver = None  # type: ignore[assignment]
 
+try:  # pragma: no cover - optional dependency for cluster environments
+    from kubernetes import watch as kube_watch
+except Exception:  # pragma: no cover - kubernetes watch may be unavailable
+    kube_watch = None  # type: ignore[assignment]
+
 
 LOGGER = logging.getLogger(__name__)
+
+ANNOTATION_ROTATED_AT = "aether.kraken/lastRotatedAt"
 
 
 def _default_secret_path(account_id: str) -> Optional[Path]:
@@ -48,6 +56,16 @@ def _default_observer_factory() -> Optional[Any]:
     if PollingObserver is not None:
         return PollingObserver()
     return None
+
+
+def _default_watch_factory() -> Optional[Any]:
+    if kube_watch is None:
+        return None
+    try:
+        return kube_watch.Watch()
+    except Exception:  # pragma: no cover - kubernetes watch creation errors
+        LOGGER.debug("Unable to create Kubernetes watch", exc_info=True)
+        return None
 
 
 def _sanitize_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
@@ -96,7 +114,26 @@ def _material_changed(old: Dict[str, Any], new: Dict[str, Any]) -> bool:
     for key in ("api_key", "api_secret"):
         if old.get(key) != new.get(key):
             return True
+    old_meta = old.get("metadata") or {}
+    new_meta = new.get("metadata") or {}
+    if isinstance(old_meta, dict) and isinstance(new_meta, dict):
+        old_rotated = _extract_rotated_at(old_meta)
+        new_rotated = _extract_rotated_at(new_meta)
+        if old_rotated != new_rotated:
+            return True
     return False
+
+
+def _extract_rotated_at(metadata: Dict[str, Any]) -> Optional[str]:
+    rotated = metadata.get("rotated_at") or metadata.get("last_rotated_at")
+    if rotated:
+        return str(rotated)
+    annotations = metadata.get("annotations")
+    if isinstance(annotations, dict):
+        value = annotations.get(ANNOTATION_ROTATED_AT)
+        if value:
+            return str(value)
+    return None
 
 
 @dataclass
@@ -118,6 +155,7 @@ class KrakenCredentialWatcher:
         secret_path: Optional[Path] = None,
         manager: Optional[KrakenSecretManager] = None,
         observer_factory: Optional[Callable[[], Any]] = None,
+        watch_factory: Optional[Callable[[], Any]] = None,
         refresh_interval: float = 30.0,
         debounce_seconds: float = 0.5,
     ) -> None:
@@ -127,6 +165,7 @@ class KrakenCredentialWatcher:
         self._refresh_interval = refresh_interval
         self._debounce_seconds = debounce_seconds
         self._observer_factory = observer_factory or _default_observer_factory
+        self._watch_factory = watch_factory or _default_watch_factory
 
         self._lock = threading.RLock()
         self._snapshot = _CredentialSnapshot(version=0, payload={})
@@ -140,8 +179,11 @@ class KrakenCredentialWatcher:
         )
 
         self._observer: Any | None = None
+        self._watch: Any | None = None
+        self._watch_thread: threading.Thread | None = None
         self._load_initial_snapshot()
         self._start_observer()
+        self._start_kubernetes_watch()
         self._thread.start()
 
     # ------------------------------------------------------------------
@@ -181,6 +223,15 @@ class KrakenCredentialWatcher:
                 self._observer.join(timeout=2.0)
             except Exception:  # pragma: no cover - observer specific errors
                 LOGGER.exception("Failed stopping watchdog observer")
+        if self._watch is not None:
+            try:
+                self._watch.stop()
+            except Exception:  # pragma: no cover - defensive stop
+                LOGGER.debug("Failed stopping kubernetes watch", exc_info=True)
+        if self._watch_thread is not None and self._watch_thread.is_alive():
+            self._watch_thread.join(timeout=2.0)
+        self._watch_thread = None
+        self._watch = None
         if self._thread.is_alive():
             self._thread.join(timeout=2.0)
         with self._instances_lock:
@@ -258,6 +309,57 @@ class KrakenCredentialWatcher:
         observer.start()
         self._observer = observer
 
+    def _start_kubernetes_watch(self) -> None:
+        if self._watch_thread is not None:
+            return
+        if not callable(self._watch_factory):
+            return
+        watch = self._watch_factory()
+        if watch is None:
+            return
+        core_v1 = getattr(self._manager.secret_store, "core_v1", None)
+        namespace = getattr(self._manager.secret_store, "namespace", None)
+        if not hasattr(core_v1, "list_namespaced_secret") or namespace is None:
+            return
+
+        def _loop() -> None:
+            field_selector = f"metadata.name={self._manager.secret_name}"
+            while not self._stop_event.is_set():
+                try:
+                    stream = watch.stream(
+                        core_v1.list_namespaced_secret,
+                        namespace=namespace,
+                        field_selector=field_selector,
+                        timeout_seconds=5,
+                    )
+                    for event in stream:
+                        if self._stop_event.is_set():
+                            break
+                        if isinstance(event, dict):
+                            event_type = str(event.get("type", "")).upper()
+                            if event_type in {"ADDED", "MODIFIED", "DELETED", "BOOKMARK"}:
+                                self._reload_signal.set()
+                                continue
+                        self._reload_signal.set()
+                except Exception:  # pragma: no cover - kube watch failures
+                    LOGGER.debug("Kubernetes watch error", exc_info=True)
+                    time.sleep(1.0)
+                else:
+                    break
+            try:
+                watch.stop()
+            except Exception:  # pragma: no cover - defensive cleanup
+                LOGGER.debug("Failed to stop kubernetes watch", exc_info=True)
+
+        thread = threading.Thread(
+            target=_loop,
+            name=f"kraken-secret-watch-{self.account_id}",
+            daemon=True,
+        )
+        thread.start()
+        self._watch_thread = thread
+        self._watch = watch
+
     def _run(self) -> None:
         while not self._stop_event.is_set():
             triggered = self._reload_signal.wait(timeout=self._refresh_interval)
@@ -311,12 +413,15 @@ class KrakenCredentialWatcher:
         secret = data.get("api_secret") or data.get("secret")
         if not key or not secret:
             raise ValueError(f"Credential file at {path} missing key/secret")
+        rotated_at = datetime.now(timezone.utc).isoformat()
         metadata = _sanitize_metadata({
             "secret_path": str(path),
             "material_present": True,
             "api_key": key,
             "api_secret": secret,
+            "rotated_at": rotated_at,
         })
+        metadata["rotated_at"] = rotated_at
         return {"api_key": key, "api_secret": secret, "metadata": metadata}
 
 
