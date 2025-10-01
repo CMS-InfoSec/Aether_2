@@ -16,11 +16,20 @@ from reports.storage import ArtifactStorage, TimescaleSession, build_storage_fro
 LOGGER = logging.getLogger(__name__)
 
 SHAP_QUERY = """
-SELECT account_id, feature_name, shap_value, inference_time
+SELECT account_id, feature_name, shap_value, inference_time, model_version, metadata
 FROM ml_shap_outputs
 WHERE inference_time >= %(start)s AND inference_time < %(end)s
 {account_filter}
 """
+
+EXPECTED_SHAP_COLUMNS = {
+    "account_id",
+    "feature_name",
+    "shap_value",
+    "inference_time",
+    "model_version",
+    "metadata",
+}
 
 @dataclass
 class WeeklyFeatureAttribution:
@@ -46,6 +55,18 @@ def _fetch(session: TimescaleSession, query: str, params: Mapping[str, Any]) -> 
     return ResultSetAdapter(result).as_dicts()
 
 
+def _validate_shap_rows(rows: Iterable[Mapping[str, Any]]) -> None:
+    for row in rows:
+        missing = EXPECTED_SHAP_COLUMNS.difference(row.keys())
+        if missing:
+            missing_columns = ", ".join(sorted(missing))
+            raise ValueError(
+                f"ml_shap_outputs row missing expected columns: {missing_columns}"
+            )
+        # Only need to validate one row since the query schema is static.
+        break
+
+
 def fetch_shap_values(
     session: TimescaleSession,
     *,
@@ -59,7 +80,10 @@ def fetch_shap_values(
         account_filter = " AND account_id = ANY(%(account_ids)s)"
         params["account_ids"] = list(account_ids)
     query = SHAP_QUERY.format(account_filter=account_filter)
-    return _fetch(session, query, params)
+    rows = _fetch(session, query, params)
+    if rows:
+        _validate_shap_rows(rows)
+    return rows
 
 
 def summarize_weekly_shap(rows: Iterable[Mapping[str, Any]]) -> List[WeeklyFeatureAttribution]:
