@@ -49,10 +49,10 @@ class AuditLogWriter:
         event_id = uuid.uuid4()
         params = {
             "event_id": event_id,
-            "action": "report.artifact.stored",
             "entity_type": "report_artifact",
             "entity_id": entity_id,
             "actor": actor,
+            "action": "report.artifact.stored",
             "event_time": event_time,
             "metadata": json.dumps(metadata),
         }
@@ -61,19 +61,19 @@ class AuditLogWriter:
             """
             INSERT INTO audit_log (
                 event_id,
-                action,
                 entity_type,
                 entity_id,
                 actor,
+                action,
                 event_time,
                 metadata
             )
             VALUES (
                 %(event_id)s,
-                %(action)s,
                 %(entity_type)s,
                 %(entity_id)s,
                 %(actor)s,
+                %(action)s,
                 %(event_time)s,
                 %(metadata)s::jsonb
             )
