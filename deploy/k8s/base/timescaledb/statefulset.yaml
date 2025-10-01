@@ -3,13 +3,16 @@ kind: StatefulSet
 metadata:
   name: timescaledb
   labels:
+
     app.kubernetes.io/name: timescaledb
     app.kubernetes.io/component: database
+
 spec:
   serviceName: timescaledb
   replicas: 1
   selector:
     matchLabels:
+
       app.kubernetes.io/name: timescaledb
   template:
     metadata:
@@ -30,12 +33,14 @@ spec:
             requests:
               cpu: 500m
               memory: 1Gi
+
             limits:
               cpu: 1
               memory: 2Gi
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
+
       securityContext:
         fsGroup: 999
   volumeClaimTemplates:
@@ -47,3 +52,4 @@ spec:
         resources:
           requests:
             storage: 50Gi
+

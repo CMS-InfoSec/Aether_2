@@ -1,0 +1,15 @@
+{
+  "title": "Drift Monitoring",
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Mid Price Drift",
+      "targets": [
+        {
+          "expr": "avg_over_time(pricing_service_mid_price_delta[5m])",
+          "legendFormat": "Drift"
+        }
+      ]
+    }
+  ]
+}

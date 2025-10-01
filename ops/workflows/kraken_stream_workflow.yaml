@@ -1,0 +1,39 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  name: kraken-streaming
+  labels:
+    workflow-type: realtime
+spec:
+  entrypoint: run
+  templates:
+    - name: run
+      container:
+        image: python:3.11-slim
+        command:
+          - python
+          - data/ingest/kraken_ws.py
+          - BTC/USD
+          - ETH/USD
+        args:
+          - --kafka-bootstrap
+          - kafka:9092
+          - --database-url
+          - postgresql://feast:feast@timescaledb:5432/aether
+          - --snapshot-interval
+          - "120"
+        workingDir: /workspace
+        env:
+          - name: PYTHONUNBUFFERED
+            value: "1"
+        volumeMounts:
+          - name: workspace
+            mountPath: /workspace
+  volumeClaimTemplates:
+    - metadata:
+        name: workspace
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi

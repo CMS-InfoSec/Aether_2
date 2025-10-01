@@ -1,0 +1,15 @@
+{
+  "title": "Fee Spend",
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Fee Spend per Hour",
+      "targets": [
+        {
+          "expr": "sum(increase(order_gateway_fee_spend_usd[1h]))",
+          "legendFormat": "Fee Spend"
+        }
+      ]
+    }
+  ]
+}

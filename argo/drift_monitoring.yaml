@@ -1,0 +1,65 @@
+apiVersion: argoproj.io/v1alpha1
+kind: CronWorkflow
+metadata:
+  name: ml-drift-monitoring
+  labels:
+    workflows.argoproj.io/controller-instanceid: ml-platform
+spec:
+  schedule: "0 6 * * *"
+  concurrencyPolicy: Forbid
+  workflowSpec:
+    entrypoint: monitor
+    templates:
+      - name: monitor
+        steps:
+          - - name: fetch-data
+              template: fetch-data
+            - name: compute-drift
+              template: compute-drift
+            - name: alert
+              when: "{{steps.compute-drift.outputs.parameters.has_alerts}} == true"
+              template: alert
+      - name: fetch-data
+        container:
+          image: ghcr.io/aether/ml-runtime:latest
+          command: ["python", "-m", "ml.monitoring.fetch_production_snapshot"]
+          envFrom:
+            - configMapRef:
+                name: ml-config
+            - secretRef:
+                name: observability-credentials
+      - name: compute-drift
+        script:
+          image: ghcr.io/aether/ml-runtime:latest
+          command: [python]
+          source: |
+            import json
+            from pathlib import Path
+            import pandas as pd
+            from ml.monitoring.drift import generate_drift_report
+
+            baseline = pd.read_parquet("/artifacts/baseline.parquet")
+            production = pd.read_parquet("/artifacts/production.parquet")
+            reports = generate_drift_report(baseline, production)
+            alerts = [r for r in reports if r.alert]
+            Path("/tmp/drift_report.json").write_text(json.dumps([r.to_dict() for r in reports], indent=2))
+            Path("/tmp/has_alerts").write_text("true" if alerts else "false")
+        outputs:
+          parameters:
+            - name: has_alerts
+              valueFrom:
+                path: /tmp/has_alerts
+          artifacts:
+            - name: drift_report
+              path: /tmp/drift_report.json
+      - name: alert
+        inputs:
+          artifacts:
+            - name: drift_report
+              path: /reports/drift_report.json
+        container:
+          image: ghcr.io/aether/observability-cli:latest
+          command: ["obsctl", "alerts", "send", "--channel", "ml-ops", "--file", "/reports/drift_report.json"]
+          envFrom:
+            - secretRef:
+                name: observability-credentials

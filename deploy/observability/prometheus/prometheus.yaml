@@ -1,0 +1,130 @@
+apiVersion: monitoring.coreos.com/v1
+kind: Prometheus
+metadata:
+  name: aether
+spec:
+  replicas: 2
+  serviceAccountName: prometheus
+  serviceMonitorSelector:
+    matchLabels:
+      release: aether
+  podMonitorSelector:
+    matchLabels:
+      release: aether
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: 2
+      memory: 4Gi
+  ruleSelector:
+    matchLabels:
+      app: aether-prometheus-rules
+  additionalScrapeConfigs:
+    name: prometheus-additional-scrape
+    key: scrape-configs.yaml
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+spec:
+  selector:
+    prometheus: aether
+  ports:
+    - name: web
+      port: 9090
+      targetPort: web
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: aether-rules
+  labels:
+    app: aether-prometheus-rules
+spec:
+  groups:
+    - name: trading-kpis
+      rules:
+        - record: trading:orders:rate5m
+          expr: sum(rate(order_gateway_orders_total[5m]))
+        - alert: TradingVolumeDrop
+          expr: sum(rate(order_gateway_filled_notional_usd[15m])) < 1000
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: Trading volume dropped below threshold
+            description: Investigate connectivity to exchanges.
+    - name: fee-monitoring
+      rules:
+        - alert: ExcessiveFeeSpend
+          expr: sum(increase(order_gateway_fee_spend_usd[1h])) > 500
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Fee spend exceeding normal bounds
+            description: Review routing strategies.
+    - name: drift-monitoring
+      rules:
+        - alert: PricingDriftHigh
+          expr: abs(avg_over_time(pricing_service_mid_price_delta[5m])) > 0.5
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: Market data drift detected
+            description: Check data sources.
+    - name: circuit-breakers
+      rules:
+        - alert: CircuitBreakerEngaged
+          expr: max_over_time(order_gateway_circuit_breaker_engaged[1m]) > 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: Circuit breaker engaged
+            description: Verify risk thresholds.
+    - name: slos
+      rules:
+        - record: trading:latency:availability
+          expr: 1 - (sum(rate(order_gateway_request_errors_total[5m])) / sum(rate(order_gateway_requests_total[5m])))
+        - alert: TradingSLOBreach
+          expr: trading:latency:availability < 0.995
+          for: 15m
+          labels:
+            severity: critical
+          annotations:
+            summary: SLO breach on trading availability
+            description: Investigate upstream dependencies.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-additional-scrape
+  labels:
+    app: prometheus
+    release: aether
+data:
+  scrape-configs.yaml: |
+    - job_name: fastapi
+      honor_labels: true
+      kubernetes_sd_configs:
+        - role: pod
+      relabel_configs:
+        - source_labels: [__meta_kubernetes_pod_label_app]
+          action: keep
+          regex: order-gateway|pricing-service
+        - source_labels: [__meta_kubernetes_pod_container_port_name]
+          action: keep
+          regex: http
+    - job_name: kafka
+      static_configs:
+        - targets: ['bootstrap.kafka:9092']

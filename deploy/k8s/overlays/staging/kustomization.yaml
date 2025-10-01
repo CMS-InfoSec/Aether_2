@@ -4,6 +4,7 @@ nameSuffix: -staging
 namespace: aether-staging
 resources:
   - ../../base
+
 patches:
   - target:
       kind: Deployment
@@ -33,3 +34,4 @@ patches:
       - op: add
         path: /data/environment
         value: staging
+

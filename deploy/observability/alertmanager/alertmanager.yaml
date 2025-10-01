@@ -1,0 +1,54 @@
+apiVersion: monitoring.coreos.com/v1
+kind: Alertmanager
+metadata:
+  name: aether
+spec:
+  replicas: 2
+  configSecret: alertmanager-config
+  secrets:
+    - prometheus-slack
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  labels:
+    app: alertmanager
+    release: aether
+data:
+  alertmanager-config.yaml: |
+    route:
+      receiver: default
+      group_by: ['alertname']
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 3h
+    receivers:
+      - name: default
+        slack_configs:
+          - channel: '#aether-alerts'
+            api_url_file: /etc/alertmanager/secrets/prometheus-slack/webhook-url
+            title: '{{ template "aether.title" . }}'
+            text: '{{ template "aether.body" . }}'
+    templates:
+      - /etc/alertmanager/templates/*.tmpl
+    inhibit_rules:
+      - source_match:
+          severity: critical
+        target_match:
+          severity: warning
+        equal: ['alertname']
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-templates
+  labels:
+    app: alertmanager
+data:
+  aether.tmpl: |
+    {{ define "aether.title" }}[{{ .Status | toUpper }}] {{ .CommonLabels.alertname }}{{ end }}
+    {{ define "aether.body" }}
+    *Severity*: {{ .CommonLabels.severity }}
+    *Description*: {{ .CommonAnnotations.description }}
+    {{ end }}

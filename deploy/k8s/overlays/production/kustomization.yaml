@@ -1,5 +1,6 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
+
 namespace: aether-prod
 nameSuffix: -prod
 resources:
@@ -33,3 +34,4 @@ patches:
       - op: add
         path: /data/environment
         value: production
+

@@ -1,0 +1,36 @@
+name: ArgoCD Sync Trigger
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'deploy/**'
+      - '.github/workflows/argocd-sync.yml'
+  workflow_dispatch:
+
+jobs:
+  notify-argocd:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger ArgoCD refresh
+        env:
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_TOKEN: ${{ secrets.ARGOCD_TOKEN }}
+        run: |
+          if [ -z "$ARGOCD_SERVER" ] || [ -z "$ARGOCD_TOKEN" ]; then
+            echo "ArgoCD server or token not configured; skipping"
+            exit 0
+          fi
+          curl -sk -X POST "${ARGOCD_SERVER}/api/v1/applications/aether-prod/sync" \
+            -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d '{"revision": "main"}'
+          curl -sk -X POST "${ARGOCD_SERVER}/api/v1/applications/aether-staging/sync" \
+            -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d '{"revision": "main"}'
+          curl -sk -X POST "${ARGOCD_SERVER}/api/v1/applications/aether-observability/sync" \
+            -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d '{"revision": "main"}'
