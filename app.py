@@ -10,6 +10,7 @@ from auth.routes import get_auth_service, router as auth_router
 from auth.service import AdminRepository, AuthService, SessionStore
 from services.alert_manager import setup_alerting
 from services.report_service import router as reports_router
+from exposure_forecast import router as exposure_router
 from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
 from shared.correlation import CorrelationIdMiddleware
 
@@ -33,6 +34,7 @@ def create_app() -> FastAPI:
     app.dependency_overrides[get_auth_service] = _get_auth_service
     app.include_router(auth_router)
     app.include_router(reports_router)
+    app.include_router(exposure_router)
 
     app.state.audit_store = audit_store
     app.state.audit_logger = audit_logger
