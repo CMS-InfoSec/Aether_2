@@ -1,14 +1,14 @@
 """FastAPI service for managing Kraken API secrets in Kubernetes."""
 from __future__ import annotations
 
-import base64
 import hashlib
 import logging
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -40,6 +40,11 @@ from services.secrets.middleware import (
     TRUSTED_HOSTS,
     TRUSTED_PROXY_CLIENTS,
 )
+from services.secrets.secure_secrets import (
+    EnvelopeEncryptor,
+    EncryptedSecretEnvelope,
+    SecretsMetadataStore,
+)
 from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
 
 
@@ -52,6 +57,88 @@ app.add_middleware(ForwardedSchemeMiddleware)
 _audit_store = AuditLogStore()
 _audit_logger = TimescaleAuditLogger(_audit_store)
 _auditor = SensitiveActionRecorder(_audit_logger)
+
+_encryptor = EnvelopeEncryptor()
+
+
+def _encrypt_credentials(
+    *, account_id: str, api_key: str, api_secret: str
+) -> Tuple[EncryptedSecretEnvelope, SecretsMetadataStore, Dict[str, str]]:
+    envelope = _encryptor.encrypt_credentials(
+        account_id,
+        api_key=api_key,
+        api_secret=api_secret,
+    )
+    store = SecretsMetadataStore(account_id=account_id)
+    return envelope, store, envelope.to_secret_data()
+
+
+def _perform_secure_rotation(
+    *,
+    account_id: str,
+    api_key: str,
+    api_secret: str,
+    api: CoreV1Api,
+    request: Request,
+) -> Dict[str, Any]:
+    existing_metadata = _read_secret_metadata(
+        api, name=_secret_name(account_id), namespace=KRAKEN_SECRET_NAMESPACE
+    )
+    before_for_audit = _serialize_metadata_for_audit(existing_metadata)
+
+    envelope, meta_store, secret_data = _encrypt_credentials(
+        account_id=account_id,
+        api_key=api_key,
+        api_secret=api_secret,
+    )
+
+    updated_metadata = _upsert_secret(
+        api,
+        account_id=account_id,
+        secret_data=secret_data,
+        namespace=KRAKEN_SECRET_NAMESPACE,
+        existing_metadata=existing_metadata,
+    )
+
+    recorded_meta = meta_store.record_rotation(
+        kms_key_id=envelope.kms_key_id,
+        last_rotated=updated_metadata["last_rotated_at"],
+    )
+
+    ip_address = request.client.host if request.client else None
+    hashed_ip = _hash_ip(ip_address)
+
+    audit_after = {
+        "account_id": account_id,
+        "actor": account_id,
+        "secret_name": updated_metadata["secret_name"],
+        "rotated_at": updated_metadata["last_rotated_at"].isoformat(),
+        "kms_key_id": envelope.kms_key_id,
+        "ip_hash": hashed_ip,
+    }
+
+    _auditor.record(
+        action="kraken.secret.rotate",
+        actor_id=account_id,
+        before=before_for_audit,
+        after=audit_after,
+    )
+
+    LOGGER.info(
+        "OMS watcher note: Kraken credentials rotated with envelope encryption",  # pragma: no cover - log only
+        extra={
+            "account_id": account_id,
+            "secret_name": updated_metadata["secret_name"],
+            "kms_key_id": envelope.kms_key_id,
+        },
+    )
+
+    return {
+        "secret_name": updated_metadata["secret_name"],
+        "last_rotated_at": updated_metadata["last_rotated_at"],
+        "kms_key_id": envelope.kms_key_id,
+        "metadata": recorded_meta,
+    }
 
 KRAKEN_SECRET_NAMESPACE = "aether-secrets"
 ANNOTATION_CREATED_AT = "aether.kraken/createdAt"
@@ -135,6 +222,26 @@ class KrakenSecretStatus(BaseModel):
     account_id: str = Field(..., description="Trading account identifier")
     secret_name: str = Field(..., description="Kubernetes secret name")
     last_rotated_at: datetime = Field(..., description="Timestamp of the latest rotation")
+
+
+class EncryptedRotationResponse(BaseModel):
+    """Response payload for the encrypted rotation endpoint."""
+
+    secret_name: str
+    last_rotated_at: datetime
+    kms_key_id: str
+    secrets_meta: Dict[str, Any]
+
+    @validator("secrets_meta", pre=True)
+    def _normalize_metadata(cls, value: Dict[str, Any]) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if isinstance(item, datetime):
+                    result[key] = item.isoformat()
+                else:
+                    result[key] = item
+        return result
 
 
 class KrakenForceRotateRequest(BaseModel):
@@ -303,8 +410,7 @@ def _upsert_secret(
     api: CoreV1Api,
     *,
     account_id: str,
-    api_key: str,
-    api_secret: str,
+    secret_data: Dict[str, str],
     namespace: str,
     existing_metadata: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -315,12 +421,9 @@ def _upsert_secret(
         ANNOTATION_CREATED_AT: created_at.isoformat(),
         ANNOTATION_ROTATED_AT: now.isoformat(),
     }
-    encoded_api_key = base64.b64encode(api_key.encode("utf-8")).decode("utf-8")
-    encoded_api_secret = base64.b64encode(api_secret.encode("utf-8")).decode("utf-8")
-
     patch_body = {
         "metadata": {"annotations": annotations},
-        "data": {"api_key": encoded_api_key, "api_secret": encoded_api_secret},
+        "data": secret_data,
         "type": "Opaque",
     }
 
@@ -341,7 +444,7 @@ def _upsert_secret(
                 "namespace": namespace,
                 "annotations": annotations,
             },
-            "data": {"api_key": encoded_api_key, "api_secret": encoded_api_secret},
+            "data": secret_data,
             "type": "Opaque",
         }
         try:
@@ -398,50 +501,17 @@ def rotate_kraken_secret(
             detail="Unable to validate Kraken credentials",
         )
 
-    existing_metadata = _read_secret_metadata(
-        api, name=_secret_name(actor_account), namespace=KRAKEN_SECRET_NAMESPACE
-    )
-    before_for_audit = _serialize_metadata_for_audit(existing_metadata)
-
-    updated_metadata = _upsert_secret(
-        api,
+    rotation = _perform_secure_rotation(
         account_id=actor_account,
         api_key=api_key,
         api_secret=api_secret,
-        namespace=KRAKEN_SECRET_NAMESPACE,
-        existing_metadata=existing_metadata,
-    )
-
-    ip_address = request.client.host if request.client else None
-    hashed_ip = _hash_ip(ip_address)
-
-    audit_after = {
-        "account_id": actor_account,
-        "actor": actor_account,
-        "secret_name": updated_metadata["secret_name"],
-        "rotated_at": updated_metadata["last_rotated_at"].isoformat(),
-        "ip_hash": hashed_ip,
-    }
-
-    _auditor.record(
-        action="kraken.secret.rotate",
-        actor_id=actor_account,
-        before=before_for_audit,
-        after=audit_after,
-    )
-
-    LOGGER.info(
-        "OMS watcher note: Kraken credentials rotated; OMS watches %s",
-        ANNOTATION_ROTATED_AT,
-        extra={
-            "account_id": actor_account,
-            "secret_name": updated_metadata["secret_name"],
-        },
+        api=api,
+        request=request,
     )
 
     payload = {
-        "secret_name": updated_metadata["secret_name"],
-        "last_rotated_at": updated_metadata["last_rotated_at"].isoformat(),
+        "secret_name": rotation["secret_name"],
+        "last_rotated_at": rotation["last_rotated_at"].isoformat(),
     }
 
     response = JSONResponse(status_code=status.HTTP_200_OK, content=payload)
@@ -449,6 +519,59 @@ def rotate_kraken_secret(
         "X-OMS-Watcher"
     ] = "Kraken credentials rotated; OMS hot-reloads when secret annotations change."
     return response
+
+
+@app.post(
+    "/secrets/rotate_encrypted",
+    response_model=EncryptedRotationResponse,
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(ensure_secure_transport)],
+)
+def rotate_encrypted_secret(
+    payload: KrakenSecretRequest,
+    request: Request,
+    actor_account: str = Depends(require_admin_account),
+    _: str = Depends(require_mfa_context),
+    api: CoreV1Api = Depends(get_core_v1_api),
+) -> Response:
+    if payload.account_id != actor_account:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account mismatch between header and payload",
+        )
+
+    api_key = payload.api_key.get_secret_value()
+    api_secret = payload.api_secret.get_secret_value()
+
+    if not validate_kraken_credentials(api_key, api_secret):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unable to validate Kraken credentials",
+        )
+
+    rotation = _perform_secure_rotation(
+        account_id=actor_account,
+        api_key=api_key,
+        api_secret=api_secret,
+        api=api,
+        request=request,
+    )
+
+    response = EncryptedRotationResponse(
+        secret_name=rotation["secret_name"],
+        last_rotated_at=rotation["last_rotated_at"],
+        kms_key_id=rotation["kms_key_id"],
+        secrets_meta=rotation["metadata"],
+    )
+
+    headers = {
+        "X-OMS-Watcher": "Kraken credentials rotated with envelope encryption; OMS watchers notified.",
+    }
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content=jsonable_encoder(response),
+        headers=headers,
+    )
 
 
 @app.post(
@@ -590,8 +713,10 @@ __all__ = [
     "app",
     "KrakenSecretRequest",
     "KrakenSecretStatus",
+    "EncryptedRotationResponse",
     "KrakenForceRotateRequest",
     "rotate_kraken_secret",
+    "rotate_encrypted_secret",
     "force_rotate_kraken_secret",
     "kraken_secret_status",
     "test_kraken_secret",

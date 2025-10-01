@@ -10,6 +10,10 @@ from datetime import datetime, timezone
 from typing import Any, Callable, ClassVar, Dict, Iterable, List, Mapping, Optional
 
 from shared.k8s import KrakenSecretStore
+from services.secrets.secure_secrets import (
+    EncryptedSecretEnvelope,
+    EnvelopeEncryptor,
+)
 
 from services.universe.repository import UniverseRepository
 
@@ -65,6 +69,7 @@ class TimescaleAdapter:
     _credential_events: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
     _risk_configs: ClassVar[Dict[str, Dict[str, Any]]] = {}
     _credential_rotations: ClassVar[Dict[str, Dict[str, Any]]] = {}
+    _kill_events: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
     _daily_usage: ClassVar[Dict[str, Dict[str, Dict[str, float]]]] = {}
     _instrument_exposures: ClassVar[Dict[str, Dict[str, float]]] = {}
     _rolling_volume: ClassVar[Dict[str, Dict[str, Dict[str, Any]]]] = {}
@@ -387,7 +392,11 @@ class TimescaleAdapter:
     # Credential rotation tracking & test helpers
     # ------------------------------------------------------------------
     def record_credential_rotation(
-        self, *, secret_name: str, rotated_at: datetime
+        self,
+        *,
+        secret_name: str,
+        rotated_at: datetime,
+        kms_key_id: str | None = None,
     ) -> Dict[str, Any]:
         existing = self._credential_rotations.get(self.account_id) or {}
         created_at = existing.get("created_at", rotated_at)
@@ -397,6 +406,8 @@ class TimescaleAdapter:
             "created_at": created_at,
             "rotated_at": rotated_at,
         }
+        if kms_key_id is not None:
+            metadata["kms_key_id"] = kms_key_id
 
         self._credential_rotations[self.account_id] = deepcopy(metadata)
 
@@ -666,12 +677,15 @@ class KrakenSecretManager:
     namespace: str = "aether-secrets"
     secret_store: Optional[KrakenSecretStore] = None
     timescale: Optional[TimescaleAdapter] = None
+    encryptor: Optional[EnvelopeEncryptor] = None
 
     def __post_init__(self) -> None:
         if self.secret_store is None:
             self.secret_store = KrakenSecretStore(namespace=self.namespace)
         if self.timescale is None:
             self.timescale = TimescaleAdapter(account_id=self.account_id)
+        if self.encryptor is None:
+            self.encryptor = EnvelopeEncryptor()
 
     @property
     def secret_name(self) -> str:
@@ -685,14 +699,28 @@ class KrakenSecretManager:
 
         before_status = self.timescale.credential_rotation_status()
         rotated_at = datetime.now(timezone.utc)
-        self.secret_store.write_credentials(
+        assert self.encryptor is not None
+        envelope = self.encryptor.encrypt_credentials(
             self.account_id,
             api_key=api_key,
             api_secret=api_secret,
         )
+        assert self.secret_store is not None
+        if hasattr(self.secret_store, "write_encrypted_secret"):
+            self.secret_store.write_encrypted_secret(
+                self.account_id,
+                envelope=envelope,
+            )
+        else:  # pragma: no cover - compatibility guard
+            self.secret_store.write_credentials(
+                self.account_id,
+                api_key=api_key,
+                api_secret=api_secret,
+            )
         metadata = self.timescale.record_credential_rotation(
             secret_name=self.secret_name,
             rotated_at=rotated_at,
+            kms_key_id=envelope.kms_key_id,
         )
         metadata.setdefault("secret_name", self.secret_name)
         metadata.setdefault("created_at", rotated_at)
@@ -721,8 +749,26 @@ class KrakenSecretManager:
             )
 
         data: Dict[str, Any] = secret_payload.get("data") or {}
-        api_key = data.get("api_key")
-        api_secret = data.get("api_secret")
+        api_key: Optional[str]
+        api_secret: Optional[str]
+        if {
+            "encrypted_api_key",
+            "encrypted_api_key_nonce",
+            "encrypted_api_secret",
+            "encrypted_api_secret_nonce",
+            "encrypted_data_key",
+        }.issubset(data):
+            envelope = EncryptedSecretEnvelope.from_secret_data(data)
+            assert self.encryptor is not None
+            decrypted = self.encryptor.decrypt_credentials(
+                self.account_id,
+                envelope,
+            )
+            api_key = decrypted.api_key
+            api_secret = decrypted.api_secret
+        else:
+            api_key = data.get("api_key")
+            api_secret = data.get("api_secret")
         if not api_key or not api_secret:
             raise RuntimeError(
                 "Kraken credentials are missing required fields 'api_key' or 'api_secret'."
@@ -734,9 +780,16 @@ class KrakenSecretManager:
         metadata["material_present"] = True
 
         sanitized_metadata = deepcopy(metadata)
-        for sensitive_field in ("api_key", "api_secret"):
+        for sensitive_field in (
+            "api_key",
+            "api_secret",
+            "encrypted_api_key",
+            "encrypted_api_secret",
+        ):
             if sensitive_field in sanitized_metadata and sanitized_metadata[sensitive_field]:
                 sanitized_metadata[sensitive_field] = "***"
+        sanitized_metadata.setdefault("api_key", "***")
+        sanitized_metadata.setdefault("api_secret", "***")
 
         self.timescale.record_credential_access(
             secret_name=self.secret_name,
