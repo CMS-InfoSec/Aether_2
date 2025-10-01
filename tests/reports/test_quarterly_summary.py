@@ -7,7 +7,7 @@ from typing import Any, Dict, Iterable, List, Mapping
 
 import pytest
 
-from reports.quarterly_summary import generate_quarterly_summary
+from reports.quarterly_summary import AUDIT_QUERY, generate_quarterly_summary
 from reports.storage import ArtifactStorage
 
 
@@ -104,19 +104,14 @@ class QuarterlyRecordingSession:
         if "from audit_log" in normalized_query:
             start = params.get("start")
             end = params.get("end")
-            counts: Dict[str, int] = {}
+            rows = []
             for entry in self._audits:
                 event_time = entry["event_time"]
                 if start and event_time < start:
                     continue
                 if end and event_time >= end:
                     continue
-                actor = entry["actor"]
-                counts[actor] = counts.get(actor, 0) + 1
-            rows = [
-                {"account_id": account_id, "audit_events": count}
-                for account_id, count in counts.items()
-            ]
+                rows.append({"account_id": entry["actor"], "event_time": event_time})
             return FakeResult(rows)
 
         raise AssertionError(f"Unexpected query: {query}")
@@ -230,3 +225,20 @@ def test_generate_quarterly_summary_outputs_expected_metrics(
     assert int(beta_eth["audit_events"]) == 1
 
     assert quarterly_session.audit_entries, "expected audit entries to be recorded"
+
+
+def test_audit_query_returns_actor_event_time_rows(
+    quarterly_session: QuarterlyRecordingSession,
+) -> None:
+    start = datetime(2024, 4, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 7, 1, tzinfo=timezone.utc)
+    result = quarterly_session.execute(
+        AUDIT_QUERY,
+        {"start": start, "end": end},
+    )
+    rows = result.mappings()
+    assert sorted((row["account_id"], row["event_time"]) for row in rows) == [
+        ("alpha", datetime(2024, 4, 15, 0, 0, tzinfo=timezone.utc)),
+        ("alpha", datetime(2024, 5, 20, 0, 0, tzinfo=timezone.utc)),
+        ("beta", datetime(2024, 4, 20, 0, 0, tzinfo=timezone.utc)),
+    ]

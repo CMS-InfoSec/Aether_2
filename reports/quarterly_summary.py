@@ -38,10 +38,9 @@ GROUP BY o.account_id, f.market
 """
 
 AUDIT_QUERY = """
-SELECT actor AS account_id, COUNT(*) AS audit_events
+SELECT actor AS account_id, event_time
 FROM audit_log
 WHERE event_time >= %(start)s AND event_time < %(end)s
-GROUP BY actor
 """
 
 
@@ -98,9 +97,12 @@ def merge_quarterly_metrics(
         bucket["fill_count"] += int(fill.get("fill_count", 0))
         bucket["notional"] += float(fill.get("notional", 0.0))
 
-    audit_map: Dict[str, int] = {
-        str(row["account_id"]): int(row.get("audit_events", 0)) for row in audits
-    }
+    audit_counts: Dict[str, int] = defaultdict(int)
+    for audit in audits:
+        account_id = audit.get("account_id") or audit.get("actor")
+        if account_id is None:
+            continue
+        audit_counts[str(account_id)] += 1
 
     summaries: List[QuarterlyAccountSummary] = []
     for (account_id, instrument), bucket in sorted(aggregates.items()):
@@ -112,7 +114,7 @@ def merge_quarterly_metrics(
                 fill_count=bucket["fill_count"],
                 submitted_qty=bucket["submitted_qty"],
                 notional=bucket["notional"],
-                audit_events=audit_map.get(account_id, 0),
+                audit_events=audit_counts.get(account_id, 0),
             )
         )
     LOGGER.info("Computed %d quarterly summary rows", len(summaries))
