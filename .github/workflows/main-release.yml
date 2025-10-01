@@ -1,0 +1,165 @@
+name: Main Branch Release Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  lint-and-test:
+    name: Lint and Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff black mypy pytest
+
+      - name: Run Ruff
+        run: ruff check .
+
+      - name: Run Black (check mode)
+        run: black --check .
+
+      - name: Run mypy
+        run: mypy .
+
+      - name: Run pytest
+        run: pytest
+
+  build-image:
+    name: Build and Push Container Image
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    container:
+      image: gcr.io/kaniko-project/executor:latest
+    env:
+      DOCKER_CONFIG: /kaniko/.docker/
+    outputs:
+      image-ref: ${{ steps.publish.outputs.image_ref }}
+      image-digest: ${{ steps.publish.outputs.digest }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure registry auth
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          if [ -z "$GHCR_TOKEN" ]; then
+            echo "GHCR_TOKEN secret must be provided" >&2
+            exit 1
+          fi
+          mkdir -p "$DOCKER_CONFIG"
+          AUTH_TOKEN=$(printf "%s:%s" "$GHCR_USERNAME" "$GHCR_TOKEN" | base64 | tr -d '\n')
+          cat <<JSON > "$DOCKER_CONFIG/config.json"
+          {
+            "auths": {
+              "ghcr.io": {
+                "auth": "${AUTH_TOKEN}"
+              }
+            }
+          }
+          JSON
+
+      - name: Build and push image
+        id: publish
+        env:
+          IMAGE_DESTINATION: ghcr.io/${{ github.repository_owner }}/aether-app
+        run: |
+          /kaniko/executor \
+            --context "$GITHUB_WORKSPACE" \
+            --dockerfile deploy/docker/kraken-ws-ingest/Dockerfile \
+            --destination "${IMAGE_DESTINATION}:${GITHUB_SHA}" \
+            --destination "${IMAGE_DESTINATION}:latest" \
+            --digest-file image-digest.txt
+          echo "image_ref=${IMAGE_DESTINATION}" >> "$GITHUB_OUTPUT"
+          echo "digest=$(cat image-digest.txt)" >> "$GITHUB_OUTPUT"
+
+  security-and-sign:
+    name: Security Scan, SBOM, and Signing
+    runs-on: ubuntu-latest
+    needs: build-image
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    steps:
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.4.0
+
+      - name: Install Syft
+        uses: anchore/syft-action/download-syft@v0
+
+      - name: Scan image for vulnerabilities
+        uses: anchore/grype-action@v0
+        with:
+          image: ${{ needs.build-image.outputs.image-ref }}@${{ needs.build-image.outputs.image-digest }}
+          fail-on-severity: critical
+
+      - name: Generate SBOM
+        run: |
+          syft "${{ needs.build-image.outputs.image-ref }}@${{ needs.build-image.outputs.image-digest }}" -o json > sbom.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.json
+
+      - name: Sign container image
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          if [ -z "$COSIGN_PRIVATE_KEY" ]; then
+            echo "COSIGN_PRIVATE_KEY secret must be provided" >&2
+            exit 1
+          fi
+          if [ -z "$COSIGN_PASSWORD" ]; then
+            echo "COSIGN_PASSWORD secret must be provided" >&2
+            exit 1
+          fi
+          echo "$COSIGN_PRIVATE_KEY" > cosign.key
+          trap 'rm -f cosign.key' EXIT
+          cosign sign --key cosign.key "${{ needs.build-image.outputs.image-ref }}@${{ needs.build-image.outputs.image-digest }}"
+
+  deploy:
+    name: Deploy to Linode via Argo CD
+    runs-on: ubuntu-latest
+    needs: security-and-sign
+    steps:
+      - name: Install Argo CD CLI
+        run: |
+          curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          install -m 755 argocd /usr/local/bin/argocd
+
+      - name: Argo CD login and sync
+        env:
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_USERNAME: ${{ secrets.ARGOCD_USERNAME }}
+          ARGOCD_PASSWORD: ${{ secrets.ARGOCD_PASSWORD }}
+          ARGOCD_APP: ${{ vars.ARGOCD_APP_NAME }}
+        run: |
+          if [ -z "$ARGOCD_SERVER" ] || [ -z "$ARGOCD_USERNAME" ] || [ -z "$ARGOCD_PASSWORD" ] || [ -z "$ARGOCD_APP" ]; then
+            echo "Argo CD credentials and application name must be provided" >&2
+            exit 1
+          fi
+          argocd login "$ARGOCD_SERVER" --username "$ARGOCD_USERNAME" --password "$ARGOCD_PASSWORD" --insecure
+          argocd app set "$ARGOCD_APP" --revision "${GITHUB_SHA}"
+          argocd app sync "$ARGOCD_APP"
+          argocd app wait "$ARGOCD_APP" --health --timeout 600
