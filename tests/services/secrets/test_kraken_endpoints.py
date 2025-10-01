@@ -39,36 +39,36 @@ def test_rotate_and_fetch_status_includes_metadata(monkeypatch: pytest.MonkeyPat
 
     response = client.post(
         "/secrets/kraken",
-        json={"account_id": "admin-eu", "api_key": "new-key", "api_secret": "new-secret"},
-        headers={"X-Account-ID": "admin-eu", **MFA_HEADER},
+        json={"account_id": "company", "api_key": "new-key", "api_secret": "new-secret"},
+        headers={"X-Account-ID": "company", **MFA_HEADER},
     )
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["secret_name"] == "kraken-keys-admin-eu"
+    assert payload["secret_name"] == "kraken-keys-company"
     assert "created_at" in payload
     assert "rotated_at" in payload
 
     status_response = client.get(
         "/secrets/kraken/status",
-        params={"account_id": "admin-eu"},
-        headers={"X-Account-ID": "admin-eu", **MFA_HEADER},
+        params={"account_id": "company"},
+        headers={"X-Account-ID": "company", **MFA_HEADER},
     )
 
     assert status_response.status_code == 200
     status_payload = status_response.json()
-    assert status_payload["secret_name"] == "kraken-keys-admin-eu"
+    assert status_payload["secret_name"] == "kraken-keys-company"
     assert "created_at" in status_payload
     assert "rotated_at" in status_payload
 
 
 def test_manager_rotate_credentials_includes_metadata() -> None:
     secret_store = MagicMock()
-    secret_store.secret_name.return_value = "kraken-keys-admin-eu"
+    secret_store.secret_name.return_value = "kraken-keys-company"
 
-    timescale = TimescaleAdapter(account_id="admin-eu")
+    timescale = TimescaleAdapter(account_id="company")
     manager = KrakenSecretManager(
-        account_id="admin-eu",
+        account_id="company",
         secret_store=secret_store,
         timescale=timescale,
     )
@@ -76,17 +76,17 @@ def test_manager_rotate_credentials_includes_metadata() -> None:
     result = manager.rotate_credentials(api_key="new", api_secret="secret")
 
     secret_store.write_credentials.assert_called_once_with(
-        "admin-eu", api_key="new", api_secret="secret"
+        "company", api_key="new", api_secret="secret"
     )
 
     metadata = result["metadata"]
-    assert metadata["secret_name"] == "kraken-keys-admin-eu"
+    assert metadata["secret_name"] == "kraken-keys-company"
     assert metadata["created_at"]
     assert metadata["rotated_at"]
 
     rotation_events = timescale.credential_events()
     assert any(
         event["event_type"] == "kraken.credentials.rotation"
-        and event["metadata"]["secret_name"] == "kraken-keys-admin-eu"
+        and event["metadata"]["secret_name"] == "kraken-keys-company"
         for event in rotation_events
     )

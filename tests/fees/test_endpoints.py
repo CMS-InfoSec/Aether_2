@@ -79,7 +79,7 @@ def test_get_effective_fees_handles_missing_repository_override(
     response = client.get(
         "/fees/effective",
         params={"isolation_segment": "seg-fees", "fee_tier": "standard"},
-        headers={"X-Account-Id": "admin-eu"},
+        headers={"X-Account-Id": "company"},
     )
 
     assert response.status_code == 200
@@ -111,7 +111,7 @@ def test_get_effective_fees_uses_repository_override(monkeypatch, client: TestCl
     response = client.get(
         "/fees/effective",
         params={"isolation_segment": "seg-fees", "fee_tier": "standard"},
-        headers={"X-Account-Id": "admin-eu"},
+        headers={"X-Account-Id": "company"},
     )
 
     assert response.status_code == 200
@@ -153,11 +153,11 @@ def test_get_effective_fees_uses_factory_when_repository_not_supplied(
     response = client.get(
         "/fees/effective",
         params={"isolation_segment": "seg-fees", "fee_tier": "standard"},
-        headers={"X-Account-Id": "admin-us"},
+        headers={"X-Account-Id": "director-1"},
     )
 
     assert response.status_code == 200
-    assert repositories and repositories[-1].account_id == "admin-us"
+    assert repositories and repositories[-1].account_id == "director-1"
     assert repositories[-1].fee_override_calls == ["default"]
     payload = response.json()
     assert payload["fee"]["maker"] == 0.25

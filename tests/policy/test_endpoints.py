@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from __future__ import annotations
-
 import importlib.util
 import sys
 import sysconfig
@@ -12,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from services.policy.main import app
 
-ADMIN_ACCOUNTS = ["admin-eu", "admin-us", "admin-apac"]
+ADMIN_ACCOUNTS = ["company", "director-1", "director-2"]
 
 _STDLIB_SECRETS = Path(sysconfig.get_paths()["stdlib"]) / "secrets.py"
 
@@ -24,6 +22,10 @@ if (
     if spec and spec.loader:
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        secrets_package_path = Path(__file__).resolve().parent.parent / "secrets"
+        module.__path__ = [str(secrets_package_path)]
+        if module.__spec__ is not None:
+            module.__spec__.submodule_search_locations = [str(secrets_package_path)]
         sys.modules["secrets"] = module
 
 
@@ -66,7 +68,7 @@ def test_decide_policy_allows_admin_accounts(client: TestClient, account_id: str
 
 
 def test_decide_policy_rejects_non_admin(client: TestClient) -> None:
-    payload = _decision_payload("admin-eu")
+    payload = _decision_payload("company")
 
     response = client.post("/policy/decide", json=payload, headers={"X-Account-ID": "shadow"})
 
@@ -74,9 +76,9 @@ def test_decide_policy_rejects_non_admin(client: TestClient) -> None:
 
 
 def test_decide_policy_mismatched_account(client: TestClient) -> None:
-    payload = _decision_payload("admin-us")
+    payload = _decision_payload("director-1")
 
-    response = client.post("/policy/decide", json=payload, headers={"X-Account-ID": "admin-eu"})
+    response = client.post("/policy/decide", json=payload, headers={"X-Account-ID": "company"})
 
     assert response.status_code == 403
     assert response.json()["detail"] == "Account mismatch between header and payload."

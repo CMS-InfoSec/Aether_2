@@ -35,14 +35,14 @@ def test_upsert_secret_writes_to_kubernetes_and_timescale(monkeypatch: pytest.Mo
 
     response = client.post(
         "/secrets/kraken",
-        json={"account_id": "admin-eu", "api_key": "new-key", "api_secret": "new-secret"},
-        headers={"X-Account-ID": "admin-eu", **MFA_HEADER},
+        json={"account_id": "company", "api_key": "new-key", "api_secret": "new-secret"},
+        headers={"X-Account-ID": "company", **MFA_HEADER},
     )
 
     assert response.status_code == 200
     body = response.json()
-    assert body["account_id"] == "admin-eu"
-    assert body["secret_name"] == "kraken-keys-admin-eu"
+    assert body["account_id"] == "company"
+    assert body["secret_name"] == "kraken-keys-company"
     assert "created_at" in body
     assert "rotated_at" in body
     assert "api_key" not in body
@@ -50,20 +50,20 @@ def test_upsert_secret_writes_to_kubernetes_and_timescale(monkeypatch: pytest.Mo
 
     core.patch_namespaced_secret.assert_called_once()
     _, kwargs = core.patch_namespaced_secret.call_args
-    assert kwargs["name"] == "kraken-keys-admin-eu"
+    assert kwargs["name"] == "kraken-keys-company"
     assert kwargs["namespace"] == "aether-secrets"
     assert kwargs["body"]["stringData"] == {"api_key": "new-key", "api_secret": "new-secret"}
 
     status_response = client.get(
         "/secrets/kraken/status",
-        params={"account_id": "admin-eu"},
-        headers={"X-Account-ID": "admin-eu", **MFA_HEADER},
+        params={"account_id": "company"},
+        headers={"X-Account-ID": "company", **MFA_HEADER},
     )
 
     assert status_response.status_code == 200
     status_body = status_response.json()
-    assert status_body["secret_name"] == "kraken-keys-admin-eu"
-    assert status_body["account_id"] == "admin-eu"
+    assert status_body["secret_name"] == "kraken-keys-company"
+    assert status_body["account_id"] == "company"
     assert "rotated_at" in status_body
     assert "created_at" in status_body
 
@@ -71,8 +71,8 @@ def test_upsert_secret_writes_to_kubernetes_and_timescale(monkeypatch: pytest.Mo
 def test_upsert_secret_requires_mfa() -> None:
     response = client.post(
         "/secrets/kraken",
-        json={"account_id": "admin-eu", "api_key": "new-key", "api_secret": "new-secret"},
-        headers={"X-Account-ID": "admin-eu"},
+        json={"account_id": "company", "api_key": "new-key", "api_secret": "new-secret"},
+        headers={"X-Account-ID": "company"},
     )
 
     assert response.status_code == 422
@@ -84,13 +84,13 @@ def test_status_requires_authorized_account(monkeypatch: pytest.MonkeyPatch) -> 
 
     client.post(
         "/secrets/kraken",
-        json={"account_id": "admin-eu", "api_key": "new-key", "api_secret": "new-secret"},
-        headers={"X-Account-ID": "admin-eu", **MFA_HEADER},
+        json={"account_id": "company", "api_key": "new-key", "api_secret": "new-secret"},
+        headers={"X-Account-ID": "company", **MFA_HEADER},
     )
 
     response = client.get(
         "/secrets/kraken/status",
-        params={"account_id": "admin-eu"},
+        params={"account_id": "company"},
         headers={"X-Account-ID": "guest", **MFA_HEADER},
     )
 
@@ -98,7 +98,7 @@ def test_status_requires_authorized_account(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 def test_manager_rotation_updates_status_metadata() -> None:
-    manager = KrakenSecretManager(account_id="admin-eu")
+    manager = KrakenSecretManager(account_id="company")
 
     first_rotation = manager.rotate_credentials(api_key="first", api_secret="secret")
     second_rotation = manager.rotate_credentials(api_key="second", api_secret="secret-2")

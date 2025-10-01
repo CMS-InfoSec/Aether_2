@@ -29,7 +29,7 @@ def _reset_state() -> None:
 
 def _base_payload() -> dict:
     return {
-        "account_id": "admin-eu",
+        "account_id": "company",
         "order_id": "42",
         "instrument": "BTC-USD",
         "side": "BUY",

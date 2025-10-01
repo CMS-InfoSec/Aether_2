@@ -16,7 +16,7 @@ def reset_secret_store() -> None:
 
 
 def test_kraken_ws_client_loads_seeded_credentials() -> None:
-    account_id = "admin-eu"
+    account_id = "company"
     api_key = "fixture-key"
     api_secret = "fixture-secret"
 
@@ -41,4 +41,6 @@ def test_kraken_ws_client_loads_seeded_credentials() -> None:
 
     response = client.open_orders()
     assert response == {"open": []}
-    assert captured == {"api_key": api_key, "api_secret": api_secret}
+    assert captured["api_key"] == api_key
+    assert captured["api_secret"] == api_secret
+    assert captured.get("metadata", {}).get("secret_name") == "kraken-keys-company"

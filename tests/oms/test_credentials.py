@@ -7,11 +7,11 @@ def test_secret_manager_get_credentials_loads_values() -> None:
     TimescaleAdapter.reset()
 
     store = KrakenSecretStore()
-    store.write_credentials("admin-eu", api_key="api-key", api_secret="api-secret")
+    store.write_credentials("company", api_key="api-key", api_secret="api-secret")
 
-    timescale = TimescaleAdapter(account_id="admin-eu")
+    timescale = TimescaleAdapter(account_id="company")
     manager = KrakenSecretManager(
-        account_id="admin-eu", secret_store=store, timescale=timescale
+        account_id="company", secret_store=store, timescale=timescale
     )
 
     credentials = manager.get_credentials()
@@ -23,7 +23,7 @@ def test_secret_manager_get_credentials_loads_values() -> None:
     assert metadata["api_secret"] == "***"
     assert metadata["secret_name"] == manager.secret_name
 
-    events = timescale._events["admin-eu"]["events"]  # type: ignore[attr-defined]
+    events = timescale._events["company"]["events"]  # type: ignore[attr-defined]
     assert events
     last_event = events[-1]
     assert last_event["event_type"] == "kraken.credentials.access"

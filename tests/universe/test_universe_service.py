@@ -31,7 +31,7 @@ def test_non_usd_symbols_are_filtered() -> None:
         ]
     )
 
-    adapter = RedisFeastAdapter(account_id="admin-eu")
+    adapter = RedisFeastAdapter(account_id="company")
     instruments = adapter.approved_instruments()
 
     assert instruments == ["BTC-USD"]
@@ -57,12 +57,12 @@ def test_manual_overrides_are_honored() -> None:
         ]
     )
 
-    repo = UniverseRepository(account_id="admin-eu")
+    repo = UniverseRepository(account_id="company")
     assert "DOGE-USD" not in repo.approved_universe()
 
-    repo.set_manual_override("DOGE-USD", approved=True, actor_id="admin-eu", reason="Liquidity waiver")
+    repo.set_manual_override("DOGE-USD", approved=True, actor_id="company", reason="Liquidity waiver")
 
-    adapter = RedisFeastAdapter(account_id="admin-eu", repository=repo)
+    adapter = RedisFeastAdapter(account_id="company", repository=repo)
     instruments = adapter.approved_instruments()
 
     assert "DOGE-USD" in instruments
@@ -93,7 +93,7 @@ def test_volatility_threshold_filters_low_and_high_risk_assets() -> None:
         ]
     )
 
-    repo = UniverseRepository(account_id="admin-eu")
+    repo = UniverseRepository(account_id="company")
     approved_universe = repo.approved_universe()
 
     assert "ADA-USD" not in approved_universe
@@ -134,11 +134,11 @@ def test_adapter_uses_repository_factory_when_not_injected() -> None:
         created.append(repository)
         return repository
 
-    adapter = RedisFeastAdapter(account_id="admin-eu", repository_factory=factory)
+    adapter = RedisFeastAdapter(account_id="company", repository_factory=factory)
 
     instruments = adapter.approved_instruments()
     assert instruments == ["BTC-USD"]
-    assert created and created[-1].account_id == "admin-eu"
+    assert created and created[-1].account_id == "company"
     assert created[-1].approved_calls == 1
 
     fee = adapter.fee_override("BTC-USD")
@@ -156,10 +156,10 @@ def test_fastapi_endpoint_uses_cached_repository(monkeypatch) -> None:
     monkeypatch.setattr(universe_main, "RedisFeastAdapter", StubRedisFeastAdapter)
 
     client = TestClient(universe_main.app)
-    response = client.get("/universe/approved", headers={"X-Account-ID": "admin-eu"})
+    response = client.get("/universe/approved", headers={"X-Account-ID": "company"})
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["account_id"] == "admin-eu"
+    assert payload["account_id"] == "company"
     assert payload["instruments"] == ["BTC-USD"]
     assert payload["fee_overrides"]["BTC-USD"]["maker"] == 0.1

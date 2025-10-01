@@ -49,7 +49,7 @@ def reset_state() -> Generator[None, None, None]:
 
 def make_request(**overrides: float | str | dict[str, float]) -> RiskValidationRequest:
     payload: dict[str, float | str | dict[str, float]] = {
-        "account_id": "admin-eu",
+        "account_id": "company",
         "instrument": "ETH-USD",
         "net_exposure": 100_000.0,
         "gross_notional": 25_000.0,
@@ -65,7 +65,7 @@ def make_request(**overrides: float | str | dict[str, float]) -> RiskValidationR
 
 
 def test_engine_accepts_trade_within_limits() -> None:
-    account = "admin-eu"
+    account = "company"
     engine = RiskEngine(account_id=account)
     request = make_request(account_id=account)
 
@@ -84,7 +84,7 @@ def test_engine_accepts_trade_within_limits() -> None:
 
 
 def test_engine_rejects_non_whitelisted_instrument() -> None:
-    account = "admin-eu"
+    account = "company"
     engine = RiskEngine(account_id=account)
     request = make_request(account_id=account, instrument="DOGE-USD")
 
@@ -100,7 +100,7 @@ def test_engine_rejects_non_whitelisted_instrument() -> None:
 
 
 def test_engine_flags_var_breach_and_records_event() -> None:
-    account = "admin-eu"
+    account = "company"
     engine = RiskEngine(account_id=account)
     request = make_request(account_id=account, var_95=500_000.0)
 
@@ -117,7 +117,7 @@ def test_engine_flags_var_breach_and_records_event() -> None:
 
 
 def test_engine_honors_kill_switch_and_short_circuits() -> None:
-    account = "admin-eu"
+    account = "company"
     adapter = TimescaleAdapter(account_id=account)
 
     original_config = adapter.load_risk_config()
@@ -126,16 +126,10 @@ def test_engine_honors_kill_switch_and_short_circuits() -> None:
         engine = RiskEngine(account_id=account)
         request = make_request(account_id=account)
 
+        response = engine.validate(request)
 
-    engine = RiskEngine(account_id=account)
-    request = make_request(account_id=account)
-
-    response = engine.validate(request)
-
-
-    assert response.valid is False
-    assert response.reasons == ["Risk kill switch engaged for account"]
-
+        assert response.valid is False
+        assert response.reasons == ["Risk kill switch engaged for account"]
 
         events = TimescaleAdapter(account_id=account).events()
         assert any(event["type"] == "kill_switch_triggered" for event in events["events"])
@@ -144,7 +138,7 @@ def test_engine_honors_kill_switch_and_short_circuits() -> None:
 
 
 def test_engine_records_events_without_exception() -> None:
-    account = "admin-eu"
+    account = "company"
     engine = RiskEngine(account_id=account)
     request = make_request(account_id=account, instrument="DOGE-USD")
 

@@ -64,7 +64,7 @@ def test_precision_snapping(client: TestClient, monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(main, "KrakenWSClient", factory)
 
     payload = {
-        "account_id": "admin-eu",
+        "account_id": "company",
         "order_id": "snap-1",
         "instrument": "BTC-USD",
         "side": "BUY",
@@ -74,7 +74,7 @@ def test_precision_snapping(client: TestClient, monkeypatch: pytest.MonkeyPatch)
         "post_only": True,
     }
 
-    response = client.post("/oms/place", json=payload, headers={"X-Account-ID": "admin-eu"})
+    response = client.post("/oms/place", json=payload, headers={"X-Account-ID": "company"})
     assert response.status_code == 200
 
     assert records, "Kraken client was not invoked"
@@ -83,11 +83,11 @@ def test_precision_snapping(client: TestClient, monkeypatch: pytest.MonkeyPatch)
     assert snapped_payload["volume"] == pytest.approx(0.1235)
     assert "post" in snapped_payload["oflags"]
 
-    events = TimescaleAdapter(account_id="admin-eu").events()
+    events = TimescaleAdapter(account_id="company").events()
     assert events["acks"][0]["price"] == pytest.approx(20100.1)
     assert events["acks"][0]["open_orders"]
 
-    history = KafkaNATSAdapter(account_id="admin-eu").history()
+    history = KafkaNATSAdapter(account_id="company").history()
     assert any(record["topic"] == "oms.acks" for record in history)
 
 
@@ -95,7 +95,7 @@ def test_circuit_breaker_halts(client: TestClient) -> None:
     main.CircuitBreaker.halt("BTC-USD", reason="Limit up")
 
     payload = {
-        "account_id": "admin-eu",
+        "account_id": "company",
         "order_id": "halt-1",
         "instrument": "BTC-USD",
         "side": "BUY",
@@ -104,7 +104,7 @@ def test_circuit_breaker_halts(client: TestClient) -> None:
         "fee": {"currency": "USD", "maker": 0.1, "taker": 0.2},
     }
 
-    response = client.post("/oms/place", json=payload, headers={"X-Account-ID": "admin-eu"})
+    response = client.post("/oms/place", json=payload, headers={"X-Account-ID": "company"})
     assert response.status_code == 423
     assert response.json()["detail"] == "Limit up"
 
@@ -139,7 +139,7 @@ def test_rest_fallback_when_ws_stalls(client: TestClient, monkeypatch: pytest.Mo
     monkeypatch.setattr(main, "KrakenWSClient", factory)
 
     payload = {
-        "account_id": "admin-eu",
+        "account_id": "company",
         "order_id": "rest-1",
         "instrument": "ETH-USD",
         "side": "SELL",
@@ -149,10 +149,10 @@ def test_rest_fallback_when_ws_stalls(client: TestClient, monkeypatch: pytest.Mo
         "time_in_force": "GTC",
     }
 
-    response = client.post("/oms/place", json=payload, headers={"X-Account-ID": "admin-eu"})
+    response = client.post("/oms/place", json=payload, headers={"X-Account-ID": "company"})
     assert response.status_code == 200
 
-    events = TimescaleAdapter(account_id="admin-eu").events()
+    events = TimescaleAdapter(account_id="company").events()
     assert events["acks"][0]["transport"] == "rest"
-    history = KafkaNATSAdapter(account_id="admin-eu").history()
+    history = KafkaNATSAdapter(account_id="company").history()
     assert any(entry["payload"].get("transport") == "rest" for entry in history if entry["topic"] == "oms.acks")

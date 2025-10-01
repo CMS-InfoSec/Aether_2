@@ -67,13 +67,13 @@ def test_universe_endpoint_filters_to_usd_when_timescale_empty(client: TestClien
 
     response = client.get(
         "/universe/approved",
-        headers={"X-Account-ID": "admin-apac"},
+        headers={"X-Account-ID": "director-2"},
     )
 
     assert response.status_code == 200
     body = response.json()
 
-    adapter = RedisFeastAdapter(account_id="admin-apac")
+    adapter = RedisFeastAdapter(account_id="director-2")
     expected_instruments = adapter.approved_instruments()
 
     assert body["instruments"] == expected_instruments

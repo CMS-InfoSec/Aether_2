@@ -2,6 +2,7 @@ from fastapi.testclient import TestClient
 
 from services.common.adapters import RedisFeastAdapter
 from services.common.security import ADMIN_ACCOUNTS
+from services.universe import main as universe_main
 from services.universe.main import app
 
 from services.universe.repository import UniverseRepository
@@ -12,15 +13,16 @@ client = TestClient(app)
 
 def test_universe_approved_authorized_accounts():
     UniverseRepository.reset()
-    repo = UniverseRepository(account_id="admin-eu")
-    expected_instruments = repo.approved_universe()
-    expected_overrides = {}
-    for instrument in expected_instruments:
-        override = repo.fee_override(instrument)
-        if override:
-            expected_overrides[instrument] = override
-
     for account in ADMIN_ACCOUNTS:
+        repo = UniverseRepository(account_id=account)
+        adapter = RedisFeastAdapter(account_id=account, repository=repo)
+        expected_instruments = adapter.approved_instruments()
+        expected_overrides = {}
+        for instrument in expected_instruments:
+            override = repo.fee_override(instrument)
+            if override:
+                expected_overrides[instrument] = override
+
         response = client.get("/universe/approved", headers={"X-Account-ID": account})
         assert response.status_code == 200
         data = response.json()
@@ -59,7 +61,7 @@ def test_universe_endpoint_uses_repository_calls(monkeypatch):
     monkeypatch.setattr(universe_main, "RedisFeastAdapter", factory)
 
     local_client = TestClient(app)
-    response = local_client.get("/universe/approved", headers={"X-Account-ID": "admin-eu"})
+    response = local_client.get("/universe/approved", headers={"X-Account-ID": "company"})
 
     assert response.status_code == 200
     assert instances
