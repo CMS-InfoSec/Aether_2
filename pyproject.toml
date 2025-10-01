@@ -13,7 +13,9 @@ dependencies = [
     "pyotp>=2.9.0",
     "email-validator>=2.1",
     "prometheus-client>=0.20",
+
     "aiokafka>=0.10",
+
 ]
 
 [project.optional-dependencies]
