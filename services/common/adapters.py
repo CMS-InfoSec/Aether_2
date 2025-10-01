@@ -338,6 +338,7 @@ class RedisFeastAdapter:
     repository_factory: Callable[[str], UniverseRepository] = field(
         default=UniverseRepository, repr=False
     )
+    repository: UniverseRepository | None = field(default=None, repr=False)
 
 
     _features: ClassVar[Dict[str, Dict[str, Any]]] = {
@@ -374,7 +375,12 @@ class RedisFeastAdapter:
 
     def __post_init__(self) -> None:
 
-        self._repository = self.repository or UniverseRepository(account_id=self.account_id)
+        if self.repository is not None:
+            self._repository = self.repository
+        else:
+            self._repository = self.repository_factory(self.account_id)
+
+
 
     def approved_instruments(self) -> List[str]:
 
