@@ -24,74 +24,150 @@ class FakeResult:
 
 
 class RecordingSession:
-    def __init__(self, fills: List[Dict[str, Any]], orders: List[Dict[str, Any]]):
+    def __init__(
+        self,
+        accounts: List[Dict[str, Any]],
+        orders: List[Dict[str, Any]],
+        fills: List[Dict[str, Any]],
+    ) -> None:
+        self._accounts = {account["account_id"]: account for account in accounts}
+        self._orders = {order["order_id"]: order for order in orders}
         self._fills = fills
-        self._orders = orders
         self.audit_entries: List[Mapping[str, Any]] = []
         self.queries: List[str] = []
 
     def execute(self, query: str, params: Mapping[str, Any] | None = None) -> FakeResult:
         params = params or {}
+        normalized_query = " ".join(query.lower().split())
         self.queries.append(query.strip())
-        if "INSERT INTO audit_logs" in query:
+
+        if "insert into audit_log" in normalized_query:
+
             self.audit_entries.append(params)
             return FakeResult([])
-        if "trading_fills" in query:
-            account_ids = params.get("account_ids")
-            rows = [
-                row
-                for row in self._fills
-                if not account_ids or row["account_id"] in account_ids
-            ]
+
+        account_filter = params.get("account_ids")
+
+        if "from fills" in normalized_query:
+            start = params.get("start")
+            end = params.get("end")
+            rows: List[Dict[str, Any]] = []
+            for fill in self._fills:
+                fill_ts = fill["fill_ts"]
+                if start and fill_ts < start:
+                    continue
+                if end and fill_ts >= end:
+                    continue
+                order = self._orders[fill["order_id"]]
+                account = self._accounts[order["account_id"]]
+                account_name = account["name"]
+                if account_filter and account_name not in account_filter:
+                    continue
+                rows.append(
+                    {
+                        "account_id": account_name,
+                        "order_id": fill["order_id"],
+                        "side": order["side"],
+                        "size": fill["size"],
+                        "price": fill["price"],
+                        "fee": fill.get("fee"),
+                        "instrument": order["symbol"],
+                    }
+                )
             return FakeResult(rows)
-        if "trading_orders" in query:
-            account_ids = params.get("account_ids")
-            rows = [
-                row
-                for row in self._orders
-                if not account_ids or row["account_id"] in account_ids
-            ]
+
+        if "o.submitted_ts" in normalized_query:
+            start = params.get("start")
+            end = params.get("end")
+            rows = []
+            for order in self._orders.values():
+                submitted = order["submitted_ts"]
+                if start and submitted < start:
+                    continue
+                if end and submitted >= end:
+                    continue
+                account = self._accounts[order["account_id"]]
+                account_name = account["name"]
+                if account_filter and account_name not in account_filter:
+                    continue
+                rows.append(
+                    {
+                        "order_id": order["order_id"],
+                        "account_id": account_name,
+                        "instrument": order["symbol"],
+                        "size": order["size"],
+                        "submitted_ts": submitted,
+                    }
+                )
             return FakeResult(rows)
+
         raise AssertionError(f"Unexpected query: {query}")
 
 
 @pytest.fixture
 def sample_session() -> RecordingSession:
+    from datetime import datetime, timezone
+
+    accounts = [
+        {"account_id": 1, "name": "alpha"},
+        {"account_id": 2, "name": "beta"},
+    ]
+    orders = [
+        {
+            "order_id": "ord-1",
+            "account_id": 1,
+            "symbol": "BTC-USD",
+            "side": "BUY",
+            "size": 1,
+            "submitted_ts": datetime(2024, 5, 1, 0, 0, tzinfo=timezone.utc),
+        },
+        {
+            "order_id": "ord-2",
+            "account_id": 1,
+            "symbol": "BTC-USD",
+            "side": "SELL",
+            "size": 1,
+            "submitted_ts": datetime(2024, 5, 1, 1, 0, tzinfo=timezone.utc),
+        },
+        {
+            "order_id": "ord-3",
+            "account_id": 2,
+            "symbol": "ETH-USD",
+            "side": "SELL",
+            "size": 2,
+            "submitted_ts": datetime(2024, 5, 1, 2, 0, tzinfo=timezone.utc),
+        },
+    ]
     fills = [
         {
-            "account_id": "alpha",
+            "fill_id": "fill-1",
             "order_id": "ord-1",
-            "instrument": "BTC-USD",
-            "side": "BUY",
-            "quantity": 1,
+            "symbol": "BTC-USD",
+            "fill_ts": datetime(2024, 5, 1, 0, 15, tzinfo=timezone.utc),
             "price": 100,
+            "size": 1,
             "fee": 0.5,
         },
         {
-            "account_id": "alpha",
+            "fill_id": "fill-2",
             "order_id": "ord-2",
-            "instrument": "BTC-USD",
-            "side": "SELL",
-            "quantity": 1,
+            "symbol": "BTC-USD",
+            "fill_ts": datetime(2024, 5, 1, 1, 15, tzinfo=timezone.utc),
             "price": 110,
+            "size": 1,
             "fee": 0.6,
         },
         {
-            "account_id": "beta",
+            "fill_id": "fill-3",
             "order_id": "ord-3",
-            "instrument": "ETH-USD",
-            "side": "SELL",
-            "quantity": 2,
+            "symbol": "ETH-USD",
+            "fill_ts": datetime(2024, 5, 1, 2, 15, tzinfo=timezone.utc),
             "price": 50,
+            "size": 2,
             "fee": 0.4,
         },
     ]
-    orders = [
-        {"order_id": "ord-1", "account_id": "alpha", "instrument": "BTC-USD"},
-        {"order_id": "ord-2", "account_id": "alpha", "instrument": "BTC-USD"},
-        {"order_id": "ord-3", "account_id": "beta", "instrument": "ETH-USD"},
-    ]
-    return RecordingSession(fills, orders)
+    return RecordingSession(accounts, orders, fills)
 
 
 def read_csv(path: Path) -> List[Dict[str, str]]:
