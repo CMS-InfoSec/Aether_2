@@ -47,6 +47,7 @@ from services.common.security import require_admin_account
 from battle_mode import BattleModeController, create_battle_mode_tables
 
 from cost_throttler import CostThrottler
+from services.risk.position_sizer import PositionSizer
 
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,19 @@ class AccountRiskUsage(Base):
     var_95 = Column(Float, nullable=True)
     var_99 = Column(Float, nullable=True)
     updated_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class PositionSizeLog(Base):
+    """Record of suggested position sizes for auditability."""
+
+    __tablename__ = "position_size_log"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(String, nullable=False, index=True)
+    symbol = Column(String, nullable=False)
+    volatility = Column(Float, nullable=False)
+    size = Column(Float, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.now(timezone.utc))
 
 
 class ConfigError(RuntimeError):
@@ -324,6 +338,25 @@ def get_session() -> Iterator[Session]:
         raise
     finally:
         session.close()
+
+
+def _log_position_size(
+    account_id: str,
+    symbol: str,
+    volatility: float,
+    size: float,
+    timestamp: datetime,
+) -> None:
+    normalized_symbol = symbol.upper()
+    record = PositionSizeLog(
+        account_id=account_id,
+        symbol=normalized_symbol,
+        volatility=float(volatility),
+        size=float(size),
+        created_at=timestamp,
+    )
+    with get_session() as session:
+        session.add(record)
 
 
 _STUB_MARKET_TELEMETRY: Dict[str, Dict[str, float]] = {
@@ -658,6 +691,51 @@ async def get_risk_limits(
 
 
 
+@app.get("/risk/size")
+async def get_position_size(
+    symbol: str = Query(..., min_length=1, description="Instrument symbol to size"),
+    account_id: str = Depends(require_admin_account),
+) -> Dict[str, Any]:
+    try:
+        limits = _load_account_limits(account_id)
+    except ConfigError as exc:
+        logger.exception("Unable to load risk limits for account %s", account_id)
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    usage = _load_account_usage(account_id)
+    sizer = PositionSizer(
+        account_id,
+        limits=limits,
+        log_callback=_log_position_size,
+    )
+
+    try:
+        result = sizer.suggest_max_position(symbol, nav=usage.net_asset_value)
+    except Exception as exc:  # pragma: no cover - defensive programming
+        logger.exception(
+            "Position sizing failed for account %s symbol %s", account_id, symbol
+        )
+        raise HTTPException(status_code=500, detail="Unable to compute position size") from exc
+
+    payload = {
+        "account_id": result.account_id,
+        "symbol": symbol.upper(),
+        "volatility": result.volatility,
+        "nav": result.nav,
+        "risk_budget": result.risk_budget,
+        "max_position": result.max_position,
+        "timestamp": result.timestamp,
+    }
+    logger.info(
+        "Computed position size for account %s symbol %s: %.2f",
+        account_id,
+        symbol,
+        result.max_position,
+    )
+    return payload
+
+
+
 @app.get("/risk/throttle/status")
 async def get_throttle_status(
     account_id: str = Depends(require_admin_account),
@@ -836,6 +914,25 @@ async def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
         if 0.0 not in suggested_quantities:
             suggested_quantities.append(0.0)
 
+    sizing_result = None
+    try:
+        sizer = PositionSizer(
+            context.request.account_id,
+            limits=limits,
+            timescale=TimescaleAdapter(account_id=context.request.account_id),
+            feature_store=RedisFeastAdapter(account_id=context.request.account_id),
+            log_callback=_log_position_size,
+        )
+        sizing_result = sizer.suggest_max_position(
+            normalized_instrument,
+            nav=float(state.net_asset_value),
+        )
+    except Exception:  # pragma: no cover - defensive programming
+        logger.exception(
+            "Failed to compute position sizing for account %s instrument %s",
+            context.request.account_id,
+            normalized_instrument,
+        )
 
     allocator_state = _query_allocator_state(context.request.account_id)
     if allocator_state:
@@ -856,6 +953,29 @@ async def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
             cooldown=True,
             details={"instrument": intent.instrument_id, "whitelist": whitelist},
         )
+
+    if sizing_result is not None and trade_notional > sizing_result.max_position:
+        message = (
+            "Trade notional exceeds volatility adjusted position cap: "
+            f"trade={trade_notional:.2f} cap={sizing_result.max_position:.2f}"
+        )
+        _register_violation(
+            message,
+            details={
+                "trade_notional": trade_notional,
+                "position_cap": sizing_result.max_position,
+                "volatility": sizing_result.volatility,
+                "nav": sizing_result.nav,
+            },
+        )
+        if (
+            intent.side == "buy"
+            and intent.notional_per_unit
+            and sizing_result.max_position > 0.0
+        ):
+            suggested_quantities.append(
+                sizing_result.max_position / float(intent.notional_per_unit)
+            )
 
     # 1. Daily loss cap check
     if state.realized_daily_loss >= limits.max_daily_loss:
