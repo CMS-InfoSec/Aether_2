@@ -44,12 +44,37 @@ class TimescaleAdapter:
 
     _telemetry: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
 
+    _risk_configs: ClassVar[Dict[str, Dict[str, Any]]] = {}
+
+    _default_risk_config: ClassVar[Dict[str, Any]] = {
+        "kill_switch": False,
+        "loss_cap": 50_000.0,
+        "fee_cap": 5_000.0,
+        "nav": 1_000_000.0,
+        "max_nav_percent": 0.20,
+        "var_limit": 250_000.0,
+        "spread_limit_bps": 25.0,
+        "latency_limit_ms": 250.0,
+        "diversification_rules": {"max_single_instrument_percent": 0.25},
+    }
+
+    _daily_usage: ClassVar[Dict[str, Dict[str, Dict[str, float]]]] = {}
+
+    _instrument_exposures: ClassVar[Dict[str, Dict[str, float]]] = {}
+
+    _events: ClassVar[Dict[str, Dict[str, List[Dict[str, Any]]]]] = {}
+
 
     def __post_init__(self) -> None:
         self._metrics.setdefault(self.account_id, {"limit": 1_000_000.0, "usage": 0.0})
         self._telemetry.setdefault(self.account_id, [])
 
         self._events.setdefault(self.account_id, {"acks": [], "fills": []})
+        self._events[self.account_id].setdefault("events", [])
+        self._events[self.account_id].setdefault("credential_rotations", [])
+        self._risk_configs.setdefault(self.account_id, deepcopy(self._default_risk_config))
+        self._daily_usage.setdefault(self.account_id, {})
+        self._instrument_exposures.setdefault(self.account_id, {})
 
 
     def record_usage(self, notional: float) -> None:
@@ -70,6 +95,96 @@ class TimescaleAdapter:
 
     def telemetry(self) -> List[Dict[str, Any]]:
         return list(self._telemetry.get(self.account_id, []))
+
+    # ------------------------------------------------------------------
+    # Timescale-inspired risk state helpers
+    # ------------------------------------------------------------------
+    def load_risk_config(self) -> Dict[str, Any]:
+        """Return a copy of the simulated risk configuration for the account."""
+
+        config = self._risk_configs.setdefault(
+            self.account_id, deepcopy(self._default_risk_config)
+        )
+        return deepcopy(config)
+
+    def get_daily_usage(self) -> Dict[str, float]:
+        """Return aggregated loss/fee usage for the current UTC day."""
+
+        date_key = datetime.now(timezone.utc).date().isoformat()
+        usage = self._daily_usage.setdefault(self.account_id, {})
+        day_usage = usage.setdefault(date_key, {"loss": 0.0, "fee": 0.0})
+        return deepcopy(day_usage)
+
+    def record_daily_usage(self, loss: float, fee: float) -> None:
+        """Increment the simulated loss/fee counters for the current day."""
+
+        date_key = datetime.now(timezone.utc).date().isoformat()
+        usage = self._daily_usage.setdefault(self.account_id, {})
+        day_usage = usage.setdefault(date_key, {"loss": 0.0, "fee": 0.0})
+        day_usage["loss"] += float(loss)
+        day_usage["fee"] += float(fee)
+
+    def record_instrument_exposure(self, instrument: str, notional: float) -> None:
+        """Accumulate gross notional exposure per instrument for diversification checks."""
+
+        exposures = self._instrument_exposures.setdefault(self.account_id, {})
+        exposures[instrument] = exposures.get(instrument, 0.0) + float(notional)
+
+    def instrument_exposure(self, instrument: str) -> float:
+        """Return the stored gross notional exposure for an instrument."""
+
+        exposures = self._instrument_exposures.get(self.account_id, {})
+        return float(exposures.get(instrument, 0.0))
+
+    # ------------------------------------------------------------------
+    # OMS order lifecycle helpers
+    # ------------------------------------------------------------------
+    def record_ack(self, payload: Dict[str, Any]) -> None:
+        """Persist a synthetic acknowledgement emitted by the OMS layer."""
+
+        record = {"payload": deepcopy(payload), "recorded_at": datetime.now(timezone.utc)}
+        self._events[self.account_id]["acks"].append(record)
+
+    def record_fill(self, payload: Dict[str, Any]) -> None:
+        """Persist a synthetic trade fill emitted by the OMS layer."""
+
+        record = {"payload": deepcopy(payload), "recorded_at": datetime.now(timezone.utc)}
+        self._events[self.account_id]["fills"].append(record)
+
+    def record_event(self, event_type: str, payload: Dict[str, Any]) -> None:
+        """Record a generic risk/telemetry event for observability tests."""
+
+        entry = {
+            "event_type": event_type,
+            "payload": deepcopy(payload),
+            "timestamp": datetime.now(timezone.utc),
+        }
+        self._events[self.account_id]["events"].append(entry)
+
+    # ------------------------------------------------------------------
+    # Credential rotation tracking
+    # ------------------------------------------------------------------
+    def record_credential_rotation(self, *, secret_name: str, rotated_at: datetime) -> None:
+        record = {"secret_name": secret_name, "rotated_at": rotated_at}
+        self._events[self.account_id]["credential_rotations"].append(record)
+
+    def credential_rotation_status(self) -> Optional[Dict[str, Any]]:
+        rotations = self._events.get(self.account_id, {}).get("credential_rotations", [])
+        if not rotations:
+            return None
+        return deepcopy(rotations[-1])
+
+    # ------------------------------------------------------------------
+    # Test helpers
+    # ------------------------------------------------------------------
+    @classmethod
+    def reset(cls) -> None:
+        cls._metrics.clear()
+        cls._telemetry.clear()
+        cls._risk_configs.clear()
+        cls._daily_usage.clear()
+        cls._instrument_exposures.clear()
+        cls._events.clear()
 
 
 
