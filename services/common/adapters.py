@@ -270,7 +270,18 @@ class TimescaleAdapter:
 @dataclass
 class RedisFeastAdapter:
     account_id: str
-    _repository: UniverseRepository = field(init=False)
+
+    repository: Any | None = None
+
+    _repository: Any = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.repository is not None:
+            self._repository = self.repository
+            return
+
+        self._repository = UniverseRepository(account_id=self.account_id)
+
 
 
     _features: ClassVar[Dict[str, Dict[str, Any]]] = {
