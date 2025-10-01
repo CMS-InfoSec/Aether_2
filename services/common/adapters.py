@@ -466,6 +466,35 @@ class KrakenSecretManager:
         assert self.timescale is not None
         return self.timescale.credential_rotation_status()
 
+    def get_credentials(self) -> Dict[str, Any]:
+        """Load Kraken API credentials for the account from Kubernetes."""
+
+        assert self.secret_store is not None
+
+        secret_payload = self.secret_store.get_secret(self.secret_name)
+        if not secret_payload:
+            raise RuntimeError(
+                f"Kraken credentials secret '{self.secret_name}' not found in namespace "
+                f"'{self.namespace}'."
+            )
+
+        data: Dict[str, Any] = secret_payload.get("data") or {}
+        api_key = data.get("api_key")
+        api_secret = data.get("api_secret")
+        if not api_key or not api_secret:
+            raise RuntimeError(
+                "Kraken credentials are missing required fields 'api_key' or 'api_secret'."
+            )
+
+        metadata = deepcopy(secret_payload.get("metadata") or {})
+        for sensitive_field in ("api_key", "api_secret"):
+            if sensitive_field in metadata:
+                metadata[sensitive_field] = "***"
+        metadata.setdefault("secret_name", self.secret_name)
+        metadata.setdefault("namespace", self.namespace)
+
+        return {"api_key": api_key, "api_secret": api_secret, "metadata": metadata}
+
 
 def default_fee(currency: str = "USD") -> Dict[str, float | str]:
     return {"currency": currency, "maker": 0.1, "taker": 0.2}
