@@ -25,6 +25,7 @@ SELECT
     f.symbol AS instrument
 FROM fills AS f
 JOIN orders AS o ON o.order_id = f.order_id
+{account_join}
 WHERE f.fill_ts >= %(start)s AND f.fill_ts < %(end)s
 {account_filter}
 """
@@ -37,6 +38,7 @@ SELECT
     o.size,
     o.submitted_ts
 FROM orders AS o
+{account_join}
 WHERE o.submitted_ts >= %(start)s AND o.submitted_ts < %(end)s
 {account_filter}
 """
@@ -69,19 +71,62 @@ def _fetch_rows(session: TimescaleSession, query: str, params: Mapping[str, Any]
     return ResultSetAdapter(result).as_dicts()
 
 
+def _prepare_account_filter(
+    account_ids: Sequence[str | int],
+) -> tuple[str, str, Dict[str, Any]]:
+    numeric_ids: List[int] = []
+    admin_slugs: List[str] = []
+    for raw in account_ids:
+        if isinstance(raw, int):
+            numeric_ids.append(raw)
+        elif isinstance(raw, str):
+            candidate = raw.strip()
+            if candidate.isdigit():
+                numeric_ids.append(int(candidate))
+            elif candidate:
+                admin_slugs.append(candidate)
+        else:
+            raise TypeError(f"Unsupported account identifier type: {type(raw)!r}")
+
+    params: Dict[str, Any] = {}
+    clauses: List[str] = []
+    account_join = ""
+
+    if numeric_ids:
+        params["account_ids"] = numeric_ids
+        clauses.append("o.account_id = ANY(%(account_ids)s)")
+
+    if admin_slugs:
+        params["account_slugs"] = admin_slugs
+        account_join = "\nJOIN accounts AS a ON a.account_id = o.account_id"
+        clauses.append("a.admin_slug = ANY(%(account_slugs)s)")
+
+    if not clauses:
+        return "", "", params
+
+    if len(clauses) == 1:
+        predicate = clauses[0]
+    else:
+        predicate = "(" + " OR ".join(clauses) + ")"
+
+    account_filter = f" AND {predicate}"
+    return account_join, account_filter, params
+
+
 def fetch_daily_fills(
     session: TimescaleSession,
     *,
     start: datetime,
     end: datetime,
-    account_ids: Sequence[str] | None = None,
+    account_ids: Sequence[str | int] | None = None,
 ) -> List[Dict[str, Any]]:
+    account_join = ""
     account_filter = ""
     params: Dict[str, Any] = {"start": start, "end": end}
     if account_ids:
-        account_filter = " AND o.account_id = ANY(%(account_ids)s)"
-        params["account_ids"] = list(account_ids)
-    query = FILL_QUERY.format(account_filter=account_filter)
+        account_join, account_filter, extra_params = _prepare_account_filter(account_ids)
+        params.update(extra_params)
+    query = FILL_QUERY.format(account_join=account_join, account_filter=account_filter)
     fills = _fetch_rows(session, query, params)
     LOGGER.debug("Fetched %d fills between %s and %s", len(fills), start, end)
     return fills
@@ -92,14 +137,15 @@ def fetch_daily_orders(
     *,
     start: datetime,
     end: datetime,
-    account_ids: Sequence[str] | None = None,
+    account_ids: Sequence[str | int] | None = None,
 ) -> Dict[str, str]:
+    account_join = ""
     account_filter = ""
     params: Dict[str, Any] = {"start": start, "end": end}
     if account_ids:
-        account_filter = " AND o.account_id = ANY(%(account_ids)s)"
-        params["account_ids"] = list(account_ids)
-    query = ORDER_QUERY.format(account_filter=account_filter)
+        account_join, account_filter, extra_params = _prepare_account_filter(account_ids)
+        params.update(extra_params)
+    query = ORDER_QUERY.format(account_join=account_join, account_filter=account_filter)
     orders = _fetch_rows(session, query, params)
     order_to_instrument: Dict[str, str] = {}
     for order in orders:
@@ -199,7 +245,7 @@ def generate_daily_pnl(
     storage: ArtifactStorage,
     *,
     report_date: date,
-    account_ids: Sequence[str] | None = None,
+    account_ids: Sequence[str | int] | None = None,
     output_formats: Sequence[str] = ("csv", "parquet"),
 ) -> List[str]:
     """Generate PnL artifacts for *report_date* and return object keys."""
