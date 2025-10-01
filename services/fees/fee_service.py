@@ -133,6 +133,12 @@ optimizer = FeeOptimizer(
 )
 
 
+def _ordered_tiers(session: Session) -> list[FeeTier]:
+    """Return the configured fee tiers ordered by threshold."""
+
+    return optimizer.ordered_tiers(session)
+
+
 @app.get("/fees/effective", response_model=EffectiveFeeResponse)
 def get_effective_fee(
     pair: str = Query(..., description="Trading pair symbol", min_length=3, max_length=32),
@@ -144,7 +150,7 @@ def get_effective_fee(
     del pair  # the current schedule is global and does not vary by pair
 
     normalized_liquidity = liquidity.lower()
-    tiers = optimizer.ordered_tiers(session)
+    tiers = _ordered_tiers(session)
     if not tiers:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Fee schedule is not configured")
 
@@ -177,7 +183,7 @@ def get_fee_tiers(
     session: Session = Depends(get_session),
     _: str = Depends(require_admin_account),
 ) -> List[FeeTierSchema]:
-    tiers = optimizer.ordered_tiers(session)
+    tiers = _ordered_tiers(session)
     if not tiers:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Fee schedule is not configured")
 
