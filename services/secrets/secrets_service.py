@@ -47,8 +47,14 @@ from services.secrets.secure_secrets import (
 )
 from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
 
+try:  # pragma: no cover - OMS watcher is optional in some runtimes
+    from services.oms.oms_kraken import KrakenCredentialWatcher
+except Exception:  # pragma: no cover - fallback when OMS package unavailable
+    KrakenCredentialWatcher = None  # type: ignore[misc, assignment]
+
 
 LOGGER = logging.getLogger(__name__)
+SECRETS_LOGGER = logging.getLogger("secrets_log")
 
 app = FastAPI(title="Kraken Secrets Service")
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
@@ -59,6 +65,37 @@ _audit_logger = TimescaleAuditLogger(_audit_store)
 _auditor = SensitiveActionRecorder(_audit_logger)
 
 _encryptor = EnvelopeEncryptor()
+
+
+def _trigger_hot_reload(account_id: str) -> None:
+    """Signal the OMS credential watcher to refresh without downtime."""
+
+    if KrakenCredentialWatcher is None:  # pragma: no cover - optional runtime dependency
+        LOGGER.debug("KrakenCredentialWatcher unavailable; skipping hot-reload for %s", account_id)
+        return
+    try:
+        watcher = KrakenCredentialWatcher.instance(account_id)
+    except Exception:  # pragma: no cover - watcher instantiation issues
+        LOGGER.exception("Failed to obtain credential watcher for %s", account_id)
+        return
+    try:
+        watcher.trigger_refresh()
+    except Exception:  # pragma: no cover - watcher errors are non-fatal
+        LOGGER.exception("Failed to trigger OMS credential refresh for %s", account_id)
+
+
+def _log_secret_rotation(*, account_id: str, actor: str, rotated_at: datetime) -> None:
+    payload = {
+        "account_id": account_id,
+        "actor": actor,
+        "ts": rotated_at.isoformat(),
+    }
+    SECRETS_LOGGER.info("credential_rotation", extra={"secret_rotation": payload})
+
+
+def _post_rotation_hooks(*, account_id: str, actor: str, rotated_at: datetime) -> None:
+    _trigger_hot_reload(account_id)
+    _log_secret_rotation(account_id=account_id, actor=actor, rotated_at=rotated_at)
 
 
 def _encrypt_credentials(
@@ -221,6 +258,22 @@ class KrakenSecretStatus(BaseModel):
 
     account_id: str = Field(..., description="Trading account identifier")
     secret_name: str = Field(..., description="Kubernetes secret name")
+    last_rotated_at: datetime = Field(..., description="Timestamp of the latest rotation")
+
+
+class SecretRotationResponse(BaseModel):
+    """Response payload for the generic rotation endpoint."""
+
+    account_id: str = Field(..., description="Trading account identifier")
+    secret_name: str = Field(..., description="Kubernetes secret name")
+    last_rotated_at: datetime = Field(..., description="Timestamp of the latest rotation")
+    kms_key_id: str = Field(..., description="Identifier of the KMS data key")
+
+
+class SecretStatusResponse(BaseModel):
+    """Status payload for the generic credential endpoint."""
+
+    account_id: str = Field(..., description="Trading account identifier")
     last_rotated_at: datetime = Field(..., description="Timestamp of the latest rotation")
 
 
@@ -475,6 +528,65 @@ def _upsert_secret(
 
 
 @app.post(
+    "/secrets/rotate",
+    response_model=SecretRotationResponse,
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(ensure_secure_transport)],
+)
+def rotate_secret(
+    payload: KrakenSecretRequest,
+    request: Request,
+    actor_account: str = Depends(require_admin_account),
+    _: str = Depends(require_mfa_context),
+    api: CoreV1Api = Depends(get_core_v1_api),
+) -> Response:
+    if payload.account_id != actor_account:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account mismatch between header and payload",
+        )
+
+    api_key = payload.api_key.get_secret_value()
+    api_secret = payload.api_secret.get_secret_value()
+
+    if not validate_kraken_credentials(api_key, api_secret):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unable to validate Kraken credentials",
+        )
+
+    rotation = _perform_secure_rotation(
+        account_id=actor_account,
+        api_key=api_key,
+        api_secret=api_secret,
+        api=api,
+        request=request,
+    )
+
+    rotated_at = rotation["last_rotated_at"]
+    if isinstance(rotated_at, datetime):
+        rotation_ts = rotated_at
+    else:
+        rotation_ts = datetime.now(timezone.utc)
+    _post_rotation_hooks(account_id=actor_account, actor=actor_account, rotated_at=rotation_ts)
+
+    response_payload = SecretRotationResponse(
+        account_id=actor_account,
+        secret_name=rotation["secret_name"],
+        last_rotated_at=rotation_ts,
+        kms_key_id=rotation["kms_key_id"],
+    )
+    headers = {
+        "X-OMS-Watcher": "Credentials rotated; OMS hot-reload triggered.",
+    }
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content=jsonable_encoder(response_payload),
+        headers=headers,
+    )
+
+
+@app.post(
     "/secrets/kraken",
     status_code=status.HTTP_200_OK,
     dependencies=[Depends(ensure_secure_transport)],
@@ -509,9 +621,16 @@ def rotate_kraken_secret(
         request=request,
     )
 
+    rotated_at = rotation["last_rotated_at"]
+    if isinstance(rotated_at, datetime):
+        rotation_ts = rotated_at
+    else:
+        rotation_ts = datetime.now(timezone.utc)
+    _post_rotation_hooks(account_id=actor_account, actor=actor_account, rotated_at=rotation_ts)
+
     payload = {
         "secret_name": rotation["secret_name"],
-        "last_rotated_at": rotation["last_rotated_at"].isoformat(),
+        "last_rotated_at": rotation_ts.isoformat(),
     }
 
     response = JSONResponse(status_code=status.HTTP_200_OK, content=payload)
@@ -557,9 +676,16 @@ def rotate_encrypted_secret(
         request=request,
     )
 
+    rotated_at = rotation["last_rotated_at"]
+    if isinstance(rotated_at, datetime):
+        rotation_ts = rotated_at
+    else:
+        rotation_ts = datetime.now(timezone.utc)
+    _post_rotation_hooks(account_id=actor_account, actor=actor_account, rotated_at=rotation_ts)
+
     response = EncryptedRotationResponse(
         secret_name=rotation["secret_name"],
-        last_rotated_at=rotation["last_rotated_at"],
+        last_rotated_at=rotation_ts,
         kms_key_id=rotation["kms_key_id"],
         secrets_meta=rotation["metadata"],
     )
@@ -622,6 +748,8 @@ def force_rotate_kraken_secret(
         annotations=updated_annotations,
     )
 
+    _post_rotation_hooks(account_id=actor_account, actor=actor_account, rotated_at=now)
+
     before_for_audit = _serialize_metadata_for_audit(metadata)
     after_for_audit = {
         "account_id": actor_account,
@@ -648,6 +776,49 @@ def force_rotate_kraken_secret(
         "X-OMS-Watcher"
     ] = "Kraken credentials force-rotated; OMS hot-reloads when secret annotations change."
     return response
+
+
+@app.get(
+    "/secrets/status",
+    response_model=SecretStatusResponse,
+    dependencies=[Depends(ensure_secure_transport)],
+)
+def secret_status(
+    account_id: str = Query(..., description="Trading account identifier"),
+    actor_account: str = Depends(require_admin_account),
+    _: str = Depends(require_mfa_context),
+    api: CoreV1Api = Depends(get_core_v1_api),
+) -> SecretStatusResponse:
+    if account_id != actor_account:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account mismatch between header and query parameter",
+        )
+
+    metadata = _read_secret_metadata(
+        api, name=_secret_name(account_id), namespace=KRAKEN_SECRET_NAMESPACE
+    )
+    if not metadata:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No rotation metadata found for account",
+        )
+    rotated_at = metadata.get("last_rotated_at")
+    if rotated_at is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Rotation timestamp unavailable",
+        )
+    if not isinstance(rotated_at, datetime):
+        try:
+            rotated_at = datetime.fromisoformat(str(rotated_at))
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Rotation metadata corrupt",
+            ) from None
+
+    return SecretStatusResponse(account_id=account_id, last_rotated_at=rotated_at)
 
 
 @app.get(
@@ -713,11 +884,15 @@ __all__ = [
     "app",
     "KrakenSecretRequest",
     "KrakenSecretStatus",
+    "SecretRotationResponse",
+    "SecretStatusResponse",
     "EncryptedRotationResponse",
     "KrakenForceRotateRequest",
+    "rotate_secret",
     "rotate_kraken_secret",
     "rotate_encrypted_secret",
     "force_rotate_kraken_secret",
+    "secret_status",
     "kraken_secret_status",
     "test_kraken_secret",
     "validate_kraken_credentials",
