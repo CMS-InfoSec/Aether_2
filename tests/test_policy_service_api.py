@@ -1,9 +1,18 @@
 from __future__ import annotations
 
 from decimal import Decimal
+import sys
+import types
 
 import pytest
 from fastapi.testclient import TestClient
+
+if "metrics" not in sys.modules:
+    metrics_stub = types.ModuleType("metrics")
+    metrics_stub.setup_metrics = lambda app: None
+    metrics_stub.record_abstention_rate = lambda *args, **kwargs: None
+    metrics_stub.record_drift_score = lambda *args, **kwargs: None
+    sys.modules["metrics"] = metrics_stub
 
 import policy_service
 from services.common.schemas import ActionTemplate, ConfidenceMetrics
@@ -13,6 +22,11 @@ from services.models.model_server import Intent
 @pytest.fixture(name="client")
 def _client() -> TestClient:
     return TestClient(policy_service.app)
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    return "asyncio"
 
 
 def _intent(
@@ -158,6 +172,80 @@ def test_policy_decide_rejects_when_costs_exceed_edge(
     assert data["side"] == "none"
     assert data["qty"] == 0.0
     assert data["reason"] == "Fee-adjusted edge non-positive"
+
+
+@pytest.mark.anyio("asyncio")
+async def test_fetch_effective_fee_parses_flat_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    response_payload = {
+        "bps": "5.25",
+        "usd": 1.23,
+        "tier_id": "tier_1",
+        "basis_ts": "2023-01-01T00:00:00+00:00",
+    }
+    recorded: dict[str, object] = {}
+
+    monkeypatch.setattr(policy_service, "FEES_SERVICE_URL", "https://fees.test", raising=False)
+    monkeypatch.setattr(policy_service, "FEES_REQUEST_TIMEOUT", 1.5, raising=False)
+
+    class _DummyResponse:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self._payload = payload
+
+        def raise_for_status(self) -> None:
+            recorded["status_checked"] = True
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    class _DummyClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            recorded["client_kwargs"] = kwargs
+
+        async def __aenter__(self) -> "_DummyClient":
+            recorded["entered"] = True
+            return self
+
+        async def __aexit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            tb: object,
+        ) -> None:
+            recorded["exited"] = True
+
+        async def get(
+            self,
+            path: str,
+            *,
+            params: dict[str, object] | None = None,
+            headers: dict[str, str] | None = None,
+        ) -> _DummyResponse:
+            recorded["request"] = {
+                "path": path,
+                "params": params,
+                "headers": headers,
+            }
+            return _DummyResponse(response_payload)
+
+    monkeypatch.setattr(policy_service.httpx, "AsyncClient", _DummyClient)
+
+    fee = await policy_service._fetch_effective_fee(
+        account_id="acct-123",
+        symbol="ETH-USD",
+        liquidity="MaKeR",
+        notional=123.456789,
+    )
+
+    assert fee == pytest.approx(5.25)
+    request = recorded["request"]
+    assert request["path"] == "/fees/effective"
+    assert request["headers"] == {"X-Account-ID": "acct-123"}
+    assert request["params"] == {
+        "pair": "ETH-USD",
+        "liquidity": "maker",
+        "notional": "123.45678900",
+    }
+    assert recorded["status_checked"] is True
 
 
 def test_health_endpoints(client: TestClient) -> None:

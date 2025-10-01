@@ -214,16 +214,14 @@ async def _fetch_effective_fee(
             ) from exc
 
     payload = response.json()
-    fee_payload = payload.get("fee") if isinstance(payload, dict) else None
-    if not isinstance(fee_payload, dict):
+    if not isinstance(payload, dict):
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Fee service response malformed",
         )
 
-    key = "maker" if liquidity_normalized == "maker" else "taker"
     try:
-        return float(fee_payload[key])
+        return float(payload["bps"])
     except (KeyError, TypeError, ValueError) as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
