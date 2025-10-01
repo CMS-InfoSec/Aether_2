@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: policy-service
+  labels:
+    app: policy-service
+    app.kubernetes.io/name: policy-service
+spec:
+  selector:
+    app: policy-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+  type: ClusterIP
