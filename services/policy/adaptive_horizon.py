@@ -25,6 +25,22 @@ _RANGE_HORIZON = 15 * 60  # 15 minutes
 _HIGH_VOL_HORIZON = 5 * 60  # 5 minutes
 _DEFAULT_HORIZON = _RANGE_HORIZON
 
+# Canonical horizon mapping keyed by normalized regime names.  We maintain a
+# small alias map so that callers can pass in a variety of representations
+# without having to worry about formatting nuances.
+_REGIME_TO_HORIZON: dict[str, int] = {
+    "trend": _TREND_HORIZON,
+    "range": _RANGE_HORIZON,
+    "neutral": _RANGE_HORIZON,
+    "high_vol": _HIGH_VOL_HORIZON,
+}
+
+_REGIME_ALIASES: dict[str, str] = {
+    "high-vol": "high_vol",
+    "highvol": "high_vol",
+    "sideways": "range",
+}
+
 # Cache the most recent horizon per symbol so we only emit transition logs
 # when the value actually changes.
 _LAST_HORIZONS: dict[str, int] = {}
@@ -59,14 +75,19 @@ def _extract_symbol(features: Mapping[str, Any] | None) -> str:
     return "UNKNOWN"
 
 
-def _resolve_horizon(regime: str) -> int:
-    if regime == "trend":
-        return _TREND_HORIZON
-    if regime in {"range", "neutral"}:
-        return _RANGE_HORIZON
-    if regime in {"high_vol", "high-vol", "highvol"}:
-        return _HIGH_VOL_HORIZON
-    return _DEFAULT_HORIZON
+def _normalize_regime(regime: str) -> str:
+    normalized = regime.strip().lower()
+    normalized = normalized.replace(" ", "_")
+    # Treat hyphenated values as underscores so callers can specify "high-vol"
+    # or "high vol" interchangeably.
+    normalized = normalized.replace("-", "_")
+    return _REGIME_ALIASES.get(normalized, normalized)
+
+
+def _resolve_horizon(regime: str) -> tuple[str, int]:
+    normalized = _normalize_regime(regime)
+    horizon = _REGIME_TO_HORIZON.get(normalized, _DEFAULT_HORIZON)
+    return normalized, horizon
 
 
 def horizon_log(symbol: str, regime: str, horizon: int, ts: datetime) -> None:
@@ -88,12 +109,12 @@ def get_horizon(features: Mapping[str, Any] | None) -> int:
     """Return the model prediction horizon given the latest features."""
 
     regime = _extract_regime(features)
-    horizon = _resolve_horizon(regime)
+    normalized_regime, horizon = _resolve_horizon(regime)
     symbol = _extract_symbol(features)
 
     previous = _LAST_HORIZONS.get(symbol)
     if previous != horizon:
-        horizon_log(symbol, regime, horizon, datetime.now(timezone.utc))
+        horizon_log(symbol, normalized_regime, horizon, datetime.now(timezone.utc))
         _LAST_HORIZONS[symbol] = horizon
 
     return horizon
