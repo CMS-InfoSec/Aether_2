@@ -8,17 +8,25 @@ from fastapi.testclient import TestClient
 from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
 from services.oms import main
 from services.oms.kraken_client import KrakenWSClient, KrakenWebsocketTimeout
+from shared.k8s import KrakenSecretStore
 
 
 @pytest.fixture(autouse=True)
 def reset_state() -> None:
     KafkaNATSAdapter.reset()
     TimescaleAdapter.reset()
+    KrakenSecretStore.reset()
     main.CircuitBreaker.reset()
     yield
     KafkaNATSAdapter.reset()
     TimescaleAdapter.reset()
+    KrakenSecretStore.reset()
     main.CircuitBreaker.reset()
+
+
+def _seed_credentials(account_id: str) -> None:
+    store = KrakenSecretStore()
+    store.write_credentials(account_id, api_key="test-key", api_secret="test-secret")
 
 
 @pytest.fixture(name="client")
@@ -116,6 +124,7 @@ def test_rest_fallback_when_ws_stalls(client: TestClient, monkeypatch: pytest.Mo
             return None
 
     def factory(account_id: str, **_: Any) -> KrakenWSClient:
+        _seed_credentials(account_id)
         return KrakenWSClient(
             account_id=account_id,
             session_factory=lambda _creds: TimeoutSession(),

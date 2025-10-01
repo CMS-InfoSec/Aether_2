@@ -354,10 +354,6 @@ class KrakenSecretManager:
         assert self.secret_store is not None
         return self.secret_store.secret_name(self.account_id)
 
-    def get_credentials(self) -> Dict[str, str]:
-        assert self.secret_store is not None
-        return self.secret_store.read_credentials(self.account_id)
-
     def rotate_credentials(self, *, api_key: str, api_secret: str) -> Dict[str, Any]:
         assert self.secret_store is not None  # for type checkers
         assert self.timescale is not None
@@ -376,11 +372,34 @@ class KrakenSecretManager:
         }
 
     def get_credentials(self) -> Dict[str, str]:
+        """Return the stored Kraken API credentials for the account.
+
+        Raises:
+            RuntimeError: If no credentials have been provisioned for the account
+                in the configured namespace.
+        """
+
         assert self.secret_store is not None
+
         credentials = self.secret_store.read_credentials(self.account_id)
-        if credentials:
-            return credentials
-        return {"api_key": f"demo-key-{self.account_id}", "api_secret": f"demo-secret-{self.account_id}"}
+        if not credentials:
+            raise RuntimeError(
+                "No Kraken API credentials are provisioned for account"
+                f" '{self.account_id}'. Use the secrets service to rotate keys"
+                " before attempting to trade."
+            )
+
+        missing_fields = [
+            field for field in ("api_key", "api_secret") if not credentials.get(field)
+        ]
+        if missing_fields:
+            fields = ", ".join(sorted(missing_fields))
+            raise RuntimeError(
+                "Incomplete Kraken credentials for account"
+                f" '{self.account_id}': missing {fields}."
+            )
+
+        return {"api_key": credentials["api_key"], "api_secret": credentials["api_secret"]}
 
     def status(self) -> Optional[Dict[str, Any]]:
         assert self.timescale is not None

@@ -1,12 +1,35 @@
+from __future__ import annotations
+
+from typing import Iterator
+
+import pytest
 from fastapi.testclient import TestClient
 
 from services.common.security import ADMIN_ACCOUNTS
 from services.oms.main import app
+from shared.k8s import KrakenSecretStore
 
-client = TestClient(app)
+
+@pytest.fixture(name="client")
+def client_fixture() -> Iterator[TestClient]:
+    KrakenSecretStore.reset()
+    store = KrakenSecretStore()
+    for account in ADMIN_ACCOUNTS:
+        store.write_credentials(
+            account,
+            api_key=f"test-key-{account}",
+            api_secret=f"test-secret-{account}",
+        )
+
+    client = TestClient(app)
+    try:
+        yield client
+    finally:
+        client.close()
+        KrakenSecretStore.reset()
 
 
-def test_oms_place_authorized_accounts():
+def test_oms_place_authorized_accounts(client: TestClient) -> None:
     payload = {
         "account_id": "admin-eu",
         "order_id": "1",
@@ -25,7 +48,7 @@ def test_oms_place_authorized_accounts():
         assert data["fee"] == payload["fee"]
 
 
-def test_oms_place_rejects_non_admin_account():
+def test_oms_place_rejects_non_admin_account(client: TestClient) -> None:
     payload = {
         "account_id": "shadow",
         "order_id": "1",
