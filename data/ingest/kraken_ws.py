@@ -38,29 +38,30 @@ NATS_SERVERS = os.getenv("NATS_SERVERS", "nats://localhost:4222").split(",")
 NATS_SUBJECT = os.getenv("NATS_SUBJECT", "marketdata.kraken.orderbook")
 
 metadata = MetaData()
-order_book_table = Table(
-    "order_book_events",
+orderbook_events_table = Table(
+    "orderbook_events",
     metadata,
-    Column("market", String, primary_key=True),
-    Column("event_time", DateTime(timezone=True), primary_key=True),
-    Column("side", String, nullable=False),
-    Column("price", Numeric, nullable=False),
-    Column("size", Numeric, nullable=False),
-    Column("event_type", String, nullable=False),
-    Column("sequence", BigInteger, nullable=False),
-    Column("raw", JSON, nullable=False),
+    Column("symbol", String(32), primary_key=True),
+    Column("ts", DateTime(timezone=True), primary_key=True),
+    Column("side", String(4), primary_key=True),
+    Column("price", Numeric(28, 10), primary_key=True),
+    Column("size", Numeric(28, 10), nullable=False),
+    Column("action", String(16), nullable=False),
+    Column("sequence", BigInteger, nullable=True),
+    Column("meta", JSON, nullable=True),
 )
 
 
 @dataclass
-class OrderBookUpdate:
-    market: str
-    event_time: dt.datetime
+class OrderBookEvent:
+    symbol: str
+    ts: dt.datetime
     side: str
     price: float
     size: float
-    sequence: int
-    raw: Dict[str, Any]
+    action: str
+    sequence: int | None
+    meta: Dict[str, Any]
 
 
 def kafka_producer() -> Producer | None:
@@ -82,10 +83,10 @@ async def subscribe(session: aiohttp.ClientSession, pairs: Sequence[str]) -> aio
     return ws
 
 
-def flatten_updates(market: str, payload: Dict[str, Any]) -> List[OrderBookUpdate]:
-    # Kraken payloads contain snapshots ('as'/'bs') and updates ('a'/'b').
-    bids = payload.get('b') or payload.get('bs') or []
-    asks = payload.get('a') or payload.get('as') or []
+def flatten_updates(symbol: str, payload: Dict[str, Any]) -> List[OrderBookEvent]:
+    """Normalise Kraken order book payloads into orderbook_events rows."""
+    bids = payload.get("b") or payload.get("bs") or []
+    asks = payload.get("a") or payload.get("as") or []
     timestamp = payload.get('timestamp')
     if not timestamp and bids:
         timestamp = bids[0][2] if len(bids[0]) > 2 else None
@@ -94,21 +95,24 @@ def flatten_updates(market: str, payload: Dict[str, Any]) -> List[OrderBookUpdat
     if timestamp is None:
         return []
     event_time = datetime_from_kraken(timestamp)
-    sequence = int(payload.get('sequence', payload.get('checksum', 0)) or 0)
-    updates: List[OrderBookUpdate] = []
-    for side, levels in (('buy', bids), ('sell', asks)):
+    sequence_value = payload.get("sequence", payload.get("checksum"))
+    sequence = int(sequence_value) if sequence_value not in (None, "") else None
+    action = "snapshot" if any(key in payload for key in ("as", "bs")) else "update"
+    updates: List[OrderBookEvent] = []
+    for side, levels in (("bid", bids), ("ask", asks)):
         for level in levels:
             price = float(level[0])
             size = float(level[1]) if len(level) > 1 else 0.0
             updates.append(
-                OrderBookUpdate(
-                    market=market,
-                    event_time=event_time,
+                OrderBookEvent(
+                    symbol=symbol,
+                    ts=event_time,
                     side=side,
                     price=price,
                     size=size,
+                    action=action,
                     sequence=sequence,
-                    raw={'payload': payload, 'side': side, 'price': price, 'size': size, 'sequence': sequence},
+                    meta={"payload": payload, "side": side, "price": price, "size": size},
                 )
             )
     return updates
@@ -133,50 +137,60 @@ def datetime_from_kraken(timestamp: Any) -> dt.datetime:
     return dt_obj
 
 
-def persist_updates(engine: Engine, updates: Sequence[OrderBookUpdate]) -> None:
+def persist_updates(engine: Engine, updates: Sequence[OrderBookEvent]) -> None:
     if not updates:
         return
     with engine.begin() as connection:
         for update in updates:
             record = {
-                "market": update.market,
-                "event_time": update.event_time,
+                "symbol": update.symbol,
+                "ts": update.ts,
                 "side": update.side,
                 "price": update.price,
                 "size": update.size,
-                "event_type": "book",
+                "action": update.action,
                 "sequence": update.sequence,
-                "raw": update.raw,
+                "meta": update.meta,
             }
-            stmt = pg_insert(order_book_table).values(**record)
+            stmt = pg_insert(orderbook_events_table).values(**record)
             stmt = stmt.on_conflict_do_update(
                 index_elements=[
-                    order_book_table.c.market,
-                    order_book_table.c.event_time,
-                    order_book_table.c.sequence,
+                    orderbook_events_table.c.symbol,
+                    orderbook_events_table.c.ts,
+                    orderbook_events_table.c.side,
+                    orderbook_events_table.c.price,
                 ],
-                set_={"raw": stmt.excluded.raw, "size": stmt.excluded.size, "price": stmt.excluded.price},
+                set_={
+                    "size": stmt.excluded.size,
+                    "action": stmt.excluded.action,
+                    "sequence": stmt.excluded.sequence,
+                    "meta": stmt.excluded.meta,
+                },
             )
             connection.execute(stmt)
-    LOGGER.info("Persisted Kraken updates", extra={"count": len(updates)})
 
 
-def publish_updates(producer: Producer | None, updates: Sequence[OrderBookUpdate]) -> None:
+def publish_updates(producer: Producer | None, updates: Sequence[OrderBookEvent]) -> None:
     if producer is None:
         return
     for update in updates:
         payload = json.dumps(
             {
-                "market": update.market,
-                "event_time": update.event_time.isoformat(),
-                "raw": update.raw,
+                "symbol": update.symbol,
+                "ts": update.ts.isoformat(),
+                "side": update.side,
+                "price": update.price,
+                "size": update.size,
+                "action": update.action,
+                "sequence": update.sequence,
+                "meta": update.meta,
             }
         ).encode("utf-8")
         producer.produce(KAFKA_TOPIC, payload)
     producer.flush()
 
 
-async def publish_to_nats(updates: Sequence[OrderBookUpdate]) -> None:
+async def publish_to_nats(updates: Sequence[OrderBookEvent]) -> None:
     if NATS is None or not updates:
         return
     client = NATS()
@@ -185,9 +199,14 @@ async def publish_to_nats(updates: Sequence[OrderBookUpdate]) -> None:
         for update in updates:
             payload = json.dumps(
                 {
-                    "market": update.market,
-                    "event_time": update.event_time.isoformat(),
-                    "raw": update.raw,
+                    "symbol": update.symbol,
+                    "ts": update.ts.isoformat(),
+                    "side": update.side,
+                    "price": update.price,
+                    "size": update.size,
+                    "action": update.action,
+                    "sequence": update.sequence,
+                    "meta": update.meta,
                 }
             ).encode("utf-8")
             await client.publish(NATS_SUBJECT, payload)
