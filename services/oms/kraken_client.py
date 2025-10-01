@@ -170,6 +170,15 @@ class KrakenWSClient:
             fallback = self._rest_fallback(payload)
             fallback.setdefault("transport", "rest")
             return fallback
+        except KrakenWebsocketError:
+            fallback = self._rest_fallback(payload)
+            fallback.setdefault("transport", "rest")
+            return fallback
+
+    def rest_add_order(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        fallback = self._rest_fallback(payload)
+        fallback.setdefault("transport", "rest")
+        return fallback
 
     def cancel_order(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         response = self._send("cancel_order", payload)

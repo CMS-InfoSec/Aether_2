@@ -286,6 +286,7 @@ class TimescaleAdapter:
             cls._events,
             cls._credential_rotations,
             cls._credential_events,
+            cls._rolling_volume,
         )
 
         if account_id is None:

@@ -1,3 +1,4 @@
+
 """Kraken OMS credential hot-reload utilities."""
 
 from __future__ import annotations
@@ -320,4 +321,5 @@ class KrakenCredentialWatcher:
 
 
 __all__ = ["KrakenCredentialWatcher"]
+
 
