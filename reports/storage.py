@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +28,55 @@ class TimescaleSession(Protocol):
 
     def commit(self) -> None:  # pragma: no cover - optional behaviour
         ...
+
+
+class AuditLogWriter:
+    """Helper responsible for emitting audit log events."""
+
+    def __init__(self, session: TimescaleSession) -> None:
+        self._session = session
+
+    def artifact_stored(
+        self,
+        *,
+        actor: str,
+        entity_id: str,
+        metadata: Mapping[str, Any],
+        event_time: datetime,
+    ) -> None:
+        """Record an audit event describing a stored artifact."""
+
+        event_id = uuid.uuid4()
+        params = {
+            "event_id": event_id,
+            "entity_type": "report_artifact",
+            "entity_id": entity_id,
+            "actor": actor,
+            "event_time": event_time,
+            "metadata": json.dumps(metadata),
+        }
+
+        self._session.execute(
+            """
+            INSERT INTO audit_log (
+                event_id,
+                entity_type,
+                entity_id,
+                actor,
+                event_time,
+                metadata
+            )
+            VALUES (
+                %(event_id)s,
+                %(entity_type)s,
+                %(entity_id)s,
+                %(actor)s,
+                %(event_time)s,
+                %(metadata)s::jsonb
+            )
+            """,
+            params,
+        )
 
 
 @dataclass
@@ -87,16 +137,6 @@ class ArtifactStorage:
         checksum = hashlib.sha256(data).hexdigest()
         created_at = datetime.now(timezone.utc)
         relative_path = str(target_path.relative_to(self.base_path))
-        audit_payload = {
-            "account_id": account_id,
-            "object_key": relative_path,
-            "checksum": checksum,
-            "size_bytes": len(data),
-            "content_type": content_type,
-            "metadata": metadata or {},
-            "created_at": created_at.isoformat(),
-        }
-
         LOGGER.info(
             "Stored artifact for account %s at %s (checksum=%s)",
             account_id,
@@ -104,19 +144,25 @@ class ArtifactStorage:
             checksum,
         )
 
+        audit_metadata: dict[str, Any] = {
+            "account_id": account_id,
+            "object_key": relative_path,
+            "checksum": checksum,
+            "size_bytes": len(data),
+            "content_type": content_type,
+            "created_at": created_at.isoformat(),
+        }
+        if metadata:
+            for key, value in metadata.items():
+                audit_metadata.setdefault(key, value)
+
         try:
-            session.execute(
-                """
-                INSERT INTO audit_logs (actor, action, target, payload, created_at)
-                VALUES (%(actor)s, %(action)s, %(target)s, %(payload)s::jsonb, %(created_at)s)
-                """,
-                {
-                    "actor": account_id,
-                    "action": "report_artifact_stored",
-                    "target": relative_path,
-                    "payload": json.dumps(audit_payload),
-                    "created_at": created_at,
-                },
+            audit_log_writer = AuditLogWriter(session)
+            audit_log_writer.artifact_stored(
+                actor=account_id,
+                entity_id=relative_path,
+                metadata=audit_metadata,
+                event_time=created_at,
             )
             if hasattr(session, "commit"):
                 try:
