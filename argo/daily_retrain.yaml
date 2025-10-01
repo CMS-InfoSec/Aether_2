@@ -4,6 +4,8 @@ metadata:
   name: ml-daily-retrain
   labels:
     workflows.argoproj.io/controller-instanceid: ml-platform
+  annotations:
+    slo.aether.dev/reference: docs/slo.md
 spec:
   schedule: "0 2 * * *"
   concurrencyPolicy: Replace
