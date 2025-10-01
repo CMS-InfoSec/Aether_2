@@ -47,6 +47,9 @@ class AuditLogWriter:
     ) -> None:
         """Record an audit event describing a stored artifact."""
 
+        event_id = hashlib.sha256(
+            f"{entity_id}:{event_time.isoformat()}".encode("utf-8")
+        ).hexdigest()
         payload = json.dumps(
             {
                 "entity": {
@@ -54,37 +57,31 @@ class AuditLogWriter:
                     "id": entity_id,
                 },
                 "metadata": metadata,
+                "event_id": event_id,
+                "event_time": event_time.isoformat(),
             }
         )
         params = {
-            "event_id": hashlib.sha256(
-                f"{entity_id}:{event_time.isoformat()}".encode("utf-8")
-            ).hexdigest(),
-            "entity_type": "report_artifact",
-            "entity_id": entity_id,
             "actor": actor,
             "action": "report.artifact.stored",
-            "event_time": event_time,
+            "target": entity_id,
+            "created_at": event_time,
             "payload": payload,
         }
 
         insert_audit_log_sql = """
             INSERT INTO audit_logs (
-                event_id,
-                entity_type,
-                entity_id,
                 actor,
                 action,
-                event_time,
+                target,
+                created_at,
                 payload
             )
             VALUES (
-                %(event_id)s,
-                %(entity_type)s,
-                %(entity_id)s,
                 %(actor)s,
                 %(action)s,
-                %(event_time)s,
+                %(target)s,
+                %(created_at)s,
                 %(payload)s::jsonb
             )
         """
