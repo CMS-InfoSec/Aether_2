@@ -1,0 +1,6 @@
+killSwitch:
+  enabled: false
+  rolloutWindowSeconds: 60
+  allowedStages:
+    - canary
+    - production

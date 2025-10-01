@@ -1,0 +1,149 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-gateway
+  labels:
+    app: order-gateway
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: order-gateway
+  template:
+    metadata:
+      labels:
+        app: order-gateway
+      annotations:
+        aether.io/secret-access: "true"
+    spec:
+      serviceAccountName: api-services
+      containers:
+        - name: order-gateway
+          image: ghcr.io/aether/order-gateway:1.4.2
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+              name: http
+          envFrom:
+            - secretRef:
+                name: fastapi-credentials
+          env:
+            - name: TIMESCALEDB_HOST
+              value: timescaledb.aether.svc.cluster.local
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: REDIS_URL
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1
+              memory: 1Gi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          volumeMounts:
+            - name: config
+              mountPath: /etc/aether
+      volumes:
+        - name: config
+          configMap:
+            name: fastapi-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-gateway
+spec:
+  selector:
+    app: order-gateway
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pricing-service
+  labels:
+    app: pricing-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: pricing-service
+  template:
+    metadata:
+      labels:
+        app: pricing-service
+      annotations:
+        aether.io/secret-access: "true"
+    spec:
+      serviceAccountName: api-services
+      containers:
+        - name: pricing-service
+          image: ghcr.io/aether/pricing-service:2.0.1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+              name: http
+          envFrom:
+            - secretRef:
+                name: fastapi-credentials
+          env:
+            - name: FEATURE_STORE_ENDPOINT
+              value: feast-online-store.aether.svc.cluster.local:6566
+            - name: NATS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: NATS_URL
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 800m
+              memory: 1Gi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+          volumeMounts:
+            - name: config
+              mountPath: /etc/aether
+      volumes:
+        - name: config
+          configMap:
+            name: fastapi-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pricing-service
+spec:
+  selector:
+    app: pricing-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8000

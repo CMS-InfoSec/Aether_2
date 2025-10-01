@@ -1,0 +1,23 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: aether-staging
+  namespace: argocd
+spec:
+  project: aether
+  source:
+    repoURL: https://github.com/example/aether
+    targetRevision: main
+    path: deploy/k8s/overlays/staging
+    kustomize:
+      commonAnnotations:
+        argocd.argoproj.io/sync-wave: "5"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: aether-staging
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

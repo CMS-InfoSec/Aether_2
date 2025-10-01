@@ -1,0 +1,71 @@
+name: OCI Build Pipeline
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'services/**'
+      - '.github/workflows/oci-build.yml'
+
+env:
+  REGISTRY: ghcr.io/aether
+
+jobs:
+  kaniko:
+    name: Kaniko Build
+    runs-on: ubuntu-latest
+    if: ${{ hashFiles('services/order-gateway/Dockerfile') != '' && hashFiles('services/pricing-service/Dockerfile') != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Order Gateway image
+        uses: addnab/docker-run-action@v3
+        with:
+          image: gcr.io/kaniko-project/executor:v1.18.0
+          options: >-
+            --rm
+            -v ${GITHUB_WORKSPACE}:/workspace
+            -v /kaniko/.docker:/kaniko/.docker
+          run: >-
+            /kaniko/executor
+            --context /workspace/services/order-gateway
+            --destination ${REGISTRY}/order-gateway:${{ github.sha }}
+            --snapshotMode time
+            --single-snapshot
+      - name: Build Pricing Service image
+        uses: addnab/docker-run-action@v3
+        with:
+          image: gcr.io/kaniko-project/executor:v1.18.0
+          options: >-
+            --rm
+            -v ${GITHUB_WORKSPACE}:/workspace
+            -v /kaniko/.docker:/kaniko/.docker
+          run: >-
+            /kaniko/executor
+            --context /workspace/services/pricing-service
+            --destination ${REGISTRY}/pricing-service:${{ github.sha }}
+            --snapshotMode time
+            --single-snapshot
+  buildah:
+    name: Buildah Build
+    runs-on: ubuntu-latest
+    needs: kaniko
+    if: ${{ needs.kaniko.result == 'success' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Buildah
+        run: sudo apt-get update && sudo apt-get install -y buildah
+      - name: Build Order Gateway image
+        run: |
+          buildah bud --layers -f services/order-gateway/Dockerfile -t ${REGISTRY}/order-gateway:${{ github.sha }} services/order-gateway
+      - name: Build Pricing Service image
+        run: |
+          buildah bud --layers -f services/pricing-service/Dockerfile -t ${REGISTRY}/pricing-service:${{ github.sha }} services/pricing-service
+      - name: Push images
+        env:
+          CR_PAT: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "${CR_PAT}" | buildah login --username ${{ github.actor }} --password-stdin ghcr.io
+          buildah push ${REGISTRY}/order-gateway:${{ github.sha }}
+          buildah push ${REGISTRY}/pricing-service:${{ github.sha }}

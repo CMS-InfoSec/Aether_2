@@ -1,0 +1,14 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+nameSuffix: -staging
+namespace: aether-staging
+resources:
+  - ../../base
+patchesStrategicMerge:
+  - patches/replicas.yaml
+configMapGenerator:
+  - name: fastapi-config
+    behavior: merge
+    literals:
+      - killSwitch.enabled=true
+      - killSwitch.allowedStages=staging

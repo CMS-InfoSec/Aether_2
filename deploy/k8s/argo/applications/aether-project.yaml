@@ -1,0 +1,20 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: aether
+  namespace: argocd
+spec:
+  description: Aether trading infrastructure
+  sourceRepos:
+    - https://github.com/example/aether
+  destinations:
+    - namespace: '*'
+      server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+    - group: '*'
+      kind: '*'
+  namespaceResourceWhitelist:
+    - group: '*'
+      kind: '*'
+  signatureKeys:
+    - keyID: 0123456789ABCDEF
