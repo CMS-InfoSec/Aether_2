@@ -28,6 +28,7 @@ from services.common.schemas import (
     PolicyState,
 )
 from services.models.model_server import Intent, predict_intent
+from services.policy.adaptive_horizon import get_horizon
 
 
 from metrics import record_abstention_rate, record_drift_score, setup_metrics
@@ -492,6 +493,23 @@ async def decide_policy(request: PolicyDecisionRequest) -> PolicyDecisionRespons
     book_snapshot = request.book_snapshot
 
     state_model = request.state or _default_state()
+    state_payload = (
+        state_model.model_dump()
+        if hasattr(state_model, "model_dump")
+        else {
+            "regime": getattr(state_model, "regime", "unknown"),
+            "volatility": getattr(state_model, "volatility", 0.0),
+            "liquidity_score": getattr(state_model, "liquidity_score", 0.0),
+            "conviction": getattr(state_model, "conviction", 0.0),
+        }
+    )
+    horizon_features = {
+        "symbol": request.instrument,
+        "regime": state_payload.get("regime"),
+        "state": state_payload,
+        "features": list(request.features or []),
+    }
+    horizon_seconds = get_horizon(horizon_features)
     features: List[float] = [float(value) for value in request.features]
 
 
@@ -506,6 +524,7 @@ async def decide_policy(request: PolicyDecisionRequest) -> PolicyDecisionRespons
             features=features,
             book_snapshot=book_snapshot,
             model_variant=variant,
+            horizon=horizon_seconds,
         )
 
     notional = float(Decimal(str(snapped_price)) * Decimal(str(snapped_qty)))
