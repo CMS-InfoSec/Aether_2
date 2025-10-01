@@ -304,7 +304,33 @@ class TimescaleAdapter:
 
     @classmethod
     def reset_rotation_state(cls, account_id: str | None = None) -> None:
-        cls.reset(account_id=account_id)
+        rotation_caches = (
+            cls._credential_rotations,
+            cls._credential_events,
+        )
+
+        if account_id is None:
+            for cache in rotation_caches:
+                cache.clear()
+
+            for events in cls._events.values():
+                rotations = events.get("credential_rotations")
+                if isinstance(rotations, list):
+                    rotations.clear()
+                elif rotations is not None:
+                    events["credential_rotations"] = []
+            return
+
+        for cache in rotation_caches:
+            cache.pop(account_id, None)
+
+        account_events = cls._events.get(account_id)
+        if account_events is not None and "credential_rotations" in account_events:
+            rotations = account_events["credential_rotations"]
+            if isinstance(rotations, list):
+                rotations.clear()
+            else:
+                account_events["credential_rotations"] = []
 
 
 

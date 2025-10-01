@@ -162,3 +162,67 @@ def test_reset_clears_account_rolling_volume_cache_only_for_target_account() -> 
 
     assert "acct-1" not in TimescaleAdapter._rolling_volume
     assert "acct-2" in TimescaleAdapter._rolling_volume
+
+
+def test_reset_rotation_state_clears_only_rotation_state_for_account() -> None:
+    TimescaleAdapter.reset()
+
+    rotation_time = datetime.now(timezone.utc)
+
+    primary = TimescaleAdapter(account_id="acct-1")
+    secondary = TimescaleAdapter(account_id="acct-2")
+
+    primary.record_usage(500.0)
+    primary.record_event("limit", {"reason": "test"})
+    primary.record_credential_rotation(secret_name="secret-1", rotated_at=rotation_time)
+    primary.record_credential_access(
+        secret_name="secret-1", metadata={"api_key": "abc", "api_secret": "xyz"}
+    )
+
+    secondary.record_credential_rotation(secret_name="secret-2", rotated_at=rotation_time)
+
+    TimescaleAdapter._events["acct-1"]["credential_rotations"].append({"rotated_at": rotation_time})
+    TimescaleAdapter._events["acct-2"]["credential_rotations"].append({"rotated_at": rotation_time})
+
+    TimescaleAdapter.reset_rotation_state(account_id="acct-1")
+
+    assert "acct-1" not in TimescaleAdapter._credential_rotations
+    assert "acct-1" not in TimescaleAdapter._credential_events
+    assert TimescaleAdapter._events["acct-1"]["credential_rotations"] == []
+
+    # Non-credential caches remain untouched
+    assert TimescaleAdapter._metrics["acct-1"]["usage"] == pytest.approx(500.0)
+    assert TimescaleAdapter._events["acct-1"]["events"]
+
+    # Other accounts retain their rotation state
+    assert "acct-2" in TimescaleAdapter._credential_rotations
+    assert TimescaleAdapter._events["acct-2"]["credential_rotations"]
+
+
+def test_reset_rotation_state_without_account_clears_all_rotation_state() -> None:
+    TimescaleAdapter.reset()
+
+    rotation_time = datetime.now(timezone.utc)
+
+    first = TimescaleAdapter(account_id="acct-1")
+    second = TimescaleAdapter(account_id="acct-2")
+
+    first.record_usage(250.0)
+    second.record_usage(125.0)
+
+    first.record_credential_rotation(secret_name="secret-1", rotated_at=rotation_time)
+    second.record_credential_rotation(secret_name="secret-2", rotated_at=rotation_time)
+
+    TimescaleAdapter._events["acct-1"]["credential_rotations"].append({"rotated_at": rotation_time})
+    TimescaleAdapter._events["acct-2"]["credential_rotations"].append({"rotated_at": rotation_time})
+
+    TimescaleAdapter.reset_rotation_state()
+
+    assert TimescaleAdapter._credential_rotations == {}
+    assert TimescaleAdapter._credential_events == {}
+    assert TimescaleAdapter._events["acct-1"]["credential_rotations"] == []
+    assert TimescaleAdapter._events["acct-2"]["credential_rotations"] == []
+
+    # Existing metrics remain for both accounts
+    assert TimescaleAdapter._metrics["acct-1"]["usage"] == pytest.approx(250.0)
+    assert TimescaleAdapter._metrics["acct-2"]["usage"] == pytest.approx(125.0)
