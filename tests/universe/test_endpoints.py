@@ -61,19 +61,22 @@ def test_get_universe_rejects_non_admin(client: TestClient) -> None:
 
 
 
-def test_universe_endpoint_filters_to_usd_when_timescale_empty(client: TestClient) -> None:
+@pytest.mark.parametrize("account_id", sorted(ADMIN_ACCOUNTS))
+def test_universe_endpoint_uses_fallback_when_timescale_empty(
+    client: TestClient, account_id: str
+) -> None:
 
     UniverseRepository.seed_market_snapshots([])
 
     response = client.get(
         "/universe/approved",
-        headers={"X-Account-ID": "director-2"},
+        headers={"X-Account-ID": account_id},
     )
 
     assert response.status_code == 200
     body = response.json()
 
-    adapter = RedisFeastAdapter(account_id="director-2")
+    adapter = RedisFeastAdapter(account_id=account_id)
     expected_instruments = adapter.approved_instruments()
 
     assert body["instruments"] == expected_instruments

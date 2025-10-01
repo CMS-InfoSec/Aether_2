@@ -13,6 +13,11 @@ from shared.k8s import KrakenSecretStore
 
 from services.universe.repository import UniverseRepository
 
+def _normalize_account_id(account_id: str) -> str:
+    """Convert human readable admin labels into canonical keys."""
+
+    return account_id.strip().lower().replace(" ", "-")
+
 
 logger = logging.getLogger(__name__)
 
@@ -336,30 +341,48 @@ class RedisFeastAdapter:
     repository: UniverseRepository | None = field(default=None, repr=False)
 
 
-    _features: ClassVar[Dict[str, Dict[str, Any]]] = {
+    _FEATURE_TEMPLATES: ClassVar[Dict[str, Dict[str, Any]]] = {
         "company": {
             "approved": ["BTC-USD", "ETH-USD"],
-            "fees": {"BTC-USD": {"maker": 0.1, "taker": 0.2}},
+            "fees": {
+                "BTC-USD": {"currency": "USD", "maker": 0.1, "taker": 0.2},
+                "ETH-USD": {"currency": "USD", "maker": 0.13, "taker": 0.26},
+            },
         },
-        "director-1": {"approved": ["SOL-USD"], "fees": {}},
-        "director-2": {"approved": ["BTC-USD", "ETH-USD"], "fees": {}},
+        "director-1": {
+            "approved": ["SOL-USD"],
+            "fees": {
+                "SOL-USD": {"currency": "USD", "maker": 0.12, "taker": 0.24}
+            },
+        },
+        "director-2": {
+            "approved": ["BTC-USD", "ETH-USD"],
+            "fees": {
+                "BTC-USD": {"currency": "USD", "maker": 0.09, "taker": 0.18},
+                "ETH-USD": {"currency": "USD", "maker": 0.11, "taker": 0.22},
+            },
+        },
+        "default": {"approved": [], "fees": {}},
     }
-    _fee_tiers: ClassVar[Dict[str, List[Dict[str, Any]]]] = {
-        "default": [
-            {
-                "tier_id": "base",
-                "volume_threshold": 0.0,
-                "maker_bps": 1.0,
-                "taker_bps": 1.5,
-                "currency": "USD",
-            }
-        ]
+    _FEE_TIER_TEMPLATES: ClassVar[
+        Dict[str, Dict[str, List[Dict[str, Any]]]]
+    ] = {
+        "company": {"default": []},
+        "director-1": {"default": []},
+        "director-2": {"default": []},
+        "default": {"default": []},
     }
-    _online_feature_store: ClassVar[Dict[str, Dict[str, Dict[str, Any]]]] = {
+    _ONLINE_FEATURE_TEMPLATES: ClassVar[
+        Dict[str, Dict[str, Dict[str, Any]]]
+    ] = {
         "company": {
             "BTC-USD": {
                 "features": [18.0, 4.0, -2.0],
-                "book_snapshot": {"mid_price": 30_000.0, "spread_bps": 3.0, "imbalance": 0.15},
+                "book_snapshot": {
+                    "mid_price": 30_000.0,
+                    "spread_bps": 3.0,
+                    "imbalance": 0.15,
+                },
                 "state": {
                     "regime": "neutral",
                     "volatility": 0.35,
@@ -375,8 +398,14 @@ class RedisFeastAdapter:
                     "execution_confidence": 0.64,
                 },
             }
-        }
+        },
+        "director-1": {},
+        "director-2": {},
+        "default": {},
     }
+    _features: ClassVar[Dict[str, Dict[str, Any]]] = {}
+    _fee_tiers: ClassVar[Dict[str, Dict[str, List[Dict[str, Any]]]]] = {}
+    _online_feature_store: ClassVar[Dict[str, Dict[str, Dict[str, Any]]]] = {}
 
 
     def __post_init__(self) -> None:
@@ -395,7 +424,7 @@ class RedisFeastAdapter:
 
         instruments = self._repository.approved_universe()
         if not instruments:
-            fallback = self._features.get(self.account_id, {}).get("approved", [])
+            fallback = self._account_config().get("approved", [])
             instruments = list(fallback)
 
         return [symbol for symbol in instruments if symbol.endswith("-USD")]
@@ -405,28 +434,57 @@ class RedisFeastAdapter:
         override = self._repository.fee_override(instrument)
         if override:
             return dict(override)
-        account_config = self._features.get(self.account_id, {})
+        account_config = self._account_config()
         fees = account_config.get("fees", {})
         if instrument not in fees:
             return None
         return dict(fees[instrument])
 
     def fee_tiers(self, pair: str) -> List[Dict[str, Any]]:
-        tiers = self._fee_tiers.get(pair) or self._fee_tiers.get("default", [])
+        account_tiers = self._account_fee_tiers()
+        tiers = account_tiers.get(pair) or account_tiers.get("default", [])
         return [dict(tier) for tier in tiers]
 
     @classmethod
-    def seed_fee_tiers(cls, tiers: Mapping[str, Iterable[Mapping[str, Any]]]) -> None:
+    def seed_fee_tiers(
+        cls, tiers: Mapping[str, Mapping[str, Iterable[Mapping[str, Any]]]]
+    ) -> None:
         cls._fee_tiers = {
-            pair: [dict(entry) for entry in entries]
-            for pair, entries in tiers.items()
+            account: {
+                pair: [dict(entry) for entry in entries]
+                for pair, entries in account_tiers.items()
+            }
+            for account, account_tiers in tiers.items()
         }
 
 
     def fetch_online_features(self, instrument: str) -> Dict[str, Any]:
-        account_store = self._online_feature_store.get(self.account_id, {})
+        account_store = self._account_feature_store()
         feature_payload = account_store.get(instrument, {})
         return dict(feature_payload)
+
+    def _account_config(self) -> Dict[str, Any]:
+        normalized = _normalize_account_id(self.account_id)
+        template = self._FEATURE_TEMPLATES.get(
+            normalized, self._FEATURE_TEMPLATES["default"]
+        )
+        return self._features.setdefault(self.account_id, deepcopy(template))
+
+    def _account_fee_tiers(self) -> Dict[str, List[Dict[str, Any]]]:
+        normalized = _normalize_account_id(self.account_id)
+        template = self._FEE_TIER_TEMPLATES.get(
+            normalized, self._FEE_TIER_TEMPLATES["default"]
+        )
+        return self._fee_tiers.setdefault(self.account_id, deepcopy(template))
+
+    def _account_feature_store(self) -> Dict[str, Dict[str, Any]]:
+        normalized = _normalize_account_id(self.account_id)
+        template = self._ONLINE_FEATURE_TEMPLATES.get(
+            normalized, self._ONLINE_FEATURE_TEMPLATES["default"]
+        )
+        return self._online_feature_store.setdefault(
+            self.account_id, deepcopy(template)
+        )
 
 
 @dataclass

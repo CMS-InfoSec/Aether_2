@@ -7,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import services.fees.main as fees_main
+from services.common.adapters import RedisFeastAdapter
 from services.common.security import ADMIN_ACCOUNTS
 from services.fees.main import app
 
@@ -128,19 +129,31 @@ def test_get_effective_fees_transitions_between_tiers(
     first = client.get(
         "/fees/effective",
 
-        params={"isolation_segment": "seg-fees", "fee_tier": "standard"},
+        params={
+            "pair": "BTC-USD",
+            "liquidity": "maker",
+            "notional": 100_000,
+            "isolation_segment": "seg-fees",
+            "fee_tier": "standard",
+        },
         headers={"X-Account-Id": "company"},
 
     )
     assert first.status_code == 200
     first_body = first.json()["fee"]
-    assert first_body["maker"] == pytest.approx(4.0)
-    assert first_body["maker_detail"]["tier_id"] == "standard"
+    assert first_body["maker"] == pytest.approx(2.0)
+    assert first_body["maker_detail"]["tier_id"] == "vip"
 
     second = client.get(
         "/fees/effective",
 
-        params={"isolation_segment": "seg-fees", "fee_tier": "standard"},
+        params={
+            "pair": "BTC-USD",
+            "liquidity": "taker",
+            "notional": 100_000,
+            "isolation_segment": "seg-fees",
+            "fee_tier": "standard",
+        },
         headers={"X-Account-Id": "company"},
 
     )
@@ -178,14 +191,75 @@ def test_get_effective_fees_uses_fallback_when_schedule_missing(
     response = client.get(
         "/fees/effective",
 
-        params={"isolation_segment": "seg-fees", "fee_tier": "standard"},
+        params={
+            "pair": "BTC-USD",
+            "liquidity": "maker",
+            "notional": 50_000,
+            "isolation_segment": "seg-fees",
+            "fee_tier": "standard",
+        },
         headers={"X-Account-Id": "director-1"},
     )
 
     assert response.status_code == 200
-    assert repositories and repositories[-1].account_id == "director-1"
-    assert repositories[-1].fee_override_calls == ["default"]
     payload = response.json()
-    assert payload["fee"]["maker"] == 0.25
-    assert payload["fee"]["taker"] == 0.4
+    fee = payload["fee"]
+    assert fee["maker"] == pytest.approx(1.5)
+    assert fee["taker"] == pytest.approx(2.0)
+    assert fee["maker_detail"]["tier_id"] == "default"
+
+
+@pytest.mark.parametrize("account_id", sorted(ADMIN_ACCOUNTS))
+def test_get_effective_fees_uses_fallback_store_for_each_admin(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, account_id: str
+) -> None:
+    class EmptyUniverseRepository:
+        def approved_universe(self) -> list[str]:
+            return []
+
+        def fee_override(self, instrument: str) -> dict[str, float | str] | None:
+            return None
+
+    class FallbackRedisAdapter(RedisFeastAdapter):
+        def __post_init__(self) -> None:  # type: ignore[override]
+            self._repository = EmptyUniverseRepository()
+
+    class StubTimescaleAdapter:
+        def __init__(self, account_id: str) -> None:
+            self.account_id = account_id
+
+        def rolling_volume(self, pair: str) -> Dict[str, float | datetime]:
+            return {"notional": 0.0, "basis_ts": datetime.now(timezone.utc)}
+
+    monkeypatch.setattr(fees_main, "RedisFeastAdapter", FallbackRedisAdapter)
+    monkeypatch.setattr(fees_main, "TimescaleAdapter", StubTimescaleAdapter)
+
+    baseline_adapter = RedisFeastAdapter(
+        account_id=account_id, repository=EmptyUniverseRepository()
+    )
+    instruments = baseline_adapter.approved_instruments()
+    assert instruments, "Fallback should supply at least one instrument"
+    assert all(symbol.endswith("-USD") for symbol in instruments)
+
+    pair = instruments[0]
+    override = baseline_adapter.fee_override(pair)
+    assert override is not None
+
+    response = client.get(
+        "/fees/effective",
+        params={"pair": pair, "liquidity": "maker", "notional": 50_000},
+        headers={"X-Account-ID": account_id},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["account_id"] == account_id
+
+    fee = body["fee"]
+    assert fee["currency"] == override["currency"]
+    assert fee["maker"] == pytest.approx(override["maker"])
+    assert fee["taker"] == pytest.approx(override["taker"])
+    assert fee["maker_detail"]["usd"] == pytest.approx(
+        50_000 * override["maker"] / 10_000
+    )
 
