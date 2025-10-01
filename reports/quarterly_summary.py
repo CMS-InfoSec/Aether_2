@@ -38,9 +38,9 @@ GROUP BY o.account_id, f.market
 """
 
 AUDIT_QUERY = """
-SELECT actor AS account_id, event_time
-FROM audit_log
-WHERE event_time >= %(start)s AND event_time < %(end)s
+SELECT actor AS account_id, created_at
+FROM audit_logs
+WHERE created_at >= %(start)s AND created_at < %(end)s
 """
 
 

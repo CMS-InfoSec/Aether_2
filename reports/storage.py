@@ -2,7 +2,7 @@
 
 This module provides a thin abstraction that writes generated report
 artifacts into a filesystem-backed bucket and records immutable audit
-entries in TimescaleDB's ``audit_log`` hypertable.  The storage backend is
+entries in TimescaleDB's ``audit_logs`` hypertable.  The storage backend is
 kept intentionally simple so it can be swapped out for a real object store
 (S3, GCS, MinIO, …) without touching the reporting jobs themselves.
 """
@@ -11,7 +11,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,36 +45,38 @@ class AuditLogWriter:
     ) -> None:
         """Record an audit event describing a stored artifact."""
 
-        event_id = uuid.uuid4()
+        payload = json.dumps(
+            {
+                "entity": {
+                    "type": "report_artifact",
+                    "id": entity_id,
+                },
+                "metadata": metadata,
+            }
+        )
         params = {
-            "event_id": event_id,
-            "entity_type": "report_artifact",
-            "entity_id": entity_id,
             "actor": actor,
             "action": "report.artifact.stored",
-            "event_time": event_time,
-            "metadata": json.dumps(metadata),
+            "target": entity_id,
+            "created_at": event_time,
+            "payload": payload,
         }
 
         self._session.execute(
             """
-            INSERT INTO audit_log (
-                event_id,
-                entity_type,
-                entity_id,
+            INSERT INTO audit_logs (
                 actor,
                 action,
-                event_time,
-                metadata
+                target,
+                created_at,
+                payload
             )
             VALUES (
-                %(event_id)s,
-                %(entity_type)s,
-                %(entity_id)s,
                 %(actor)s,
                 %(action)s,
-                %(event_time)s,
-                %(metadata)s::jsonb
+                %(target)s,
+                %(created_at)s,
+                %(payload)s::jsonb
             )
             """,
             params,
@@ -112,7 +113,7 @@ class ArtifactStorage:
         content_type: str,
         metadata: Mapping[str, Any] | None = None,
     ) -> StoredArtifact:
-        """Persist *data* and emit an ``audit_log`` entry.
+        """Persist *data* and emit an ``audit_logs`` entry.
 
         Parameters
         ----------
