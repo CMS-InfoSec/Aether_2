@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, ClassVar, Dict, Optional
 
+import base64
+
 try:  # pragma: no cover - optional dependency for real clusters
     from kubernetes import client, config
 except ImportError:  # pragma: no cover - fallback for tests/local
@@ -79,6 +81,57 @@ class KrakenSecretStore:
         # Fall back to in-memory store when the Kubernetes client is unavailable
         namespace_store = self._store.setdefault(self.namespace, {})
         namespace_store[name] = {"api_key": api_key, "api_secret": api_secret}
+
+    def get_secret(self, name: str) -> Dict[str, Any]:
+        """Return the raw secret payload for the provided name."""
+
+        if hasattr(self.core_v1, "read_namespaced_secret"):
+            try:  # pragma: no branch - mirrors the Kubernetes client API
+                response = self.core_v1.read_namespaced_secret(  # type: ignore[call-arg]
+                    name=name,
+                    namespace=self.namespace,
+                )
+            except Exception:
+                response = None
+            if response is not None:
+                metadata: Dict[str, Any] = {}
+                raw_metadata = getattr(response, "metadata", None)
+                if raw_metadata is not None:
+                    if hasattr(raw_metadata, "to_dict"):
+                        metadata = raw_metadata.to_dict()  # pragma: no cover - client dep
+                    else:
+                        metadata = dict(getattr(raw_metadata, "__dict__", {}))
+                payload: Dict[str, Any] = {}
+                string_data = getattr(response, "string_data", None)
+                if isinstance(string_data, dict) and string_data:
+                    payload = {str(k): str(v) for k, v in string_data.items()}
+                else:
+                    data = getattr(response, "data", None)
+                    if isinstance(data, dict):
+                        decoded: Dict[str, Any] = {}
+                        for key, value in data.items():
+                            if isinstance(value, str) and base64 is not None:
+                                try:
+                                    decoded_value = base64.b64decode(value).decode()
+                                except Exception:
+                                    decoded_value = value
+                                decoded[str(key)] = decoded_value
+                            else:
+                                decoded[str(key)] = value
+                        payload = decoded
+                return {"metadata": metadata, "data": payload}
+
+        namespace_store = self._store.get(self.namespace, {})
+        secret = namespace_store.get(name)
+        if not secret:
+            return {}
+        metadata = {
+            "name": name,
+            "namespace": self.namespace,
+            "api_key": secret.get("api_key"),
+            "api_secret": secret.get("api_secret"),
+        }
+        return {"metadata": metadata, "data": dict(secret)}
 
     def read_credentials(self, account_id: str) -> Dict[str, str]:
         """Retrieve credentials from the in-memory store for tests."""
