@@ -3,6 +3,10 @@
 ## Purpose
 Ensure rapid rollback to the last known good production model when a regression or anomaly is detected during canary or full rollout.
 
+## Related SLOs
+- [Model Canary Promotion SLO](../slo.md#model-canary-promotion) — 95% of promotions must complete within 45 minutes.
+- [WebSocket Ingest Latency SLO](../slo.md#websocket-ingest-latency) — confirm downstream signal dissemination remains within budget post-rollback.
+
 ## Preconditions
 - PagerDuty incident triggered by `model_latency_p99` or `model_error_rate` exceeding thresholds defined in `../slo.md`.
 - Access to MLflow registry credentials and Argo Rollouts/Workflows permissions.
