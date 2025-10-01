@@ -27,7 +27,9 @@ from services.oms.kraken_ws import (
     OrderAck,
     OrderState,
 )
+
 from services.oms.routing import LatencyRouter
+
 
 import websockets
 

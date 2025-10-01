@@ -98,12 +98,19 @@ class TimescaleAdapter:
 
         account_events = self._events.setdefault(
             self.account_id,
-            {"acks": [], "fills": [], "events": [], "credential_rotations": []},
+            {
+                "acks": [],
+                "fills": [],
+                "events": [],
+                "credential_rotations": [],
+                "shadow_fills": [],
+            },
         )
         account_events.setdefault("acks", [])
         account_events.setdefault("fills", [])
         account_events.setdefault("events", [])
         account_events.setdefault("credential_rotations", [])
+        account_events.setdefault("shadow_fills", [])
 
 
         self._risk_configs.setdefault(self.account_id, deepcopy(self._default_risk_config))
@@ -131,11 +138,21 @@ class TimescaleAdapter:
         record = {"payload": deepcopy(payload), "recorded_at": datetime.now(timezone.utc)}
         self._events[self.account_id]["fills"].append(record)
 
+    def record_shadow_fill(self, payload: Dict[str, Any]) -> None:
+        record = {"payload": deepcopy(payload), "recorded_at": datetime.now(timezone.utc)}
+        self._events[self.account_id]["shadow_fills"].append(record)
+
     def events(self) -> Dict[str, List[Dict[str, Any]]]:
 
         stored = self._events.get(
             self.account_id,
-            {"acks": [], "fills": [], "events": [], "credential_rotations": []},
+            {
+                "acks": [],
+                "fills": [],
+                "events": [],
+                "credential_rotations": [],
+                "shadow_fills": [],
+            },
         )
         return {
             "acks": [
@@ -145,6 +162,10 @@ class TimescaleAdapter:
             "fills": [
                 {**deepcopy(entry["payload"]), "recorded_at": entry["recorded_at"]}
                 for entry in stored.get("fills", [])
+            ],
+            "shadow_fills": [
+                {**deepcopy(entry["payload"]), "recorded_at": entry["recorded_at"]}
+                for entry in stored.get("shadow_fills", [])
             ],
             "events": [deepcopy(entry) for entry in stored.get("events", [])],
             "credential_rotations": [

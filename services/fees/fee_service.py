@@ -1,13 +1,11 @@
 """FastAPI service exposing the venue fee schedule and volume metrics."""
 from __future__ import annotations
 
-import logging
 import os
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Iterator, List, Sequence
 
-import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, func, select
@@ -15,6 +13,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from services.common.security import require_admin_account
+from services.fees.fee_optimizer import FeeOptimizer
 from services.fees.models import AccountVolume30d, Base, FeeTier
 
 
@@ -25,9 +24,6 @@ POLICY_VOLUME_SIGNAL_PATH = os.getenv(
 )
 POLICY_VOLUME_SIGNAL_TIMEOUT = float(os.getenv("POLICY_VOLUME_SIGNAL_TIMEOUT", "0.5"))
 NEXT_TIER_ALERT_THRESHOLD = Decimal("0.95")
-
-
-LOGGER = logging.getLogger(__name__)
 
 
 def _database_url() -> str:
@@ -115,54 +111,13 @@ class Volume30dResponse(BaseModel):
 
 
 class NextTierStatusResponse(BaseModel):
-    current_tier_id: str = Field(..., description="Identifier of the active fee tier")
-    current_tier_threshold: float = Field(
-        ..., description="Notional threshold in USD that defines the current tier"
-    )
-    current_volume_30d: float = Field(
-        ..., description="Observed rolling 30-day notional volume in USD"
-    )
-    next_tier_id: str | None = Field(
+    current_tier: str = Field(..., description="Identifier of the active fee tier")
+    next_tier: str | None = Field(
         None, description="Identifier of the next fee tier if one exists"
     )
-    next_tier_threshold: float | None = Field(
-        None, description="Notional threshold in USD required for the next tier"
+    progress_pct: float = Field(
+        ..., description="Progress towards the next tier expressed as a percentage"
     )
-    notional_to_next: float | None = Field(
-        None,
-        description="Additional notional volume in USD required to reach the next tier",
-    )
-    progress_to_next_pct: float | None = Field(
-        None,
-        description="Progress towards the next tier expressed as a percentage",
-    )
-    within_five_percent: bool = Field(
-        False,
-        description="True when volume is within five percent of the next tier threshold",
-    )
-    basis_ts: datetime = Field(
-        ..., description="Timestamp of the volume observation used for the calculation"
-    )
-
-
-def _ordered_tiers(session: Session) -> List[FeeTier]:
-    stmt = select(FeeTier).order_by(FeeTier.notional_threshold_usd.asc())
-    return session.execute(stmt).scalars().all()
-
-
-def _determine_tier(tiers: Sequence[FeeTier], volume: Decimal) -> FeeTier:
-    if not tiers:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Fee schedule is empty")
-
-    ordered = sorted(tiers, key=lambda tier: Decimal(tier.notional_threshold_usd or 0))
-    match = ordered[0]
-    for tier in ordered:
-        threshold = Decimal(tier.notional_threshold_usd or 0)
-        if volume >= threshold:
-            match = tier
-        else:
-            break
-    return match
 
 
 def _fee_amount(notional: Decimal, bps: Decimal) -> Decimal:
@@ -170,123 +125,12 @@ def _fee_amount(notional: Decimal, bps: Decimal) -> Decimal:
     return raw_fee.quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
 
 
-def _build_policy_signal_url(base_url: str, path: str) -> str:
-    sanitized_base = base_url.rstrip("/")
-    sanitized_path = path if path.startswith("/") else f"/{path}"
-    return f"{sanitized_base}{sanitized_path}"
-
-
-def _current_and_next_tier(
-    tiers: Sequence[FeeTier], volume: Decimal
-) -> tuple[FeeTier, FeeTier | None]:
-    if not tiers:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Fee schedule is empty")
-
-    ordered = sorted(tiers, key=lambda tier: Decimal(tier.notional_threshold_usd or 0))
-    current = ordered[0]
-    next_tier: FeeTier | None = None
-    for idx, tier in enumerate(ordered):
-        threshold = Decimal(tier.notional_threshold_usd or 0)
-        if volume >= threshold:
-            current = tier
-            next_tier = ordered[idx + 1] if idx + 1 < len(ordered) else None
-        else:
-            next_tier = tier
-            break
-
-    return current, next_tier
-
-
-def _calculate_next_tier_status(
-    tiers: Sequence[FeeTier], volume: Decimal
-) -> dict[str, Decimal | FeeTier | bool | None]:
-    current_tier, next_tier = _current_and_next_tier(tiers, volume)
-    current_threshold = Decimal(current_tier.notional_threshold_usd or 0)
-
-    next_threshold: Decimal | None = None
-    notional_to_next: Decimal | None = None
-    progress_ratio: Decimal | None = None
-    within_five_percent = False
-
-    if next_tier is not None:
-        next_threshold = Decimal(next_tier.notional_threshold_usd or 0)
-        if next_threshold > 0:
-            notional_to_next = max(next_threshold - volume, Decimal("0"))
-            progress_ratio = min(volume / next_threshold, Decimal("1"))
-            within_five_percent = (
-                Decimal("0") < notional_to_next
-                and progress_ratio >= NEXT_TIER_ALERT_THRESHOLD
-                and progress_ratio < Decimal("1")
-            )
-
-    return {
-        "current_tier": current_tier,
-        "next_tier": next_tier,
-        "current_threshold": current_threshold,
-        "next_threshold": next_threshold,
-        "current_volume": volume,
-        "notional_to_next": notional_to_next,
-        "progress_ratio": progress_ratio,
-        "within_five_percent": within_five_percent,
-    }
-
-
-def _signal_policy_service(
-    account_id: str,
-    status: dict[str, Decimal | FeeTier | bool | None],
-    basis_ts: datetime,
-) -> None:
-    if not status.get("within_five_percent"):
-        return
-
-    next_tier = status.get("next_tier")
-    next_threshold = status.get("next_threshold")
-    notional_to_next = status.get("notional_to_next")
-    progress_ratio = status.get("progress_ratio")
-
-    if not isinstance(next_tier, FeeTier) or not isinstance(next_threshold, Decimal):
-        return
-
-    payload = {
-        "account_id": account_id,
-        "current_tier": status["current_tier"].tier_id if isinstance(status.get("current_tier"), FeeTier) else None,
-        "current_volume_30d": float(status.get("current_volume", Decimal("0"))),
-        "next_tier": next_tier.tier_id,
-        "next_tier_threshold": float(next_threshold),
-        "notional_to_next": float(notional_to_next) if isinstance(notional_to_next, Decimal) else None,
-        "progress_to_next_pct": float(progress_ratio * Decimal("100")) if isinstance(progress_ratio, Decimal) else None,
-        "basis_ts": basis_ts.isoformat(),
-    }
-
-    url = _build_policy_signal_url(POLICY_SERVICE_URL, POLICY_VOLUME_SIGNAL_PATH)
-
-    try:
-        with httpx.Client(timeout=POLICY_VOLUME_SIGNAL_TIMEOUT) as client:
-            response = client.post(url, json=payload)
-            response.raise_for_status()
-    except httpx.HTTPError as exc:  # pragma: no cover - network or upstream failure
-        LOGGER.warning(
-            "Failed to signal policy service for account %s near fee tier threshold", account_id, exc_info=exc
-        )
-
-
-def _evaluate_and_signal_next_tier(
-    session: Session,
-    account_id: str,
-    basis_ts: datetime,
-) -> None:
-    try:
-        tiers = _ordered_tiers(session)
-        if not tiers:
-            return
-        record = session.get(AccountVolume30d, account_id)
-        volume = Decimal(record.notional_usd_30d or 0) if record is not None else Decimal("0")
-        status = _calculate_next_tier_status(tiers, volume)
-        _signal_policy_service(account_id, status, basis_ts)
-    except Exception:  # pragma: no cover - defensive guard to avoid cascading failures
-        LOGGER.exception(
-            "Unable to evaluate next tier proximity for account %s", account_id
-        )
+optimizer = FeeOptimizer(
+    alert_threshold=NEXT_TIER_ALERT_THRESHOLD,
+    policy_service_url=POLICY_SERVICE_URL,
+    policy_path=POLICY_VOLUME_SIGNAL_PATH,
+    policy_timeout=POLICY_VOLUME_SIGNAL_TIMEOUT,
+)
 
 
 @app.get("/fees/effective", response_model=EffectiveFeeResponse)
@@ -300,7 +144,7 @@ def get_effective_fee(
     del pair  # the current schedule is global and does not vary by pair
 
     normalized_liquidity = liquidity.lower()
-    tiers = _ordered_tiers(session)
+    tiers = optimizer.ordered_tiers(session)
     if not tiers:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Fee schedule is not configured")
 
@@ -312,7 +156,10 @@ def get_effective_fee(
         basis_ts = volume_row.updated_at or datetime.now(timezone.utc)
         rolling_volume = Decimal(volume_row.notional_usd_30d or 0)
 
-    tier = _determine_tier(tiers, rolling_volume)
+    try:
+        tier = optimizer.determine_tier(tiers, rolling_volume)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     bps_value = Decimal(tier.maker_bps if normalized_liquidity == "maker" else tier.taker_bps)
     notional_decimal = Decimal(str(notional))
     fee_usd = _fee_amount(notional_decimal, bps_value)
@@ -330,7 +177,7 @@ def get_fee_tiers(
     session: Session = Depends(get_session),
     _: str = Depends(require_admin_account),
 ) -> List[FeeTierSchema]:
-    tiers = _ordered_tiers(session)
+    tiers = optimizer.ordered_tiers(session)
     if not tiers:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Fee schedule is not configured")
 
@@ -369,31 +216,15 @@ def get_next_tier_status(
     session: Session = Depends(get_session),
     account_id: str = Depends(require_admin_account),
 ) -> NextTierStatusResponse:
-    tiers = _ordered_tiers(session)
-    if not tiers:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Fee schedule is not configured")
-
-    record = session.get(AccountVolume30d, account_id)
-    basis_ts = record.updated_at if record is not None and record.updated_at is not None else datetime.now(timezone.utc)
-    volume = Decimal(record.notional_usd_30d or 0) if record is not None else Decimal("0")
-    status = _calculate_next_tier_status(tiers, volume)
-
-    progress_ratio = status.get("progress_ratio")
-    notional_to_next = status.get("notional_to_next")
-    next_threshold = status.get("next_threshold")
-    next_tier = status.get("next_tier")
-    current_tier = status.get("current_tier")
+    try:
+        status = optimizer.status_for_account(session, account_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
     return NextTierStatusResponse(
-        current_tier_id=current_tier.tier_id if isinstance(current_tier, FeeTier) else "",
-        current_tier_threshold=float(status.get("current_threshold", Decimal("0"))),
-        current_volume_30d=float(status.get("current_volume", Decimal("0"))),
-        next_tier_id=next_tier.tier_id if isinstance(next_tier, FeeTier) else None,
-        next_tier_threshold=float(next_threshold) if isinstance(next_threshold, Decimal) else None,
-        notional_to_next=float(notional_to_next) if isinstance(notional_to_next, Decimal) else None,
-        progress_to_next_pct=float(progress_ratio * Decimal("100")) if isinstance(progress_ratio, Decimal) else None,
-        within_five_percent=bool(status.get("within_five_percent")),
-        basis_ts=basis_ts,
+        current_tier=status.current_tier.tier_id,
+        next_tier=status.next_tier.tier_id if status.next_tier is not None else None,
+        progress_pct=float(status.progress_pct),
     )
 
 
@@ -427,7 +258,12 @@ def update_account_volume_30d(
     session.commit()
     session.refresh(record)
 
-    _evaluate_and_signal_next_tier(session, account_id, record.updated_at or timestamp)
+    optimizer.monitor_account(
+        session,
+        account_id,
+        Decimal(record.notional_usd_30d or 0),
+        record.updated_at or timestamp,
+    )
     return record
 
 

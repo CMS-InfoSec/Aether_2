@@ -1,837 +1,537 @@
-"""FastAPI service responsible for monitoring trade fills for anomalies.
+"""FastAPI service that performs near real-time anomaly detection for trading accounts.
 
-The service periodically scans the ``fills`` hypertable inside the
-account-specific TimescaleDB schema and looks for a handful of risk signals:
-
-* **Price outliers** – fill prices that deviate materially from the recent
-  median for the instrument.
-* **Excessive rejections** – orders that are repeatedly rejected relative to
-  filled orders within the observation window.
-* **Fee spikes** – fees that are disproportionally large compared to the
-  notional of the executed trade.
-
-When an anomaly is detected it is persisted to the ``fill_anomalies`` table,
-Alertmanager notifications are triggered, and (optionally) the account's kill
-switch is engaged to halt trading.
+The service performs ad-hoc scans when requested via the ``/anomaly/scan`` endpoint
+and surfaces the current status for an account via ``/anomaly/status``.  Detected
+incidents are stored in the ``anomaly_log`` table and immediately trigger
+Alertmanager notifications as well as kill switch activation for the impacted
+account.
 """
 
 from __future__ import annotations
 
-import asyncio
-import hashlib
 import json
 import logging
-import math
 import os
-import statistics
-from collections import defaultdict
-from contextlib import closing, suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional
 
-import psycopg2
-from fastapi import FastAPI, HTTPException, status
-from fastapi.responses import Response
+from fastapi import FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from psycopg2 import sql
-from psycopg2.extras import RealDictCursor
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, generate_latest
+from sqlalchemy import JSON, Column, DateTime, Integer, String, create_engine
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session, declarative_base, sessionmaker
+from sqlalchemy.pool import StaticPool
 
-from services.alert_manager import (
-    RiskEvent,
-    alert_fee_spike,
-    get_alert_manager_instance,
-    setup_alerting,
-)
+from services.alert_manager import RiskEvent, get_alert_manager_instance
 from services.common.adapters import TimescaleAdapter
-from services.common.config import get_timescale_session
 
 
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+DATABASE_URL = os.getenv("ANOMALY_DATABASE_URL", "sqlite:///./anomaly.db")
 
 
-ACCOUNT_ID = os.getenv("AETHER_ACCOUNT_ID", "default")
-TIMESCALE = get_timescale_session(ACCOUNT_ID)
-
-LOOKBACK_MINUTES = int(os.getenv("ANOMALY_LOOKBACK_MINUTES", "15"))
-SCAN_INTERVAL_SECONDS = int(os.getenv("ANOMALY_SCAN_INTERVAL_SECONDS", "300"))
-PRICE_DEVIATION_THRESHOLD_PCT = float(os.getenv("ANOMALY_PRICE_DEVIATION_PCT", "5.0"))
-FEE_SPIKE_THRESHOLD_BPS = float(os.getenv("ANOMALY_FEE_THRESHOLD_BPS", "75.0"))
-REJECTION_THRESHOLD = int(os.getenv("ANOMALY_REJECTION_THRESHOLD", "5"))
-BLOCK_ON_SEVERITIES = {
-    severity.strip().lower()
-    for severity in os.getenv("ANOMALY_BLOCK_SEVERITIES", "high,critical").split(",")
-    if severity.strip()
-}
-BLOCK_ENABLED = os.getenv("ANOMALY_BLOCK_ENABLED", "true").lower() in {"true", "1", "yes"}
-BLOCK_ACTOR = os.getenv("ANOMALY_BLOCK_ACTOR", "anomaly-service")
+def _engine_options(url: str) -> Dict[str, Any]:
+    options: Dict[str, Any] = {"future": True}
+    if url.startswith("sqlite://"):
+        options.setdefault("connect_args", {"check_same_thread": False})
+        if url.endswith(":memory:"):
+            options["poolclass"] = StaticPool
+    return options
 
 
-# ---------------------------------------------------------------------------
-# Prometheus metrics
-# ---------------------------------------------------------------------------
+ENGINE: Engine = create_engine(DATABASE_URL, **_engine_options(DATABASE_URL))
+SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
+Base = declarative_base()
 
 
-ANOMALY_SCANS_TOTAL = Counter(
-    "anomaly_scans_total",
-    "Total number of anomaly scans executed.",
-)
+class AnomalyLog(Base):
+    """SQLAlchemy ORM model backing ``anomaly_log``."""
 
-ANOMALY_EVENTS_TOTAL = Counter(
-    "anomaly_events_total",
-    "Number of detected anomalies grouped by type and severity.",
-    ("anomaly_type", "severity"),
-)
+    __tablename__ = "anomaly_log"
 
-ANOMALY_LAST_SCAN_TS = Gauge(
-    "anomaly_last_scan_timestamp_seconds",
-    "Unix timestamp of the most recent anomaly scan.",
-)
-
-ANOMALY_BLOCKED_ACCOUNTS = Gauge(
-    "anomaly_blocked_accounts",
-    "Number of accounts currently blocked by the anomaly service.",
-)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(String, nullable=False, index=True)
+    anomaly_type = Column(String, nullable=False)
+    details_json = Column(JSON, nullable=False, default=dict)
+    ts = Column(DateTime(timezone=True), nullable=False, index=True)
 
 
-# ---------------------------------------------------------------------------
-# Database helpers
-# ---------------------------------------------------------------------------
+Base.metadata.create_all(bind=ENGINE)
 
 
-def _connect() -> psycopg2.extensions.connection:
-    """Create a TimescaleDB connection scoped to the account schema."""
+class ScanRequest(BaseModel):
+    """Request payload for triggering a scan."""
 
-    conn = psycopg2.connect(TIMESCALE.dsn)
-    conn.autocommit = True
-    with conn.cursor() as cursor:
-        cursor.execute(
-            sql.SQL("SET search_path TO {}, public").format(
-                sql.Identifier(TIMESCALE.account_schema)
-            )
-        )
-    return conn
-
-
-def _ensure_tables() -> None:
-    """Create the ``fill_anomalies`` table if it does not yet exist."""
-
-    create_stmt = """
-    CREATE TABLE IF NOT EXISTS fill_anomalies (
-        anomaly_id BIGSERIAL PRIMARY KEY,
-        fill_id UUID,
-        order_id UUID,
-        account_id TEXT NOT NULL,
-        instrument TEXT NOT NULL,
-        anomaly_type TEXT NOT NULL,
-        severity TEXT NOT NULL,
-        description TEXT NOT NULL,
-        detected_at TIMESTAMPTZ NOT NULL,
-        metadata JSONB DEFAULT '{}'::jsonb,
-        fingerprint TEXT UNIQUE
+    account_id: str = Field(..., min_length=1, description="Account identifier to scan")
+    lookback_minutes: int = Field(
+        15, ge=1, le=180, description="Observation lookback window in minutes"
     )
-    """
-
-    with closing(_connect()) as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(create_stmt)
 
 
-# ---------------------------------------------------------------------------
-# Domain models
-# ---------------------------------------------------------------------------
+class Incident(BaseModel):
+    """Response payload describing an anomaly incident."""
 
-
-@dataclass(frozen=True)
-class FillRecord:
-    fill_id: Optional[str]
-    order_id: Optional[str]
     account_id: str
-    instrument: str
-    price: float
-    size: float
-    fee: Optional[float]
-    fill_time: datetime
-
-
-@dataclass(frozen=True)
-class RejectionStats:
-    account_id: str
-    instrument: str
-    rejections: int
-    fills: int
-    last_order_ts: Optional[datetime]
-
-
-@dataclass(frozen=True)
-class DetectedAnomaly:
-    account_id: str
-    instrument: str
     anomaly_type: str
-    severity: str
-    description: str
-    metadata: MutableMapping[str, Any] = field(default_factory=dict)
-    fill_id: Optional[str] = None
-    order_id: Optional[str] = None
-
-    @property
-    def fingerprint(self) -> str:
-        payload = json.dumps(
-            {
-                "account_id": self.account_id,
-                "instrument": self.instrument,
-                "type": self.anomaly_type,
-                "severity": self.severity,
-                "description": self.description,
-                "fill_id": self.fill_id,
-                "order_id": self.order_id,
-            },
-            sort_keys=True,
-        )
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    details: Dict[str, Any]
+    ts: datetime
 
 
-# ---------------------------------------------------------------------------
-# Anomaly monitor
-# ---------------------------------------------------------------------------
+class ScanResponse(BaseModel):
+    incidents: List[Incident]
+    blocked: bool
 
 
-class AnomalyMonitor:
-    """Encapsulates the anomaly detection workflow and state."""
+class StatusResponse(BaseModel):
+    account_id: str
+    blocked: bool
+    incidents: List[Incident]
 
-    def __init__(
-        self,
-        *,
-        lookback: timedelta,
-        price_threshold_pct: float,
-        fee_threshold_bps: float,
-        rejection_threshold: int,
-        interval_seconds: int,
-    ) -> None:
-        self.lookback = lookback
-        self.price_threshold_pct = price_threshold_pct
-        self.fee_threshold_bps = fee_threshold_bps
-        self.rejection_threshold = rejection_threshold
-        self.interval_seconds = interval_seconds
-        self.last_run: Optional[datetime] = None
-        self.blocked_accounts: set[str] = set()
-        self._stop_event = asyncio.Event()
-        self._scan_lock = asyncio.Lock()
+
+@dataclass
+class FillSnapshot:
+    price: float
+    mid_price: Optional[float]
+    fee: Optional[float]
+    quantity: Optional[float]
+    recorded_at: datetime
+    metadata: Dict[str, Any]
+
+
+class AnomalyDetector:
+    """Encapsulates anomaly detection heuristics."""
+
+    price_deviation_threshold: float = 0.05
+    fee_spike_multiplier: float = 2.0
+    rejection_threshold: int = 3
+    auth_failure_threshold: int = 3
+    volume_spike_multiplier: float = 3.0
+
+    def __init__(self, adapter_factory: type[TimescaleAdapter] = TimescaleAdapter) -> None:
+        self._adapter_factory = adapter_factory
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    async def run_periodic(self) -> None:
-        """Continuously execute anomaly scans until cancelled."""
+    def scan_account(self, account_id: str, lookback_minutes: int) -> List[Incident]:
+        """Scan a single account for anomalies."""
 
-        while not self._stop_event.is_set():
-            try:
-                await self.run_scan_async()
-            except Exception:  # pragma: no cover - defensive logging
-                logger.exception("Anomaly scan failed")
-
-            try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=self.interval_seconds)
-            except asyncio.TimeoutError:
-                continue
-
-    async def run_scan_async(self) -> None:
-        """Execute a scan in a thread-safe manner from the asyncio loop."""
-
-        async with self._scan_lock:
-            await asyncio.to_thread(self.scan_once)
-
-    def stop(self) -> None:
-        """Signal the monitor to stop periodic execution."""
-
-        self._stop_event.set()
-
-    # ------------------------------------------------------------------
-    # Core logic
-    # ------------------------------------------------------------------
-    def scan_once(self) -> None:
-        """Run a single anomaly detection pass."""
-
-        observation_start = datetime.now(timezone.utc) - self.lookback
         now = datetime.now(timezone.utc)
-        logger.debug("Starting anomaly scan lookback=%s", self.lookback)
+        observation_start = now - timedelta(minutes=lookback_minutes)
 
-        with closing(_connect()) as conn:
-            fills = self._fetch_recent_fills(conn, observation_start)
-            rejection_stats = self._fetch_rejection_stats(conn, observation_start)
+        adapter = self._adapter_factory(account_id=account_id)
+        events = adapter.events()
 
-            anomalies: List[DetectedAnomaly] = []
-            anomalies.extend(self._detect_price_outliers(fills))
-            anomalies.extend(self._detect_fee_spikes(fills))
-            anomalies.extend(self._detect_rejection_spikes(rejection_stats))
+        fills = self._extract_fills(events.get("fills", []), observation_start)
+        ack_events = events.get("acks", [])
+        telemetry = events.get("events", [])
 
-            inserted = self._persist_anomalies(conn, anomalies, now)
+        incidents: List[Incident] = []
+        incidents.extend(self._detect_price_outliers(account_id, fills))
+        incidents.extend(self._detect_fee_spikes(account_id, fills))
+        incidents.extend(
+            self._detect_rejection_spikes(account_id, ack_events, observation_start)
+        )
+        incidents.extend(
+            self._detect_api_abuse(account_id, telemetry, observation_start, fills)
+        )
 
-            if inserted:
-                self._emit_alerts(inserted)
-                engaged = self._engage_kill_switch(inserted)
-                if engaged:
-                    self._mark_blocked(conn, inserted, now)
-
-        self.last_run = now
-        ANOMALY_SCANS_TOTAL.inc()
-        ANOMALY_LAST_SCAN_TS.set(now.timestamp())
-        ANOMALY_BLOCKED_ACCOUNTS.set(len(self.blocked_accounts))
-
-    def fetch_recent_anomalies(self, limit: int = 100) -> List[Mapping[str, Any]]:
-        """Return the most recent anomaly rows for API display."""
-
-        query = """
-        SELECT
-            anomaly_id,
-            detected_at,
-            account_id,
-            instrument,
-            anomaly_type,
-            severity,
-            description,
-            metadata,
-            fill_id::text AS fill_id,
-            order_id::text AS order_id
-        FROM fill_anomalies
-        ORDER BY detected_at DESC
-        LIMIT %(limit)s
-        """
-
-        with closing(_connect()) as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                cursor.execute(query, {"limit": limit})
-                results = cursor.fetchall()
-        return results
+        return incidents
 
     # ------------------------------------------------------------------
-    # Data collection helpers
+    # Detection helpers
     # ------------------------------------------------------------------
-    def _fetch_recent_fills(
-        self, conn: psycopg2.extensions.connection, start: datetime
-    ) -> List[FillRecord]:
-        query = """
-        SELECT
-            f.fill_id::text AS fill_id,
-            f.order_id::text AS order_id,
-            o.account_id::text AS account_id,
-            o.market AS instrument,
-            f.price::float AS price,
-            f.size::float AS size,
-            f.fee::float AS fee,
-            f.fill_time AS fill_time
-        FROM fills AS f
-        JOIN orders AS o ON o.order_id = f.order_id
-        WHERE f.fill_time >= %(start)s
-        """
+    def _extract_fills(
+        self, raw_fills: Iterable[Dict[str, Any]], observation_start: datetime
+    ) -> List[FillSnapshot]:
+        snapshots: List[FillSnapshot] = []
+        for entry in raw_fills:
+            recorded_at = entry.get("recorded_at")
+            if not isinstance(recorded_at, datetime):
+                continue
+            if recorded_at < observation_start:
+                continue
 
-        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-            cursor.execute(query, {"start": start})
-            rows = cursor.fetchall()
+            payload = entry.get("payload") or {}
+            price = self._to_float(payload.get("price"))
+            if price is None:
+                continue
 
-        fills: List[FillRecord] = []
-        for row in rows:
-            price = float(row.get("price") or 0.0)
-            size = float(row.get("size") or 0.0)
-            fee = row.get("fee")
-            fee_value = float(fee) if fee is not None else None
-            fills.append(
-                FillRecord(
-                    fill_id=row.get("fill_id"),
-                    order_id=row.get("order_id"),
-                    account_id=str(row.get("account_id")),
-                    instrument=str(row.get("instrument")),
-                    price=price,
-                    size=size,
-                    fee=fee_value,
-                    fill_time=row["fill_time"],
+            mid_price = self._to_float(payload.get("mid_price"))
+            if mid_price is None:
+                book = payload.get("book_snapshot") or {}
+                mid_price = self._to_float(book.get("mid_price"))
+
+            fee = self._to_float(payload.get("fee"))
+            quantity = self._to_float(
+                payload.get("quantity")
+                if payload.get("quantity") is not None
+                else payload.get("size")
+            )
+
+            snapshots.append(
+                FillSnapshot(
+                    price=float(price),
+                    mid_price=mid_price,
+                    fee=fee,
+                    quantity=quantity,
+                    recorded_at=recorded_at,
+                    metadata={k: v for k, v in payload.items() if k not in {"price", "fee"}},
                 )
             )
-        return fills
+        return snapshots
 
-    def _fetch_rejection_stats(
-        self, conn: psycopg2.extensions.connection, start: datetime
-    ) -> List[RejectionStats]:
-        query = """
-        SELECT
-            o.account_id::text AS account_id,
-            o.market AS instrument,
-            COUNT(*) FILTER (WHERE lower(o.status) = 'rejected') AS rejections,
-            COUNT(*) FILTER (
-                WHERE lower(o.status) IN ('filled', 'partially_filled', 'executed')
-            ) AS fills,
-            MAX(o.submitted_at) AS last_order_ts
-        FROM orders AS o
-        WHERE o.submitted_at >= %(start)s
-        GROUP BY 1, 2
-        """
-
-        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-            cursor.execute(query, {"start": start})
-            rows = cursor.fetchall()
-
-        stats: List[RejectionStats] = []
-        for row in rows:
-            stats.append(
-                RejectionStats(
-                    account_id=str(row.get("account_id")),
-                    instrument=str(row.get("instrument")),
-                    rejections=int(row.get("rejections") or 0),
-                    fills=int(row.get("fills") or 0),
-                    last_order_ts=row.get("last_order_ts"),
-                )
-            )
-        return stats
-
-    # ------------------------------------------------------------------
-    # Detection logic
-    # ------------------------------------------------------------------
-    def _detect_price_outliers(self, fills: Sequence[FillRecord]) -> List[DetectedAnomaly]:
-        grouped: Dict[tuple[str, str], List[FillRecord]] = defaultdict(list)
+    def _detect_price_outliers(
+        self, account_id: str, fills: List[FillSnapshot]
+    ) -> List[Incident]:
+        incidents: List[Incident] = []
         for fill in fills:
-            grouped[(fill.account_id, fill.instrument)].append(fill)
-
-        anomalies: List[DetectedAnomaly] = []
-        for (account_id, instrument), records in grouped.items():
-            if len(records) < 3:
+            if not fill.mid_price or fill.mid_price <= 0:
                 continue
-
-            prices = [fill.price for fill in records if fill.price and not math.isnan(fill.price)]
-            if len(prices) < 3:
-                continue
-
-            median_price = statistics.median(prices)
-            if median_price == 0:
-                continue
-
-            for fill in records:
-                deviation_pct = abs(fill.price - median_price) / abs(median_price) * 100.0
-                if deviation_pct < self.price_threshold_pct:
-                    continue
-
-                severity = "warning"
-                if deviation_pct >= self.price_threshold_pct * 2:
-                    severity = "critical"
-                elif deviation_pct >= self.price_threshold_pct * 1.5:
-                    severity = "high"
-
-                metadata: MutableMapping[str, Any] = {
-                    "fill_price": fill.price,
-                    "median_price": median_price,
-                    "percent_deviation": deviation_pct,
-                    "observation_count": len(records),
-                }
-                anomalies.append(
-                    DetectedAnomaly(
+            deviation = abs(fill.price - fill.mid_price) / fill.mid_price
+            if deviation >= self.price_deviation_threshold:
+                incidents.append(
+                    Incident(
                         account_id=account_id,
-                        instrument=instrument,
                         anomaly_type="price_outlier",
-                        severity=severity,
-                        description=(
-                            f"Fill price deviated {deviation_pct:.2f}% from the "
-                            f"median for {instrument}"
-                        ),
-                        metadata=metadata,
-                        fill_id=fill.fill_id,
-                        order_id=fill.order_id,
+                        details={
+                            "fill_price": fill.price,
+                            "mid_price": fill.mid_price,
+                            "deviation_pct": round(deviation * 100, 4),
+                        },
+                        ts=fill.recorded_at,
                     )
                 )
-        return anomalies
+        return incidents
 
-    def _detect_fee_spikes(self, fills: Sequence[FillRecord]) -> List[DetectedAnomaly]:
-        anomalies: List[DetectedAnomaly] = []
+    def _detect_fee_spikes(
+        self, account_id: str, fills: List[FillSnapshot]
+    ) -> List[Incident]:
+        incidents: List[Incident] = []
+        if not fills:
+            return incidents
+
+        effective_rates: List[float] = []
         for fill in fills:
             if fill.fee is None:
                 continue
-
-            notional = abs(fill.price * fill.size)
-            if notional <= 0:
+            notional = self._estimate_notional(fill)
+            if notional is None or notional <= 0:
                 continue
+            effective_rates.append(fill.fee / notional)
 
-            fee_bps = abs(fill.fee) / notional * 10_000.0
-            if fee_bps < self.fee_threshold_bps:
+        if not effective_rates:
+            return incidents
+
+        baseline = median(effective_rates)
+        if baseline <= 0:
+            positive_rates = [rate for rate in effective_rates if rate > 0]
+            baseline = min(positive_rates) if positive_rates else 0.0
+
+        for fill in fills:
+            if fill.fee is None:
                 continue
-
-            severity = "warning"
-            if fee_bps >= self.fee_threshold_bps * 2:
-                severity = "critical"
-            elif fee_bps >= self.fee_threshold_bps * 1.5:
-                severity = "high"
-
-            metadata: MutableMapping[str, Any] = {
-                "fee": fill.fee,
-                "notional": notional,
-                "fee_bps": fee_bps,
-            }
-
-            anomalies.append(
-                DetectedAnomaly(
-                    account_id=fill.account_id,
-                    instrument=fill.instrument,
-                    anomaly_type="fee_spike",
-                    severity=severity,
-                    description=(
-                        f"Observed fee of {fee_bps:.2f} bps on fill {fill.fill_id or 'unknown'}"
-                    ),
-                    metadata=metadata,
-                    fill_id=fill.fill_id,
-                    order_id=fill.order_id,
+            notional = self._estimate_notional(fill)
+            if notional is None or notional <= 0:
+                continue
+            rate = fill.fee / notional
+            if baseline > 0 and rate >= baseline * self.fee_spike_multiplier:
+                incidents.append(
+                    Incident(
+                        account_id=account_id,
+                        anomaly_type="fee_spike",
+                        details={
+                            "fee": fill.fee,
+                            "notional": notional,
+                            "effective_rate": rate,
+                            "baseline_rate": baseline,
+                        },
+                        ts=fill.recorded_at,
+                    )
                 )
-            )
-        return anomalies
+        return incidents
 
     def _detect_rejection_spikes(
-        self, stats: Sequence[RejectionStats]
-    ) -> List[DetectedAnomaly]:
-        anomalies: List[DetectedAnomaly] = []
-        for record in stats:
-            if record.rejections < self.rejection_threshold:
+        self,
+        account_id: str,
+        ack_events: Iterable[Dict[str, Any]],
+        observation_start: datetime,
+    ) -> List[Incident]:
+        rejections = 0
+        total = 0
+        for entry in ack_events:
+            recorded_at = entry.get("recorded_at")
+            if not isinstance(recorded_at, datetime) or recorded_at < observation_start:
                 continue
+            payload = entry.get("payload") or {}
+            status = str(payload.get("status") or payload.get("state") or "").lower()
+            if not status:
+                continue
+            total += 1
+            if "reject" in status:
+                rejections += 1
 
-            ratio = record.rejections / max(record.fills, 1)
-            severity = "warning"
-            if ratio >= 3 or record.rejections >= self.rejection_threshold * 3:
-                severity = "critical"
-            elif ratio >= 2 or record.rejections >= self.rejection_threshold * 2:
-                severity = "high"
-
-            metadata: MutableMapping[str, Any] = {
-                "rejections": record.rejections,
-                "fills": record.fills,
-                "ratio": ratio,
-            }
-
-            if record.last_order_ts:
-                metadata["last_order_ts"] = record.last_order_ts.isoformat()
-
-            anomalies.append(
-                DetectedAnomaly(
-                    account_id=record.account_id,
-                    instrument=record.instrument,
+        incidents: List[Incident] = []
+        if rejections >= self.rejection_threshold and rejections >= max(total, 1) / 2:
+            incidents.append(
+                Incident(
+                    account_id=account_id,
                     anomaly_type="rejection_spike",
-                    severity=severity,
-                    description=(
-                        f"Recorded {record.rejections} rejections vs {record.fills} fills for "
-                        f"{record.instrument}"
-                    ),
-                    metadata=metadata,
-                )
-            )
-        return anomalies
-
-    # ------------------------------------------------------------------
-    # Persistence and side effects
-    # ------------------------------------------------------------------
-    def _persist_anomalies(
-        self,
-        conn: psycopg2.extensions.connection,
-        anomalies: Sequence[DetectedAnomaly],
-        detected_at: datetime,
-    ) -> List[DetectedAnomaly]:
-        if not anomalies:
-            return []
-
-        insert_sql = """
-        INSERT INTO fill_anomalies (
-            fill_id,
-            order_id,
-            account_id,
-            instrument,
-            anomaly_type,
-            severity,
-            description,
-            detected_at,
-            metadata,
-            fingerprint
-        )
-        VALUES (
-            %(fill_id)s,
-            %(order_id)s,
-            %(account_id)s,
-            %(instrument)s,
-            %(anomaly_type)s,
-            %(severity)s,
-            %(description)s,
-            %(detected_at)s,
-            %(metadata)s::jsonb,
-            %(fingerprint)s
-        )
-        ON CONFLICT (fingerprint) DO NOTHING
-        RETURNING anomaly_id
-        """
-
-        inserted: List[DetectedAnomaly] = []
-        with conn.cursor() as cursor:
-            for anomaly in anomalies:
-                payload = {
-                    "fill_id": anomaly.fill_id,
-                    "order_id": anomaly.order_id,
-                    "account_id": anomaly.account_id,
-                    "instrument": anomaly.instrument,
-                    "anomaly_type": anomaly.anomaly_type,
-                    "severity": anomaly.severity,
-                    "description": anomaly.description,
-                    "detected_at": detected_at,
-                    "metadata": json.dumps(
-                        {
-                            **anomaly.metadata,
-                            "block_requested": BLOCK_ENABLED
-                            and anomaly.severity.lower() in BLOCK_ON_SEVERITIES,
-                        }
-                    ),
-                    "fingerprint": anomaly.fingerprint,
-                }
-                cursor.execute(insert_sql, payload)
-                if cursor.fetchone():
-                    inserted.append(anomaly)
-                    ANOMALY_EVENTS_TOTAL.labels(
-                        anomaly.anomaly_type, anomaly.severity.lower()
-                    ).inc()
-        return inserted
-
-    def _emit_alerts(self, anomalies: Sequence[DetectedAnomaly]) -> None:
-        manager = get_alert_manager_instance()
-        if not manager:
-            return
-
-        for anomaly in anomalies:
-            severity = anomaly.severity.lower()
-            if anomaly.anomaly_type == "fee_spike":
-                fee_bps = anomaly.metadata.get("fee_bps")
-                if fee_bps is None:
-                    continue
-                alert_fee_spike(anomaly.account_id, float(fee_bps) / 100.0)
-                continue
-
-            labels = {
-                "account_id": anomaly.account_id,
-                "instrument": anomaly.instrument,
-                "anomaly_type": anomaly.anomaly_type,
-            }
-            manager.handle_risk_event(
-                RiskEvent(
-                    event_type=f"anomaly_{anomaly.anomaly_type}",
-                    severity=severity,
-                    description=anomaly.description,
-                    labels=labels,
-                )
-            )
-
-    def _engage_kill_switch(
-        self, anomalies: Sequence[DetectedAnomaly]
-    ) -> List[DetectedAnomaly]:
-        if not BLOCK_ENABLED:
-            return []
-
-        engaged: List[DetectedAnomaly] = []
-        for anomaly in anomalies:
-            severity = anomaly.severity.lower()
-            if severity not in BLOCK_ON_SEVERITIES:
-                continue
-
-            account_id = anomaly.account_id
-            if account_id in self.blocked_accounts:
-                continue
-
-            try:
-                adapter = TimescaleAdapter(account_id=account_id)
-                adapter.set_kill_switch(
-                    engaged=True,
-                    reason=f"Anomaly detected: {anomaly.anomaly_type}",
-                    actor=BLOCK_ACTOR,
-                )
-                self.blocked_accounts.add(account_id)
-                engaged.append(anomaly)
-                logger.warning(
-                    "Engaged kill switch for %s due to %s", account_id, anomaly.anomaly_type
-                )
-            except Exception:  # pragma: no cover - defensive logging
-                logger.exception("Failed to engage kill switch for %s", account_id)
-        return engaged
-
-    def _mark_blocked(
-        self,
-        conn: psycopg2.extensions.connection,
-        anomalies: Sequence[DetectedAnomaly],
-        blocked_at: datetime,
-    ) -> None:
-        if not anomalies:
-            return
-
-        update_sql = """
-        UPDATE fill_anomalies
-        SET metadata = metadata || %(update)s::jsonb
-        WHERE fingerprint = %(fingerprint)s
-        """
-
-        update_payload = json.dumps(
-            {"kill_switch_engaged": True, "blocked_at": blocked_at.isoformat()}
-        )
-
-        with conn.cursor() as cursor:
-            for anomaly in anomalies:
-                cursor.execute(
-                    update_sql,
-                    {
-                        "update": update_payload,
-                        "fingerprint": anomaly.fingerprint,
+                    details={
+                        "rejections": rejections,
+                        "total": total,
+                        "rejection_ratio": rejections / max(total, 1),
                     },
+                    ts=datetime.now(timezone.utc),
                 )
-
-
-# ---------------------------------------------------------------------------
-# API models
-# ---------------------------------------------------------------------------
-
-
-class AnomalyRecord(BaseModel):
-    anomaly_id: int
-    detected_at: datetime
-    account_id: str
-    instrument: str
-    anomaly_type: str
-    severity: str
-    description: str
-    metadata: Dict[str, Any] = Field(default_factory=dict)
-    fill_id: Optional[str] = None
-    order_id: Optional[str] = None
-
-
-class AnomalyStatus(BaseModel):
-    last_scan: Optional[datetime]
-    lookback_minutes: int
-    interval_seconds: int
-    blocked_accounts: List[str]
-    anomalies: List[AnomalyRecord]
-
-
-# ---------------------------------------------------------------------------
-# FastAPI application
-# ---------------------------------------------------------------------------
-
-
-app = FastAPI(title="Anomaly Monitoring Service", version="1.0.0")
-setup_alerting(app)
-
-
-@app.on_event("startup")
-async def _startup() -> None:
-    _ensure_tables()
-    monitor = AnomalyMonitor(
-        lookback=timedelta(minutes=LOOKBACK_MINUTES),
-        price_threshold_pct=PRICE_DEVIATION_THRESHOLD_PCT,
-        fee_threshold_bps=FEE_SPIKE_THRESHOLD_BPS,
-        rejection_threshold=REJECTION_THRESHOLD,
-        interval_seconds=max(SCAN_INTERVAL_SECONDS, 1),
-    )
-    app.state.monitor = monitor
-    if SCAN_INTERVAL_SECONDS > 0:
-        app.state.monitor_task = asyncio.create_task(monitor.run_periodic())
-    else:
-        app.state.monitor_task = None
-
-
-@app.on_event("shutdown")
-async def _shutdown() -> None:
-    monitor: AnomalyMonitor | None = getattr(app.state, "monitor", None)
-    task: asyncio.Task | None = getattr(app.state, "monitor_task", None)
-
-    if monitor:
-        monitor.stop()
-
-    if task:
-        task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
-
-
-@app.get("/metrics")
-async def metrics_endpoint() -> Response:  # pragma: no cover - simple I/O
-    payload = generate_latest()
-    return Response(payload, media_type=CONTENT_TYPE_LATEST)
-
-
-@app.get("/health", tags=["health"])
-async def health() -> Dict[str, str]:
-    return {"status": "ok"}
-
-
-@app.get("/ready", tags=["health"])
-async def ready() -> Dict[str, Any]:
-    monitor: AnomalyMonitor | None = getattr(app.state, "monitor", None)
-    if not monitor:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Anomaly monitor not initialised",
-        )
-    return {"status": "ready", "last_scan": monitor.last_run.isoformat() if monitor.last_run else None}
-
-
-@app.get("/anomaly/status", response_model=AnomalyStatus)
-async def anomaly_status() -> AnomalyStatus:
-    monitor: AnomalyMonitor | None = getattr(app.state, "monitor", None)
-    if not monitor:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Anomaly monitor not available",
-        )
-
-    try:
-        rows = monitor.fetch_recent_anomalies()
-    except Exception as exc:  # pragma: no cover - DB errors
-        logger.exception("Failed to load anomaly status")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Unable to load anomaly status",
-        ) from exc
-
-    records: List[AnomalyRecord] = []
-    for row in rows:
-        metadata = row.get("metadata")
-        if isinstance(metadata, str):
-            try:
-                metadata = json.loads(metadata)
-            except json.JSONDecodeError:
-                metadata = {}
-        elif metadata is None:
-            metadata = {}
-
-        records.append(
-            AnomalyRecord(
-                anomaly_id=int(row["anomaly_id"]),
-                detected_at=row["detected_at"],
-                account_id=str(row["account_id"]),
-                instrument=str(row["instrument"]),
-                anomaly_type=str(row["anomaly_type"]),
-                severity=str(row["severity"]),
-                description=str(row["description"]),
-                metadata=metadata,
-                fill_id=row.get("fill_id"),
-                order_id=row.get("order_id"),
             )
+        return incidents
+
+    def _detect_api_abuse(
+        self,
+        account_id: str,
+        telemetry: Iterable[Dict[str, Any]],
+        observation_start: datetime,
+        fills: List[FillSnapshot],
+    ) -> List[Incident]:
+        auth_failures = 0
+        incidents: List[Incident] = []
+        volume_spike = self._detect_volume_spike(fills)
+
+        for entry in telemetry:
+            timestamp = entry.get("timestamp") or entry.get("recorded_at")
+            if not isinstance(timestamp, datetime) or timestamp < observation_start:
+                continue
+            event_type = str(entry.get("event_type") or entry.get("type") or "").lower()
+            payload = entry.get("payload") or {}
+            description = str(payload.get("status") or payload.get("error") or "").lower()
+
+            if "auth" in event_type and "fail" in event_type:
+                auth_failures += 1
+            elif "auth" in description and "fail" in description:
+                auth_failures += 1
+
+        if auth_failures >= self.auth_failure_threshold:
+            incidents.append(
+                Incident(
+                    account_id=account_id,
+                    anomaly_type="api_auth_failure",
+                    details={"failures": auth_failures},
+                    ts=datetime.now(timezone.utc),
+                )
+            )
+
+        if volume_spike is not None:
+            details, ts = volume_spike
+            incidents.append(
+                Incident(
+                    account_id=account_id,
+                    anomaly_type="volume_spike",
+                    details=details,
+                    ts=ts,
+                )
+            )
+
+        return incidents
+
+    def _detect_volume_spike(
+        self, fills: List[FillSnapshot]
+    ) -> Optional[tuple[Dict[str, Any], datetime]]:
+        if len(fills) < 2:
+            return None
+
+        totals: List[float] = []
+        for fill in fills:
+            notional = self._estimate_notional(fill)
+            if notional is None:
+                continue
+            totals.append(notional)
+
+        if len(totals) < 2:
+            return None
+
+        baseline = median(totals[:-1]) if len(totals) > 2 else totals[0]
+        latest = totals[-1]
+        if baseline <= 0:
+            return None
+
+        if latest >= baseline * self.volume_spike_multiplier:
+            ts = fills[-1].recorded_at
+            return (
+                {
+                    "latest_notional": latest,
+                    "baseline_notional": baseline,
+                    "multiplier": latest / baseline,
+                    "timestamp": ts.isoformat(),
+                },
+                ts,
+            )
+        return None
+
+    # ------------------------------------------------------------------
+    # Utility helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _to_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _estimate_notional(fill: FillSnapshot) -> Optional[float]:
+        if fill.quantity is not None:
+            return abs(fill.price * fill.quantity)
+        notional = fill.metadata.get("notional") if isinstance(fill.metadata, dict) else None
+        return float(notional) if notional is not None else None
+
+
+def median(values: Iterable[float]) -> float:
+    sorted_values = sorted(values)
+    if not sorted_values:
+        return 0.0
+    mid = len(sorted_values) // 2
+    if len(sorted_values) % 2 == 1:
+        return sorted_values[mid]
+    return (sorted_values[mid - 1] + sorted_values[mid]) / 2.0
+
+
+class IncidentRepository:
+    """Persistence layer for anomaly incidents."""
+
+    def __init__(self, session_factory: sessionmaker = SessionLocal) -> None:
+        self._session_factory = session_factory
+
+    def log_incident(self, incident: Incident) -> None:
+        record = AnomalyLog(
+            account_id=incident.account_id,
+            anomaly_type=incident.anomaly_type,
+            details_json=incident.details,
+            ts=incident.ts,
+        )
+        with self._session_factory() as session:
+            session: Session
+            session.add(record)
+            session.commit()
+
+    def recent_incidents(self, account_id: str, limit: int = 20) -> List[Incident]:
+        with self._session_factory() as session:
+            session: Session
+            query = (
+                session.query(AnomalyLog)
+                .filter(AnomalyLog.account_id == account_id)
+                .order_by(AnomalyLog.ts.desc())
+                .limit(limit)
+            )
+            return [
+                Incident(
+                    account_id=row.account_id,
+                    anomaly_type=row.anomaly_type,
+                    details=dict(row.details_json or {}),
+                    ts=row.ts,
+                )
+                for row in query.all()
+            ]
+
+
+class ResponseFactory:
+    """Coordinates detection, persistence, and mitigation actions."""
+
+    def __init__(
+        self,
+        detector: Optional[AnomalyDetector] = None,
+        repository: Optional[IncidentRepository] = None,
+    ) -> None:
+        self.detector = detector or AnomalyDetector()
+        self.repository = repository or IncidentRepository()
+
+    def scan(self, request: ScanRequest) -> ScanResponse:
+        account_id = request.account_id.strip().lower()
+        if not account_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Account identifier must not be empty.",
+            )
+
+        incidents = self.detector.scan_account(account_id, request.lookback_minutes)
+        blocked = False
+        if incidents:
+            for incident in incidents:
+                self.repository.log_incident(incident)
+                self._raise_alert(incident)
+                self._block_account(incident)
+            blocked = True
+
+        if blocked:
+            logger.warning("Blocked trading for %s due to anomalies", account_id)
+        else:
+            logger.info("Scan completed with no anomalies for %s", account_id)
+
+        blocked_state = self._is_blocked(account_id)
+        return ScanResponse(incidents=incidents, blocked=blocked_state)
+
+    def status(self, account_id: str) -> StatusResponse:
+        normalized = account_id.strip().lower()
+        if not normalized:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Account identifier must not be empty.",
+            )
+
+        incidents = self.repository.recent_incidents(normalized)
+        blocked = self._is_blocked(normalized)
+        return StatusResponse(account_id=normalized, blocked=blocked, incidents=incidents)
+
+    # ------------------------------------------------------------------
+    # Side effects
+    # ------------------------------------------------------------------
+    def _raise_alert(self, incident: Incident) -> None:
+        manager = get_alert_manager_instance()
+        if manager is None:
+            logger.info("Alertmanager not configured; skipping alert for %s", incident.anomaly_type)
+            return
+
+        event = RiskEvent(
+            event_type=f"anomaly.{incident.anomaly_type}",
+            severity="high",
+            description=json.dumps(incident.details),
+            labels={"account_id": incident.account_id},
+        )
+        manager.handle_risk_event(event)
+
+    def _block_account(self, incident: Incident) -> None:
+        adapter = TimescaleAdapter(account_id=incident.account_id)
+        adapter.set_kill_switch(
+            engaged=True,
+            reason=f"Anomaly detected: {incident.anomaly_type}",
+            actor="anomaly-service",
         )
 
-    blocked_accounts = sorted(monitor.blocked_accounts)
-
-    return AnomalyStatus(
-        last_scan=monitor.last_run,
-        lookback_minutes=int(monitor.lookback.total_seconds() // 60),
-        interval_seconds=monitor.interval_seconds,
-        blocked_accounts=blocked_accounts,
-        anomalies=records,
-    )
+    def _is_blocked(self, account_id: str) -> bool:
+        adapter = TimescaleAdapter(account_id=account_id)
+        config = adapter.load_risk_config()
+        return bool(config.get("kill_switch"))
 
 
-__all__ = [
-    "app",
-    "AnomalyMonitor",
-    "AnomalyRecord",
-    "AnomalyStatus",
-]
+app = FastAPI(title="Anomaly Detection Service")
+_coordinator = ResponseFactory()
 
+
+@app.get("/anomaly/status", response_model=StatusResponse)
+def get_status(account_id: str = Query(..., min_length=1)) -> StatusResponse:
+    """Return current anomaly status for the requested account."""
+
+    return _coordinator.status(account_id)
+
+
+@app.post("/anomaly/scan", response_model=ScanResponse)
+def post_scan(request: ScanRequest) -> ScanResponse:
+    """Run anomaly detection for the specified account."""
+
+    return _coordinator.scan(request)

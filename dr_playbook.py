@@ -1,15 +1,16 @@
-"""Disaster recovery playbook for TimescaleDB and MLflow artifacts.
+"""Disaster recovery playbook for TimescaleDB, Redis, and MLflow artifacts.
 
-This module provides helpers to capture crash-consistent snapshots of the
-TimescaleDB instance backing Aether as well as MLflow experiment artifacts.
-Snapshots are bundled into a tarball and pushed to remote object storage
-(currently S3-compatible).  The ``restore_cluster`` entry point downloads the
-latest snapshot and rebuilds the data plane.  A small CLI is provided so the
-runbook can be executed manually during incident response.
+This module exposes ``snapshot_cluster`` and ``restore_cluster`` helpers that
+collect crash-consistent snapshots of TimescaleDB, Redis, and MLflow artifacts
+before storing them in object storage.  Snapshots are bundled into a tarball and
+uploaded to S3-compatible object storage.  A minimal CLI allows operators to run
+``python dr_playbook.py snapshot`` or ``python dr_playbook.py restore
+<snapshot_id>`` during incident response.
 """
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import logging
 import os
@@ -19,10 +20,32 @@ import tarfile
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from getpass import getuser
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
+from urllib.parse import urlparse
 
 LOGGER = logging.getLogger("dr_playbook")
+
+
+try:  # pragma: no cover - optional dependency exercised in integration tests
+    import psycopg
+    from psycopg import sql
+except Exception as exc:  # pragma: no cover - captured for runtime errors
+    psycopg = None  # type: ignore[assignment]
+    sql = None  # type: ignore[assignment]
+    _PSYCOPG_IMPORT_ERROR = exc
+else:  # pragma: no cover - optional dependency
+    _PSYCOPG_IMPORT_ERROR = None
+
+
+try:  # pragma: no cover - optional dependency exercised in integration tests
+    import redis
+except Exception as exc:  # pragma: no cover - captured for runtime errors
+    redis = None  # type: ignore[assignment]
+    _REDIS_IMPORT_ERROR = exc
+else:  # pragma: no cover - optional dependency
+    _REDIS_IMPORT_ERROR = None
 
 
 @dataclass
@@ -30,6 +53,7 @@ class DisasterRecoveryConfig:
     """Configuration bundle used by the disaster recovery helpers."""
 
     timescale_dsn: str
+    redis_url: str
     mlflow_artifact_uri: str
     object_store_bucket: str
     object_store_prefix: str = "disaster-recovery"
@@ -39,12 +63,15 @@ class DisasterRecoveryConfig:
     pg_dump_bin: str = os.environ.get("PG_DUMP_BIN", "pg_dump")
     pg_restore_bin: str = os.environ.get("PG_RESTORE_BIN", "pg_restore")
     mlflow_restore_path: Optional[Path] = None
+    actor: str = getuser()
+    log_table: str = "dr_log"
 
     @classmethod
     def from_env(cls) -> "DisasterRecoveryConfig":
         """Instantiate the configuration from environment variables."""
 
         timescale_dsn = os.environ.get("DR_TIMESCALE_DSN")
+        redis_url = os.environ.get("DR_REDIS_URL")
         mlflow_artifact_uri = os.environ.get("DR_MLFLOW_ARTIFACT_URI")
         object_store_bucket = os.environ.get("DR_OBJECT_STORE_BUCKET")
 
@@ -52,6 +79,7 @@ class DisasterRecoveryConfig:
             name
             for name, value in {
                 "DR_TIMESCALE_DSN": timescale_dsn,
+                "DR_REDIS_URL": redis_url,
                 "DR_MLFLOW_ARTIFACT_URI": mlflow_artifact_uri,
                 "DR_OBJECT_STORE_BUCKET": object_store_bucket,
             }.items()
@@ -64,6 +92,7 @@ class DisasterRecoveryConfig:
 
         config = cls(
             timescale_dsn=timescale_dsn,
+            redis_url=redis_url,
             mlflow_artifact_uri=mlflow_artifact_uri,
             object_store_bucket=object_store_bucket,
             object_store_prefix=os.environ.get(
@@ -80,9 +109,15 @@ class DisasterRecoveryConfig:
                 if "DR_MLFLOW_RESTORE_PATH" in os.environ
                 else None
             ),
+            actor=os.environ.get("DR_ACTOR", getuser()),
+            log_table=os.environ.get("DR_LOG_TABLE", "dr_log"),
         )
         config.work_dir.mkdir(parents=True, exist_ok=True)
         return config
+
+    @property
+    def redis_connection_kwargs(self) -> Dict[str, Any]:
+        return _parse_redis_url(self.redis_url)
 
 
 def _timestamp(prefix: str) -> str:
@@ -90,10 +125,31 @@ def _timestamp(prefix: str) -> str:
     return f"{prefix}-{now}"
 
 
+def _parse_redis_url(url: str) -> Dict[str, Any]:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"redis", "rediss"}:
+        raise ValueError(f"Unsupported Redis URL scheme: {parsed.scheme}")
+
+    db = 0
+    if parsed.path and parsed.path != "/":
+        try:
+            db = int(parsed.path.lstrip("/"))
+        except ValueError as exc:
+            raise ValueError(f"Invalid Redis database in URL: {parsed.path}") from exc
+
+    return {
+        "host": parsed.hostname or "localhost",
+        "port": parsed.port or 6379,
+        "db": db,
+        "password": parsed.password,
+        "ssl": parsed.scheme == "rediss",
+    }
+
+
 def _build_object_store_client(config: DisasterRecoveryConfig):
     """Construct a boto3 S3 client using the configuration values."""
 
-    try:  # pragma: no cover - boto3 is optional in tests
+    try:  # pragma: no cover - boto3 is optional in unit tests
         import boto3  # type: ignore
     except Exception as exc:  # pragma: no cover - optional dependency
         raise RuntimeError("boto3 is required for the disaster recovery playbook") from exc
@@ -127,12 +183,46 @@ def snapshot_timescaledb(config: DisasterRecoveryConfig) -> Path:
     return snapshot_path
 
 
+def snapshot_redis_state(config: DisasterRecoveryConfig) -> Path:
+    """Capture Redis state using the ``DUMP`` command for every key."""
+
+    if redis is None:  # pragma: no cover - dependency enforced at runtime
+        raise RuntimeError(
+            "redis-py is required for Redis snapshots"
+        ) from _REDIS_IMPORT_ERROR
+
+    client = redis.Redis(**config.redis_connection_kwargs)
+    snapshot_path = config.work_dir / f"{_timestamp('redis')}.json"
+    LOGGER.info("Capturing Redis snapshot to %s", snapshot_path)
+
+    state = []
+    key_count = 0
+    for key in client.scan_iter(count=1000):
+        key_count += 1
+        value = client.dump(key)
+        if value is None:
+            continue
+        ttl = client.pttl(key)
+        key_bytes = key if isinstance(key, bytes) else str(key).encode("utf-8")
+        state.append(
+            {
+                "key": base64.b64encode(key_bytes).decode("ascii"),
+                "value": base64.b64encode(value).decode("ascii"),
+                "ttl": ttl,
+            }
+        )
+
+    snapshot_path.write_text(json.dumps({"keys": state, "count": key_count}))
+    LOGGER.info("Redis snapshot captured with %s keys", key_count)
+    return snapshot_path
+
+
 def _resolve_mlflow_artifact_source(uri: str) -> Tuple[Path, Optional[Path]]:
     path_candidate = Path(uri.replace("file://", ""))
     if path_candidate.exists():
         return path_candidate, None
 
-    try:  # pragma: no cover - mlflow optional in tests
+    try:  # pragma: no cover - mlflow optional in unit tests
         from mlflow.artifacts import download_artifacts
     except Exception as exc:  # pragma: no cover - optional dependency
         raise RuntimeError(
@@ -163,12 +253,11 @@ def snapshot_mlflow_artifacts(config: DisasterRecoveryConfig) -> Path:
     return snapshot_path
 
 
-def create_snapshot_bundle(
-    config: DisasterRecoveryConfig,
-) -> Path:
-    """Bundle the database dump and MLflow archive into a single tarball."""
+def create_snapshot_bundle(config: DisasterRecoveryConfig) -> Path:
+    """Bundle the database dump, Redis snapshot, and MLflow archive into a tarball."""
 
     timescale_dump = snapshot_timescaledb(config)
+    redis_snapshot = snapshot_redis_state(config)
     mlflow_archive = snapshot_mlflow_artifacts(config)
 
     bundle_name = f"{_timestamp('aether-dr')}.tar.gz"
@@ -176,6 +265,7 @@ def create_snapshot_bundle(
     manifest = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "timescale_dump": timescale_dump.name,
+        "redis_snapshot": redis_snapshot.name,
         "mlflow_archive": mlflow_archive.name,
     }
     manifest_path = config.work_dir / "snapshot-manifest.json"
@@ -184,13 +274,14 @@ def create_snapshot_bundle(
     LOGGER.info("Creating DR bundle %s", bundle_path)
     with tarfile.open(bundle_path, "w:gz") as tar:
         tar.add(timescale_dump, arcname=timescale_dump.name)
+        tar.add(redis_snapshot, arcname=redis_snapshot.name)
         tar.add(mlflow_archive, arcname=mlflow_archive.name)
         tar.add(manifest_path, arcname="manifest.json")
 
     LOGGER.info("Snapshot bundle ready: %s", bundle_path)
 
-    # Clean up intermediate files after bundling
     timescale_dump.unlink(missing_ok=True)
+    redis_snapshot.unlink(missing_ok=True)
     mlflow_archive.unlink(missing_ok=True)
     manifest_path.unlink(missing_ok=True)
 
@@ -198,14 +289,20 @@ def create_snapshot_bundle(
 
 
 def push_snapshot(
-    bundle_path: Path, config: DisasterRecoveryConfig, *, delete_after_upload: bool = True
+    bundle_path: Path,
+    config: DisasterRecoveryConfig,
+    *,
+    delete_after_upload: bool = True,
 ) -> str:
     """Upload the snapshot bundle to the configured object storage bucket."""
 
     client = _build_object_store_client(config)
     key = f"{config.object_store_prefix.strip('/')}/{bundle_path.name}".strip("/")
     LOGGER.info(
-        "Uploading snapshot %s to s3://%s/%s", bundle_path, config.object_store_bucket, key
+        "Uploading snapshot %s to s3://%s/%s",
+        bundle_path,
+        config.object_store_bucket,
+        key,
     )
     client.upload_file(str(bundle_path), config.object_store_bucket, key)
     LOGGER.info("Upload complete")
@@ -214,80 +311,163 @@ def push_snapshot(
     return key
 
 
-def restore_cluster(config: DisasterRecoveryConfig, *, drop_existing: bool = True) -> None:
-    """Download the latest snapshot from object storage and restore it."""
+def _normalize_snapshot_key(snapshot_id: str, config: DisasterRecoveryConfig) -> str:
+    snapshot_id = snapshot_id.strip()
+    if snapshot_id.startswith("s3://"):
+        parsed = urlparse(snapshot_id)
+        bucket = parsed.netloc
+        key = parsed.path.lstrip("/")
+        if bucket and bucket != config.object_store_bucket:
+            raise ValueError(
+                f"Snapshot bucket {bucket} does not match configured bucket {config.object_store_bucket}"
+            )
+        return key
 
-    client = _build_object_store_client(config)
+    key = snapshot_id.lstrip("/")
     prefix = config.object_store_prefix.strip("/")
-    paginator = client.get_paginator("list_objects_v2")
-    latest_obj = None
-    for page in paginator.paginate(
-        Bucket=config.object_store_bucket,
-        Prefix=prefix,
-    ):
-        for obj in page.get("Contents", []):
-            if latest_obj is None or obj["LastModified"] > latest_obj["LastModified"]:
-                latest_obj = obj
+    if prefix and not key.startswith(f"{prefix}/"):
+        key = f"{prefix}/{key}" if key else prefix
+    return key
 
-    if latest_obj is None:
-        raise RuntimeError("No disaster recovery snapshots found in object storage")
 
-    key = latest_obj["Key"]
-    LOGGER.info("Restoring from snapshot s3://%s/%s", config.object_store_bucket, key)
+def _restore_timescaledb(
+    config: DisasterRecoveryConfig, dump_path: Path, *, drop_existing: bool = True
+) -> None:
+    restore_cmd = [config.pg_restore_bin, f"--dbname={config.timescale_dsn}"]
+    if drop_existing:
+        restore_cmd.extend(["--clean", "--create"])
+    restore_cmd.append(str(dump_path))
+    LOGGER.info("Restoring TimescaleDB: %s", " ".join(restore_cmd))
+    try:
+        subprocess.run(restore_cmd, check=True, capture_output=True)
+    except subprocess.CalledProcessError as exc:
+        LOGGER.error(
+            "pg_restore failed with exit code %s: %s",
+            exc.returncode,
+            exc.stderr.decode("utf-8", errors="ignore"),
+        )
+        raise RuntimeError("TimescaleDB restore failed") from exc
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        bundle_path = Path(tmpdir) / Path(key).name
-        client.download_file(config.object_store_bucket, key, str(bundle_path))
 
-        with tarfile.open(bundle_path, "r:gz") as tar:
-            tar.extractall(path=tmpdir)
+def _restore_redis_state(config: DisasterRecoveryConfig, snapshot: Path) -> None:
+    if redis is None:  # pragma: no cover - dependency enforced at runtime
+        raise RuntimeError(
+            "redis-py is required for Redis restore"
+        ) from _REDIS_IMPORT_ERROR
 
-        manifest_path = Path(tmpdir) / "manifest.json"
-        if not manifest_path.exists():
-            raise RuntimeError("Snapshot manifest missing from bundle")
-        manifest = json.loads(manifest_path.read_text())
+    payload = json.loads(snapshot.read_text())
+    keys = payload.get("keys", [])
+    LOGGER.info("Restoring Redis dataset containing %s keys", len(keys))
 
-        dump_path = Path(tmpdir) / manifest["timescale_dump"]
-        mlflow_archive = Path(tmpdir) / manifest["mlflow_archive"]
+    client = redis.Redis(**config.redis_connection_kwargs)
+    client.flushdb()
 
-        restore_cmd = [config.pg_restore_bin, f"--dbname={config.timescale_dsn}"]
-        if drop_existing:
-            restore_cmd.extend(["--clean", "--create"])
-        restore_cmd.append(str(dump_path))
-        LOGGER.info("Restoring TimescaleDB: %s", " ".join(restore_cmd))
-        try:
-            subprocess.run(restore_cmd, check=True, capture_output=True)
-        except subprocess.CalledProcessError as exc:
-            LOGGER.error(
-                "pg_restore failed with exit code %s: %s",
-                exc.returncode,
-                exc.stderr.decode("utf-8", errors="ignore"),
+    pipeline = client.pipeline()
+    for entry in keys:
+        key_bytes = base64.b64decode(entry["key"])
+        value_bytes = base64.b64decode(entry["value"])
+        ttl = entry.get("ttl", 0)
+        ttl = ttl if isinstance(ttl, int) and ttl > 0 else 0
+        pipeline.restore(key_bytes, ttl, value_bytes, replace=True)
+    if keys:
+        pipeline.execute()
+    LOGGER.info("Redis restore complete")
+
+
+def _restore_mlflow_artifacts(config: DisasterRecoveryConfig, archive: Path) -> None:
+    if config.mlflow_restore_path is None:
+        raise RuntimeError(
+            "MLflow restore path is not configured (set DR_MLFLOW_RESTORE_PATH)."
+        )
+
+    target_path = config.mlflow_restore_path
+    LOGGER.info("Restoring MLflow artifacts to %s", target_path)
+    if target_path.exists():
+        shutil.rmtree(target_path)
+    target_path.mkdir(parents=True, exist_ok=True)
+
+    with tarfile.open(archive, "r:gz") as tar:
+        tar.extractall(path=target_path)
+
+
+def _log_dr_action(config: DisasterRecoveryConfig, action: str) -> None:
+    if psycopg is None or sql is None:  # pragma: no cover - dependency enforced at runtime
+        raise RuntimeError(
+            "psycopg is required to log disaster recovery actions"
+        ) from _PSYCOPG_IMPORT_ERROR
+
+    LOGGER.debug("Recording DR action '%s' for actor '%s'", action, config.actor)
+    query = sql.SQL(
+        "INSERT INTO {table} (actor, action, ts) VALUES (%s, %s, NOW())"
+    ).format(table=sql.Identifier(config.log_table))
+    with psycopg.connect(config.timescale_dsn, autocommit=True) as conn:  # type: ignore[arg-type]
+        with conn.cursor() as cur:
+            cur.execute(query, (config.actor, action))
+
+
+def restore_cluster(
+    snapshot_id: str,
+    config: Optional[DisasterRecoveryConfig] = None,
+    *,
+    drop_existing: bool = True,
+) -> None:
+    """Download the specified snapshot from object storage and restore it."""
+
+    config = config or DisasterRecoveryConfig.from_env()
+    key = _normalize_snapshot_key(snapshot_id, config)
+    _log_dr_action(config, f"restore:start:{key}")
+
+    try:
+        client = _build_object_store_client(config)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle_path = Path(tmpdir) / Path(key).name
+            LOGGER.info(
+                "Downloading snapshot s3://%s/%s to %s",
+                config.object_store_bucket,
+                key,
+                bundle_path,
             )
-            raise RuntimeError("TimescaleDB restore failed") from exc
+            client.download_file(config.object_store_bucket, key, str(bundle_path))
 
-        if config.mlflow_restore_path is None:
-            raise RuntimeError(
-                "MLflow restore path is not configured (set DR_MLFLOW_RESTORE_PATH)."
-            )
+            with tarfile.open(bundle_path, "r:gz") as tar:
+                tar.extractall(path=tmpdir)
 
-        target_path = config.mlflow_restore_path
-        LOGGER.info("Restoring MLflow artifacts to %s", target_path)
-        if target_path.exists():
-            shutil.rmtree(target_path)
-        target_path.mkdir(parents=True, exist_ok=True)
+            manifest_path = Path(tmpdir) / "manifest.json"
+            if not manifest_path.exists():
+                raise RuntimeError("Snapshot manifest missing from bundle")
+            manifest = json.loads(manifest_path.read_text())
 
-        with tarfile.open(mlflow_archive, "r:gz") as tar:
-            tar.extractall(path=target_path)
+            dump_path = Path(tmpdir) / manifest["timescale_dump"]
+            redis_snapshot = Path(tmpdir) / manifest["redis_snapshot"]
+            mlflow_archive = Path(tmpdir) / manifest["mlflow_archive"]
 
-        LOGGER.info("Cluster restore completed successfully")
+            _restore_timescaledb(config, dump_path, drop_existing=drop_existing)
+            _restore_redis_state(config, redis_snapshot)
+            _restore_mlflow_artifacts(config, mlflow_archive)
+    except Exception:
+        _log_dr_action(config, f"restore:error:{key}")
+        raise
+
+    LOGGER.info("Cluster restore completed successfully")
+    _log_dr_action(config, f"restore:complete:{key}")
 
 
-def trigger_manual_failover(config: DisasterRecoveryConfig) -> None:
-    """Manual failover entry point that wraps ``restore_cluster`` with logging."""
+def snapshot_cluster(config: Optional[DisasterRecoveryConfig] = None) -> str:
+    """Create a full cluster snapshot and upload it to object storage."""
 
-    LOGGER.warning("Manual failover initiated. Proceeding to restore latest snapshot.")
-    restore_cluster(config, drop_existing=True)
-    LOGGER.warning("Manual failover complete. Promote restored cluster as primary.")
+    config = config or DisasterRecoveryConfig.from_env()
+    _log_dr_action(config, "snapshot:start")
+
+    try:
+        bundle = create_snapshot_bundle(config)
+        key = push_snapshot(bundle, config)
+    except Exception:
+        _log_dr_action(config, "snapshot:error")
+        raise
+
+    LOGGER.info("Snapshot uploaded to s3://%s/%s", config.object_store_bucket, key)
+    _log_dr_action(config, f"snapshot:complete:{key}")
+    return key
 
 
 def _configure_logging(verbosity: int) -> None:
@@ -301,24 +481,31 @@ def _configure_logging(verbosity: int) -> None:
 
 def _build_cli() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["snapshot", "restore", "failover"], help="Action to perform")
-    parser.add_argument(
+    parent = argparse.ArgumentParser(add_help=False)
+    parent.add_argument(
         "-v",
         "--verbose",
         action="count",
         default=0,
         help="Increase logging verbosity (use -vv for debug)",
     )
-    parser.add_argument(
-        "--keep-local",
-        action="store_true",
-        help="Keep local snapshot artifacts after upload",
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser("snapshot", parents=[parent], help="Create a new cluster snapshot")
+
+    restore_parser = subparsers.add_parser(
+        "restore",
+        parents=[parent],
+        help="Restore cluster from a snapshot",
     )
-    parser.add_argument(
+    restore_parser.add_argument("snapshot_id", help="Snapshot identifier or S3 key")
+    restore_parser.add_argument(
         "--no-clean",
         action="store_true",
         help="Skip dropping existing objects during restore (pg_restore --clean)",
     )
+
     return parser
 
 
@@ -329,17 +516,11 @@ def main() -> None:
     config = DisasterRecoveryConfig.from_env()
 
     if args.command == "snapshot":
-        bundle = create_snapshot_bundle(config)
-        key = push_snapshot(bundle, config, delete_after_upload=not args.keep_local)
-        if args.keep_local:
-            LOGGER.info("Snapshot retained locally at %s", bundle)
+        key = snapshot_cluster(config)
         print(f"Snapshot uploaded to s3://{config.object_store_bucket}/{key}")
     elif args.command == "restore":
-        restore_cluster(config, drop_existing=not args.no_clean)
+        restore_cluster(args.snapshot_id, config, drop_existing=not args.no_clean)
         print("Cluster restore completed")
-    elif args.command == "failover":
-        trigger_manual_failover(config)
-        print("Manual failover finished")
 
 
 if __name__ == "__main__":
