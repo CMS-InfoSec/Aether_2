@@ -68,6 +68,7 @@ _DEFAULT_MARKETS: Tuple[MarketSnapshot, ...] = (
 
 _DEFAULT_FEE_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "BTC-USD": {"currency": "USD", "maker": 0.1, "taker": 0.2},
+    "default": {"currency": "USD", "maker": 0.05, "taker": 0.1},
 }
 
 

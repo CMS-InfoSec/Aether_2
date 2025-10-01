@@ -13,9 +13,9 @@ def client_fixture() -> TestClient:
     return TestClient(app)
 
 
-def test_rotate_rejects_mismatched_account(client: TestClient) -> None:
+def test_upsert_rejects_mismatched_account(client: TestClient) -> None:
     response = client.post(
-        "/secrets/kraken/rotate",
+        "/secrets/kraken",
         json={"account_id": "admin-eu", "api_key": "a", "api_secret": "b"},
         headers={"X-Account-ID": "admin-us", "X-MFA-Context": "verified"},
     )
@@ -36,7 +36,7 @@ def test_status_returns_not_found_without_rotation(client: TestClient) -> None:
 
 def test_mfa_context_must_be_verified(client: TestClient) -> None:
     response = client.post(
-        "/secrets/kraken/rotate",
+        "/secrets/kraken",
         json={"account_id": "admin-eu", "api_key": "a", "api_secret": "b"},
         headers={"X-Account-ID": "admin-eu", "X-MFA-Context": "unverified"},
     )
