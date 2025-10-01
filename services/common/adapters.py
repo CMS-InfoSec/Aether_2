@@ -420,7 +420,7 @@ class KrakenSecretManager:
         assert self.timescale is not None
         return self.timescale.credential_rotation_status()
 
-    def get_credentials(self) -> Dict[str, str]:
+    def get_credentials(self) -> Dict[str, Any]:
         """Load Kraken API credentials for the account from the secret store."""
 
         assert self.secret_store is not None
@@ -453,7 +453,7 @@ class KrakenSecretManager:
 
         self.timescale.record_credential_access(
             secret_name=self.secret_name,
-            metadata=sanitized_metadata,
+            metadata=metadata,
         )
 
         self.timescale.record_event(
@@ -464,7 +464,11 @@ class KrakenSecretManager:
             },
         )
 
-        return {"api_key": api_key, "api_secret": api_secret}
+        return {
+            "api_key": api_key,
+            "api_secret": api_secret,
+            "metadata": sanitized_metadata,
+        }
 
 
 def default_fee(currency: str = "USD") -> Dict[str, float | str]:
