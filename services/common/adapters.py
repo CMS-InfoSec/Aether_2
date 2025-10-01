@@ -2,12 +2,12 @@ from __future__ import annotations
 
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from datetime import datetime, timezone
 from typing import Any, ClassVar, Dict, List, Optional
 
-from shared.k8s import KubernetesSecretClient
+from shared.k8s import KrakenSecretStore
 
 from services.universe.repository import UniverseRepository
 
@@ -42,6 +42,7 @@ class TimescaleAdapter:
 
     _metrics: ClassVar[Dict[str, Dict[str, float]]] = {}
     _events: ClassVar[Dict[str, Dict[str, List[Dict[str, Any]]]]] = {}
+    _credential_rotations: ClassVar[Dict[str, Dict[str, Any]]] = {}
 
     _risk_configs: ClassVar[Dict[str, Dict[str, Any]]] = {
         "admin-eu": {
@@ -88,6 +89,8 @@ class TimescaleAdapter:
 
         self._events.setdefault(self.account_id, {"acks": [], "fills": []})
 
+        self._credential_rotations.setdefault(self.account_id, {})
+
 
     def record_usage(self, notional: float) -> None:
         self._metrics[self.account_id]["usage"] += notional
@@ -115,9 +118,11 @@ class TimescaleAdapter:
         if account_id is None:
             cls._metrics.clear()
             cls._events.clear()
+            cls._credential_rotations.clear()
             return
         cls._metrics.pop(account_id, None)
         cls._events.pop(account_id, None)
+        cls._credential_rotations.pop(account_id, None)
 
 
     def load_risk_config(self) -> Dict[str, Any]:
@@ -165,6 +170,34 @@ class TimescaleAdapter:
     def events(self) -> List[Dict[str, Any]]:
         return list(self._events.get(self.account_id, []))
 
+    # ------------------------------------------------------------------
+    # Credential rotation metadata helpers
+    # ------------------------------------------------------------------
+    def record_credential_rotation(self, *, secret_name: str) -> Dict[str, Any]:
+        rotated_at = datetime.now(timezone.utc)
+        record = self._credential_rotations.setdefault(
+            self.account_id,
+            {
+                "secret_name": secret_name,
+                "created_at": rotated_at,
+                "rotated_at": rotated_at,
+            },
+        )
+        record["secret_name"] = secret_name
+        record.setdefault("created_at", rotated_at)
+        record["rotated_at"] = rotated_at
+        return dict(record)
+
+    def credential_rotation_status(self) -> Optional[Dict[str, Any]]:
+        record = self._credential_rotations.get(self.account_id)
+        if not record:
+            return None
+        return dict(record)
+
+    @classmethod
+    def reset_rotation_state(cls) -> None:
+        cls._credential_rotations.clear()
+
 
 
 @dataclass
@@ -187,43 +220,35 @@ class RedisFeastAdapter:
 class KrakenSecretManager:
     account_id: str
     namespace: str = "aether-secrets"
-    k8s_client: Optional[KubernetesSecretClient] = None
+    secret_store: Optional[KrakenSecretStore] = None
     timescale: Optional[TimescaleAdapter] = None
 
-    secret_prefix: ClassVar[str] = "kraken"
-
     def __post_init__(self) -> None:
-        if self.k8s_client is None:
-            self.k8s_client = KubernetesSecretClient(namespace=self.namespace)
+        if self.secret_store is None:
+            self.secret_store = KrakenSecretStore(namespace=self.namespace)
         if self.timescale is None:
             self.timescale = TimescaleAdapter(account_id=self.account_id)
 
     @property
     def secret_name(self) -> str:
-        return f"{self.secret_prefix}-{self.account_id}"
+        assert self.secret_store is not None
+        return self.secret_store.secret_name(self.account_id)
 
     def rotate_credentials(self, *, api_key: str, api_secret: str) -> Dict[str, Any]:
-        assert self.k8s_client is not None  # for type checkers
+        assert self.secret_store is not None  # for type checkers
         assert self.timescale is not None
 
-        before_secret = self.k8s_client.get_secret(self.secret_name)
-        payload = {"api_key": api_key, "api_secret": api_secret}
-        self.k8s_client.patch_secret(self.secret_name, payload)
-
-        rotated_at = datetime.now(timezone.utc)
-        self.timescale.record_credential_rotation(secret_name=self.secret_name, rotated_at=rotated_at)
+        before_status = self.timescale.credential_rotation_status()
+        self.secret_store.write_credentials(
+            self.account_id,
+            api_key=api_key,
+            api_secret=api_secret,
+        )
+        metadata = self.timescale.record_credential_rotation(secret_name=self.secret_name)
 
         return {
-            "secret_name": self.secret_name,
-            "rotated_at": rotated_at,
-            "before": {
-                "secret_name": self.secret_name,
-                "material_present": bool(before_secret),
-            },
-            "after": {
-                "secret_name": self.secret_name,
-                "material_present": True,
-            },
+            "metadata": metadata,
+            "before": before_status,
         }
 
     def status(self) -> Optional[Dict[str, Any]]:

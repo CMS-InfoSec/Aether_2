@@ -106,16 +106,17 @@ class ApprovedUniverseResponse(BaseModel):
     )
 
 
-class KrakenSecretRotationRequest(BaseModel):
+class KrakenCredentialRequest(BaseModel):
     account_id: str = Field(..., description="Trading account identifier")
-    api_key: str = Field(..., description="Rotated Kraken API key")
-    api_secret: str = Field(..., description="Rotated Kraken API secret")
+    api_key: str = Field(..., description="Kraken API key material")
+    api_secret: str = Field(..., description="Kraken API secret material")
 
 
-class KrakenSecretRotationResponse(BaseModel):
+class KrakenCredentialResponse(BaseModel):
     account_id: str = Field(..., description="Trading account identifier")
     secret_name: str = Field(..., description="Kubernetes secret storing credentials")
-    rotated_at: datetime = Field(..., description="Timestamp of the last rotation event")
+    created_at: datetime = Field(..., description="First time the secret was written")
+    rotated_at: datetime = Field(..., description="Most recent rotation timestamp")
 
 
 class KrakenSecretStatusResponse(BaseModel):

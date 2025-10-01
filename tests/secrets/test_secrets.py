@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
 import pytest
 
 fastapi = pytest.importorskip("fastapi")
@@ -7,7 +10,8 @@ from fastapi.testclient import TestClient
 
 from services.common.adapters import TimescaleAdapter
 from services.secrets.main import app
-from shared.k8s import KubernetesSecretClient
+from shared import k8s
+from shared.k8s import KrakenSecretStore
 
 client = TestClient(app)
 
@@ -15,13 +19,23 @@ MFA_HEADER = {"X-MFA-Context": "verified"}
 
 
 def setup_function() -> None:
-    KubernetesSecretClient.reset()
+    KrakenSecretStore.reset()
     TimescaleAdapter.reset_rotation_state()
+    TimescaleAdapter.reset()
 
 
-def test_rotate_secret_writes_to_kubernetes_and_timescale() -> None:
+def _mock_kubernetes(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    core = MagicMock()
+    monkeypatch.setattr(k8s, "client", SimpleNamespace(CoreV1Api=lambda: core))
+    monkeypatch.setattr(k8s, "config", SimpleNamespace(load_incluster_config=lambda: None))
+    return core
+
+
+def test_upsert_secret_writes_to_kubernetes_and_timescale(monkeypatch: pytest.MonkeyPatch) -> None:
+    core = _mock_kubernetes(monkeypatch)
+
     response = client.post(
-        "/secrets/kraken/rotate",
+        "/secrets/kraken",
         json={"account_id": "admin-eu", "api_key": "new-key", "api_secret": "new-secret"},
         headers={"X-Account-ID": "admin-eu", **MFA_HEADER},
     )
@@ -29,14 +43,17 @@ def test_rotate_secret_writes_to_kubernetes_and_timescale() -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["account_id"] == "admin-eu"
-    assert body["secret_name"] == "kraken-admin-eu"
+    assert body["secret_name"] == "kraken-keys-admin-eu"
+    assert "created_at" in body
     assert "rotated_at" in body
     assert "api_key" not in body
     assert "api_secret" not in body
 
-    k8s_client = KubernetesSecretClient(namespace="aether-secrets")
-    stored = k8s_client.get_secret("kraken-admin-eu")
-    assert stored == {"api_key": "new-key", "api_secret": "new-secret"}
+    core.patch_namespaced_secret.assert_called_once()
+    _, kwargs = core.patch_namespaced_secret.call_args
+    assert kwargs["name"] == "kraken-keys-admin-eu"
+    assert kwargs["namespace"] == "aether-secrets"
+    assert kwargs["body"]["stringData"] == {"api_key": "new-key", "api_secret": "new-secret"}
 
     status_response = client.get(
         "/secrets/kraken/status",
@@ -46,26 +63,28 @@ def test_rotate_secret_writes_to_kubernetes_and_timescale() -> None:
 
     assert status_response.status_code == 200
     status_body = status_response.json()
-    assert status_body["secret_name"] == "kraken-admin-eu"
+    assert status_body["secret_name"] == "kraken-keys-admin-eu"
     assert status_body["account_id"] == "admin-eu"
     assert "rotated_at" in status_body
     assert "created_at" in status_body
 
 
-def test_rotate_secret_requires_mfa() -> None:
+def test_upsert_secret_requires_mfa() -> None:
     response = client.post(
-        "/secrets/kraken/rotate",
+        "/secrets/kraken",
         json={"account_id": "admin-eu", "api_key": "new-key", "api_secret": "new-secret"},
         headers={"X-Account-ID": "admin-eu"},
     )
 
-    assert response.status_code == 403
-    assert response.json()["detail"] == "MFA context is invalid or incomplete."
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"][-1] == "X-MFA-Context"
 
 
-def test_status_requires_authorized_account() -> None:
+def test_status_requires_authorized_account(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_kubernetes(monkeypatch)
+
     client.post(
-        "/secrets/kraken/rotate",
+        "/secrets/kraken",
         json={"account_id": "admin-eu", "api_key": "new-key", "api_secret": "new-secret"},
         headers={"X-Account-ID": "admin-eu", **MFA_HEADER},
     )
