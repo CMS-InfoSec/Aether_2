@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+
+import math
+
 import os
+
 import math
 from collections import defaultdict
+
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Dict, List
+from threading import Lock
+from typing import Dict, List, MutableMapping, Sequence
 
 import httpx
 from fastapi import FastAPI, HTTPException, status
@@ -31,6 +37,15 @@ from services.common.security import ADMIN_ACCOUNTS
 FEES_SERVICE_URL = os.getenv("FEES_SERVICE_URL", "http://fees-service")
 FEES_REQUEST_TIMEOUT = float(os.getenv("FEES_REQUEST_TIMEOUT", "1.0"))
 CONFIDENCE_THRESHOLD = float(os.getenv("POLICY_CONFIDENCE_THRESHOLD", "0.55"))
+OMS_SERVICE_URL = os.getenv("OMS_SERVICE_URL", "http://oms-service")
+PAPER_OMS_SERVICE_URL = os.getenv("PAPER_OMS_SERVICE_URL", "http://paper-oms-service")
+OMS_REQUEST_TIMEOUT = float(os.getenv("OMS_REQUEST_TIMEOUT", "1.0"))
+ENABLE_SHADOW_EXECUTION = os.getenv("ENABLE_SHADOW_EXECUTION", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+SHADOW_CLIENT_SUFFIX = os.getenv("SHADOW_CLIENT_SUFFIX", "-shadow")
 
 MODEL_VARIANTS: List[str] = ["trend_model", "meanrev_model", "vol_breakout"]
 DEFAULT_MODEL_SHARPES: Dict[str, float] = {
@@ -48,12 +63,158 @@ KRAKEN_PRECISION: Dict[str, Dict[str, float]] = {
 }
 
 
+logger = logging.getLogger(__name__)
+
+
 app = FastAPI(title="Policy Service", version="2.0.0")
 setup_metrics(app)
 
 
+@dataclass
+class RegimeSnapshot:
+    """Container holding the latest regime classification for a symbol."""
+
+    symbol: str
+    regime: str
+    volatility: float
+    trend_strength: float
+    feature_scale: float
+    size_scale: float
+    sample_count: int
+    updated_at: datetime
+
+    def as_payload(self) -> Dict[str, float | int | str]:
+        return {
+            "symbol": self.symbol,
+            "regime": self.regime,
+            "volatility": round(self.volatility, 6),
+            "trend_strength": round(self.trend_strength, 6),
+            "feature_scale": round(self.feature_scale, 4),
+            "size_scale": round(self.size_scale, 4),
+            "sample_count": self.sample_count,
+            "updated_at": self.updated_at.isoformat(),
+        }
+
+
+class RegimeClassifier:
+    """Rolling-volatility regime classifier with lightweight trend detection."""
+
+    def __init__(
+        self,
+        window: int = 50,
+        min_samples: int = 5,
+        high_vol_threshold: float = 0.012,
+        trend_signal_threshold: float = 1.35,
+        feature_scale_map: Dict[str, float] | None = None,
+        size_scale_map: Dict[str, float] | None = None,
+    ) -> None:
+        self.window = max(window, 5)
+        self.min_samples = max(min_samples, 2)
+        self.high_vol_threshold = max(high_vol_threshold, 0.0)
+        self.trend_signal_threshold = max(trend_signal_threshold, 0.0)
+        self._prices: MutableMapping[str, deque[float]] = defaultdict(
+            lambda: deque(maxlen=self.window)
+        )
+        self._snapshots: Dict[str, RegimeSnapshot] = {}
+        self._lock = Lock()
+        self._feature_scale_map = feature_scale_map or {
+            "trend": 1.1,
+            "range": 1.0,
+            "high_vol": 0.85,
+        }
+        self._size_scale_map = size_scale_map or {
+            "trend": 1.15,
+            "range": 0.85,
+            "high_vol": 0.6,
+        }
+
+    def observe(self, symbol: str, price: float) -> RegimeSnapshot:
+        norm_symbol = symbol.upper()
+        with self._lock:
+            price_series = self._prices[norm_symbol]
+            if price > 0:
+                price_series.append(float(price))
+            volatility = self._compute_volatility(price_series)
+            trend_strength = self._compute_trend_strength(price_series)
+            regime = self._classify(volatility, trend_strength, len(price_series))
+            feature_scale = self._feature_scale_map.get(regime, 1.0)
+            size_scale = self._size_scale_map.get(regime, 1.0)
+            snapshot = RegimeSnapshot(
+                symbol=norm_symbol,
+                regime=regime,
+                volatility=volatility,
+                trend_strength=trend_strength,
+                feature_scale=feature_scale,
+                size_scale=size_scale,
+                sample_count=len(price_series),
+                updated_at=datetime.now(timezone.utc),
+            )
+            self._snapshots[norm_symbol] = snapshot
+            return snapshot
+
+    def get_snapshot(self, symbol: str) -> RegimeSnapshot | None:
+        norm_symbol = symbol.upper()
+        with self._lock:
+            snapshot = self._snapshots.get(norm_symbol)
+            return replace(snapshot) if snapshot is not None else None
+
+    def _compute_volatility(self, prices: Sequence[float]) -> float:
+        if len(prices) < 2:
+            return 0.0
+        series = list(prices)
+        log_returns: List[float] = []
+        previous = series[0]
+        for price in series[1:]:
+            if previous <= 0 or price <= 0:
+                continue
+            log_returns.append(math.log(price / previous))
+            previous = price
+        if not log_returns:
+            return 0.0
+        mean_return = sum(log_returns) / len(log_returns)
+        variance = sum((ret - mean_return) ** 2 for ret in log_returns) / len(log_returns)
+        return math.sqrt(max(variance, 0.0))
+
+    def _compute_trend_strength(self, prices: Sequence[float]) -> float:
+        series = list(prices)
+        count = len(series)
+        if count < 2:
+            return 0.0
+        x_values = range(count)
+        mean_x = (count - 1) / 2.0
+        mean_y = sum(series) / float(count)
+        numerator = sum((x - mean_x) * (y - mean_y) for x, y in zip(x_values, series))
+        denominator = sum((x - mean_x) ** 2 for x in x_values)
+        if denominator <= 0:
+            return 0.0
+        slope = numerator / denominator
+        latest_price = series[-1] if series[-1] != 0 else 1.0
+        return slope / latest_price
+
+    def _classify(self, volatility: float, trend_strength: float, sample_count: int) -> str:
+        if sample_count < self.min_samples:
+            return "range"
+        if volatility >= self.high_vol_threshold:
+            return "high_vol"
+        signal = abs(trend_strength) / max(volatility, 1e-6)
+        if signal >= self.trend_signal_threshold:
+            return "trend"
+        return "range"
+
+
+regime_classifier = RegimeClassifier()
+
+
 def _default_state() -> PolicyState:
     return PolicyState(regime="unknown", volatility=0.0, liquidity_score=0.0, conviction=0.0)
+
+
+def _reset_regime_state() -> None:
+    """Reset cached regime state. Intended for test isolation."""
+
+    with regime_classifier._lock:  # type: ignore[attr-defined]
+        regime_classifier._prices.clear()  # type: ignore[attr-defined]
+        regime_classifier._snapshots.clear()  # type: ignore[attr-defined]
 
 
 
@@ -68,7 +229,6 @@ def _snap(value: float, step: float) -> float:
     quant = Decimal(str(step))
     snapped = (Decimal(str(value)) / quant).to_integral_value(rounding=ROUND_HALF_UP) * quant
     return float(snapped)
-
 
 
 
@@ -235,6 +395,7 @@ def _resolve_risk_band(
     return fallback
 
 
+
 async def _fetch_effective_fee(account_id: str, symbol: str, liquidity: str, notional: float) -> float:
     liquidity_normalized = liquidity.lower() if liquidity else "maker"
     if liquidity_normalized not in {"maker", "taker"}:
@@ -294,6 +455,17 @@ async def ready() -> Dict[str, str]:
     return {"status": "ready"}
 
 
+@app.get("/policy/regime", tags=["policy"])
+async def get_regime(symbol: str) -> Dict[str, float | int | str]:
+    snapshot = regime_classifier.get_snapshot(symbol)
+    if snapshot is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No regime information available for symbol",
+        )
+    return snapshot.as_payload()
+
+
 @app.post(
     "/policy/decide",
     response_model=PolicyDecisionResponse,
@@ -318,8 +490,10 @@ async def decide_policy(request: PolicyDecisionRequest) -> PolicyDecisionRespons
         )
 
     book_snapshot = request.book_snapshot
+
     state_model = request.state or _default_state()
     features: List[float] = [float(value) for value in request.features]
+
 
     raw_weights = _model_sharpe_weights()
     weights = _normalize_weights(raw_weights)
@@ -445,6 +619,7 @@ async def decide_policy(request: PolicyDecisionRequest) -> PolicyDecisionRespons
     reason: str | None = None
     selected_action = winning_action if winning_action in {"maker", "taker"} else "abstain"
     if not approved:
+
         if entropy > 0.3:
             reason = "High ensemble entropy"
         elif winning_action not in {"maker", "taker"}:
@@ -455,10 +630,12 @@ async def decide_policy(request: PolicyDecisionRequest) -> PolicyDecisionRespons
             reason = "Confidence below threshold"
         else:
             reason = "Fee-adjusted edge non-positive"
+
         selected_action = "abstain"
         fee_adjusted_edge = min(fee_adjusted_edge, 0.0)
     else:
         selected_action = selected_template.name if selected_template else selected_action
+
 
     drift_value = getattr(state_model, "conviction", 0.0)
     try:
@@ -486,4 +663,82 @@ async def decide_policy(request: PolicyDecisionRequest) -> PolicyDecisionRespons
         stop_loss_bps=round(float(stop_loss), 4),
     )
 
+    await _dispatch_shadow_orders(request, response)
+
     return response
+
+
+async def _dispatch_shadow_orders(
+    request: PolicyDecisionRequest, response: PolicyDecisionResponse
+) -> None:
+    """Submit the primary execution as well as the paper shadow copy."""
+
+    if not response.approved or response.selected_action.lower() == "abstain":
+        return
+
+    await _submit_execution(request, response, shadow=False)
+
+    if not ENABLE_SHADOW_EXECUTION:
+        return
+
+    try:
+        await _submit_execution(request, response, shadow=True)
+    except Exception as exc:  # pragma: no cover - best-effort shadow dispatch
+        logger.warning(
+            "Shadow execution submission failed for order %s: %s",
+            request.order_id,
+            exc,
+        )
+
+
+async def _submit_execution(
+    request: PolicyDecisionRequest,
+    response: PolicyDecisionResponse,
+    *,
+    shadow: bool,
+) -> None:
+    """Submit the execution payload to the configured OMS endpoint."""
+
+    base_url = PAPER_OMS_SERVICE_URL if shadow else OMS_SERVICE_URL
+    if not base_url:
+        return
+
+    precision = _resolve_precision(request.instrument)
+    snapped_price = _snap(request.price, precision["tick"])
+    snapped_qty = _snap(request.quantity, precision["lot"])
+
+    order_type = "limit" if response.selected_action.lower() == "maker" else "market"
+    client_id = request.order_id
+    if shadow and SHADOW_CLIENT_SUFFIX:
+        client_id = f"{client_id}{SHADOW_CLIENT_SUFFIX}"
+
+    payload: Dict[str, object] = {
+        "account_id": request.account_id,
+        "client_id": client_id,
+        "symbol": request.instrument,
+        "side": request.side.lower(),
+        "order_type": order_type,
+        "qty": snapped_qty,
+        "post_only": response.selected_action.lower() == "maker",
+        "reduce_only": False,
+        "flags": [],
+        "shadow": shadow,
+    }
+    if order_type == "limit":
+        payload["limit_px"] = snapped_price
+
+    headers = {"X-Account-ID": request.account_id}
+    timeout = httpx.Timeout(OMS_REQUEST_TIMEOUT)
+    async with httpx.AsyncClient(base_url=base_url, timeout=timeout) as client:
+        try:
+            response = await client.post("/oms/place", json=payload, headers=headers)
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            if shadow:
+                raise
+            logger.error(
+                "Primary OMS submission failed for order %s: %s",
+                request.order_id,
+                exc,
+            )
+            raise

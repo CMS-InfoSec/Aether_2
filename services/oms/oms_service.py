@@ -6,7 +6,10 @@ import contextlib
 import json
 import logging
 import os
+
 from dataclasses import dataclass
+from datetime import datetime, timezone
+
 from decimal import Decimal, ROUND_HALF_EVEN
 from pathlib import Path
 from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple
@@ -14,6 +17,7 @@ from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
 
+from services.oms.impact_store import ImpactAnalyticsStore, impact_store
 from services.oms.kraken_rest import KrakenRESTClient, KrakenRESTError
 from services.oms.kraken_ws import (
     KrakenWSError,
@@ -64,6 +68,13 @@ class OMSPlaceRequest(BaseModel):
         default=None,
         gt=Decimal("0"),
         description="Trailing stop offset",
+    )
+
+    pre_trade_mid_px: Optional[Decimal] = Field(
+        default=None,
+        gt=Decimal("0"),
+        description="Observed mid price immediately before order placement",
+
     )
 
     @field_validator("side")
@@ -118,6 +129,18 @@ class OMSPlaceResponse(OMSOrderStatusResponse):
     reused: bool = Field(
         default=False, description="True when the idempotency cache satisfied the request"
     )
+    shadow: bool = Field(default=False, description="True when the order executed in shadow mode")
+
+
+class ImpactCurvePoint(BaseModel):
+    size: float
+    impact_bps: float
+
+
+class ImpactCurveResponse(BaseModel):
+    symbol: str
+    points: List[ImpactCurvePoint]
+    as_of: datetime
 
 
 class _IdempotencyStore:
@@ -158,6 +181,12 @@ class OrderRecord:
     client_id: str
     result: OMSOrderStatusResponse
     transport: str
+    symbol: str
+    side: str
+
+    pre_trade_mid: Optional[Decimal]
+    recorded_qty: Decimal = Decimal("0")
+
 
 
 class _PrecisionValidator:
@@ -358,6 +387,9 @@ class AccountContext:
         self._startup_lock = asyncio.Lock()
         self._stream_task: Optional[asyncio.Task[None]] = None
 
+        self._impact_store: ImpactAnalyticsStore = impact_store
+
+
     async def start(self) -> None:
         async with self._startup_lock:
             await self.credentials.start()
@@ -395,47 +427,92 @@ class AccountContext:
             avg_price=Decimal(str(state.avg_price or 0)),
             errors=state.errors or None,
         )
-        record = OrderRecord(client_id=key, result=result, transport=state.transport)
         async with self._orders_lock:
+
+            existing = self._orders.get(key)
+            if existing:
+                record = OrderRecord(
+                    client_id=key,
+                    result=result,
+                    transport=existing.transport,
+                    symbol=existing.symbol,
+                    side=existing.side,
+                    pre_trade_mid=existing.pre_trade_mid,
+                    recorded_qty=existing.recorded_qty,
+                )
+            else:
+
+                record = OrderRecord(
+                    client_id=key,
+                    result=result,
+                    transport=state.transport,
+                    symbol="",
+
+                    side="",
+                    pre_trade_mid=None,
+                )
+
             self._orders[key] = record
+        await self._record_trade_impact(record)
 
     async def place_order(self, request: OMSPlaceRequest) -> OMSPlaceResponse:
         await self.start()
 
         async def _execute() -> OMSOrderStatusResponse:
-            assert self.ws_client is not None
-            assert self.rest_client is not None
-
-            metadata = await self.credentials.get_metadata()
-            qty, px = _PrecisionValidator.validate(
-                request.symbol,
-                request.qty,
-                request.limit_px,
-                metadata,
-            )
-
-            payload = self._build_payload(request, qty, px)
-            try:
-                ack = await self.ws_client.add_order(payload)
-                transport = "websocket"
-            except (KrakenWSTimeout, KrakenWSError) as exc:
-                logger.warning(
-                    "Websocket add_order failed for account %s: %s", self.account_id, exc
+            if request.shadow:
+                filled_qty = request.qty
+                avg_price = request.limit_px or Decimal("0")
+                result = OMSOrderStatusResponse(
+                    exchange_order_id=f"{request.client_id}-shadow",
+                    status="filled",
+                    filled_qty=filled_qty,
+                    avg_price=avg_price,
+                    errors=None,
                 )
+                transport = "shadow"
+            else:
+                assert self.ws_client is not None
+                assert self.rest_client is not None
+
+                metadata = await self.credentials.get_metadata()
+                qty, px = _PrecisionValidator.validate(
+                    request.symbol,
+                    request.qty,
+                    request.limit_px,
+                    metadata,
+                )
+
+                payload = self._build_payload(request, qty, px)
                 try:
-                    ack = await self.rest_client.add_order(payload)
-                except KrakenRESTError as rest_exc:
-                    raise HTTPException(
-                        status_code=status.HTTP_502_BAD_GATEWAY,
-                        detail=str(rest_exc),
-                    ) from rest_exc
-                transport = "rest"
+                    ack = await self.ws_client.add_order(payload)
+                    transport = "websocket"
+                except (KrakenWSTimeout, KrakenWSError) as exc:
+                    logger.warning(
+                        "Websocket add_order failed for account %s: %s",
+                        self.account_id,
+                        exc,
+                    )
+                    try:
+                        ack = await self.rest_client.add_order(payload)
+                    except KrakenRESTError as rest_exc:
+                        raise HTTPException(
+                            status_code=status.HTTP_502_BAD_GATEWAY,
+                            detail=str(rest_exc),
+                        ) from rest_exc
+                    transport = "rest"
 
-            result = self._order_result_from_ack(request, ack)
+                result = self._order_result_from_ack(request, ack)
             async with self._orders_lock:
+
                 self._orders[request.client_id] = OrderRecord(
-                    client_id=request.client_id, result=result, transport=transport
+                    client_id=request.client_id,
+                    result=result,
+                    transport=transport,
+                    symbol=request.symbol,
+                    side=request.side,
+                    pre_trade_mid=request.pre_trade_mid_px,
                 )
+
             return result
 
         cache_key = f"place:{request.client_id}"
@@ -443,6 +520,8 @@ class AccountContext:
         async with self._orders_lock:
             record = self._orders.get(request.client_id)
         transport = record.transport if record else "websocket"
+        if record is not None:
+            await self._record_trade_impact(record)
         return OMSPlaceResponse(
             exchange_order_id=result.exchange_order_id,
             status=result.status,
@@ -451,6 +530,7 @@ class AccountContext:
             errors=result.errors,
             transport=transport,
             reused=reused,
+            shadow=request.shadow,
         )
 
     async def cancel_order(self, request: OMSCancelRequest) -> OMSOrderStatusResponse:
@@ -496,9 +576,18 @@ class AccountContext:
                 errors=ack.errors or None,
             )
             async with self._orders_lock:
+
+                existing = self._orders.get(request.client_id)
                 self._orders[request.client_id] = OrderRecord(
-                    client_id=request.client_id, result=result, transport=transport
+                    client_id=request.client_id,
+                    result=result,
+                    transport=transport,
+                    symbol=existing.symbol if existing else "",
+                    side=existing.side if existing else "",
+                    pre_trade_mid=existing.pre_trade_mid if existing else None,
+                    recorded_qty=existing.recorded_qty if existing else Decimal("0"),
                 )
+
             return result
 
         cache_key = f"cancel:{request.client_id}"
@@ -559,6 +648,51 @@ class AccountContext:
     async def lookup(self, client_id: str) -> OrderRecord | None:
         async with self._orders_lock:
             return self._orders.get(client_id)
+
+
+    async def _record_trade_impact(self, record: OrderRecord) -> None:
+        if record.pre_trade_mid is None:
+            return
+        if record.result.filled_qty <= 0:
+            return
+        if record.result.avg_price <= 0:
+            return
+        if record.recorded_qty >= record.result.filled_qty:
+            return
+        if not record.symbol:
+            return
+
+        filled_qty = record.result.filled_qty
+        avg_price = record.result.avg_price
+        mid_px = record.pre_trade_mid
+        if mid_px is None or mid_px <= 0:
+            return
+
+        normalized_side = record.side.lower()
+        if normalized_side not in {"buy", "sell"}:
+            return
+
+        direction = Decimal("1") if normalized_side == "buy" else Decimal("-1")
+        impact_ratio = (avg_price - mid_px) / mid_px
+        impact_bps = float((impact_ratio * direction * Decimal("10000")))
+
+        await self._impact_store.record_fill(
+            account_id=self.account_id,
+            client_order_id=record.client_id,
+            symbol=record.symbol,
+            side=record.side,
+            filled_qty=float(filled_qty),
+            avg_price=float(avg_price),
+            pre_trade_mid=float(mid_px),
+            impact_bps=impact_bps,
+            recorded_at=datetime.now(timezone.utc),
+        )
+
+        async with self._orders_lock:
+            current = self._orders.get(record.client_id)
+            if current:
+                current.recorded_qty = filled_qty
+
 
 
 class OMSManager:
@@ -641,5 +775,20 @@ async def get_status(
     if not record:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown order")
     return record.result
+
+
+
+@app.get("/oms/impact_curve", response_model=ImpactCurveResponse)
+async def get_impact_curve(
+    symbol: str,
+    account_id: str = Depends(require_account_id),
+) -> ImpactCurveResponse:
+    points_raw = await impact_store.impact_curve(account_id=account_id, symbol=symbol)
+    points = [
+        ImpactCurvePoint(size=point["size"], impact_bps=point["impact_bps"])
+        for point in points_raw
+    ]
+    return ImpactCurveResponse(symbol=symbol, points=points, as_of=datetime.now(timezone.utc))
+
 
 

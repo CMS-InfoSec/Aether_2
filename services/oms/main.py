@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal, ROUND_HALF_UP
+import logging
 import time
 from typing import Dict, List
 
@@ -9,7 +10,11 @@ from fastapi import Depends, FastAPI, HTTPException, status
 from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
 from services.common.schemas import OrderPlacementRequest, OrderPlacementResponse
 from services.common.security import require_admin_account
-from services.oms.kraken_client import KrakenWSClient, KrakenWebsocketError
+from services.oms.kraken_client import (
+    KrakenCredentialExpired,
+    KrakenWSClient,
+    KrakenWebsocketError,
+)
 
 from metrics import (
     increment_trade_rejection,
@@ -20,6 +25,9 @@ from metrics import (
 
 app = FastAPI(title="OMS Service")
 setup_metrics(app)
+
+
+logger = logging.getLogger(__name__)
 
 
 class CircuitBreaker:
@@ -146,6 +154,17 @@ def place_order(
     start_time = time.perf_counter()
     try:
         ack = client.add_order(order_payload, timeout=1.0)
+    except KrakenCredentialExpired as exc:
+        client.close()
+        increment_trade_rejection(account_id, request.instrument)
+        logger.warning(
+            "Rejected order due to expired Kraken credentials",
+            extra={"account_id": account_id, "instrument": request.instrument},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(exc),
+        ) from exc
     except KrakenWebsocketError as exc:
         client.close()
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))

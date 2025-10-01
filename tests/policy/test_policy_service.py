@@ -26,6 +26,13 @@ from services.common.schemas import ActionTemplate, ConfidenceMetrics, PolicyDec
 import policy_service
 
 
+@pytest.fixture(autouse=True)
+def _reset_regime() -> None:
+    policy_service._reset_regime_state()
+    yield
+    policy_service._reset_regime_state()
+
+
 @dataclass
 class DataclassIntent:
     edge_bps: float
@@ -122,4 +129,35 @@ def test_metrics_endpoint_exposed_after_import():
     response = client.get("/metrics")
 
     assert response.status_code == 200
+
+
+def test_regime_endpoint_returns_latest_snapshot(client: TestClient) -> None:
+    base_payload = {
+        "account_id": str(uuid4()),
+        "order_id": "regime-test",
+        "instrument": "ETH-USD",
+        "side": "BUY",
+        "quantity": 0.5,
+        "price": 1500.0,
+        "fee": {"currency": "USD", "maker": 2.0, "taker": 4.0},
+        "features": [0.2, 0.1, -0.05],
+        "book_snapshot": {"mid_price": 1500.0, "spread_bps": 1.5, "imbalance": 0.05},
+    }
+
+    for idx, mid_price in enumerate([1500.0, 1502.0, 1504.5, 1507.0, 1510.0, 1512.5], start=1):
+        payload = dict(base_payload)
+        payload["order_id"] = f"regime-{idx}"
+        payload["book_snapshot"] = {
+            "mid_price": mid_price,
+            "spread_bps": 1.5,
+            "imbalance": 0.05,
+        }
+        client.post("/policy/decide", json=payload)
+
+    response = client.get("/policy/regime", params={"symbol": "ETH-USD"})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["symbol"] == "ETH-USD"
+    assert payload["regime"] in {"trend", "range", "high_vol"}
+    assert payload["sample_count"] >= 5
 
