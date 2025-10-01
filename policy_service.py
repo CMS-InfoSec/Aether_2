@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import math
 import os
+from collections import defaultdict, deque
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Dict, List
+from threading import Lock
+from typing import Dict, List, MutableMapping, Sequence
 
 import httpx
 from fastapi import FastAPI, HTTPException, status
@@ -41,8 +46,151 @@ app = FastAPI(title="Policy Service", version="2.0.0")
 setup_metrics(app)
 
 
+@dataclass
+class RegimeSnapshot:
+    """Container holding the latest regime classification for a symbol."""
+
+    symbol: str
+    regime: str
+    volatility: float
+    trend_strength: float
+    feature_scale: float
+    size_scale: float
+    sample_count: int
+    updated_at: datetime
+
+    def as_payload(self) -> Dict[str, float | int | str]:
+        return {
+            "symbol": self.symbol,
+            "regime": self.regime,
+            "volatility": round(self.volatility, 6),
+            "trend_strength": round(self.trend_strength, 6),
+            "feature_scale": round(self.feature_scale, 4),
+            "size_scale": round(self.size_scale, 4),
+            "sample_count": self.sample_count,
+            "updated_at": self.updated_at.isoformat(),
+        }
+
+
+class RegimeClassifier:
+    """Rolling-volatility regime classifier with lightweight trend detection."""
+
+    def __init__(
+        self,
+        window: int = 50,
+        min_samples: int = 5,
+        high_vol_threshold: float = 0.012,
+        trend_signal_threshold: float = 1.35,
+        feature_scale_map: Dict[str, float] | None = None,
+        size_scale_map: Dict[str, float] | None = None,
+    ) -> None:
+        self.window = max(window, 5)
+        self.min_samples = max(min_samples, 2)
+        self.high_vol_threshold = max(high_vol_threshold, 0.0)
+        self.trend_signal_threshold = max(trend_signal_threshold, 0.0)
+        self._prices: MutableMapping[str, deque[float]] = defaultdict(
+            lambda: deque(maxlen=self.window)
+        )
+        self._snapshots: Dict[str, RegimeSnapshot] = {}
+        self._lock = Lock()
+        self._feature_scale_map = feature_scale_map or {
+            "trend": 1.1,
+            "range": 1.0,
+            "high_vol": 0.85,
+        }
+        self._size_scale_map = size_scale_map or {
+            "trend": 1.15,
+            "range": 0.85,
+            "high_vol": 0.6,
+        }
+
+    def observe(self, symbol: str, price: float) -> RegimeSnapshot:
+        norm_symbol = symbol.upper()
+        with self._lock:
+            price_series = self._prices[norm_symbol]
+            if price > 0:
+                price_series.append(float(price))
+            volatility = self._compute_volatility(price_series)
+            trend_strength = self._compute_trend_strength(price_series)
+            regime = self._classify(volatility, trend_strength, len(price_series))
+            feature_scale = self._feature_scale_map.get(regime, 1.0)
+            size_scale = self._size_scale_map.get(regime, 1.0)
+            snapshot = RegimeSnapshot(
+                symbol=norm_symbol,
+                regime=regime,
+                volatility=volatility,
+                trend_strength=trend_strength,
+                feature_scale=feature_scale,
+                size_scale=size_scale,
+                sample_count=len(price_series),
+                updated_at=datetime.now(timezone.utc),
+            )
+            self._snapshots[norm_symbol] = snapshot
+            return snapshot
+
+    def get_snapshot(self, symbol: str) -> RegimeSnapshot | None:
+        norm_symbol = symbol.upper()
+        with self._lock:
+            snapshot = self._snapshots.get(norm_symbol)
+            return replace(snapshot) if snapshot is not None else None
+
+    def _compute_volatility(self, prices: Sequence[float]) -> float:
+        if len(prices) < 2:
+            return 0.0
+        series = list(prices)
+        log_returns: List[float] = []
+        previous = series[0]
+        for price in series[1:]:
+            if previous <= 0 or price <= 0:
+                continue
+            log_returns.append(math.log(price / previous))
+            previous = price
+        if not log_returns:
+            return 0.0
+        mean_return = sum(log_returns) / len(log_returns)
+        variance = sum((ret - mean_return) ** 2 for ret in log_returns) / len(log_returns)
+        return math.sqrt(max(variance, 0.0))
+
+    def _compute_trend_strength(self, prices: Sequence[float]) -> float:
+        series = list(prices)
+        count = len(series)
+        if count < 2:
+            return 0.0
+        x_values = range(count)
+        mean_x = (count - 1) / 2.0
+        mean_y = sum(series) / float(count)
+        numerator = sum((x - mean_x) * (y - mean_y) for x, y in zip(x_values, series))
+        denominator = sum((x - mean_x) ** 2 for x in x_values)
+        if denominator <= 0:
+            return 0.0
+        slope = numerator / denominator
+        latest_price = series[-1] if series[-1] != 0 else 1.0
+        return slope / latest_price
+
+    def _classify(self, volatility: float, trend_strength: float, sample_count: int) -> str:
+        if sample_count < self.min_samples:
+            return "range"
+        if volatility >= self.high_vol_threshold:
+            return "high_vol"
+        signal = abs(trend_strength) / max(volatility, 1e-6)
+        if signal >= self.trend_signal_threshold:
+            return "trend"
+        return "range"
+
+
+regime_classifier = RegimeClassifier()
+
+
 def _default_state() -> PolicyState:
     return PolicyState(regime="unknown", volatility=0.0, liquidity_score=0.0, conviction=0.0)
+
+
+def _reset_regime_state() -> None:
+    """Reset cached regime state. Intended for test isolation."""
+
+    with regime_classifier._lock:  # type: ignore[attr-defined]
+        regime_classifier._prices.clear()  # type: ignore[attr-defined]
+        regime_classifier._snapshots.clear()  # type: ignore[attr-defined]
 
 
 
@@ -57,6 +205,13 @@ def _snap(value: float, step: float) -> float:
     quant = Decimal(str(step))
     snapped = (Decimal(str(value)) / quant).to_integral_value(rounding=ROUND_HALF_UP) * quant
     return float(snapped)
+
+
+
+def _scale_features(values: Sequence[float], multiplier: float) -> List[float]:
+    if not values:
+        return []
+    return [float(value) * multiplier for value in values]
 
 
 
@@ -119,6 +274,17 @@ async def ready() -> Dict[str, str]:
     return {"status": "ready"}
 
 
+@app.get("/policy/regime", tags=["policy"])
+async def get_regime(symbol: str) -> Dict[str, float | int | str]:
+    snapshot = regime_classifier.get_snapshot(symbol)
+    if snapshot is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No regime information available for symbol",
+        )
+    return snapshot.as_payload()
+
+
 @app.post(
     "/policy/decide",
     response_model=PolicyDecisionResponse,
@@ -145,7 +311,24 @@ async def decide_policy(request: PolicyDecisionRequest) -> PolicyDecisionRespons
 
 
     book_snapshot = request.book_snapshot
-    features: List[float] = [float(value) for value in request.features]
+    regime_snapshot = regime_classifier.observe(
+        request.instrument,
+        book_snapshot.mid_price,
+    )
+    features: List[float] = _scale_features(request.features, regime_snapshot.feature_scale)
+
+    if request.state is not None:
+        state_model = request.state.model_copy(deep=True)
+    else:
+        state_model = _default_state()
+    state_model.regime = regime_snapshot.regime
+    state_model.volatility = round(regime_snapshot.volatility, 6)
+    base_conviction = float(getattr(state_model, "conviction", 0.0))
+    regime_conviction = min(max(regime_snapshot.size_scale, 0.0), 1.0)
+    state_model.conviction = round(
+        min(1.0, max(0.0, (base_conviction + regime_conviction) / 2.0)),
+        4,
+    )
 
 
     intent = predict_intent(
@@ -236,11 +419,13 @@ async def decide_policy(request: PolicyDecisionRequest) -> PolicyDecisionRespons
     reason = intent.reason
     selected_action = intent.selected_action or "abstain"
     if not approved:
-        if reason is None:
-            if (confidence.overall_confidence or 0.0) < CONFIDENCE_THRESHOLD:
-                reason = "Confidence below threshold"
-            else:
-                reason = "Fee-adjusted edge non-positive"
+        overall_conf = confidence.overall_confidence or 0.0
+        if overall_conf < CONFIDENCE_THRESHOLD:
+            reason = "Confidence below threshold"
+        elif fee_adjusted_edge <= 0:
+            reason = "Fee-adjusted edge non-positive"
+        elif reason is None:
+            reason = "Intent rejected by policy"
         selected_action = "abstain"
         fee_adjusted_edge = min(fee_adjusted_edge, 0.0)
     else:
@@ -249,7 +434,6 @@ async def decide_policy(request: PolicyDecisionRequest) -> PolicyDecisionRespons
     take_profit = request.take_profit_bps or intent.take_profit_bps or 0.0
     stop_loss = request.stop_loss_bps or intent.stop_loss_bps or 0.0
 
-    state_model = request.state or _default_state()
     drift_value = getattr(state_model, "conviction", 0.0)
     try:
         drift_value = float(drift_value)
