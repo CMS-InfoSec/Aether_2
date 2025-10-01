@@ -242,7 +242,7 @@ async def ingest_symbol(
 async def run_ingest(args: argparse.Namespace) -> None:
     engine = create_async_engine(args.db_url, future=True)
     timeout = httpx.Timeout(REQUEST_TIMEOUT_SECONDS)
-    async with engine:
+    try:
         async with httpx.AsyncClient(base_url=args.api_base_url, timeout=timeout) as client:
             for symbol in args.symbols:
                 await ingest_symbol(
@@ -254,6 +254,8 @@ async def run_ingest(args: argparse.Namespace) -> None:
                     args.end,
                     max_retries=args.max_retries,
                 )
+    finally:
+        await engine.dispose()
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
