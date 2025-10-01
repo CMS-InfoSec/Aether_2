@@ -196,6 +196,7 @@ class Backtester:
         bar_stream = list(self._normalise_stream(bar_events, "bar"))
         book_stream = list(self._normalise_stream(book_events, "book"))
         self._base_events = sorted(bar_stream + book_stream, key=lambda item: item["timestamp"])
+        self._last_state: Optional[SimulationState] = None
 
     @staticmethod
     def _normalise_stream(events: Iterable[Dict[str, Any]], event_type: str) -> Iterator[Dict[str, Any]]:
@@ -227,6 +228,33 @@ class Backtester:
         result["stress"] = stress_metrics
         return result
 
+    def run_with_events(self, events: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+        """Execute the simulation against a custom event stream.
+
+        Parameters
+        ----------
+        events:
+            Iterable of events adhering to the same schema as the constructor
+            inputs. Each event must define a ``timestamp`` key and a ``type``
+            key ("bar" or "book").
+
+        Returns
+        -------
+        Dict[str, Any]
+            Performance metrics as returned by :meth:`run`.
+        """
+
+        normalised_events = [dict(event) for event in events]
+        for event in normalised_events:
+            if "timestamp" not in event:
+                raise KeyError("event missing 'timestamp'")
+            if not isinstance(event["timestamp"], pd.Timestamp):
+                event["timestamp"] = pd.Timestamp(event["timestamp"])
+            if "type" not in event:
+                raise KeyError("event missing 'type'")
+        normalised_events.sort(key=lambda item: item["timestamp"])
+        return self._run_once(normalised_events)
+
     # ------------------------------------------------------------------
     # Core simulation loop
     # ------------------------------------------------------------------
@@ -244,7 +272,9 @@ class Backtester:
                 self._handle_bar_event(event, state, fee_model)
             self._mark_to_market(timestamp, state)
 
-        return self._compute_performance(state)
+        metrics = self._compute_performance(state)
+        self._last_state = state
+        return metrics
 
     def _reset_policy(self) -> None:
         reset_fn = getattr(self.policy, "reset", None)
@@ -691,3 +721,9 @@ class Backtester:
     @property
     def base_events(self) -> List[Dict[str, Any]]:
         return list(self._base_events)
+
+    @property
+    def last_state(self) -> Optional[SimulationState]:
+        """Return the most recent :class:`SimulationState` after a run."""
+
+        return self._last_state
