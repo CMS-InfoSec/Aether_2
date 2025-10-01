@@ -1,287 +1,231 @@
-"""Streaming ingestion from Kraken's public WebSocket API.
 
-The consumer multiplexes trades and level-2 order-book updates into Kafka or
-NATS topics and optionally archives periodic snapshots into TimescaleDB.
-
-The implementation embraces asyncio to handle high-throughput real-time data
-while remaining dependency-light. Downstream systems can choose either Kafka or
-NATS by providing the relevant connection URLs.
-"""
+"""Async consumers for Kraken WebSocket market data."""
 from __future__ import annotations
 
-import argparse
+
 import asyncio
 import datetime as dt
 import json
 import logging
+
+import os
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, List, Sequence
 
-import websockets
+import aiohttp
+from sqlalchemy import BigInteger, Column, DateTime, JSON, MetaData, Numeric, String, Table
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.engine import Engine, create_engine
 
-logger = logging.getLogger(__name__)
+try:
+    from confluent_kafka import Producer
+except ImportError:  # pragma: no cover - optional dependency
+    Producer = None  # type: ignore
 
-KRAKEN_WS_URL = "wss://ws.kraken.com"
-TRADES_TOPIC = "md.trades"
-BOOK_TOPIC = "md.book"
-SNAPSHOT_DEPTH = 10
+try:
+    from nats.aio.client import Client as NATS
+except ImportError:  # pragma: no cover - optional dependency
+    NATS = None  # type: ignore
+
+LOGGER = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+KRAKEN_WS_URL = os.getenv("KRAKEN_WS_URL", "wss://ws.kraken.com")
+KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
+KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "kraken.marketdata")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg2://localhost:5432/aether")
+NATS_SERVERS = os.getenv("NATS_SERVERS", "nats://localhost:4222").split(",")
+NATS_SUBJECT = os.getenv("NATS_SUBJECT", "marketdata.kraken.orderbook")
+
+metadata = MetaData()
+order_book_table = Table(
+    "order_book_events",
+    metadata,
+    Column("market", String, primary_key=True),
+    Column("event_time", DateTime(timezone=True), primary_key=True),
+    Column("side", String, nullable=False),
+    Column("price", Numeric, nullable=False),
+    Column("size", Numeric, nullable=False),
+    Column("event_type", String, nullable=False),
+    Column("sequence", BigInteger, nullable=False),
+    Column("raw", JSON, nullable=False),
+)
 
 
 @dataclass
-class PublisherConfig:
-    kafka_bootstrap: Optional[str] = None
-    nats_url: Optional[str] = None
+class OrderBookUpdate:
+    market: str
+    event_time: dt.datetime
+    side: str
+    price: float
+    size: float
+    sequence: int
+    raw: Dict[str, Any]
 
-    def validate(self) -> None:
-        if not self.kafka_bootstrap and not self.nats_url:
-            raise ValueError("At least one of kafka_bootstrap or nats_url must be provided")
 
-
-class BasePublisher:
-    async def start(self) -> None:  # pragma: no cover - interface
+def kafka_producer() -> Producer | None:
+    if Producer is None:
+        LOGGER.warning("Kafka producer not available; messages will not be published")
         return None
-
-    async def stop(self) -> None:  # pragma: no cover - interface
-        return None
-
-    async def publish(self, topic: str, payload: Dict[str, Any]) -> None:  # pragma: no cover - interface
-        raise NotImplementedError
+    return Producer({"bootstrap.servers": KAFKA_BROKERS})
 
 
-class KafkaPublisher(BasePublisher):
-    def __init__(self, bootstrap_servers: str) -> None:
-        from aiokafka import AIOKafkaProducer
-
-        self._producer = AIOKafkaProducer(bootstrap_servers=bootstrap_servers)
-
-    async def start(self) -> None:
-        await self._producer.start()
-
-    async def stop(self) -> None:
-        await self._producer.stop()
-
-    async def publish(self, topic: str, payload: Dict[str, Any]) -> None:
-        await self._producer.send_and_wait(topic, json.dumps(payload).encode("utf-8"))
+async def subscribe(session: aiohttp.ClientSession, pairs: Sequence[str]) -> aiohttp.ClientWebSocketResponse:
+    LOGGER.info("Connecting to Kraken WebSocket", extra={"url": KRAKEN_WS_URL, "pairs": pairs})
+    ws = await session.ws_connect(KRAKEN_WS_URL)
+    subscribe_message = {
+        "event": "subscribe",
+        "pair": list(pairs),
+        "subscription": {"name": "book", "depth": 25},
+    }
+    await ws.send_str(json.dumps(subscribe_message))
+    return ws
 
 
-class NatsPublisher(BasePublisher):
-    def __init__(self, url: str) -> None:
-        from nats.aio.client import Client as NATS
-
-        self._client = NATS()
-        self._url = url
-
-    async def start(self) -> None:
-        await self._client.connect(servers=[self._url])
-
-    async def stop(self) -> None:
-        await self._client.close()
-
-    async def publish(self, topic: str, payload: Dict[str, Any]) -> None:
-        await self._client.publish(topic, json.dumps(payload).encode("utf-8"))
-
-
-class TimescaleArchiver:
-    def __init__(self, dsn: str) -> None:
-        import asyncpg
-
-        self._dsn = dsn
-        self._pool: Optional[asyncpg.pool.Pool] = None
-
-    async def start(self) -> None:
-        import asyncpg
-
-        self._pool = await asyncpg.create_pool(self._dsn)
-
-    async def stop(self) -> None:
-        if self._pool:
-            await self._pool.close()
-            self._pool = None
-
-    async def archive_book(self, symbol: str, snapshot: Dict[str, Any]) -> None:
-        if not self._pool:
-            return
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO orderbook_snapshots(symbol, depth, as_of, bids, asks)
-                VALUES($1, $2, $3, $4, $5)
-                ON CONFLICT (symbol, depth, as_of) DO NOTHING
-                """,
-                symbol,
-                SNAPSHOT_DEPTH,
-                snapshot["as_of"],
-                json.dumps(snapshot["bids"]),
-                json.dumps(snapshot["asks"]),
+def flatten_updates(market: str, payload: Dict[str, Any]) -> List[OrderBookUpdate]:
+    # Kraken payloads contain snapshots ('as'/'bs') and updates ('a'/'b').
+    bids = payload.get('b') or payload.get('bs') or []
+    asks = payload.get('a') or payload.get('as') or []
+    timestamp = payload.get('timestamp')
+    if not timestamp and bids:
+        timestamp = bids[0][2] if len(bids[0]) > 2 else None
+    if not timestamp and asks:
+        timestamp = asks[0][2] if len(asks[0]) > 2 else None
+    if timestamp is None:
+        return []
+    event_time = datetime_from_kraken(timestamp)
+    sequence = int(payload.get('sequence', payload.get('checksum', 0)) or 0)
+    updates: List[OrderBookUpdate] = []
+    for side, levels in (('buy', bids), ('sell', asks)):
+        for level in levels:
+            price = float(level[0])
+            size = float(level[1]) if len(level) > 1 else 0.0
+            updates.append(
+                OrderBookUpdate(
+                    market=market,
+                    event_time=event_time,
+                    side=side,
+                    price=price,
+                    size=size,
+                    sequence=sequence,
+                    raw={'payload': payload, 'side': side, 'price': price, 'size': size, 'sequence': sequence},
+                )
             )
+    return updates
 
 
-class KrakenIngestor:
-    def __init__(
-        self,
-        symbols: Sequence[str],
-        publisher: BasePublisher,
-        archiver: Optional[TimescaleArchiver] = None,
-        snapshot_interval: int = 60,
-    ) -> None:
-        self.symbols = symbols
-        self.publisher = publisher
-        self.archiver = archiver
-        self.snapshot_interval = snapshot_interval
-        self._last_snapshot: Dict[str, dt.datetime] = {}
+def datetime_from_kraken(timestamp: Any) -> dt.datetime:
+    from datetime import datetime, timezone
 
-    async def run(self) -> None:
-        subscribe_msg = {
-            "event": "subscribe",
-            "pair": list(self.symbols),
-            "subscription": {"name": "book", "depth": SNAPSHOT_DEPTH},
-        }
-        subscribe_trades = {
-            "event": "subscribe",
-            "pair": list(self.symbols),
-            "subscription": {"name": "trade"},
-        }
-        async with websockets.connect(KRAKEN_WS_URL, ping_interval=20) as ws:
-            await ws.send(json.dumps(subscribe_msg))
-            await ws.send(json.dumps(subscribe_trades))
-            logger.info("Subscribed to Kraken order book and trade streams: %s", ", ".join(self.symbols))
-            async for raw in ws:
-                await self._handle_message(raw)
-
-    async def _handle_message(self, raw: str) -> None:
+    if isinstance(timestamp, (int, float)):
+        return datetime.fromtimestamp(float(timestamp), tz=timezone.utc)
+    if isinstance(timestamp, str):
         try:
-            message = json.loads(raw)
-        except json.JSONDecodeError:
-            logger.debug("Ignoring non-JSON message: %s", raw)
-            return
+            return datetime.fromtimestamp(float(timestamp), tz=timezone.utc)
+        except ValueError:
+            dt_obj = datetime.fromisoformat(timestamp)
+            if dt_obj.tzinfo is None:
+                dt_obj = dt_obj.replace(tzinfo=timezone.utc)
+            return dt_obj
+    dt_obj = datetime.fromisoformat(str(timestamp))
+    if dt_obj.tzinfo is None:
+        dt_obj = dt_obj.replace(tzinfo=timezone.utc)
+    return dt_obj
 
-        if isinstance(message, dict):
-            if message.get("event") == "heartbeat":
-                return
-            if message.get("event") == "systemStatus":
-                logger.info("Kraken WS status: %s", message)
-            elif message.get("event") == "subscriptionStatus":
-                logger.info("Subscription update: %s", message)
-            else:
-                logger.debug("Unhandled control message: %s", message)
-            return
 
-        if not isinstance(message, list) or len(message) < 4:
-            logger.debug("Unexpected payload: %s", message)
-            return
-
-        _, payload, channel_name, pair = message[0], message[1], message[2], message[3]
-        symbol = pair.replace("/", "")
-        if channel_name.startswith("trade"):
-            await self._handle_trades(symbol, payload)
-        elif channel_name.startswith("book"):
-            await self._handle_book(symbol, payload)
-        else:
-            logger.debug("Unknown channel %s", channel_name)
-
-    async def _handle_trades(self, symbol: str, trades: List[List[str]]) -> None:
-        for trade in trades:
-            price, volume, time, side, order_type, misc = trade
-            event = {
-                "symbol": symbol,
-                "price": float(price),
-                "volume": float(volume),
-                "ts": dt.datetime.fromtimestamp(float(time), tz=dt.timezone.utc).isoformat(),
-                "side": side,
-                "type": order_type,
-                "misc": misc,
+def persist_updates(engine: Engine, updates: Sequence[OrderBookUpdate]) -> None:
+    if not updates:
+        return
+    with engine.begin() as connection:
+        for update in updates:
+            record = {
+                "market": update.market,
+                "event_time": update.event_time,
+                "side": update.side,
+                "price": update.price,
+                "size": update.size,
+                "event_type": "book",
+                "sequence": update.sequence,
+                "raw": update.raw,
             }
-            await self.publisher.publish(TRADES_TOPIC, event)
+            stmt = pg_insert(order_book_table).values(**record)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[
+                    order_book_table.c.market,
+                    order_book_table.c.event_time,
+                    order_book_table.c.sequence,
+                ],
+                set_={"raw": stmt.excluded.raw, "size": stmt.excluded.size, "price": stmt.excluded.price},
+            )
+            connection.execute(stmt)
+    LOGGER.info("Persisted Kraken updates", extra={"count": len(updates)})
 
-    async def _handle_book(self, symbol: str, data: Dict[str, Any]) -> None:
-        book_event = {
-            "symbol": symbol,
-            "ts": dt.datetime.now(tz=dt.timezone.utc).isoformat(),
-            "payload": data,
-        }
-        await self.publisher.publish(BOOK_TOPIC, book_event)
 
-        now = dt.datetime.now(tz=dt.timezone.utc)
-        last_snapshot = self._last_snapshot.get(symbol)
-        if self.archiver and (last_snapshot is None or (now - last_snapshot).total_seconds() >= self.snapshot_interval):
-            bids = data.get("b", data.get("bs", []))
-            asks = data.get("a", data.get("as", []))
-            snapshot = {
-                "symbol": symbol,
-                "as_of": now,
-                "bids": bids,
-                "asks": asks,
+def publish_updates(producer: Producer | None, updates: Sequence[OrderBookUpdate]) -> None:
+    if producer is None:
+        return
+    for update in updates:
+        payload = json.dumps(
+            {
+                "market": update.market,
+                "event_time": update.event_time.isoformat(),
+                "raw": update.raw,
             }
-            await self.archiver.archive_book(symbol, snapshot)
-            self._last_snapshot[symbol] = now
+        ).encode("utf-8")
+        producer.produce(KAFKA_TOPIC, payload)
+    producer.flush()
 
 
-async def build_publisher(config: PublisherConfig) -> BasePublisher:
-    publishers: List[BasePublisher] = []
-    if config.kafka_bootstrap:
-        publishers.append(KafkaPublisher(config.kafka_bootstrap))
-    if config.nats_url:
-        publishers.append(NatsPublisher(config.nats_url))
-
-    if len(publishers) == 1:
-        publisher = publishers[0]
-    else:
-        publisher = MultiPublisher(publishers)
-    await publisher.start()
-    return publisher
-
-
-class MultiPublisher(BasePublisher):
-    def __init__(self, publishers: Iterable[BasePublisher]) -> None:
-        self.publishers = list(publishers)
-
-    async def start(self) -> None:
-        for publisher in self.publishers:
-            await publisher.start()
-
-    async def stop(self) -> None:
-        for publisher in self.publishers:
-            await publisher.stop()
-
-    async def publish(self, topic: str, payload: Dict[str, Any]) -> None:
-        await asyncio.gather(*(publisher.publish(topic, payload) for publisher in self.publishers))
-
-
-async def run_ingestor(args: argparse.Namespace) -> None:
-    publisher_config = PublisherConfig(args.kafka_bootstrap, args.nats_url)
-    publisher_config.validate()
-
-    publisher = await build_publisher(publisher_config)
-    archiver = TimescaleArchiver(args.database_url) if args.database_url else None
-    if archiver:
-        await archiver.start()
-
-    ingestor = KrakenIngestor(args.symbols, publisher, archiver, args.snapshot_interval)
-
+async def publish_to_nats(updates: Sequence[OrderBookUpdate]) -> None:
+    if NATS is None or not updates:
+        return
+    client = NATS()
+    await client.connect(servers=NATS_SERVERS)
     try:
-        await ingestor.run()
+        for update in updates:
+            payload = json.dumps(
+                {
+                    "market": update.market,
+                    "event_time": update.event_time.isoformat(),
+                    "raw": update.raw,
+                }
+            ).encode("utf-8")
+            await client.publish(NATS_SUBJECT, payload)
     finally:
-        await publisher.stop()
-        if archiver:
-            await archiver.stop()
+        await client.drain()
 
 
-def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Stream Kraken market data into Kafka/NATS and TimescaleDB")
-    parser.add_argument("symbols", nargs="+", help="Trading pairs in Kraken format (e.g. BTC/USD)")
-    parser.add_argument("--kafka-bootstrap", dest="kafka_bootstrap", help="Kafka bootstrap servers, comma separated")
-    parser.add_argument("--nats-url", dest="nats_url", help="NATS connection URL")
-    parser.add_argument("--database-url", help="TimescaleDB DSN for snapshot archiving")
-    parser.add_argument("--snapshot-interval", type=int, default=60, help="Seconds between archived snapshots per symbol")
-    parser.add_argument("--log-level", default="INFO", help="Python logging level")
-    return parser.parse_args(argv)
+async def consume(pairs: Sequence[str]) -> None:
+    engine = create_engine(DATABASE_URL, future=True)
+    producer = kafka_producer()
+    async with aiohttp.ClientSession() as session:
+        ws = await subscribe(session, pairs)
+        async for message in ws:
+            if message.type != aiohttp.WSMsgType.TEXT:
+                continue
+            data = json.loads(message.data)
+            if isinstance(data, dict) and data.get("event") == "subscriptionStatus":
+                LOGGER.info("Subscription update", extra=data)
+                continue
+            if not isinstance(data, list) or len(data) < 4:
+                continue
+            channel_data = data[1]
+            if not isinstance(channel_data, dict):
+                continue
+            market = data[3]
+            updates = flatten_updates(market, channel_data)
+            if not updates:
+                continue
+            persist_updates(engine, updates)
+            publish_updates(producer, updates)
+            await publish_to_nats(updates)
 
 
-def main(argv: Optional[Sequence[str]] = None) -> None:
-    args = parse_args(argv)
-    logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO))
-    asyncio.run(run_ingestor(args))
+def main() -> None:
+    pairs = os.getenv("KRAKEN_PAIRS", "BTC/USD,ETH/USD").split(",")
+    asyncio.run(consume(pairs))
 
 
 if __name__ == "__main__":
     main()
+

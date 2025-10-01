@@ -1,0 +1,47 @@
+name: ingestion_checkpoint
+config_version: 1.0
+class_name: SimpleCheckpoint
+run_name_template: "%Y%m%d-%H%M%S-ingestion"
+validations:
+  - batch_request:
+      datasource_name: timescale_default
+      data_connector_name: default_runtime_data_connector
+      data_asset_name: universe_whitelist
+      runtime_parameters:
+        query: "SELECT * FROM universe_whitelist WHERE as_of > NOW() - INTERVAL '2 days'"
+      batch_identifiers:
+        default_identifier_name: whitelist
+    expectation_suite_name: universe_whitelist_suite
+    action_list:
+      - name: store_validation_result
+        action:
+          class_name: StoreValidationResultAction
+      - name: store_evaluation_params
+        action:
+          class_name: StoreEvaluationParametersAction
+  - batch_request:
+      datasource_name: timescale_default
+      data_connector_name: default_runtime_data_connector
+      data_asset_name: ohlcv_bars
+      runtime_parameters:
+        query: "SELECT * FROM ohlcv_bars WHERE bucket_start > NOW() - INTERVAL '1 day'"
+      batch_identifiers:
+        default_identifier_name: ohlcv
+    expectation_suite_name: ohlcv_bars_suite
+    action_list:
+      - name: store_validation_result
+        action:
+          class_name: StoreValidationResultAction
+  - batch_request:
+      datasource_name: timescale_default
+      data_connector_name: default_runtime_data_connector
+      data_asset_name: order_book_events
+      runtime_parameters:
+        query: "SELECT * FROM order_book_events WHERE event_time > NOW() - INTERVAL '1 hour'"
+      batch_identifiers:
+        default_identifier_name: orderbook
+    expectation_suite_name: order_book_events_suite
+    action_list:
+      - name: store_validation_result
+        action:
+          class_name: StoreValidationResultAction

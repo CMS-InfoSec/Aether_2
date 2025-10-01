@@ -1,0 +1,134 @@
+apiVersion: argoproj.io/v1alpha1
+kind: CronWorkflow
+metadata:
+  name: coingecko-nightly
+spec:
+  schedule: "0 2 * * *"
+  timezone: UTC
+  concurrencyPolicy: Replace
+  startingDeadlineSeconds: 600
+  workflowSpec:
+    entrypoint: coingecko-pipeline
+    arguments:
+      parameters:
+        - name: database_url
+          value: postgresql+psycopg2://aether:aether@timescale:5432/aether
+        - name: redis_url
+          value: redis://redis:6379/0
+    templates:
+      - name: coingecko-pipeline
+        steps:
+          - - name: run-coingecko
+              template: python-task
+              arguments:
+                parameters:
+                  - name: command
+                    value: python data/ingest/coingecko_job.py
+          - - name: run-quality-checks
+              template: python-task
+              arguments:
+                parameters:
+                  - name: command
+                    value: >-
+                      python -m great_expectations checkpoint run ingestion_checkpoint --v3-api
+          - - name: run-feast-materialization
+              template: python-task
+              arguments:
+                parameters:
+                  - name: command
+                    value: python data/feast/materialize.py --mode refresh --repo data/feast --days 3
+      - name: python-task
+        inputs:
+          parameters:
+            - name: command
+        container:
+          image: python:3.11-slim
+          workingDir: /workspace
+          command: ["bash", "-lc"]
+          args:
+            - >-
+              pip install --no-cache-dir feast great_expectations sqlalchemy psycopg2-binary requests aiohttp nats-py &&
+              export DATABASE_URL={{workflow.parameters.database_url}} &&
+              export FEAST_REDIS_URL={{workflow.parameters.redis_url}} &&
+              eval "$(python - <<'PY'
+import os
+from urllib.parse import urlparse
+
+url = os.environ["DATABASE_URL"]
+parsed = urlparse(url)
+
+envs = {
+    "PGHOST": parsed.hostname or "",
+    "PGPORT": str(parsed.port or ""),
+    "PGDATABASE": parsed.path.lstrip("/") or "",
+    "PGUSER": parsed.username or "",
+    "PGPASSWORD": parsed.password or "",
+}
+
+for key, value in envs.items():
+    if value:
+        print(f"export {key}='{value}'")
+PY
+)" &&
+              export GE_DATA_CONTEXT_ROOT_DIR=data/great_expectations &&
+              {{inputs.parameters.command}}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: CronWorkflow
+metadata:
+  name: feast-incremental-hourly
+spec:
+  schedule: "0 * * * *"
+  timezone: UTC
+  concurrencyPolicy: Forbid
+  workflowSpec:
+    entrypoint: feast-incremental
+    arguments:
+      parameters:
+        - name: database_url
+          value: postgresql+psycopg2://aether:aether@timescale:5432/aether
+        - name: redis_url
+          value: redis://redis:6379/0
+    templates:
+      - name: feast-incremental
+        steps:
+          - - name: run-incremental
+              template: python-task
+              arguments:
+                parameters:
+                  - name: command
+                    value: python data/feast/materialize.py --mode incremental --repo data/feast
+      - name: python-task
+        inputs:
+          parameters:
+            - name: command
+        container:
+          image: python:3.11-slim
+          workingDir: /workspace
+          command: ["bash", "-lc"]
+          args:
+            - >-
+              pip install --no-cache-dir feast sqlalchemy psycopg2-binary redis &&
+              export DATABASE_URL={{workflow.parameters.database_url}} &&
+              export FEAST_REDIS_URL={{workflow.parameters.redis_url}} &&
+              eval "$(python - <<'PY'
+import os
+from urllib.parse import urlparse
+
+url = os.environ["DATABASE_URL"]
+parsed = urlparse(url)
+
+envs = {
+    "PGHOST": parsed.hostname or "",
+    "PGPORT": str(parsed.port or ""),
+    "PGDATABASE": parsed.path.lstrip("/") or "",
+    "PGUSER": parsed.username or "",
+    "PGPASSWORD": parsed.password or "",
+}
+
+for key, value in envs.items():
+    if value:
+        print(f"export {key}='{value}'")
+PY
+)" &&
+              {{inputs.parameters.command}}

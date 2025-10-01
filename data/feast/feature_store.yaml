@@ -1,20 +1,16 @@
 project: aether
 registry: data/feast/registry.db
 provider: local
-entity_key_serialization_version: 2
-offline_store:
-  type: feast.infra.offline_stores.contrib.postgres_offline_store.PostgreSQLOfflineStore
-  config:
-    host: localhost
-    port: 5432
-    database: aether
-    db_schema: public
-    user: feast
-    password: feast
+
 online_store:
   type: redis
-  connection_string: "redis://localhost:6379/0"
+  connection_string: ${FEAST_REDIS_URL:-redis://localhost:6379/0}
+offline_store:
+  type: postgres
+  host: ${PGHOST:-localhost}
+  port: ${PGPORT:-5432}
+  database: ${PGDATABASE:-aether}
+  user: ${PGUSER:-aether}
+  password: ${PGPASSWORD:-aether}
+default_entity_key_serialization_version: 2
 
-feature_server:
-  host: 0.0.0.0
-  port: 6566

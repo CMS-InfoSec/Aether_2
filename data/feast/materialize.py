@@ -1,38 +1,58 @@
-"""Utility script to trigger Feast materialization for nightly jobs."""
+
+"""Helpers for running Feast materialization jobs."""
 from __future__ import annotations
 
 import argparse
-import datetime as dt
-import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Sequence
 
-FEAST_BIN = "feast"
-
-
-def run_materialize(start: dt.datetime, end: dt.datetime, repo_path: Path) -> None:
-    cmd = [
-        FEAST_BIN,
-        "-c",
-        str(repo_path),
-        "materialize",
-        start.isoformat(),
-        end.isoformat(),
-    ]
-    subprocess.run(cmd, check=True)
+from feast import FeatureStore
 
 
-def main(argv: Sequence[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Materialize Feast offline data into Redis online store")
-    parser.add_argument("--repo", type=Path, default=Path(__file__).parent, help="Path to Feast repository")
+def get_store(repo_path: str | None) -> FeatureStore:
+    path = Path(repo_path or Path(__file__).parent)
+    return FeatureStore(repo_path=str(path))
+
+
+def materialize_daily(store: FeatureStore, days: int = 1) -> None:
+    end_date = datetime.now(tz=timezone.utc)
+    start_date = end_date - timedelta(days=days)
+    store.materialize(start_date=start_date, end_date=end_date)
+
+
+def materialize_incremental(store: FeatureStore) -> None:
+    end_date = datetime.now(tz=timezone.utc)
+    store.materialize_incremental(end_date=end_date)
+
+
+def refresh_online_store(store: FeatureStore, days: int = 1) -> None:
+    materialize_daily(store, days=days)
+    materialize_incremental(store)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Feast materialization helpers")
+    parser.add_argument("--repo", default=str(Path(__file__).parent), help="Path to the Feast repository")
+    parser.add_argument("--days", type=int, default=1, help="Number of days to backfill for full materialization")
     parser.add_argument(
-        "--days", type=int, default=1, help="Number of trailing days to materialize (default: 1)"
+        "--mode",
+        choices=["daily", "incremental", "refresh"],
+        default="refresh",
+        help="Materialization mode",
     )
-    args = parser.parse_args(argv)
+    return parser.parse_args()
 
-    end = dt.datetime.utcnow()
-    start = end - dt.timedelta(days=args.days)
-    run_materialize(start, end, args.repo)
+
+def main() -> None:
+    args = parse_args()
+    store = get_store(args.repo)
+    if args.mode == "daily":
+        materialize_daily(store, days=args.days)
+    elif args.mode == "incremental":
+        materialize_incremental(store)
+    else:
+        refresh_online_store(store, days=args.days)
+
 
 
 if __name__ == "__main__":
