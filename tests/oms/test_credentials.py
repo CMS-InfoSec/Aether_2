@@ -23,3 +23,10 @@ def test_secret_manager_get_credentials_loads_values() -> None:
     last_event = events[-1]
     assert last_event["event_type"] == "kraken.credentials.access"
     assert last_event["payload"]["secret_name"] == manager.secret_name
+
+    audit_events = timescale.credential_events()
+    assert audit_events
+    audit_event = audit_events[-1]
+    assert audit_event["event_type"] == "kraken.credentials.access"
+    assert audit_event["secret_name"] == manager.secret_name
+    assert audit_event["metadata"]["material_present"] is True
