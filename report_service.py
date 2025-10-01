@@ -123,7 +123,13 @@ def _normalize_timestamp(frame: pd.DataFrame, *, report_date: date) -> pd.Series
     )
     if time_col is None:
         return pd.Series([report_date] * len(frame))
-    return pd.to_datetime(frame[time_col]).dt.tz_localize(None).dt.date
+    series = pd.to_datetime(frame[time_col])
+    try:
+        series = series.dt.tz_localize(None)
+    except TypeError:
+        # Already timezone-naive; nothing to strip.
+        pass
+    return series.dt.date
 
 
 def _daily_fill_summary(
