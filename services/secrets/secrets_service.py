@@ -35,7 +35,11 @@ except ImportError:  # pragma: no cover - fallback for testing environments
             self.status = status
 
 from services.common.security import require_admin_account, require_mfa_context
-from services.secrets.middleware import ForwardedSchemeMiddleware, TRUSTED_HOSTS
+from services.secrets.middleware import (
+    ForwardedSchemeMiddleware,
+    TRUSTED_HOSTS,
+    TRUSTED_PROXY_CLIENTS,
+)
 from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
 
 
@@ -136,25 +140,24 @@ class KrakenSecretStatus(BaseModel):
 def ensure_secure_transport(request: Request) -> None:
     """Reject requests that are not routed through TLS."""
 
-    forwarded_headers = ("x-forwarded-proto", "x-forwarded-scheme")
-    scheme = None
+    scope = request.scope
+    scheme = str(scope.get("scheme", "")).lower()
+    forwarded_scheme = scope.get("aether_forwarded_scheme")
 
-    for header in forwarded_headers:
-        header_value = request.headers.get(header)
-        if header_value:
-            forwarded_scheme = header_value.split(",")[0].strip().lower()
-            if forwarded_scheme:
-                scheme = forwarded_scheme
-                break
+    if not forwarded_scheme and scheme == "https":
+        return
 
-    if scheme is None:
-        scheme = request.url.scheme.lower()
+    if (
+        forwarded_scheme == "https"
+        and request.client is not None
+        and request.client.host in TRUSTED_PROXY_CLIENTS
+    ):
+        return
 
-    if scheme != "https":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="TLS termination required (https only).",
-        )
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="TLS termination required (https only).",
+    )
 
 
 def _load_kubernetes_configuration() -> None:
