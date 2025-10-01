@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
 from services.common.adapters import KrakenSecretManager
+from services.oms.oms_kraken import KrakenCredentialWatcher
 
 
 class KrakenWebsocketError(RuntimeError):
@@ -53,19 +54,33 @@ class KrakenWSClient:
         *,
         session_factory: Optional[Callable[[Dict[str, str]], Any]] = None,
         credentials: Optional[Dict[str, Any]] = None,
+        credential_source: Optional[KrakenCredentialWatcher] = None,
         rest_fallback: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
         max_retries: int = 2,
         retry_delay: float = 0.1,
     ) -> None:
         if credentials is not None:
             resolved_credentials = credentials
+            self._credential_source = None
+            self._credential_version = -1
+            self._unsubscribe: Optional[Callable[[], None]] = None
         else:
             try:
-                resolved_credentials = KrakenSecretManager(account_id).get_credentials()
+                source = credential_source or KrakenCredentialWatcher.instance(account_id)
+                resolved_credentials, version = source.snapshot()
+                if not resolved_credentials:
+                    resolved_credentials = KrakenSecretManager(account_id).get_credentials()
+                    version = 0
+                self._credential_source = source
+                self._credential_version = version
+                self._unsubscribe = self._credential_source.subscribe(self._on_credential_update)
             except RuntimeError:
                 if session_factory is None:
                     raise
                 resolved_credentials = {"api_key": "", "api_secret": "", "metadata": {}}
+                self._credential_source = None
+                self._credential_version = -1
+                self._unsubscribe = None
 
         self._credentials = resolved_credentials
         self._session_factory = session_factory or (lambda creds: _LoopbackSession(creds))
@@ -73,14 +88,32 @@ class KrakenWSClient:
         self._max_retries = max_retries
         self._retry_delay = retry_delay
         self._session: Any | None = None
+        self._session_version: int = -1
+        self._session_stale = False
+
+    def _on_credential_update(self, payload: Dict[str, Any], version: int) -> None:
+        self._credentials = payload
+        self._credential_version = version
+        self._session_stale = True
 
     # session helpers -------------------------------------------------
     def _session_or_connect(self) -> Any:
-        if self._session is None:
+        if (
+            self._session is None
+            or self._session_stale
+            or (
+                self._credential_source is not None
+                and self._session_version != self._credential_version
+            )
+        ):
+            if self._session is not None:
+                self._close_session()
             self._session = self._session_factory(self._credentials)
+            self._session_version = self._credential_version
+            self._session_stale = False
         return self._session
 
-    def close(self) -> None:
+    def _close_session(self, *, dispose_subscription: bool = False) -> None:
         if self._session is not None:
             try:
                 close = getattr(self._session, "close", None)
@@ -88,6 +121,12 @@ class KrakenWSClient:
                     close()
             finally:
                 self._session = None
+        if dispose_subscription and self._unsubscribe is not None:
+            self._unsubscribe()
+            self._unsubscribe = None
+
+    def close(self) -> None:
+        self._close_session(dispose_subscription=True)
 
     # request helpers -------------------------------------------------
     def _send(self, channel: str, payload: Dict[str, Any], timeout: float | None = None) -> Dict[str, Any]:
