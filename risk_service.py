@@ -16,7 +16,9 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+
+from fastapi import Depends, FastAPI, HTTPException, Query
+
 from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, model_validator
 from sqlalchemy import Column, DateTime, Float, Integer, String, create_engine, select
 from sqlalchemy.engine import Engine
@@ -37,6 +39,8 @@ from services.common.compliance import (
 )
 from services.common.security import require_admin_account
 from battle_mode import BattleModeController, create_battle_mode_tables
+
+from cost_throttler import CostThrottler
 
 
 logger = logging.getLogger(__name__)
@@ -505,6 +509,7 @@ class BattleModeToggleRequest(BaseModel):
 
 app = FastAPI(title="Risk Validation Service", version="1.0.0")
 setup_metrics(app)
+COST_THROTTLER = CostThrottler()
 
 
 
@@ -617,38 +622,16 @@ async def get_risk_limits(
     return response.dict()
 
 
-@app.get("/risk/battle_mode/status")
-async def get_battle_mode_status(
-    account_id: Optional[str] = Query(
-        None,
-        description="Account identifier to inspect. Defaults to the authenticated admin account.",
-    ),
-    admin_account: str = Depends(require_admin_account),
-) -> Dict[str, Any]:
-    target = account_id or admin_account
-    status_payload = battle_mode_controller.status(target)
-    logger.info("Retrieved battle mode status for account %s", target)
-    return status_payload.to_dict()
 
+@app.get("/risk/throttle/status")
+async def get_throttle_status(
+    account_id: str = Depends(require_admin_account),
+) -> Dict[str, Optional[str]]:
+    """Expose the current cost based throttling status for ``account_id``."""
 
-@app.post("/risk/battle_mode/toggle")
-async def toggle_battle_mode(
-    request: BattleModeToggleRequest,
-    _: str = Depends(require_admin_account),
-) -> Dict[str, Any]:
-    try:
-        status_payload = battle_mode_controller.manual_toggle(
-            request.account_id,
-            engage=request.engage,
-            reason=request.reason,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    status = COST_THROTTLER.evaluate(account_id)
+    return {"active": status.active, "reason": status.reason}
 
-    logger.warning(
-        "Battle mode toggled for account %s -> engaged=%s", request.account_id, status_payload.engaged
-    )
-    return status_payload.to_dict()
 
 
 def _load_account_limits(account_id: str) -> AccountRiskLimit:
@@ -702,21 +685,24 @@ def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
             cooldown_until = cooldown_until or _determine_cooldown(limits)
         _audit_violation(context, message, details)
 
-    sanction_hits = _load_sanction_hits(intent.instrument_id)
-    if sanction_hits:
-        sources = sorted({record.source for record in sanction_hits})
-        statuses = sorted({record.status.lower() for record in sanction_hits})
+
+    throttle_status = COST_THROTTLER.evaluate(context.request.account_id)
+    if throttle_status.active:
+        details = {
+            "action": throttle_status.action,
+            "cost_ratio": throttle_status.cost_ratio,
+            "infra_cost": throttle_status.infra_cost,
+            "recent_pnl": throttle_status.recent_pnl,
+        }
         _register_violation(
-            "Instrument is present on compliance sanctions list",
+            throttle_status.reason
+            or "Account operations throttled due to infrastructure cost overruns",
             cooldown=True,
-            details={"sources": sources, "statuses": statuses},
+            details=details,
         )
-        return RiskValidationResponse(
-            pass_=False,
-            reasons=reasons,
-            adjusted_qty=0.0,
-            cooldown=cooldown_until,
-        )
+        if 0.0 not in suggested_quantities:
+            suggested_quantities.append(0.0)
+
 
     allocator_state = _query_allocator_state(context.request.account_id)
     if allocator_state:
