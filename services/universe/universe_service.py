@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 DATABASE_URL = os.getenv(
     "TIMESCALE_DATABASE_URI",
-    os.getenv("DATABASE_URL", "postgresql+psycopg://timescale:password@localhost:5432/aether"),
+    os.getenv("DATABASE_URL", "postgresql+psycopg2://timescale:password@localhost:5432/aether"),
 )
 
 
@@ -82,8 +82,21 @@ class AuditLog(Base):
     attributes = Column("metadata", JSONB, default=dict)
 
 
+def _normalize_database_url(url: str) -> str:
+    """Ensure PostgreSQL URLs use the psycopg2 dialect."""
+
+    if url.startswith("postgresql+psycopg://"):
+        return "postgresql+psycopg2://" + url[len("postgresql+psycopg://") :]
+    if url.startswith("postgresql://"):
+        return "postgresql+psycopg2://" + url[len("postgresql://") :]
+    if url.startswith("postgres://"):
+        return "postgresql+psycopg2://" + url[len("postgres://") :]
+    return url
+
+
 def _create_engine() -> Engine:
-    return create_engine(DATABASE_URL, future=True)
+    database_url = _normalize_database_url(DATABASE_URL)
+    return create_engine(database_url, future=True)
 
 
 ENGINE = _create_engine()
