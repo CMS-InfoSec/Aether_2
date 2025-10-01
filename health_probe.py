@@ -19,7 +19,7 @@ from prometheus_client import Gauge, start_http_server
 
 DEFAULT_ACCOUNT_ID = "ACC-DEFAULT"
 DEFAULT_SYMBOL = "AAPL"
-DEFAULT_INTERVAL = 60.0
+DEFAULT_INTERVAL = 300.0
 DEFAULT_ALERTMANAGER_URL = os.getenv("ALERTMANAGER_URL", "http://alertmanager:9093")
 ALERTMANAGER_ENDPOINT = "/api/v2/alerts"
 LATENCY_BUDGET_MS = 500.0
@@ -30,7 +30,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 
 PIPELINE_LATENCY_GAUGE = Gauge(
-    "health_pipeline_latency_ms",
+    "pipeline_latency_ms",
     "Latency in milliseconds for the dummy Intent->Policy->Risk->OMS pipeline.",
 )
 
