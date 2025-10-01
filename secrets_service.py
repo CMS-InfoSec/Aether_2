@@ -9,16 +9,24 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from kubernetes import client, config
 from kubernetes.client import ApiException
 from kubernetes.config.config_exception import ConfigException
 from pydantic import BaseModel, Field
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+try:  # pragma: no cover - optional audit dependency
+    from common.utils.audit_logger import hash_ip, log_audit
+except Exception:  # pragma: no cover - degrade gracefully
+    log_audit = None  # type: ignore[assignment]
+
+    def hash_ip(_: Optional[str]) -> Optional[str]:  # type: ignore[override]
+        return None
 
 
 LOGGER = logging.getLogger(__name__)
@@ -253,7 +261,9 @@ def get_secret_manager() -> KrakenSecretManager:
 
 @app.post("/secrets/kraken", status_code=status.HTTP_201_CREATED)
 async def store_kraken_secret(
-    payload: KrakenSecretRequest, manager: KrakenSecretManager = Depends(get_secret_manager)
+    payload: KrakenSecretRequest,
+    request: Request,
+    manager: KrakenSecretManager = Depends(get_secret_manager),
 ) -> JSONResponse:
     masked_key = redact_secret(payload.api_key)
     LOGGER.info(
@@ -261,6 +271,17 @@ async def store_kraken_secret(
         payload.account_id,
         masked_key,
     )
+
+    before_snapshot: Dict[str, Any] = {}
+    if log_audit is not None:
+        try:
+            before_snapshot = manager.get_status(payload.account_id)
+        except HTTPException as exc:
+            if exc.status_code != status.HTTP_404_NOT_FOUND:
+                raise
+        except ApiException as exc:
+            if exc.status != 404:
+                raise
 
     try:
         result = manager.upsert_secret(
@@ -275,6 +296,24 @@ async def store_kraken_secret(
         ) from exc
 
     log_rotation(payload.account_id, payload.actor, result["last_rotated"])
+
+    if log_audit is not None:
+        try:
+            audit_after = dict(result)
+            audit_after["actor"] = payload.actor
+            log_audit(
+                actor=payload.actor,
+                action="secret.kraken.rotate",
+                entity=payload.account_id,
+                before=before_snapshot,
+                after=audit_after,
+                ip_hash=hash_ip(request.client.host if request.client else None),
+            )
+        except Exception:  # pragma: no cover - defensive best effort
+            LOGGER.exception(
+                "Failed to record audit log for Kraken secret rotation for %s",
+                payload.account_id,
+            )
 
     return JSONResponse(status_code=status.HTTP_201_CREATED, content=result)
 

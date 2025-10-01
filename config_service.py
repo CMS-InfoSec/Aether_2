@@ -2,17 +2,26 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Generator, Iterable, List, Optional, Set, Tuple
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import JSON, Column, DateTime, Integer, String, UniqueConstraint, create_engine, func, select
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
+
+try:  # pragma: no cover - optional audit dependency
+    from common.utils.audit_logger import hash_ip, log_audit
+except Exception:  # pragma: no cover - degrade gracefully
+    log_audit = None  # type: ignore[assignment]
+
+    def hash_ip(_: Optional[str]) -> Optional[str]:  # type: ignore[override]
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +48,9 @@ engine = _create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
 
 Base = declarative_base()
+
+
+LOGGER = logging.getLogger("config_service")
 
 
 class ConfigVersion(Base):
@@ -126,6 +138,21 @@ def _next_version(session: Session, *, account_id: str, key: str) -> int:
     return (max_version or 0) + 1
 
 
+def _latest_config_record(
+    session: Session,
+    *,
+    account_id: str,
+    key: str,
+) -> Optional[ConfigVersion]:
+    stmt = (
+        select(ConfigVersion)
+        .where(ConfigVersion.account_id == account_id, ConfigVersion.key == key)
+        .order_by(ConfigVersion.version.desc())
+        .limit(1)
+    )
+    return session.execute(stmt).scalars().first()
+
+
 def _serialize_config(record: ConfigVersion) -> "ConfigEntry":
     return ConfigEntry(
         id=record.id,
@@ -136,6 +163,20 @@ def _serialize_config(record: ConfigVersion) -> "ConfigEntry":
         approvers=list(record.approvers or []),
         ts=record.ts,
     )
+
+
+def _audit_snapshot(record: Optional[ConfigVersion]) -> Dict[str, Any]:
+    if record is None:
+        return {}
+
+    return {
+        "account_id": record.account_id,
+        "key": record.key,
+        "value": record.value_json,
+        "version": record.version,
+        "approvers": list(record.approvers or []),
+        "ts": record.ts.isoformat(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +267,7 @@ def get_current_config(
 @app.post("/config/update", response_model=ConfigUpdateResponse)
 def update_config(
     payload: ConfigUpdateRequest,
+    request: Request,
     account_id: str = Query("global", description="Account identifier"),
     session: Session = Depends(get_session),
 ):
@@ -233,13 +275,19 @@ def update_config(
     pending_identifier = _pending_key(account_id, key)
     required_approvals = 2 if key in GUARDED_KEYS else 1
 
+    before_record = _latest_config_record(session, account_id=account_id, key=key)
+    before_snapshot = _audit_snapshot(before_record)
+    entity = f"{account_id}:{key}"
+    ip_hash = hash_ip(request.client.host if request.client else None)
+
     if key in GUARDED_KEYS:
         pending = _pending_guarded.get(pending_identifier)
         if pending is None:
+            created_at = datetime.now(timezone.utc)
             _pending_guarded[pending_identifier] = PendingGuardedChange(
                 value=payload.value,
                 author=payload.author,
-                created_at=datetime.now(timezone.utc),
+                created_at=created_at,
             )
             response = ConfigUpdateResponse(
                 status="pending",
@@ -251,6 +299,30 @@ def update_config(
                 ts=None,
                 required_approvals=required_approvals,
             )
+
+            if log_audit is not None:
+                try:
+                    after_snapshot = {
+                        "account_id": account_id,
+                        "key": key,
+                        "value": payload.value,
+                        "status": "pending",
+                        "requested_by": payload.author,
+                        "requested_at": created_at.isoformat(),
+                        "required_approvals": required_approvals,
+                    }
+                    log_audit(
+                        actor=payload.author,
+                        action="config.change.requested",
+                        entity=entity,
+                        before=before_snapshot,
+                        after=after_snapshot,
+                        ip_hash=ip_hash,
+                    )
+                except Exception:  # pragma: no cover - defensive best effort
+                    LOGGER.exception(
+                        "Failed to record audit log for pending config change %s", entity
+                    )
             return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=response.model_dump())
 
         if pending.author == payload.author:
@@ -266,7 +338,7 @@ def update_config(
             approvers=[pending.author, payload.author],
         )
         _pending_guarded.pop(pending_identifier, None)
-        return ConfigUpdateResponse(
+        response = ConfigUpdateResponse(
             status="applied",
             account_id=record.account_id,
             key=record.key,
@@ -277,6 +349,21 @@ def update_config(
             required_approvals=required_approvals,
         )
 
+        if log_audit is not None:
+            try:
+                log_audit(
+                    actor=payload.author,
+                    action="config.change.approved",
+                    entity=entity,
+                    before=before_snapshot,
+                    after=_audit_snapshot(record),
+                    ip_hash=ip_hash,
+                )
+            except Exception:  # pragma: no cover - defensive best effort
+                LOGGER.exception("Failed to record audit log for config approval %s", entity)
+
+        return response
+
     record = _commit_version(
         session,
         account_id=account_id,
@@ -284,7 +371,7 @@ def update_config(
         value=payload.value,
         approvers=[payload.author],
     )
-    return ConfigUpdateResponse(
+    response = ConfigUpdateResponse(
         status="applied",
         account_id=record.account_id,
         key=record.key,
@@ -294,6 +381,21 @@ def update_config(
         ts=record.ts,
         required_approvals=required_approvals,
     )
+
+    if log_audit is not None:
+        try:
+            log_audit(
+                actor=payload.author,
+                action="config.change.applied",
+                entity=entity,
+                before=before_snapshot,
+                after=_audit_snapshot(record),
+                ip_hash=ip_hash,
+            )
+        except Exception:  # pragma: no cover - defensive best effort
+            LOGGER.exception("Failed to record audit log for config change %s", entity)
+
+    return response
 
 
 @app.get("/config/history", response_model=List[ConfigEntry])

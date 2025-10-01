@@ -8,16 +8,19 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Iterable, List, Optional
 
-from fastapi import Depends, FastAPI, Header, Query, status
+from fastapi import Depends, FastAPI, Header, Query, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 try:  # pragma: no cover - import guarded for optional dependency
-    from audit_logger import log_audit
+    from common.utils.audit_logger import hash_ip, log_audit
 except Exception:  # pragma: no cover - degrade gracefully if audit logger unavailable
     log_audit = None  # type: ignore[assignment]
+
+    def hash_ip(_: Optional[str]) -> Optional[str]:  # type: ignore[override]
+        return None
 
 
 LOGGER = logging.getLogger("override_service")
@@ -138,6 +141,7 @@ def latest_override(intent_id: str) -> Optional[OverrideRecord]:
 @app.post("/override/trade", response_model=OverrideRecord, status_code=status.HTTP_201_CREATED)
 def record_override(
     payload: OverrideRequest,
+    request: Request,
     session: Session = Depends(get_session),
     actor: str = Depends(get_actor),
     account_id: Optional[str] = Header(None, alias="X-Account-ID"),
@@ -156,6 +160,7 @@ def record_override(
 
     if log_audit is not None:
         try:
+            ip_hash = hash_ip(request.client.host if request.client else None)
             log_audit(
                 actor=actor,
                 action="override.human_decision",
@@ -167,7 +172,7 @@ def record_override(
                     "account_id": normalized_account,
                     "source": "human decision",
                 },
-                ip=None,
+                ip_hash=ip_hash,
             )
         except Exception:  # pragma: no cover - audit logging best effort
             LOGGER.exception("Failed to record audit log for override %s", payload.intent_id)
