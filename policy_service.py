@@ -6,9 +6,10 @@ from __future__ import annotations
 import math
 
 import os
-from collections import defaultdict, deque
-from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+
+import math
+from collections import defaultdict
+
 from decimal import ROUND_HALF_UP, Decimal
 from threading import Lock
 from typing import Dict, List, MutableMapping, Sequence
@@ -26,7 +27,7 @@ from services.common.schemas import (
     PolicyDecisionResponse,
     PolicyState,
 )
-from services.models.model_server import predict_intent
+from services.models.model_server import Intent, predict_intent
 
 
 from metrics import record_abstention_rate, record_drift_score, setup_metrics
@@ -45,6 +46,15 @@ ENABLE_SHADOW_EXECUTION = os.getenv("ENABLE_SHADOW_EXECUTION", "true").lower() i
     "yes",
 }
 SHADOW_CLIENT_SUFFIX = os.getenv("SHADOW_CLIENT_SUFFIX", "-shadow")
+
+MODEL_VARIANTS: List[str] = ["trend_model", "meanrev_model", "vol_breakout"]
+DEFAULT_MODEL_SHARPES: Dict[str, float] = {
+    "trend_model": 1.0,
+    "meanrev_model": 0.9,
+    "vol_breakout": 1.1,
+}
+
+_ATR_CACHE: Dict[str, float] = {}
 
 KRAKEN_PRECISION: Dict[str, Dict[str, float]] = {
     "BTC-USD": {"tick": 0.1, "lot": 0.0001},
@@ -222,10 +232,167 @@ def _snap(value: float, step: float) -> float:
 
 
 
-def _scale_features(values: Sequence[float], multiplier: float) -> List[float]:
-    if not values:
-        return []
-    return [float(value) * multiplier for value in values]
+
+def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
+    return max(lower, min(upper, value))
+
+
+def _model_sharpe_weights() -> Dict[str, float]:
+    weights: Dict[str, float] = {}
+    for variant in MODEL_VARIANTS:
+        env_key = f"POLICY_{variant.upper()}_SHARPE"
+        default = DEFAULT_MODEL_SHARPES.get(variant, 1.0)
+        raw_value = os.getenv(env_key)
+        try:
+            weight = float(raw_value) if raw_value is not None else default
+        except (TypeError, ValueError):
+            weight = default
+        weights[variant] = max(weight, 0.0)
+    return weights
+
+
+def _normalize_weights(weights: Dict[str, float]) -> Dict[str, float]:
+    filtered = {key: max(value, 0.0) for key, value in weights.items()}
+    total = sum(filtered.values())
+    if total <= 0:
+        if not MODEL_VARIANTS:
+            return {}
+        uniform = 1.0 / float(len(MODEL_VARIANTS))
+        return {variant: uniform for variant in MODEL_VARIANTS}
+    return {key: (value / total if total > 0 else 0.0) for key, value in filtered.items()}
+
+
+def _blend_confidence(intents: Dict[str, "Intent"], weights: Dict[str, float]) -> ConfidenceMetrics:
+    model_conf = 0.0
+    state_conf = 0.0
+    exec_conf = 0.0
+    overall = 0.0
+
+    for key, intent in intents.items():
+        weight = weights.get(key, 0.0)
+        if weight <= 0:
+            continue
+        confidence = intent.confidence
+        model_conf += confidence.model_confidence * weight
+        state_conf += confidence.state_confidence * weight
+        exec_conf += confidence.execution_confidence * weight
+        overall += (confidence.overall_confidence or 0.0) * weight
+
+    blended = ConfidenceMetrics(
+        model_confidence=round(_clamp(model_conf), 4),
+        state_confidence=round(_clamp(state_conf), 4),
+        execution_confidence=round(_clamp(exec_conf), 4),
+        overall_confidence=round(_clamp(overall), 4),
+    )
+    return blended
+
+
+def _blend_template_confidences(intents: Dict[str, "Intent"], weights: Dict[str, float]) -> Dict[str, float]:
+    confidence_totals: Dict[str, float] = defaultdict(float)
+    weight_totals: Dict[str, float] = defaultdict(float)
+
+    for key, intent in intents.items():
+        weight = weights.get(key, 0.0)
+        if weight <= 0:
+            continue
+        for template in intent.action_templates or []:
+            template_key = template.name.lower()
+            confidence_totals[template_key] += template.confidence * weight
+            weight_totals[template_key] += weight
+
+    blended: Dict[str, float] = {}
+    for template_key, total_conf in confidence_totals.items():
+        weight = weight_totals.get(template_key, 0.0)
+        if weight <= 0:
+            blended[template_key] = 0.0
+        else:
+            blended[template_key] = round(_clamp(total_conf / weight), 4)
+    return blended
+
+
+def _vote_entropy(votes: Dict[str, float]) -> float:
+    total = sum(value for value in votes.values() if value > 0)
+    if total <= 0:
+        return 0.0
+    entropy = 0.0
+    for value in votes.values():
+        if value <= 0:
+            continue
+        probability = value / total
+        entropy -= probability * math.log(probability)
+    return entropy
+
+
+def _resolve_atr(symbol: str, snapshot: BookSnapshot, state: PolicyState | None) -> float:
+    symbol_key = symbol.upper()
+
+    atr_candidates: List[float] = []
+    if state is not None:
+        try:
+            atr_candidates.append(float(getattr(state, "volatility", 0.0)) * 100.0)
+        except (TypeError, ValueError):
+            pass
+
+    try:
+        atr_candidates.append(float(snapshot.spread_bps) * 1.5)
+    except (TypeError, ValueError):
+        pass
+
+    atr = next((value for value in atr_candidates if value and math.isfinite(value) and value > 0), None)
+    if atr is None:
+        atr = _ATR_CACHE.get(symbol_key, 10.0)
+    else:
+        previous = _ATR_CACHE.get(symbol_key)
+        if previous is not None:
+            atr = 0.5 * previous + 0.5 * atr
+        _ATR_CACHE[symbol_key] = atr
+
+    atr = max(_ATR_CACHE.get(symbol_key, atr), 1.0)
+    _ATR_CACHE[symbol_key] = atr
+    return atr
+
+
+def _resolve_risk_band(
+    request_value: float | None,
+    intents: Dict[str, "Intent"],
+    weights: Dict[str, float],
+    attribute: str,
+) -> float | None:
+    """Resolve a blended risk band while honouring overrides."""
+
+    def _coerce(value: object | None) -> float | None:
+        try:
+            numeric = float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(numeric) or numeric <= 0:
+            return None
+        return numeric
+
+    candidate = _coerce(request_value)
+    if candidate is not None:
+        return candidate
+
+    weighted_total = 0.0
+    total_weight = 0.0
+    fallback: float | None = None
+
+    for variant, intent in intents.items():
+        value = _coerce(getattr(intent, attribute, None))
+        if value is None:
+            continue
+        if fallback is None:
+            fallback = value
+        weight = weights.get(variant, 0.0)
+        if weight <= 0:
+            continue
+        weighted_total += value * weight
+        total_weight += weight
+
+    if total_weight > 0:
+        return weighted_total / total_weight
+
+    return fallback
 
 
 
@@ -304,6 +471,7 @@ async def get_regime(symbol: str) -> Dict[str, float | int | str]:
     response_model=PolicyDecisionResponse,
     status_code=status.HTTP_200_OK,
 )
+
 async def decide_policy(request: PolicyDecisionRequest) -> PolicyDecisionResponse:
     precision = _resolve_precision(request.instrument)
     snapped_price = _snap(request.price, precision["tick"])
@@ -315,42 +483,30 @@ async def decide_policy(request: PolicyDecisionRequest) -> PolicyDecisionRespons
             detail="Snapped price or quantity is non-positive",
         )
 
-
     if request.book_snapshot is None:
-
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Book snapshot is required for policy evaluation",
         )
 
-
     book_snapshot = request.book_snapshot
-    regime_snapshot = regime_classifier.observe(
-        request.instrument,
-        book_snapshot.mid_price,
-    )
-    features: List[float] = _scale_features(request.features, regime_snapshot.feature_scale)
 
-    if request.state is not None:
-        state_model = request.state.model_copy(deep=True)
-    else:
-        state_model = _default_state()
-    state_model.regime = regime_snapshot.regime
-    state_model.volatility = round(regime_snapshot.volatility, 6)
-    base_conviction = float(getattr(state_model, "conviction", 0.0))
-    regime_conviction = min(max(regime_snapshot.size_scale, 0.0), 1.0)
-    state_model.conviction = round(
-        min(1.0, max(0.0, (base_conviction + regime_conviction) / 2.0)),
-        4,
-    )
+    state_model = request.state or _default_state()
+    features: List[float] = [float(value) for value in request.features]
 
 
-    intent = predict_intent(
-        account_id=request.account_id,
-        symbol=request.instrument,
-        features=features,
-        book_snapshot=book_snapshot,
-    )
+    raw_weights = _model_sharpe_weights()
+    weights = _normalize_weights(raw_weights)
+
+    intents: Dict[str, Intent] = {}
+    for variant in MODEL_VARIANTS:
+        intents[variant] = predict_intent(
+            account_id=request.account_id,
+            symbol=request.instrument,
+            features=features,
+            book_snapshot=book_snapshot,
+            model_variant=variant,
+        )
 
     notional = float(Decimal(str(snapped_price)) * Decimal(str(snapped_qty)))
     maker_fee_bps = await _fetch_effective_fee(request.account_id, request.instrument, "maker", notional)
@@ -364,8 +520,8 @@ async def decide_policy(request: PolicyDecisionRequest) -> PolicyDecisionRespons
         taker_detail=request.fee.taker_detail,
     )
 
+    confidence = _blend_confidence(intents, weights)
     caller_confidence = request.confidence
-    confidence = intent.confidence
     if caller_confidence is not None:
         confidence = ConfidenceMetrics(
             model_confidence=max(confidence.model_confidence, caller_confidence.model_confidence),
@@ -379,13 +535,18 @@ async def decide_policy(request: PolicyDecisionRequest) -> PolicyDecisionRespons
             ),
         )
 
-    expected_edge = float(intent.edge_bps or 0.0)
+    expected_edge = 0.0
+    for variant, intent in intents.items():
+        expected_edge += weights.get(variant, 0.0) * float(intent.edge_bps or 0.0)
+
     maker_edge = round(expected_edge - effective_fee.maker, 4)
     taker_edge = round(expected_edge - effective_fee.taker, 4)
 
-    template_lookup = {template.name.lower(): template for template in intent.action_templates or []}
-    maker_template = template_lookup.get("maker")
-    taker_template = template_lookup.get("taker")
+    template_confidences = _blend_template_confidences(intents, weights)
+    maker_confidence = _clamp(template_confidences.get("maker", confidence.execution_confidence))
+    taker_confidence = _clamp(
+        template_confidences.get("taker", confidence.execution_confidence * 0.95)
+    )
 
     action_templates = [
         ActionTemplate(
@@ -393,29 +554,39 @@ async def decide_policy(request: PolicyDecisionRequest) -> PolicyDecisionRespons
             venue_type="maker",
             edge_bps=maker_edge,
             fee_bps=round(effective_fee.maker, 4),
-            confidence=round(
-                maker_template.confidence if maker_template else confidence.execution_confidence, 4
-            ),
+            confidence=round(maker_confidence, 4),
         ),
         ActionTemplate(
             name="taker",
             venue_type="taker",
             edge_bps=taker_edge,
             fee_bps=round(effective_fee.taker, 4),
-            confidence=round(
-                taker_template.confidence
-                if taker_template
-                else confidence.execution_confidence * 0.95,
-                4,
-            ),
+            confidence=round(taker_confidence, 4),
         ),
     ]
+
+    vote_totals: Dict[str, float] = defaultdict(float)
+    for variant, intent in intents.items():
+        action = (intent.selected_action or "abstain").lower()
+        if action not in {"maker", "taker"}:
+            action = "abstain"
+        vote_totals[action] += weights.get(variant, 0.0)
+    for label in ("maker", "taker", "abstain"):
+        vote_totals.setdefault(label, 0.0)
+
+    action_priority = {"maker": 2, "taker": 1, "abstain": 0}
+    winning_action = max(
+        vote_totals.items(),
+        key=lambda item: (item[1], action_priority.get(item[0], -1)),
+    )[0]
+
+    entropy = _vote_entropy(vote_totals)
 
     selected_template = next(
         (
             template
             for template in action_templates
-            if template.name.lower() == (intent.selected_action or "").lower()
+            if template.name.lower() == winning_action
         ),
         None,
     )
@@ -423,30 +594,48 @@ async def decide_policy(request: PolicyDecisionRequest) -> PolicyDecisionRespons
         selected_template = max(action_templates, key=lambda template: template.edge_bps)
 
     fee_adjusted_edge = selected_template.edge_bps if selected_template else 0.0
-
-    approved = (
-        intent.approved
-        and fee_adjusted_edge > 0
-        and (confidence.overall_confidence or 0.0) >= CONFIDENCE_THRESHOLD
+    approval_score = sum(
+        weights.get(variant, 0.0) for variant, intent in intents.items() if intent.approved
     )
 
-    reason = intent.reason
-    selected_action = intent.selected_action or "abstain"
+    atr = _resolve_atr(request.instrument, book_snapshot, state_model)
+    take_profit_override = _resolve_risk_band(
+        request.take_profit_bps, intents, weights, "take_profit_bps"
+    )
+    stop_loss_override = _resolve_risk_band(
+        request.stop_loss_bps, intents, weights, "stop_loss_bps"
+    )
+    take_profit = take_profit_override if take_profit_override is not None else 3.0 * atr
+    stop_loss = stop_loss_override if stop_loss_override is not None else 2.0 * atr
+
+    approved = (
+        winning_action in {"maker", "taker"}
+        and approval_score >= 0.5
+        and fee_adjusted_edge > 0
+        and (confidence.overall_confidence or 0.0) >= CONFIDENCE_THRESHOLD
+        and entropy <= 0.3
+    )
+
+    reason: str | None = None
+    selected_action = winning_action if winning_action in {"maker", "taker"} else "abstain"
     if not approved:
-        overall_conf = confidence.overall_confidence or 0.0
-        if overall_conf < CONFIDENCE_THRESHOLD:
+
+        if entropy > 0.3:
+            reason = "High ensemble entropy"
+        elif winning_action not in {"maker", "taker"}:
+            reason = "Ensemble voted to abstain"
+        elif approval_score < 0.5:
+            reason = "Insufficient ensemble approval"
+        elif (confidence.overall_confidence or 0.0) < CONFIDENCE_THRESHOLD:
             reason = "Confidence below threshold"
-        elif fee_adjusted_edge <= 0:
+        else:
             reason = "Fee-adjusted edge non-positive"
-        elif reason is None:
-            reason = "Intent rejected by policy"
+
         selected_action = "abstain"
         fee_adjusted_edge = min(fee_adjusted_edge, 0.0)
     else:
         selected_action = selected_template.name if selected_template else selected_action
 
-    take_profit = request.take_profit_bps or intent.take_profit_bps or 0.0
-    stop_loss = request.stop_loss_bps or intent.stop_loss_bps or 0.0
 
     drift_value = getattr(state_model, "conviction", 0.0)
     try:

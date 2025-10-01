@@ -86,6 +86,7 @@ def test_decide_policy_accepts_dataclass_intent(monkeypatch: pytest.MonkeyPatch,
 
     monkeypatch.setattr(policy_service, "_fetch_effective_fee", _fake_fee)
     monkeypatch.setattr(policy_service, "predict_intent", lambda **_: intent)
+    policy_service._ATR_CACHE.clear()
 
     payload = {
         "account_id": str(uuid4()),
@@ -113,20 +114,13 @@ def test_decide_policy_accepts_dataclass_intent(monkeypatch: pytest.MonkeyPatch,
     response = client.post("/policy/decide", json=payload)
     assert response.status_code == 200
 
-    assert response.json() == {
-        "action": expected_intent.action,
-        "side": expected_intent.side,
-        "qty": expected_intent.qty,
-        "preference": expected_intent.preference,
-        "type": expected_intent.type,
-        "limit_px": expected_intent.limit_px,
-        "tif": expected_intent.tif,
-        "tp": expected_intent.tp,
-        "sl": expected_intent.sl,
-        "expected_edge_bps": expected_intent.expected_edge_bps,
-        "expected_cost_bps": expected_intent.expected_cost_bps,
-        "confidence": expected_intent.confidence,
-    }
+    body = PolicyDecisionResponse.model_validate(response.json())
+    assert body.approved is True
+    assert body.selected_action == "maker"
+    assert body.expected_edge_bps == pytest.approx(20.0)
+    assert body.fee_adjusted_edge_bps == pytest.approx(16.0)
+    assert body.take_profit_bps == pytest.approx(30.0)
+    assert body.stop_loss_bps == pytest.approx(10.0)
 
 
 def test_metrics_endpoint_exposed_after_import():

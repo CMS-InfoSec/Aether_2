@@ -79,7 +79,7 @@ def _validate_response(payload: dict) -> PolicyDecisionResponse:
     return PolicyDecisionResponse.model_validate(payload)
 
 def test_policy_decide_approves_when_edge_beats_costs(
-    monkeypatch: pytest.MonkeyPatch, client: TestClient, account_id: str
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
     recorded: List[dict[str, object]] = []
     dispatched: List[dict[str, object]] = []
@@ -168,6 +168,40 @@ def test_policy_decide_approves_when_edge_beats_costs(
     ]
     assert dispatched == [{"order_id": "abc-123", "approved": True}]
 
+
+def test_policy_decide_honours_request_risk_overrides(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    async def _fake_fee(account_id: str, symbol: str, liquidity: str, notional: float) -> float:
+        return 4.5
+
+    monkeypatch.setattr(policy_service, "_fetch_effective_fee", _fake_fee)
+    monkeypatch.setattr(
+        policy_service,
+        "predict_intent",
+        lambda **_: _intent(edge_bps=24.0, approved=True, selected="maker"),
+    )
+
+    payload = {
+        "account_id": "company",
+        "order_id": "abc-456",
+        "instrument": "BTC-USD",
+        "side": "SELL",
+        "quantity": 0.5,
+        "price": 20000.0,
+        "fee": {"currency": "USD", "maker": 4.0, "taker": 6.0},
+        "features": [0.2, 0.0, 1.5],
+        "book_snapshot": {"mid_price": 20010.0, "spread_bps": 3.0, "imbalance": -0.02},
+        "take_profit_bps": 18.0,
+        "stop_loss_bps": 9.0,
+    }
+
+    response = client.post("/policy/decide", json=payload)
+    assert response.status_code == 200
+
+    body = _validate_response(response.json())
+    assert body.take_profit_bps == pytest.approx(18.0)
+    assert body.stop_loss_bps == pytest.approx(9.0)
 
 
 def test_policy_decide_rejects_unknown_account(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
