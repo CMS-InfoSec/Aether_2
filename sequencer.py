@@ -1,0 +1,607 @@
+"""Sequencer service orchestrating policy, risk, and OMS pipelines."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+from collections import deque
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import logging
+import os
+import time
+import uuid
+from typing import Any, Awaitable, Callable, Deque, Dict, List, Mapping, MutableMapping, Optional, Tuple
+
+from fastapi import FastAPI, HTTPException, status
+from fastapi.encoders import jsonable_encoder
+from pydantic import BaseModel, Field
+
+from services.common.adapters import KafkaNATSAdapter
+
+
+LOGGER = logging.getLogger("sequencer")
+
+
+DEFAULT_POLICY_TIMEOUT = float(os.getenv("SEQUENCER_POLICY_TIMEOUT", "2.0"))
+DEFAULT_RISK_TIMEOUT = float(os.getenv("SEQUENCER_RISK_TIMEOUT", "2.0"))
+DEFAULT_OMS_TIMEOUT = float(os.getenv("SEQUENCER_OMS_TIMEOUT", "2.5"))
+DEFAULT_PUBLISH_TIMEOUT = float(os.getenv("SEQUENCER_PUBLISH_TIMEOUT", "1.0"))
+
+RECENT_RUN_CAPACITY = int(os.getenv("SEQUENCER_HISTORY_SIZE", "200"))
+TOPIC_PREFIX = os.getenv("SEQUENCER_TOPIC_PREFIX", "sequencer")
+
+
+class SequencerIntentRequest(BaseModel):
+    """Incoming request describing an intent payload to be sequenced."""
+
+    intent: Dict[str, Any] = Field(..., description="Raw intent payload to process")
+
+
+class SequencerResponse(BaseModel):
+    """Response returned to the caller after the pipeline completes."""
+
+    run_id: str = Field(..., description="Unique identifier for the sequencer run")
+    status: str = Field(..., description="Final status of the sequencer pipeline")
+    latency_ms: float = Field(..., ge=0.0, description="Total pipeline latency in milliseconds")
+    stage_latencies_ms: Dict[str, float] = Field(
+        default_factory=dict, description="Latency per pipeline stage in milliseconds"
+    )
+    stage_artifacts: Dict[str, Any] = Field(
+        default_factory=dict, description="Artifacts emitted by each pipeline stage"
+    )
+    fill_event: Dict[str, Any] = Field(
+        default_factory=dict, description="Fill event emitted to downstream consumers"
+    )
+
+
+class SequencerStatusResponse(BaseModel):
+    """Represents a snapshot of recent pipeline runs and aggregate statistics."""
+
+    runs: List[Dict[str, Any]]
+    stats: Dict[str, Any]
+
+
+class StageError(Exception):
+    """Base class for stage execution errors."""
+
+    def __init__(self, stage: str, message: str) -> None:
+        super().__init__(message)
+        self.stage = stage
+        self.message = message
+
+
+class StageTimeoutError(StageError):
+    """Raised when a stage exceeds its allotted timeout."""
+
+
+class StageFailedError(StageError):
+    """Raised when a stage fails for reasons other than timeout."""
+
+
+@dataclass
+class StageResult:
+    """Represents the outcome of a pipeline stage."""
+
+    payload: Dict[str, Any]
+    artifact: Dict[str, Any]
+
+
+@dataclass
+class PipelineContext:
+    """Context shared across pipeline stages for a specific run."""
+
+    run_id: str
+    account_id: str
+    intent_id: str
+    publisher: "AuditPublisher"
+
+
+@dataclass
+class Stage:
+    """Encapsulates a single stage in the sequencer pipeline."""
+
+    name: str
+    handler: Callable[[Dict[str, Any], PipelineContext], Awaitable[StageResult]]
+    rollback: Optional[Callable[[StageResult, PipelineContext], Awaitable[None]]] = None
+    timeout: float = 1.0
+
+    async def execute(self, payload: Dict[str, Any], ctx: PipelineContext) -> StageResult:
+        """Execute the stage handler with timeout protection."""
+
+        task = asyncio.create_task(self.handler(payload, ctx))
+        try:
+            result = await asyncio.wait_for(task, timeout=self.timeout)
+        except asyncio.TimeoutError as exc:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            raise StageTimeoutError(self.name, f"Stage '{self.name}' timed out after {self.timeout:.2f}s") from exc
+        except Exception as exc:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            raise StageFailedError(self.name, f"Stage '{self.name}' failed: {exc}") from exc
+
+        if not isinstance(result, StageResult):
+            raise StageFailedError(self.name, "Stage handler returned an invalid result")
+        return result
+
+
+@dataclass
+class PipelineRunSummary:
+    """Captured metadata about a pipeline run for status reporting."""
+
+    run_id: str
+    account_id: str
+    intent_id: str
+    status: str
+    started_at: datetime
+    completed_at: datetime
+    latency_ms: float
+    stage_latencies_ms: Dict[str, float]
+    error: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "account_id": self.account_id,
+            "intent_id": self.intent_id,
+            "status": self.status,
+            "started_at": self.started_at.isoformat(),
+            "completed_at": self.completed_at.isoformat(),
+            "latency_ms": round(self.latency_ms, 3),
+            "stage_latencies_ms": {k: round(v, 3) for k, v in self.stage_latencies_ms.items()},
+            "error": self.error,
+        }
+
+
+class PipelineHistory:
+    """Thread-safe ring buffer tracking recent pipeline runs."""
+
+    def __init__(self, capacity: int) -> None:
+        self._runs: Deque[PipelineRunSummary] = deque(maxlen=capacity)
+        self._lock = asyncio.Lock()
+
+    async def record(self, summary: PipelineRunSummary) -> None:
+        async with self._lock:
+            self._runs.append(summary)
+
+    async def snapshot(self) -> List[PipelineRunSummary]:
+        async with self._lock:
+            return list(self._runs)
+
+
+class AuditPublisher:
+    """Asynchronous Kafka publisher using the in-memory adapter for auditing."""
+
+    def __init__(self, account_id: str, topic_prefix: str = TOPIC_PREFIX) -> None:
+        self._account_id = account_id
+        self._adapter = KafkaNATSAdapter(account_id=account_id)
+        self._topic_prefix = topic_prefix.rstrip(".")
+
+    async def publish(self, topic_suffix: str, payload: Mapping[str, Any]) -> None:
+        topic = f"{self._topic_prefix}.{topic_suffix}" if topic_suffix else self._topic_prefix
+        encoded = jsonable_encoder(payload)
+        await asyncio.to_thread(self._adapter.publish, topic, encoded)  # type: ignore[arg-type]
+
+    async def publish_event(
+        self,
+        stage: str,
+        phase: str,
+        *,
+        run_id: str,
+        intent_id: str,
+        account_id: str,
+        data: Mapping[str, Any],
+    ) -> None:
+        payload = {
+            "run_id": run_id,
+            "intent_id": intent_id,
+            "account_id": account_id,
+            "stage": stage,
+            "phase": phase,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "data": data,
+        }
+        await self.publish(f"{stage}.{phase}", payload)
+
+
+class PipelineResult(BaseModel):
+    run_id: str
+    status: str
+    latency_ms: float
+    stage_latencies_ms: Dict[str, float]
+    stage_artifacts: Dict[str, Any]
+    fill_event: Dict[str, Any]
+
+
+class SequencerPipeline:
+    """Coordinates the policy → risk → OMS pipeline."""
+
+    def __init__(self, stages: List[Stage], history: PipelineHistory) -> None:
+        self._stages = stages
+        self._history = history
+
+    async def submit(self, intent: Dict[str, Any]) -> PipelineResult:
+        run_id = str(uuid.uuid4())
+        normalized_account = str(intent.get("account_id") or "unknown").strip().lower() or "unknown"
+        intent_id = str(
+            intent.get("order_id")
+            or intent.get("intent_id")
+            or intent.get("client_id")
+            or uuid.uuid4()
+        )
+        publisher = AuditPublisher(normalized_account)
+        ctx = PipelineContext(
+            run_id=run_id,
+            account_id=normalized_account,
+            intent_id=intent_id,
+            publisher=publisher,
+        )
+
+        payload: Dict[str, Any] = {"intent": jsonable_encoder(intent)}
+        stage_artifacts: Dict[str, Any] = {}
+        stage_latencies: Dict[str, float] = {}
+        executed: List[Tuple[Stage, StageResult]] = []
+
+        started_at = datetime.now(timezone.utc)
+        pipeline_start = time.perf_counter()
+        status_value = "success"
+        error_message: Optional[str] = None
+        fill_event: Optional[Dict[str, Any]] = None
+        total_latency: float = 0.0
+
+        await publisher.publish_event(
+            "pipeline",
+            "start",
+            run_id=run_id,
+            intent_id=intent_id,
+            account_id=normalized_account,
+            data={"intent": payload["intent"]},
+        )
+
+        try:
+            for stage in self._stages:
+                await publisher.publish_event(
+                    stage.name,
+                    "start",
+                    run_id=run_id,
+                    intent_id=intent_id,
+                    account_id=normalized_account,
+                    data={"payload": payload},
+                )
+                stage_start = time.perf_counter()
+                result = await stage.execute(payload, ctx)
+                stage_latency = (time.perf_counter() - stage_start) * 1000.0
+                stage_latencies[stage.name] = stage_latency
+                payload = result.payload
+                stage_artifacts[stage.name] = result.artifact
+                executed.append((stage, result))
+                await publisher.publish_event(
+                    stage.name,
+                    "complete",
+                    run_id=run_id,
+                    intent_id=intent_id,
+                    account_id=normalized_account,
+                    data=result.artifact,
+                )
+
+            fill_event = await self._emit_fill_event(ctx, payload, stage_artifacts)
+            total_latency_snapshot = (time.perf_counter() - pipeline_start) * 1000.0
+            await publisher.publish_event(
+                "pipeline",
+                "complete",
+                run_id=run_id,
+                intent_id=intent_id,
+                account_id=normalized_account,
+                data={"fill_event": fill_event, "latency_ms": total_latency_snapshot},
+            )
+        except StageError as exc:
+            status_value = "failed"
+            error_message = f"{exc.stage}: {exc.message}"
+            await publisher.publish_event(
+                exc.stage,
+                "failed",
+                run_id=run_id,
+                intent_id=intent_id,
+                account_id=normalized_account,
+                data={"error": exc.message},
+            )
+            await publisher.publish_event(
+                "pipeline",
+                "failed",
+                run_id=run_id,
+                intent_id=intent_id,
+                account_id=normalized_account,
+                data={"error": exc.message},
+            )
+            await self._rollback(executed, ctx)
+            raise
+        except Exception as exc:  # pragma: no cover - defensive guard
+            status_value = "failed"
+            error_message = f"unexpected: {exc}"
+            await publisher.publish_event(
+                "pipeline",
+                "failed",
+                run_id=run_id,
+                intent_id=intent_id,
+                account_id=normalized_account,
+                data={"error": error_message},
+            )
+            await self._rollback(executed, ctx)
+            raise StageFailedError("pipeline", error_message) from exc
+        finally:
+            completed_at = datetime.now(timezone.utc)
+            total_latency = (time.perf_counter() - pipeline_start) * 1000.0
+            summary = PipelineRunSummary(
+                run_id=run_id,
+                account_id=normalized_account,
+                intent_id=intent_id,
+                status=status_value,
+                started_at=started_at,
+                completed_at=completed_at,
+                latency_ms=total_latency,
+                stage_latencies_ms=stage_latencies,
+                error=error_message,
+            )
+            await self._history.record(summary)
+
+        if fill_event is None:
+            raise StageFailedError("pipeline", error_message or "Pipeline failed to produce fill event")
+
+        return PipelineResult(
+            run_id=run_id,
+            status=status_value,
+            latency_ms=total_latency,
+            stage_latencies_ms=stage_latencies,
+            stage_artifacts=stage_artifacts,
+            fill_event=fill_event,
+        )
+
+    async def _rollback(self, executed: List[Tuple[Stage, StageResult]], ctx: PipelineContext) -> None:
+        for stage, result in reversed(executed):
+            if stage.rollback is None:
+                continue
+            try:
+                await stage.rollback(result, ctx)
+            except Exception:  # pragma: no cover - rollback best effort
+                LOGGER.exception("Rollback for stage %s failed", stage.name)
+
+    async def _emit_fill_event(
+        self,
+        ctx: PipelineContext,
+        payload: MutableMapping[str, Any],
+        stage_artifacts: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        intent = payload.get("intent", {})
+        oms_result = stage_artifacts.get("oms", {})
+        quantity = _safe_float(intent.get("quantity") or intent.get("qty") or 0.0)
+        price = _safe_float(
+            intent.get("price")
+            or intent.get("limit_px")
+            or (intent.get("mid_price") if isinstance(intent.get("mid_price"), (int, float)) else 0.0)
+        )
+        filled_qty = _safe_float(oms_result.get("filled_qty", quantity))
+        avg_price = _safe_float(oms_result.get("avg_price", price))
+        event = {
+            "event_type": "FillEvent",
+            "run_id": ctx.run_id,
+            "account_id": ctx.account_id,
+            "intent_id": ctx.intent_id,
+            "order_id": intent.get("order_id"),
+            "instrument": intent.get("instrument"),
+            "status": "filled" if oms_result.get("accepted", True) else "rejected",
+            "filled_qty": filled_qty,
+            "avg_price": avg_price,
+            "stage_artifacts": stage_artifacts,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        await asyncio.wait_for(
+            ctx.publisher.publish_event(
+                "fill",
+                "publish",
+                run_id=ctx.run_id,
+                intent_id=ctx.intent_id,
+                account_id=ctx.account_id,
+                data=event,
+            ),
+            timeout=DEFAULT_PUBLISH_TIMEOUT,
+        )
+        return event
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+async def policy_handler(payload: Dict[str, Any], ctx: PipelineContext) -> StageResult:
+    intent = payload.get("intent", {})
+    now = datetime.now(timezone.utc).isoformat()
+    decision = {
+        "approved": True,
+        "reason": None,
+        "evaluated_at": now,
+        "constraints": intent.get("constraints", {}),
+    }
+    new_payload = dict(payload)
+    new_payload["policy_decision"] = decision
+    return StageResult(payload=new_payload, artifact=decision)
+
+
+async def policy_rollback(result: StageResult, ctx: PipelineContext) -> None:
+    await ctx.publisher.publish_event(
+        "policy",
+        "rollback",
+        run_id=ctx.run_id,
+        intent_id=ctx.intent_id,
+        account_id=ctx.account_id,
+        data=result.artifact,
+    )
+
+
+async def risk_handler(payload: Dict[str, Any], ctx: PipelineContext) -> StageResult:
+    decision = payload.get("policy_decision", {})
+    if not decision.get("approved", False):
+        raise StageFailedError("risk", "Policy decision rejected the intent")
+
+    intent = payload.get("intent", {})
+    quantity = _safe_float(intent.get("quantity") or intent.get("qty"))
+    price = _safe_float(intent.get("price") or intent.get("limit_px"))
+    notional = abs(quantity * price)
+    assessment = {
+        "valid": True,
+        "reasons": [],
+        "assessed_at": datetime.now(timezone.utc).isoformat(),
+        "projected_notional": notional,
+        "net_exposure": quantity,
+    }
+    new_payload = dict(payload)
+    new_payload["risk_validation"] = assessment
+    return StageResult(payload=new_payload, artifact=assessment)
+
+
+async def risk_rollback(result: StageResult, ctx: PipelineContext) -> None:
+    await ctx.publisher.publish_event(
+        "risk",
+        "rollback",
+        run_id=ctx.run_id,
+        intent_id=ctx.intent_id,
+        account_id=ctx.account_id,
+        data=result.artifact,
+    )
+
+
+async def oms_handler(payload: Dict[str, Any], ctx: PipelineContext) -> StageResult:
+    risk = payload.get("risk_validation", {})
+    if not risk.get("valid", False):
+        raise StageFailedError("oms", "Risk validation failed")
+
+    intent = payload.get("intent", {})
+    client_order_id = intent.get("order_id") or str(uuid.uuid4())
+    filled_qty = _safe_float(intent.get("quantity") or intent.get("qty") or 0.0)
+    avg_price = _safe_float(intent.get("price") or intent.get("limit_px") or 0.0)
+    oms_result = {
+        "accepted": True,
+        "routed_venue": intent.get("venue") or "default",
+        "client_order_id": client_order_id,
+        "filled_qty": filled_qty,
+        "avg_price": avg_price,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    new_payload = dict(payload)
+    new_payload["oms_result"] = oms_result
+    return StageResult(payload=new_payload, artifact=oms_result)
+
+
+async def oms_rollback(result: StageResult, ctx: PipelineContext) -> None:
+    await ctx.publisher.publish_event(
+        "oms",
+        "rollback",
+        run_id=ctx.run_id,
+        intent_id=ctx.intent_id,
+        account_id=ctx.account_id,
+        data=result.artifact,
+    )
+
+
+history = PipelineHistory(capacity=RECENT_RUN_CAPACITY)
+
+pipeline = SequencerPipeline(
+    stages=[
+        Stage(
+            name="policy",
+            handler=policy_handler,
+            rollback=policy_rollback,
+            timeout=DEFAULT_POLICY_TIMEOUT,
+        ),
+        Stage(
+            name="risk",
+            handler=risk_handler,
+            rollback=risk_rollback,
+            timeout=DEFAULT_RISK_TIMEOUT,
+        ),
+        Stage(
+            name="oms",
+            handler=oms_handler,
+            rollback=oms_rollback,
+            timeout=DEFAULT_OMS_TIMEOUT,
+        ),
+    ],
+    history=history,
+)
+
+app = FastAPI(title="Sequencer Service", version="1.0.0")
+
+
+@app.post("/sequencer/submit_intent", response_model=SequencerResponse)
+async def submit_intent(request: SequencerIntentRequest) -> SequencerResponse:
+    try:
+        result = await pipeline.submit(request.intent)
+    except StageTimeoutError as exc:
+        raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail=exc.message) from exc
+    except StageFailedError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=exc.message) from exc
+
+    return SequencerResponse(**result.model_dump())
+
+
+@app.get("/sequencer/status", response_model=SequencerStatusResponse)
+async def sequencer_status() -> SequencerStatusResponse:
+    runs = await history.snapshot()
+    serialized_runs = [run.to_dict() for run in runs]
+    latency_values = [run.latency_ms for run in runs if run.latency_ms >= 0]
+
+    stats: Dict[str, Any] = {
+        "total_runs": len(serialized_runs),
+        "success": sum(1 for run in runs if run.status == "success"),
+        "failed": sum(1 for run in runs if run.status != "success"),
+        "average_latency_ms": round(_average(latency_values), 3) if latency_values else 0.0,
+        "p95_latency_ms": round(_percentile(latency_values, 95), 3) if latency_values else 0.0,
+        "max_latency_ms": round(max(latency_values), 3) if latency_values else 0.0,
+    }
+
+    stage_keys = {
+        stage
+        for run in runs
+        for stage in run.stage_latencies_ms.keys()
+    }
+    stage_stats: Dict[str, Dict[str, float]] = {}
+    for stage in stage_keys:
+        values = [run.stage_latencies_ms.get(stage, 0.0) for run in runs if stage in run.stage_latencies_ms]
+        if not values:
+            continue
+        stage_stats[stage] = {
+            "average_latency_ms": round(_average(values), 3),
+            "p95_latency_ms": round(_percentile(values, 95), 3),
+            "max_latency_ms": round(max(values), 3),
+        }
+    if stage_stats:
+        stats["stages"] = stage_stats
+
+    return SequencerStatusResponse(runs=serialized_runs, stats=stats)
+
+
+def _average(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+
+def _percentile(values: List[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    sorted_values = sorted(values)
+    k = max(0, min(len(sorted_values) - 1, int(round((percentile / 100.0) * (len(sorted_values) - 1)))))
+    return sorted_values[k]
+
+
+__all__ = [
+    "app",
+    "pipeline",
+    "SequencerIntentRequest",
+    "SequencerResponse",
+]
