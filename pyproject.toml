@@ -13,6 +13,7 @@ dependencies = [
     "pyotp>=2.9.0",
     "email-validator>=2.1",
     "prometheus-client>=0.20",
+    "watchdog>=3.0",
 ]
 
 [project.optional-dependencies]
