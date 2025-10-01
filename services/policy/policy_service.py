@@ -69,7 +69,9 @@ class PolicyIntent(BaseModel):
     confidence: float = Field(..., description="Confidence score for the decision")
 
 
-app = FastAPI(title="Policy Service")
+APP_VERSION = "2.0.0"
+
+app = FastAPI(title="Policy Service", version=APP_VERSION)
 setup_metrics(app)
 
 

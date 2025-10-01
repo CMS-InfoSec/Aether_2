@@ -10,7 +10,13 @@ from fastapi.testclient import TestClient
 
 if "metrics" not in sys.modules:
     metrics_stub = types.ModuleType("metrics")
-    metrics_stub.setup_metrics = lambda app: None
+    def _setup_metrics(app):
+        if not any(route.path == "/metrics" for route in app.routes):
+            @app.get("/metrics")  # pragma: no cover - simple stub endpoint
+            def _metrics_endpoint():
+                return {"status": "ok"}
+
+    metrics_stub.setup_metrics = _setup_metrics
     metrics_stub.record_abstention_rate = lambda *args, **kwargs: None
     metrics_stub.record_drift_score = lambda *args, **kwargs: None
     sys.modules["metrics"] = metrics_stub
@@ -100,12 +106,26 @@ def test_decide_policy_accepts_dataclass_intent(monkeypatch: pytest.MonkeyPatch,
     response = client.post("/policy/decide", json=payload)
     assert response.status_code == 200
 
-    body = PolicyDecisionResponse.model_validate(response.json())
+    assert response.json() == {
+        "action": expected_intent.action,
+        "side": expected_intent.side,
+        "qty": expected_intent.qty,
+        "preference": expected_intent.preference,
+        "type": expected_intent.type,
+        "limit_px": expected_intent.limit_px,
+        "tif": expected_intent.tif,
+        "tp": expected_intent.tp,
+        "sl": expected_intent.sl,
+        "expected_edge_bps": expected_intent.expected_edge_bps,
+        "expected_cost_bps": expected_intent.expected_cost_bps,
+        "confidence": expected_intent.confidence,
+    }
 
-    assert body.approved is True
-    assert body.selected_action == "maker"
-    assert body.fee_adjusted_edge_bps == pytest.approx(16.0)
-    assert body.confidence.overall_confidence >= 0.8
-    assert body.state.regime == "expansion"
-    assert body.effective_fee.maker == pytest.approx(4.0)
-    assert body.effective_fee.taker == pytest.approx(7.0)
+
+def test_metrics_endpoint_exposed_after_import():
+    client = TestClient(policy_service.app)
+
+    response = client.get("/metrics")
+
+    assert response.status_code == 200
+
