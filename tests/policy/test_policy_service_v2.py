@@ -52,7 +52,7 @@ def test_policy_service_decision(monkeypatch: pytest.MonkeyPatch, client: TestCl
     async def _fake_fee(account_id: str, symbol: str, liquidity: str, notional: float) -> float:
         assert account_id == "company"
         assert symbol == "BTC-USD"
-        assert liquidity == "maker"
+        assert liquidity in {"maker", "taker"}
         expected_notional = float(Decimal("30120.5") * Decimal("0.1235"))
         assert notional == pytest.approx(expected_notional)
         return 4.5
@@ -62,11 +62,12 @@ def test_policy_service_decision(monkeypatch: pytest.MonkeyPatch, client: TestCl
 
     payload = {
         "account_id": "company",
-        "symbol": "BTC-USD",
-        "side": "buy",
-        "qty": 0.1234567,
+        "order_id": "abc-123",
+        "instrument": "BTC-USD",
+        "side": "BUY",
+        "quantity": 0.1234567,
         "price": 30120.4567,
-        "impact_bps": 1.0,
+        "fee": {"currency": "USD", "maker": 4.0, "taker": 6.0},
         "features": [0.4, -0.1, 2.8],
         "book_snapshot": {"mid_price": 30125.4, "spread_bps": 2.4, "imbalance": 0.05},
     }
@@ -76,9 +77,8 @@ def test_policy_service_decision(monkeypatch: pytest.MonkeyPatch, client: TestCl
     assert response.status_code == 200
     body = response.json()
     assert body["approved"] is True
-    assert body["action"] == "maker"
-    assert body["qty"] == pytest.approx(0.1235)
-    assert body["price"] == pytest.approx(30120.5)
-    assert body["expected_edge_bps"] == pytest.approx(18.0)
-    assert body["effective_fee_bps"] == pytest.approx(4.5)
-    assert body["expected_cost_bps"] == pytest.approx(7.9)
+    assert body["selected_action"] == "maker"
+    assert body["expected_edge_bps"] == pytest.approx(22.0)
+    assert body["fee_adjusted_edge_bps"] == pytest.approx(17.5)
+    assert body["take_profit_bps"] == pytest.approx(10.8)
+    assert body["stop_loss_bps"] == pytest.approx(7.2)

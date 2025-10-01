@@ -167,8 +167,9 @@ class MLflowClientStub:
 _client = MLflowClientStub()
 
 
-def _model_name(account_id: str, symbol: str) -> str:
-    return f"policy-intent::{account_id}::{symbol}".lower()
+def _model_name(account_id: str, symbol: str, variant: str | None = None) -> str:
+    suffix = f"::{variant}" if variant else ""
+    return f"policy-intent::{account_id}::{symbol}{suffix}".lower()
 
 
 def predict_intent(
@@ -176,6 +177,7 @@ def predict_intent(
     symbol: str,
     features: Sequence[float],
     book_snapshot: BookSnapshot | Dict[str, float],
+    model_variant: str | None = None,
 ) -> Intent:
     """Run inference against the latest MLflow model and return an intent.
 
@@ -189,7 +191,7 @@ def predict_intent(
             if isinstance(book_snapshot, BookSnapshot)
             else BookSnapshot(**book_snapshot)
         )
-        model_key = _model_name(account_id, symbol)
+        model_key = _model_name(account_id, symbol, model_variant)
         model = _client.load_latest_model(model_key)
         return model.predict(features, snapshot)
     except Exception:  # pragma: no cover - defensive safety net

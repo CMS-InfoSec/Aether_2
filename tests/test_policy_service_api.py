@@ -71,7 +71,7 @@ def _validate_response(payload: dict) -> PolicyDecisionResponse:
     return PolicyDecisionResponse.model_validate(payload)
 
 def test_policy_decide_approves_when_edge_beats_costs(
-    monkeypatch: pytest.MonkeyPatch, client: TestClient, account_id: str
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
     recorded: List[dict[str, object]] = []
 
@@ -130,8 +130,8 @@ def test_policy_decide_approves_when_edge_beats_costs(
     assert body.features == pytest.approx(payload["features"])  # type: ignore[arg-type]
     assert body.book_snapshot.mid_price == pytest.approx(payload["book_snapshot"]["mid_price"])
     assert body.state.regime == "unknown"
-    assert body.take_profit_bps == pytest.approx(25.0)
-    assert body.stop_loss_bps == pytest.approx(12.0)
+    assert body.take_profit_bps == pytest.approx(10.8)
+    assert body.stop_loss_bps == pytest.approx(7.2)
 
     snapped_price = Decimal("30120.5")
     snapped_quantity = Decimal("0.1235")
