@@ -10,6 +10,7 @@ from accounts.service import AccountsService
 from auth.routes import get_auth_service, router as auth_router
 from auth.service import AdminRepository, AuthService, SessionStore
 from services.alert_manager import setup_alerting
+from alert_prioritizer import router as alert_prioritizer_router
 from services.report_service import router as reports_router
 
 from services.models.model_zoo import router as models_router
@@ -39,6 +40,7 @@ def create_app() -> FastAPI:
     app.include_router(auth_router)
     app.include_router(reports_router)
     app.include_router(exposure_router)
+    app.include_router(alert_prioritizer_router)
 
     app.include_router(models_router)
 
