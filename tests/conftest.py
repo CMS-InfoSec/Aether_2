@@ -34,6 +34,35 @@ def _install_sqlalchemy_stub() -> None:
             self.args = args
             self.kwargs = kwargs
 
+    class MetaData:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self.tables: dict[str, "Table"] = {}
+
+        def create_all(self, *args: object, **kwargs: object) -> None:  # pragma: no cover - noop
+            return None
+
+    class Table:
+        def __init__(self, name: str, metadata: MetaData, *columns: object, **kwargs: object) -> None:
+            self.name = name
+            self.columns = columns
+            self.kwargs = kwargs
+            metadata.tables[name] = self
+
+    class _Insert:
+        def __init__(self, table: Table) -> None:
+            self.table = table
+            self._values: dict[str, object] | None = None
+
+        def values(self, *args: object, **kwargs: object) -> "_Insert":
+            self._values = kwargs if kwargs else (args[0] if args else None)
+            return self
+
+        def on_conflict_do_update(self, *args: object, **kwargs: object) -> "_Insert":
+            return self
+
+        def returning(self, *args: object, **kwargs: object) -> "_Insert":
+            return self
+
     def _select(*args: object, **kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(order_by=lambda *a, **k: SimpleNamespace(
             where=lambda *a, **k: SimpleNamespace(
@@ -41,16 +70,40 @@ def _install_sqlalchemy_stub() -> None:
             )
         ))
 
+    def _insert(table: Table) -> _Insert:
+        return _Insert(table)
+
+    def _create_engine(*args: object, **kwargs: object) -> SimpleNamespace:
+        class _Connection(SimpleNamespace):
+            def execute(self, *c_args: object, **c_kwargs: object) -> SimpleNamespace:
+                return SimpleNamespace(
+                    fetchall=lambda: [],
+                    scalar=lambda: None,
+                    scalars=lambda: SimpleNamespace(all=lambda: []),
+                )
+
+        return SimpleNamespace(connect=lambda: _Connection(), dispose=lambda: None)
+
+    def _engine_from_config(*args: object, **kwargs: object) -> SimpleNamespace:
+        return _create_engine()
+
     sa.Column = _Column
     sa.Float = _Type
     sa.Integer = _Type
     sa.String = _Type
     sa.Boolean = _Type
+    sa.BigInteger = _Type
     sa.DateTime = _Type
     sa.Numeric = _Type
+    sa.JSON = _Type
+    sa.JSONB = _Type
+    sa.MetaData = MetaData
+    sa.Table = Table
     sa.func = SimpleNamespace(count=lambda *a, **k: 0)
     sa.select = _select
-    sa.create_engine = lambda *a, **k: SimpleNamespace()
+    sa.insert = _insert
+    sa.create_engine = _create_engine
+    sa.engine_from_config = _engine_from_config
 
     sys.modules["sqlalchemy"] = sa
 
@@ -88,18 +141,33 @@ def _install_sqlalchemy_stub() -> None:
     def declarative_base(**kwargs: object):
         return DeclarativeBase
 
+    def _registry(*args: object, **kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(mapper=lambda *a, **k: None)
+
     orm.declarative_base = declarative_base
+    orm.registry = _registry
     sys.modules["sqlalchemy.orm"] = orm
 
     engine = ModuleType("sqlalchemy.engine")
     engine.Engine = SimpleNamespace
     sys.modules["sqlalchemy.engine"] = engine
 
+    exc = ModuleType("sqlalchemy.exc")
+    exc.SQLAlchemyError = Exception
+    sys.modules["sqlalchemy.exc"] = exc
+
+    pool = ModuleType("sqlalchemy.pool")
+    pool.NullPool = object
+    sa.pool = pool
+    sys.modules["sqlalchemy.pool"] = pool
+
     dialects = ModuleType("sqlalchemy.dialects")
     postgresql = ModuleType("sqlalchemy.dialects.postgresql")
 
     class JSONB:  # pragma: no cover - simple placeholder
-        ...
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self.args = args
+            self.kwargs = kwargs
 
     class UUID:
         def __init__(self, *args: object, **kwargs: object) -> None:
@@ -108,8 +176,50 @@ def _install_sqlalchemy_stub() -> None:
 
     postgresql.JSONB = JSONB
     postgresql.UUID = UUID
+    postgresql.insert = _insert
     sys.modules["sqlalchemy.dialects"] = dialects
     sys.modules["sqlalchemy.dialects.postgresql"] = postgresql
+
+    ext = ModuleType("sqlalchemy.ext")
+    sys.modules["sqlalchemy.ext"] = ext
+
+    ext_asyncio = ModuleType("sqlalchemy.ext.asyncio")
+
+    class _AsyncConnection(SimpleNamespace):
+        async def execute(self, *args: object, **kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: []))
+
+    class AsyncEngine(SimpleNamespace):
+        def begin(self) -> "_AsyncBegin":
+            return _AsyncBegin()
+
+        async def dispose(self) -> None:  # pragma: no cover - noop
+            return None
+
+    class _AsyncBegin:
+        async def __aenter__(self) -> _AsyncConnection:
+            return _AsyncConnection()
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    def create_async_engine(*args: object, **kwargs: object) -> AsyncEngine:
+        return AsyncEngine()
+
+    ext_asyncio.AsyncEngine = AsyncEngine
+    ext_asyncio.create_async_engine = create_async_engine
+    sys.modules["sqlalchemy.ext.asyncio"] = ext_asyncio
+
+    ext_compiler = ModuleType("sqlalchemy.ext.compiler")
+
+    def compiles(*args: object, **kwargs: object):
+        def decorator(func):
+            return func
+
+        return decorator
+
+    ext_compiler.compiles = compiles
+    sys.modules["sqlalchemy.ext.compiler"] = ext_compiler
 
 
 def _install_prometheus_stub() -> None:
