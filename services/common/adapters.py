@@ -48,12 +48,15 @@ class TimescaleAdapter:
     _credential_rotations: ClassVar[Dict[str, Dict[str, Any]]] = {}
     _telemetry: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
 
+
     def __post_init__(self) -> None:
         self._metrics.setdefault(self.account_id, {"limit": 1_000_000.0, "usage": 0.0})
         self._daily_usage.setdefault(self.account_id, {"loss": 0.0, "fee": 0.0})
         self._instrument_exposure.setdefault(self.account_id, {})
         self._telemetry.setdefault(self.account_id, [])
+
         self._events.setdefault(self.account_id, {"acks": [], "fills": [], "risk": []})
+
         self._credential_rotations.setdefault(self.account_id, {})
         self._risk_configs.setdefault(
             self.account_id,
@@ -161,8 +164,10 @@ class TimescaleAdapter:
         return list(self._telemetry.get(self.account_id, []))
 
     # ------------------------------------------------------------------
-    # Credential rotation metadata helpers
+
+    # Timescale-inspired risk state helpers
     # ------------------------------------------------------------------
+
     def record_credential_rotation(self, *, secret_name: str) -> Dict[str, Any]:
         rotated_at = datetime.now(timezone.utc)
         record = self._credential_rotations[self.account_id]
@@ -178,15 +183,27 @@ class TimescaleAdapter:
             record.setdefault("created_at", rotated_at)
         return deepcopy(record)
 
+
     def credential_rotation_status(self) -> Optional[Dict[str, Any]]:
-        record = self._credential_rotations.get(self.account_id)
-        if not record:
+        rotations = self._events.get(self.account_id, {}).get("credential_rotations", [])
+        if not rotations:
             return None
+
         return deepcopy(record)
 
+
+    # ------------------------------------------------------------------
+    # Test helpers
+    # ------------------------------------------------------------------
     @classmethod
-    def reset_rotation_state(cls) -> None:
-        cls._credential_rotations.clear()
+    def reset(cls) -> None:
+        cls._metrics.clear()
+        cls._telemetry.clear()
+        cls._risk_configs.clear()
+        cls._daily_usage.clear()
+        cls._instrument_exposures.clear()
+        cls._events.clear()
+
 
 
 
