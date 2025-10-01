@@ -5,6 +5,7 @@ import os
 
 from fastapi import FastAPI
 
+from audit_mode import configure_audit_mode
 from accounts.service import AccountsService
 from auth.routes import get_auth_service, router as auth_router
 from auth.service import AdminRepository, AuthService, SessionStore
@@ -43,6 +44,8 @@ def create_app() -> FastAPI:
     app.state.session_store = session_store
     app.state.auth_service = auth_service
     app.state.accounts_service = accounts_service
+
+    configure_audit_mode(app)
 
     alertmanager_url = os.getenv("ALERTMANAGER_URL")
     setup_alerting(app, alertmanager_url=alertmanager_url)
