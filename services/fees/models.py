@@ -32,6 +32,22 @@ class AccountVolume30d(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False)
 
 
+class AccountFill(Base):
+    """Stores individual fills for computing rolling volume and realized fees."""
+
+    __tablename__ = "account_fills"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(String(64), nullable=False, index=True)
+    liquidity = Column(String(16), nullable=True)
+    notional_usd = Column(Numeric(20, 8), nullable=False)
+    estimated_fee_bps = Column(Numeric(10, 4), nullable=True)
+    estimated_fee_usd = Column(Numeric(20, 8), nullable=True)
+    actual_fee_usd = Column(Numeric(20, 8), nullable=True)
+    fill_ts = Column(DateTime(timezone=True), nullable=False)
+    recorded_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+
+
 class FeeTierProgress(Base):
     """Persists proximity alerts when an account nears the next fee tier."""
 
@@ -44,5 +60,5 @@ class FeeTierProgress(Base):
     ts = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
 
 
-__all__ = ["Base", "FeeTier", "AccountVolume30d", "FeeTierProgress"]
+__all__ = ["Base", "FeeTier", "AccountVolume30d", "AccountFill", "FeeTierProgress"]
 

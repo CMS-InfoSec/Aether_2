@@ -35,7 +35,12 @@ from services.models.model_server import Intent
 
 
 @pytest.fixture(name="client")
-def _client() -> TestClient:
+def _client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    async def _noop_place_order(account_id: str, payload: dict, shadow: bool = False):
+        return {"order_id": payload.get("client_id", "order")}
+
+    monkeypatch.setattr(policy_service.EXCHANGE_ADAPTER, "place_order", _noop_place_order)
+    monkeypatch.setattr(policy_service.EXCHANGE_ADAPTER, "supports", lambda op: True)
     return TestClient(policy_service.app)
 
 
@@ -167,6 +172,41 @@ def test_policy_decide_approves_when_edge_beats_costs(
         },
     ]
     assert dispatched == [{"order_id": "abc-123", "approved": True}]
+
+
+def test_policy_decide_rejects_when_slippage_erodes_edge(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    async def _fake_fee(account_id: str, symbol: str, liquidity: str, notional: float) -> float:
+        return {"maker": 4.0, "taker": 6.0}[liquidity]
+
+    monkeypatch.setattr(policy_service, "_fetch_effective_fee", _fake_fee)
+    monkeypatch.setattr(
+        policy_service,
+        "predict_intent",
+        lambda **_: _intent(edge_bps=10.0, approved=True, selected="maker"),
+    )
+
+    payload = {
+        "account_id": "company",
+        "order_id": "edge-001",
+        "instrument": "ETH-USD",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 2100.0,
+        "fee": {"currency": "USD", "maker": 4.0, "taker": 6.0},
+        "features": [0.1, -0.2, 0.3],
+        "slippage_bps": 8.0,
+        "book_snapshot": {"mid_price": 2100.0, "spread_bps": 3.0, "imbalance": 0.0},
+    }
+
+    response = client.post("/policy/decide", json=payload)
+    assert response.status_code == 200
+
+    body = response.json()
+    assert body["approved"] is False
+    assert body["reason"] == "Fee-adjusted edge non-positive"
+    assert body["fee_adjusted_edge_bps"] <= 0
 
 
 def test_policy_decide_honours_request_risk_overrides(
