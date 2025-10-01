@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kraken-ws-ingest
+  labels:
+    app: kraken-ws-ingest
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kraken-ws-ingest
+  template:
+    metadata:
+      labels:
+        app: kraken-ws-ingest
+    spec:
+      containers:
+        - name: kraken-ws-ingest
+          image: ghcr.io/your-org/kraken-ws-ingest:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--pairs"
+            - "XBT/USD,ETH/USD"
+            - "--kafka-bootstrap"
+            - "kafka:9092"
+            - "--trade-topic"
+            - "md.trades"
+            - "--book-topic"
+            - "md.book"
+          env:
+            - name: LOG_LEVEL
+              value: INFO
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - "pgrep -f kraken_ws_ingest || exit 1"
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - "pgrep -f kraken_ws_ingest || exit 1"
+            initialDelaySeconds: 10
+            periodSeconds: 30
