@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 
 import math
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from typing import Dict, Iterable, Iterator, List, Optional
+from typing import Callable, Dict, Iterable, Iterator, List, Optional
 
 
+import httpx
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, model_validator
 from sqlalchemy import Column, DateTime, Float, Integer, String, create_engine
@@ -32,6 +35,11 @@ from services.common.security import require_admin_account
 logger = logging.getLogger(__name__)
 audit_logger = logging.getLogger("risk.audit")
 logging.basicConfig(level=logging.INFO)
+
+
+_CAPITAL_ALLOCATOR_URL = os.getenv("CAPITAL_ALLOCATOR_URL")
+_CAPITAL_ALLOCATOR_TIMEOUT = float(os.getenv("CAPITAL_ALLOCATOR_TIMEOUT", "1.5"))
+_CAPITAL_ALLOCATOR_TOLERANCE = float(os.getenv("CAPITAL_ALLOCATOR_NAV_TOLERANCE", "0.02"))
 
 
 Base = declarative_base()
@@ -113,6 +121,15 @@ class AccountRiskLimit(Base):
 
 
 DEFAULT_DATABASE_URL = "sqlite:///./risk.db"
+
+
+@dataclass
+class AllocatorAccountState:
+    account_id: str
+    allocation_pct: float
+    allocated_nav: float
+    drawdown_ratio: float
+    throttled: bool
 
 
 def _database_url() -> str:
@@ -593,6 +610,7 @@ def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
     state = context.request.portfolio_state
     _refresh_usage_from_fills(context.request.account_id, state)
     intent = context.request.intent
+    trade_notional = context.intended_notional
 
     def _register_violation(
         message: str, *, cooldown: bool = False, details: Optional[Dict[str, object]] = None
@@ -615,6 +633,18 @@ def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
             nonlocal cooldown_until
             cooldown_until = cooldown_until or _determine_cooldown(limits)
         _audit_violation(context, message, details)
+
+    allocator_state = _query_allocator_state(context.request.account_id)
+    if allocator_state:
+        _apply_allocator_guard(
+            allocator_state,
+            context,
+            trade_notional,
+            lambda message, cooldown=False, details=None: _register_violation(
+                message, cooldown=cooldown, details=details
+            ),
+            suggested_quantities,
+        )
 
     whitelist = limits.whitelist
     if whitelist and intent.instrument_id not in whitelist:
@@ -642,7 +672,6 @@ def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
             details={"fees": state.fees_paid, "limit": limits.fee_budget},
         )
 
-    trade_notional = context.intended_notional
     nav_cap_for_trade = limits.max_nav_pct_per_trade * state.net_asset_value
 
     scaled_notional_cap = None
@@ -1259,3 +1288,105 @@ def set_stub_account_returns(account_id: str, pnl_history: List[float]) -> None:
 def set_stub_fills(records: List[Dict[str, object]]) -> None:
     _STUB_FILLS.clear()
     _STUB_FILLS.extend(records)
+def _query_allocator_state(account_id: str) -> Optional[AllocatorAccountState]:
+    url = os.getenv("CAPITAL_ALLOCATOR_URL", _CAPITAL_ALLOCATOR_URL)
+    if not url:
+        return None
+
+    endpoint = url.rstrip("/") + "/allocator/status"
+    try:
+        with httpx.Client(timeout=_CAPITAL_ALLOCATOR_TIMEOUT) as client:
+            response = client.get(endpoint)
+            response.raise_for_status()
+    except httpx.HTTPError as exc:
+        logger.warning("Capital allocator query failed for account %s: %s", account_id, exc)
+        return None
+
+    try:
+        payload = response.json()
+    except ValueError as exc:  # pragma: no cover - defensive guard
+        logger.warning("Allocator response is not valid JSON: %s", exc)
+        return None
+
+    total_nav = float(payload.get("total_nav") or 0.0)
+    accounts = payload.get("accounts", [])
+    for entry in accounts:
+        if str(entry.get("account_id")) != account_id:
+            continue
+
+        def _float(value: object, default: float = 0.0) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        allocation_pct = _float(entry.get("allocation_pct", entry.get("allocation")))
+        allocated_nav = entry.get("allocated_nav")
+        allocated_value = _float(allocated_nav, allocation_pct * total_nav)
+        drawdown_ratio = _float(entry.get("drawdown_ratio"))
+        throttled = bool(entry.get("throttled"))
+        return AllocatorAccountState(
+            account_id=account_id,
+            allocation_pct=allocation_pct,
+            allocated_nav=allocated_value,
+            drawdown_ratio=drawdown_ratio,
+            throttled=throttled,
+        )
+    return None
+
+
+def _apply_allocator_guard(
+    allocator_state: AllocatorAccountState,
+    context: RiskEvaluationContext,
+    trade_notional: float,
+    register_violation_with_context: Callable[[str, bool, Optional[Dict[str, object]]], None],
+    suggested_quantities: List[float],
+) -> None:
+    state = context.request.portfolio_state
+    intent = context.request.intent
+    current_nav = float(state.net_asset_value or 0.0)
+    trade_amount = float(trade_notional or 0.0)
+    tolerance = max(_CAPITAL_ALLOCATOR_TOLERANCE, 0.0)
+
+    if allocator_state.throttled and intent.side == "buy":
+        register_violation_with_context(
+            "Account trading disabled by capital allocator",  # message
+            True,
+            {
+                "allocation_pct": allocator_state.allocation_pct,
+                "drawdown_ratio": allocator_state.drawdown_ratio,
+            },
+        )
+        suggested_quantities.append(0.0)
+        return
+
+    allocation_nav = max(allocator_state.allocated_nav, 0.0)
+    if allocation_nav <= 0:
+        return
+
+    projected_nav = current_nav
+    if intent.side == "buy":
+        projected_nav += trade_amount
+    else:
+        projected_nav = max(current_nav - trade_amount, 0.0)
+
+    allowed_nav = allocation_nav * (1.0 + tolerance)
+    if projected_nav <= allowed_nav:
+        return
+
+    register_violation_with_context(
+        "Trade would exceed capital allocation limit",
+        False,
+        {
+            "projected_nav": projected_nav,
+            "allocation_nav": allocation_nav,
+            "allocation_pct": allocator_state.allocation_pct,
+        },
+    )
+
+    if intent.side == "buy":
+        headroom = max(allowed_nav - current_nav, 0.0)
+        if headroom > 0 and intent.notional_per_unit > 0:
+            suggested_quantities.append(headroom / intent.notional_per_unit)
+        else:
+            suggested_quantities.append(0.0)
