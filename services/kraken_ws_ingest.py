@@ -53,6 +53,8 @@ class KrakenIngestor:
         self._producer: Optional[AIOKafkaProducer] = None
         self._running = False
         self._last_heartbeat_ts = time.monotonic()
+        self._active_ws: Optional[websockets.WebSocketClientProtocol] = None
+        self._active_tasks: set[asyncio.Task[Any]] = set()
 
     async def run(self) -> None:
         """Entrypoint for the ingestion loop with reconnection handling."""
@@ -97,16 +99,31 @@ class KrakenIngestor:
         """Request graceful shutdown."""
         self._running = False
 
+        if self._active_ws is not None:
+            try:
+                await self._active_ws.close()
+            finally:
+                self._active_ws = None
+
+        if self._active_tasks:
+            for task in list(self._active_tasks):
+                task.cancel()
+            await asyncio.gather(*self._active_tasks, return_exceptions=True)
+            self._active_tasks.clear()
+
     async def _connect_and_consume(self) -> None:
         """Connect to Kraken and stream messages until disconnect."""
         logging.info("Connecting to Kraken WebSocket at %s", KRAKEN_WS_URL)
 
         async with websockets.connect(KRAKEN_WS_URL, ping_interval=None) as ws:
+            self._active_ws = ws
             await self._subscribe(ws)
             self._last_heartbeat_ts = time.monotonic()
 
             consumer_task = asyncio.create_task(self._consume(ws))
             heartbeat_task = asyncio.create_task(self._heartbeat_guard(ws))
+
+            self._active_tasks.update({consumer_task, heartbeat_task})
 
             done, pending = await asyncio.wait(
                 {consumer_task, heartbeat_task},
@@ -124,6 +141,13 @@ class KrakenIngestor:
                     await task
                 except asyncio.CancelledError:
                     continue
+                finally:
+                    self._active_tasks.discard(task)
+
+            for task in pending:
+                self._active_tasks.discard(task)
+
+        self._active_ws = None
 
     async def _subscribe(self, ws: websockets.WebSocketClientProtocol) -> None:
         """Send subscription requests for trades and order books."""
