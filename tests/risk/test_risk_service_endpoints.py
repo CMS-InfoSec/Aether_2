@@ -1,0 +1,116 @@
+from __future__ import annotations
+
+from copy import deepcopy
+import sys
+import types
+
+import pytest
+from fastapi.testclient import TestClient
+
+if "prometheus_client" not in sys.modules:
+    prometheus_client = types.ModuleType("prometheus_client")
+
+    class _CollectorRegistry:
+        def __init__(self) -> None:  # pragma: no cover - simple stub
+            self.metrics: list[object] = []
+
+    class _Metric:
+        def __init__(self, *args, **kwargs) -> None:  # pragma: no cover - simple stub
+            self._args = args
+            self._kwargs = kwargs
+
+        def labels(self, **kwargs):  # pragma: no cover - simple stub
+            return self
+
+        def set(self, *args, **kwargs) -> None:  # pragma: no cover - simple stub
+            return None
+
+        def inc(self, *args, **kwargs) -> None:  # pragma: no cover - simple stub
+            return None
+
+    def _generate_latest(_registry: _CollectorRegistry) -> bytes:  # pragma: no cover - stub
+        return b""
+
+    prometheus_client.CONTENT_TYPE_LATEST = "text/plain"
+    prometheus_client.CollectorRegistry = _CollectorRegistry
+    prometheus_client.Counter = _Metric
+    prometheus_client.Gauge = _Metric
+    prometheus_client.generate_latest = _generate_latest
+
+    sys.modules["prometheus_client"] = prometheus_client
+
+from risk_service import app
+from services.common import security
+
+
+@pytest.fixture(autouse=True)
+def allow_stub_accounts(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        security,
+        "ADMIN_ACCOUNTS",
+        set(security.ADMIN_ACCOUNTS) | {"ACC-DEFAULT", "ACC-AGGR"},
+    )
+
+
+@pytest.fixture(name="client")
+def client_fixture() -> TestClient:
+    return TestClient(app)
+
+
+@pytest.fixture(name="risk_payload")
+def risk_payload_fixture() -> dict[str, object]:
+    return {
+        "account_id": "ACC-DEFAULT",
+        "intent": {
+            "policy_id": "policy-1",
+            "instrument_id": "AAPL",
+            "side": "buy",
+            "quantity": 10.0,
+            "price": 150.0,
+        },
+        "portfolio_state": {
+            "net_asset_value": 1_000_000.0,
+            "notional_exposure": 250_000.0,
+            "realized_daily_loss": 5_000.0,
+            "fees_paid": 2_500.0,
+            "var_95": 20_000.0,
+            "var_99": 40_000.0,
+        },
+    }
+
+
+def test_validate_requires_admin_header(client: TestClient, risk_payload: dict[str, object]) -> None:
+    response = client.post("/risk/validate", json=risk_payload)
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Account is not authorized for administrative access."
+
+
+def test_validate_rejects_account_mismatch(client: TestClient, risk_payload: dict[str, object]) -> None:
+    payload = deepcopy(risk_payload)
+    payload["account_id"] = "ACC-AGGR"
+
+    response = client.post(
+        "/risk/validate",
+        json=payload,
+        headers={"X-Account-ID": "ACC-DEFAULT"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Account mismatch between header and payload."
+
+
+def test_limits_requires_admin_header(client: TestClient) -> None:
+    response = client.get("/risk/limits")
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Account is not authorized for administrative access."
+
+
+def test_limits_returns_account_data(client: TestClient) -> None:
+    response = client.get("/risk/limits", headers={"X-Account-ID": "ACC-DEFAULT"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["account_id"] == "ACC-DEFAULT"
+    assert "limits" in body and "usage" in body
