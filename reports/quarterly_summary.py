@@ -39,10 +39,9 @@ GROUP BY o.account_id, f.symbol
 """
 
 AUDIT_QUERY = """
-SELECT
-    actor AS account_id,
-    created_at AS event_time,
-    payload
+
+SELECT actor AS account_id, created_at
+
 FROM audit_logs
 WHERE created_at >= %(start)s AND created_at < %(end)s
 """

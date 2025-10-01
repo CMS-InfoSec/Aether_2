@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from uuid import UUID
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -43,39 +42,29 @@ def test_store_artifact_writes_expected_audit_log(tmp_path: Path) -> None:
     assert len(session.executions) == 1
 
     query, params = session.executions[0]
-    assert "INSERT INTO audit_log" in query
+    assert "INSERT INTO audit_logs" in query
     expected_columns = """
-                event_id,
-                entity_type,
-                entity_id,
                 actor,
                 action,
-                event_time,
-                metadata
+                target,
+                created_at,
+                payload
     """.strip()
     assert expected_columns in query
-    assert set(params) == {
-        "event_id",
-        "action",
-        "entity_type",
-        "entity_id",
-        "actor",
-        "event_time",
-        "metadata",
-    }
+    assert set(params) == {"action", "actor", "created_at", "payload", "target"}
 
-    assert isinstance(params["event_id"], UUID)
     assert params["action"] == "report.artifact.stored"
-    assert params["entity_type"] == "report_artifact"
-    assert params["entity_id"] == artifact.object_key
+    assert params["target"] == artifact.object_key
     assert params["actor"] == "acct-123"
 
-    created_at = params["event_time"]
+    created_at = params["created_at"]
     assert isinstance(created_at, datetime)
     assert created_at.tzinfo is timezone.utc
     assert created_at == artifact.created_at
 
-    metadata_payload = json.loads(params["metadata"])
+    payload = json.loads(params["payload"])
+    assert payload["entity"] == {"type": "report_artifact", "id": artifact.object_key}
+    metadata_payload = payload["metadata"]
     assert metadata_payload["checksum"] == artifact.checksum
     assert metadata_payload["checksum_object_key"] == artifact.checksum_object_key
     assert metadata_payload["content_type"] == "text/csv"

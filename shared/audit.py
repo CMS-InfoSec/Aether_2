@@ -37,7 +37,7 @@ class AuditLogStore:
 
 
 class TimescaleAuditLogger:
-    """Writer abstraction for the TimescaleDB ``audit_log`` hypertable."""
+    """Writer abstraction for the TimescaleDB ``audit_logs`` hypertable."""
 
     def __init__(self, store: AuditLogStore) -> None:
         self._store = store
