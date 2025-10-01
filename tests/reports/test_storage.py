@@ -41,6 +41,16 @@ def test_store_artifact_writes_expected_audit_log(tmp_path: Path) -> None:
 
     query, params = session.executions[0]
     assert "INSERT INTO audit_log" in query
+    expected_columns = """
+                event_id,
+                entity_type,
+                entity_id,
+                actor,
+                action,
+                event_time,
+                metadata
+    """.strip()
+    assert expected_columns in query
     assert set(params) == {
         "event_id",
         "action",
