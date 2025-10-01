@@ -10,6 +10,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_EVEN, ROUND_UP
 
 from pathlib import Path
@@ -202,6 +203,7 @@ class OrderRecord:
     side: Optional[str] = None
     pre_trade_mid: Optional[Decimal] = None
     recorded_qty: Decimal = Decimal("0")
+    requested_qty: Optional[Decimal] = None
 
 
 @dataclass
@@ -209,6 +211,7 @@ class ChildOrderRecord:
     client_id: str
     exchange_order_id: str
     transport: str
+    quantity: Decimal = Decimal("0")
 
 
 
@@ -676,6 +679,9 @@ class AccountContext:
         self.routing = LatencyRouter(account_id)
 
         self._impact_store: ImpactAnalyticsStore = impact_store
+        self._reconcile_task: Optional[asyncio.Task[None]] = None
+        self._reconcile_interval = max(float(os.environ.get("OMS_RECONCILE_INTERVAL", "30")), 0.0)
+        self._reconcile_lock = asyncio.Lock()
 
 
     async def start(self) -> None:
@@ -693,6 +699,13 @@ class AccountContext:
             await self.ws_client.ensure_connected()
             await self.ws_client.subscribe_private(["openOrders", "ownTrades"])
             await self.routing.start(self.ws_client, self.rest_client)
+            if (
+                self._reconcile_interval > 0
+                and (self._reconcile_task is None or self._reconcile_task.done())
+            ):
+                self._reconcile_task = asyncio.create_task(
+                    self._reconcile_loop(), name=f"{self.account_id}-reconcile"
+                )
 
     async def close(self) -> None:
         await self.routing.stop()
@@ -707,6 +720,41 @@ class AccountContext:
             await self.rest_client.close()
         self._child_parent.clear()
         self._child_results.clear()
+        if self._reconcile_task is not None:
+            self._reconcile_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._reconcile_task
+            self._reconcile_task = None
+
+    async def _reconcile_loop(self) -> None:
+        interval = max(self._reconcile_interval, 1.0)
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    await self._perform_reconciliation()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "Periodic reconciliation failed for account %s: %s",
+                        self.account_id,
+                        exc,
+                    )
+        finally:
+            logger.debug("Reconciliation loop stopped for account %s", self.account_id)
+
+    async def _perform_reconciliation(self) -> None:
+        async with self._reconcile_lock:
+            orders = await self.resync_from_exchange(replace=False)
+            fills = await self.resync_trades()
+        if orders or fills:
+            logger.info(
+                "Reconciled Kraken state for account %s (orders=%s, fills=%s)",
+                self.account_id,
+                orders,
+                fills,
+            )
 
     async def _apply_stream_state(self, state: OrderState) -> None:
         if not state.client_order_id:
@@ -732,6 +780,7 @@ class AccountContext:
                             client_id=child.client_id,
                             exchange_order_id=result.exchange_order_id,
                             transport=state.transport,
+                            quantity=child.quantity,
                         )
                         break
             transports: Set[str] = set()
@@ -767,16 +816,21 @@ class AccountContext:
                     result=result,
                     transport=state.transport,
                     children=None,
+                    requested_qty=existing.requested_qty if existing else None,
                 )
+            requested_qty = existing.requested_qty if existing else None
+            if requested_qty is None and children:
+                requested_qty = sum((child.quantity for child in children), Decimal("0"))
             self._orders[parent_key] = OrderRecord(
                 client_id=parent_key,
                 result=aggregate_result,
                 transport=transport,
                 children=children,
+                requested_qty=requested_qty,
             )
 
 
-    async def resync_from_exchange(self) -> int:
+    async def resync_from_exchange(self, *, replace: bool = True) -> int:
         await self.start()
 
         if self.ws_client is None:
@@ -806,7 +860,7 @@ class AccountContext:
                 )
                 snapshot = []
 
-        return await self._apply_open_order_snapshot(snapshot)
+        return await self._apply_open_order_snapshot(snapshot, replace=replace)
 
     async def resync_positions(self) -> int:
         await self.start()
@@ -895,13 +949,16 @@ class AccountContext:
 
         return True
 
-    async def _apply_open_order_snapshot(self, orders: Iterable[Dict[str, Any]]) -> int:
-        async with self._orders_lock:
-            self._orders.clear()
-            self._child_parent.clear()
-            self._child_results.clear()
+    async def _apply_open_order_snapshot(
+        self, orders: Iterable[Dict[str, Any]] | None, *, replace: bool
+    ) -> int:
+        if replace:
+            async with self._orders_lock:
+                self._orders.clear()
+                self._child_parent.clear()
+                self._child_results.clear()
 
-        if orders is None:
+        if not orders:
             return 0
 
         applied = 0
@@ -1230,6 +1287,7 @@ class AccountContext:
                         client_id=client_id_used,
                         exchange_order_id=child_result.exchange_order_id,
                         transport=transport,
+                        quantity=child_qty,
                     )
                 )
 
@@ -1247,6 +1305,7 @@ class AccountContext:
                     result=aggregated_result,
                     transport=aggregate_transport,
                     children=child_records,
+                    requested_qty=sum((child.quantity for child in child_records), Decimal("0")),
                 )
                 for child_result, child_record in zip(child_results, child_records):
                     self._child_results[child_record.client_id] = child_result
@@ -1256,6 +1315,7 @@ class AccountContext:
                             result=child_result,
                             transport=child_record.transport,
                             children=None,
+                            requested_qty=child_record.quantity,
                         )
                 self._update_child_mapping(request.client_id, child_records)
             return aggregated_result
@@ -1393,6 +1453,7 @@ class AccountContext:
             "ordertype": request.order_type.lower(),
             "volume": str(qty),
         }
+        payload["idempotencyKey"] = client_id or request.client_id
         if price is not None:
             payload["price"] = str(price)
 
@@ -1486,7 +1547,8 @@ class AccountContext:
                 errors=None,
             )
 
-        total_filled = sum(result.filled_qty for result in child_results)
+        total_filled = sum((result.filled_qty for result in child_results), Decimal("0"))
+        requested_total = sum((child.quantity for child in child_records), Decimal("0"))
         notional = Decimal("0")
         errors: List[str] = []
         statuses: List[str] = []
@@ -1511,6 +1573,17 @@ class AccountContext:
             status_value = "rejected"
         elif any(status.startswith("cancel") for status in lowered):
             status_value = "canceled"
+        elif requested_total > 0 and total_filled >= requested_total:
+            status_value = "filled"
+        elif (
+            total_filled > 0
+            and requested_total > 0
+            and not any(
+                status in {"filled", "closed", "canceled", "cancelled", "rejected"}
+                for status in lowered
+            )
+        ):
+            status_value = "partially_filled"
 
         exchange_ids = [child.exchange_order_id for child in child_records if child.exchange_order_id]
         exchange_value = ",".join(exchange_ids) if exchange_ids else parent_client_id
@@ -1540,6 +1613,7 @@ class AccountContext:
         assert self.rest_client is not None
 
         base_payload = dict(payload)
+        base_payload.setdefault("idempotencyKey", base_client_id)
         self.routing.update_probe_template(base_payload)
         preferred = self.routing.preferred_path
         transports = [preferred]
@@ -1557,6 +1631,7 @@ class AccountContext:
             if transport == "rest" and ws_failed:
                 rest_after_ws_attempted = True
                 attempt_payload["clientOrderId"] = self._derive_retry_client_id(base_client_id)
+            attempt_payload.setdefault("idempotencyKey", base_client_id)
 
             start = time.perf_counter()
             try:
@@ -1602,6 +1677,7 @@ class AccountContext:
         if ws_failed and not rest_after_ws_attempted:
             rest_payload = dict(base_payload)
             rest_payload["clientOrderId"] = self._derive_retry_client_id(base_client_id)
+            rest_payload.setdefault("idempotencyKey", base_client_id)
             start = time.perf_counter()
             try:
                 ack = await self.rest_client.add_order(rest_payload)
