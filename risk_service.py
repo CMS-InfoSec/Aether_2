@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import math
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional
@@ -70,6 +72,9 @@ class AccountRiskLimit(Base):
     spread_threshold_bps = Column(Float, nullable=True)
     latency_stall_seconds = Column(Float, nullable=True)
     exchange_outage_block = Column(Integer, nullable=False, default=0)
+    correlation_threshold = Column(Float, nullable=True)
+    correlation_lookback = Column(Integer, nullable=True)
+    diversification_cluster_limits = Column(String, nullable=True)
 
     def __repr__(self) -> str:  # pragma: no cover - debug helper
         return (
@@ -85,7 +90,10 @@ class AccountRiskLimit(Base):
             f"var_99_limit={self.var_99_limit}, "
             f"spread_threshold_bps={self.spread_threshold_bps}, "
             f"latency_stall_seconds={self.latency_stall_seconds}, "
-            f"exchange_outage_block={self.exchange_outage_block}"
+            f"exchange_outage_block={self.exchange_outage_block}, "
+            f"correlation_threshold={self.correlation_threshold}, "
+            f"correlation_lookback={self.correlation_lookback}, "
+            f"diversification_cluster_limits={self.diversification_cluster_limits}"
             ")"
         )
 
@@ -94,6 +102,10 @@ class AccountRiskLimit(Base):
         if not self.instrument_whitelist:
             return []
         return [token.strip() for token in self.instrument_whitelist.split(",") if token.strip()]
+
+    @property
+    def cluster_limits(self) -> Dict[str, float]:
+        return _parse_cluster_limits(self.diversification_cluster_limits)
 
 
 class StubSession:
@@ -131,6 +143,9 @@ _STUB_RISK_LIMITS: Dict[str, Dict[str, float]] = {
         "spread_threshold_bps": 15.0,
         "latency_stall_seconds": 2.5,
         "exchange_outage_block": 1,
+        "correlation_threshold": 0.85,
+        "correlation_lookback": 20,
+        "diversification_cluster_limits": json.dumps({"BTC": 0.4}),
     },
     "ACC-AGGR": {
         "account_id": "ACC-AGGR",
@@ -145,6 +160,9 @@ _STUB_RISK_LIMITS: Dict[str, Dict[str, float]] = {
         "spread_threshold_bps": 10.0,
         "latency_stall_seconds": 1.5,
         "exchange_outage_block": 0,
+        "correlation_threshold": 0.9,
+        "correlation_lookback": 30,
+        "diversification_cluster_limits": json.dumps({"ENERGY": 0.5}),
     },
 }
 
@@ -221,6 +239,22 @@ class AccountPortfolioState(BaseModel):
     var_99: Optional[float] = Field(
         None, ge=0.0, description="Current 1-day 99% Value-at-Risk for the portfolio"
     )
+    instrument_exposure: Dict[str, float] = Field(
+        default_factory=dict,
+        description="Current absolute notional exposure per instrument",
+    )
+    historical_returns: Dict[str, List[float]] = Field(
+        default_factory=dict,
+        description="Historical return series used for correlation analysis",
+    )
+    instrument_clusters: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Mapping from instrument to diversification cluster",
+    )
+    cluster_exposure: Dict[str, float] = Field(
+        default_factory=dict,
+        description="Current absolute exposure per diversification cluster",
+    )
 
 
 class RiskValidationRequest(BaseModel):
@@ -285,6 +319,9 @@ class AccountRiskLimitModel(BaseModel):
     spread_threshold_bps: Optional[float] = None
     latency_stall_seconds: Optional[float] = None
     exchange_outage_block: bool = False
+    correlation_threshold: Optional[float] = None
+    correlation_lookback: Optional[int] = None
+    diversification_cluster_limits: Dict[str, float] = Field(default_factory=dict)
 
     class Config:
         orm_mode = True
@@ -385,6 +422,9 @@ async def get_risk_limits(
         spread_threshold_bps=limits.spread_threshold_bps,
         latency_stall_seconds=limits.latency_stall_seconds,
         exchange_outage_block=bool(limits.exchange_outage_block),
+        correlation_threshold=limits.correlation_threshold,
+        correlation_lookback=limits.correlation_lookback,
+        diversification_cluster_limits=limits.cluster_limits,
     )
 
     response = RiskLimitsResponse(account_id=account_id, limits=limit_model, usage=usage)
@@ -508,6 +548,94 @@ def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
                 details={"var99": state.var_99, "limit": limits.var_99_limit},
             )
 
+    correlation_threshold = getattr(limits, "correlation_threshold", None)
+    correlation_matrix = _compute_correlation_matrix(
+        state.historical_returns,
+        getattr(limits, "correlation_lookback", None),
+    )
+    if (
+        correlation_threshold is not None
+        and intent.side == "buy"
+        and correlation_matrix
+    ):
+        base_exposures = state.instrument_exposure or {}
+        current_correlation = _weighted_portfolio_correlation(
+            base_exposures,
+            intent.instrument_id,
+            correlation_matrix,
+        )
+        projected_exposures = _apply_trade_to_exposures(
+            base_exposures,
+            intent.instrument_id,
+            trade_notional,
+            intent.side,
+        )
+        projected_correlation = _weighted_portfolio_correlation(
+            projected_exposures,
+            intent.instrument_id,
+            correlation_matrix,
+        )
+        if projected_correlation > correlation_threshold and projected_correlation > current_correlation:
+            allowed_notional = _max_trade_notional_for_correlation(
+                base_exposures,
+                intent.instrument_id,
+                trade_notional,
+                intent.side,
+                correlation_matrix,
+                correlation_threshold,
+            )
+            correlation_details = {
+                "current_correlation": current_correlation,
+                "projected_correlation": projected_correlation,
+                "threshold": correlation_threshold,
+                "allowed_notional": allowed_notional,
+            }
+            if allowed_notional <= 0:
+                _register_violation(
+                    "Projected correlation breach: trade blocked",
+                    details=correlation_details,
+                )
+                suggested_quantities.append(0.0)
+            elif allowed_notional < trade_notional:
+                suggested_quantities.append(allowed_notional / intent.notional_per_unit)
+                _register_violation(
+                    "Trade size reduced to maintain correlation threshold",
+                    details=correlation_details,
+                )
+
+    cluster_limits = getattr(limits, "cluster_limits", {})
+    if cluster_limits:
+        instrument_cluster = state.instrument_clusters.get(intent.instrument_id)
+        if instrument_cluster and instrument_cluster in cluster_limits:
+            nav = float(state.net_asset_value) if state.net_asset_value else 0.0
+            current_cluster_exposure = abs(state.cluster_exposure.get(instrument_cluster, 0.0))
+            if intent.side == "buy":
+                projected_cluster_exposure = current_cluster_exposure + trade_notional
+            else:
+                projected_cluster_exposure = max(current_cluster_exposure - trade_notional, 0.0)
+
+            exposure_ratio = (projected_cluster_exposure / nav) if nav else 0.0
+            limit_ratio = float(cluster_limits[instrument_cluster])
+            if exposure_ratio > limit_ratio:
+                diversification_details = {
+                    "cluster": instrument_cluster,
+                    "projected_exposure": projected_cluster_exposure,
+                    "current_exposure": current_cluster_exposure,
+                    "nav": nav,
+                    "threshold_ratio": limit_ratio,
+                    "projected_ratio": exposure_ratio,
+                }
+                if intent.side == "buy":
+                    allowable_increment = max(limit_ratio * nav - current_cluster_exposure, 0.0)
+                    if allowable_increment <= 0:
+                        suggested_quantities.append(0.0)
+                    else:
+                        suggested_quantities.append(allowable_increment / intent.notional_per_unit)
+                _register_violation(
+                    "Diversification constraint breached for cluster",
+                    details=diversification_details,
+                )
+
     telemetry = _load_market_telemetry(intent.instrument_id)
     latency_seconds = _read_prometheus_latency(intent.instrument_id)
     if telemetry and limits.spread_threshold_bps is not None:
@@ -604,6 +732,8 @@ def set_stub_limits(records: Iterable[AccountRiskLimit]) -> None:
 
     _STUB_RISK_LIMITS.clear()
     for record in records:
+        cluster_limits = getattr(record, "cluster_limits", {}) or {}
+        cluster_payload = json.dumps(cluster_limits) if cluster_limits else None
         _STUB_RISK_LIMITS[record.account_id] = {
             "account_id": record.account_id,
             "max_daily_loss": record.max_daily_loss,
@@ -617,6 +747,9 @@ def set_stub_limits(records: Iterable[AccountRiskLimit]) -> None:
             "spread_threshold_bps": record.spread_threshold_bps,
             "latency_stall_seconds": record.latency_stall_seconds,
             "exchange_outage_block": 1 if record.exchange_outage_block else 0,
+            "correlation_threshold": getattr(record, "correlation_threshold", None),
+            "correlation_lookback": getattr(record, "correlation_lookback", None),
+            "diversification_cluster_limits": cluster_payload,
         }
 
 
@@ -647,6 +780,150 @@ def _read_prometheus_latency(instrument_id: str) -> Optional[float]:
     if key in _STUB_PROM_METRICS:
         return _STUB_PROM_METRICS[key]
     return _STUB_PROM_METRICS.get("latency_seconds")
+
+
+def _parse_cluster_limits(raw_value: Optional[Any]) -> Dict[str, float]:
+    if not raw_value:
+        return {}
+    if isinstance(raw_value, dict):
+        parsed: Dict[str, float] = {}
+        for key, value in raw_value.items():
+            try:
+                parsed[str(key)] = float(value)
+            except (TypeError, ValueError):
+                logger.debug("Skipping invalid cluster limit entry", extra={"cluster": key, "value": value})
+        return parsed
+    if isinstance(raw_value, str):
+        try:
+            data = json.loads(raw_value)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            logger.warning("Failed to parse diversification cluster limits", extra={"value": raw_value})
+            return {}
+        return _parse_cluster_limits(data)
+    logger.debug("Unsupported cluster limit format", extra={"value": raw_value})
+    return {}
+
+
+def _compute_correlation_matrix(
+    return_series: Dict[str, List[float]], window: Optional[int]
+) -> Dict[str, Dict[str, float]]:
+    instruments = sorted(return_series)
+    matrix: Dict[str, Dict[str, float]] = {}
+    if not instruments:
+        return matrix
+
+    for index, instrument in enumerate(instruments):
+        series_i = list(return_series.get(instrument, []))
+        if window and window > 0:
+            series_i = series_i[-window:]
+        if len(series_i) < 2:
+            continue
+        matrix.setdefault(instrument, {})[instrument] = 1.0
+        for other in instruments[index + 1 :]:
+            series_j = list(return_series.get(other, []))
+            if window and window > 0:
+                series_j = series_j[-window:]
+            corr = _pearson_correlation(series_i, series_j)
+            if corr is None:
+                continue
+            matrix.setdefault(instrument, {})[other] = corr
+            matrix.setdefault(other, {})[instrument] = corr
+
+    return matrix
+
+
+def _pearson_correlation(series_a: List[float], series_b: List[float]) -> Optional[float]:
+    if not series_a or not series_b:
+        return None
+    length = min(len(series_a), len(series_b))
+    if length < 2:
+        return None
+    trimmed_a = series_a[-length:]
+    trimmed_b = series_b[-length:]
+    mean_a = sum(trimmed_a) / length
+    mean_b = sum(trimmed_b) / length
+    numerator = sum((a - mean_a) * (b - mean_b) for a, b in zip(trimmed_a, trimmed_b))
+    denom_a = math.sqrt(sum((a - mean_a) ** 2 for a in trimmed_a))
+    denom_b = math.sqrt(sum((b - mean_b) ** 2 for b in trimmed_b))
+    if denom_a == 0 or denom_b == 0:
+        return 0.0
+    return numerator / (denom_a * denom_b)
+
+
+def _lookup_correlation(
+    matrix: Dict[str, Dict[str, float]], instrument_a: str, instrument_b: str
+) -> Optional[float]:
+    if instrument_a in matrix and instrument_b in matrix[instrument_a]:
+        return matrix[instrument_a][instrument_b]
+    if instrument_b in matrix and instrument_a in matrix[instrument_b]:
+        return matrix[instrument_b][instrument_a]
+    return None
+
+
+def _apply_trade_to_exposures(
+    exposures: Dict[str, float], instrument: str, trade_notional: float, side: str
+) -> Dict[str, float]:
+    updated = {key: abs(float(value)) for key, value in exposures.items() if abs(float(value)) > 0}
+    current = updated.get(instrument, 0.0)
+    if side == "buy":
+        updated[instrument] = current + trade_notional
+    else:
+        updated[instrument] = max(current - trade_notional, 0.0)
+        if updated[instrument] <= 0:
+            updated.pop(instrument, None)
+    return updated
+
+
+def _weighted_portfolio_correlation(
+    exposures: Dict[str, float], instrument: str, matrix: Dict[str, Dict[str, float]]
+) -> float:
+    if not exposures:
+        return 0.0
+    weighted_correlations: List[float] = []
+    weights: List[float] = []
+    for other, exposure in exposures.items():
+        if other == instrument:
+            continue
+        weight = abs(float(exposure))
+        if weight <= 0:
+            continue
+        correlation = _lookup_correlation(matrix, instrument, other)
+        if correlation is None:
+            continue
+        weights.append(weight)
+        weighted_correlations.append(weight * correlation)
+    if not weights:
+        return 0.0
+    total_weight = sum(weights)
+    if total_weight <= 0:
+        return 0.0
+    return sum(weighted_correlations) / total_weight
+
+
+def _max_trade_notional_for_correlation(
+    exposures: Dict[str, float],
+    instrument: str,
+    requested_notional: float,
+    side: str,
+    matrix: Dict[str, Dict[str, float]],
+    threshold: float,
+) -> float:
+    if requested_notional <= 0 or side != "buy":
+        return requested_notional
+
+    low = 0.0
+    high = requested_notional
+    allowed = 0.0
+    for _ in range(25):
+        mid = (low + high) / 2.0
+        projected = _apply_trade_to_exposures(exposures, instrument, mid, side)
+        correlation = _weighted_portfolio_correlation(projected, instrument, matrix)
+        if correlation <= threshold or math.isclose(correlation, threshold, rel_tol=1e-5, abs_tol=1e-5):
+            allowed = mid
+            low = mid
+        else:
+            high = mid
+    return max(0.0, min(allowed, requested_notional))
 
 
 def set_stub_account_usage(account_id: str, usage: Dict[str, float]) -> None:
