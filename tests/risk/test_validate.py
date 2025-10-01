@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 from collections.abc import Generator
 
 import pytest
@@ -7,6 +8,7 @@ import pytest
 from services.common.adapters import TimescaleAdapter
 from services.common.schemas import RiskValidationRequest, RiskValidationResponse
 from services.risk.engine import RiskEngine
+
 from services.universe.repository import MarketSnapshot, UniverseRepository
 
 
@@ -42,6 +44,7 @@ def reset_state() -> Generator[None, None, None]:
     yield
     TimescaleAdapter.reset()
     UniverseRepository.seed_market_snapshots(original_snapshots)
+
 
 
 def make_request(**overrides: float | str | dict[str, float]) -> RiskValidationRequest:
@@ -90,8 +93,10 @@ def test_engine_rejects_non_whitelisted_instrument() -> None:
     assert response.valid is False
     assert any("approved trading universe" in reason for reason in response.reasons)
 
+
     events = TimescaleAdapter(account_id=account).events()
     assert any(event["type"] == "universe_rejection" for event in events["events"])
+
 
 
 def test_engine_flags_var_breach_and_records_event() -> None:
@@ -104,24 +109,33 @@ def test_engine_flags_var_breach_and_records_event() -> None:
     assert response.valid is False
     assert any("VaR" in reason for reason in response.reasons)
 
+
     events = TimescaleAdapter(account_id=account).events()
     assert any(event["type"] == "var_breach" for event in events["events"])
     assert any(event["type"] == "risk_rejected" for event in events["events"])
 
 
+
 def test_engine_honors_kill_switch_and_short_circuits() -> None:
     account = "admin-eu"
     adapter = TimescaleAdapter(account_id=account)
+
     original_config = adapter.load_risk_config()
     try:
         TimescaleAdapter._risk_configs[account]["kill_switch"] = True  # type: ignore[attr-defined]
         engine = RiskEngine(account_id=account)
         request = make_request(account_id=account)
 
-        response = engine.validate(request)
 
-        assert response.valid is False
-        assert response.reasons == ["Risk kill switch engaged for account"]
+    engine = RiskEngine(account_id=account)
+    request = make_request(account_id=account)
+
+    response = engine.validate(request)
+
+
+    assert response.valid is False
+    assert response.reasons == ["Risk kill switch engaged for account"]
+
 
         events = TimescaleAdapter(account_id=account).events()
         assert any(event["type"] == "kill_switch_triggered" for event in events["events"])
@@ -139,3 +153,4 @@ def test_engine_records_events_without_exception() -> None:
     assert isinstance(response, RiskValidationResponse)
     events = TimescaleAdapter(account_id=account).events()["events"]
     assert all("type" in event and "payload" in event for event in events)
+

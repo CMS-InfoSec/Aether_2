@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 
+import base64
+import logging
 from copy import deepcopy
 from dataclasses import dataclass, field
 
@@ -10,6 +12,17 @@ from typing import Any, Callable, ClassVar, Dict, List, Optional
 from shared.k8s import KrakenSecretStore
 
 from services.universe.repository import UniverseRepository
+
+
+logger = logging.getLogger(__name__)
+
+
+def _mask_secret(value: str) -> str:
+    if not value:
+        return "***"
+    if len(value) <= 4:
+        return "*" * len(value)
+    return f"{value[:2]}{'*' * (len(value) - 4)}{value[-2:]}"
 
 
 @dataclass
@@ -41,9 +54,13 @@ class TimescaleAdapter:
     account_id: str
 
     _metrics: ClassVar[Dict[str, Dict[str, float]]] = {}
+
     _telemetry: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
+
     _events: ClassVar[Dict[str, Dict[str, List[Dict[str, Any]]]]] = {}
+    _risk_configs: ClassVar[Dict[str, Dict[str, Any]]] = {}
     _credential_rotations: ClassVar[Dict[str, Dict[str, Any]]] = {}
+
     _risk_configs: ClassVar[Dict[str, Dict[str, Any]]] = {}
     _daily_usage: ClassVar[Dict[str, Dict[str, Dict[str, float]]]] = {}
     _instrument_exposures: ClassVar[Dict[str, Dict[str, float]]] = {}
@@ -56,13 +73,18 @@ class TimescaleAdapter:
         "max_nav_percent": 0.20,
         "var_limit": 250_000.0,
         "spread_limit_bps": 25.0,
+
         "latency_limit_ms": 250.0,
-        "diversification_rules": {"max_single_instrument_percent": 0.25},
+        "diversification_rules": {"max_single_instrument_percent": 0.35},
+        "kill_switch": False,
     }
 
     def __post_init__(self) -> None:
         self._metrics.setdefault(self.account_id, {"limit": 1_000_000.0, "usage": 0.0})
+        self._daily_usage.setdefault(self.account_id, {"loss": 0.0, "fee": 0.0})
+        self._instrument_exposure.setdefault(self.account_id, {})
         self._telemetry.setdefault(self.account_id, [])
+
 
         account_events = self._events.setdefault(
             self.account_id,
@@ -76,7 +98,22 @@ class TimescaleAdapter:
         self._risk_configs.setdefault(self.account_id, deepcopy(self._default_risk_config))
         self._daily_usage.setdefault(self.account_id, {})
         self._instrument_exposures.setdefault(self.account_id, {})
+
         self._credential_rotations.setdefault(self.account_id, {})
+        self._risk_configs.setdefault(
+            self.account_id,
+            {
+                "nav": 2_500_000.0,
+                "loss_cap": 150_000.0,
+                "fee_cap": 50_000.0,
+                "max_nav_percent": 0.25,
+                "var_limit": 120_000.0,
+                "spread_limit_bps": 50.0,
+                "latency_limit_ms": 250.0,
+                "diversification_rules": {"max_single_instrument_percent": 0.35},
+                "kill_switch": False,
+            },
+        )
 
     # ------------------------------------------------------------------
     # OMS-inspired metrics
@@ -97,6 +134,7 @@ class TimescaleAdapter:
         self._events[self.account_id]["fills"].append(record)
 
     def events(self) -> Dict[str, List[Dict[str, Any]]]:
+
         stored = self._events.get(
             self.account_id,
             {"acks": [], "fills": [], "events": [], "credential_rotations": []},
@@ -114,11 +152,13 @@ class TimescaleAdapter:
             "credential_rotations": [
                 deepcopy(entry) for entry in stored.get("credential_rotations", [])
             ],
+
         }
 
     # ------------------------------------------------------------------
     # Timescale-inspired risk state helpers
     # ------------------------------------------------------------------
+
     def load_risk_config(self) -> Dict[str, Any]:
         config = self._risk_configs.setdefault(
             self.account_id, deepcopy(self._default_risk_config)
@@ -178,16 +218,20 @@ class TimescaleAdapter:
         self._events[self.account_id]["credential_rotations"].append(record)
         return deepcopy(record)
 
+
     def credential_rotation_status(self) -> Optional[Dict[str, Any]]:
         rotations = self._events.get(self.account_id, {}).get("credential_rotations", [])
         if not rotations:
             return None
-        return deepcopy(rotations[-1])
+
+        return deepcopy(record)
+
 
     # ------------------------------------------------------------------
     # Test helpers
     # ------------------------------------------------------------------
     @classmethod
+
     def reset(cls, account_id: str | None = None) -> None:
         if account_id is None:
             cls._metrics.clear()
@@ -210,6 +254,7 @@ class TimescaleAdapter:
 
 
 
+
 @dataclass
 class RedisFeastAdapter:
     account_id: str
@@ -217,7 +262,9 @@ class RedisFeastAdapter:
         default=UniverseRepository, repr=False
     )
 
+
     _repository: UniverseRepository = field(init=False, repr=False)
+
 
     _features: ClassVar[Dict[str, Dict[str, Any]]] = {
         "admin-eu": {"approved": ["BTC-USD", "ETH-USD"], "fees": {"BTC-USD": {"maker": 0.1, "taker": 0.2}}},
@@ -249,13 +296,18 @@ class RedisFeastAdapter:
 
 
     def __post_init__(self) -> None:
+
         self._repository = self.repository_factory(self.account_id)
 
+
     def approved_instruments(self) -> List[str]:
+        assert self._repository is not None
         return self._repository.approved_universe()
 
     def fee_override(self, instrument: str) -> Dict[str, Any] | None:
+        assert self._repository is not None
         return self._repository.fee_override(instrument)
+
 
     def fetch_online_features(self, instrument: str) -> Dict[str, Any]:
         account_store = self._online_feature_store.get(self.account_id, {})
@@ -281,9 +333,11 @@ class KrakenSecretManager:
         assert self.secret_store is not None
         return self.secret_store.secret_name(self.account_id)
 
+
     def get_credentials(self) -> Dict[str, str]:
         assert self.secret_store is not None
         return self.secret_store.read_credentials(self.account_id)
+
 
     def rotate_credentials(self, *, api_key: str, api_secret: str) -> Dict[str, Any]:
         assert self.secret_store is not None  # for type checkers
@@ -302,6 +356,13 @@ class KrakenSecretManager:
             "before": before_status,
         }
 
+    def get_credentials(self) -> Dict[str, str]:
+        assert self.secret_store is not None
+        credentials = self.secret_store.read_credentials(self.account_id)
+        if credentials:
+            return credentials
+        return {"api_key": f"demo-key-{self.account_id}", "api_secret": f"demo-secret-{self.account_id}"}
+
     def status(self) -> Optional[Dict[str, Any]]:
         assert self.timescale is not None
         return self.timescale.credential_rotation_status()
@@ -309,3 +370,4 @@ class KrakenSecretManager:
 
 def default_fee(currency: str = "USD") -> Dict[str, float | str]:
     return {"currency": currency, "maker": 0.1, "taker": 0.2}
+
