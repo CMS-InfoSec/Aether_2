@@ -204,40 +204,35 @@ class TimescaleAdapter:
     # Credential rotation tracking & test helpers
     # ------------------------------------------------------------------
     def record_credential_rotation(
-
         self, *, secret_name: str, rotated_at: datetime
     ) -> Dict[str, Any]:
+        existing = self._credential_rotations.get(self.account_id) or {}
+        created_at = existing.get("created_at", rotated_at)
 
-        record = self._credential_rotations.setdefault(self.account_id, {})
+        metadata = {
+            "secret_name": secret_name,
+            "created_at": created_at,
+            "rotated_at": rotated_at,
+        }
 
-        created_at = record.get("created_at", rotated_at)
-        record["secret_name"] = secret_name
-        record["created_at"] = created_at
-        record["rotated_at"] = rotated_at
-
-
-        metadata = deepcopy(record)
+        self._credential_rotations[self.account_id] = deepcopy(metadata)
 
         events = self._credential_events.setdefault(self.account_id, [])
-        payload = {
-            "event": "rotation",
-            "secret_name": secret_name,
-            "rotated_at": rotated_at,
-            "timestamp": rotated_at,
-            "created_at": created_at,
-        }
-        events.append(deepcopy(payload))
+        events.append(
+            {
+                "event": "rotation",
+                "secret_name": secret_name,
+                "metadata": deepcopy(metadata),
+                "timestamp": rotated_at,
+            }
+        )
 
-        return metadata
-
-
+        return deepcopy(metadata)
 
     def credential_rotation_status(self) -> Optional[Dict[str, Any]]:
         record = self._credential_rotations.get(self.account_id)
-        if record:
-            return deepcopy(record)
-
-
+        if not record:
+            return None
         return deepcopy(record)
 
 
