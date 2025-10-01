@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from fastapi.testclient import TestClient
+
 from services.common.adapters import RedisFeastAdapter
 from services.universe.repository import MarketSnapshot, UniverseRepository
+from services.universe import main as universe_main
 
 
 def setup_function(function: object) -> None:
@@ -95,3 +98,34 @@ def test_volatility_threshold_filters_low_and_high_risk_assets() -> None:
 
     assert "ADA-USD" not in approved_universe
     assert "AVAX-USD" in approved_universe
+
+
+class StubUniverseRepository:
+    def __init__(self) -> None:
+        self._approved = ["BTC-USD"]
+        self._fees = {"BTC-USD": {"currency": "USD", "maker": 0.1, "taker": 0.2}}
+
+    def approved_universe(self) -> list[str]:
+        return list(self._approved)
+
+    def fee_override(self, instrument: str) -> dict[str, float | str] | None:
+        return dict(self._fees[instrument]) if instrument in self._fees else None
+
+
+def test_fastapi_endpoint_uses_cached_repository(monkeypatch) -> None:
+    stub_repository = StubUniverseRepository()
+
+    class StubRedisFeastAdapter(RedisFeastAdapter):
+        def __init__(self, account_id: str) -> None:
+            super().__init__(account_id=account_id, repository=stub_repository)
+
+    monkeypatch.setattr(universe_main, "RedisFeastAdapter", StubRedisFeastAdapter)
+
+    client = TestClient(universe_main.app)
+    response = client.get("/universe/approved", headers={"X-Account-ID": "admin-eu"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["account_id"] == "admin-eu"
+    assert payload["instruments"] == ["BTC-USD"]
+    assert payload["fee_overrides"]["BTC-USD"]["maker"] == 0.1
