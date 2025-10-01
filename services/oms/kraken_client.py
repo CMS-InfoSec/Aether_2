@@ -52,12 +52,22 @@ class KrakenWSClient:
         account_id: str,
         *,
         session_factory: Optional[Callable[[Dict[str, str]], Any]] = None,
+        credentials: Optional[Dict[str, Any]] = None,
         rest_fallback: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
         max_retries: int = 2,
         retry_delay: float = 0.1,
     ) -> None:
-        credentials = KrakenSecretManager(account_id).get_credentials()
-        self._credentials = credentials
+        if credentials is not None:
+            resolved_credentials = credentials
+        else:
+            try:
+                resolved_credentials = KrakenSecretManager(account_id).get_credentials()
+            except RuntimeError:
+                if session_factory is None:
+                    raise
+                resolved_credentials = {"api_key": "", "api_secret": "", "metadata": {}}
+
+        self._credentials = resolved_credentials
         self._session_factory = session_factory or (lambda creds: _LoopbackSession(creds))
         self._rest_fallback = rest_fallback or self._default_rest_fallback
         self._max_retries = max_retries
