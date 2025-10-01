@@ -131,7 +131,9 @@ class AlertManager:
         self.metrics = metrics
         self.alertmanager_url = alertmanager_url or os.getenv("ALERTMANAGER_URL")
         self.timeout = timeout
-        self.push_severities = {s.lower() for s in (push_severities or ("critical", "high"))}
+        self.push_severities = {
+            s.lower() for s in (push_severities or ("critical", "high", "warning"))
+        }
         self._trade_rejection_counts: Dict[str, int] = defaultdict(int)
 
     # ------------------------------------------------------------------
