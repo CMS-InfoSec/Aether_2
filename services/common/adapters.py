@@ -68,7 +68,9 @@ class TimescaleAdapter:
     _daily_usage: ClassVar[Dict[str, Dict[str, Dict[str, float]]]] = {}
     _instrument_exposures: ClassVar[Dict[str, Dict[str, float]]] = {}
     _rolling_volume: ClassVar[Dict[str, Dict[str, Dict[str, Any]]]] = {}
-    _kill_events: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
+
+    _cvar_results: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
+
 
     _default_risk_config: ClassVar[Dict[str, Any]] = {
         "kill_switch": False,
@@ -96,6 +98,8 @@ class TimescaleAdapter:
         self._telemetry.setdefault(self.account_id, [])
         self._credential_events.setdefault(self.account_id, [])
         self._kill_events.setdefault(self.account_id, [])
+
+        self._cvar_results.setdefault(self.account_id, [])
 
 
         account_events = self._events.setdefault(
@@ -229,6 +233,36 @@ class TimescaleAdapter:
     def instrument_exposure(self, instrument: str) -> float:
         exposures = self._instrument_exposures.get(self.account_id, {})
         return float(exposures.get(instrument, 0.0))
+
+    def open_positions(self) -> Dict[str, float]:
+        exposures = self._instrument_exposures.get(self.account_id, {})
+        return {symbol: float(notional) for symbol, notional in exposures.items()}
+
+    def record_cvar_result(
+        self,
+        *,
+        horizon: str,
+        var95: float,
+        cvar95: float,
+        prob_cap_hit: float,
+        timestamp: datetime | None = None,
+    ) -> Dict[str, Any]:
+        ts = timestamp or datetime.now(timezone.utc)
+        record = {
+            "account_id": self.account_id,
+            "horizon": horizon,
+            "var95": float(var95),
+            "cvar95": float(cvar95),
+            "prob_cap_hit": float(prob_cap_hit),
+            "ts": ts,
+        }
+        history = self._cvar_results.setdefault(self.account_id, [])
+        history.append(record)
+        return dict(record)
+
+    def cvar_results(self) -> List[Dict[str, Any]]:
+        records = self._cvar_results.get(self.account_id, [])
+        return [dict(entry) for entry in records]
 
     # ------------------------------------------------------------------
     # Rolling volume helpers
@@ -377,7 +411,9 @@ class TimescaleAdapter:
             cls._credential_rotations,
             cls._credential_events,
             cls._rolling_volume,
-            cls._kill_events,
+
+            cls._cvar_results,
+
         )
 
         if account_id is None:
