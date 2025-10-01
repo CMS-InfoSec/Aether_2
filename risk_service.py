@@ -6,7 +6,9 @@ import logging
 import os
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+
 from typing import Dict, Iterable, Iterator, List, Optional
+
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, model_validator
@@ -15,11 +17,13 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+
 from metrics import (
     increment_trade_rejection,
     record_fees_nav_pct,
     setup_metrics,
 )
+from services.common.security import require_admin_account
 
 
 logger = logging.getLogger(__name__)
@@ -65,6 +69,7 @@ class AccountRiskLimit(Base):
     spread_threshold_bps = Column(Float, nullable=True)
     latency_stall_seconds = Column(Float, nullable=True)
     exchange_outage_block = Column(Integer, nullable=False, default=0)
+    target_volatility = Column(Float, nullable=True)
 
     def __repr__(self) -> str:  # pragma: no cover - debug helper
         return (
@@ -80,7 +85,8 @@ class AccountRiskLimit(Base):
             f"var_99_limit={self.var_99_limit}, "
             f"spread_threshold_bps={self.spread_threshold_bps}, "
             f"latency_stall_seconds={self.latency_stall_seconds}, "
-            f"exchange_outage_block={self.exchange_outage_block}"
+            f"exchange_outage_block={self.exchange_outage_block}, "
+            f"target_volatility={self.target_volatility}"
             ")"
         )
 
@@ -145,6 +151,7 @@ _DEFAULT_LIMITS: List[Dict[str, object]] = [
         "spread_threshold_bps": 20.0,
         "latency_stall_seconds": 3.0,
         "exchange_outage_block": 1,
+        "target_volatility": 3.0,
     },
     {
         "account_id": "director-2",
@@ -159,6 +166,7 @@ _DEFAULT_LIMITS: List[Dict[str, object]] = [
         "spread_threshold_bps": 18.0,
         "latency_stall_seconds": 2.5,
         "exchange_outage_block": 0,
+        "target_volatility": 4.5,
     },
 ]
 
@@ -255,6 +263,43 @@ _STUB_PROM_METRICS: Dict[str, float] = {
 }
 
 
+_STUB_PRICE_HISTORY: Dict[str, List[Dict[str, float]]] = {
+    "AAPL": [
+        {"high": 178.5, "low": 174.4, "close": 176.3},
+        {"high": 179.1, "low": 175.2, "close": 178.7},
+        {"high": 181.2, "low": 176.8, "close": 180.3},
+        {"high": 180.9, "low": 177.6, "close": 179.4},
+        {"high": 182.4, "low": 178.9, "close": 181.7},
+        {"high": 183.2, "low": 179.7, "close": 182.1},
+        {"high": 184.0, "low": 180.1, "close": 183.5},
+        {"high": 185.6, "low": 181.4, "close": 184.2},
+        {"high": 186.2, "low": 182.7, "close": 185.3},
+        {"high": 187.3, "low": 183.5, "close": 186.8},
+        {"high": 188.8, "low": 184.6, "close": 187.1},
+        {"high": 189.5, "low": 185.2, "close": 188.6},
+        {"high": 190.7, "low": 186.1, "close": 189.4},
+        {"high": 191.2, "low": 187.5, "close": 190.8},
+        {"high": 192.3, "low": 188.4, "close": 191.5},
+    ]
+}
+
+
+_STUB_ACCOUNT_RETURNS: Dict[str, List[float]] = {
+    "ACC-DEFAULT": [-1500.0 + (i % 5) * 100 for i in range(260)],
+    "ACC-AGGR": [-4500.0 + (i % 7) * 250 for i in range(260)],
+}
+
+
+_STUB_FILLS: List[Dict[str, object]] = [
+    {
+        "account_id": "ACC-DEFAULT",
+        "timestamp": datetime.utcnow().isoformat(),
+        "pnl": -2500.0,
+        "fee": 125.0,
+    }
+]
+
+
 class TradeIntent(BaseModel):
     """Represents the incoming trading intent from the policy layer."""
 
@@ -341,6 +386,9 @@ class RiskEvaluationContext(BaseModel):
     def intended_notional(self) -> float:
         return float(self.request.intent.notional)
 
+    class Config:
+        arbitrary_types_allowed = True
+
 
 class AccountUsage(BaseModel):
     account_id: str
@@ -364,6 +412,7 @@ class AccountRiskLimitModel(BaseModel):
     spread_threshold_bps: Optional[float] = None
     latency_stall_seconds: Optional[float] = None
     exchange_outage_block: bool = False
+    target_volatility: Optional[float] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -378,6 +427,7 @@ app = FastAPI(title="Risk Validation Service", version="1.0.0")
 setup_metrics(app)
 
 
+
 @app.on_event("startup")
 def _on_startup() -> None:
     _bootstrap_storage()
@@ -388,27 +438,41 @@ _bootstrap_storage()
 
 @app.post("/risk/validate", response_model=RiskValidationResponse)
 async def validate_risk(request: RiskValidationRequest) -> RiskValidationResponse:
+
     """Validate a trading intent against account level risk limits."""
 
-    logger.info("Received risk validation request for account %s", request.account_id)
+    try:
+        request = RiskValidationRequest.parse_obj(payload)
+    except ValidationError as exc:  # pragma: no cover - FastAPI handles validation
+        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+
+    if request.account_id != account_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account mismatch between header and payload.",
+        )
+
+    logger.info("Received risk validation request for account %s", account_id)
 
     try:
-        limits = _load_account_limits(request.account_id)
+        limits = _load_account_limits(account_id)
     except ConfigError as exc:
+
         logger.exception("Unable to load risk limits for account %s", request.account_id)
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
 
     context = RiskEvaluationContext(request=request, limits=limits)
 
     try:
         decision = _evaluate(context)
     except Exception as exc:  # pragma: no cover - defensive programming
-        logger.exception("Risk evaluation failed for account %s", request.account_id)
+        logger.exception("Risk evaluation failed for account %s", account_id)
         raise HTTPException(status_code=500, detail="Internal risk evaluation failure") from exc
 
     logger.info(
         "Risk evaluation completed for account %s: passed=%s",
-        request.account_id,
+        account_id,
         decision.pass_,
     )
     symbol = str(context.request.intent.instrument_id)
@@ -416,7 +480,7 @@ async def validate_risk(request: RiskValidationRequest) -> RiskValidationRespons
     if not decision.pass_:
         _audit_failure(context, decision)
         increment_trade_rejection(
-            request.account_id,
+            account_id,
             symbol,
         )
 
@@ -425,16 +489,18 @@ async def validate_risk(request: RiskValidationRequest) -> RiskValidationRespons
     fees = float(state.fees_paid) if state.fees_paid else 0.0
     fees_pct = (fees / nav * 100.0) if nav else 0.0
     record_fees_nav_pct(
-        request.account_id,
+        account_id,
         symbol,
         fees_pct,
     )
 
-    return decision
+    return decision.dict(by_alias=True)
 
 
-@app.get("/risk/limits", response_model=RiskLimitsResponse)
-async def get_risk_limits(account_id: str = Query(..., description="Account identifier")) -> RiskLimitsResponse:
+@app.get("/risk/limits")
+async def get_risk_limits(
+    account_id: str = Depends(require_admin_account),
+) -> Dict[str, Any]:
     try:
         limits = _load_account_limits(account_id)
     except ConfigError as exc:
@@ -455,11 +521,12 @@ async def get_risk_limits(account_id: str = Query(..., description="Account iden
         spread_threshold_bps=limits.spread_threshold_bps,
         latency_stall_seconds=limits.latency_stall_seconds,
         exchange_outage_block=bool(limits.exchange_outage_block),
+        target_volatility=limits.target_volatility,
     )
 
     response = RiskLimitsResponse(account_id=account_id, limits=limit_model, usage=usage)
     logger.info("Retrieved risk limits for account %s", account_id)
-    return response
+    return response.dict()
 
 
 def _load_account_limits(account_id: str) -> AccountRiskLimit:
@@ -477,6 +544,7 @@ def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
 
     limits = context.limits
     state = context.request.portfolio_state
+    _refresh_usage_from_fills(context.request.account_id, state)
     intent = context.request.intent
 
     def _register_violation(
@@ -530,6 +598,18 @@ def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
     trade_notional = context.intended_notional
     nav_cap_for_trade = limits.max_nav_pct_per_trade * state.net_asset_value
 
+    scaled_notional_cap = None
+    target_vol = getattr(limits, "target_volatility", None)
+    atr_value: Optional[float] = None
+    if target_vol:
+        atr_value = _compute_atr(intent.instrument_id)
+        if atr_value:
+            base_size = nav_cap_for_trade or trade_notional
+            current_vol = max(atr_value, 1e-8)
+            scaled_notional_cap = base_size * float(target_vol) / current_vol
+        elif nav_cap_for_trade:
+            scaled_notional_cap = nav_cap_for_trade
+
     # 3. Max NAV percentage per trade
     if trade_notional > nav_cap_for_trade:
         _register_violation(
@@ -539,6 +619,20 @@ def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
         )
         if intent.side == "buy":
             suggested_quantities.append(nav_cap_for_trade / intent.notional_per_unit)
+
+    if scaled_notional_cap is not None and trade_notional > scaled_notional_cap:
+        _register_violation(
+            "Trade notional exceeds volatility adjusted cap: "
+            f"trade={trade_notional:.2f} cap={scaled_notional_cap:.2f}",
+            details={
+                "trade_notional": trade_notional,
+                "volatility_cap": scaled_notional_cap,
+                "target_volatility": target_vol,
+                "atr": atr_value,
+            },
+        )
+        if intent.side == "buy" and scaled_notional_cap > 0:
+            suggested_quantities.append(scaled_notional_cap / intent.notional_per_unit)
 
     # 4. Notional cap on projected exposure
     current_exposure = state.notional_exposure
@@ -559,6 +653,31 @@ def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
                 suggested_quantities.append(allowable_increment / intent.notional_per_unit)
             else:
                 suggested_quantities.append(0.0)
+
+    nav = state.net_asset_value
+    if nav:
+        fee_ratio = (state.fees_paid / nav) if nav else 0.0
+        if fee_ratio > 0.0015:
+            _register_violation(
+                "Fee usage exceeds 0.15% of NAV",
+                cooldown=True,
+                details={"fees_paid": state.fees_paid, "nav": nav, "fee_ratio": fee_ratio},
+            )
+
+    historical_var = _compute_historical_var(context.request.account_id, nav)
+    if historical_var is not None:
+        state.var_95 = historical_var
+        loss_threshold = nav * 0.05 if nav else None
+        if loss_threshold is not None and historical_var > loss_threshold:
+            _register_violation(
+                "Historical VaR exceeds 5% of NAV",
+                cooldown=True,
+                details={
+                    "historical_var": historical_var,
+                    "nav": nav,
+                    "threshold": loss_threshold,
+                },
+            )
 
     # 5. VaR checks
     if limits.var_95_limit is not None and state.var_95 is not None:
@@ -670,6 +789,7 @@ def _audit_failure(context: RiskEvaluationContext, decision: RiskValidationRespo
 
 
 def set_stub_limits(records: Iterable[AccountRiskLimit]) -> None:
+
     """Utility used in testing to override the persisted limits table."""
 
     with get_session() as session:
@@ -697,6 +817,7 @@ def set_stub_limits(records: Iterable[AccountRiskLimit]) -> None:
             )
             stored.exchange_outage_block = 1 if record.exchange_outage_block else 0
             session.add(stored)
+
 
 
 def _load_account_usage(account_id: str) -> AccountUsage:
@@ -760,3 +881,106 @@ def set_stub_prometheus_metric(name: str, value: float, instrument_id: Optional[
         _STUB_PROM_METRICS[key] = value
     else:
         _STUB_PROM_METRICS[name] = value
+
+
+def _compute_atr(instrument_id: str, window: int = 14) -> Optional[float]:
+    history = _STUB_PRICE_HISTORY.get(instrument_id)
+    if not history or len(history) < window + 1:
+        return None
+
+    recent = history[-(window + 1) :]
+    true_ranges: List[float] = []
+    prev_close: Optional[float] = None
+    for bar in recent:
+        high = bar.get("high")
+        low = bar.get("low")
+        close = bar.get("close")
+        if high is None or low is None or close is None:
+            continue
+        if prev_close is None:
+            tr = float(high) - float(low)
+        else:
+            tr = max(
+                float(high) - float(low),
+                abs(float(high) - prev_close),
+                abs(float(low) - prev_close),
+            )
+        true_ranges.append(tr)
+        prev_close = float(close)
+
+    if len(true_ranges) < window:
+        return None
+
+    return mean(true_ranges[-window:])
+
+
+def _compute_historical_var(account_id: str, nav: float, window: int = 250) -> Optional[float]:
+    pnl_history = _STUB_ACCOUNT_RETURNS.get(account_id)
+    if not pnl_history or len(pnl_history) < window:
+        return None
+
+    sample = pnl_history[-window:]
+    sorted_pnl = sorted(sample)
+    index = max(int(0.05 * len(sorted_pnl)) - 1, 0)
+    loss_quantile = sorted_pnl[index]
+    projected_loss = max(-loss_quantile, 0.0)
+
+    if nav:
+        projected_loss = min(projected_loss, float(nav))
+
+    return projected_loss
+
+
+def _load_recent_fills(account_id: str) -> List[Dict[str, object]]:
+    today = datetime.utcnow().date()
+    fills: List[Dict[str, object]] = []
+    for record in _STUB_FILLS:
+        if record.get("account_id") != account_id:
+            continue
+        timestamp = record.get("timestamp")
+        if isinstance(timestamp, str):
+            try:
+                timestamp_dt = datetime.fromisoformat(timestamp)
+            except ValueError:
+                continue
+        elif isinstance(timestamp, datetime):
+            timestamp_dt = timestamp
+        else:
+            continue
+        if timestamp_dt.date() == today:
+            fills.append(record)
+    return fills
+
+
+def _refresh_usage_from_fills(account_id: str, state: AccountPortfolioState) -> None:
+    fills = _load_recent_fills(account_id)
+    if not fills:
+        return
+
+    total_pnl = 0.0
+    total_fees = 0.0
+    for record in fills:
+        pnl = float(record.get("pnl", 0.0))
+        fee = float(record.get("fee", 0.0))
+        total_pnl += pnl
+        total_fees += fee
+
+    realized_loss = max(-total_pnl, 0.0)
+    state.realized_daily_loss = realized_loss
+    state.fees_paid = total_fees
+    usage = _STUB_ACCOUNT_USAGE.setdefault(account_id, {})
+    usage["realized_daily_loss"] = realized_loss
+    usage["fees_paid"] = total_fees
+
+
+def set_stub_price_history(instrument_id: str, history: List[Dict[str, float]]) -> None:
+    _STUB_PRICE_HISTORY[instrument_id] = history
+
+
+def set_stub_account_returns(account_id: str, pnl_history: List[float]) -> None:
+    _STUB_ACCOUNT_RETURNS[account_id] = pnl_history
+
+
+def set_stub_fills(records: List[Dict[str, object]]) -> None:
+    _STUB_FILLS.clear()
+    _STUB_FILLS.extend(records)
