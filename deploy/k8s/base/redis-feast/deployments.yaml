@@ -1,0 +1,96 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-master
+  labels:
+    app: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+      role: master
+  template:
+    metadata:
+      labels:
+        app: redis
+        role: master
+    spec:
+      serviceAccountName: cache-services
+      containers:
+        - name: redis
+          image: redis:7.2.4-alpine
+          ports:
+            - containerPort: 6379
+          command:
+            - redis-server
+            - --save
+            - ""
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-master
+spec:
+  type: ClusterIP
+  selector:
+    app: redis
+    role: master
+  ports:
+    - port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: feast-online-store
+  labels:
+    app: feast-online-store
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: feast-online-store
+  template:
+    metadata:
+      labels:
+        app: feast-online-store
+    spec:
+      serviceAccountName: ml-services
+      containers:
+        - name: feast
+          image: feastdev/feature-server:0.36.1
+          ports:
+            - containerPort: 6566
+          env:
+            - name: REDIS_HOST
+              value: redis-master
+            - name: REDIS_PORT
+              value: "6379"
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 1
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: feast-online-store
+spec:
+  type: ClusterIP
+  selector:
+    app: feast-online-store
+  ports:
+    - name: grpc
+      port: 6566
+      targetPort: 6566

@@ -1,0 +1,15 @@
+{
+  "title": "Circuit Breakers",
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Breaker State",
+      "targets": [
+        {
+          "expr": "max(order_gateway_circuit_breaker_engaged)",
+          "legendFormat": "Engaged"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+name: Security Scans
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+jobs:
+  trivy-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Trivy config scan
+        uses: aquasecurity/trivy-action@0.17.0
+        with:
+          scan-type: config
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          scan-ref: deploy
+  trivy-repo:
+    runs-on: ubuntu-latest
+    needs: trivy-config
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Trivy FS scan
+        uses: aquasecurity/trivy-action@0.17.0
+        with:
+          scan-type: fs
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          scan-ref: .
+  kubesec:
+    runs-on: ubuntu-latest
+    needs: trivy-repo
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kube-score
+        run: |
+          wget -qO- https://github.com/zegl/kube-score/releases/download/v1.18.0/kube-score_1.18.0_linux_amd64.tar.gz | tar xz
+          sudo mv kube-score /usr/local/bin/
+      - name: Score manifests
+        run: |
+          kube-score score deploy/k8s/base

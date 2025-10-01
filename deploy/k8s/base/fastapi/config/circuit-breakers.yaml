@@ -1,0 +1,9 @@
+circuitBreakers:
+  orderExecution:
+    failureThreshold: 5
+    recoveryTimeoutSeconds: 120
+    minimumRequestThreshold: 20
+  marketData:
+    failureThreshold: 3
+    recoveryTimeoutSeconds: 60
+    minimumRequestThreshold: 10

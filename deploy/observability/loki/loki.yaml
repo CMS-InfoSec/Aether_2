@@ -1,0 +1,17 @@
+apiVersion: loki.grafana.com/v1
+kind: LokiStack
+metadata:
+  name: aether
+spec:
+  size: 1x.small
+  storageClassName: standard
+  tenants:
+    mode: openshift-logging
+  limits:
+    global:
+      ingestionRate: 4MB
+      ingestionBurstSize: 6MB
+      maxGlobalStreamsPerTenant: 5000
+  schema:
+    datasource:
+      type: boltdb-shipper

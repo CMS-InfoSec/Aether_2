@@ -1,0 +1,26 @@
+{
+  "title": "Trading KPIs",
+  "timezone": "browser",
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Orders per Minute",
+      "targets": [
+        {
+          "expr": "sum(rate(order_gateway_orders_total[5m]))",
+          "legendFormat": "Orders"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Filled Notional USD",
+      "targets": [
+        {
+          "expr": "sum(rate(order_gateway_filled_notional_usd[5m]))",
+          "legendFormat": "Notional"
+        }
+      ]
+    }
+  ]
+}
