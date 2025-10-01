@@ -11,6 +11,7 @@ from auth.routes import get_auth_service, router as auth_router
 from auth.service import AdminRepository, AuthService, SessionStore
 from services.alert_manager import setup_alerting
 from services.report_service import router as reports_router
+from multiformat_export import router as log_export_router
 
 from services.models.model_zoo import router as models_router
 
@@ -41,6 +42,7 @@ def create_app() -> FastAPI:
     app.include_router(exposure_router)
 
     app.include_router(models_router)
+    app.include_router(log_export_router)
 
 
     app.state.audit_store = audit_store
