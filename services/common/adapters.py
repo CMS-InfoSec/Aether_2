@@ -80,6 +80,12 @@ class TimescaleAdapter:
     def __post_init__(self) -> None:
         self._metrics.setdefault(self.account_id, {"limit": 1_000_000.0, "usage": 0.0})
 
+        self._daily_usage.setdefault(self.account_id, {"loss": 0.0, "fee": 0.0})
+        self._instrument_exposures.setdefault(self.account_id, {})
+        self._telemetry.setdefault(self.account_id, [])
+
+
+
         self._telemetry.setdefault(self.account_id, [])
         self._credential_events.setdefault(self.account_id, [])
 
@@ -198,25 +204,32 @@ class TimescaleAdapter:
     # Credential rotation tracking & test helpers
     # ------------------------------------------------------------------
     def record_credential_rotation(
-        self, *, secret_name: str, rotated_at: Optional[datetime] = None
+
+        self, *, secret_name: str, rotated_at: datetime
     ) -> Dict[str, Any]:
 
-        timestamp = rotated_at or datetime.now(timezone.utc)
         record = self._credential_rotations.setdefault(self.account_id, {})
-        record.setdefault("created_at", timestamp)
-        record["secret_name"] = secret_name
-        record["rotated_at"] = timestamp
 
+        created_at = record.get("created_at", rotated_at)
+        record["secret_name"] = secret_name
+        record["created_at"] = created_at
+        record["rotated_at"] = rotated_at
+
+
+        metadata = deepcopy(record)
+
+        events = self._credential_events.setdefault(self.account_id, [])
         payload = {
             "event": "rotation",
             "secret_name": secret_name,
-            "rotated_at": timestamp,
-            "timestamp": timestamp,
-            "created_at": record["created_at"],
+            "rotated_at": rotated_at,
+            "timestamp": rotated_at,
+            "created_at": created_at,
         }
-        self._credential_events[self.account_id].append(deepcopy(payload))
+        events.append(deepcopy(payload))
 
-        return deepcopy(record)
+        return metadata
+
 
 
     def credential_rotation_status(self) -> Optional[Dict[str, Any]]:
@@ -224,24 +237,47 @@ class TimescaleAdapter:
         if record:
             return deepcopy(record)
 
-        events = [
-            event
-            for event in self._credential_events.get(self.account_id, [])
-            if event.get("event") == "rotation"
-        ]
-        if not events:
-            return None
+
+        return deepcopy(record)
 
 
-        created_at = events[0].get("created_at") or events[0].get("rotated_at")
-        latest = deepcopy(events[-1])
-        if "created_at" not in latest and created_at is not None:
-            latest["created_at"] = created_at
-        return {
-            "secret_name": latest.get("secret_name", ""),
-            "created_at": latest.get("created_at"),
-            "rotated_at": latest.get("rotated_at"),
-        }
+    # ------------------------------------------------------------------
+    # Test helpers
+    # ------------------------------------------------------------------
+    @classmethod
+
+    def reset(cls, account_id: str | None = None) -> None:
+        if account_id is None:
+            cls._metrics.clear()
+            cls._telemetry.clear()
+            cls._risk_configs.clear()
+            cls._daily_usage.clear()
+            cls._instrument_exposures.clear()
+            cls._events.clear()
+            cls._credential_rotations.clear()
+            cls._credential_events.clear()
+            return
+
+        cls._metrics.pop(account_id, None)
+        cls._telemetry.pop(account_id, None)
+        cls._risk_configs.pop(account_id, None)
+        cls._daily_usage.pop(account_id, None)
+        cls._instrument_exposures.pop(account_id, None)
+        cls._events.pop(account_id, None)
+        cls._credential_rotations.pop(account_id, None)
+        cls._credential_events.pop(account_id, None)
+
+    @classmethod
+    def reset_rotation_state(cls, account_id: str | None = None) -> None:
+        if account_id is None:
+            cls._credential_rotations.clear()
+            cls._credential_events.clear()
+            return
+
+        cls._credential_rotations.pop(account_id, None)
+        cls._credential_events.pop(account_id, None)
+
+
 
 
     def record_credential_access(self, *, secret_name: str, metadata: Dict[str, Any]) -> None:
@@ -261,46 +297,6 @@ class TimescaleAdapter:
 
     def credential_events(self) -> List[Dict[str, Any]]:
         return [deepcopy(event) for event in self._credential_events.get(self.account_id, [])]
-
-
-    # ------------------------------------------------------------------
-    # Test helpers
-    # ------------------------------------------------------------------
-    @classmethod
-
-    def reset(cls, account_id: str | None = None) -> None:
-        if account_id is None:
-            cls._metrics.clear()
-            cls._telemetry.clear()
-            cls._risk_configs.clear()
-            cls._daily_usage.clear()
-            cls._instrument_exposures.clear()
-            cls._events.clear()
-            cls._credential_rotations.clear()
-            cls._credential_events.clear()
-            cls._credential_rotations.clear()
-            return
-
-        cls._metrics.pop(account_id, None)
-        cls._telemetry.pop(account_id, None)
-        cls._risk_configs.pop(account_id, None)
-        cls._daily_usage.pop(account_id, None)
-        cls._instrument_exposures.pop(account_id, None)
-        cls._events.pop(account_id, None)
-        cls._credential_rotations.pop(account_id, None)
-        cls._credential_events.pop(account_id, None)
-        cls._credential_rotations.pop(account_id, None)
-
-    @classmethod
-    def reset_rotation_state(cls, account_id: str | None = None) -> None:
-        if account_id is None:
-            cls._credential_events.clear()
-            cls._credential_rotations.clear()
-            return
-
-        cls._credential_events.pop(account_id, None)
-        cls._credential_rotations.pop(account_id, None)
-
 
 
 @dataclass
@@ -416,11 +412,9 @@ class KrakenSecretManager:
             secret_name=self.secret_name,
             rotated_at=rotated_at,
         )
-        metadata = {
-            "secret_name": metadata.get("secret_name", self.secret_name),
-            "created_at": metadata.get("created_at", rotated_at),
-            "rotated_at": metadata.get("rotated_at", rotated_at),
-        }
+        metadata.setdefault("secret_name", self.secret_name)
+        metadata.setdefault("created_at", rotated_at)
+        metadata.setdefault("rotated_at", rotated_at)
 
         return {
             "metadata": metadata,
