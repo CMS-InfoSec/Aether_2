@@ -68,6 +68,7 @@ class TimescaleAdapter:
     _daily_usage: ClassVar[Dict[str, Dict[str, Dict[str, float]]]] = {}
     _instrument_exposures: ClassVar[Dict[str, Dict[str, float]]] = {}
     _rolling_volume: ClassVar[Dict[str, Dict[str, Dict[str, Any]]]] = {}
+    _kill_events: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
 
     _default_risk_config: ClassVar[Dict[str, Any]] = {
         "kill_switch": False,
@@ -94,6 +95,7 @@ class TimescaleAdapter:
 
         self._telemetry.setdefault(self.account_id, [])
         self._credential_events.setdefault(self.account_id, [])
+        self._kill_events.setdefault(self.account_id, [])
 
 
         account_events = self._events.setdefault(
@@ -269,6 +271,45 @@ class TimescaleAdapter:
         }
         self._events[self.account_id]["events"].append(entry)
 
+    def record_kill_event(
+        self,
+        *,
+        reason_code: str,
+        triggered_at: datetime,
+        channels_sent: Iterable[str],
+    ) -> Dict[str, Any]:
+        payload = {
+            "account_id": self.account_id,
+            "reason": reason_code,
+            "ts": triggered_at,
+            "channels_sent": list(channels_sent),
+        }
+        events = self._kill_events.setdefault(self.account_id, [])
+        events.append(deepcopy(payload))
+        return deepcopy(payload)
+
+    def kill_events(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        entries = list(self._kill_events.get(self.account_id, []))
+        entries.sort(key=lambda entry: entry["ts"], reverse=True)
+        if limit is not None:
+            entries = entries[: int(limit)]
+        return [deepcopy(entry) for entry in entries]
+
+    @classmethod
+    def all_kill_events(
+        cls, *, account_id: Optional[str] = None, limit: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        if account_id is not None:
+            entries = list(cls._kill_events.get(account_id, []))
+        else:
+            entries = [
+                entry for events in cls._kill_events.values() for entry in events
+            ]
+        entries.sort(key=lambda entry: entry["ts"], reverse=True)
+        if limit is not None:
+            entries = entries[: int(limit)]
+        return [deepcopy(entry) for entry in entries]
+
     # ------------------------------------------------------------------
     # Telemetry helpers
     # ------------------------------------------------------------------
@@ -336,6 +377,7 @@ class TimescaleAdapter:
             cls._credential_rotations,
             cls._credential_events,
             cls._rolling_volume,
+            cls._kill_events,
         )
 
         if account_id is None:
