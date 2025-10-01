@@ -6,7 +6,7 @@ import contextlib
 import json
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_HALF_EVEN
 from pathlib import Path
 from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple
@@ -65,6 +65,10 @@ class OMSPlaceRequest(BaseModel):
         gt=Decimal("0"),
         description="Trailing stop offset",
     )
+    shadow: bool = Field(
+        default=False,
+        description="When true, the order is mirrored for paper trading and not routed to the venue",
+    )
 
     @field_validator("side")
     @classmethod
@@ -118,6 +122,7 @@ class OMSPlaceResponse(OMSOrderStatusResponse):
     reused: bool = Field(
         default=False, description="True when the idempotency cache satisfied the request"
     )
+    shadow: bool = Field(default=False, description="True when the order executed in shadow mode")
 
 
 class _IdempotencyStore:
@@ -158,6 +163,148 @@ class OrderRecord:
     client_id: str
     result: OMSOrderStatusResponse
     transport: str
+    symbol: str
+    side: str
+    shadow: bool = False
+    recorded_fill_qty: Decimal = field(default_factory=lambda: Decimal("0"))
+
+
+class _PnLLedger:
+    """Tracks realized PnL and open positions for a single execution lane."""
+
+    def __init__(self) -> None:
+        self._positions: Dict[str, Decimal] = {}
+        self._avg_price: Dict[str, Decimal] = {}
+        self._realized: Decimal = Decimal("0")
+        self._fills: List[Dict[str, object]] = []
+
+    def record_trade(self, symbol: str, side: str, quantity: Decimal, price: Decimal) -> None:
+        if quantity <= 0 or price <= 0:
+            return
+
+        normalized_side = side.lower()
+        if normalized_side not in {"buy", "sell"}:
+            return
+
+        qty = quantity
+        px = price
+        position = self._positions.get(symbol, Decimal("0"))
+        avg_price = self._avg_price.get(symbol, Decimal("0"))
+        signed_qty = qty if normalized_side == "buy" else -qty
+
+        if position == 0 or position * signed_qty > 0:
+            new_position = position + signed_qty
+            if new_position > 0:
+                total_cost = (avg_price * position if position > 0 else Decimal("0")) + (px * qty)
+                self._positions[symbol] = new_position
+                self._avg_price[symbol] = total_cost / new_position
+            elif new_position < 0:
+                total_cost = (avg_price * (-position) if position < 0 else Decimal("0")) + (px * qty)
+                self._positions[symbol] = new_position
+                self._avg_price[symbol] = total_cost / (-new_position)
+            else:
+                self._positions.pop(symbol, None)
+                self._avg_price.pop(symbol, None)
+        else:
+            if position > 0:
+                closing_qty = min(position, -signed_qty)
+                self._realized += (px - avg_price) * closing_qty
+                new_position = position + signed_qty
+                if new_position > 0:
+                    self._positions[symbol] = new_position
+                elif new_position < 0:
+                    self._positions[symbol] = new_position
+                    self._avg_price[symbol] = px
+                else:
+                    self._positions.pop(symbol, None)
+                    self._avg_price.pop(symbol, None)
+            else:  # position < 0
+                closing_qty = min(-position, signed_qty)
+                self._realized += (avg_price - px) * closing_qty
+                new_position = position + signed_qty
+                if new_position < 0:
+                    self._positions[symbol] = new_position
+                elif new_position > 0:
+                    self._positions[symbol] = new_position
+                    self._avg_price[symbol] = px
+                else:
+                    self._positions.pop(symbol, None)
+                    self._avg_price.pop(symbol, None)
+
+        self._fills.append(
+            {
+                "symbol": symbol,
+                "side": normalized_side,
+                "quantity": qty,
+                "price": px,
+            }
+        )
+
+    def snapshot(self) -> Dict[str, Any]:
+        positions = {
+            symbol: {
+                "quantity": qty,
+                "avg_price": self._avg_price.get(symbol, Decimal("0")),
+            }
+            for symbol, qty in self._positions.items()
+        }
+        return {
+            "realized_pnl": self._realized,
+            "positions": positions,
+            "fills": list(self._fills),
+        }
+
+
+class _ShadowPnLTracker:
+    """Maintains independent ledgers for real and paper executions."""
+
+    def __init__(self) -> None:
+        self._real = _PnLLedger()
+        self._shadow = _PnLLedger()
+
+    def record_fill(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        quantity: Decimal,
+        price: Decimal,
+        shadow: bool,
+    ) -> None:
+        ledger = self._shadow if shadow else self._real
+        ledger.record_trade(symbol, side, quantity, price)
+
+    def snapshot(self) -> Dict[str, Any]:
+        real_state = self._real.snapshot()
+        shadow_state = self._shadow.snapshot()
+        delta = shadow_state["realized_pnl"] - real_state["realized_pnl"]
+        return {
+            "real": self._serialize(real_state),
+            "shadow": self._serialize(shadow_state),
+            "delta": {"realized_pnl": float(delta)},
+        }
+
+    @staticmethod
+    def _serialize(state: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "realized_pnl": float(state["realized_pnl"]),
+            "positions": {
+                symbol: {
+                    "quantity": float(data["quantity"]),
+                    "avg_price": float(data["avg_price"]),
+                }
+                for symbol, data in state["positions"].items()
+            },
+            "fills": [
+                {
+                    "symbol": entry["symbol"],
+                    "side": entry["side"],
+                    "quantity": float(entry["quantity"]),
+                    "price": float(entry["price"]),
+                }
+                for entry in state["fills"]
+            ],
+        }
 
 
 class _PrecisionValidator:
@@ -357,6 +504,7 @@ class AccountContext:
         self._orders_lock = asyncio.Lock()
         self._startup_lock = asyncio.Lock()
         self._stream_task: Optional[asyncio.Task[None]] = None
+        self._pnl_tracker = _ShadowPnLTracker()
 
     async def start(self) -> None:
         async with self._startup_lock:
@@ -395,47 +543,88 @@ class AccountContext:
             avg_price=Decimal(str(state.avg_price or 0)),
             errors=state.errors or None,
         )
-        record = OrderRecord(client_id=key, result=result, transport=state.transport)
         async with self._orders_lock:
+            record = self._orders.get(key)
+            if record is None:
+                record = OrderRecord(
+                    client_id=key,
+                    result=result,
+                    transport=state.transport,
+                    symbol="",
+                    side="buy",
+                )
+            else:
+                record.transport = state.transport or record.transport
+                record.result = result
+            self._record_fill_locked(record, result)
             self._orders[key] = record
 
     async def place_order(self, request: OMSPlaceRequest) -> OMSPlaceResponse:
         await self.start()
 
         async def _execute() -> OMSOrderStatusResponse:
-            assert self.ws_client is not None
-            assert self.rest_client is not None
-
-            metadata = await self.credentials.get_metadata()
-            qty, px = _PrecisionValidator.validate(
-                request.symbol,
-                request.qty,
-                request.limit_px,
-                metadata,
-            )
-
-            payload = self._build_payload(request, qty, px)
-            try:
-                ack = await self.ws_client.add_order(payload)
-                transport = "websocket"
-            except (KrakenWSTimeout, KrakenWSError) as exc:
-                logger.warning(
-                    "Websocket add_order failed for account %s: %s", self.account_id, exc
+            if request.shadow:
+                filled_qty = request.qty
+                avg_price = request.limit_px or Decimal("0")
+                result = OMSOrderStatusResponse(
+                    exchange_order_id=f"{request.client_id}-shadow",
+                    status="filled",
+                    filled_qty=filled_qty,
+                    avg_price=avg_price,
+                    errors=None,
                 )
+                transport = "shadow"
+            else:
+                assert self.ws_client is not None
+                assert self.rest_client is not None
+
+                metadata = await self.credentials.get_metadata()
+                qty, px = _PrecisionValidator.validate(
+                    request.symbol,
+                    request.qty,
+                    request.limit_px,
+                    metadata,
+                )
+
+                payload = self._build_payload(request, qty, px)
                 try:
-                    ack = await self.rest_client.add_order(payload)
-                except KrakenRESTError as rest_exc:
-                    raise HTTPException(
-                        status_code=status.HTTP_502_BAD_GATEWAY,
-                        detail=str(rest_exc),
-                    ) from rest_exc
-                transport = "rest"
+                    ack = await self.ws_client.add_order(payload)
+                    transport = "websocket"
+                except (KrakenWSTimeout, KrakenWSError) as exc:
+                    logger.warning(
+                        "Websocket add_order failed for account %s: %s",
+                        self.account_id,
+                        exc,
+                    )
+                    try:
+                        ack = await self.rest_client.add_order(payload)
+                    except KrakenRESTError as rest_exc:
+                        raise HTTPException(
+                            status_code=status.HTTP_502_BAD_GATEWAY,
+                            detail=str(rest_exc),
+                        ) from rest_exc
+                    transport = "rest"
 
-            result = self._order_result_from_ack(request, ack)
+                result = self._order_result_from_ack(request, ack)
             async with self._orders_lock:
-                self._orders[request.client_id] = OrderRecord(
-                    client_id=request.client_id, result=result, transport=transport
-                )
+                record = self._orders.get(request.client_id)
+                if record is None:
+                    record = OrderRecord(
+                        client_id=request.client_id,
+                        result=result,
+                        transport=transport,
+                        symbol=request.symbol,
+                        side=request.side,
+                        shadow=request.shadow,
+                    )
+                    self._orders[request.client_id] = record
+                else:
+                    record.result = result
+                    record.transport = transport
+                    record.symbol = request.symbol
+                    record.side = request.side
+                    record.shadow = request.shadow
+                self._record_fill_locked(record, result)
             return result
 
         cache_key = f"place:{request.client_id}"
@@ -451,6 +640,7 @@ class AccountContext:
             errors=result.errors,
             transport=transport,
             reused=reused,
+            shadow=request.shadow,
         )
 
     async def cancel_order(self, request: OMSCancelRequest) -> OMSOrderStatusResponse:
@@ -496,9 +686,19 @@ class AccountContext:
                 errors=ack.errors or None,
             )
             async with self._orders_lock:
-                self._orders[request.client_id] = OrderRecord(
-                    client_id=request.client_id, result=result, transport=transport
-                )
+                record = self._orders.get(request.client_id)
+                if record is None:
+                    record = OrderRecord(
+                        client_id=request.client_id,
+                        result=result,
+                        transport=transport,
+                        symbol="",
+                        side="buy",
+                    )
+                    self._orders[request.client_id] = record
+                else:
+                    record.transport = transport
+                    record.result = result
             return result
 
         cache_key = f"cancel:{request.client_id}"
@@ -559,6 +759,31 @@ class AccountContext:
     async def lookup(self, client_id: str) -> OrderRecord | None:
         async with self._orders_lock:
             return self._orders.get(client_id)
+
+    def shadow_snapshot(self) -> Dict[str, Any]:
+        return self._pnl_tracker.snapshot()
+
+    def _record_fill_locked(
+        self, record: OrderRecord, result: OMSOrderStatusResponse
+    ) -> None:
+        if result.filled_qty is None or result.filled_qty <= 0:
+            return
+        delta = result.filled_qty - record.recorded_fill_qty
+        if delta <= 0:
+            return
+        price = result.avg_price
+        if price is None or price <= 0:
+            return
+        if not record.symbol:
+            return
+        self._pnl_tracker.record_fill(
+            symbol=record.symbol,
+            side=record.side,
+            quantity=delta,
+            price=price,
+            shadow=record.shadow,
+        )
+        record.recorded_fill_qty += delta
 
 
 class OMSManager:
@@ -641,5 +866,19 @@ async def get_status(
     if not record:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown order")
     return record.result
+
+
+@app.get("/oms/shadow_pnl")
+async def get_shadow_pnl(
+    account_id: str,
+    header_account: str = Depends(require_account_id),
+) -> Dict[str, Any]:
+    if account_id != header_account:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account mismatch")
+
+    account = await manager.get_account(account_id)
+    snapshot = account.shadow_snapshot()
+    snapshot["account_id"] = account_id
+    return snapshot
 
 
