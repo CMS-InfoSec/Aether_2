@@ -74,6 +74,7 @@ class TimescaleAdapter:
 
     _default_risk_config: ClassVar[Dict[str, Any]] = {
         "kill_switch": False,
+        "safe_mode": False,
         "loss_cap": 50_000.0,
         "fee_cap": 5_000.0,
         "nav": 1_000_000.0,
@@ -211,6 +212,29 @@ class TimescaleAdapter:
             event_payload["actor"] = actor
 
         event_type = "kill_switch_engaged" if engaged else "kill_switch_released"
+        self.record_event(event_type, event_payload)
+
+    def set_safe_mode(
+        self,
+        *,
+        engaged: bool,
+        reason: str | None = None,
+        actor: str | None = None,
+    ) -> None:
+        """Engage or release safe mode controls for the account."""
+
+        config = self._risk_configs.setdefault(
+            self.account_id, deepcopy(self._default_risk_config)
+        )
+        config["safe_mode"] = bool(engaged)
+
+        event_payload: Dict[str, Any] = {"state": "engaged" if engaged else "released"}
+        if reason:
+            event_payload["reason"] = reason
+        if actor:
+            event_payload["actor"] = actor
+
+        event_type = "safe_mode_engaged" if engaged else "safe_mode_released"
         self.record_event(event_type, event_payload)
 
     def get_daily_usage(self) -> Dict[str, float]:

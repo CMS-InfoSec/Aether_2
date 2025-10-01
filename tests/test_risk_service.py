@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Iterator, Tuple
 
 import pytest
+
+pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
 from services.common.security import ADMIN_ACCOUNTS

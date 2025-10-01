@@ -5,12 +5,15 @@ import os
 
 from fastapi import FastAPI
 
+from audit_mode import configure_audit_mode
 from accounts.service import AccountsService
 from auth.routes import get_auth_service, router as auth_router
 from auth.service import AdminRepository, AuthService, SessionStore
 from services.alert_manager import setup_alerting
 from services.report_service import router as reports_router
+
 from services.models.model_zoo import router as models_router
+
 from exposure_forecast import router as exposure_router
 from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
 from shared.correlation import CorrelationIdMiddleware
@@ -36,7 +39,9 @@ def create_app() -> FastAPI:
     app.include_router(auth_router)
     app.include_router(reports_router)
     app.include_router(exposure_router)
+
     app.include_router(models_router)
+
 
     app.state.audit_store = audit_store
     app.state.audit_logger = audit_logger
@@ -45,6 +50,8 @@ def create_app() -> FastAPI:
     app.state.session_store = session_store
     app.state.auth_service = auth_service
     app.state.accounts_service = accounts_service
+
+    configure_audit_mode(app)
 
     alertmanager_url = os.getenv("ALERTMANAGER_URL")
     setup_alerting(app, alertmanager_url=alertmanager_url)

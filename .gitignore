@@ -1,4 +1,5 @@
 __pycache__/
 
 *.pyc
+release_manifest_current.json
 
