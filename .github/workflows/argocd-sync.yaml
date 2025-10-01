@@ -1,0 +1,33 @@
+name: Trigger ArgoCD Sync
+
+on:
+  workflow_run:
+    workflows: ["Build OCI Images"]
+    types:
+      - completed
+  workflow_dispatch:
+
+jobs:
+  sync:
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install ArgoCD CLI
+        run: |
+          curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/download/v2.9.3/argocd-linux-amd64
+          chmod +x argocd
+          sudo mv argocd /usr/local/bin/
+      - name: ArgoCD Login
+        env:
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_TOKEN }}
+        run: |
+          argocd login $ARGOCD_SERVER --username token --password $ARGOCD_AUTH_TOKEN --insecure
+      - name: Sync Applications
+        run: |
+          argocd app sync aether-risk-staging
+          argocd app wait aether-risk-staging --health --timeout 600
+          argocd app sync aether-risk-prod
+          argocd app wait aether-risk-prod --health --timeout 600

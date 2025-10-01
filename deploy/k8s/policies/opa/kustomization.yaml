@@ -1,0 +1,3 @@
+resources:
+  - secret-access-template.yaml
+  - secret-access-constraint.yaml

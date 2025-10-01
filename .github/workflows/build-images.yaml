@@ -1,0 +1,71 @@
+name: Build OCI Images
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'services/**'
+      - 'Dockerfile*'
+
+jobs:
+  kaniko-build:
+    runs-on: ubuntu-latest
+    container:
+      image: gcr.io/kaniko-project/executor:latest
+    env:
+      DOCKER_CONFIG: /kaniko/.docker/
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Configure Registry Auth
+        run: |
+          mkdir -p $DOCKER_CONFIG
+          cat <<'EOC' > $DOCKER_CONFIG/config.json
+          {
+            "auths": {
+              "ghcr.io": {
+                "auth": "${{ secrets.GHCR_AUTH }}"
+              }
+            }
+          }
+          EOC
+      - name: Build Risk API Image
+        run: |
+          /kaniko/executor \
+            --context $GITHUB_WORKSPACE \
+            --dockerfile services/risk-api/Dockerfile \
+            --destination ghcr.io/aether/risk-api:${{ github.sha }}
+      - name: Build Ingestor Image
+        run: |
+          /kaniko/executor \
+            --context $GITHUB_WORKSPACE \
+            --dockerfile services/risk-ingestor/Dockerfile \
+            --destination ghcr.io/aether/risk-ingestor:${{ github.sha }}
+
+  buildah-sbom:
+    runs-on: ubuntu-latest
+    needs: kaniko-build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Buildah and Syft
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y buildah
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+      - name: Build Risk API with Buildah
+        run: |
+          buildah bud -f services/risk-api/Dockerfile -t ghcr.io/aether/risk-api:${{ github.sha }} .
+      - name: Generate SBOMs
+        run: |
+          syft ghcr.io/aether/risk-api:${{ github.sha }} -o json > sbom-risk-api.json
+          syft ghcr.io/aether/risk-ingestor:${{ github.sha }} -o json > sbom-risk-ingestor.json
+      - name: Upload SBOMs
+        uses: actions/upload-artifact@v4
+        with:
+          name: sboms
+          path: |
+            sbom-risk-api.json
+            sbom-risk-ingestor.json

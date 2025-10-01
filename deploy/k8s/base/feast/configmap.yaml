@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: feast-config
+  labels:
+    app.kubernetes.io/name: feast
+    app.kubernetes.io/component: feature-store
+data:
+  feature_store.yaml: |
+    project: kraken-risk
+    registry: sqlite:////data/registry.db
+    provider: kubernetes
+    online_store:
+      type: redis
+      connection_string: redis:6379
+    offline_store:
+      type: postgres
+      host: timescaledb
+      port: 5432
+      database: marketdata
+      db_schema: feast
+      user: risk_engine
+      password: changeme
