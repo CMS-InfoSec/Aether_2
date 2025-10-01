@@ -59,7 +59,7 @@ def test_manual_overrides_are_honored() -> None:
 
     repo.set_manual_override("DOGE-USD", approved=True, actor_id="admin-eu", reason="Liquidity waiver")
 
-    adapter = RedisFeastAdapter(account_id="admin-eu")
+    adapter = RedisFeastAdapter(account_id="admin-eu", repository=repo)
     instruments = adapter.approved_instruments()
 
     assert "DOGE-USD" in instruments

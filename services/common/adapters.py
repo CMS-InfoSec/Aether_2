@@ -247,7 +247,9 @@ class TimescaleAdapter:
 @dataclass
 class RedisFeastAdapter:
     account_id: str
+    repository: Optional[UniverseRepository] = field(default=None, repr=False)
 
+    _repository: Optional[UniverseRepository] = field(init=False, repr=False, default=None)
 
     _features: ClassVar[Dict[str, Dict[str, Any]]] = {
         "admin-eu": {"approved": ["BTC-USD", "ETH-USD"], "fees": {"BTC-USD": {"maker": 0.1, "taker": 0.2}}},
@@ -278,10 +280,16 @@ class RedisFeastAdapter:
     }
 
 
+    def __post_init__(self) -> None:
+        repository = self.repository or UniverseRepository(account_id=self.account_id)
+        self._repository = repository
+
     def approved_instruments(self) -> List[str]:
+        assert self._repository is not None
         return self._repository.approved_universe()
 
     def fee_override(self, instrument: str) -> Dict[str, Any] | None:
+        assert self._repository is not None
         return self._repository.fee_override(instrument)
 
     def fetch_online_features(self, instrument: str) -> Dict[str, Any]:
