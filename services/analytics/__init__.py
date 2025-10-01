@@ -1,11 +1,7 @@
-"""Analytics service utilities for whale trade detection."""
 
-from .whale_detector import ToxicFlowMetric, WhaleDetector, WhaleEvent, app, detector
+"""Analytics service package."""
 
-__all__ = [
-    "ToxicFlowMetric",
-    "WhaleDetector",
-    "WhaleEvent",
-    "app",
-    "detector",
-]
+from .orderflow_service import router as orderflow_router
+
+__all__ = ["orderflow_router"]
+
