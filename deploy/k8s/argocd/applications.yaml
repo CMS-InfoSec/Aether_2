@@ -1,0 +1,61 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: aether-risk
+  namespace: argocd
+spec:
+  description: Delivery project for Aether risk platform
+  destinations:
+    - namespace: aether-staging
+      server: https://kubernetes.default.svc
+    - namespace: aether-prod
+      server: https://kubernetes.default.svc
+  sourceRepos:
+    - https://github.com/aether/aether-risk.git
+  clusterResourceWhitelist:
+    - group: "*"
+      kind: "*"
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: aether-risk-staging
+  namespace: argocd
+spec:
+  project: aether-risk
+  source:
+    repoURL: https://github.com/aether/aether-risk.git
+    targetRevision: main
+    path: deploy/k8s/overlays/staging
+  destination:
+    namespace: aether-staging
+    server: https://kubernetes.default.svc
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: aether-risk-prod
+  namespace: argocd
+spec:
+  project: aether-risk
+  source:
+    repoURL: https://github.com/aether/aether-risk.git
+    targetRevision: main
+    path: deploy/k8s/overlays/production
+  destination:
+    namespace: aether-prod
+    server: https://kubernetes.default.svc
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ApplyOutOfSyncOnly=true

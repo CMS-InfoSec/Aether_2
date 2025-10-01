@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: marketdata-ingestor
+  labels:
+    app.kubernetes.io/name: marketdata-ingestor
+    app.kubernetes.io/component: ingestion
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: marketdata-ingestor
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: marketdata-ingestor
+    spec:
+      containers:
+        - name: app
+          image: ghcr.io/aether/risk-ingestor:v1.5.0
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: SETTINGS_FILE
+              value: /etc/aether/settings.yaml
+          volumeMounts:
+            - name: config
+              mountPath: /etc/aether
+              readOnly: true
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: config
+          configMap:
+            name: fastapi-config

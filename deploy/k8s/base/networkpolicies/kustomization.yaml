@@ -1,0 +1,3 @@
+resources:
+  - egress-marketdata.yaml
+  - ingress-risk.yaml

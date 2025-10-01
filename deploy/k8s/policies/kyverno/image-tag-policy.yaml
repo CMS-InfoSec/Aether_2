@@ -1,0 +1,26 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: enforce-image-tags
+  annotations:
+    policies.kyverno.io/title: Enforce Pinned Image Tags
+    policies.kyverno.io/category: Security
+spec:
+  validationFailureAction: Enforce
+  rules:
+    - name: disallow-latest-tag
+      match:
+        any:
+          - resources:
+              kinds:
+                - Deployment
+                - StatefulSet
+                - Job
+      validate:
+        message: "Container images must use a semantic version or digest, not the 'latest' tag."
+        pattern:
+          spec:
+            template:
+              spec:
+                containers:
+                  - image: "!*:latest"

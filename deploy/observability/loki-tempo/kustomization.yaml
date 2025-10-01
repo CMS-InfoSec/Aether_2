@@ -1,0 +1,7 @@
+resources:
+  - loki-config.yaml
+  - loki-deployment.yaml
+  - loki-service.yaml
+  - tempo-config.yaml
+  - tempo-deployment.yaml
+  - tempo-service.yaml

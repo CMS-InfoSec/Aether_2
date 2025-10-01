@@ -1,0 +1,6 @@
+resources:
+  - configmap.yaml
+  - deployment-ingestor.yaml
+  - deployment-risk.yaml
+  - service-ingestor.yaml
+  - service-risk.yaml

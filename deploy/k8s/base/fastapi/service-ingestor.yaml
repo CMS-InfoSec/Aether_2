@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: marketdata-ingestor
+  labels:
+    app.kubernetes.io/name: marketdata-ingestor
+spec:
+  selector:
+    app.kubernetes.io/name: marketdata-ingestor
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

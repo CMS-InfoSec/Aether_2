@@ -1,0 +1,54 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/part-of: aether-observability
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+    rule_files:
+      - /etc/prometheus/rules/*.yaml
+    scrape_configs:
+      - job_name: risk-api
+        metrics_path: /metrics
+        static_configs:
+          - targets:
+              - risk-api.aether-prod.svc.cluster.local
+              - risk-api.aether-staging.svc.cluster.local
+      - job_name: marketdata-ingestor
+        metrics_path: /metrics
+        static_configs:
+          - targets:
+              - marketdata-ingestor.aether-prod.svc.cluster.local
+              - marketdata-ingestor.aether-staging.svc.cluster.local
+      - job_name: node-exporter
+        kubernetes_sd_configs:
+          - role: node
+  slo-rules.yaml: |
+    groups:
+      - name: risk-api-latency
+        rules:
+          - record: slo:risk_api_latency:ratio
+            expr: histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{service="risk-api"}[5m])) by (le))
+          - alert: RiskApiLatencyBreached
+            expr: slo:risk_api_latency:ratio > 0.5
+            for: 10m
+            labels:
+              severity: critical
+            annotations:
+              summary: Risk API latency SLO breaching
+              description: P99 latency exceeded 500ms threshold for 10m.
+      - name: ingestion-freshness
+        rules:
+          - alert: MarketDataStale
+            expr: time() - max(risk_marketdata_latest_timestamp_seconds) > 120
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: Market data freshness degraded
+              description: The latest market data point is older than 2 minutes.

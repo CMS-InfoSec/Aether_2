@@ -1,0 +1,15 @@
+apiVersion: risk.aether.dev/v1alpha1
+kind: RiskThresholdPolicy
+metadata:
+  name: default-thresholds
+spec:
+  latency:
+    service: risk-api
+    objective: 500ms
+    window: 5m
+  exposure:
+    max_notional_usd: 2500000
+    max_drawdown: 0.18
+  liquidation:
+    maintenance_margin: 0.25
+    alert_margin: 0.30

@@ -1,31 +1,10 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
-namespace: observability
+
 resources:
-  - prometheus/prometheus.yaml
-  - grafana/grafana.yaml
-  - loki/loki.yaml
-  - tempo/tempo.yaml
-  - alertmanager/alertmanager.yaml
-configMapGenerator:
-  - name: grafana-dashboards
-    files:
-      - grafana/dashboards/trading-kpis.json
-      - grafana/dashboards/fee-spend.json
-      - grafana/dashboards/drift-monitoring.json
-      - grafana/dashboards/circuit-breakers.json
-      - grafana/dashboards/slos.json
-  - name: alertmanager-config
-    files:
-      - alertmanager/alertmanager-config.yaml
-secretGenerator:
-  - name: grafana-admin
-    literals:
-      - admin-user=admin
-      - admin-password=changeme
-  - name: prometheus-slack
-    literals:
-      - webhook-url=https://hooks.slack.com/services/T000/B000/XXXX
-      - channel=#aether-alerts
-generatorOptions:
-  disableNameSuffixHash: true
+  - prometheus
+  - grafana
+  - loki-tempo
+commonLabels:
+  app.kubernetes.io/part-of: aether-observability
+

@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: risk-api
+  labels:
+    app.kubernetes.io/name: risk-api
+    app.kubernetes.io/component: api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: risk-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: risk-api
+    spec:
+      containers:
+        - name: app
+          image: ghcr.io/aether/risk-api:v2.1.3
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: SETTINGS_FILE
+              value: /etc/aether/settings.yaml
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 15
+          volumeMounts:
+            - name: config
+              mountPath: /etc/aether
+              readOnly: true
+          resources:
+            requests:
+              cpu: 300m
+              memory: 512Mi
+            limits:
+              cpu: 800m
+              memory: 1Gi
+      volumes:
+        - name: config
+          configMap:
+            name: fastapi-config

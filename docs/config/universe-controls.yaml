@@ -1,0 +1,25 @@
+apiVersion: risk.aether.dev/v1alpha1
+kind: UniverseControl
+metadata:
+  name: core-crypto
+spec:
+  assets:
+    - symbol: BTC/USD
+      venue: kraken
+      max_position: 150
+      max_notional: 750000
+    - symbol: ETH/USD
+      venue: kraken
+      max_position: 300
+      max_notional: 600000
+    - symbol: SOL/USD
+      venue: coingecko
+      max_position: 1200
+      max_notional: 250000
+  compliance:
+    restricted_counterparties:
+      - ftx
+      - terra
+  risk_modes:
+    default: enforce
+    kill_switch: observe

@@ -1,0 +1,6 @@
+resources:
+  - dashboards.yaml
+  - provisioning.yaml
+  - deployment.yaml
+  - secret.yaml
+  - service.yaml
