@@ -41,6 +41,26 @@ def test_ws_client_rejects_expired_credentials() -> None:
         client.add_order({"clientOrderId": "EXPIRED"})
 
 
+def test_ws_client_rejects_existing_session_after_expiry() -> None:
+    fresh_rotated_at = datetime.now(timezone.utc) - timedelta(days=10)
+    credentials: Dict[str, Any] = {
+        "api_key": "key",
+        "api_secret": "secret",
+        "metadata": {"rotated_at": fresh_rotated_at},
+    }
+    client = KrakenWSClient("company", credentials=credentials)
+
+    client.add_order({"clientOrderId": "INITIAL"})
+    assert client._session is not None
+
+    credentials["metadata"]["rotated_at"] = datetime.now(timezone.utc) - timedelta(days=91)
+
+    with pytest.raises(KrakenCredentialExpired):
+        client.add_order({"clientOrderId": "STALE"})
+
+    assert client._session is None
+
+
 def test_ws_client_loads_credentials() -> None:
     store = KubernetesSecretClient()
     store.write_credentials("company", api_key="key-123", api_secret="secret-456")

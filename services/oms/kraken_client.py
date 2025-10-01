@@ -134,6 +134,14 @@ class KrakenWSClient:
         return now - ts > SECRET_MAX_AGE
 
     def _session_or_connect(self) -> Any:
+        if self._credentials_expired():
+            self._session_stale = True
+            if self._session is not None:
+                self._close_session()
+            raise KrakenCredentialExpired(
+                "Kraken API credentials have expired; rotation required before trading."
+            )
+
         if (
             self._session is None
             or self._session_stale
@@ -142,10 +150,6 @@ class KrakenWSClient:
                 and self._session_version != self._credential_version
             )
         ):
-            if self._credentials_expired():
-                raise KrakenCredentialExpired(
-                    "Kraken API credentials have expired; rotation required before trading."
-                )
             if self._session is not None:
                 self._close_session()
             self._session = self._session_factory(self._credentials)
