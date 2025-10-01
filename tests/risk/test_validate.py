@@ -7,6 +7,7 @@ from services.common.schemas import RiskValidationRequest
 from services.risk.engine import RiskEngine
 
 
+
 @pytest.fixture(autouse=True)
 def reset_state() -> None:
     TimescaleAdapter.reset()
@@ -14,6 +15,7 @@ def reset_state() -> None:
     yield
     TimescaleAdapter.reset()
     TimescaleAdapter.reset_rotation_state()
+
 
 
 def make_request(**overrides: float | str | dict[str, float]) -> RiskValidationRequest:
@@ -81,10 +83,12 @@ def test_engine_honors_kill_switch_and_short_circuits() -> None:
     account = "admin-eu"
     adapter = TimescaleAdapter(account_id=account)
     adapter.update_risk_config(kill_switch=True)
+
     engine = RiskEngine(account_id=account)
     request = make_request(account_id=account)
 
     response = engine.validate(request)
+
 
     assert response.valid is False
     assert response.reasons == ["Risk kill switch engaged for account"]

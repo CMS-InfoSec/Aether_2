@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+
 import pytest
 
 from services.common.adapters import TimescaleAdapter
+
 
 
 @pytest.fixture(autouse=True)
@@ -10,8 +12,10 @@ def reset_timescale() -> None:
     TimescaleAdapter.reset()
     TimescaleAdapter.reset_rotation_state()
     yield
+
     TimescaleAdapter.reset()
     TimescaleAdapter.reset_rotation_state()
+
 
 
 def test_record_daily_usage_accumulates() -> None:
@@ -77,3 +81,4 @@ def test_risk_config_can_be_overridden_without_side_effects() -> None:
     default_snapshot["nav"] = 123.0
     reloaded = adapter.load_risk_config()
     assert reloaded["nav"] == pytest.approx(3_000_000.0)
+
