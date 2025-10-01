@@ -12,19 +12,19 @@ def setup_function() -> None:
 
 def test_ws_client_loads_credentials() -> None:
     store = KubernetesSecretClient()
-    store.write_credentials("admin-eu", api_key="key-123", api_secret="secret-456")
+    store.write_credentials("company", api_key="key-123", api_secret="secret-456")
 
-    client = KrakenWSClient("admin-eu")
+    client = KrakenWSClient("company")
 
     assert client._credentials["api_key"] == "key-123"
     assert client._credentials["api_secret"] == "secret-456"
     assert client._credentials["metadata"]["api_key"] == "***"
     assert client._credentials["metadata"]["api_secret"] == "***"
-    assert client._credentials["metadata"]["secret_name"] == "kraken-keys-admin-eu"
+    assert client._credentials["metadata"]["secret_name"] == "kraken-keys-company"
 
-    events = TimescaleAdapter(account_id="admin-eu").credential_events()
+    events = TimescaleAdapter(account_id="company").credential_events()
     assert events
     access_event = events[-1]
     assert access_event["event_type"] == "kraken.credentials.access"
-    assert access_event["metadata"]["secret_name"] == "kraken-keys-admin-eu"
+    assert access_event["metadata"]["secret_name"] == "kraken-keys-company"
     assert access_event["metadata"]["material_present"] is True

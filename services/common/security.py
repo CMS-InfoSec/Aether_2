@@ -1,7 +1,7 @@
 
 from fastapi import Header, HTTPException, status
 
-ADMIN_ACCOUNTS = {"admin-eu", "admin-us", "admin-apac"}
+ADMIN_ACCOUNTS = {"company", "director-1", "director-2"}
 
 
 def require_admin_account(x_account_id: str = Header(..., alias="X-Account-ID")) -> str:

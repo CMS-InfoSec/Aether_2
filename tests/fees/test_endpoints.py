@@ -127,8 +127,10 @@ def test_get_effective_fees_transitions_between_tiers(
 
     first = client.get(
         "/fees/effective",
-        params={"pair": "ETH-USD", "liquidity": "maker", "notional": 50_000},
-        headers={"X-Account-ID": "admin-eu"},
+
+        params={"isolation_segment": "seg-fees", "fee_tier": "standard"},
+        headers={"X-Account-Id": "company"},
+
     )
     assert first.status_code == 200
     first_body = first.json()["fee"]
@@ -137,8 +139,10 @@ def test_get_effective_fees_transitions_between_tiers(
 
     second = client.get(
         "/fees/effective",
-        params={"pair": "ETH-USD", "liquidity": "taker", "notional": 200_000},
-        headers={"X-Account-ID": "admin-eu"},
+
+        params={"isolation_segment": "seg-fees", "fee_tier": "standard"},
+        headers={"X-Account-Id": "company"},
+
     )
     assert second.status_code == 200
     second_body = second.json()["fee"]
@@ -173,12 +177,15 @@ def test_get_effective_fees_uses_fallback_when_schedule_missing(
 
     response = client.get(
         "/fees/effective",
-        params={"pair": "SOL-USD", "liquidity": "maker", "notional": 75_000},
-        headers={"X-Account-ID": "admin-us"},
+
+        params={"isolation_segment": "seg-fees", "fee_tier": "standard"},
+        headers={"X-Account-Id": "director-1"},
     )
 
     assert response.status_code == 200
-    payload = response.json()["fee"]
-    assert payload["maker"] == pytest.approx(1.5)
-    assert payload["maker_detail"]["tier_id"] == "default"
-    assert payload["maker_detail"]["usd"] == pytest.approx(75_000 * 1.5 / 10_000)
+    assert repositories and repositories[-1].account_id == "director-1"
+    assert repositories[-1].fee_override_calls == ["default"]
+    payload = response.json()
+    assert payload["fee"]["maker"] == 0.25
+    assert payload["fee"]["taker"] == 0.4
+
