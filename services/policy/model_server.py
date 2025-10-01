@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import random
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 
 from services.common.schemas import ActionTemplate, BookSnapshot, ConfidenceMetrics
 
@@ -148,6 +148,28 @@ class DummyPolicyModel:
             return 0.0
         return total / float(count)
 
+    def explain(
+        self, feature_values: Mapping[str, float] | Sequence[float]
+    ) -> Dict[str, float]:
+        """Return a deterministic attribution for the supplied features."""
+
+        if isinstance(feature_values, Mapping):
+            items: Iterable[Tuple[str, float]] = (
+                (str(key), float(value)) for key, value in feature_values.items()
+            )
+        else:
+            items = ((f"feature_{idx}", float(value)) for idx, value in enumerate(feature_values))
+
+        values = list(items)
+        if not values:
+            return {}
+
+        normalizer = float(len(values))
+        if normalizer == 0:
+            return {}
+
+        return {name: contribution / normalizer for name, contribution in values}
+
 
 class MLflowClientStub:
     """Very small stand-in for the MLflow client used in production."""
@@ -167,8 +189,9 @@ class MLflowClientStub:
 _client = MLflowClientStub()
 
 
-def _model_name(account_id: str, symbol: str) -> str:
-    return f"policy-intent::{account_id}::{symbol}".lower()
+def _model_name(account_id: str, symbol: str, variant: str | None = None) -> str:
+    suffix = f"::{variant}" if variant else ""
+    return f"policy-intent::{account_id}::{symbol}{suffix}".lower()
 
 
 def predict_intent(
@@ -176,6 +199,7 @@ def predict_intent(
     symbol: str,
     features: Sequence[float],
     book_snapshot: BookSnapshot | Dict[str, float],
+    model_variant: str | None = None,
 ) -> Intent:
     """Run inference against the latest MLflow model and return an intent.
 
@@ -189,9 +213,16 @@ def predict_intent(
             if isinstance(book_snapshot, BookSnapshot)
             else BookSnapshot(**book_snapshot)
         )
-        model_key = _model_name(account_id, symbol)
+        model_key = _model_name(account_id, symbol, model_variant)
         model = _client.load_latest_model(model_key)
         return model.predict(features, snapshot)
     except Exception:  # pragma: no cover - defensive safety net
         logger.exception("Failed to generate intent for account=%s symbol=%s", account_id, symbol)
         return Intent.null()
+
+
+def get_active_model(account_id: str, symbol: str) -> DummyPolicyModel:
+    """Return the latest model instance for ``account_id`` and ``symbol``."""
+
+    model_key = _model_name(account_id, symbol)
+    return _client.load_latest_model(model_key)
