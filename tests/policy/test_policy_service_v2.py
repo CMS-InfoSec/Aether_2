@@ -80,5 +80,5 @@ def test_policy_service_decision(monkeypatch: pytest.MonkeyPatch, client: TestCl
     assert body["selected_action"] == "maker"
     assert body["expected_edge_bps"] == pytest.approx(22.0)
     assert body["fee_adjusted_edge_bps"] == pytest.approx(17.5)
-    assert body["take_profit_bps"] == pytest.approx(10.8)
-    assert body["stop_loss_bps"] == pytest.approx(7.2)
+    assert body["take_profit_bps"] == pytest.approx(25.0)
+    assert body["stop_loss_bps"] == pytest.approx(12.0)

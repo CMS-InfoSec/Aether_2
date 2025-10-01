@@ -192,6 +192,49 @@ def _resolve_atr(symbol: str, snapshot: BookSnapshot, state: PolicyState | None)
     return atr
 
 
+def _resolve_risk_band(
+    request_value: float | None,
+    intents: Dict[str, "Intent"],
+    weights: Dict[str, float],
+    attribute: str,
+) -> float | None:
+    """Resolve a blended risk band while honouring overrides."""
+
+    def _coerce(value: object | None) -> float | None:
+        try:
+            numeric = float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(numeric) or numeric <= 0:
+            return None
+        return numeric
+
+    candidate = _coerce(request_value)
+    if candidate is not None:
+        return candidate
+
+    weighted_total = 0.0
+    total_weight = 0.0
+    fallback: float | None = None
+
+    for variant, intent in intents.items():
+        value = _coerce(getattr(intent, attribute, None))
+        if value is None:
+            continue
+        if fallback is None:
+            fallback = value
+        weight = weights.get(variant, 0.0)
+        if weight <= 0:
+            continue
+        weighted_total += value * weight
+        total_weight += weight
+
+    if total_weight > 0:
+        return weighted_total / total_weight
+
+    return fallback
+
+
 async def _fetch_effective_fee(account_id: str, symbol: str, liquidity: str, notional: float) -> float:
     liquidity_normalized = liquidity.lower() if liquidity else "maker"
     if liquidity_normalized not in {"maker", "taker"}:
@@ -382,8 +425,14 @@ async def decide_policy(request: PolicyDecisionRequest) -> PolicyDecisionRespons
     )
 
     atr = _resolve_atr(request.instrument, book_snapshot, state_model)
-    take_profit = 3.0 * atr
-    stop_loss = 2.0 * atr
+    take_profit_override = _resolve_risk_band(
+        request.take_profit_bps, intents, weights, "take_profit_bps"
+    )
+    stop_loss_override = _resolve_risk_band(
+        request.stop_loss_bps, intents, weights, "stop_loss_bps"
+    )
+    take_profit = take_profit_override if take_profit_override is not None else 3.0 * atr
+    stop_loss = stop_loss_override if stop_loss_override is not None else 2.0 * atr
 
     approved = (
         winning_action in {"maker", "taker"}

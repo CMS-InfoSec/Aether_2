@@ -112,8 +112,8 @@ def test_decide_policy_accepts_dataclass_intent(monkeypatch: pytest.MonkeyPatch,
     assert body.selected_action == "maker"
     assert body.expected_edge_bps == pytest.approx(20.0)
     assert body.fee_adjusted_edge_bps == pytest.approx(16.0)
-    assert body.take_profit_bps == pytest.approx(60.0)
-    assert body.stop_loss_bps == pytest.approx(40.0)
+    assert body.take_profit_bps == pytest.approx(30.0)
+    assert body.stop_loss_bps == pytest.approx(10.0)
 
 
 def test_metrics_endpoint_exposed_after_import():
