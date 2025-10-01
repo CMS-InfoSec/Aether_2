@@ -26,6 +26,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from reports.storage import ArtifactStorage, build_storage_from_env
+from services.models.model_server import get_active_model
 
 try:  # pragma: no cover - psycopg is an optional dependency in tests
     import psycopg
@@ -98,6 +99,125 @@ def _query_dataframe(conn: Any, query: str, params: Mapping[str, Any]) -> pd.Dat
     if isinstance(rows[0], Mapping):
         return pd.DataFrame(rows)
     return pd.DataFrame(rows)
+
+
+def _maybe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalise_feature_payload(raw: Any) -> dict[str, float]:
+    if raw is None:
+        return {}
+    if isinstance(raw, Mapping):
+        normalised: dict[str, float] = {}
+        for key, value in raw.items():
+            try:
+                normalised[str(key)] = float(value)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Feature '{key}' is not numeric",
+                ) from exc
+        return normalised
+    if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, bytearray)):
+        normalised = {}
+        for idx, value in enumerate(raw):
+            try:
+                normalised[f"feature_{idx}"] = float(value)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Feature at position {idx} is not numeric",
+                ) from exc
+        return normalised
+    return {}
+
+
+def _extract_feature_mapping(trade_row: Mapping[str, Any]) -> dict[str, float]:
+    candidates = ("features", "feature_vector", "feature_values")
+    for key in candidates:
+        if key in trade_row:
+            mapping = _normalise_feature_payload(trade_row[key])
+            if mapping:
+                return mapping
+
+    metadata_candidates = (
+        trade_row.get("order_metadata"),
+        trade_row.get("fill_metadata"),
+        trade_row.get("metadata"),
+    )
+    for container in metadata_candidates:
+        if isinstance(container, Mapping):
+            for key in candidates:
+                if key in container:
+                    mapping = _normalise_feature_payload(container[key])
+                    if mapping:
+                        return mapping
+
+    raise HTTPException(status_code=422, detail="Trade is missing feature metadata")
+
+
+def _extract_model_version(trade_row: Mapping[str, Any]) -> str | None:
+    if isinstance(trade_row.get("model_version"), str):
+        return trade_row["model_version"]
+
+    metadata_candidates = (
+        trade_row.get("order_metadata"),
+        trade_row.get("fill_metadata"),
+        trade_row.get("metadata"),
+    )
+    for container in metadata_candidates:
+        if isinstance(container, Mapping):
+            model_version = container.get("model_version")
+            if isinstance(model_version, str):
+                return model_version
+    return None
+
+
+def _load_trade_record(trade_id: str) -> Mapping[str, Any]:
+    if psycopg is None:  # pragma: no cover - exercised when psycopg is unavailable
+        raise HTTPException(
+            status_code=503,
+            detail="TimescaleDB driver (psycopg) is not installed in this environment.",
+        )
+
+    query = """
+        SELECT
+            f.fill_id,
+            f.order_id,
+            COALESCE(f.account_id, o.account_id) AS account_id,
+            COALESCE(f.market, f.symbol, o.symbol) AS instrument,
+            COALESCE(f.fill_time, f.fill_ts) AS executed_at,
+            f.price,
+            f.size,
+            f.fee,
+            f.liquidity,
+            f.metadata AS fill_metadata,
+            o.metadata AS order_metadata
+        FROM fills AS f
+        LEFT JOIN orders AS o ON o.order_id = f.order_id
+        WHERE f.fill_id = %(trade_id)s
+    """
+
+    try:
+        with psycopg.connect(_database_url(), row_factory=dict_row) as conn:  # type: ignore[arg-type]
+            with conn.cursor() as cursor:
+                cursor.execute(query, {"trade_id": trade_id})
+                row = cursor.fetchone()
+    except HTTPException:
+        raise
+    except Exception as exc:  # pragma: no cover - defensive guard for DB errors
+        LOGGER.exception("Failed to load trade context", extra={"trade_id": trade_id})
+        raise HTTPException(status_code=500, detail="Unable to load trade context") from exc
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="Trade not found")
+    return dict(row)
 
 
 def _first_column(frame: pd.DataFrame, candidates: Sequence[str]) -> str | None:
@@ -483,7 +603,15 @@ def _build_html_report(payload: Mapping[str, Any]) -> str:
         "<h2>Summary</h2>",
         _table([payload.get("summary", {})]) if payload.get("summary") else "<p>No summary.</p>",
         "<h2>Feature Attributions</h2>",
-        _table(shap_values),
+        _table(
+            sorted(
+                shap_values,
+                key=lambda row: abs(
+                    float(row.get("importance", row.get("attribution", row.get("weight", 0.0))))
+                ),
+                reverse=True,
+            )[:5]
+        ),
         "<h2>Detected Regimes</h2>",
         _table(regimes),
         "<h2>Instrument Breakdown</h2>",
@@ -498,6 +626,55 @@ def _build_html_report(payload: Mapping[str, Any]) -> str:
 storage: ArtifactStorage = build_storage_from_env(os.environ)
 
 app = FastAPI(title="Report Service")
+
+
+@app.get("/reports/trade_explain")
+def get_trade_explanation(
+    trade_id: str = Query(..., description="Unique trade/fill identifier")
+) -> JSONResponse:
+    """Return the model explanation for a single trade."""
+
+    trade = _load_trade_record(trade_id)
+    account_id = trade.get("account_id")
+    if not account_id:
+        raise HTTPException(status_code=422, detail="Trade is missing account context")
+    instrument = trade.get("instrument") or trade.get("symbol")
+    if not instrument:
+        raise HTTPException(status_code=422, detail="Trade is missing instrument context")
+
+    features = _extract_feature_mapping(trade)
+    model = get_active_model(str(account_id), str(instrument))
+    raw_importance = model.explain(features)
+
+    ordered = sorted(
+        ((name, float(value)) for name, value in raw_importance.items()),
+        key=lambda item: abs(item[1]),
+        reverse=True,
+    )
+    feature_importance = [
+        {"feature": name, "importance": value}
+        for name, value in ordered
+    ]
+    top_features = feature_importance[:5]
+
+    executed_at = (
+        trade.get("executed_at")
+        or trade.get("fill_time")
+        or trade.get("fill_ts")
+    )
+
+    payload = {
+        "trade_id": trade_id,
+        "account_id": str(account_id),
+        "instrument": str(instrument),
+        "executed_at": executed_at,
+        "price": _maybe_float(trade.get("price")),
+        "size": _maybe_float(trade.get("size")),
+        "feature_importance": feature_importance,
+        "top_features": top_features,
+        "model_version": _extract_model_version(trade),
+    }
+    return JSONResponse(content=payload)
 
 
 @app.get("/reports/daily")
