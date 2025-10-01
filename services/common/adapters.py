@@ -158,7 +158,14 @@ class TimescaleAdapter:
 @dataclass
 class RedisFeastAdapter:
     account_id: str
+    repository: UniverseRepository | None = None
+    _repository: UniverseRepository = field(init=False, repr=False)
 
+    def __post_init__(self) -> None:
+        if self.repository is not None:
+            self._repository = self.repository
+        else:
+            self._repository = UniverseRepository(account_id=self.account_id)
 
     _features: ClassVar[Dict[str, Dict[str, Any]]] = {
         "admin-eu": {"approved": ["BTC-USD", "ETH-USD"], "fees": {"BTC-USD": {"maker": 0.1, "taker": 0.2}}},
