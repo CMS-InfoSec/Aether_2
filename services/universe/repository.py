@@ -15,7 +15,8 @@ class MarketSnapshot:
     base_asset: str
     quote_asset: str
     market_cap: float
-    volume_24h: float
+    global_volume_24h: float
+    kraken_volume_24h: float
     volatility_30d: float
     source: str = "coingecko"
 
@@ -40,28 +41,32 @@ _DEFAULT_MARKETS: Tuple[MarketSnapshot, ...] = (
         base_asset="BTC",
         quote_asset="USD",
         market_cap=8.5e11,
-        volume_24h=3.2e10,
+        global_volume_24h=3.2e10,
+        kraken_volume_24h=1.8e10,
         volatility_30d=0.12,
     ),
     MarketSnapshot(
         base_asset="ETH",
         quote_asset="USD",
         market_cap=4.0e11,
-        volume_24h=1.5e10,
+        global_volume_24h=1.5e10,
+        kraken_volume_24h=8.5e9,
         volatility_30d=0.14,
     ),
     MarketSnapshot(
         base_asset="SOL",
         quote_asset="USD",
         market_cap=6.2e10,
-        volume_24h=7.0e9,
+        global_volume_24h=7.0e9,
+        kraken_volume_24h=3.1e9,
         volatility_30d=0.18,
     ),
     MarketSnapshot(
         base_asset="BTC",
         quote_asset="USDT",
         market_cap=8.5e11,
-        volume_24h=3.2e10,
+        global_volume_24h=3.2e10,
+        kraken_volume_24h=1.8e10,
         volatility_30d=0.12,
     ),
 )
@@ -75,8 +80,9 @@ _DEFAULT_FEE_OVERRIDES: Dict[str, Dict[str, Any]] = {
 class UniverseRepository:
     """Aggregates Timescale metrics and manual overrides for approvals."""
 
-    MARKET_CAP_THRESHOLD: ClassVar[float] = 5.0e8
-    VOLUME_THRESHOLD: ClassVar[float] = 2.5e7
+    MARKET_CAP_THRESHOLD: ClassVar[float] = 1.0e9
+    GLOBAL_VOLUME_THRESHOLD: ClassVar[float] = 2.5e7
+    KRAKEN_VOLUME_THRESHOLD: ClassVar[float] = 1.0e7
     VOLATILITY_THRESHOLD: ClassVar[float] = 0.40
     CONFIG_KEY_OVERRIDES: ClassVar[str] = "universe.manual_overrides"
 
@@ -164,7 +170,9 @@ class UniverseRepository:
                 continue
             if snapshot.market_cap < self.MARKET_CAP_THRESHOLD:
                 continue
-            if snapshot.volume_24h < self.VOLUME_THRESHOLD:
+            if snapshot.global_volume_24h < self.GLOBAL_VOLUME_THRESHOLD:
+                continue
+            if snapshot.kraken_volume_24h < self.KRAKEN_VOLUME_THRESHOLD:
                 continue
             if snapshot.volatility_30d < self.VOLATILITY_THRESHOLD:
                 continue
@@ -179,7 +187,8 @@ class UniverseRepository:
                         base_asset=symbol.split("-")[0],
                         quote_asset=symbol.split("-")[-1],
                         market_cap=self.MARKET_CAP_THRESHOLD,
-                        volume_24h=self.VOLUME_THRESHOLD,
+                        global_volume_24h=self.GLOBAL_VOLUME_THRESHOLD,
+                        kraken_volume_24h=self.KRAKEN_VOLUME_THRESHOLD,
                         volatility_30d=self.VOLATILITY_THRESHOLD,
                         source="manual",
                     ),
