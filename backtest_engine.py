@@ -89,6 +89,7 @@ class Order:
     triggered: bool = False
     active: bool = True
     trigger_reference: Optional[float] = None
+    maker_probability: float = 0.0
 
     def record_fill(self, quantity: float) -> None:
         self.remaining = max(self.remaining - quantity, 0.0)
@@ -106,6 +107,7 @@ class Fill:
     quantity: float
     fee: float
     liquidity_flag: str  # "maker" or "taker"
+    slippage_bps: float = 0.0
 
 
 @dataclass
@@ -124,6 +126,7 @@ class SimulationState:
     total_fee: float = 0.0
     slippage_sum_bps: float = 0.0
     slippage_samples: int = 0
+    slippage_cost_total: float = 0.0
     best_bid: Optional[float] = None
     best_ask: Optional[float] = None
     bid_size: float = 0.0
@@ -219,9 +222,9 @@ class Backtester:
         stress_metrics = {
             name: self._run_once(self._apply_stress(name)) for name in [
                 "flash_crash",
-                "spread_blowout",
+                "spread_widen",
                 "liquidity_halving",
-                "feed_gap",
+                "feed_outage",
             ]
         }
         result: Dict[str, Any] = dict(base_metrics)
@@ -338,6 +341,10 @@ class Backtester:
             if intent.side == "sell" and state.best_bid is not None and intent.price <= state.best_bid:
                 crosses_book = True
 
+        if intent.order_type == "limit" and intent.price is not None:
+            order.maker_probability = self._calculate_maker_probability(intent, state, crosses_book)
+            state.maker_target_qty += intent.quantity * order.maker_probability
+
         if intent.trailing_offset is not None:
             order.active = False
             reference = state.best_bid if intent.side == "sell" else state.best_ask
@@ -359,9 +366,6 @@ class Backtester:
                 order.status = "cancelled"
                 order.active = False
                 return
-
-        if intent.order_type == "limit" and intent.price is not None and not crosses_book:
-            state.maker_target_qty += intent.quantity
 
         if order.triggered and order.active:
             self._execute_order(order, timestamp, state, fee_model)
@@ -446,6 +450,27 @@ class Backtester:
         else:
             self._execute_limit_order(order, timestamp, state, fee_model)
 
+    def _calculate_maker_probability(
+        self,
+        intent: OrderIntent,
+        state: SimulationState,
+        crosses_book: bool,
+    ) -> float:
+        if intent.order_type != "limit" or intent.price is None:
+            return 0.0
+        if not crosses_book:
+            return 1.0
+        queue_bias = max(0.0, min(1.0, 1.0 - intent.queue_position))
+        depth = state.ask_size if intent.side == "buy" else state.bid_size
+        if depth <= 0:
+            return 0.0
+        depth_factor = min(1.0, depth / max(intent.quantity, 1e-9))
+        return max(0.0, min(1.0, queue_bias * depth_factor))
+
+    def _sample_latency(self, state: SimulationState) -> pd.Timedelta:
+        latency_ms = int(state.rng.integers(50, 301))
+        return pd.Timedelta(milliseconds=latency_ms)
+
     def _execute_market_order(
         self,
         order: Order,
@@ -463,9 +488,28 @@ class Backtester:
             return
         if order.intent.time_in_force == "FOK" and fill_qty < order.remaining:
             return
-        price = state.best_ask if order.intent.side == "buy" else state.best_bid
-        exec_price = self._apply_slippage(price, order.intent.side, state)
-        self._register_fill(order, timestamp, exec_price, fill_qty, "taker", state, fee_model)
+        base_price = state.best_ask if order.intent.side == "buy" else state.best_bid
+        exec_price, slippage_cost, slippage_bps = self._apply_slippage(
+            base_price,
+            order.intent.side,
+            fill_qty,
+            state,
+            "taker",
+        )
+        latency = self._sample_latency(state)
+        fill_timestamp = timestamp + latency
+        self._register_fill(
+            order,
+            fill_timestamp,
+            base_price,
+            exec_price,
+            fill_qty,
+            "taker",
+            state,
+            fee_model,
+            slippage_cost=slippage_cost,
+            slippage_bps=slippage_bps,
+        )
         if order.intent.side == "buy":
             state.ask_size = max(0.0, state.ask_size - fill_qty)
         else:
@@ -488,71 +532,105 @@ class Backtester:
 
         if order.intent.side == "buy":
             crossed = price >= state.best_ask
+            taker_reference_price = state.best_ask
             maker_liquidity = max(state.ask_size * (1.0 - order.intent.queue_position), 0.0)
             taker_liquidity = state.ask_size
         else:
             crossed = price <= state.best_bid
+            taker_reference_price = state.best_bid
             maker_liquidity = max(state.bid_size * (1.0 - order.intent.queue_position), 0.0)
             taker_liquidity = state.bid_size
 
         if not crossed:
             return
 
-        if crossed:
-            maker_fraction = max(0.0, min(1.0, 1.0 - order.intent.queue_position))
-        else:
-            maker_fraction = 1.0
+        maker_probability = order.maker_probability or self._calculate_maker_probability(
+            order.intent, state, crossed
+        )
+        maker_probability = max(0.0, min(1.0, maker_probability))
+        liquidity_flag = "maker"
+        if maker_probability < 1.0:
+            draw = float(state.rng.random())
+            if draw >= maker_probability or maker_liquidity <= 0:
+                liquidity_flag = "taker"
+        if liquidity_flag == "maker" and maker_liquidity <= 0:
+            liquidity_flag = "taker"
 
-        taker_qty = order.remaining * (1.0 - maker_fraction)
-        maker_qty = order.remaining - taker_qty
-
-        if taker_qty > 0:
-            available = taker_liquidity
-            fill_qty = min(taker_qty, available)
-            if order.intent.time_in_force == "FOK" and fill_qty < order.remaining:
-                return
-            if fill_qty > 0:
-                exec_price = self._apply_slippage(state.best_ask if order.intent.side == "buy" else state.best_bid, order.intent.side, state)
-                self._register_fill(order, timestamp, exec_price, fill_qty, "taker", state, fee_model)
-                if order.intent.side == "buy":
-                    state.ask_size = max(0.0, state.ask_size - fill_qty)
-                else:
-                    state.bid_size = max(0.0, state.bid_size - fill_qty)
-
-        if maker_qty > 0:
+        if liquidity_flag == "maker":
             available = maker_liquidity
-            fill_qty = min(maker_qty, available)
+            fill_qty = min(order.remaining, available)
             if fill_qty <= 0:
                 return
-            if fill_qty < maker_qty and not order.intent.allow_partial:
+            if fill_qty < order.remaining and not order.intent.allow_partial:
                 return
             if order.intent.time_in_force == "FOK" and fill_qty < order.remaining:
                 return
-            exec_price = price
-            self._register_fill(order, timestamp, exec_price, fill_qty, "maker", state, fee_model)
-            if order.intent.side == "buy":
-                state.ask_size = max(0.0, state.ask_size - fill_qty)
-            else:
-                state.bid_size = max(0.0, state.bid_size - fill_qty)
+            latency = self._sample_latency(state)
+            fill_timestamp = timestamp + latency
+            self._register_fill(
+                order,
+                fill_timestamp,
+                price,
+                price,
+                fill_qty,
+                "maker",
+                state,
+                fee_model,
+                slippage_cost=0.0,
+                slippage_bps=0.0,
+            )
+        else:
+            available = taker_liquidity
+            fill_qty = min(order.remaining, available)
+            if order.intent.time_in_force == "FOK" and fill_qty < order.remaining:
+                return
+            if fill_qty <= 0:
+                return
+            reference_price = taker_reference_price
+            exec_price, slippage_cost, slippage_bps = self._apply_slippage(
+                reference_price,
+                order.intent.side,
+                fill_qty,
+                state,
+                "taker",
+            )
+            latency = self._sample_latency(state)
+            fill_timestamp = timestamp + latency
+            self._register_fill(
+                order,
+                fill_timestamp,
+                reference_price,
+                exec_price,
+                fill_qty,
+                "taker",
+                state,
+                fee_model,
+                slippage_cost=slippage_cost,
+                slippage_bps=slippage_bps,
+            )
 
     def _register_fill(
         self,
         order: Order,
         timestamp: pd.Timestamp,
-        price: float,
+        base_price: float,
+        exec_price: float,
         quantity: float,
         liquidity_flag: str,
         state: SimulationState,
         fee_model: Optional[RollingFeeModel],
+        *,
+        slippage_cost: float = 0.0,
+        slippage_bps: float = 0.0,
     ) -> None:
         if quantity <= 0:
             return
 
         fee = 0.0
         if fee_model is not None:
-            fee, _ = fee_model.calculate_fee(timestamp, price, quantity, liquidity_flag)
+            fee, _ = fee_model.calculate_fee(timestamp, exec_price, quantity, liquidity_flag)
         state.total_fee += fee
-        notional = abs(price * quantity)
+        notional = abs(exec_price * quantity)
         state.total_notional += notional
 
         state.fills.append(
@@ -560,10 +638,11 @@ class Backtester:
                 order_id=order.order_id,
                 timestamp=timestamp,
                 side=order.intent.side,
-                price=price,
+                price=exec_price,
                 quantity=quantity,
                 fee=fee,
                 liquidity_flag=liquidity_flag,
+                slippage_bps=slippage_bps,
             )
         )
         order.record_fill(quantity)
@@ -571,19 +650,18 @@ class Backtester:
 
         if order.intent.side == "buy":
             state.position += quantity
-            state.cash -= price * quantity + fee
+            state.cash -= base_price * quantity + fee + slippage_cost
         else:
             state.position -= quantity
-            state.cash += price * quantity - fee
+            state.cash += base_price * quantity - fee - slippage_cost
 
         if liquidity_flag == "maker":
             state.maker_fill_qty += quantity
 
-        if state.mid_price is not None and state.mid_price > 0:
-            signed = 1 if order.intent.side == "buy" else -1
-            slippage = (price - state.mid_price) / state.mid_price * 10_000 * signed
-            state.slippage_sum_bps += slippage
+        if slippage_bps != 0.0 or slippage_cost > 0.0:
+            state.slippage_sum_bps += slippage_bps
             state.slippage_samples += 1
+        state.slippage_cost_total += slippage_cost
 
         if order.status == "filled":
             order.active = False
@@ -670,49 +748,51 @@ class Backtester:
         tail = sorted_returns.iloc[:cutoff_index]
         return float(tail.mean())
 
-    def _apply_slippage(self, price: float, side: str, state: SimulationState) -> float:
+    def _apply_slippage(
+        self,
+        price: float,
+        side: str,
+        quantity: float,
+        state: SimulationState,
+        liquidity_flag: str,
+    ) -> Tuple[float, float, float]:
+        if liquidity_flag == "maker":
+            return price, 0.0, 0.0
+        base_bps = self.slippage_bps if self.slippage_bps > 0 else 1.0
+        depth = state.ask_size if side == "buy" else state.bid_size
+        depth = max(depth, 1e-9)
+        depth_ratio = min(quantity / depth, 5.0)
+        dynamic_bps = base_bps * (1.0 + depth_ratio)
+        noise = base_bps * 0.25 * float(state.rng.normal())
+        total_bps = max(0.0, dynamic_bps + noise)
         direction = 1 if side == "buy" else -1
-        base = price * (self.slippage_bps / 10_000.0) * direction
-        noise = price * (self.slippage_bps / 20_000.0) * state.rng.normal()
-        return price + base + noise
+        price_shift = price * total_bps / 10_000.0 * direction
+        exec_price = price + price_shift
+        slippage_cost = abs(price_shift) * quantity
+        return exec_price, slippage_cost, total_bps
 
     # ------------------------------------------------------------------
     # Stress scenarios
     # ------------------------------------------------------------------
     def _apply_stress(self, scenario: str) -> List[Dict[str, Any]]:
         events = [dict(event) for event in self._base_events]
+        injectors = {
+            "flash_crash": flash_crash,
+            "spread_widen": spread_widen,
+            "feed_outage": feed_outage,
+        }
+        if scenario in injectors:
+            return injectors[scenario](events)
+
         book_indices = [idx for idx, event in enumerate(events) if event["type"] == "book"]
         if not book_indices:
             return events
 
-        if scenario == "flash_crash":
-            window = book_indices[len(book_indices) // 2 : len(book_indices) // 2 + 5]
-            for idx in window:
-                event = events[idx]
-                if event.get("bid") is not None:
-                    event["bid"] *= 0.7
-                if event.get("ask") is not None:
-                    event["ask"] *= 0.72
-                event["bid_size"] = float(event.get("bid_size", 1.0)) * 0.5
-                event["ask_size"] = float(event.get("ask_size", 1.0)) * 0.5
-        elif scenario == "spread_blowout":
-            for idx in book_indices[len(book_indices) // 3 : len(book_indices) // 3 + 5]:
-                event = events[idx]
-                bid = event.get("bid")
-                ask = event.get("ask")
-                if bid is not None and ask is not None:
-                    mid = (bid + ask) / 2
-                    event["bid"] = mid * 0.98
-                    event["ask"] = mid * 1.02
-        elif scenario == "liquidity_halving":
+        if scenario == "liquidity_halving":
             for idx in book_indices[::2]:
                 event = events[idx]
                 event["bid_size"] = float(event.get("bid_size", 1.0)) * 0.5
                 event["ask_size"] = float(event.get("ask_size", 1.0)) * 0.5
-        elif scenario == "feed_gap":
-            gap_indices = book_indices[len(book_indices) // 4 : len(book_indices) // 4 + 3]
-            for idx in sorted(gap_indices, reverse=True):
-                events.pop(idx)
         return events
 
     # ------------------------------------------------------------------
@@ -727,3 +807,59 @@ class Backtester:
         """Return the most recent :class:`SimulationState` after a run."""
 
         return self._last_state
+
+
+def _book_event_indices(events: List[Dict[str, Any]]) -> List[int]:
+    return [idx for idx, event in enumerate(events) if event.get("type") == "book"]
+
+
+def flash_crash(events: List[Dict[str, Any]], drop: float = 0.3, depth_factor: float = 0.5) -> List[Dict[str, Any]]:
+    book_indices = _book_event_indices(events)
+    if not book_indices:
+        return events
+    start = len(book_indices) // 2
+    window = book_indices[start : start + 5]
+    for idx in window:
+        event = events[idx]
+        bid = event.get("bid")
+        ask = event.get("ask")
+        if bid is not None:
+            event["bid"] = bid * (1.0 - drop)
+        if ask is not None:
+            event["ask"] = ask * (1.0 - drop * 0.9)
+        event["bid_size"] = float(event.get("bid_size", 1.0)) * depth_factor
+        event["ask_size"] = float(event.get("ask_size", 1.0)) * depth_factor
+    return events
+
+
+def spread_widen(events: List[Dict[str, Any]], widen_bps: float = 75.0) -> List[Dict[str, Any]]:
+    book_indices = _book_event_indices(events)
+    if not book_indices:
+        return events
+    width = widen_bps / 10_000.0
+    for idx in book_indices[len(book_indices) // 3 : len(book_indices) // 3 + 5]:
+        event = events[idx]
+        bid = event.get("bid")
+        ask = event.get("ask")
+        if bid is None or ask is None:
+            continue
+        mid = (bid + ask) / 2.0
+        event["bid"] = mid * (1.0 - width)
+        event["ask"] = mid * (1.0 + width)
+    return events
+
+
+def feed_outage(events: List[Dict[str, Any]], gap_events: int = 3) -> List[Dict[str, Any]]:
+    book_indices = _book_event_indices(events)
+    if len(book_indices) < gap_events:
+        return events
+    start = max(len(book_indices) // 4, 0)
+    outage = book_indices[start : start + gap_events]
+    for idx in outage:
+        event = events[idx]
+        event["bid"] = None
+        event["ask"] = None
+        event["bid_size"] = 0.0
+        event["ask_size"] = 0.0
+        event["halted"] = True
+    return events
