@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, ClassVar, Dict, List, Optional
 
-from shared.k8s import KubernetesSecretClient
+from shared.k8s import KrakenSecretStore
 
 from services.universe.repository import UniverseRepository
 
@@ -41,6 +41,10 @@ class TimescaleAdapter:
     account_id: str
 
     _metrics: ClassVar[Dict[str, Dict[str, float]]] = {}
+
+    _events: ClassVar[Dict[str, Dict[str, List[Dict[str, Any]]]]] = {}
+    _credential_rotations: ClassVar[Dict[str, Dict[str, Any]]] = {}
+
 
     _telemetry: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
 
@@ -76,6 +80,8 @@ class TimescaleAdapter:
         self._daily_usage.setdefault(self.account_id, {})
         self._instrument_exposures.setdefault(self.account_id, {})
 
+        self._credential_rotations.setdefault(self.account_id, {})
+
 
     def record_usage(self, notional: float) -> None:
         self._metrics[self.account_id]["usage"] += notional
@@ -83,6 +89,54 @@ class TimescaleAdapter:
     def check_limits(self, notional: float) -> bool:
         projected = self._metrics[self.account_id]["usage"] + notional
         return projected <= self._metrics[self.account_id]["limit"]
+
+
+    def record_ack(self, payload: Dict[str, Any]) -> None:
+        event = dict(payload)
+        event.setdefault("timestamp", datetime.now(timezone.utc))
+        self._events[self.account_id]["acks"].append(event)
+
+    def record_fill(self, payload: Dict[str, Any]) -> None:
+        event = dict(payload)
+        event.setdefault("timestamp", datetime.now(timezone.utc))
+        self._events[self.account_id]["fills"].append(event)
+
+    def events(self) -> Dict[str, List[Dict[str, Any]]]:
+        stored = self._events.get(self.account_id, {"acks": [], "fills": []})
+        return {"acks": list(stored["acks"]), "fills": list(stored["fills"])}
+
+    @classmethod
+    def reset(cls, account_id: str | None = None) -> None:
+        if account_id is None:
+            cls._metrics.clear()
+            cls._events.clear()
+            cls._credential_rotations.clear()
+            return
+        cls._metrics.pop(account_id, None)
+        cls._events.pop(account_id, None)
+        cls._credential_rotations.pop(account_id, None)
+
+
+    def load_risk_config(self) -> Dict[str, Any]:
+        config = self._risk_configs.setdefault(
+            self.account_id,
+            {
+                "nav": 2_500_000.0,
+                "loss_cap": 150_000.0,
+                "fee_cap": 50_000.0,
+                "max_nav_percent": 0.25,
+                "var_limit": 120_000.0,
+                "spread_limit_bps": 50.0,
+                "latency_limit_ms": 250.0,
+                "diversification_rules": {"max_single_instrument_percent": 0.35},
+                "kill_switch": False,
+            },
+        )
+        return deepcopy(config)
+
+    def get_daily_usage(self) -> Dict[str, float]:
+        usage = self._daily_usage.setdefault(self.account_id, {"loss": 0.0, "fee": 0.0})
+        return dict(usage)
 
 
     def record_decision(self, order_id: str, payload: Dict[str, Any]) -> None:
@@ -97,6 +151,7 @@ class TimescaleAdapter:
         return list(self._telemetry.get(self.account_id, []))
 
     # ------------------------------------------------------------------
+
     # Timescale-inspired risk state helpers
     # ------------------------------------------------------------------
     def load_risk_config(self) -> Dict[str, Any]:
@@ -188,6 +243,7 @@ class TimescaleAdapter:
 
 
 
+
 @dataclass
 class RedisFeastAdapter:
     account_id: str
@@ -238,43 +294,35 @@ class RedisFeastAdapter:
 class KrakenSecretManager:
     account_id: str
     namespace: str = "aether-secrets"
-    k8s_client: Optional[KubernetesSecretClient] = None
+    secret_store: Optional[KrakenSecretStore] = None
     timescale: Optional[TimescaleAdapter] = None
 
-    secret_prefix: ClassVar[str] = "kraken"
-
     def __post_init__(self) -> None:
-        if self.k8s_client is None:
-            self.k8s_client = KubernetesSecretClient(namespace=self.namespace)
+        if self.secret_store is None:
+            self.secret_store = KrakenSecretStore(namespace=self.namespace)
         if self.timescale is None:
             self.timescale = TimescaleAdapter(account_id=self.account_id)
 
     @property
     def secret_name(self) -> str:
-        return f"{self.secret_prefix}-{self.account_id}"
+        assert self.secret_store is not None
+        return self.secret_store.secret_name(self.account_id)
 
     def rotate_credentials(self, *, api_key: str, api_secret: str) -> Dict[str, Any]:
-        assert self.k8s_client is not None  # for type checkers
+        assert self.secret_store is not None  # for type checkers
         assert self.timescale is not None
 
-        before_secret = self.k8s_client.get_secret(self.secret_name)
-        payload = {"api_key": api_key, "api_secret": api_secret}
-        self.k8s_client.patch_secret(self.secret_name, payload)
-
-        rotated_at = datetime.now(timezone.utc)
-        self.timescale.record_credential_rotation(secret_name=self.secret_name, rotated_at=rotated_at)
+        before_status = self.timescale.credential_rotation_status()
+        self.secret_store.write_credentials(
+            self.account_id,
+            api_key=api_key,
+            api_secret=api_secret,
+        )
+        metadata = self.timescale.record_credential_rotation(secret_name=self.secret_name)
 
         return {
-            "secret_name": self.secret_name,
-            "rotated_at": rotated_at,
-            "before": {
-                "secret_name": self.secret_name,
-                "material_present": bool(before_secret),
-            },
-            "after": {
-                "secret_name": self.secret_name,
-                "material_present": True,
-            },
+            "metadata": metadata,
+            "before": before_status,
         }
 
     def status(self) -> Optional[Dict[str, Any]]:

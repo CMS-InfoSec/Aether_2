@@ -3,8 +3,8 @@ from fastapi import Depends, FastAPI, HTTPException, Query, status
 
 from services.common.adapters import KrakenSecretManager
 from services.common.schemas import (
-    KrakenSecretRotationRequest,
-    KrakenSecretRotationResponse,
+    KrakenCredentialRequest,
+    KrakenCredentialResponse,
     KrakenSecretStatusResponse,
 )
 from services.common.security import require_admin_account, require_mfa_context
@@ -17,12 +17,12 @@ _audit_logger = TimescaleAuditLogger(_audit_store)
 _auditor = SensitiveActionRecorder(_audit_logger)
 
 
-@app.post("/secrets/kraken/rotate", response_model=KrakenSecretRotationResponse)
-def rotate_kraken_secret(
-    request: KrakenSecretRotationRequest,
+@app.post("/secrets/kraken", response_model=KrakenCredentialResponse)
+def upsert_kraken_secret(
+    request: KrakenCredentialRequest,
     account_id: str = Depends(require_admin_account),
     _: str = Depends(require_mfa_context),
-) -> KrakenSecretRotationResponse:
+) -> KrakenCredentialResponse:
     if request.account_id != account_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -36,13 +36,16 @@ def rotate_kraken_secret(
         action="kraken.secret.rotate",
         actor_id=account_id,
         before=rotation["before"],
-        after=rotation["after"],
+        after=rotation["metadata"],
     )
 
-    return KrakenSecretRotationResponse(
+    metadata = rotation["metadata"]
+
+    return KrakenCredentialResponse(
         account_id=account_id,
-        secret_name=rotation["secret_name"],
-        rotated_at=rotation["rotated_at"],
+        secret_name=metadata["secret_name"],
+        created_at=metadata["created_at"],
+        rotated_at=metadata["rotated_at"],
     )
 
 
