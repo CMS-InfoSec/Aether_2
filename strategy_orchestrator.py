@@ -107,8 +107,6 @@ class StrategyRegistry:
                     if record is None:
                         record = StrategyRecord(name=name, enabled=True, max_nav_pct=max_nav_pct)
                         session.add(record)
-                    else:
-                        record.max_nav_pct = max_nav_pct
                     self._descriptions[name] = description
 
     def register(self, name: str, description: str, max_nav_pct: float) -> StrategySnapshot:
