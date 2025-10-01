@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Union
-from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 try:  # pragma: no cover - optional dependency
     from . import models
@@ -14,12 +13,13 @@ except ImportError:  # pragma: no cover - the inference module is optional at ru
     models = None
 
 from metrics import record_abstention_rate, record_drift_score, setup_metrics
+from services.common.security import ADMIN_ACCOUNTS
 
 
 class PolicyDecisionRequest(BaseModel):
     """Request schema for the policy decision endpoint."""
 
-    account_id: UUID = Field(..., description="Unique account identifier")
+    account_id: str = Field(..., description="Unique account identifier")
     symbol: str = Field(..., description="Trading symbol for the decision")
     features: Optional[Union[List[Any], Dict[str, Any]]] = Field(
         None, description="Feature vector or mapping for model inference"
@@ -32,6 +32,13 @@ class PolicyDecisionRequest(BaseModel):
         default_factory=dict,
         description="Account state such as positions, balances, and risk metrics",
     )
+
+    @field_validator("account_id")
+    @classmethod
+    def _validate_account_id(cls, value: str) -> str:
+        if value not in ADMIN_ACCOUNTS:
+            raise ValueError("Account must be an authorized admin.")
+        return value
 
 
 class PolicyIntent(BaseModel):
@@ -77,7 +84,7 @@ def decide_policy_intent(request: PolicyDecisionRequest) -> PolicyIntent:
 
     try:
         intent_payload = models.predict_intent(
-            account_id=str(request.account_id),
+            account_id=request.account_id,
             symbol=request.symbol,
             features=request.features,
             book_snapshot=request.book_snapshot,
@@ -113,10 +120,10 @@ def decide_policy_intent(request: PolicyDecisionRequest) -> PolicyIntent:
             drift = float(raw)
         except (TypeError, ValueError):
             drift = 0.0
-    record_drift_score(str(request.account_id), request.symbol, drift)
+    record_drift_score(request.account_id, request.symbol, drift)
 
     action = (response.action or "").lower()
     abstain = 1.0 if action in {"hold", "abstain"} else 0.0
-    record_abstention_rate(str(request.account_id), request.symbol, abstain)
+    record_abstention_rate(request.account_id, request.symbol, abstain)
 
     return response
