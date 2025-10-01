@@ -76,10 +76,10 @@ class StrategyHooks:
         triggered_sl: List[int] = []
         for order_id, threshold in list(self.pending_sl.items()):
             direction = self.order_side.get(order_id)
-            if direction == "buy" and engine.position > 0 and ask is not None and ask <= threshold:
+            if direction == "buy" and engine.position > 0 and bid is not None and bid <= threshold:
                 engine.place_exit_order(order_id, threshold, "stop_loss")
                 triggered_sl.append(order_id)
-            elif direction == "sell" and engine.position < 0 and bid is not None and bid >= threshold:
+            elif direction == "sell" and engine.position < 0 and ask is not None and ask >= threshold:
                 engine.place_exit_order(order_id, threshold, "stop_loss")
                 triggered_sl.append(order_id)
         for order_id in triggered_sl:
