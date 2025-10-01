@@ -206,9 +206,9 @@ class HitlService:
                 entry.status = "pending"
                 entry.ts = now
 
-    def _schedule_timeout(self, intent_id: str) -> None:
-        timeout = self.config.approval_timeout_seconds
-        if timeout == 0:
+    def _schedule_timeout(self, intent_id: str, *, delay: Optional[float] = None) -> None:
+        timeout = self.config.approval_timeout_seconds if delay is None else delay
+        if timeout <= 0:
             return
 
         existing = self._timeout_tasks.get(intent_id)
@@ -220,15 +220,18 @@ class HitlService:
         task = loop.create_task(self._expire_after_timeout(intent_id, timeout))
         self._timeout_tasks[intent_id] = task
 
-    async def _expire_after_timeout(self, intent_id: str, timeout: int) -> None:
+    def _mark_expired(self, intent_id: str, *, reason: str) -> None:
+        with db_session() as session:
+            entry = session.get(HitlQueueEntry, intent_id)
+            if entry and entry.status == "pending":
+                entry.status = "expired"
+                entry.ts = datetime.now(timezone.utc)
+                logger.info("HITL intent %s expired %s", intent_id, reason)
+
+    async def _expire_after_timeout(self, intent_id: str, timeout: float) -> None:
         try:
             await asyncio.sleep(timeout)
-            with db_session() as session:
-                entry = session.get(HitlQueueEntry, intent_id)
-                if entry and entry.status == "pending":
-                    entry.status = "expired"
-                    entry.ts = datetime.now(timezone.utc)
-                    logger.info("HITL intent %s expired without approval", intent_id)
+            self._mark_expired(intent_id, reason="without approval")
         except asyncio.CancelledError:  # pragma: no cover - cooperative cancellation
             pass
         finally:
@@ -299,6 +302,31 @@ class HitlService:
                 )
         return entries
 
+    async def restore_pending_timeouts(self) -> None:
+        timeout = self.config.approval_timeout_seconds
+        if timeout == 0:
+            return
+
+        with db_session() as session:
+            pending: List[tuple[str, datetime]] = [
+                (row.intent_id, row.ts)
+                for row in session.query(HitlQueueEntry)
+                .filter(HitlQueueEntry.status == "pending")
+                .all()
+            ]
+
+        now = datetime.now(timezone.utc)
+        for intent_id, submitted_at in pending:
+            elapsed = (now - submitted_at).total_seconds()
+            remaining = timeout - elapsed
+            if remaining <= 0:
+                self._mark_expired(
+                    intent_id,
+                    reason="after exceeding the SLA while the service was offline",
+                )
+            else:
+                self._schedule_timeout(intent_id, delay=remaining)
+
     def record_decision(self, request: ApprovalRequest) -> ApprovalResponse:
         with db_session() as session:
             entry = session.get(HitlQueueEntry, request.intent_id)
@@ -354,6 +382,11 @@ def get_pending_trades() -> List[PendingTrade]:
 @app.post("/hitl/approve", response_model=ApprovalResponse)
 def approve_trade(request: ApprovalRequest) -> ApprovalResponse:
     return service.record_decision(request)
+
+
+@app.on_event("startup")
+async def _reschedule_pending_timeouts() -> None:
+    await service.restore_pending_timeouts()
 
 
 __all__ = [
