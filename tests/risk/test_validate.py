@@ -2,11 +2,21 @@ from __future__ import annotations
 
 
 from collections.abc import Generator
+from typing import Any
 
 import pytest
 
 from services.common.adapters import TimescaleAdapter
-from services.common.schemas import RiskValidationRequest, RiskValidationResponse
+from services.common.schemas import (
+    FeeBreakdown,
+    PolicyDecisionPayload,
+    PolicyDecisionRequest,
+    PortfolioState,
+    RiskIntentMetrics,
+    RiskIntentPayload,
+    RiskValidationRequest,
+    RiskValidationResponse,
+)
 from services.risk.engine import RiskEngine
 
 from services.universe.repository import MarketSnapshot, UniverseRepository
@@ -22,21 +32,24 @@ def reset_state() -> Generator[None, None, None]:
                 base_asset="BTC",
                 quote_asset="USD",
                 market_cap=1.0e9,
-                volume_24h=5.0e8,
+                global_volume_24h=5.0e8,
+                kraken_volume_24h=2.5e8,
                 volatility_30d=0.5,
             ),
             MarketSnapshot(
                 base_asset="ETH",
                 quote_asset="USD",
-                market_cap=8.0e8,
-                volume_24h=3.0e8,
+                market_cap=1.6e9,
+                global_volume_24h=3.0e8,
+                kraken_volume_24h=1.6e8,
                 volatility_30d=0.45,
             ),
             MarketSnapshot(
                 base_asset="SOL",
                 quote_asset="USD",
-                market_cap=7.5e8,
-                volume_24h=2.6e8,
+                market_cap=1.1e9,
+                global_volume_24h=2.6e8,
+                kraken_volume_24h=1.3e8,
                 volatility_30d=0.5,
             ),
         ]
@@ -48,10 +61,11 @@ def reset_state() -> Generator[None, None, None]:
 
 
 
-def make_request(**overrides: float | str | dict[str, float]) -> RiskValidationRequest:
-    payload: dict[str, float | str | dict[str, float]] = {
-        "account_id": "company",
-        "instrument": "ETH-USD",
+def make_request(**overrides: Any) -> RiskValidationRequest:
+    account_id = str(overrides.pop("account_id", "company"))
+    instrument = str(overrides.pop("instrument", "ETH-USD"))
+
+    scalar_defaults = {
         "net_exposure": 100_000.0,
         "gross_notional": 25_000.0,
         "projected_loss": 10_000.0,
@@ -59,11 +73,52 @@ def make_request(**overrides: float | str | dict[str, float]) -> RiskValidationR
         "var_95": 50_000.0,
         "spread_bps": 10.0,
         "latency_ms": 100.0,
-        "fee": {"currency": "USD", "maker": 0.1, "taker": 0.2},
-
     }
 
-    return RiskValidationRequest(**payload)
+    scalars: dict[str, float] = {}
+    for key, default in scalar_defaults.items():
+        value = overrides.pop(key, default)
+        scalars[key] = float(value)
+
+    raw_fee = overrides.pop("fee", {"currency": "USD", "maker": 0.1, "taker": 0.2})
+    fee = FeeBreakdown(**raw_fee) if isinstance(raw_fee, dict) else raw_fee
+
+    policy_request = PolicyDecisionRequest(
+        account_id=account_id,
+        order_id="ABC-123",
+        instrument=instrument,
+        side="BUY",
+        quantity=1.0,
+        price=25_000.0,
+        fee=fee,
+    )
+
+    metrics = RiskIntentMetrics(**scalars)
+    intent = RiskIntentPayload(
+        policy_decision=PolicyDecisionPayload(request=policy_request),
+        metrics=metrics,
+    )
+
+    portfolio_state = PortfolioState(
+        nav=10_000_000.0,
+        loss_to_date=5_000.0,
+        fee_to_date=2_000.0,
+        instrument_exposure={instrument: scalars["gross_notional"] / 2},
+    )
+
+    request_payload = {
+        "account_id": account_id,
+        "intent": intent,
+        "portfolio_state": portfolio_state,
+        "instrument": instrument,
+        "fee": fee,
+        **scalars,
+    }
+
+    # Propagate any remaining overrides directly.
+    request_payload.update(overrides)
+
+    return RiskValidationRequest(**request_payload)
 
 
 def test_engine_accepts_trade_within_limits() -> None:

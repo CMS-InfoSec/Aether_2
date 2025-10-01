@@ -19,7 +19,7 @@ def test_universe_approved_authorized_accounts():
         expected_instruments = adapter.approved_instruments()
         expected_overrides = {}
         for instrument in expected_instruments:
-            override = repo.fee_override(instrument)
+            override = adapter.fee_override(instrument)
             if override:
                 expected_overrides[instrument] = override
 

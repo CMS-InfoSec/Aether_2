@@ -56,6 +56,9 @@ class RecordingSession:
         account_filter_ids = params.get("account_ids") or []
         account_filter_slugs = params.get("account_slugs") or []
 
+        if account_filter_slugs and "join accounts as a on a.account_id = o.account_id" not in normalized_query:
+            raise AssertionError("Slug filters must join the accounts table")
+
         if "from fills" in normalized_query:
             start = params.get("start")
             end = params.get("end")
@@ -271,6 +274,14 @@ def test_generate_daily_pnl_accepts_admin_slug_filter(
     assert slug_params
     for params in slug_params:
         assert params["account_slugs"] == ["alpha"]
+
+    slug_queries = [
+        query for query, params in zip(sample_session.queries, sample_session.params)
+        if params.get("account_slugs")
+    ]
+    assert slug_queries
+    for query in slug_queries:
+        assert "JOIN accounts AS a ON a.account_id = o.account_id" in query
 
     for params in sample_session.params:
         if "account_ids" in params:

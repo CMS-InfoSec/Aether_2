@@ -45,6 +45,15 @@ ANNOTATION_CREATED_AT = "aether.kraken/createdAt"
 ANNOTATION_ROTATED_AT = "aether.kraken/lastRotatedAt"
 
 
+def validate_kraken_credentials(api_key: str, api_secret: str) -> bool:
+    """Stub for validating Kraken credentials via the GetBalance endpoint."""
+
+    # TODO: Integrate with Kraken's REST API client to verify credentials.
+    # The stub intentionally returns ``True`` for now so rotation can proceed.
+    _ = (api_key, api_secret)  # Avoid unused variable warnings without logging secrets.
+    return True
+
+
 class KrakenSecretRequest(BaseModel):
     """Payload for rotating Kraken API credentials."""
 
@@ -248,6 +257,12 @@ def rotate_kraken_secret(
     api_key = payload.api_key.get_secret_value()
     api_secret = payload.api_secret.get_secret_value()
 
+    if not validate_kraken_credentials(api_key, api_secret):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unable to validate Kraken credentials",
+        )
+
     existing_metadata = _read_secret_metadata(
         api, name=_secret_name(actor_account), namespace=KRAKEN_SECRET_NAMESPACE
     )
@@ -262,11 +277,17 @@ def rotate_kraken_secret(
         existing_metadata=existing_metadata,
     )
 
+    audit_after = {
+        "account_id": actor_account,
+        "secret_name": updated_metadata["secret_name"],
+        "rotated_at": updated_metadata["last_rotated_at"].isoformat(),
+    }
+
     _auditor.record(
         action="kraken.secret.rotate",
         actor_id=actor_account,
         before=before_for_audit,
-        after=_serialize_metadata_for_audit(updated_metadata),
+        after=audit_after,
     )
 
     return KrakenSecretResponse(
@@ -320,5 +341,6 @@ __all__ = [
     "KrakenSecretRequest",
     "KrakenSecretResponse",
     "KrakenSecretStatus",
+    "validate_kraken_credentials",
 ]
 
