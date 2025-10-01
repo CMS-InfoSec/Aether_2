@@ -1,3 +1,4 @@
+
 from fastapi import Depends, FastAPI, HTTPException, status
 
 from services.common.adapters import KafkaNATSAdapter
@@ -7,8 +8,10 @@ from services.common.security import require_admin_account
 app = FastAPI(title="Policy Service")
 
 
+
 @app.post("/policy/decide", response_model=PolicyDecisionResponse)
 def decide_policy(
+
     request: PolicyDecisionRequest,
     account_id: str = Depends(require_admin_account),
 ) -> PolicyDecisionResponse:
@@ -38,3 +41,4 @@ def decide_policy(
         reason=reason,
         effective_fee=request.fee if approved else request.fee,
     )
+

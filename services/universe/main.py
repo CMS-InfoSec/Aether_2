@@ -1,3 +1,4 @@
+
 from fastapi import Depends, FastAPI
 
 from services.common.adapters import RedisFeastAdapter
@@ -22,3 +23,4 @@ def approved_universe(account_id: str = Depends(require_admin_account)) -> Appro
             )
 
     return ApprovedUniverseResponse(account_id=account_id, instruments=instruments, fee_overrides=fee_overrides)
+

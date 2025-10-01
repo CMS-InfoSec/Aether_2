@@ -1,3 +1,4 @@
+
 from fastapi import Depends, FastAPI, HTTPException, status
 
 from services.common.adapters import KafkaNATSAdapter
@@ -32,3 +33,4 @@ def place_order(
     venue = "kraken" if request.instrument.endswith("USD") else "kraken-intl"
 
     return OrderPlacementResponse(accepted=True, routed_venue=venue, fee=request.fee)
+

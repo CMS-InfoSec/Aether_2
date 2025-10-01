@@ -1,6 +1,8 @@
+
 from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI
+
 
 from services.common.adapters import RedisFeastAdapter
 from services.common.schemas import FeeBreakdown, FeeScheduleResponse
@@ -20,3 +22,4 @@ def get_effective_fees(account_id: str = Depends(require_admin_account)) -> FeeS
         effective_from=datetime.now(timezone.utc),
         fee=fee,
     )
+

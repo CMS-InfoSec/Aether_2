@@ -1,3 +1,4 @@
+
 from fastapi import Depends, FastAPI, HTTPException, status
 
 from services.common.adapters import KrakenSecretManager
@@ -31,3 +32,4 @@ def get_kraken_credentials(
         api_secret=credentials["api_secret"],
         fee=fee,
     )
+

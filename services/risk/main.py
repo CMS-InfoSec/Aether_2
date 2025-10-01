@@ -1,3 +1,4 @@
+
 from fastapi import Depends, FastAPI, HTTPException, status
 
 from services.common.adapters import TimescaleAdapter
@@ -7,8 +8,10 @@ from services.common.security import require_admin_account
 app = FastAPI(title="Risk Service")
 
 
+
 @app.post("/risk/validate", response_model=RiskValidationResponse)
 def validate_risk(
+
     request: RiskValidationRequest,
     account_id: str = Depends(require_admin_account),
 ) -> RiskValidationResponse:
@@ -27,3 +30,4 @@ def validate_risk(
         timescale.record_usage(notional)
 
     return RiskValidationResponse(valid=within_limits, reasons=reasons, fee=request.fee)
+

@@ -1,9 +1,12 @@
+
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Dict, List, Optional
 
+
 from pydantic import BaseModel, Field
+
 
 
 class FeeBreakdown(BaseModel):
@@ -83,3 +86,4 @@ class KrakenCredentialResponse(BaseModel):
     api_key: str = Field(..., description="Kraken API key")
     api_secret: str = Field(..., description="Kraken API secret")
     fee: FeeBreakdown = Field(..., description="Fee context for credential usage")
+
