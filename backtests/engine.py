@@ -1,8 +1,8 @@
 """Event-driven backtest engine for Kraken market data."""
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import Callable, Dict, Iterable, Iterator, List, Optional
 
 from backtests.strategies.hooks import StrategyHooks
@@ -34,6 +34,8 @@ class OrderIntent:
     allow_partial: bool = True
     take_profit: Optional[float] = None
     stop_loss: Optional[float] = None
+    trailing_offset: Optional[float] = None
+    trailing_percentage: Optional[float] = None
 
 
 @dataclass
@@ -47,6 +49,10 @@ class Order:
     filled: float = 0.0
     status: str = "open"
     is_taker: bool = False
+    activation_time: datetime = field(default_factory=lambda: datetime.now(UTC))
+    queue_position: float = 0.0
+    pending_market_fill: bool = False
+    exit_reason: Optional[str] = None
 
 
 @dataclass
@@ -130,6 +136,7 @@ class BacktestEngine:
         slippage_bps: float = 0.0,
         spread_bps: float = 0.0,
         hooks: Optional[StrategyHooks] = None,
+        latency_seconds: float = 0.0,
     ) -> None:
         self.fee_schedule = fee_schedule
         self.data_feed = data_feed
@@ -142,9 +149,14 @@ class BacktestEngine:
         self.cash: float = 0.0
         self.best_bid: Optional[float] = None
         self.best_ask: Optional[float] = None
+        self.best_bid_size: float = 0.0
+        self.best_ask_size: float = 0.0
+        self.current_time: datetime = datetime.now(UTC)
+        self.latency = timedelta(seconds=latency_seconds)
 
     def run(self, strategy: "Policy") -> None:
         for event in self.data_feed:
+            self.current_time = event.timestamp
             if event.type == "order_book":
                 self._update_book(event.data)
                 self.hooks.evaluate_tp_sl(self, event.data)
@@ -153,32 +165,46 @@ class BacktestEngine:
             decision = strategy.on_event(event, self)
             self.hooks.process_decision(decision, self.place_order)
 
-    def place_order(self, intent: OrderIntent, force_taker: bool = False) -> Order:
+    def place_order(
+        self,
+        intent: OrderIntent,
+        force_taker: bool = False,
+        exit_reason: Optional[str] = None,
+    ) -> Order:
         order_id = self.hooks.next_order_id()
         is_taker = self._is_taker(intent, force_taker)
+        activation_time = self.current_time + self.latency
         order = Order(
             order_id=order_id,
             intent=intent,
-            timestamp=datetime.now(UTC),
+            timestamp=self.current_time,
             remaining=intent.quantity,
             is_taker=is_taker,
+            activation_time=activation_time,
+            queue_position=self._initial_queue_position(intent, is_taker),
+            exit_reason=exit_reason,
         )
         self.orders[order_id] = order
-        if is_taker:
+        if is_taker and activation_time <= self.current_time:
             self._fill_order(order, self._execution_price(intent.side))
+        elif is_taker:
+            order.pending_market_fill = True
         return order
 
     def place_exit_order(self, original_order_id: int, price: float, reason: str) -> None:
         side = "sell" if self.position > 0 else "buy"
         intent = OrderIntent(side=side, quantity=abs(self.position), price=price, order_type="market")
         intent.allow_partial = False
-        order = self.place_order(intent, force_taker=True)
+        order = self.place_order(intent, force_taker=True, exit_reason=reason)
         order.status = reason
+        self.hooks.on_exit(original_order_id)
 
     def _update_book(self, book: Dict[str, float]) -> None:
         spread = book.get("spread")
         self.best_bid = book.get("bid")
         self.best_ask = book.get("ask")
+        self.best_bid_size = book.get("bid_size", self.best_bid_size)
+        self.best_ask_size = book.get("ask_size", self.best_ask_size)
         if spread and self.best_bid and not self.best_ask:
             self.best_ask = self.best_bid + spread
         if spread and self.best_ask and not self.best_bid:
@@ -192,9 +218,26 @@ class BacktestEngine:
         for order in list(self.orders.values()):
             if order.status not in {"open", "partial"}:
                 continue
+            if order.activation_time > event.timestamp:
+                continue
+            if order.pending_market_fill:
+                execution_price = self._execution_price(order.intent.side)
+                self._fill_order(order, execution_price)
+                order.pending_market_fill = False
+                continue
             if self._is_fillable(order, price):
-                traded = min(order.remaining, quantity if order.intent.allow_partial else order.remaining)
+                available, consumed = self._available_quantity(order, price, quantity)
+                if available <= 0:
+                    quantity -= consumed
+                    continue
+                traded = min(order.remaining, available if order.intent.allow_partial else order.remaining)
+                if traded <= 0:
+                    quantity -= consumed
+                    continue
                 self._fill_order(order, price, traded)
+                quantity -= traded + consumed
+                if quantity <= 0:
+                    break
 
     def _is_fillable(self, order: Order, trade_price: float) -> bool:
         if order.intent.order_type == "market":
@@ -205,6 +248,17 @@ class BacktestEngine:
         if order.intent.side == "buy":
             return trade_price <= price
         return trade_price >= price
+
+    def _available_quantity(self, order: Order, trade_price: float, quantity: float) -> tuple[float, float]:
+        if order.is_taker:
+            return quantity, 0.0
+        if not self._trade_crosses_price(order, trade_price):
+            return 0.0, 0.0
+        if order.queue_position > 0:
+            consumed = min(order.queue_position, quantity)
+            order.queue_position -= consumed
+            return max(0.0, quantity - consumed), consumed
+        return quantity, 0.0
 
     def _fill_order(self, order: Order, price: float, quantity: Optional[float] = None) -> None:
         quantity = quantity or order.remaining
@@ -225,18 +279,20 @@ class BacktestEngine:
         order.filled += quantity
         if order.remaining <= 1e-9:
             order.status = "filled"
+            order.queue_position = 0.0
         else:
             order.status = "partial"
         self.fills.append(
             Fill(
                 order_id=order.order_id,
-                timestamp=datetime.now(UTC),
+                timestamp=self.current_time,
                 price=adjusted_price,
                 quantity=quantity,
                 fee=fee,
                 liquidity_flag=liquidity_flag,
             )
         )
+        self.hooks.on_fill(order, self.fills[-1], self)
 
     def _execution_price(self, side: str) -> float:
         base_price = self.best_ask if side == "buy" else self.best_bid
@@ -261,6 +317,19 @@ class BacktestEngine:
         if intent.side == "sell" and self.best_bid is not None:
             return intent.price <= self.best_bid
         return False
+
+    def _initial_queue_position(self, intent: OrderIntent, is_taker: bool) -> float:
+        if is_taker:
+            return 0.0
+        if intent.side == "buy":
+            return float(self.best_bid_size or 0.0)
+        return float(self.best_ask_size or 0.0)
+
+    @staticmethod
+    def _trade_crosses_price(order: Order, trade_price: float) -> bool:
+        if order.intent.side == "buy":
+            return trade_price <= (order.intent.price or trade_price)
+        return trade_price >= (order.intent.price or trade_price)
 
 
 class Policy:
