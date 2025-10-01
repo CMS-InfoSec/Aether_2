@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+
 from copy import deepcopy
 from dataclasses import dataclass
+
 from datetime import datetime, timezone
-from typing import Any, ClassVar, Dict, List
+from typing import Any, ClassVar, Dict, List, Optional
+
+from shared.k8s import KubernetesSecretClient
+
+from services.universe.repository import UniverseRepository
 
 
 @dataclass
@@ -28,6 +34,7 @@ class TimescaleAdapter:
     account_id: str
 
     _metrics: ClassVar[Dict[str, Dict[str, float]]] = {}
+
     _risk_configs: ClassVar[Dict[str, Dict[str, Any]]] = {
         "admin-eu": {
             "nav": 5_000_000.0,
@@ -67,6 +74,7 @@ class TimescaleAdapter:
     _instrument_exposure: ClassVar[Dict[str, Dict[str, float]]] = {}
     _events: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
 
+
     def __post_init__(self) -> None:
         self._metrics.setdefault(self.account_id, {"limit": 1_000_000.0, "usage": 0.0})
         self._daily_usage.setdefault(self.account_id, {"loss": 0.0, "fee": 0.0})
@@ -79,6 +87,7 @@ class TimescaleAdapter:
     def check_limits(self, notional: float) -> bool:
         projected = self._metrics[self.account_id]["usage"] + notional
         return projected <= self._metrics[self.account_id]["limit"]
+
 
     def load_risk_config(self) -> Dict[str, Any]:
         config = self._risk_configs.setdefault(
@@ -126,37 +135,69 @@ class TimescaleAdapter:
         return list(self._events.get(self.account_id, []))
 
 
+
 @dataclass
 class RedisFeastAdapter:
     account_id: str
 
-    _features: ClassVar[Dict[str, Dict[str, Any]]] = {
-        "admin-eu": {"approved": ["BTC-USD", "ETH-USD"], "fees": {"BTC-USD": {"maker": 0.1, "taker": 0.2}}},
-        "admin-us": {"approved": ["SOL-USD"], "fees": {}},
-        "admin-apac": {"approved": ["BTC-USDT", "ETH-USDT"], "fees": {}},
-    }
+    _repository: UniverseRepository = field(init=False)
+
+    def __post_init__(self) -> None:
+        self._repository = UniverseRepository(account_id=self.account_id)
 
     def approved_instruments(self) -> List[str]:
-        return list(self._features.get(self.account_id, {}).get("approved", []))
+        return self._repository.approved_universe()
 
     def fee_override(self, instrument: str) -> Dict[str, Any] | None:
-        return self._features.get(self.account_id, {}).get("fees", {}).get(instrument)
+        return self._repository.fee_override(instrument)
 
 
 @dataclass
 class KrakenSecretManager:
     account_id: str
+    namespace: str = "aether-secrets"
+    k8s_client: Optional[KubernetesSecretClient] = None
+    timescale: Optional[TimescaleAdapter] = None
 
-    _secrets: ClassVar[Dict[str, Dict[str, str]]] = {
-        "admin-eu": {"api_key": "eu-key", "api_secret": "eu-secret"},
-        "admin-us": {"api_key": "us-key", "api_secret": "us-secret"},
-        "admin-apac": {"api_key": "apac-key", "api_secret": "apac-secret"},
-    }
+    secret_prefix: ClassVar[str] = "kraken"
 
-    def get_credentials(self) -> Dict[str, str]:
-        if self.account_id not in self._secrets:
-            raise PermissionError("Account has no Kraken credentials")
-        return dict(self._secrets[self.account_id])
+    def __post_init__(self) -> None:
+        if self.k8s_client is None:
+            self.k8s_client = KubernetesSecretClient(namespace=self.namespace)
+        if self.timescale is None:
+            self.timescale = TimescaleAdapter(account_id=self.account_id)
+
+    @property
+    def secret_name(self) -> str:
+        return f"{self.secret_prefix}-{self.account_id}"
+
+    def rotate_credentials(self, *, api_key: str, api_secret: str) -> Dict[str, Any]:
+        assert self.k8s_client is not None  # for type checkers
+        assert self.timescale is not None
+
+        before_secret = self.k8s_client.get_secret(self.secret_name)
+        payload = {"api_key": api_key, "api_secret": api_secret}
+        self.k8s_client.patch_secret(self.secret_name, payload)
+
+        rotated_at = datetime.now(timezone.utc)
+        self.timescale.record_credential_rotation(secret_name=self.secret_name, rotated_at=rotated_at)
+
+        return {
+            "secret_name": self.secret_name,
+            "rotated_at": rotated_at,
+            "before": {
+                "secret_name": self.secret_name,
+                "material_present": bool(before_secret),
+            },
+            "after": {
+                "secret_name": self.secret_name,
+                "material_present": True,
+            },
+        }
+
+    def status(self) -> Optional[Dict[str, Any]]:
+        assert self.timescale is not None
+        return self.timescale.credential_rotation_status()
 
 
 def default_fee(currency: str = "USD") -> Dict[str, float | str]:

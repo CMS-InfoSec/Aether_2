@@ -12,3 +12,14 @@ def require_admin_account(x_account_id: str = Header(..., alias="X-Account-ID"))
         )
     return x_account_id
 
+
+def require_mfa_context(x_mfa_context: str = Header(..., alias="X-MFA-Context")) -> str:
+    """Ensure the caller has completed MFA challenges."""
+
+    if x_mfa_context.strip().lower() != "verified":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="MFA context is invalid or incomplete.",
+        )
+    return x_mfa_context
+
