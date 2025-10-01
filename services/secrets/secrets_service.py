@@ -1,11 +1,13 @@
 """FastAPI service for managing Kraken API secrets in Kubernetes."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import re
-from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from contextlib import suppress
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.encoders import jsonable_encoder
@@ -34,7 +36,11 @@ except ImportError:  # pragma: no cover - fallback for testing environments
             super().__init__(reason)
             self.status = status
 
-from services.common.security import require_admin_account, require_mfa_context
+from services.common.security import (
+    require_admin_account,
+    require_dual_director_confirmation,
+    require_mfa_context,
+)
 from services.secrets.middleware import (
     ForwardedSchemeMiddleware,
     TRUSTED_HOSTS,
@@ -65,6 +71,42 @@ _audit_logger = TimescaleAuditLogger(_audit_store)
 _auditor = SensitiveActionRecorder(_audit_logger)
 
 _encryptor = EnvelopeEncryptor()
+_MASTER_KEY_CHECK_INTERVAL = timedelta(hours=6)
+
+
+async def _master_key_rotation_loop() -> None:
+    while True:
+        try:
+            record = _encryptor.rotate_master_key_if_due()
+            if record is not None:
+                SECRETS_LOGGER.info(
+                    "master_key_rotated",  # pragma: no cover - logging only
+                    extra={
+                        "master_key_rotation": {
+                            "master_key_id": record.master_key_id,
+                            "rotated_at": record.rotated_at.isoformat(),
+                            "version": record.version,
+                        }
+                    },
+                )
+        except Exception:  # pragma: no cover - defensive guard for background loop
+            LOGGER.exception("Background master key rotation loop failed")
+        await asyncio.sleep(_MASTER_KEY_CHECK_INTERVAL.total_seconds())
+
+
+@app.on_event("startup")
+async def _start_master_key_scheduler() -> None:
+    app.state.master_key_rotation_task = asyncio.create_task(_master_key_rotation_loop())
+
+
+@app.on_event("shutdown")
+async def _stop_master_key_scheduler() -> None:
+    task = getattr(app.state, "master_key_rotation_task", None)
+    if task is None:
+        return
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
 
 
 def _trigger_hot_reload(account_id: str) -> None:
@@ -117,6 +159,8 @@ def _perform_secure_rotation(
     api_secret: str,
     api: CoreV1Api,
     request: Request,
+    approvals: Tuple[str, str],
+    actor: str,
 ) -> Dict[str, Any]:
     existing_metadata = _read_secret_metadata(
         api, name=_secret_name(account_id), namespace=KRAKEN_SECRET_NAMESPACE
@@ -137,26 +181,34 @@ def _perform_secure_rotation(
         existing_metadata=existing_metadata,
     )
 
-    recorded_meta = meta_store.record_rotation(
-        kms_key_id=envelope.kms_key_id,
-        last_rotated=updated_metadata["last_rotated_at"],
-    )
-
     ip_address = request.client.host if request.client else None
     hashed_ip = _hash_ip(ip_address)
 
+    recorded_meta = meta_store.record_rotation(
+        kms_key_id=envelope.kms_key_id,
+        last_rotated=updated_metadata["last_rotated_at"],
+        actor=actor,
+        approvers=approvals,
+        ip_hash=hashed_ip,
+        master_key_id=envelope.master_key_id,
+        master_key_rotated_at=envelope.master_key_rotated_at,
+    )
+
     audit_after = {
         "account_id": account_id,
-        "actor": account_id,
+        "actor": actor,
         "secret_name": updated_metadata["secret_name"],
         "rotated_at": updated_metadata["last_rotated_at"].isoformat(),
         "kms_key_id": envelope.kms_key_id,
         "ip_hash": hashed_ip,
+        "approvals": list(recorded_meta.get("approvers", [])),
+        "master_key_id": envelope.master_key_id,
+        "master_key_rotated_at": envelope.master_key_rotated_at.isoformat(),
     }
 
     _auditor.record(
         action="kraken.secret.rotate",
-        actor_id=account_id,
+        actor_id=actor,
         before=before_for_audit,
         after=audit_after,
     )
@@ -167,6 +219,7 @@ def _perform_secure_rotation(
             "account_id": account_id,
             "secret_name": updated_metadata["secret_name"],
             "kms_key_id": envelope.kms_key_id,
+            "master_key_id": envelope.master_key_id,
         },
     )
 
@@ -305,6 +358,20 @@ class KrakenForceRotateRequest(BaseModel):
     @validator("account_id")
     def validate_account_id(cls, value: str) -> str:
         return KrakenSecretRequest._ensure(_ACCOUNT_ID_PATTERN, value, "account_id")
+
+
+class RotationAuditEntry(BaseModel):
+    """History entry describing an individual secret rotation."""
+
+    account_id: str
+    actor: str
+    approvers: List[str]
+    kms_key_id: str
+    master_key_id: str
+    last_rotated_at: datetime
+    master_key_rotated_at: datetime
+    recorded_at: datetime
+    ip_hash: str
 
 
 def ensure_secure_transport(request: Request) -> None:
@@ -538,6 +605,7 @@ def rotate_secret(
     request: Request,
     actor_account: str = Depends(require_admin_account),
     _: str = Depends(require_mfa_context),
+    director_approvals: Tuple[str, str] = Depends(require_dual_director_confirmation),
     api: CoreV1Api = Depends(get_core_v1_api),
 ) -> Response:
     if payload.account_id != actor_account:
@@ -561,6 +629,8 @@ def rotate_secret(
         api_secret=api_secret,
         api=api,
         request=request,
+        approvals=director_approvals,
+        actor=actor_account,
     )
 
     rotated_at = rotation["last_rotated_at"]
@@ -596,6 +666,7 @@ def rotate_kraken_secret(
     request: Request,
     actor_account: str = Depends(require_admin_account),
     _: str = Depends(require_mfa_context),
+    director_approvals: Tuple[str, str] = Depends(require_dual_director_confirmation),
     api: CoreV1Api = Depends(get_core_v1_api),
 ) -> Response:
     if payload.account_id != actor_account:
@@ -619,6 +690,8 @@ def rotate_kraken_secret(
         api_secret=api_secret,
         api=api,
         request=request,
+        approvals=director_approvals,
+        actor=actor_account,
     )
 
     rotated_at = rotation["last_rotated_at"]
@@ -651,6 +724,7 @@ def rotate_encrypted_secret(
     request: Request,
     actor_account: str = Depends(require_admin_account),
     _: str = Depends(require_mfa_context),
+    director_approvals: Tuple[str, str] = Depends(require_dual_director_confirmation),
     api: CoreV1Api = Depends(get_core_v1_api),
 ) -> Response:
     if payload.account_id != actor_account:
@@ -674,6 +748,8 @@ def rotate_encrypted_secret(
         api_secret=api_secret,
         api=api,
         request=request,
+        approvals=director_approvals,
+        actor=actor_account,
     )
 
     rotated_at = rotation["last_rotated_at"]
@@ -822,6 +898,69 @@ def secret_status(
 
 
 @app.get(
+    "/secrets/audit",
+    response_model=List[RotationAuditEntry],
+    dependencies=[Depends(ensure_secure_transport)],
+)
+def secret_rotation_audit(
+    account_id: str = Query(..., description="Trading account identifier"),
+    actor_account: str = Depends(require_admin_account),
+    _: str = Depends(require_mfa_context),
+) -> List[RotationAuditEntry]:
+    if account_id != actor_account:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account mismatch between header and query parameter",
+        )
+
+    history = SecretsMetadataStore.history(account_id)
+    audit_entries: List[RotationAuditEntry] = []
+    for entry in history:
+        last_rotated = entry.get("last_rotated")
+        if isinstance(last_rotated, datetime):
+            last_rotated_at = last_rotated
+        else:
+            try:
+                last_rotated_at = datetime.fromisoformat(str(last_rotated))
+            except ValueError:
+                last_rotated_at = datetime.now(timezone.utc)
+
+        master_rotated = entry.get("master_key_rotated_at", last_rotated_at)
+        if isinstance(master_rotated, datetime):
+            master_key_rotated_at = master_rotated
+        else:
+            try:
+                master_key_rotated_at = datetime.fromisoformat(str(master_rotated))
+            except ValueError:
+                master_key_rotated_at = last_rotated_at
+
+        recorded_at = entry.get("ts", datetime.now(timezone.utc))
+        if isinstance(recorded_at, datetime):
+            ts = recorded_at
+        else:
+            try:
+                ts = datetime.fromisoformat(str(recorded_at))
+            except ValueError:
+                ts = datetime.now(timezone.utc)
+
+        audit_entries.append(
+            RotationAuditEntry(
+                account_id=entry.get("account_id", account_id),
+                actor=entry.get("actor", actor_account),
+                approvers=list(entry.get("approvers") or []),
+                kms_key_id=entry.get("kms_key_id", "unknown"),
+                master_key_id=entry.get("master_key_id", "unknown"),
+                last_rotated_at=last_rotated_at,
+                master_key_rotated_at=master_key_rotated_at,
+                recorded_at=ts,
+                ip_hash=entry.get("ip_hash", "anonymous"),
+            )
+        )
+
+    return audit_entries
+
+
+@app.get(
     "/secrets/kraken/status",
     response_model=KrakenSecretStatus,
     dependencies=[Depends(ensure_secure_transport)],
@@ -888,11 +1027,13 @@ __all__ = [
     "SecretStatusResponse",
     "EncryptedRotationResponse",
     "KrakenForceRotateRequest",
+    "RotationAuditEntry",
     "rotate_secret",
     "rotate_kraken_secret",
     "rotate_encrypted_secret",
     "force_rotate_kraken_secret",
     "secret_status",
+    "secret_rotation_audit",
     "kraken_secret_status",
     "test_kraken_secret",
     "validate_kraken_credentials",
