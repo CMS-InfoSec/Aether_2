@@ -32,6 +32,7 @@ def upgrade() -> None:
         "accounts",
         sa.Column("account_id", sa.Integer(), primary_key=True, autoincrement=True),
         sa.Column("name", sa.String(length=255), nullable=False, unique=True),
+        sa.Column("admin_slug", sa.String(length=255), nullable=True, unique=True),
         sa.Column("owner", sa.String(length=255), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
         sa.Column("metadata", sa.JSON(), nullable=True),
