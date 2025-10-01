@@ -57,32 +57,39 @@ class AuditLogWriter:
             }
         )
         params = {
+            "event_id": hashlib.sha256(
+                f"{entity_id}:{event_time.isoformat()}".encode("utf-8")
+            ).hexdigest(),
+            "entity_type": "report_artifact",
+            "entity_id": entity_id,
             "actor": actor,
             "action": "report.artifact.stored",
-            "target": entity_id,
-            "created_at": event_time,
+            "event_time": event_time,
             "payload": payload,
         }
 
-        self._session.execute(
-            """
+        insert_audit_log_sql = """
             INSERT INTO audit_logs (
+                event_id,
+                entity_type,
+                entity_id,
                 actor,
                 action,
-                target,
-                created_at,
+                event_time,
                 payload
             )
             VALUES (
+                %(event_id)s,
+                %(entity_type)s,
+                %(entity_id)s,
                 %(actor)s,
                 %(action)s,
-                %(target)s,
-                %(created_at)s,
+                %(event_time)s,
                 %(payload)s::jsonb
             )
-            """,
-            params,
-        )
+        """
+
+        self._session.execute(insert_audit_log_sql, params)
 
 
 @dataclass
