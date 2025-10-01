@@ -1,19 +1,22 @@
 """Transaction cost analysis (TCA) service exposed via FastAPI.
 
 This module is intentionally self-contained so the service can be deployed as a
-small microservice beside the other operational APIs.  It provides two
-endpoints:
+small microservice beside the other operational APIs.  It provides several
+endpoints and helper utilities:
 
 * ``GET /tca/trade`` – materialises a detailed report for an individual trade
   (identified by ``trade_id``).
 * ``GET /tca/summary`` – aggregates the realised slippage profile for an
   account across a single trading day.
+* ``GET /tca/report`` – compares the expected execution profile with the
+  realised outcome for an account/symbol on a specific trading day.
 
 The service is backed by TimescaleDB (or any PostgreSQL compatible database)
 using SQLAlchemy for the ORM layer.  Whenever a trade report is generated the
 volume weighted slippage (in basis points) and the fees are persisted to the
 ``tca_results`` table so that downstream systems can reuse the normalised data
-set.
+set.  Daily expected-vs-realised comparisons are stored in ``tca_reports`` so
+that risk directors can review the health of the execution programme.
 """
 
 from __future__ import annotations
@@ -86,6 +89,19 @@ class TCAResult(Base):
     ts = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC))
 
 
+class TCAReport(Base):
+    """Persistence model for daily expected-vs-realised execution reports."""
+
+    __tablename__ = "tca_reports"
+
+    account_id = Column(String, primary_key=True)
+    symbol = Column(String, primary_key=True)
+    ts = Column(DateTime(timezone=True), primary_key=True, default=lambda: datetime.now(UTC))
+    expected_cost = Column(Float, nullable=False)
+    realized_cost = Column(Float, nullable=False)
+    slippage_bps = Column(Float, nullable=False)
+
+
 Base.metadata.create_all(bind=ENGINE)
 
 
@@ -153,6 +169,70 @@ def _liquidity_flag(*payloads: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _trade_direction(size: float, *payloads: Mapping[str, Any]) -> int:
+    """Infer trade direction from metadata falling back to fill size."""
+
+    for payload in payloads:
+        side = payload.get("side") or payload.get("trade_side") or payload.get("direction")
+        if side is None:
+            continue
+        text_value = str(side).strip().lower()
+        if text_value in {"buy", "bid", "long", "b"}:
+            return 1
+        if text_value in {"sell", "ask", "short", "s"}:
+            return -1
+    if size > 0:
+        return 1
+    if size < 0:
+        return -1
+    return 1
+
+
+def _expected_price_from_metadata(*payloads: Mapping[str, Any]) -> float | None:
+    """Extract the expected execution price if available."""
+
+    candidate_keys = (
+        "expected_price",
+        "benchmark_price",
+        "target_price",
+        "arrival_price",
+        "limit_price",
+        "reference_price",
+    )
+    for payload in payloads:
+        for key in candidate_keys:
+            value = payload.get(key)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):  # pragma: no cover - defensive guard
+                continue
+    return _mid_price_from_metadata(*payloads)
+
+
+def _expected_fee_from_metadata(*payloads: Mapping[str, Any]) -> float:
+    """Extract the expected fees if they were estimated upstream."""
+
+    candidate_keys = (
+        "expected_fee",
+        "expected_fees",
+        "fee_estimate",
+        "estimated_fee",
+        "estimated_fees",
+    )
+    for payload in payloads:
+        for key in candidate_keys:
+            value = payload.get(key)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):  # pragma: no cover - defensive guard
+                continue
+    return 0.0
+
+
 def _slippage_bps(fill_price: float, mid_price: float) -> float:
     if mid_price == 0:
         return 0.0
@@ -214,6 +294,33 @@ class DailySummaryModel(BaseModel):
     maker_ratio: float
     taker_ratio: float
     fee_attribution: dict[str, float]
+    trade_count: int
+
+
+class TCAReportModel(BaseModel):
+    account_id: str
+    symbol: str
+    date: date
+    expected_cost_usd: float
+    realized_cost_usd: float
+    slippage_bps: float
+    slippage_cost_usd: float
+    fill_quality_bps: float
+    fee_impact_usd: float
+    trade_count: int
+
+    class Config:
+        json_encoders = {datetime: lambda value: value.isoformat()}
+
+
+@dataclass
+class ExpectedVsRealised:
+    expected_cost: float
+    realized_cost: float
+    slippage_bps: float
+    slippage_cost_usd: float
+    fill_quality_bps: float
+    fee_impact_usd: float
     trade_count: int
 
 
@@ -306,6 +413,70 @@ def _build_fill_metrics(rows: Iterable[Mapping[str, Any]]) -> tuple[list[FillMet
     if order_info is None:
         return [], {}
     return fills, order_info
+
+
+def _compare_expected_realised(rows: Sequence[Mapping[str, Any]]) -> ExpectedVsRealised:
+    if not rows:
+        return ExpectedVsRealised(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0)
+
+    expected_cost_total = 0.0
+    realized_cost_total = 0.0
+    weighted_slippage = 0.0
+    weighted_quality = 0.0
+    slippage_cost_total = 0.0
+    fee_impact_total = 0.0
+    total_size = 0.0
+    seen_trades: set[str] = set()
+
+    for row in rows:
+        trade_id = str(row.get("trade_id"))
+        seen_trades.add(trade_id)
+
+        order_metadata = _normalise_metadata(row.get("order_metadata"))
+        fill_metadata = _normalise_metadata(row.get("fill_metadata"))
+
+        fill_price = _coerce_decimal(row.get("fill_price"))
+        size = _coerce_decimal(row.get("size"))
+        abs_size = abs(size)
+        if abs_size == 0:
+            continue
+
+        expected_price = _expected_price_from_metadata(fill_metadata, order_metadata)
+        if expected_price is None or expected_price == 0:
+            expected_price = fill_price
+
+        expected_fee = _expected_fee_from_metadata(fill_metadata, order_metadata)
+        realized_fee = _coerce_decimal(row.get("fee"))
+        direction = _trade_direction(size, fill_metadata, order_metadata)
+
+        expected_notional = expected_price * abs_size
+        realized_notional = fill_price * abs_size
+
+        expected_cost_total += expected_notional + expected_fee
+        realized_cost_total += realized_notional + realized_fee
+
+        slippage_bps = ((fill_price - expected_price) * direction / expected_price) * 10_000 if expected_price else 0.0
+        slippage_cost = (fill_price - expected_price) * abs_size * direction
+        fee_impact = realized_fee - expected_fee
+
+        weighted_slippage += slippage_bps * abs_size
+        weighted_quality += (-slippage_bps) * abs_size
+        slippage_cost_total += slippage_cost
+        fee_impact_total += fee_impact
+        total_size += abs_size
+
+    avg_slippage = weighted_slippage / total_size if total_size else 0.0
+    avg_quality = weighted_quality / total_size if total_size else 0.0
+
+    return ExpectedVsRealised(
+        expected_cost=expected_cost_total,
+        realized_cost=realized_cost_total,
+        slippage_bps=avg_slippage,
+        slippage_cost_usd=slippage_cost_total,
+        fill_quality_bps=avg_quality,
+        fee_impact_usd=fee_impact_total,
+        trade_count=len(seen_trades),
+    )
 
 
 def _aggregate_trade(
@@ -456,6 +627,86 @@ def _daily_summary(
     )
 
 
+def _persist_report(
+    session: Session,
+    *,
+    account_id: str,
+    symbol: str,
+    expected_cost: float,
+    realized_cost: float,
+    slippage_bps: float,
+) -> None:
+    session.add(
+        TCAReport(
+            account_id=account_id,
+            symbol=symbol,
+            expected_cost=expected_cost,
+            realized_cost=realized_cost,
+            slippage_bps=slippage_bps,
+            ts=datetime.now(UTC),
+        )
+    )
+
+
+def _fetch_execution_rows(
+    session: Session,
+    *,
+    account_id: str,
+    symbol: str,
+    start: datetime,
+    end: datetime,
+) -> list[Mapping[str, Any]]:
+    query = text(
+        """
+        SELECT
+            o.order_id AS trade_id,
+            o.account_id,
+            o.market,
+            o.submitted_at,
+            o.metadata AS order_metadata,
+            f.fill_id,
+            f.fill_time,
+            f.price AS fill_price,
+            f.size,
+            f.fee,
+            f.metadata AS fill_metadata
+        FROM orders o
+        JOIN fills f ON f.order_id = o.order_id
+        WHERE o.account_id = :account_id
+          AND o.market = :symbol
+          AND f.fill_time >= :start_ts
+          AND f.fill_time < :end_ts
+        ORDER BY f.fill_time
+        """
+    )
+    result = session.execute(
+        query,
+        {"account_id": account_id, "symbol": symbol, "start_ts": start, "end_ts": end},
+    )
+    return [dict(row._mapping) for row in result]
+
+
+def _build_report_response(
+    *,
+    account_id: str,
+    symbol: str,
+    target_date: date,
+    metrics: ExpectedVsRealised,
+) -> TCAReportModel:
+    return TCAReportModel(
+        account_id=account_id,
+        symbol=symbol,
+        date=target_date,
+        expected_cost_usd=metrics.expected_cost,
+        realized_cost_usd=metrics.realized_cost,
+        slippage_bps=metrics.slippage_bps,
+        slippage_cost_usd=metrics.slippage_cost_usd,
+        fill_quality_bps=metrics.fill_quality_bps,
+        fee_impact_usd=metrics.fee_impact_usd,
+        trade_count=metrics.trade_count,
+    )
+
+
 @app.get("/tca/trade", response_model=TradeReportModel)
 def get_trade_report(trade_id: str = Query(..., description="Unique identifier for the trade/order")):
     with SessionLocal() as session:
@@ -525,5 +776,132 @@ def get_daily_summary(
     return summary
 
 
-__all__ = ["app"]
+@app.get("/tca/report", response_model=TCAReportModel)
+def get_tca_report(
+    account_id: str = Query(..., description="Account identifier"),
+    symbol: str = Query(..., description="Market or symbol identifier"),
+    date_str: str | None = Query(None, alias="date", description="Trading day in ISO format"),
+):
+    target_date = date.fromisoformat(date_str) if date_str else datetime.now(UTC).date()
+    start, end = _daterange_bounds(target_date)
+
+    with SessionLocal() as session:
+        try:
+            rows = _fetch_execution_rows(
+                session,
+                account_id=account_id,
+                symbol=symbol,
+                start=start,
+                end=end,
+            )
+        except SQLAlchemyError as exc:  # pragma: no cover - defensive guard
+            LOGGER.exception(
+                "Failed to fetch execution rows for account=%s symbol=%s", account_id, symbol
+            )
+            raise HTTPException(status_code=500, detail="Database error") from exc
+
+        if not rows:
+            raise HTTPException(status_code=404, detail="No executions found for criteria")
+
+        metrics = _compare_expected_realised(rows)
+        if metrics.trade_count == 0:
+            raise HTTPException(status_code=404, detail="No executions found for criteria")
+
+        try:
+            _persist_report(
+                session,
+                account_id=account_id,
+                symbol=symbol,
+                expected_cost=metrics.expected_cost,
+                realized_cost=metrics.realized_cost,
+                slippage_bps=metrics.slippage_bps,
+            )
+            session.commit()
+        except SQLAlchemyError as exc:  # pragma: no cover - defensive guard
+            session.rollback()
+            LOGGER.exception(
+                "Failed to persist TCA report for account=%s symbol=%s", account_id, symbol
+            )
+            raise HTTPException(status_code=500, detail="Database error") from exc
+
+    return _build_report_response(
+        account_id=account_id,
+        symbol=symbol,
+        target_date=target_date,
+        metrics=metrics,
+    )
+
+
+def generate_daily_reports(target_date: date | None = None) -> list[TCAReportModel]:
+    """Produce daily TCA reports for all account/symbol pairs with executions."""
+
+    target = target_date or (datetime.now(UTC) - timedelta(days=1)).date()
+    start, end = _daterange_bounds(target)
+    reports: list[TCAReportModel] = []
+
+    with SessionLocal() as session:
+        try:
+            pairs_result = session.execute(
+                text(
+                    """
+                    SELECT DISTINCT
+                        o.account_id,
+                        o.market AS symbol
+                    FROM orders o
+                    JOIN fills f ON f.order_id = o.order_id
+                    WHERE f.fill_time >= :start_ts
+                      AND f.fill_time < :end_ts
+                    """
+                ),
+                {"start_ts": start, "end_ts": end},
+            )
+        except SQLAlchemyError as exc:  # pragma: no cover - defensive guard
+            LOGGER.exception("Failed to enumerate executions for TCA report job")
+            raise
+
+        for account_id, symbol in pairs_result:
+            try:
+                rows = _fetch_execution_rows(
+                    session,
+                    account_id=account_id,
+                    symbol=symbol,
+                    start=start,
+                    end=end,
+                )
+            except SQLAlchemyError as exc:  # pragma: no cover - defensive guard
+                LOGGER.exception(
+                    "Failed to fetch execution rows for account=%s symbol=%s", account_id, symbol
+                )
+                continue
+
+            if not rows:
+                continue
+
+            metrics = _compare_expected_realised(rows)
+            if metrics.trade_count == 0:
+                continue
+
+            _persist_report(
+                session,
+                account_id=account_id,
+                symbol=symbol,
+                expected_cost=metrics.expected_cost,
+                realized_cost=metrics.realized_cost,
+                slippage_bps=metrics.slippage_bps,
+            )
+            reports.append(
+                _build_report_response(
+                    account_id=account_id,
+                    symbol=symbol,
+                    target_date=target,
+                    metrics=metrics,
+                )
+            )
+
+        session.commit()
+
+    return reports
+
+
+__all__ = ["app", "generate_daily_reports"]
 
