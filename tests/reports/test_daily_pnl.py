@@ -215,5 +215,12 @@ def test_generate_daily_pnl_creates_audit_log_entries(tmp_path: Path, sample_ses
     )
     assert len(keys) == 1
     assert len(sample_session.audit_entries) == 1
-    payload = json.loads(sample_session.audit_entries[0]["payload"])
+    csv_path = tmp_path / "global" / keys[0]
+    rows = read_csv(csv_path)
+    sha_path = tmp_path / "global" / f"{keys[0]}.sha256"
+    assert sha_path.exists()
+
+    payload = json.loads(sample_session.audit_entries[0]["metadata"])
     assert "daily_pnl/2024-05-01.csv" in payload["object_key"]
+    assert payload["row_count"] == len(rows)
+    assert payload["storage_backend"] == "filesystem"

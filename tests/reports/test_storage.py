@@ -36,6 +36,9 @@ def test_store_artifact_writes_expected_audit_log(tmp_path: Path) -> None:
     )
 
     assert (tmp_path / artifact.object_key).read_bytes() == b"payload"
+    checksum_path = tmp_path / artifact.checksum_object_key
+    assert checksum_path.read_text() == f"{artifact.checksum}  {artifact.object_key}\n"
+
     assert session.commit_count == 1
     assert len(session.executions) == 1
 
@@ -74,7 +77,9 @@ def test_store_artifact_writes_expected_audit_log(tmp_path: Path) -> None:
 
     metadata_payload = json.loads(params["metadata"])
     assert metadata_payload["checksum"] == artifact.checksum
+    assert metadata_payload["checksum_object_key"] == artifact.checksum_object_key
     assert metadata_payload["content_type"] == "text/csv"
     assert metadata_payload["format"] == metadata["format"]
     assert metadata_payload["size_bytes"] == len(b"payload")
     assert metadata_payload["object_key"] == artifact.object_key
+    assert metadata_payload["storage_backend"] == "filesystem"
