@@ -1,84 +1,88 @@
-from datetime import datetime, timedelta, timezone
-
 import pytest
 
 pytest.importorskip("fastapi")
+
 from fastapi.testclient import TestClient
 
 import safe_mode
-from safe_mode import SafeModeController
-from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
 
 
 @pytest.fixture(autouse=True)
 def reset_state() -> None:
-    KafkaNATSAdapter.reset()
-    TimescaleAdapter.reset()
     safe_mode.controller.reset()
+    safe_mode.clear_safe_mode_log()
     yield
-    KafkaNATSAdapter.reset()
-    TimescaleAdapter.reset()
     safe_mode.controller.reset()
+    safe_mode.clear_safe_mode_log()
 
 
-def test_kraken_downtime_triggers_safe_mode() -> None:
-    controller = SafeModeController(downtime_threshold_seconds=1.0)
-
-    heartbeat_at = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-    controller.record_heartbeat("Company", timestamp=heartbeat_at)
-
-    events = controller.check_downtime(current_time=heartbeat_at + timedelta(seconds=5))
-
-    assert events, "Safe mode should trigger after extended downtime"
-    event = events[0]
-    assert event.account_id == "company"
-    assert event.reason == "kraken_ws_down"
-    assert event.automatic is True
-
-    history = KafkaNATSAdapter(account_id="company").history()
-    assert history, "Safe mode event was not published to Kafka"
-    payload = history[-1]["payload"]
-    assert payload["event"] == "SAFE_MODE_ENTERED"
-    assert payload["actions"] == ["CANCEL_OPEN_ORDERS", "HEDGE_TO_USD"]
-
-    config = TimescaleAdapter(account_id="company").load_risk_config()
-    assert config["safe_mode"] is True
-
-    events_log = TimescaleAdapter(account_id="company").events()["events"]
-    assert any(entry["event_type"] == "safe_mode_engaged" for entry in events_log)
-
-
-def test_manual_override_endpoints() -> None:
+def test_enter_safe_mode_enforces_controls() -> None:
     client = TestClient(safe_mode.app)
 
-    enter_response = client.post(
-        "/core/safe_mode/enter",
-        params={"account_id": "Company", "reason": "manual_override"},
-        headers={"X-Account-ID": "company"},
+    controller = safe_mode.controller
+    controller.order_controls.open_orders.extend(["ORD-1", "ORD-2"])
+
+    response = client.post(
+        "/safe_mode/enter",
+        json={"reason": "volatility"},
+        headers={"X-Actor": "ops"},
     )
-    assert enter_response.status_code == 200
-    enter_payload = enter_response.json()
-    assert enter_payload["state"] == "engaged"
-    assert enter_payload["reason"] == "manual_override"
 
-    config = TimescaleAdapter(account_id="company").load_risk_config()
-    assert config["safe_mode"] is True
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["active"] is True
+    assert payload["reason"] == "volatility"
 
-    history = KafkaNATSAdapter(account_id="company").history()
-    assert any(entry["payload"]["event"] == "SAFE_MODE_ENTERED" for entry in history)
+    assert controller.order_controls.open_orders == []
+    assert controller.order_controls.cancelled_orders == ["ORD-1", "ORD-2"]
+    assert controller.order_controls.only_hedging is True
+    assert controller.intent_guard.allow_new_intents is False
 
-    exit_response = client.post(
-        "/core/safe_mode/exit",
-        params={"account_id": "Company", "reason": "manual_release"},
-        headers={"X-Account-ID": "company"},
-    )
-    assert exit_response.status_code == 200
-    exit_payload = exit_response.json()
-    assert exit_payload["state"] == "released"
+    history = safe_mode.controller.kafka_history()
+    assert history, "Expected safe mode events to be published"
+    kafka_payload = history[-1]["payload"]
+    assert kafka_payload["state"] == "entered"
+    assert kafka_payload["reason"] == "volatility"
 
-    config = TimescaleAdapter(account_id="company").load_risk_config()
-    assert config["safe_mode"] is False
+    log_entries = safe_mode.get_safe_mode_log()
+    assert log_entries
+    assert log_entries[-1]["state"] == "entered"
+    assert log_entries[-1]["actor"] == "ops"
 
-    history = KafkaNATSAdapter(account_id="company").history()
-    assert any(entry["payload"]["event"] == "SAFE_MODE_EXITED" for entry in history)
 
+def test_exit_safe_mode_restores_controls() -> None:
+    client = TestClient(safe_mode.app)
+    controller = safe_mode.controller
+
+    client.post("/safe_mode/enter", json={"reason": "latency"}, headers={"X-Actor": "ops"})
+
+    response = client.post("/safe_mode/exit", headers={"X-Actor": "ops"})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["active"] is False
+
+    assert controller.order_controls.only_hedging is False
+    assert controller.intent_guard.allow_new_intents is True
+
+    history = safe_mode.controller.kafka_history()
+    exit_events = [entry for entry in history if entry["payload"]["state"] == "exited"]
+    assert exit_events, "Expected an exit event to be published"
+
+    log_entries = safe_mode.get_safe_mode_log()
+    assert log_entries[-1]["state"] == "exited"
+
+
+def test_status_endpoint_reports_current_state() -> None:
+    client = TestClient(safe_mode.app)
+
+    response = client.get("/safe_mode/status")
+    assert response.status_code == 200
+    assert response.json()["active"] is False
+
+    client.post("/safe_mode/enter", json={"reason": "stress"})
+
+    response = client.get("/safe_mode/status")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["active"] is True
+    assert payload["reason"] == "stress"
