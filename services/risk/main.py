@@ -4,12 +4,15 @@ from fastapi import Depends, FastAPI, HTTPException, status
 from services.common.schemas import RiskValidationRequest, RiskValidationResponse
 from services.common.security import require_admin_account
 from services.risk.engine import RiskEngine
+from services.risk.cvar_forecast import router as cvar_router
 
 from metrics import increment_trade_rejection, record_fees_nav_pct, setup_metrics
 
 app = FastAPI(title="Risk Service")
 setup_metrics(app)
 
+
+app.include_router(cvar_router)
 
 
 @app.post("/risk/validate", response_model=RiskValidationResponse)
