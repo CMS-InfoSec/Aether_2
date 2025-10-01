@@ -1,0 +1,242 @@
+# Disaster Recovery policy manifests for critical Aether platform services.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oms-service
+  labels:
+    app: oms-service
+    app.kubernetes.io/name: oms-service
+    app.kubernetes.io/component: api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: oms-service
+  template:
+    metadata:
+      labels:
+        app: oms-service
+        app.kubernetes.io/name: oms-service
+        app.kubernetes.io/component: api
+    spec:
+      containers:
+        - name: oms-service
+          image: ghcr.io/aether/oms-service:latest
+          ports:
+            - containerPort: 8000
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: oms-service
+  labels:
+    app: oms-service
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: oms-service
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: risk-service
+  labels:
+    app: risk-service
+    app.kubernetes.io/name: risk-service
+    app.kubernetes.io/component: api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: risk-service
+  template:
+    metadata:
+      labels:
+        app: risk-service
+        app.kubernetes.io/name: risk-service
+        app.kubernetes.io/component: api
+    spec:
+      containers:
+        - name: risk-service
+          image: ghcr.io/aether/risk-service:latest
+          ports:
+            - containerPort: 8000
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: risk-service
+  labels:
+    app: risk-service
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: risk-service
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: policy-service
+  labels:
+    app: policy-service
+    app.kubernetes.io/name: policy-service
+    app.kubernetes.io/component: api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: policy-service
+  template:
+    metadata:
+      labels:
+        app: policy-service
+        app.kubernetes.io/name: policy-service
+        app.kubernetes.io/component: api
+    spec:
+      containers:
+        - name: policy-service
+          image: ghcr.io/aether/policy-service:latest
+          ports:
+            - containerPort: 8000
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: policy-service
+  labels:
+    app: policy-service
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: policy-service
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: timescaledb
+  labels:
+    app.kubernetes.io/name: timescaledb
+    app.kubernetes.io/component: database
+spec:
+  serviceName: timescaledb
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: timescaledb
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: timescaledb
+        app.kubernetes.io/component: database
+    spec:
+      securityContext:
+        fsGroup: 999
+      containers:
+        - name: timescaledb
+          image: timescale/timescaledb-ha:pg15.3
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - secretRef:
+                name: timescaledb-secrets
+          ports:
+            - containerPort: 5432
+              name: postgres
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+        - name: wal-streamer
+          image: ghcr.io/aether/timescaledb-wal-shipper:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: WAL_ARCHIVE_S3_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: timescaledb-secrets
+                  key: wal_archive_bucket
+            - name: WAL_ARCHIVE_S3_PREFIX
+              valueFrom:
+                secretKeyRef:
+                  name: timescaledb-secrets
+                  key: wal_archive_prefix
+            - name: WAL_ARCHIVE_AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: timescaledb-secrets
+                  key: wal_archive_access_key
+            - name: WAL_ARCHIVE_AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: timescaledb-secrets
+                  key: wal_archive_secret_key
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -euo pipefail
+              while true; do
+                wal-g wal-receive --confirm && sleep 30;
+              done
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 100Gi
