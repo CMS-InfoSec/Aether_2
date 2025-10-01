@@ -112,6 +112,40 @@ class StubUniverseRepository:
         return dict(self._fees[instrument]) if instrument in self._fees else None
 
 
+def test_adapter_uses_repository_factory_when_not_injected() -> None:
+    class FactoryRepository:
+        def __init__(self, account_id: str) -> None:
+            self.account_id = account_id
+            self.approved_calls = 0
+            self.fee_override_calls: list[str] = []
+
+        def approved_universe(self) -> list[str]:
+            self.approved_calls += 1
+            return ["BTC-USD"]
+
+        def fee_override(self, instrument: str) -> dict[str, float | str] | None:
+            self.fee_override_calls.append(instrument)
+            return {"currency": "USD", "maker": 0.2, "taker": 0.3}
+
+    created: list[FactoryRepository] = []
+
+    def factory(account_id: str) -> FactoryRepository:
+        repository = FactoryRepository(account_id)
+        created.append(repository)
+        return repository
+
+    adapter = RedisFeastAdapter(account_id="admin-eu", repository_factory=factory)
+
+    instruments = adapter.approved_instruments()
+    assert instruments == ["BTC-USD"]
+    assert created and created[-1].account_id == "admin-eu"
+    assert created[-1].approved_calls == 1
+
+    fee = adapter.fee_override("BTC-USD")
+    assert fee == {"currency": "USD", "maker": 0.2, "taker": 0.3}
+    assert created[-1].fee_override_calls == ["BTC-USD"]
+
+
 def test_fastapi_endpoint_uses_cached_repository(monkeypatch) -> None:
     stub_repository = StubUniverseRepository()
 

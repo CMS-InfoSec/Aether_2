@@ -334,10 +334,11 @@ class RedisFeastAdapter:
 
     def __post_init__(self) -> None:
 
-        if self.repository is not None:
-            self._repository = self.repository
+        repository = self.repository
+        if repository is not None:
+            self._repository = repository
         else:
-            self._repository = self.repository_factory(self.account_id)
+            self._repository = self.repository_factory(account_id=self.account_id)
 
 
 

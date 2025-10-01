@@ -4,8 +4,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 
+from services.common.adapters import RedisFeastAdapter
 from services.common.security import ADMIN_ACCOUNTS
 
+from services.fees import main as fees_main
 from services.fees.main import app
 from services.universe.repository import UniverseRepository
 
@@ -63,16 +65,16 @@ def test_get_effective_fees_handles_missing_repository_override(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
     class StubRepository:
-        def __init__(self, account_id: str) -> None:
-            self.account_id = account_id
-
         def approved_universe(self) -> list[str]:
             return []
 
         def fee_override(self, instrument: str) -> dict[str, float | str] | None:
             return None
 
-    monkeypatch.setattr("services.common.adapters.UniverseRepository", StubRepository)
+    def adapter_factory(account_id: str) -> RedisFeastAdapter:
+        return RedisFeastAdapter(account_id=account_id, repository=StubRepository())
+
+    monkeypatch.setattr(fees_main, "RedisFeastAdapter", adapter_factory)
 
     response = client.get(
         "/fees/effective",
@@ -119,3 +121,44 @@ def test_get_effective_fees_uses_repository_override(monkeypatch, client: TestCl
     body = response.json()
     assert body["fee"]["maker"] == 0.5
     assert body["fee"]["taker"] == 0.8
+
+
+def test_get_effective_fees_uses_factory_when_repository_not_supplied(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    class StubRepository:
+        def __init__(self, account_id: str) -> None:
+            self.account_id = account_id
+            self.fee_override_calls: list[str] = []
+
+        def approved_universe(self) -> list[str]:
+            return []
+
+        def fee_override(self, instrument: str) -> dict[str, float | str] | None:
+            self.fee_override_calls.append(instrument)
+            return {"currency": "USD", "maker": 0.25, "taker": 0.4}
+
+    repositories: list[StubRepository] = []
+
+    def repository_factory(account_id: str) -> StubRepository:
+        repo = StubRepository(account_id)
+        repositories.append(repo)
+        return repo
+
+    def adapter_factory(account_id: str) -> RedisFeastAdapter:
+        return RedisFeastAdapter(account_id=account_id, repository_factory=repository_factory)
+
+    monkeypatch.setattr(fees_main, "RedisFeastAdapter", adapter_factory)
+
+    response = client.get(
+        "/fees/effective",
+        params={"isolation_segment": "seg-fees", "fee_tier": "standard"},
+        headers={"X-Account-Id": "admin-us"},
+    )
+
+    assert response.status_code == 200
+    assert repositories and repositories[-1].account_id == "admin-us"
+    assert repositories[-1].fee_override_calls == ["default"]
+    payload = response.json()
+    assert payload["fee"]["maker"] == 0.25
+    assert payload["fee"]["taker"] == 0.4
