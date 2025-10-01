@@ -13,7 +13,9 @@ from services.alert_manager import setup_alerting
 from alert_prioritizer import router as alert_prioritizer_router
 from services.report_service import router as reports_router
 from multiformat_export import router as log_export_router
+
 from pack_exporter import router as knowledge_router
+
 
 from services.models.meta_learner import router as meta_router
 from services.models.model_zoo import router as models_router
@@ -50,6 +52,9 @@ def create_app() -> FastAPI:
     app.include_router(log_export_router)
     app.include_router(knowledge_router)
 
+    scaling_controller = build_scaling_controller_from_env()
+    configure_scaling_controller(scaling_controller)
+    app.include_router(scaling_router)
 
 
     app.state.audit_store = audit_store
@@ -59,8 +64,17 @@ def create_app() -> FastAPI:
     app.state.session_store = session_store
     app.state.auth_service = auth_service
     app.state.accounts_service = accounts_service
+    app.state.scaling_controller = scaling_controller
 
     configure_audit_mode(app)
+
+    @app.on_event("startup")
+    async def _start_scaling_controller() -> None:  # pragma: no cover - FastAPI lifecycle
+        await scaling_controller.start()
+
+    @app.on_event("shutdown")
+    async def _stop_scaling_controller() -> None:  # pragma: no cover - FastAPI lifecycle
+        await scaling_controller.stop()
 
     alertmanager_url = os.getenv("ALERTMANAGER_URL")
     setup_alerting(app, alertmanager_url=alertmanager_url)
