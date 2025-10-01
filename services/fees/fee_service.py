@@ -12,6 +12,7 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from services.common.security import require_admin_account
 from services.fees.models import AccountVolume30d, Base, FeeTier
 
 
@@ -129,11 +130,11 @@ def _fee_amount(notional: Decimal, bps: Decimal) -> Decimal:
 
 @app.get("/fees/effective", response_model=EffectiveFeeResponse)
 def get_effective_fee(
-    account_id: str = Query(..., description="Unique account identifier"),
     pair: str = Query(..., description="Trading pair symbol", min_length=3, max_length=32),
     liquidity: str = Query(..., description="Requested liquidity side", pattern=r"(?i)^(maker|taker)$"),
     notional: float = Query(..., gt=0.0, description="Order notional in USD"),
     session: Session = Depends(get_session),
+    account_id: str = Depends(require_admin_account),
 ) -> EffectiveFeeResponse:
     del pair  # the current schedule is global and does not vary by pair
 
@@ -164,7 +165,10 @@ def get_effective_fee(
 
 
 @app.get("/fees/tiers", response_model=List[FeeTierSchema])
-def get_fee_tiers(session: Session = Depends(get_session)) -> List[FeeTierSchema]:
+def get_fee_tiers(
+    session: Session = Depends(get_session),
+    _: str = Depends(require_admin_account),
+) -> List[FeeTierSchema]:
     tiers = _ordered_tiers(session)
     if not tiers:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Fee schedule is not configured")
@@ -183,8 +187,8 @@ def get_fee_tiers(session: Session = Depends(get_session)) -> List[FeeTierSchema
 
 @app.get("/fees/volume30d", response_model=Volume30dResponse)
 def get_volume_30d(
-    account_id: str = Query(..., description="Unique account identifier"),
     session: Session = Depends(get_session),
+    account_id: str = Depends(require_admin_account),
 ) -> Volume30dResponse:
     record = session.get(AccountVolume30d, account_id)
     if record is None:
