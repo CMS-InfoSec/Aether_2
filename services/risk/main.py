@@ -7,6 +7,7 @@ from services.common.schemas import RiskValidationRequest, RiskValidationRespons
 from services.common.security import require_admin_account
 from services.risk.engine import RiskEngine
 from services.risk.cvar_forecast import router as cvar_router
+from services.risk.nav_forecaster import router as nav_router
 
 from metrics import (
     increment_trade_rejection,
@@ -21,6 +22,7 @@ setup_metrics(app, service_name="risk-service")
 
 
 app.include_router(cvar_router)
+app.include_router(nav_router)
 
 
 @app.post("/risk/validate", response_model=RiskValidationResponse)

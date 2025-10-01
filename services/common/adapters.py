@@ -75,6 +75,7 @@ class TimescaleAdapter:
     _rolling_volume: ClassVar[Dict[str, Dict[str, Dict[str, Any]]]] = {}
 
     _cvar_results: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
+    _nav_forecasts: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
 
 
     _default_risk_config: ClassVar[Dict[str, Any]] = {
@@ -90,6 +91,8 @@ class TimescaleAdapter:
         "latency_limit_ms": 250.0,
         "diversification_rules": {"max_single_instrument_percent": 0.35},
         "kill_switch": False,
+        "volatility_overrides": {},
+        "correlation_matrix": {},
     }
 
     def __post_init__(self) -> None:
@@ -106,6 +109,7 @@ class TimescaleAdapter:
         self._kill_events.setdefault(self.account_id, [])
 
         self._cvar_results.setdefault(self.account_id, [])
+        self._nav_forecasts.setdefault(self.account_id, [])
 
 
         account_events = self._events.setdefault(
@@ -291,6 +295,29 @@ class TimescaleAdapter:
 
     def cvar_results(self) -> List[Dict[str, Any]]:
         records = self._cvar_results.get(self.account_id, [])
+        return [dict(entry) for entry in records]
+
+    def record_nav_forecast(
+        self,
+        *,
+        horizon: str,
+        metrics: Mapping[str, float],
+        timestamp: datetime | None = None,
+    ) -> Dict[str, Any]:
+        ts = timestamp or datetime.now(timezone.utc)
+        normalized_metrics = {key: float(value) for key, value in metrics.items()}
+        record = {
+            "account_id": self.account_id,
+            "horizon": horizon,
+            "metrics_json": normalized_metrics,
+            "ts": ts,
+        }
+        history = self._nav_forecasts.setdefault(self.account_id, [])
+        history.append(record)
+        return dict(record)
+
+    def nav_forecasts(self) -> List[Dict[str, Any]]:
+        records = self._nav_forecasts.get(self.account_id, [])
         return [dict(entry) for entry in records]
 
     # ------------------------------------------------------------------
