@@ -6,7 +6,10 @@ import contextlib
 import json
 import logging
 import os
-from dataclasses import dataclass, field
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
 from decimal import Decimal, ROUND_HALF_EVEN
 from pathlib import Path
 from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple
@@ -14,6 +17,7 @@ from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
 
+from services.oms.impact_store import ImpactAnalyticsStore, impact_store
 from services.oms.kraken_rest import KrakenRESTClient, KrakenRESTError
 from services.oms.kraken_ws import (
     KrakenWSError,
@@ -65,9 +69,12 @@ class OMSPlaceRequest(BaseModel):
         gt=Decimal("0"),
         description="Trailing stop offset",
     )
-    shadow: bool = Field(
-        default=False,
-        description="When true, the order is mirrored for paper trading and not routed to the venue",
+
+    pre_trade_mid_px: Optional[Decimal] = Field(
+        default=None,
+        gt=Decimal("0"),
+        description="Observed mid price immediately before order placement",
+
     )
 
     @field_validator("side")
@@ -125,6 +132,17 @@ class OMSPlaceResponse(OMSOrderStatusResponse):
     shadow: bool = Field(default=False, description="True when the order executed in shadow mode")
 
 
+class ImpactCurvePoint(BaseModel):
+    size: float
+    impact_bps: float
+
+
+class ImpactCurveResponse(BaseModel):
+    symbol: str
+    points: List[ImpactCurvePoint]
+    as_of: datetime
+
+
 class _IdempotencyStore:
     """Cooperative idempotency cache used per-account."""
 
@@ -165,146 +183,10 @@ class OrderRecord:
     transport: str
     symbol: str
     side: str
-    shadow: bool = False
-    recorded_fill_qty: Decimal = field(default_factory=lambda: Decimal("0"))
 
+    pre_trade_mid: Optional[Decimal]
+    recorded_qty: Decimal = Decimal("0")
 
-class _PnLLedger:
-    """Tracks realized PnL and open positions for a single execution lane."""
-
-    def __init__(self) -> None:
-        self._positions: Dict[str, Decimal] = {}
-        self._avg_price: Dict[str, Decimal] = {}
-        self._realized: Decimal = Decimal("0")
-        self._fills: List[Dict[str, object]] = []
-
-    def record_trade(self, symbol: str, side: str, quantity: Decimal, price: Decimal) -> None:
-        if quantity <= 0 or price <= 0:
-            return
-
-        normalized_side = side.lower()
-        if normalized_side not in {"buy", "sell"}:
-            return
-
-        qty = quantity
-        px = price
-        position = self._positions.get(symbol, Decimal("0"))
-        avg_price = self._avg_price.get(symbol, Decimal("0"))
-        signed_qty = qty if normalized_side == "buy" else -qty
-
-        if position == 0 or position * signed_qty > 0:
-            new_position = position + signed_qty
-            if new_position > 0:
-                total_cost = (avg_price * position if position > 0 else Decimal("0")) + (px * qty)
-                self._positions[symbol] = new_position
-                self._avg_price[symbol] = total_cost / new_position
-            elif new_position < 0:
-                total_cost = (avg_price * (-position) if position < 0 else Decimal("0")) + (px * qty)
-                self._positions[symbol] = new_position
-                self._avg_price[symbol] = total_cost / (-new_position)
-            else:
-                self._positions.pop(symbol, None)
-                self._avg_price.pop(symbol, None)
-        else:
-            if position > 0:
-                closing_qty = min(position, -signed_qty)
-                self._realized += (px - avg_price) * closing_qty
-                new_position = position + signed_qty
-                if new_position > 0:
-                    self._positions[symbol] = new_position
-                elif new_position < 0:
-                    self._positions[symbol] = new_position
-                    self._avg_price[symbol] = px
-                else:
-                    self._positions.pop(symbol, None)
-                    self._avg_price.pop(symbol, None)
-            else:  # position < 0
-                closing_qty = min(-position, signed_qty)
-                self._realized += (avg_price - px) * closing_qty
-                new_position = position + signed_qty
-                if new_position < 0:
-                    self._positions[symbol] = new_position
-                elif new_position > 0:
-                    self._positions[symbol] = new_position
-                    self._avg_price[symbol] = px
-                else:
-                    self._positions.pop(symbol, None)
-                    self._avg_price.pop(symbol, None)
-
-        self._fills.append(
-            {
-                "symbol": symbol,
-                "side": normalized_side,
-                "quantity": qty,
-                "price": px,
-            }
-        )
-
-    def snapshot(self) -> Dict[str, Any]:
-        positions = {
-            symbol: {
-                "quantity": qty,
-                "avg_price": self._avg_price.get(symbol, Decimal("0")),
-            }
-            for symbol, qty in self._positions.items()
-        }
-        return {
-            "realized_pnl": self._realized,
-            "positions": positions,
-            "fills": list(self._fills),
-        }
-
-
-class _ShadowPnLTracker:
-    """Maintains independent ledgers for real and paper executions."""
-
-    def __init__(self) -> None:
-        self._real = _PnLLedger()
-        self._shadow = _PnLLedger()
-
-    def record_fill(
-        self,
-        *,
-        symbol: str,
-        side: str,
-        quantity: Decimal,
-        price: Decimal,
-        shadow: bool,
-    ) -> None:
-        ledger = self._shadow if shadow else self._real
-        ledger.record_trade(symbol, side, quantity, price)
-
-    def snapshot(self) -> Dict[str, Any]:
-        real_state = self._real.snapshot()
-        shadow_state = self._shadow.snapshot()
-        delta = shadow_state["realized_pnl"] - real_state["realized_pnl"]
-        return {
-            "real": self._serialize(real_state),
-            "shadow": self._serialize(shadow_state),
-            "delta": {"realized_pnl": float(delta)},
-        }
-
-    @staticmethod
-    def _serialize(state: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "realized_pnl": float(state["realized_pnl"]),
-            "positions": {
-                symbol: {
-                    "quantity": float(data["quantity"]),
-                    "avg_price": float(data["avg_price"]),
-                }
-                for symbol, data in state["positions"].items()
-            },
-            "fills": [
-                {
-                    "symbol": entry["symbol"],
-                    "side": entry["side"],
-                    "quantity": float(entry["quantity"]),
-                    "price": float(entry["price"]),
-                }
-                for entry in state["fills"]
-            ],
-        }
 
 
 class _PrecisionValidator:
@@ -504,7 +386,9 @@ class AccountContext:
         self._orders_lock = asyncio.Lock()
         self._startup_lock = asyncio.Lock()
         self._stream_task: Optional[asyncio.Task[None]] = None
-        self._pnl_tracker = _ShadowPnLTracker()
+
+        self._impact_store: ImpactAnalyticsStore = impact_store
+
 
     async def start(self) -> None:
         async with self._startup_lock:
@@ -544,20 +428,32 @@ class AccountContext:
             errors=state.errors or None,
         )
         async with self._orders_lock:
-            record = self._orders.get(key)
-            if record is None:
+
+            existing = self._orders.get(key)
+            if existing:
+                record = OrderRecord(
+                    client_id=key,
+                    result=result,
+                    transport=existing.transport,
+                    symbol=existing.symbol,
+                    side=existing.side,
+                    pre_trade_mid=existing.pre_trade_mid,
+                    recorded_qty=existing.recorded_qty,
+                )
+            else:
+
                 record = OrderRecord(
                     client_id=key,
                     result=result,
                     transport=state.transport,
                     symbol="",
-                    side="buy",
+
+                    side="",
+                    pre_trade_mid=None,
                 )
-            else:
-                record.transport = state.transport or record.transport
-                record.result = result
-            self._record_fill_locked(record, result)
+
             self._orders[key] = record
+        await self._record_trade_impact(record)
 
     async def place_order(self, request: OMSPlaceRequest) -> OMSPlaceResponse:
         await self.start()
@@ -607,24 +503,16 @@ class AccountContext:
 
                 result = self._order_result_from_ack(request, ack)
             async with self._orders_lock:
-                record = self._orders.get(request.client_id)
-                if record is None:
-                    record = OrderRecord(
-                        client_id=request.client_id,
-                        result=result,
-                        transport=transport,
-                        symbol=request.symbol,
-                        side=request.side,
-                        shadow=request.shadow,
-                    )
-                    self._orders[request.client_id] = record
-                else:
-                    record.result = result
-                    record.transport = transport
-                    record.symbol = request.symbol
-                    record.side = request.side
-                    record.shadow = request.shadow
-                self._record_fill_locked(record, result)
+
+                self._orders[request.client_id] = OrderRecord(
+                    client_id=request.client_id,
+                    result=result,
+                    transport=transport,
+                    symbol=request.symbol,
+                    side=request.side,
+                    pre_trade_mid=request.pre_trade_mid_px,
+                )
+
             return result
 
         cache_key = f"place:{request.client_id}"
@@ -632,6 +520,8 @@ class AccountContext:
         async with self._orders_lock:
             record = self._orders.get(request.client_id)
         transport = record.transport if record else "websocket"
+        if record is not None:
+            await self._record_trade_impact(record)
         return OMSPlaceResponse(
             exchange_order_id=result.exchange_order_id,
             status=result.status,
@@ -686,19 +576,18 @@ class AccountContext:
                 errors=ack.errors or None,
             )
             async with self._orders_lock:
-                record = self._orders.get(request.client_id)
-                if record is None:
-                    record = OrderRecord(
-                        client_id=request.client_id,
-                        result=result,
-                        transport=transport,
-                        symbol="",
-                        side="buy",
-                    )
-                    self._orders[request.client_id] = record
-                else:
-                    record.transport = transport
-                    record.result = result
+
+                existing = self._orders.get(request.client_id)
+                self._orders[request.client_id] = OrderRecord(
+                    client_id=request.client_id,
+                    result=result,
+                    transport=transport,
+                    symbol=existing.symbol if existing else "",
+                    side=existing.side if existing else "",
+                    pre_trade_mid=existing.pre_trade_mid if existing else None,
+                    recorded_qty=existing.recorded_qty if existing else Decimal("0"),
+                )
+
             return result
 
         cache_key = f"cancel:{request.client_id}"
@@ -760,30 +649,50 @@ class AccountContext:
         async with self._orders_lock:
             return self._orders.get(client_id)
 
-    def shadow_snapshot(self) -> Dict[str, Any]:
-        return self._pnl_tracker.snapshot()
 
-    def _record_fill_locked(
-        self, record: OrderRecord, result: OMSOrderStatusResponse
-    ) -> None:
-        if result.filled_qty is None or result.filled_qty <= 0:
+    async def _record_trade_impact(self, record: OrderRecord) -> None:
+        if record.pre_trade_mid is None:
             return
-        delta = result.filled_qty - record.recorded_fill_qty
-        if delta <= 0:
+        if record.result.filled_qty <= 0:
             return
-        price = result.avg_price
-        if price is None or price <= 0:
+        if record.result.avg_price <= 0:
+            return
+        if record.recorded_qty >= record.result.filled_qty:
             return
         if not record.symbol:
             return
-        self._pnl_tracker.record_fill(
+
+        filled_qty = record.result.filled_qty
+        avg_price = record.result.avg_price
+        mid_px = record.pre_trade_mid
+        if mid_px is None or mid_px <= 0:
+            return
+
+        normalized_side = record.side.lower()
+        if normalized_side not in {"buy", "sell"}:
+            return
+
+        direction = Decimal("1") if normalized_side == "buy" else Decimal("-1")
+        impact_ratio = (avg_price - mid_px) / mid_px
+        impact_bps = float((impact_ratio * direction * Decimal("10000")))
+
+        await self._impact_store.record_fill(
+            account_id=self.account_id,
+            client_order_id=record.client_id,
             symbol=record.symbol,
             side=record.side,
-            quantity=delta,
-            price=price,
-            shadow=record.shadow,
+            filled_qty=float(filled_qty),
+            avg_price=float(avg_price),
+            pre_trade_mid=float(mid_px),
+            impact_bps=impact_bps,
+            recorded_at=datetime.now(timezone.utc),
         )
-        record.recorded_fill_qty += delta
+
+        async with self._orders_lock:
+            current = self._orders.get(record.client_id)
+            if current:
+                current.recorded_qty = filled_qty
+
 
 
 class OMSManager:
@@ -868,17 +777,18 @@ async def get_status(
     return record.result
 
 
-@app.get("/oms/shadow_pnl")
-async def get_shadow_pnl(
-    account_id: str,
-    header_account: str = Depends(require_account_id),
-) -> Dict[str, Any]:
-    if account_id != header_account:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account mismatch")
 
-    account = await manager.get_account(account_id)
-    snapshot = account.shadow_snapshot()
-    snapshot["account_id"] = account_id
-    return snapshot
+@app.get("/oms/impact_curve", response_model=ImpactCurveResponse)
+async def get_impact_curve(
+    symbol: str,
+    account_id: str = Depends(require_account_id),
+) -> ImpactCurveResponse:
+    points_raw = await impact_store.impact_curve(account_id=account_id, symbol=symbol)
+    points = [
+        ImpactCurvePoint(size=point["size"], impact_bps=point["impact_bps"])
+        for point in points_raw
+    ]
+    return ImpactCurveResponse(symbol=symbol, points=points, as_of=datetime.now(timezone.utc))
+
 
 
