@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+
 import math
+
 import os
 from collections import defaultdict, deque
 from dataclasses import dataclass, replace
@@ -34,12 +36,24 @@ from services.common.security import ADMIN_ACCOUNTS
 FEES_SERVICE_URL = os.getenv("FEES_SERVICE_URL", "http://fees-service")
 FEES_REQUEST_TIMEOUT = float(os.getenv("FEES_REQUEST_TIMEOUT", "1.0"))
 CONFIDENCE_THRESHOLD = float(os.getenv("POLICY_CONFIDENCE_THRESHOLD", "0.55"))
+OMS_SERVICE_URL = os.getenv("OMS_SERVICE_URL", "http://oms-service")
+PAPER_OMS_SERVICE_URL = os.getenv("PAPER_OMS_SERVICE_URL", "http://paper-oms-service")
+OMS_REQUEST_TIMEOUT = float(os.getenv("OMS_REQUEST_TIMEOUT", "1.0"))
+ENABLE_SHADOW_EXECUTION = os.getenv("ENABLE_SHADOW_EXECUTION", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+SHADOW_CLIENT_SUFFIX = os.getenv("SHADOW_CLIENT_SUFFIX", "-shadow")
 
 KRAKEN_PRECISION: Dict[str, Dict[str, float]] = {
     "BTC-USD": {"tick": 0.1, "lot": 0.0001},
     "ETH-USD": {"tick": 0.01, "lot": 0.001},
     "SOL-USD": {"tick": 0.001, "lot": 0.01},
 }
+
+
+logger = logging.getLogger(__name__)
 
 
 app = FastAPI(title="Policy Service", version="2.0.0")
@@ -460,4 +474,82 @@ async def decide_policy(request: PolicyDecisionRequest) -> PolicyDecisionRespons
         stop_loss_bps=round(float(stop_loss), 4),
     )
 
+    await _dispatch_shadow_orders(request, response)
+
     return response
+
+
+async def _dispatch_shadow_orders(
+    request: PolicyDecisionRequest, response: PolicyDecisionResponse
+) -> None:
+    """Submit the primary execution as well as the paper shadow copy."""
+
+    if not response.approved or response.selected_action.lower() == "abstain":
+        return
+
+    await _submit_execution(request, response, shadow=False)
+
+    if not ENABLE_SHADOW_EXECUTION:
+        return
+
+    try:
+        await _submit_execution(request, response, shadow=True)
+    except Exception as exc:  # pragma: no cover - best-effort shadow dispatch
+        logger.warning(
+            "Shadow execution submission failed for order %s: %s",
+            request.order_id,
+            exc,
+        )
+
+
+async def _submit_execution(
+    request: PolicyDecisionRequest,
+    response: PolicyDecisionResponse,
+    *,
+    shadow: bool,
+) -> None:
+    """Submit the execution payload to the configured OMS endpoint."""
+
+    base_url = PAPER_OMS_SERVICE_URL if shadow else OMS_SERVICE_URL
+    if not base_url:
+        return
+
+    precision = _resolve_precision(request.instrument)
+    snapped_price = _snap(request.price, precision["tick"])
+    snapped_qty = _snap(request.quantity, precision["lot"])
+
+    order_type = "limit" if response.selected_action.lower() == "maker" else "market"
+    client_id = request.order_id
+    if shadow and SHADOW_CLIENT_SUFFIX:
+        client_id = f"{client_id}{SHADOW_CLIENT_SUFFIX}"
+
+    payload: Dict[str, object] = {
+        "account_id": request.account_id,
+        "client_id": client_id,
+        "symbol": request.instrument,
+        "side": request.side.lower(),
+        "order_type": order_type,
+        "qty": snapped_qty,
+        "post_only": response.selected_action.lower() == "maker",
+        "reduce_only": False,
+        "flags": [],
+        "shadow": shadow,
+    }
+    if order_type == "limit":
+        payload["limit_px"] = snapped_price
+
+    headers = {"X-Account-ID": request.account_id}
+    timeout = httpx.Timeout(OMS_REQUEST_TIMEOUT)
+    async with httpx.AsyncClient(base_url=base_url, timeout=timeout) as client:
+        try:
+            response = await client.post("/oms/place", json=payload, headers=headers)
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            if shadow:
+                raise
+            logger.error(
+                "Primary OMS submission failed for order %s: %s",
+                request.order_id,
+                exc,
+            )
+            raise
