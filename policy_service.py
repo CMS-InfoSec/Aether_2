@@ -14,6 +14,7 @@ from services.models.model_server import Intent, predict_intent
 
 
 from metrics import record_abstention_rate, record_drift_score, setup_metrics
+from services.common.security import ADMIN_ACCOUNTS
 
 
 
@@ -91,6 +92,13 @@ class PolicyDecisionRequest(BaseModel):
     @classmethod
     def _normalize_symbol(cls, value: str) -> str:
         return value.upper()
+
+    @field_validator("account_id")
+    @classmethod
+    def _ensure_admin_account(cls, value: str) -> str:
+        if value not in ADMIN_ACCOUNTS:
+            raise ValueError("Account must be an authorized admin.")
+        return value
 
     @property
     def features_vector(self) -> List[float]:
