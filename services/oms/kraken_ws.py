@@ -242,6 +242,24 @@ class KrakenWSClient:
             raise last_error
         return list(self._open_orders.values())
 
+    async def fetch_own_trades_snapshot(self) -> List[Dict[str, Any]]:
+        await self.ensure_connected()
+
+        methods = ["own_trades", "ownTrades", "ownTradesStatus", "own_trades_status"]
+        last_error: Exception | None = None
+        for method in methods:
+            try:
+                payload = await self._request(method, {})
+            except (KrakenWSError, KrakenWSTimeout) as exc:
+                last_error = exc
+                continue
+            trades = self._parse_own_trades(payload)
+            if trades is not None:
+                return trades
+        if last_error is not None:
+            raise last_error
+        return list(self._own_trades.values())
+
     def _parse_open_orders(self, payload: Dict[str, Any] | None) -> List[Dict[str, Any]] | None:
         if not isinstance(payload, dict):
             return None
@@ -277,6 +295,42 @@ class KrakenWSClient:
                 if txid is not None:
                     self._open_orders[str(txid)] = order
         return orders
+
+    def _parse_own_trades(self, payload: Dict[str, Any] | None) -> List[Dict[str, Any]] | None:
+        if not isinstance(payload, dict):
+            return None
+
+        candidates: List[Any] = []
+        data = payload.get("data")
+        if isinstance(data, list):
+            candidates.extend(data)
+
+        trades_section = payload.get("trades")
+        if isinstance(trades_section, list):
+            candidates.extend(trades_section)
+        elif isinstance(trades_section, dict):
+            candidates.extend(trades_section.values())
+
+        result = payload.get("result")
+        if isinstance(result, dict):
+            trades_result = result.get("trades")
+            if isinstance(trades_result, list):
+                candidates.extend(trades_result)
+            elif isinstance(trades_result, dict):
+                candidates.extend(trades_result.values())
+
+        trades: List[Dict[str, Any]] = []
+        for entry in candidates:
+            if isinstance(entry, dict):
+                trades.append(entry)
+
+        if trades:
+            self._own_trades.clear()
+            for trade in trades:
+                txid = trade.get("order_id") or trade.get("ordertxid") or trade.get("txid")
+                if txid is not None:
+                    self._own_trades[str(txid)] = trade
+        return trades
 
     async def stream_handler(self) -> None:
         while True:
