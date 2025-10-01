@@ -19,6 +19,9 @@ from scaling_controller import (
     router as scaling_router,
 )
 
+from canary_rollout import router as canary_router
+
+
 from services.models.meta_learner import router as meta_router
 from services.models.model_zoo import router as models_router
 
@@ -52,9 +55,11 @@ def create_app() -> FastAPI:
     app.include_router(models_router)
 
     app.include_router(log_export_router)
+
     scaling_controller = build_scaling_controller_from_env()
     configure_scaling_controller(scaling_controller)
     app.include_router(scaling_router)
+
 
     app.state.audit_store = audit_store
     app.state.audit_logger = audit_logger
