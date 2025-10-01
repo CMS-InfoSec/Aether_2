@@ -5,8 +5,17 @@ from datetime import datetime
 from typing import Dict, List, Optional
 
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, model_serializer, model_validator
 
+
+
+class FeeDetail(BaseModel):
+    """Detailed fee information anchored to a tier lookup."""
+
+    bps: float = Field(..., ge=0.0, description="Fee rate expressed in basis points")
+    usd: float = Field(..., ge=0.0, description="Fee amount converted to USD")
+    tier_id: str = Field(..., description="Identifier of the matched fee tier")
+    basis_ts: datetime = Field(..., description="Timestamp associated with the fee tier basis")
 
 
 class FeeBreakdown(BaseModel):
@@ -15,6 +24,23 @@ class FeeBreakdown(BaseModel):
     currency: str = Field(..., description="Fee currency")
     maker: float = Field(..., ge=0.0, description="Maker fee amount")
     taker: float = Field(..., ge=0.0, description="Taker fee amount")
+    maker_detail: Optional[FeeDetail] = Field(
+        None,
+        description=(
+            "Extended maker fee information including tier, basis timestamp, and USD conversion."
+        ),
+    )
+    taker_detail: Optional[FeeDetail] = Field(
+        None,
+        description=(
+            "Extended taker fee information including tier, basis timestamp, and USD conversion."
+        ),
+    )
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):  # type: ignore[override]
+        payload = handler(self)
+        return {key: value for key, value in payload.items() if value is not None}
 
 
 class BookSnapshot(BaseModel):

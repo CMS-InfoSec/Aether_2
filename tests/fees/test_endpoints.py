@@ -1,24 +1,14 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from typing import Dict, List
+
 import pytest
 from fastapi.testclient import TestClient
 
-
-from services.common.adapters import RedisFeastAdapter
+import services.fees.main as fees_main
 from services.common.security import ADMIN_ACCOUNTS
-
-from services.fees import main as fees_main
 from services.fees.main import app
-from services.universe.repository import UniverseRepository
-
-
-
-@pytest.fixture(autouse=True)
-def reset_universe_repository() -> None:
-    UniverseRepository.reset()
-    yield
-    UniverseRepository.reset()
-
 
 
 @pytest.fixture(name="client")
@@ -27,138 +17,168 @@ def client_fixture() -> TestClient:
 
 
 @pytest.mark.parametrize("account_id", sorted(ADMIN_ACCOUNTS))
-def test_get_effective_fees_allows_admin_accounts(client: TestClient, account_id: str) -> None:
-    UniverseRepository.seed_fee_overrides(
-        {
-            "default": {"currency": "USD", "maker": 0.05, "taker": 0.1},
-        }
-    )
+def test_get_effective_fees_returns_tiered_breakdown(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, account_id: str
+) -> None:
+    basis_ts = datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)
+
+    class StubRedisAdapter:
+        def __init__(self, account_id: str) -> None:
+            self.account_id = account_id
+
+        def fee_tiers(self, pair: str) -> List[Dict[str, float | str]]:
+            assert pair == "BTC-USD"
+            return [
+                {
+                    "tier_id": "starter",
+                    "volume_threshold": 0.0,
+                    "maker_bps": 2.5,
+                    "taker_bps": 3.5,
+                    "currency": "USD",
+                    "basis_ts": basis_ts,
+                }
+            ]
+
+        def fee_override(self, instrument: str) -> Dict[str, float | str]:
+            return {"currency": "USD", "maker": 2.5, "taker": 3.5}
+
+    class StubTimescaleAdapter:
+        def __init__(self, account_id: str) -> None:
+            self.account_id = account_id
+
+        def rolling_volume(self, pair: str) -> Dict[str, float | datetime]:
+            assert pair == "BTC-USD"
+            return {"notional": 150_000.0, "basis_ts": basis_ts}
+
+    monkeypatch.setattr(fees_main, "RedisFeastAdapter", StubRedisAdapter)
+    monkeypatch.setattr(fees_main, "TimescaleAdapter", StubTimescaleAdapter)
 
     response = client.get(
         "/fees/effective",
-        params={"isolation_segment": "seg-fees", "fee_tier": "standard"},
+        params={"pair": "BTC-USD", "liquidity": "maker", "notional": 250_000},
         headers={"X-Account-ID": account_id},
     )
 
     assert response.status_code == 200
     body = response.json()
     assert body["account_id"] == account_id
-    assert set(body.keys()) == {"account_id", "effective_from", "fee"}
-
-    assert body["fee"]["currency"] == "USD"
-    assert body["fee"]["maker"] == pytest.approx(0.05)
-    assert body["fee"]["taker"] == pytest.approx(0.1)
-
+    fee = body["fee"]
+    assert fee["currency"] == "USD"
+    assert fee["maker"] == pytest.approx(2.5)
+    assert fee["taker"] == pytest.approx(3.5)
+    assert fee["maker_detail"]["bps"] == pytest.approx(2.5)
+    assert fee["maker_detail"]["usd"] == pytest.approx(250_000 * 2.5 / 10_000)
+    assert fee["maker_detail"]["tier_id"] == "starter"
+    returned_basis = fee["maker_detail"]["basis_ts"]
+    parsed_basis = datetime.fromisoformat(returned_basis.replace("Z", "+00:00"))
+    assert parsed_basis == basis_ts
+    assert fee["taker_detail"]["usd"] == pytest.approx(250_000 * 3.5 / 10_000)
 
 
 def test_get_effective_fees_rejects_non_admin(client: TestClient) -> None:
     response = client.get(
         "/fees/effective",
-        params={"isolation_segment": "seg-fees", "fee_tier": "standard"},
+        params={"pair": "BTC-USD", "liquidity": "maker", "notional": 10_000},
         headers={"X-Account-ID": "guest"},
     )
 
     assert response.status_code == 403
 
 
-def test_get_effective_fees_handles_missing_repository_override(
+def test_get_effective_fees_transitions_between_tiers(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
-    class StubRepository:
-        def approved_universe(self) -> list[str]:
-            return []
+    basis_ts = datetime(2024, 3, 1, 15, 0, tzinfo=timezone.utc)
 
-        def fee_override(self, instrument: str) -> dict[str, float | str] | None:
-            return None
-
-    def adapter_factory(account_id: str) -> RedisFeastAdapter:
-        return RedisFeastAdapter(account_id=account_id, repository=StubRepository())
-
-    monkeypatch.setattr(fees_main, "RedisFeastAdapter", adapter_factory)
-
-    response = client.get(
-        "/fees/effective",
-        params={"isolation_segment": "seg-fees", "fee_tier": "standard"},
-        headers={"X-Account-Id": "admin-eu"},
-    )
-
-    assert response.status_code == 200
-    body = response.json()
-    assert body["fee"] == {"currency": "USD", "maker": 0.1, "taker": 0.2}
-
-
-def test_get_effective_fees_uses_repository_override(monkeypatch, client: TestClient) -> None:
-    class StubRepository:
-        def __init__(self) -> None:
-            self.fee_override_calls: list[str] = []
-
-        def approved_universe(self) -> list[str]:
-            return []
-
-        def fee_override(self, instrument: str) -> dict[str, float | str] | None:
-            self.fee_override_calls.append(instrument)
-            return {"currency": "USD", "maker": 0.5, "taker": 0.8}
-
-    instances: list[StubRepository] = []
-
-    def factory(account_id: str, repository: StubRepository | None = None) -> RedisFeastAdapter:
-        repo = repository or StubRepository()
-        instances.append(repo)
-        return RedisFeastAdapter(account_id=account_id, repository=repo)
-
-    monkeypatch.setattr(fees_main, "RedisFeastAdapter", factory)
-
-    response = client.get(
-        "/fees/effective",
-        params={"isolation_segment": "seg-fees", "fee_tier": "standard"},
-        headers={"X-Account-Id": "admin-eu"},
-    )
-
-    assert response.status_code == 200
-    assert instances
-    stub_repo = instances[-1]
-    assert stub_repo.fee_override_calls == ["default"]
-    body = response.json()
-    assert body["fee"]["maker"] == 0.5
-    assert body["fee"]["taker"] == 0.8
-
-
-def test_get_effective_fees_uses_factory_when_repository_not_supplied(
-    monkeypatch: pytest.MonkeyPatch, client: TestClient
-) -> None:
-    class StubRepository:
+    class StubRedisAdapter:
         def __init__(self, account_id: str) -> None:
             self.account_id = account_id
-            self.fee_override_calls: list[str] = []
 
-        def approved_universe(self) -> list[str]:
+        def fee_tiers(self, pair: str) -> List[Dict[str, float | str]]:
+            return [
+                {
+                    "tier_id": "standard",
+                    "volume_threshold": 0.0,
+                    "maker_bps": 4.0,
+                    "taker_bps": 6.0,
+                    "currency": "USD",
+                },
+                {
+                    "tier_id": "vip",
+                    "volume_threshold": 1_000_000.0,
+                    "maker_bps": 2.0,
+                    "taker_bps": 4.0,
+                    "currency": "USD",
+                },
+            ]
+
+        def fee_override(self, instrument: str) -> Dict[str, float | str]:
+            return {"currency": "USD", "maker": 4.0, "taker": 6.0}
+
+    class StubTimescaleAdapter:
+        def __init__(self, account_id: str) -> None:
+            self.account_id = account_id
+
+        def rolling_volume(self, pair: str) -> Dict[str, float | datetime]:
+            return {"notional": 900_000.0, "basis_ts": basis_ts}
+
+    monkeypatch.setattr(fees_main, "RedisFeastAdapter", StubRedisAdapter)
+    monkeypatch.setattr(fees_main, "TimescaleAdapter", StubTimescaleAdapter)
+
+    first = client.get(
+        "/fees/effective",
+        params={"pair": "ETH-USD", "liquidity": "maker", "notional": 50_000},
+        headers={"X-Account-ID": "admin-eu"},
+    )
+    assert first.status_code == 200
+    first_body = first.json()["fee"]
+    assert first_body["maker"] == pytest.approx(4.0)
+    assert first_body["maker_detail"]["tier_id"] == "standard"
+
+    second = client.get(
+        "/fees/effective",
+        params={"pair": "ETH-USD", "liquidity": "taker", "notional": 200_000},
+        headers={"X-Account-ID": "admin-eu"},
+    )
+    assert second.status_code == 200
+    second_body = second.json()["fee"]
+    assert second_body["taker"] == pytest.approx(4.0)
+    assert second_body["taker_detail"]["tier_id"] == "vip"
+
+
+def test_get_effective_fees_uses_fallback_when_schedule_missing(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    class StubRedisAdapter:
+        def __init__(self, account_id: str) -> None:
+            self.account_id = account_id
+
+        def fee_tiers(self, pair: str) -> List[Dict[str, float | str]]:
             return []
 
-        def fee_override(self, instrument: str) -> dict[str, float | str] | None:
-            self.fee_override_calls.append(instrument)
-            return {"currency": "USD", "maker": 0.25, "taker": 0.4}
+        def fee_override(self, instrument: str) -> Dict[str, float | str]:
+            if instrument == "default":
+                return {"currency": "USD", "maker": 1.5, "taker": 2.0}
+            return {}
 
-    repositories: list[StubRepository] = []
+    class StubTimescaleAdapter:
+        def __init__(self, account_id: str) -> None:
+            self.account_id = account_id
 
-    def repository_factory(account_id: str) -> StubRepository:
-        repo = StubRepository(account_id)
-        repositories.append(repo)
-        return repo
+        def rolling_volume(self, pair: str) -> Dict[str, float | datetime]:
+            return {"notional": 0.0, "basis_ts": datetime.now(timezone.utc)}
 
-    def adapter_factory(account_id: str) -> RedisFeastAdapter:
-        return RedisFeastAdapter(account_id=account_id, repository_factory=repository_factory)
-
-    monkeypatch.setattr(fees_main, "RedisFeastAdapter", adapter_factory)
+    monkeypatch.setattr(fees_main, "RedisFeastAdapter", StubRedisAdapter)
+    monkeypatch.setattr(fees_main, "TimescaleAdapter", StubTimescaleAdapter)
 
     response = client.get(
         "/fees/effective",
-        params={"isolation_segment": "seg-fees", "fee_tier": "standard"},
-        headers={"X-Account-Id": "admin-us"},
+        params={"pair": "SOL-USD", "liquidity": "maker", "notional": 75_000},
+        headers={"X-Account-ID": "admin-us"},
     )
 
     assert response.status_code == 200
-    assert repositories and repositories[-1].account_id == "admin-us"
-    assert repositories[-1].fee_override_calls == ["default"]
-    payload = response.json()
-    assert payload["fee"]["maker"] == 0.25
-    assert payload["fee"]["taker"] == 0.4
+    payload = response.json()["fee"]
+    assert payload["maker"] == pytest.approx(1.5)
+    assert payload["maker_detail"]["tier_id"] == "default"
+    assert payload["maker_detail"]["usd"] == pytest.approx(75_000 * 1.5 / 10_000)
