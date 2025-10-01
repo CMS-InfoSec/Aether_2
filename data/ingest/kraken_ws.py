@@ -1,10 +1,13 @@
+
 """Async consumers for Kraken WebSocket market data."""
 from __future__ import annotations
+
 
 import asyncio
 import datetime as dt
 import json
 import logging
+
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Sequence
@@ -225,3 +228,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

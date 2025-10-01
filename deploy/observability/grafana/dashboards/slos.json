@@ -1,0 +1,15 @@
+{
+  "title": "Trading SLOs",
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Availability",
+      "targets": [
+        {
+          "expr": "trading:latency:availability",
+          "legendFormat": "Availability"
+        }
+      ]
+    }
+  ]
+}

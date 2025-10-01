@@ -1,0 +1,30 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: aether-prod
+  namespace: argocd
+spec:
+  project: aether
+  source:
+    repoURL: https://github.com/example/aether
+    targetRevision: main
+    path: deploy/k8s/overlays/production
+    kustomize:
+      commonAnnotations:
+        argocd.argoproj.io/sync-wave: "10"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: aether
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - RespectIgnoreDifferences=true
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      name: order-gateway-prod
+      jsonPointers:
+        - /spec/replicas

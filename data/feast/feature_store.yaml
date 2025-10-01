@@ -1,6 +1,7 @@
 project: aether
 registry: data/feast/registry.db
 provider: local
+
 online_store:
   type: redis
   connection_string: ${FEAST_REDIS_URL:-redis://localhost:6379/0}
@@ -12,3 +13,4 @@ offline_store:
   user: ${PGUSER:-aether}
   password: ${PGPASSWORD:-aether}
 default_entity_key_serialization_version: 2
+

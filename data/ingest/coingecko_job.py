@@ -1,3 +1,4 @@
+
 """Batch ingestion job for CoinGecko metrics and whitelist publication."""
 from __future__ import annotations
 
@@ -60,8 +61,10 @@ class AssetMetric:
 class CoinGeckoClient:
     """Client responsible for pulling metrics from CoinGecko."""
 
+
     def __init__(self, session: requests.Session | None = None) -> None:
         self.session = session or requests.Session()
+
 
     def fetch_top_assets(self, vs_currency: str = "usd", limit: int = 100) -> List[AssetMetric]:
         params = {
@@ -180,6 +183,7 @@ def main() -> None:
         asyncio.run(publish_to_nats(whitelist_records))
     except RuntimeError:
         LOGGER.exception("Failed to publish whitelist to NATS")
+
 
 
 if __name__ == "__main__":

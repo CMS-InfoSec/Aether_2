@@ -1,3 +1,4 @@
+
 """Helpers for running Feast materialization jobs."""
 from __future__ import annotations
 
@@ -51,6 +52,7 @@ def main() -> None:
         materialize_incremental(store)
     else:
         refresh_online_store(store, days=args.days)
+
 
 
 if __name__ == "__main__":

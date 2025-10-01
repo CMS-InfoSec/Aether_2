@@ -1,0 +1,14 @@
+name: nightly_ingest
+config_version: 1.0
+class_name: Checkpoint
+validations:
+  - batch_request:
+      datasource_name: timescale_offline
+      data_connector_name: default_runtime
+      data_asset_name: coingecko_features
+      runtime_parameters:
+        query: |
+          SELECT * FROM features WHERE event_ts >= NOW() - INTERVAL '1 day'
+      batch_identifiers:
+        default_identifier: nightly
+    expectation_suite_name: features_suite

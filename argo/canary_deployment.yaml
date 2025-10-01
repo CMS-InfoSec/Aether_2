@@ -1,0 +1,62 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  name: ml-canary-deployment
+  labels:
+    workflows.argoproj.io/controller-instanceid: ml-platform
+spec:
+  entrypoint: canary
+  templates:
+    - name: canary
+      steps:
+        - - name: deploy-canary
+            template: deploy-canary
+          - name: monitor-canary
+            template: monitor-canary
+          - name: promote-canary
+            when: "{{steps.monitor-canary.outputs.parameters.canary_ok}} == true"
+            template: promote-canary
+    - name: deploy-canary
+      container:
+        image: ghcr.io/aether/ml-runtime:latest
+        command: ["python", "-m", "ml.deployment.deploy", "--strategy", "canary"]
+        envFrom:
+          - configMapRef:
+              name: ml-config
+          - secretRef:
+              name: kubernetes-credentials
+    - name: monitor-canary
+      script:
+        image: ghcr.io/aether/ml-runtime:latest
+        command: [python]
+        source: |
+          import json
+          from pathlib import Path
+          import pandas as pd
+          from ml.monitoring.drift import generate_drift_report
+
+          baseline_path = Path("/artifacts/baseline.parquet")
+          canary_path = Path("/artifacts/canary.parquet")
+          baseline_df = pd.read_parquet(baseline_path)
+          canary_df = pd.read_parquet(canary_path)
+          reports = generate_drift_report(baseline_df, canary_df)
+          alerts = any(report.alert for report in reports)
+          Path("/tmp/report.json").write_text(json.dumps([r.to_dict() for r in reports], indent=2))
+          Path("/tmp/canary_ok").write_text("true" if not alerts else "false")
+      outputs:
+        parameters:
+          - name: canary_ok
+            valueFrom:
+              path: /tmp/canary_ok
+        artifacts:
+          - name: drift_report
+            path: /tmp/report.json
+    - name: promote-canary
+      container:
+        image: ghcr.io/aether/ml-runtime:latest
+        command: ["python", "-m", "ml.registry.promote", "--stage", "Production"]
+        envFrom:
+          - secretRef:
+              name: mlflow-credentials
+          - configMapRef:
+              name: ml-config
