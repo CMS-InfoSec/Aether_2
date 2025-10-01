@@ -28,12 +28,20 @@ class KafkaNATSAdapter:
     def history(self) -> List[Dict[str, Any]]:
         return list(self._event_store.get(self.account_id, []))
 
+    @classmethod
+    def reset(cls, account_id: str | None = None) -> None:
+        if account_id is None:
+            cls._event_store.clear()
+            return
+        cls._event_store.pop(account_id, None)
+
 
 @dataclass
 class TimescaleAdapter:
     account_id: str
 
     _metrics: ClassVar[Dict[str, Dict[str, float]]] = {}
+    _events: ClassVar[Dict[str, Dict[str, List[Dict[str, Any]]]]] = {}
 
     _risk_configs: ClassVar[Dict[str, Dict[str, Any]]] = {
         "admin-eu": {
@@ -77,9 +85,9 @@ class TimescaleAdapter:
 
     def __post_init__(self) -> None:
         self._metrics.setdefault(self.account_id, {"limit": 1_000_000.0, "usage": 0.0})
-        self._daily_usage.setdefault(self.account_id, {"loss": 0.0, "fee": 0.0})
-        self._instrument_exposure.setdefault(self.account_id, {})
-        self._events.setdefault(self.account_id, [])
+
+        self._events.setdefault(self.account_id, {"acks": [], "fills": []})
+
 
     def record_usage(self, notional: float) -> None:
         self._metrics[self.account_id]["usage"] += notional
@@ -87,6 +95,29 @@ class TimescaleAdapter:
     def check_limits(self, notional: float) -> bool:
         projected = self._metrics[self.account_id]["usage"] + notional
         return projected <= self._metrics[self.account_id]["limit"]
+
+    def record_ack(self, payload: Dict[str, Any]) -> None:
+        event = dict(payload)
+        event.setdefault("timestamp", datetime.now(timezone.utc))
+        self._events[self.account_id]["acks"].append(event)
+
+    def record_fill(self, payload: Dict[str, Any]) -> None:
+        event = dict(payload)
+        event.setdefault("timestamp", datetime.now(timezone.utc))
+        self._events[self.account_id]["fills"].append(event)
+
+    def events(self) -> Dict[str, List[Dict[str, Any]]]:
+        stored = self._events.get(self.account_id, {"acks": [], "fills": []})
+        return {"acks": list(stored["acks"]), "fills": list(stored["fills"])}
+
+    @classmethod
+    def reset(cls, account_id: str | None = None) -> None:
+        if account_id is None:
+            cls._metrics.clear()
+            cls._events.clear()
+            return
+        cls._metrics.pop(account_id, None)
+        cls._events.pop(account_id, None)
 
 
     def load_risk_config(self) -> Dict[str, Any]:
