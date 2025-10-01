@@ -1,12 +1,17 @@
 """FastAPI service for managing Kraken API secrets in Kubernetes."""
 from __future__ import annotations
 
+import base64
+import hashlib
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
-from pydantic import BaseModel, Field, SecretStr
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, SecretStr, validator
 
 try:  # pragma: no cover - optional dependency for runtime environment
     from kubernetes import client, config
@@ -45,6 +50,25 @@ ANNOTATION_CREATED_AT = "aether.kraken/createdAt"
 ANNOTATION_ROTATED_AT = "aether.kraken/lastRotatedAt"
 
 
+def _hash_ip(value: Optional[str]) -> str:
+    if not value:
+        return "anonymous"
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return digest
+
+
+@app.exception_handler(RequestValidationError)
+async def handle_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+    LOGGER.warning(
+        "Validation error for Kraken secret request",
+        extra={"path": str(request.url.path)},
+    )
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content={"detail": "Invalid request payload"},
+    )
+
+
 def validate_kraken_credentials(api_key: str, api_secret: str) -> bool:
     """Stub for validating Kraken credentials via the GetBalance endpoint."""
 
@@ -54,6 +78,15 @@ def validate_kraken_credentials(api_key: str, api_secret: str) -> bool:
     return True
 
 
+_ACCOUNT_ID_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{2,63}$")
+
+
+def _ensure_no_whitespace(value: str, field_name: str) -> str:
+    if not value or value.strip() != value or any(ch.isspace() for ch in value):
+        raise ValueError(f"Invalid {field_name} format")
+    return value
+
+
 class KrakenSecretRequest(BaseModel):
     """Payload for rotating Kraken API credentials."""
 
@@ -61,13 +94,31 @@ class KrakenSecretRequest(BaseModel):
     api_key: SecretStr = Field(..., description="Kraken API key")
     api_secret: SecretStr = Field(..., description="Kraken API secret")
 
+    @staticmethod
+    def _ensure(pattern: re.Pattern[str], value: str, field_name: str) -> str:
+        if not pattern.match(value):
+            raise ValueError(f"Invalid {field_name} format")
+        return value
 
-class KrakenSecretResponse(BaseModel):
-    """Response payload after rotating credentials."""
+    @validator("account_id")
+    def validate_account_id(cls, value: str) -> str:  # noqa: D401 - short description is clear
+        return cls._ensure(_ACCOUNT_ID_PATTERN, value, "account_id")
 
-    account_id: str = Field(..., description="Trading account identifier")
-    secret_name: str = Field(..., description="Kubernetes secret name")
-    last_rotated_at: datetime = Field(..., description="Timestamp of the latest rotation")
+    @validator("api_key")
+    def validate_api_key(cls, value: SecretStr) -> SecretStr:
+        raw = value.get_secret_value()
+        _ensure_no_whitespace(raw, "api_key")
+        if len(raw) < 6:
+            raise ValueError("Invalid api_key format")
+        return value
+
+    @validator("api_secret")
+    def validate_api_secret(cls, value: SecretStr) -> SecretStr:
+        raw = value.get_secret_value()
+        _ensure_no_whitespace(raw, "api_secret")
+        if len(raw) < 10:
+            raise ValueError("Invalid api_secret format")
+        return value
 
 
 class KrakenSecretStatus(BaseModel):
@@ -184,9 +235,12 @@ def _upsert_secret(
         ANNOTATION_CREATED_AT: created_at.isoformat(),
         ANNOTATION_ROTATED_AT: now.isoformat(),
     }
+    encoded_api_key = base64.b64encode(api_key.encode("utf-8")).decode("utf-8")
+    encoded_api_secret = base64.b64encode(api_secret.encode("utf-8")).decode("utf-8")
+
     patch_body = {
         "metadata": {"annotations": annotations},
-        "stringData": {"api_key": api_key, "api_secret": api_secret},
+        "data": {"api_key": encoded_api_key, "api_secret": encoded_api_secret},
         "type": "Opaque",
     }
 
@@ -207,7 +261,7 @@ def _upsert_secret(
                 "namespace": namespace,
                 "annotations": annotations,
             },
-            "stringData": {"api_key": api_key, "api_secret": api_secret},
+            "data": {"api_key": encoded_api_key, "api_secret": encoded_api_secret},
             "type": "Opaque",
         }
         try:
@@ -239,15 +293,16 @@ def _upsert_secret(
 
 @app.post(
     "/secrets/kraken",
-    response_model=KrakenSecretResponse,
+    status_code=status.HTTP_204_NO_CONTENT,
     dependencies=[Depends(ensure_secure_transport)],
 )
 def rotate_kraken_secret(
     payload: KrakenSecretRequest,
+    request: Request,
     actor_account: str = Depends(require_admin_account),
     _: str = Depends(require_mfa_context),
     api: CoreV1Api = Depends(get_core_v1_api),
-) -> KrakenSecretResponse:
+) -> Response:
     if payload.account_id != actor_account:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -277,10 +332,15 @@ def rotate_kraken_secret(
         existing_metadata=existing_metadata,
     )
 
+    ip_address = request.client.host if request.client else None
+    hashed_ip = _hash_ip(ip_address)
+
     audit_after = {
         "account_id": actor_account,
+        "actor": actor_account,
         "secret_name": updated_metadata["secret_name"],
         "rotated_at": updated_metadata["last_rotated_at"].isoformat(),
+        "ip_hash": hashed_ip,
     }
 
     _auditor.record(
@@ -290,11 +350,20 @@ def rotate_kraken_secret(
         after=audit_after,
     )
 
-    return KrakenSecretResponse(
-        account_id=actor_account,
-        secret_name=updated_metadata["secret_name"],
-        last_rotated_at=updated_metadata["last_rotated_at"],
+    LOGGER.info(
+        "OMS watcher note: Kraken credentials rotated; OMS watches %s",
+        ANNOTATION_ROTATED_AT,
+        extra={
+            "account_id": actor_account,
+            "secret_name": updated_metadata["secret_name"],
+        },
     )
+
+    response = Response(status_code=status.HTTP_204_NO_CONTENT)
+    response.headers[
+        "X-OMS-Watcher"
+    ] = "Kraken credentials rotated; OMS hot-reloads when secret annotations change."
+    return response
 
 
 @app.get(
@@ -336,11 +405,33 @@ def kraken_secret_status(
     )
 
 
+@app.post(
+    "/secrets/kraken/test",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(ensure_secure_transport)],
+)
+def test_kraken_secret(
+    payload: KrakenSecretRequest,
+    _: str = Depends(require_admin_account),
+    __: str = Depends(require_mfa_context),
+) -> Response:
+    api_key = payload.api_key.get_secret_value()
+    api_secret = payload.api_secret.get_secret_value()
+    if not validate_kraken_credentials(api_key, api_secret):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unable to validate Kraken credentials",
+        )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 __all__ = [
     "app",
     "KrakenSecretRequest",
-    "KrakenSecretResponse",
     "KrakenSecretStatus",
+    "rotate_kraken_secret",
+    "kraken_secret_status",
+    "test_kraken_secret",
     "validate_kraken_credentials",
 ]
 
