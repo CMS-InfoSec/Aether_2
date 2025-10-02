@@ -20,6 +20,7 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID as PGUUID
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
+from services.common.security import require_admin_account
 
 DATABASE_URL = os.getenv(
     "TIMESCALE_DATABASE_URI",
@@ -123,11 +124,6 @@ class OverrideRequest(BaseModel):
     symbol: str = Field(..., description="Base asset symbol to override", example="BTC")
     enabled: bool = Field(..., description="Whether the symbol should be allowed for trading")
     reason: Optional[str] = Field(None, description="Reason for the manual override")
-    actor: Optional[str] = Field(
-        None,
-        description="Identifier for the operator performing the override",
-        example="ops_team",
-    )
 
 
 class OverrideResponse(BaseModel):
@@ -351,17 +347,17 @@ def approved_universe(session: Session = Depends(get_session)) -> UniverseRespon
 
 
 @app.post("/universe/override", response_model=OverrideResponse, status_code=201)
-def override_symbol(request: OverrideRequest, session: Session = Depends(get_session)) -> OverrideResponse:
+def override_symbol(
+    request: OverrideRequest,
+    session: Session = Depends(get_session),
+    actor_account: str = Depends(require_admin_account),
+) -> OverrideResponse:
     raw_symbol = request.symbol.strip().upper()
     if not raw_symbol:
         raise HTTPException(status_code=400, detail="Symbol must not be empty")
 
     if request.reason is not None and not request.reason.strip():
         raise HTTPException(status_code=400, detail="Override reason must not be empty when provided")
-
-    actor = (request.actor or "universe_service").strip()
-    if not actor:
-        raise HTTPException(status_code=400, detail="Actor must not be empty")
 
     canonical_symbol = _normalize_market(raw_symbol)
     if canonical_symbol is None:
@@ -371,7 +367,7 @@ def override_symbol(request: OverrideRequest, session: Session = Depends(get_ses
     previous = latest_overrides.get(canonical_symbol)
 
     now = datetime.now(timezone.utc)
-    details: Dict[str, object] = {}
+    details: Dict[str, object] = {"actor": actor_account}
     if request.reason:
         details["reason"] = request.reason
 
@@ -393,13 +389,14 @@ def override_symbol(request: OverrideRequest, session: Session = Depends(get_ses
             "approved": request.enabled,
             "reason": request.reason,
         },
+        "actor": actor_account,
     }
 
     audit_entry = AuditLog(
         event_id=uuid4(),
         entity_type="universe.symbol",
         entity_id=canonical_symbol,
-        actor=actor,
+        actor=actor_account,
         action="universe.override.enabled" if request.enabled else "universe.override.disabled",
         event_time=now,
         attributes=audit_payload,
@@ -412,7 +409,7 @@ def override_symbol(request: OverrideRequest, session: Session = Depends(get_ses
         symbol=canonical_symbol,
         enabled=request.enabled,
         reason=request.reason,
-        actor=actor,
+        actor=actor_account,
         updated_at=now,
         audit_event_id=audit_entry.event_id,
     )
