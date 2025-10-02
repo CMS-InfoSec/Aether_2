@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Header, Query, Request, status
 from fastapi.responses import JSONResponse
 from kubernetes import client, config
 from kubernetes.client import ApiException
@@ -33,6 +33,26 @@ LOGGER = logging.getLogger(__name__)
 SECRETS_LOGGER = logging.getLogger("secrets_log")
 
 
+def _load_authorized_tokens_from_env() -> Dict[str, str]:
+    raw_tokens = os.getenv("KRAKEN_SECRETS_AUTH_TOKENS", "")
+    tokens: Dict[str, str] = {}
+    for entry in raw_tokens.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        token, _, label = entry.partition(":")
+        token = token.strip()
+        if not token:
+            continue
+        label = label.strip() or "system"
+        tokens[token] = label
+    if not tokens:
+        raise RuntimeError(
+            "KRAKEN_SECRETS_AUTH_TOKENS environment variable must define at least one token"
+        )
+    return tokens
+
+
 class Settings(BaseModel):
     kubernetes_namespace: str = Field(
         default_factory=lambda: os.getenv("KRAKEN_SECRET_NAMESPACE", "default")
@@ -40,6 +60,10 @@ class Settings(BaseModel):
     encryption_key_b64: str = Field(..., alias="SECRET_ENCRYPTION_KEY")
     kraken_api_url: str = Field(
         default_factory=lambda: os.getenv("KRAKEN_API_URL", "https://api.kraken.com")
+    )
+    authorized_tokens: Dict[str, str] = Field(
+        default_factory=_load_authorized_tokens_from_env,
+        alias="KRAKEN_SECRETS_AUTH_TOKENS",
     )
 
     class Config:
@@ -259,17 +283,50 @@ def get_secret_manager() -> KrakenSecretManager:
     return secret_manager
 
 
+def _extract_bearer_token(header_value: Optional[str]) -> Optional[str]:
+    if not header_value:
+        return None
+    value = header_value.strip()
+    if not value:
+        return None
+    if value.lower().startswith("bearer "):
+        return value[7:].strip()
+    return value
+
+
+def require_authorized_caller(authorization: Optional[str] = Header(default=None)) -> str:
+    token = _extract_bearer_token(authorization)
+    if token is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid authorization token",
+        )
+    actor = SETTINGS.authorized_tokens.get(token)
+    if actor is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Caller is not authorized to access Kraken secrets",
+        )
+    return actor
+
+
 @app.post("/secrets/kraken", status_code=status.HTTP_201_CREATED)
 async def store_kraken_secret(
     payload: KrakenSecretRequest,
     request: Request,
     manager: KrakenSecretManager = Depends(get_secret_manager),
+    authorized_actor: str = Depends(require_authorized_caller),
 ) -> JSONResponse:
     masked_key = redact_secret(payload.api_key)
     LOGGER.info(
         "Received request to rotate Kraken secret for account %s using key %s",
         payload.account_id,
         masked_key,
+    )
+    LOGGER.debug(
+        "Kraken secret rotation authorized for account %s by %s",
+        payload.account_id,
+        authorized_actor,
     )
 
     before_snapshot: Dict[str, Any] = {}
@@ -322,17 +379,24 @@ async def store_kraken_secret(
 async def kraken_secret_status(
     account_id: str = Query(..., min_length=1),
     manager: KrakenSecretManager = Depends(get_secret_manager),
+    authorized_actor: str = Depends(require_authorized_caller),
 ) -> Dict[str, str]:
-    LOGGER.info("Status requested for Kraken secret %s", account_id)
+    LOGGER.info("Status requested for Kraken secret %s by %s", account_id, authorized_actor)
     status_payload = manager.get_status(account_id)
     return status_payload
 
 
 @app.post("/secrets/kraken/test")
 async def test_kraken_credentials(
-    payload: KrakenTestRequest, manager: KrakenSecretManager = Depends(get_secret_manager)
+    payload: KrakenTestRequest,
+    manager: KrakenSecretManager = Depends(get_secret_manager),
+    authorized_actor: str = Depends(require_authorized_caller),
 ) -> Dict[str, Any]:
-    LOGGER.info("Testing Kraken credentials for account %s", payload.account_id)
+    LOGGER.info(
+        "Testing Kraken credentials for account %s authorized by %s",
+        payload.account_id,
+        authorized_actor,
+    )
     credentials = manager.get_decrypted_credentials(payload.account_id)
 
     try:
