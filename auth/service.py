@@ -3,12 +3,40 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Set
 
 import pyotp
+from prometheus_client import Counter
+
+from metrics import _REGISTRY
+from shared.correlation import get_correlation_id
+
+
+logger = logging.getLogger(__name__)
+
+
+_LOGIN_SUCCESS_COUNTER = Counter(
+    "auth_login_success_total",
+    "Total number of successful administrator login attempts.",
+    registry=_REGISTRY,
+)
+
+_LOGIN_FAILURE_COUNTER = Counter(
+    "auth_login_failure_total",
+    "Total number of failed administrator login attempts by reason.",
+    ["reason"],
+    registry=_REGISTRY,
+)
+
+_MFA_DENIED_COUNTER = Counter(
+    "auth_mfa_denied_total",
+    "Total number of administrator logins denied due to MFA failure.",
+    registry=_REGISTRY,
+)
 
 
 @dataclass
@@ -79,6 +107,29 @@ class AuthService:
         self._repository = repository
         self._sessions = sessions
 
+    def _record_failure(
+        self,
+        *,
+        reason: str,
+        email: str,
+        ip_address: Optional[str],
+        admin_id: Optional[str] = None,
+    ) -> None:
+        correlation_id = get_correlation_id()
+        extra = {
+            "auth_event": "auth_login_failure",
+            "auth_reason": reason,
+            "auth_email": email,
+            "auth_ip": ip_address,
+            "correlation_id": correlation_id,
+        }
+        if admin_id:
+            extra["auth_admin_id"] = admin_id
+        logger.warning("Admin login failed", extra=extra)
+        _LOGIN_FAILURE_COUNTER.labels(reason=reason).inc()
+        if reason == "mfa_required":
+            _MFA_DENIED_COUNTER.inc()
+
     def _verify_password(self, admin: AdminAccount, password: str) -> bool:
         candidate = hashlib.sha256(password.encode()).hexdigest()
         return hmac.compare_digest(candidate, admin.password_hash)
@@ -102,14 +153,40 @@ class AuthService:
     ) -> Session:
         admin = self._repository.get_by_email(email)
         if admin is None:
+            self._record_failure(
+                reason="invalid_credentials",
+                email=email,
+                ip_address=ip_address,
+                admin_id=None,
+            )
             raise PermissionError("invalid credentials")
         if not self._verify_ip(admin, ip_address):
+            self._record_failure(
+                reason="ip_not_allowed",
+                email=email,
+                ip_address=ip_address,
+                admin_id=admin.admin_id,
+            )
             raise PermissionError("ip_not_allowed")
         if not self._verify_password(admin, password):
+            self._record_failure(
+                reason="invalid_credentials",
+                email=email,
+                ip_address=ip_address,
+                admin_id=admin.admin_id,
+            )
             raise PermissionError("invalid credentials")
         if not mfa_code or not self._verify_mfa(admin, mfa_code):
+            self._record_failure(
+                reason="mfa_required",
+                email=email,
+                ip_address=ip_address,
+                admin_id=admin.admin_id,
+            )
             raise PermissionError("mfa_required")
-        return self._sessions.create(admin.admin_id)
+        session = self._sessions.create(admin.admin_id)
+        _LOGIN_SUCCESS_COUNTER.inc()
+        return session
 
 
 def hash_password(password: str) -> str:
