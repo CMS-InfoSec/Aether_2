@@ -6,7 +6,20 @@ import json
 import logging
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Awaitable, Callable, Dict, Mapping, MutableMapping, Optional, Protocol
+from collections import defaultdict
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    DefaultDict,
+    Dict,
+    Iterable,
+    Mapping,
+    MutableMapping,
+    Optional,
+    Protocol,
+    Sequence,
+)
 
 from fastapi import APIRouter, FastAPI, HTTPException
 
@@ -250,6 +263,12 @@ class StartupManager:
         self._run_lock = asyncio.Lock()
 
         self._persisted_state: Optional[Dict[str, Any]] = None
+        self._seen_order_ids: set[str] = set()
+        self._seen_fill_ids: set[str] = set()
+        self._orders_cache: list[Any] = []
+        self._fills_cache: list[Any] = []
+        self._order_source_counts: DefaultDict[str, int] = defaultdict(int)
+        self._fill_source_counts: DefaultDict[str, int] = defaultdict(int)
 
     async def start(self, mode: StartupMode | str | None = None) -> StartupMode:
         """Execute the bootstrap workflow using *mode* or auto-detect if omitted."""
@@ -261,6 +280,12 @@ class StartupManager:
                 self._mode = mode_value
                 self._synced = False
                 self._last_error = None
+                self._seen_order_ids.clear()
+                self._seen_fill_ids.clear()
+                self._orders_cache.clear()
+                self._fills_cache.clear()
+                self._order_source_counts.clear()
+                self._fill_source_counts.clear()
 
             try:
                 if mode_value is StartupMode.COLD:
@@ -316,6 +341,11 @@ class StartupManager:
             last_offset = self._last_offset
             offsets_snapshot = dict(self._offset_sources)
             synced = self._synced
+            last_error = self._last_error
+            orders_seen = len(self._seen_order_ids)
+            fills_seen = len(self._seen_fill_ids)
+            order_sources = dict(self._order_source_counts)
+            fill_sources = dict(self._fill_source_counts)
 
         if not offsets_snapshot:
             stored_offsets = persisted.get("offsets")
@@ -330,15 +360,28 @@ class StartupManager:
         return {
             "mode": mode,
             "synced": synced,
+            "last_error": last_error,
             "offsets": {
                 "last_offset": last_offset,
                 "sources": offsets_snapshot,
+            },
+            "dedupe": {
+                "orders": {
+                    "total": orders_seen,
+                    "sources": order_sources,
+                },
+                "fills": {
+                    "total": fills_seen,
+                    "sources": fill_sources,
+                },
             },
         }
 
     async def _run_cold_start(self) -> None:
         await self._invoke_loader(self._balance_loader, "balances")
-        await self._invoke_loader(self._order_loader, "open_orders")
+        orders_payload = await self._invoke_loader(self._order_loader, "open_orders")
+        if orders_payload is not None:
+            self._register_orders(orders_payload, source="bootstrap")
         await self._invoke_loader(self._position_loader, "positions")
 
     async def _run_reconcile(self) -> None:
@@ -445,12 +488,8 @@ class StartupManager:
             LOGGER.warning("Kafka replay handler failed: %s", exc)
             return last_offset
 
-        if isinstance(result, Mapping):
-            updated = self._normalize_offsets(result)
-            if updated:
-                offsets.update(updated)
-                return max(updated.values())
-            return last_offset
+        new_last = self._process_replay_result(result, offsets, last_offset)
+        return new_last if new_last is not None else last_offset
 
         coerced = self._coerce_int(result)
         return coerced if coerced is not None else last_offset
@@ -471,6 +510,152 @@ class StartupManager:
         except Exception:  # pragma: no cover - defensive logging
             LOGGER.exception("Startup %s loader failed", label)
             raise
+
+    def _process_replay_result(
+        self,
+        result: Any,
+        offsets: MutableMapping[str, int],
+        last_offset: Optional[int],
+    ) -> Optional[int]:
+        if isinstance(result, tuple) and len(result) == 2:
+            # Allow handlers to return (offsets, events)
+            offsets_candidate, events_candidate = result
+            new_last = self._process_replay_result(offsets_candidate, offsets, last_offset)
+            self._consume_event_payload(events_candidate, source="replay")
+            return new_last
+
+        if isinstance(result, Mapping):
+            self._consume_event_payload(result, source="replay")
+            offsets_candidate = self._extract_offsets_from_mapping(result)
+            if offsets_candidate:
+                offsets.update(offsets_candidate)
+                return max(offsets_candidate.values())
+            return last_offset
+
+        self._consume_event_payload(result, source="replay")
+        normalized = self._normalize_offsets(result)
+        if normalized:
+            offsets.update(normalized)
+            return max(normalized.values())
+        return last_offset
+
+    def _extract_offsets_from_mapping(self, mapping: Mapping[str, Any]) -> Dict[str, int]:
+        if "offsets" in mapping:
+            raw_offsets = mapping.get("offsets")
+            normalized = self._normalize_offsets(raw_offsets)
+            if normalized:
+                return normalized
+        normalized_self = self._normalize_offsets(mapping)
+        return normalized_self
+
+    def _consume_event_payload(self, payload: Any, *, source: str) -> None:
+        if payload is None:
+            return
+
+        if isinstance(payload, Mapping):
+            orders_payload = payload.get("orders") or payload.get("open_orders")
+            fills_payload = (
+                payload.get("fills")
+                or payload.get("executions")
+                or payload.get("trades")
+            )
+            if orders_payload is not None:
+                deduped_orders = self._register_orders(orders_payload, source=source)
+                if isinstance(payload, MutableMapping) and deduped_orders is not None:
+                    payload["orders"] = deduped_orders
+            if fills_payload is not None:
+                deduped_fills = self._register_fills(fills_payload, source=source)
+                if isinstance(payload, MutableMapping) and deduped_fills is not None:
+                    payload["fills"] = deduped_fills
+            return
+
+        self._register_orders(payload, source=source)
+        self._register_fills(payload, source=source)
+
+    def _register_orders(self, payload: Any, *, source: str) -> Optional[Sequence[Any]]:
+        return self._register_records(
+            payload,
+            record_type="order",
+            id_fields=("order_id", "id", "client_order_id"),
+            seen=self._seen_order_ids,
+            cache=self._orders_cache,
+            counts=self._order_source_counts,
+            source=source,
+        )
+
+    def _register_fills(self, payload: Any, *, source: str) -> Optional[Sequence[Any]]:
+        return self._register_records(
+            payload,
+            record_type="fill",
+            id_fields=("fill_id", "execution_id", "trade_id", "id"),
+            seen=self._seen_fill_ids,
+            cache=self._fills_cache,
+            counts=self._fill_source_counts,
+            source=source,
+        )
+
+    def _register_records(
+        self,
+        payload: Any,
+        *,
+        record_type: str,
+        id_fields: Sequence[str],
+        seen: set[str],
+        cache: list[Any],
+        counts: MutableMapping[str, int],
+        source: str,
+    ) -> Optional[Sequence[Any]]:
+        sequence = self._coerce_sequence(payload)
+        if sequence is None:
+            return None
+
+        unique_records: list[Any] = []
+        for record in sequence:
+            identifier = self._extract_identifier(record, id_fields)
+            if identifier is not None:
+                if identifier in seen:
+                    LOGGER.debug(
+                        "Skipping duplicate %s %s from %s stage",
+                        record_type,
+                        identifier,
+                        source,
+                    )
+                    continue
+                seen.add(identifier)
+            unique_records.append(record)
+
+        if not unique_records:
+            return []
+
+        cache.extend(unique_records)
+        counts[source] += len(unique_records)
+        return unique_records
+
+    def _coerce_sequence(self, payload: Any) -> Optional[list[Any]]:
+        if payload is None:
+            return None
+        if isinstance(payload, list):
+            return payload
+        if isinstance(payload, tuple):
+            return list(payload)
+        if isinstance(payload, set):
+            return list(payload)
+        if isinstance(payload, Mapping):
+            return list(payload.values())
+        if isinstance(payload, Iterable) and not isinstance(payload, (str, bytes)):
+            return list(payload)
+        return [payload]
+
+    def _extract_identifier(self, record: Any, id_fields: Sequence[str]) -> Optional[str]:
+        if isinstance(record, Mapping):
+            for field in id_fields:
+                if field in record and record[field] is not None:
+                    return str(record[field])
+        for field in id_fields:
+            value = getattr(record, field, None)
+            if value is not None:
+                return str(value)
+        return None
 
     def _wrap_loader(
         self,

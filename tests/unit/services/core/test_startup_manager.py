@@ -8,7 +8,7 @@ import types
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Mapping
+from typing import Any, Mapping
 
 import pytest
 import sqlalchemy as sa
@@ -116,6 +116,8 @@ async def _exercise_cold_start() -> None:
     assert status["synced"] is True
     assert status["offsets"]["last_offset"] == 5
     assert status["offsets"]["sources"] == {"events:0": 5}
+    assert status["dedupe"]["orders"]["total"] == 0
+    assert status["dedupe"]["fills"]["total"] == 0
 
     persisted = await store.read_state()
     assert persisted["startup_mode"] == "cold"
@@ -167,8 +169,85 @@ async def _exercise_warm_restart() -> None:
     assert status["synced"] is True
     assert status["offsets"]["last_offset"] == 6
     assert status["offsets"]["sources"] == {"events:0": 4, "events:1": 6}
+    assert status["dedupe"]["orders"]["total"] == 0
+    assert status["dedupe"]["fills"]["total"] == 0
 
     persisted = await store.read_state()
     assert persisted["startup_mode"] == "warm"
     assert persisted["last_offset"] == 6
     assert persisted["offsets"] == {"events:0": 4, "events:1": 6}
+
+
+def test_duplicate_protection_tracks_unique_orders_and_fills() -> None:
+    asyncio.run(_exercise_duplicate_protection())
+
+
+async def _exercise_duplicate_protection() -> None:
+    balance_calls: list[str] = []
+
+    async def balance_loader() -> None:
+        balance_calls.append("balances")
+
+    async def order_loader() -> list[dict[str, str]]:
+        return [
+            {"order_id": "A"},
+            {"order_id": "A"},
+            {"order_id": "B"},
+        ]
+
+    async def replay_handler(offsets: Mapping[str, int]) -> Mapping[str, Any]:
+        base = dict(offsets)
+        base.setdefault("events:0", 0)
+        return {
+            "offsets": {"events:0": base["events:0"] + 1},
+            "orders": [
+                {"order_id": "B"},
+                {"order_id": "C"},
+            ],
+            "fills": [
+                {"fill_id": "F1"},
+                {"fill_id": "F1"},
+                {"fill_id": "F2"},
+            ],
+        }
+
+    async def reconcile_runner() -> None:
+        return None
+
+    manager = StartupManager(
+        balance_loader=balance_loader,
+        order_loader=order_loader,
+        reconcile_runner=reconcile_runner,
+        kafka_replay_handler=replay_handler,
+    )
+
+    mode = await manager.start()
+    assert mode is StartupMode.COLD
+    assert balance_calls == ["balances"]
+
+    status = await manager.status()
+    assert status["dedupe"]["orders"]["total"] == 3
+    assert status["dedupe"]["fills"]["total"] == 2
+    assert status["dedupe"]["orders"]["sources"]["bootstrap"] == 2
+    assert status["dedupe"]["orders"]["sources"]["replay"] == 1
+    assert status["dedupe"]["fills"]["sources"]["replay"] == 2
+
+
+def test_startup_status_endpoint_reports_manager_state() -> None:
+    asyncio.run(_exercise_status_endpoint())
+
+
+async def _exercise_status_endpoint() -> None:
+    manager = StartupManager()
+    await manager.start(StartupMode.COLD)
+
+    app = _MODULE.FastAPI()  # type: ignore[attr-defined]
+    _MODULE.register(app, manager)
+
+    try:
+        response = await _MODULE.startup_status()
+    finally:
+        setattr(_MODULE, "_MANAGER", None)
+
+    assert response["mode"] == "cold"
+    assert response["synced"] is True
