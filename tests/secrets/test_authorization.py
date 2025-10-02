@@ -6,12 +6,14 @@ import base64
 import importlib
 import sys
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 import pytest
 
 fastapi = pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
+
+import httpx
 
 
 @dataclass
@@ -42,6 +44,8 @@ def secrets_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     monkeypatch.setenv("SECRET_ENCRYPTION_KEY", base64.b64encode(b"a" * 32).decode())
     monkeypatch.setenv("KRAKEN_SECRETS_ALLOWED_ADMINS", "admin@example.com")
     monkeypatch.setenv("KRAKEN_SECRETS_SERVICE_TOKENS", "service-token-123")
+    monkeypatch.setenv("SECRETS_SERVICE_AUTH_TOKENS", "service-token-123")
+    monkeypatch.setenv("KRAKEN_SECRETS_AUTH_TOKENS", "service-token-123:svc")
 
     import kubernetes.config as k8s_config
 
@@ -52,6 +56,14 @@ def secrets_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
         module = importlib.reload(sys.modules["secrets_service"])
     else:
         module = importlib.import_module("secrets_service")
+
+    settings = module.Settings(
+        SECRET_ENCRYPTION_KEY=base64.b64encode(b"a" * 32).decode(),
+        SECRETS_SERVICE_AUTH_TOKENS="service-token-123",
+        authorized_token_labels={"service-token-123": "svc"},
+    )
+    module.SETTINGS = settings
+    module.STATE.settings = settings
 
     fake_manager = _FakeSecretManager()
     module.app.dependency_overrides[module.get_secret_manager] = lambda: fake_manager
@@ -82,7 +94,7 @@ def test_store_secret_allows_authorized_admin(secrets_client: TestClient) -> Non
     response = secrets_client.post(
         "/secrets/kraken",
         json={"account_id": "acct", "api_key": "key", "api_secret": "secret"},
-        headers={"X-Admin-ID": "admin@example.com"},
+        headers={"X-Admin-ID": "admin@example.com", "Authorization": "Bearer service-token-123"},
     )
 
     assert response.status_code == 201
@@ -130,3 +142,71 @@ def test_test_endpoint_allows_service_token(secrets_client: TestClient) -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["result"] == "success"
+
+
+def test_store_secret_validates_credentials(secrets_client: TestClient) -> None:
+    module = secrets_client._secrets_module  # type: ignore[attr-defined]
+    manager = secrets_client._fake_manager  # type: ignore[attr-defined]
+    manager.last_upsert = None
+
+    async def _successful_balance(*args: Tuple[Any, ...], **kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        _successful_balance.calls.append((args, kwargs))
+        return {"error": [], "result": {}}
+
+    _successful_balance.calls = []  # type: ignore[attr-defined]
+    module.kraken_get_balance = _successful_balance  # type: ignore[attr-defined]
+
+    response = secrets_client.post(
+        "/secrets/kraken",
+        json={"account_id": "acct", "api_key": "key", "api_secret": "secret"},
+        headers={"Authorization": "Bearer service-token-123"},
+    )
+
+    assert response.status_code == 201
+    assert manager.last_upsert is not None
+    assert _successful_balance.calls  # type: ignore[attr-defined]
+
+
+def test_store_secret_rejects_invalid_credentials(secrets_client: TestClient) -> None:
+    module = secrets_client._secrets_module  # type: ignore[attr-defined]
+    manager = secrets_client._fake_manager  # type: ignore[attr-defined]
+    manager.last_upsert = None
+
+    async def _invalid_balance(*_: Any, **__: Any) -> Dict[str, Any]:
+        return {"error": ["EAPI:Invalid key"], "result": {}}
+
+    module.kraken_get_balance = _invalid_balance  # type: ignore[attr-defined]
+
+    response = secrets_client.post(
+        "/secrets/kraken",
+        json={"account_id": "acct", "api_key": "key", "api_secret": "secret"},
+        headers={"Authorization": "Bearer service-token-123"},
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid Kraken credentials"
+    assert manager.last_upsert is None
+
+
+def test_store_secret_handles_kraken_errors(secrets_client: TestClient) -> None:
+    module = secrets_client._secrets_module  # type: ignore[attr-defined]
+    manager = secrets_client._fake_manager  # type: ignore[attr-defined]
+    manager.last_upsert = None
+
+    request = httpx.Request("POST", "https://api.kraken.test/0/private/Balance")
+    response = httpx.Response(500, request=request)
+
+    async def _error_balance(*_: Any, **__: Any) -> Dict[str, Any]:
+        raise httpx.HTTPStatusError("error", request=request, response=response)
+
+    module.kraken_get_balance = _error_balance  # type: ignore[attr-defined]
+
+    response_http = secrets_client.post(
+        "/secrets/kraken",
+        json={"account_id": "acct", "api_key": "key", "api_secret": "secret"},
+        headers={"Authorization": "Bearer service-token-123"},
+    )
+
+    assert response_http.status_code == 502
+    assert response_http.json()["detail"] == "Kraken API responded with an error"
+    assert manager.last_upsert is None
