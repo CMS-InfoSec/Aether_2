@@ -17,10 +17,12 @@ Provide a standardized procedure for rotating the AES encryption key that protec
 2. Copy the value into a password manager entry for audit purposes.
 
 ## Update the Kubernetes Secret
+
 1. Export the previously generated key into an environment variable without exposing it in shell history. If you stored it in
    `/tmp/secrets-service.aes`, run:
    ```bash
    export SECRET_ENCRYPTION_KEY="$(tr -d '\n' < /tmp/secrets-service.aes)"
+
    ```
    If the key was copied into a password manager, retrieve it from there instead of regenerating a new value.
 2. Create an updated secret manifest locally. If the cluster uses Sealed Secrets, run:
