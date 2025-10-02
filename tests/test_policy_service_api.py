@@ -10,6 +10,8 @@ from typing import List
 
 
 import pytest
+
+pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
 if "metrics" not in sys.modules:
@@ -43,7 +45,10 @@ def _client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
 
     monkeypatch.setattr(policy_service.EXCHANGE_ADAPTER, "place_order", _noop_place_order)
     monkeypatch.setattr(policy_service.EXCHANGE_ADAPTER, "supports", lambda op: True)
-    return TestClient(policy_service.app)
+    policy_service.app.dependency_overrides[policy_service.require_admin_account] = lambda: "company"
+    with TestClient(policy_service.app) as client:
+        yield client
+    policy_service.app.dependency_overrides.pop(policy_service.require_admin_account, None)
 
 
 
@@ -110,9 +115,18 @@ def test_policy_decide_approves_when_edge_beats_costs(
     )
 
     async def _fake_dispatch(
-        request_obj: PolicyDecisionRequest, response_obj: PolicyDecisionResponse
+        request_obj: PolicyDecisionRequest,
+        response_obj: PolicyDecisionResponse,
+        *,
+        actor: str | None = None,
     ) -> None:
-        dispatched.append({"order_id": request_obj.order_id, "approved": response_obj.approved})
+        dispatched.append(
+            {
+                "order_id": request_obj.order_id,
+                "approved": response_obj.approved,
+                "actor": actor,
+            }
+        )
 
     monkeypatch.setattr(policy_service, "_dispatch_shadow_orders", _fake_dispatch)
 
@@ -173,7 +187,9 @@ def test_policy_decide_approves_when_edge_beats_costs(
             "notional": pytest.approx(expected_notional),
         },
     ]
-    assert dispatched == [{"order_id": "abc-123", "approved": True}]
+    assert dispatched == [
+        {"order_id": "abc-123", "approved": True, "actor": "company"}
+    ]
 
 
 def test_policy_decide_rejects_when_slippage_erodes_edge(
@@ -278,6 +294,30 @@ def test_policy_decide_rejects_unknown_account(monkeypatch: pytest.MonkeyPatch, 
     assert response.status_code == 422
 
 
+def test_policy_decide_requires_authorization(client: TestClient) -> None:
+    def _reject() -> str:
+        raise policy_service.HTTPException(status_code=401, detail="unauthorized")
+
+    client.app.dependency_overrides[policy_service.require_admin_account] = _reject
+    try:
+        payload = {
+            "account_id": "company",
+            "order_id": "unauth-1",
+            "instrument": "BTC-USD",
+            "side": "BUY",
+            "quantity": 0.25,
+            "price": 25000.0,
+            "fee": {"currency": "USD", "maker": 4.0, "taker": 6.0},
+            "features": [0.1, 0.2],
+            "book_snapshot": {"mid_price": 25010.0, "spread_bps": 4.0, "imbalance": -0.2},
+        }
+
+        response = client.post("/policy/decide", json=payload)
+        assert response.status_code == 401
+    finally:
+        client.app.dependency_overrides[policy_service.require_admin_account] = lambda: "company"
+
+
 def test_policy_decide_rejects_when_costs_exceed_edge(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
@@ -328,6 +368,7 @@ async def test_dispatch_shadow_orders_invokes_shadow_copy(
         response_obj: PolicyDecisionResponse,
         *,
         shadow: bool,
+        actor: str | None = None,
     ) -> None:
         submitted.append({
             "shadow": shadow,

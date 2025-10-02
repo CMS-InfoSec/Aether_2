@@ -16,7 +16,7 @@ from threading import Lock
 from typing import TYPE_CHECKING, Dict, List, MutableMapping, Sequence
 
 import httpx
-from fastapi import FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, status
 
 
 from services.common.schemas import (
@@ -35,7 +35,7 @@ from ml.policy.fallback_policy import FallbackDecision, FallbackPolicy
 
 from exchange_adapter import get_exchange_adapter, get_exchange_adapters_status
 from metrics import record_abstention_rate, record_drift_score, setup_metrics
-from services.common.security import ADMIN_ACCOUNTS
+from services.common.security import ADMIN_ACCOUNTS, require_admin_account
 from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
 
 
@@ -557,7 +557,16 @@ async def get_regime(symbol: str) -> Dict[str, float | int | str]:
     status_code=status.HTTP_200_OK,
 )
 
-async def decide_policy(request: PolicyDecisionRequest) -> PolicyDecisionResponse:
+async def decide_policy(
+    request: PolicyDecisionRequest,
+    caller_account: str = Depends(require_admin_account),
+) -> PolicyDecisionResponse:
+    logger.info(
+        "Policy decision requested by %s for order %s on account %s",
+        caller_account,
+        request.order_id,
+        request.account_id,
+    )
     precision = _resolve_precision(request.instrument)
     snapped_price = _snap(request.price, precision["tick"])
     snapped_qty = _snap(request.quantity, precision["lot"])
@@ -636,7 +645,11 @@ async def decide_policy(request: PolicyDecisionRequest) -> PolicyDecisionRespons
         duration = time.monotonic() - activation_start
         fallback_policy.log_activation(reason=fallback_reason, duration=duration)
 
-        await _dispatch_shadow_orders(fallback_decision.request, fallback_decision.response)
+        await _dispatch_shadow_orders(
+            fallback_decision.request,
+            fallback_decision.response,
+            actor=caller_account,
+        )
         return fallback_decision.response
 
     notional = float(Decimal(str(snapped_price)) * Decimal(str(snapped_qty)))
@@ -797,30 +810,34 @@ async def decide_policy(request: PolicyDecisionRequest) -> PolicyDecisionRespons
         stop_loss_bps=round(float(stop_loss), 4),
     )
 
-    await _dispatch_shadow_orders(request, response)
+    await _dispatch_shadow_orders(request, response, actor=caller_account)
 
     return response
 
 
 async def _dispatch_shadow_orders(
-    request: PolicyDecisionRequest, response: PolicyDecisionResponse
+    request: PolicyDecisionRequest,
+    response: PolicyDecisionResponse,
+    *,
+    actor: str | None = None,
 ) -> None:
     """Submit the primary execution as well as the paper shadow copy."""
 
     if not response.approved or response.selected_action.lower() == "abstain":
         return
 
-    await _submit_execution(request, response, shadow=False)
+    await _submit_execution(request, response, shadow=False, actor=actor)
 
     if not ENABLE_SHADOW_EXECUTION:
         return
 
     try:
-        await _submit_execution(request, response, shadow=True)
+        await _submit_execution(request, response, shadow=True, actor=actor)
     except Exception as exc:  # pragma: no cover - best-effort shadow dispatch
         logger.warning(
-            "Shadow execution submission failed for order %s: %s",
+            "Shadow execution submission failed for order %s requested by %s: %s",
             request.order_id,
+            actor or "unknown",
             exc,
         )
 
@@ -830,6 +847,7 @@ async def _submit_execution(
     response: PolicyDecisionResponse,
     *,
     shadow: bool,
+    actor: str | None = None,
 ) -> None:
     """Submit the execution payload to the configured OMS endpoint."""
 
@@ -856,6 +874,8 @@ async def _submit_execution(
     }
     if order_type == "limit":
         payload["limit_px"] = snapped_price
+    if actor:
+        payload["requested_by"] = actor
 
     if not EXCHANGE_ADAPTER.supports("place_order"):
         raise RuntimeError(
@@ -868,8 +888,9 @@ async def _submit_execution(
         if shadow:
             raise
         logger.error(
-            "Primary OMS submission failed for order %s: %s",
+            "Primary OMS submission failed for order %s requested by %s: %s",
             request.order_id,
+            actor or "unknown",
             exc,
         )
         raise

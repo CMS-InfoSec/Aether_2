@@ -6,6 +6,11 @@ This runbook outlines the steps to follow when the policy evaluation latency SLO
 - [ ] Confirm the `policy_latency_p95_slo_breach` alert in Prometheus.
 - [ ] Review the `Trading Latency Percentiles` Grafana dashboard for the affected symbol/account pair.
 - [ ] Check the policy service autoscaling status and recent deploys.
+- [ ] Ensure callers include a valid `Authorization: Bearer <session-token>` header issued to an admin account when invoking `/policy/decide`.
+
+## Authentication Requirements
+
+All operator- and service-initiated calls to `/policy/decide` must include an `Authorization` header bearing an administrator session token. Requests without this credential are rejected with `401 Unauthorized`. When triaging incidents, confirm that upstream services (sequencer, orchestrator, manual tools) are propagating the admin session token in the `Authorization` header.
 
 ## Diagnostic Steps
 1. **Validate Input Load**
