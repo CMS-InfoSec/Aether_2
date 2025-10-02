@@ -2083,16 +2083,16 @@ class AccountContext:
 
         direction = Decimal("1") if normalized_side == "buy" else Decimal("-1")
         impact_ratio = (avg_price - mid_px) / mid_px
-        impact_bps = float((impact_ratio * direction * Decimal("10000")))
+        impact_bps = impact_ratio * direction * Decimal("10000")
 
         await self._impact_store.record_fill(
             account_id=self.account_id,
             client_order_id=record.client_id,
             symbol=record.symbol,
             side=record.side,
-            filled_qty=float(filled_qty),
-            avg_price=float(avg_price),
-            pre_trade_mid=float(mid_px),
+            filled_qty=filled_qty,
+            avg_price=avg_price,
+            pre_trade_mid=mid_px,
             impact_bps=impact_bps,
             recorded_at=datetime.now(timezone.utc),
         )
