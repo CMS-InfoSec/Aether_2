@@ -927,6 +927,244 @@ def test_policy_risk_oms_flow_emits_hashed_audit_and_metrics(
 
 
 @pytest.mark.integration
+def test_pipeline_handles_flash_crash_and_feed_outage(
+    monkeypatch: pytest.MonkeyPatch,
+    kraken_mock_server: MockKrakenServer,
+) -> None:
+    """Exercise a full policy → risk → OMS loop under shock conditions."""
+
+    TimescaleAdapter.reset()
+    KafkaNATSAdapter.reset()
+    safe_mode.controller.reset()
+    safe_mode.clear_safe_mode_log()
+
+    metrics_module.init_metrics("sequencer")
+
+    account_id = "company"
+    symbol = "BTC-USD"
+    features = [0.11, 0.27, 0.38]
+
+    policy_client = TestClient(policy_service.app)
+    risk_http_client = TestClient(risk_service.app)
+    fees_client = TestClient(fees_app)
+
+    confidence = factories.confidence(overall_confidence=0.9)
+    intent_stub = policy_service.Intent(
+        edge_bps=44.0,
+        confidence=confidence,
+        take_profit_bps=55.0,
+        stop_loss_bps=20.0,
+        selected_action="maker",
+        action_templates=list(factories.action_templates()),
+        approved=True,
+        reason=None,
+    )
+
+    monkeypatch.setattr(policy_service, "predict_intent", lambda **_: intent_stub)
+    policy_service.ENABLE_SHADOW_EXECUTION = False
+
+    async def fake_fetch_effective_fee(
+        account: str, pair: str, liquidity: str, notional: float
+    ) -> float:
+        response = fees_client.get(
+            "/fees/effective",
+            params={
+                "pair": pair,
+                "liquidity": liquidity,
+                "notional": f"{max(notional, 0.0):.8f}",
+            },
+            headers={"X-Account-ID": account},
+        )
+        response.raise_for_status()
+        return float(response.json()["bps"])
+
+    async def noop_submit_execution(*_: Any, **__: Any) -> None:
+        return None
+
+    monkeypatch.setattr(policy_service, "_fetch_effective_fee", fake_fetch_effective_fee)
+    monkeypatch.setattr(policy_service, "_submit_execution", noop_submit_execution)
+
+    class _Limits:
+        def __init__(self) -> None:
+            self.account_id = account_id
+            self.max_daily_loss = 250_000.0
+            self.fee_budget = 50_000.0
+            self.max_nav_pct_per_trade = 0.35
+            self.notional_cap = 5_000_000.0
+            self.cooldown_minutes = 0
+
+    async def fake_evaluate(context: risk_service.RiskEvaluationContext) -> risk_service.RiskValidationResponse:
+        return risk_service.RiskValidationResponse(pass_=True, reasons=[])
+
+    monkeypatch.setattr(risk_service, "_load_account_limits", lambda _: _Limits())
+    monkeypatch.setattr(risk_service, "_evaluate", fake_evaluate)
+    monkeypatch.setattr(risk_service, "_refresh_usage_from_fills", lambda *_, **__: None)
+
+    audit_store = AuditLogStore()
+    audit_logger = TimescaleAuditLogger(audit_store)
+    recorder = SensitiveActionRecorder(audit_logger)
+
+    pnl_tracker = TrackingPnLTracker(recorder=recorder, account_id=account_id)
+    risk_client = HttpRiskServiceClient(client=risk_http_client, risk_module=risk_service)
+    oms_client = MockOMSClient(server=kraken_mock_server)
+
+    sequencer = TradingSequencer(
+        risk_service=risk_client,
+        oms=oms_client,
+        pnl_tracker=pnl_tracker,
+    )
+
+    def _submit_intent(
+        *,
+        order_id: str,
+        side: str,
+        price: float,
+        adjustment: float | None = None,
+    ) -> tuple[IntentEvent, PolicyDecisionResponse]:
+        decision_request = factories.policy_decision_request(
+            account_id=account_id,
+            order_id=order_id,
+            instrument=symbol,
+            side=side.upper(),
+            quantity=0.5,
+            price=price,
+            features=list(features),
+        )
+        response = policy_client.post(
+            "/policy/decide",
+            json=decision_request.model_dump(mode="json"),
+            headers={"X-Account-ID": account_id},
+        )
+        response.raise_for_status()
+        decision = PolicyDecisionResponse.model_validate(response.json())
+        assert decision.approved is True
+
+        raw_intent = {
+            "account_id": account_id,
+            "order_id": order_id,
+            "instrument": symbol,
+            "symbol": symbol,
+            "side": side.lower(),
+            "quantity": decision_request.quantity,
+            "price": price,
+            "features": list(features),
+            "selected_action": decision.selected_action,
+        }
+
+        event = IntentEvent(
+            account_id=account_id,
+            symbol=symbol,
+            intent=raw_intent,
+            ts=datetime.now(timezone.utc),
+        )
+        pnl_tracker.register_intent(event)
+        if adjustment is not None:
+            pnl_tracker._context[event.symbol]["entry_price"] = adjustment  # noqa: SLF001
+        return event, decision
+
+    def _process(event: IntentEvent):
+        async def _run():
+            return await sequencer.process_intent(event)
+
+        return asyncio.run(_run())
+
+    # ------------------------------------------------------------------
+    # Happy path execution
+    # ------------------------------------------------------------------
+    initial_event, _ = _submit_intent(order_id="CRASH-INIT", side="buy", price=30_050.0)
+    initial_result = _process(initial_event)
+
+    assert initial_result.status == "filled"
+    assert initial_result.correlation_id
+
+    first_fills = list(initial_result.fills)
+    assert first_fills and first_fills[0]["details"]["price"] > 0.0
+
+    kafka_history = KafkaNATSAdapter(account_id=account_id).history(initial_result.correlation_id)
+    assert kafka_history
+    assert {entry["topic"] for entry in kafka_history} >= {
+        "sequencer.intent",
+        "sequencer.decision",
+        "sequencer.order",
+        "sequencer.fill",
+        "sequencer.update",
+    }
+    assert all(entry["correlation_id"] == initial_result.correlation_id for entry in kafka_history)
+
+    assert risk_client.validations
+    assert risk_client.validations[-1]["correlation_id"] == initial_result.correlation_id
+    assert oms_client.orders and oms_client.orders[-1]["correlation_id"] == initial_result.correlation_id
+    assert pnl_tracker.records and pnl_tracker.records[-1]["correlation_id"] == initial_result.correlation_id
+
+    account_adapter = TimescaleAdapter(account_id=account_id)
+    fills_payload = account_adapter.events()["fills"]
+    assert fills_payload and fills_payload[-1]["pnl"] >= 0.0
+
+    # ------------------------------------------------------------------
+    # Flash crash simulation – drastic price shock produces losses
+    # ------------------------------------------------------------------
+    kraken_mock_server.config.base_price = 25_000.0
+    crash_event, _ = _submit_intent(
+        order_id="CRASH-SELL",
+        side="sell",
+        price=24_900.0,
+        adjustment=30_050.0,
+    )
+    crash_result = _process(crash_event)
+
+    assert crash_result.status == "filled"
+    assert crash_result.correlation_id != initial_result.correlation_id
+
+    crash_fills = list(crash_result.fills)
+    assert crash_fills
+
+    loss_record = pnl_tracker.records[-1]
+    assert loss_record["correlation_id"] == crash_result.correlation_id
+    assert loss_record["pnl"] < 0.0
+
+    usage = account_adapter.get_daily_usage()
+    assert usage["loss"] > 0.0
+
+    crash_history = KafkaNATSAdapter(account_id=account_id).history(crash_result.correlation_id)
+    assert crash_history and {entry["topic"] for entry in crash_history} >= {
+        "sequencer.intent",
+        "sequencer.decision",
+        "sequencer.order",
+        "sequencer.fill",
+        "sequencer.update",
+    }
+
+    # ------------------------------------------------------------------
+    # Feed outage simulation – OMS raises and sequencer surfaces error
+    # ------------------------------------------------------------------
+    kraken_mock_server.schedule_error(
+        "add_order",
+        ConnectionError("mock kraken market data unavailable"),
+    )
+    outage_event, _ = _submit_intent(order_id="CRASH-OUTAGE", side="buy", price=30_020.0)
+
+    with pytest.raises(ConnectionError):
+        _process(outage_event)
+
+    history = KafkaNATSAdapter(account_id=account_id).history()
+    error_events = [entry for entry in history if entry["topic"] == "sequencer.error"]
+    assert error_events
+    outage_record = error_events[-1]
+    outage_correlation = outage_record["correlation_id"]
+    assert outage_correlation
+
+    correlated = KafkaNATSAdapter(account_id=account_id).history(outage_correlation)
+    topics = [entry["topic"] for entry in correlated]
+    assert topics[0] == "sequencer.intent"
+    assert topics[-1] == "sequencer.error"
+    assert outage_record["payload"]["error"].startswith("mock kraken")
+
+    audit_entries = list(audit_store.all())
+    assert audit_entries
+    assert all(entry.correlation_id for entry in audit_entries)
+
+
+@pytest.mark.integration
 def test_trading_sequencer_lifecycle_preserves_correlation_and_audit_chain(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
