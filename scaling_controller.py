@@ -325,6 +325,9 @@ class ScalingController:
         oms_scaler: OmsDeploymentScaler,
         gpu_manager: LinodeGPUManager | NullGPUManager,
         oms_scale_threshold: float = 500.0,
+        oms_downscale_threshold: float | None = None,
+        downscale_stabilization: timedelta = timedelta(minutes=15),
+        min_oms_replicas: int = 1,
         check_interval: float = 60.0,
         gpu_idle_timeout: timedelta = timedelta(hours=1),
     ) -> None:
@@ -334,6 +337,11 @@ class ScalingController:
         self._oms_scaler = oms_scaler
         self._gpu_manager = gpu_manager
         self._threshold = max(oms_scale_threshold, 0.0)
+        if oms_downscale_threshold is None:
+            oms_downscale_threshold = self._threshold * 0.5
+        self._downscale_threshold = max(float(oms_downscale_threshold), 0.0)
+        self._downscale_stabilization = max(downscale_stabilization, timedelta())
+        self._min_replicas = max(int(min_oms_replicas), 0)
         self._check_interval = max(check_interval, 5.0)
         self._gpu_idle_timeout = max(gpu_idle_timeout, timedelta(minutes=5))
 
@@ -341,6 +349,7 @@ class ScalingController:
         self._task: Optional[asyncio.Task[None]] = None
         self._lock = asyncio.Lock()
         self._last_gpu_activity: datetime | None = None
+        self._low_throughput_since: datetime | None = None
 
     async def start(self) -> None:
         if self._task is None or self._task.done():
@@ -379,9 +388,18 @@ class ScalingController:
                 pending_jobs,
             )
 
-            replicas = await self._oms_scaler.get_replicas()
+            current_replicas = await self._oms_scaler.get_replicas()
+            replicas = max(current_replicas, self._min_replicas)
+            if replicas != current_replicas:
+                logger.info(
+                    "Observed OMS replicas %s below minimum %s; scaling up to maintain floor",
+                    current_replicas,
+                    self._min_replicas,
+                )
+                await self._oms_scaler.scale_to(replicas)
+
             if throughput > self._threshold:
-                desired = replicas + 1
+                desired = max(replicas + 1, self._min_replicas)
                 logger.info(
                     "OMS throughput %.2f orders/min above threshold %.2f, scaling replicas %s -> %s",
                     throughput,
@@ -391,6 +409,33 @@ class ScalingController:
                 )
                 await self._oms_scaler.scale_to(desired)
                 replicas = desired
+                self._low_throughput_since = None
+            else:
+                if throughput < self._downscale_threshold:
+                    if self._low_throughput_since is None:
+                        self._low_throughput_since = now
+                    low_duration = now - self._low_throughput_since
+                    if low_duration >= self._downscale_stabilization:
+                        desired = max(replicas - 1, self._min_replicas)
+                        if desired < replicas:
+                            logger.info(
+                                "OMS throughput %.2f orders/min below downscale threshold %.2f for %s, scaling replicas %s -> %s",
+                                throughput,
+                                self._downscale_threshold,
+                                low_duration,
+                                replicas,
+                                desired,
+                            )
+                            await self._oms_scaler.scale_to(desired)
+                            replicas = desired
+                        else:
+                            logger.debug(
+                                "Low throughput persisted but replicas already at minimum floor %s",
+                                self._min_replicas,
+                            )
+                        self._low_throughput_since = now
+                else:
+                    self._low_throughput_since = None
 
             gpu_nodes = list(await self._gpu_manager.list_gpu_nodes())
             if pending_jobs > 0:
@@ -522,7 +567,10 @@ def build_scaling_controller_from_env() -> ScalingController:
 
     namespace = os.getenv("OMS_DEPLOYMENT_NAMESPACE", "aether")
     deployment_name = os.getenv("OMS_DEPLOYMENT_NAME", "oms-service")
-    fallback_replicas = int(os.getenv("OMS_REPLICA_FALLBACK", "1"))
+    try:
+        fallback_replicas = int(os.getenv("OMS_REPLICA_FALLBACK", "1"))
+    except ValueError:
+        fallback_replicas = 1
     oms_scaler = OmsDeploymentScaler(
         namespace=namespace,
         deployment=deployment_name,
@@ -547,9 +595,31 @@ def build_scaling_controller_from_env() -> ScalingController:
         gpu_manager = NullGPUManager(default_count=linode_node_count)
         logger.info("Linode credentials missing; using simulated GPU manager")
 
-    oms_threshold = float(os.getenv("OMS_THROUGHPUT_THRESHOLD", "500"))
-    check_interval = float(os.getenv("SCALING_CHECK_INTERVAL", "60"))
-    gpu_idle_seconds = float(os.getenv("GPU_IDLE_TIMEOUT", str(60 * 60)))
+    try:
+        oms_threshold = float(os.getenv("OMS_THROUGHPUT_THRESHOLD", "500"))
+    except ValueError:
+        oms_threshold = 500.0
+    downscale_threshold_env = os.getenv("OMS_DOWNSCALE_THRESHOLD")
+    try:
+        downscale_threshold = float(downscale_threshold_env) if downscale_threshold_env is not None else None
+    except ValueError:
+        downscale_threshold = None
+    try:
+        downscale_stabilization_seconds = float(os.getenv("OMS_DOWNSCALE_STABILIZATION_SECONDS", str(15 * 60)))
+    except ValueError:
+        downscale_stabilization_seconds = float(15 * 60)
+    try:
+        min_replicas = int(os.getenv("OMS_MIN_REPLICAS", str(max(fallback_replicas, 1))))
+    except ValueError:
+        min_replicas = max(fallback_replicas, 1)
+    try:
+        check_interval = float(os.getenv("SCALING_CHECK_INTERVAL", "60"))
+    except ValueError:
+        check_interval = 60.0
+    try:
+        gpu_idle_seconds = float(os.getenv("GPU_IDLE_TIMEOUT", str(60 * 60)))
+    except ValueError:
+        gpu_idle_seconds = float(60 * 60)
 
     controller = ScalingController(
         throughput_getter=throughput_getter,
@@ -558,6 +628,9 @@ def build_scaling_controller_from_env() -> ScalingController:
         oms_scaler=oms_scaler,
         gpu_manager=gpu_manager,
         oms_scale_threshold=oms_threshold,
+        oms_downscale_threshold=downscale_threshold,
+        downscale_stabilization=timedelta(seconds=downscale_stabilization_seconds),
+        min_oms_replicas=min_replicas,
         check_interval=check_interval,
         gpu_idle_timeout=timedelta(seconds=gpu_idle_seconds),
     )
