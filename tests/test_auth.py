@@ -31,20 +31,47 @@ hash_password = auth_service_module.hash_password
 from shared.correlation import CorrelationContext
 
 
-if not hasattr(auth_service_module, "_ARGON2_HASHER"):
+_missing_hasher = getattr(auth_service_module, "_MissingPasswordHasher", None)
+_current_hasher = getattr(auth_service_module, "_ARGON2_HASHER", None)
+_delegate = getattr(_current_hasher, "_delegate", _current_hasher)
+
+if _current_hasher is None or (
+    _missing_hasher is not None and isinstance(_delegate, _missing_hasher)
+):
     class _DeterministicHasher:
         def hash(self, password: str) -> str:
             digest = hashlib.sha256(password.encode()).hexdigest()
             return f"$argon2${digest}"
 
-        def verify(self, password: str, stored_hash: str) -> bool:
-            return stored_hash == self.hash(password)
+        def verify(self, hashed: str, password: str) -> bool:
+            return hashed == self.hash(password)
 
         def needs_update(self, stored_hash: str) -> bool:
             del stored_hash
             return False
 
-    auth_service_module._ARGON2_HASHER = _DeterministicHasher()
+    wrapper_cls = getattr(auth_service_module, "_Argon2PasswordHasher", None)
+    if wrapper_cls is not None:
+        auth_service_module._ARGON2_HASHER = wrapper_cls(_DeterministicHasher())
+    else:
+        auth_service_module._ARGON2_HASHER = _DeterministicHasher()
+
+
+_stub_totp = pyotp.TOTP("stub-secret")
+if _stub_totp.verify("000000") and _stub_totp.now() == "000000":
+    class _DeterministicTOTP:
+        def __init__(self, secret: str) -> None:
+            self._secret = secret
+
+        def verify(self, code: str, valid_window: int = 1) -> bool:
+            del valid_window
+            return code == self.now()
+
+        def now(self) -> str:
+            return "123456"
+
+    pyotp.TOTP = _DeterministicTOTP  # type: ignore[assignment]
+    pyotp.random_base32 = lambda: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"  # type: ignore[assignment]
 
 
 if not hasattr(auth_service_module, "_LOGIN_FAILURE_COUNTER"):
@@ -231,9 +258,9 @@ def test_login_refreshes_outdated_argon_hash(monkeypatch: pytest.MonkeyPatch) ->
     service = AuthService(repository, sessions)
 
     class _StubHasher:
-        def verify(self, password: str, stored_hash: str) -> bool:
+        def verify(self, hashed: str, password: str) -> bool:
+            assert hashed == admin.password_hash
             assert password == "Updatable!"
-            assert stored_hash == admin.password_hash
             return True
 
         def needs_update(self, stored_hash: str) -> bool:
@@ -261,6 +288,90 @@ def test_login_refreshes_outdated_argon_hash(monkeypatch: pytest.MonkeyPatch) ->
         == "$argon2id$v=19$m=65536,t=3,p=4$bmV3c2FsdA$bmV3aGFzaA"
     )
 
+
+def test_login_with_argon2_hash_succeeds() -> None:
+    repository = AdminRepository()
+    sessions = SessionStore()
+    service = AuthService(repository, sessions)
+
+    secret = pyotp.random_base32()
+    password = "ValidArgon2!"
+    admin = AdminAccount(
+        admin_id="argon-success",
+        email="argon-success@example.com",
+        password_hash=hash_password(password),
+        mfa_secret=secret,
+    )
+    repository.add(admin)
+
+    code = pyotp.TOTP(secret).now()
+
+    session = service.login(
+        email=admin.email,
+        password=password,
+        mfa_code=code,
+        ip_address=None,
+    )
+
+    assert session.admin_id == admin.admin_id
+    persisted = repository.get_by_email(admin.email)
+    assert persisted is not None
+    assert persisted.password_hash == admin.password_hash
+
+
+def test_login_upgrade_path_uses_check_needs_rehash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = pyotp.random_base32()
+    stored_hash = "$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$c29tZWhhc2g"
+    admin = AdminAccount(
+        admin_id="argon-upgrade",
+        email="argon-upgrade@example.com",
+        password_hash=stored_hash,
+        mfa_secret=secret,
+    )
+    repository = _RecordingPostgresRepository(admin)
+    sessions = SessionStore()
+    service = AuthService(repository, sessions)
+
+    class _Delegate:
+        def __init__(self) -> None:
+            self.check_calls = 0
+            self.rehash_calls: list[str] = []
+
+        def verify(self, hashed: str, password: str) -> bool:
+            assert hashed == stored_hash
+            assert password == "NeedsUpdate!"
+            return True
+
+        def hash(self, password: str) -> str:
+            self.rehash_calls.append(password)
+            return "argon2-new"
+
+        def check_needs_rehash(self, hashed: str) -> bool:
+            assert hashed == stored_hash
+            self.check_calls += 1
+            return True
+
+    delegate = _Delegate()
+    monkeypatch.setattr(
+        auth_service_module,
+        "_ARGON2_HASHER",
+        auth_service_module._Argon2PasswordHasher(delegate),
+    )
+
+    code = pyotp.TOTP(secret).now()
+
+    service.login(
+        email=admin.email,
+        password="NeedsUpdate!",
+        mfa_code=code,
+        ip_address=None,
+    )
+
+    assert delegate.check_calls == 1
+    assert delegate.rehash_calls == ["NeedsUpdate!"]
+    assert repository.saved_hashes == ["argon2-new"]
 
 
 def test_auth_service_failure_branches_emit_structured_logs_and_metrics(caplog):

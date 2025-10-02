@@ -13,7 +13,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Mapping, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+
+from services.common.security import require_admin_account
 
 
 def _optional_import(module_name: str) -> object | None:
@@ -306,7 +308,7 @@ def create_pack(
 
 
 @router.get("/export/latest")
-def latest_pack() -> Dict[str, object]:
+def latest_pack(_actor: str = Depends(require_admin_account)) -> Dict[str, object]:
     """Return the download URL for the most recent knowledge pack."""
 
     _require_psycopg()

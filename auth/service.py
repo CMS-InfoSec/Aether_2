@@ -14,6 +14,7 @@ import json
 import logging
 from typing import Dict, Optional, Protocol, Set, runtime_checkable
 
+
 import pyotp
 
 from shared.correlation import get_correlation_id
@@ -28,8 +29,10 @@ except ImportError:  # pragma: no cover - fallback when argon2 is unavailable
 
         ID = "argon2id"
 
+
     class VerificationError(ValueError):
         """Minimal stand-in for argon2's verification errors."""
+
 
     class InvalidHash(VerificationError):
         """Raised when an argon2 hash cannot be parsed."""
@@ -92,17 +95,30 @@ except ImportError:  # pragma: no cover - fallback when argon2 is unavailable
                 raise VerifyMismatchError("Password does not match stored hash")
             return True
 
-        def needs_update(self, hashed: str) -> bool:
-            return False
 
-        def check_needs_rehash(self, hashed: str) -> bool:
-            return False
+    def needs_update(self, hashed: str) -> bool:
+        checker = getattr(self._delegate, "check_needs_rehash", None)
+        if callable(checker):
+            try:
+                return bool(checker(hashed))
+            except (InvalidHash, AttributeError):
+                return False
+        fallback = getattr(self._delegate, "needs_update", None)
+        if callable(fallback):
+            try:
+                return bool(fallback(hashed))
+            except AttributeError:
+                return False
+        return False
+
+
 
     PasswordHasher = _FallbackPasswordHasher  # type: ignore[assignment]
     _ARGON2_HASHER = PasswordHasher(type=getattr(Type, "ID", None))
 else:
     PasswordHasher = _Argon2PasswordHasher
     _ARGON2_HASHER = PasswordHasher(type=Type.ID)
+
 
 try:  # pragma: no cover - prometheus is optional outside production
     from prometheus_client import Counter
@@ -121,6 +137,7 @@ except Exception:  # pragma: no cover - provide a no-op fallback
             self._value = value
 
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -137,7 +154,6 @@ _LOGIN_SUCCESS_COUNTER = Counter(
     "auth_login_success_total",
     "Number of successful administrator logins.",
 )
-
 
 
 
@@ -415,6 +431,7 @@ class AuthService:
 
     def _verify_password(self, admin: AdminAccount, password: str) -> bool:
         stored_hash = admin.password_hash
+
         try:
             if _ARGON2_HASHER.verify(stored_hash, password):
                 if hasattr(_ARGON2_HASHER, "check_needs_rehash"):
@@ -431,6 +448,7 @@ class AuthService:
             pass
         except VerificationError:
             return False
+
 
         # Backwards compatibility with legacy SHA-256 hashes.
         candidate = hashlib.sha256(password.encode()).hexdigest()

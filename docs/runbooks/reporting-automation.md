@@ -33,7 +33,10 @@ pass the new security dependencies:
 
 | Endpoint | Audience | Required headers |
 | --- | --- | --- |
-| `GET /reports/xai` | Admin only | `X-Account-ID` set to an account in `ADMIN_ACCOUNTS` |
+| `GET /reports/daily` | Admin only | `Authorization: Bearer <admin session>` and optional `X-Account-ID` matching the session |
+| `POST /reports/export` | Admin only | `Authorization: Bearer <admin session>` and optional `X-Account-ID` matching the session |
+| `GET /reports/explain` | Admin only | `Authorization: Bearer <admin session>` and optional `X-Account-ID` matching the session |
+| `GET /reports/xai` | Admin only | `Authorization: Bearer <admin session>` and `X-Account-ID` matching the session |
 | `GET /logs/export` | Auditors | `X-Role: auditor` and `X-Account-ID` matching the configured auditor allow-list |
 | `GET /compliance/export` | Auditors | `X-Role: auditor` and `X-Account-ID` matching the configured auditor allow-list |
 | `GET /alerts/prioritized` | Admin only | `X-Account-ID` set to an account in `ADMIN_ACCOUNTS` |

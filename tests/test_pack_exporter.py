@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import pack_exporter
+from services.common.security import require_admin_account
 
 
 class StubRepository:
@@ -137,6 +138,7 @@ def test_latest_pack_endpoint_returns_signed_url(monkeypatch: pytest.MonkeyPatch
 
     app = FastAPI()
     app.include_router(pack_exporter.router)
+    app.dependency_overrides[require_admin_account] = lambda: "company"
     http = TestClient(app)
 
     response = http.get("/knowledge/export/latest")
@@ -149,3 +151,28 @@ def test_latest_pack_endpoint_returns_signed_url(monkeypatch: pytest.MonkeyPatch
     assert payload["ts"] == sample.created_at.isoformat()
     assert payload["download_url"] == "https://example.com/packs/pack.tar.gz?ttl=600"
     assert client.presigned_calls[0]["expires"] == 600
+
+
+def test_latest_pack_endpoint_rejects_unauthorized(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(pack_exporter, "_require_psycopg", lambda: None)
+    monkeypatch.setattr(pack_exporter, "_require_boto3", lambda: None)
+
+    class Repo:
+        def latest_pack(self) -> pack_exporter.PackRecord | None:
+            return None
+
+    monkeypatch.setattr(pack_exporter, "KnowledgePackRepository", lambda *_, **__: Repo())
+    monkeypatch.setattr(
+        pack_exporter,
+        "_storage_config_from_env",
+        lambda: pack_exporter.ObjectStorageConfig(bucket="bucket", prefix="packs"),
+    )
+    monkeypatch.setattr(pack_exporter, "_s3_client", lambda config: FakeS3Client())
+
+    app = FastAPI()
+    app.include_router(pack_exporter.router)
+    http = TestClient(app)
+
+    response = http.get("/knowledge/export/latest")
+
+    assert response.status_code in {401, 403}
