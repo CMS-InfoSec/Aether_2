@@ -507,8 +507,6 @@ async def store_kraken_secret(
     payload: KrakenSecretRequest,
     request: Request,
 
-    _: str = Depends(require_authorized_caller),
-
     manager: KrakenSecretManager = Depends(get_secret_manager),
     authorized_actor: str = Depends(require_authorized_caller),
 ) -> JSONResponse:
@@ -534,6 +532,49 @@ async def store_kraken_secret(
         except ApiException as exc:
             if exc.status != 404:
                 raise
+
+    LOGGER.info(
+        "Validating Kraken credentials for account %s using key %s", payload.account_id, masked_key
+    )
+    try:
+        validation_response = await kraken_get_balance(
+            api_key=payload.api_key,
+            api_secret=payload.api_secret,
+        )
+    except httpx.HTTPStatusError as exc:
+        status_code = exc.response.status_code
+        LOGGER.warning(
+            "Kraken API returned status %s while validating credentials for account %s",
+            status_code,
+            payload.account_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Kraken API responded with an error",
+        ) from exc
+    except httpx.HTTPError as exc:
+        LOGGER.exception(
+            "HTTP error during Kraken credential validation for account %s", payload.account_id
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Failed to reach Kraken API",
+        ) from exc
+
+    validation_errors = validation_response.get("error")
+    if validation_errors:
+        LOGGER.warning(
+            "Kraken credential validation failed for account %s using key %s: %s",
+            payload.account_id,
+            masked_key,
+            validation_errors,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid Kraken credentials",
+        )
+
+    LOGGER.info("Kraken credentials validated for account %s", payload.account_id)
 
     try:
         result = manager.upsert_secret(
