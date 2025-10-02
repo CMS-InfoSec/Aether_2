@@ -9,6 +9,7 @@ from audit_mode import configure_audit_mode
 from accounts.service import AccountsService
 from auth.routes import get_auth_service, router as auth_router
 from auth.service import AdminRepository, AuthService, SessionStore
+from metrics import setup_metrics
 from services.alert_manager import setup_alerting
 from services.alerts.alert_dedupe import router as alert_dedupe_router, setup_alert_dedupe
 from alert_prioritizer import router as alert_prioritizer_router
@@ -25,10 +26,16 @@ from services.models.model_zoo import router as models_router
 from exposure_forecast import router as exposure_router
 from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
 from shared.correlation import CorrelationIdMiddleware
+from scaling_controller import (
+    build_scaling_controller_from_env,
+    configure_scaling_controller,
+    router as scaling_router,
+)
 
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Aether Admin Platform")
+    setup_metrics(app, service_name="admin-platform")
     app.add_middleware(CorrelationIdMiddleware)
 
     audit_store = AuditLogStore()

@@ -92,6 +92,42 @@ _pipeline_latency_ms = Gauge(
     registry=_REGISTRY,
 )
 
+_scaling_oms_replicas = Gauge(
+    "scaling_oms_replicas",
+    "Current OMS replica count recorded by the scaling controller.",
+    ["service"],
+    registry=_REGISTRY,
+)
+
+_scaling_gpu_nodes = Gauge(
+    "scaling_gpu_nodes",
+    "Number of GPU nodes the scaling controller believes are provisioned.",
+    ["service"],
+    registry=_REGISTRY,
+)
+
+_scaling_pending_training_jobs = Gauge(
+    "scaling_pending_training_jobs",
+    "Pending training jobs observed by the scaling controller.",
+    ["service"],
+    registry=_REGISTRY,
+)
+
+_scaling_evaluation_duration_seconds = Histogram(
+    "scaling_evaluation_duration_seconds",
+    "Duration of scaling controller evaluation cycles in seconds.",
+    ["service"],
+    registry=_REGISTRY,
+    buckets=(0.1, 0.25, 0.5, 1, 2, 5, 10, float("inf")),
+)
+
+_scaling_evaluations_total = Counter(
+    "scaling_evaluations_total",
+    "Total number of scaling controller evaluations executed.",
+    ["service"],
+    registry=_REGISTRY,
+)
+
 _policy_abstention_rate = Gauge(
     "policy_abstention_rate",
     "Observed abstention rate from policy decisions.",
@@ -169,6 +205,11 @@ _METRICS: Dict[str, Counter | Gauge | Histogram] = {
     "oms_submit_latency": _oms_submit_latency,
     "late_events_total": _late_events_total,
     "reorder_buffer_depth": _reorder_buffer_depth,
+    "scaling_oms_replicas": _scaling_oms_replicas,
+    "scaling_gpu_nodes": _scaling_gpu_nodes,
+    "scaling_pending_training_jobs": _scaling_pending_training_jobs,
+    "scaling_evaluation_duration_seconds": _scaling_evaluation_duration_seconds,
+    "scaling_evaluations_total": _scaling_evaluations_total,
 }
 
 _INITIALISED = False
@@ -266,6 +307,11 @@ def init_metrics(service_name: str = "service") -> Dict[str, Counter | Gauge | H
     _oms_submit_latency.labels(service=_service_value(), transport="unknown")
     _late_events_total.labels(service=_service_value(), stream="unknown")
     _reorder_buffer_depth.labels(service=_service_value(), stream="unknown").set(0)
+    _scaling_oms_replicas.labels(service=_service_value()).set(0)
+    _scaling_gpu_nodes.labels(service=_service_value()).set(0)
+    _scaling_pending_training_jobs.labels(service=_service_value()).set(0)
+    _scaling_evaluation_duration_seconds.labels(service=_service_value()).observe(0)
+    _scaling_evaluations_total.labels(service=_service_value())
 
     return _METRICS
 
@@ -513,6 +559,27 @@ def record_fees_nav_pct(
     ).set(value)
 
 
+def record_scaling_state(
+    *,
+    oms_replicas: int,
+    gpu_nodes: int,
+    pending_jobs: int,
+    service: Optional[str] = None,
+) -> None:
+    labels = {"service": _service_value(service)}
+    _scaling_oms_replicas.labels(**labels).set(max(oms_replicas, 0))
+    _scaling_gpu_nodes.labels(**labels).set(max(gpu_nodes, 0))
+    _scaling_pending_training_jobs.labels(**labels).set(max(pending_jobs, 0))
+
+
+def observe_scaling_evaluation(
+    duration_seconds: float, *, service: Optional[str] = None
+) -> None:
+    labels = {"service": _service_value(service)}
+    _scaling_evaluation_duration_seconds.labels(**labels).observe(max(duration_seconds, 0.0))
+    _scaling_evaluations_total.labels(**labels).inc()
+
+
 def get_request_id() -> Optional[str]:
     """Return the current request identifier, if available."""
 
@@ -558,6 +625,8 @@ __all__ = [
     "record_abstention_rate",
     "record_drift_score",
     "record_fees_nav_pct",
+    "record_scaling_state",
+    "observe_scaling_evaluation",
     "get_request_id",
     "traced_span",
 ]

@@ -134,6 +134,8 @@ metrics_stub.increment_oms_child_orders_total = _noop
 metrics_stub.increment_oms_error_count = _noop
 metrics_stub.record_oms_latency = _noop
 metrics_stub.setup_metrics = _noop
+metrics_stub.record_scaling_state = _noop
+metrics_stub.observe_scaling_evaluation = _noop
 sys.modules['metrics'] = metrics_stub
 
 
