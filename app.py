@@ -72,6 +72,10 @@ def create_app() -> FastAPI:
 
     app.include_router(compliance_router)
 
+    app.include_router(knowledge_router)
+
+    app.include_router(meta_router)
+
 
     scaling_controller = build_scaling_controller_from_env()
     configure_scaling_controller(scaling_controller)
