@@ -7,11 +7,24 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
+import logging
 from typing import Dict, List, Optional, Union
 
-from fastapi import Body, FastAPI, Header, HTTPException, status
+from fastapi import Body, FastAPI, Header, HTTPException, Request, status
 
 from metrics import increment_safe_mode_triggers, setup_metrics
+
+
+try:  # pragma: no cover - optional audit dependency
+    from common.utils.audit_logger import hash_ip as audit_hash_ip, log_audit as chain_log_audit
+except Exception:  # pragma: no cover - degrade gracefully
+    chain_log_audit = None  # type: ignore[assignment]
+
+    def audit_hash_ip(_: Optional[str]) -> Optional[str]:  # type: ignore[override]
+        return None
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 app = FastAPI(title="Safe Mode Service")
@@ -418,8 +431,10 @@ controller = SafeModeController()
 @app.post("/safe_mode/enter", response_model=Dict[str, object])
 def enter_safe_mode(
     payload: Dict[str, str] = Body(...),
+    request: Request,
     actor: Optional[str] = Header(default="system", alias="X-Actor"),
 ) -> Dict[str, object]:
+    before_snapshot = dict(controller.status().to_response())
     reason = payload.get("reason", "").strip()
     try:
         controller.enter(reason=reason, actor=actor)
@@ -427,16 +442,52 @@ def enter_safe_mode(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
         ) from exc
-    return controller.status().to_response()
+    response = controller.status().to_response()
+
+    if chain_log_audit is not None:
+        try:
+            ip_hash = audit_hash_ip(request.client.host if request.client else None)
+            chain_log_audit(
+                actor=actor or "system",
+                action="safe_mode.enter",
+                entity="safe_mode",
+                before=before_snapshot,
+                after=dict(response),
+                ip_hash=ip_hash,
+            )
+        except Exception:  # pragma: no cover - defensive best effort
+            LOGGER.exception("Failed to record audit log for safe mode entry")
+
+    return response
 
 
 @app.post("/safe_mode/exit", response_model=Dict[str, object])
-def exit_safe_mode(actor: Optional[str] = Header(default="system", alias="X-Actor")) -> Dict[str, object]:
+def exit_safe_mode(
+    request: Request,
+    actor: Optional[str] = Header(default="system", alias="X-Actor"),
+) -> Dict[str, object]:
+    before_snapshot = dict(controller.status().to_response())
     try:
         controller.exit(actor=actor)
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-    return controller.status().to_response()
+    response = controller.status().to_response()
+
+    if chain_log_audit is not None:
+        try:
+            ip_hash = audit_hash_ip(request.client.host if request.client else None)
+            chain_log_audit(
+                actor=actor or "system",
+                action="safe_mode.exit",
+                entity="safe_mode",
+                before=before_snapshot,
+                after=dict(response),
+                ip_hash=ip_hash,
+            )
+        except Exception:  # pragma: no cover - defensive best effort
+            LOGGER.exception("Failed to record audit log for safe mode exit")
+
+    return response
 
 
 @app.get("/safe_mode/status", response_model=Dict[str, object])

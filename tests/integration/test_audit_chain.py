@@ -158,14 +158,15 @@ def test_audit_chain_across_services(tmp_path, monkeypatch, capsys):
         "override.human_decision",
     ]
 
-    prev_hash = audit_logger._GENESIS_HASH  # pylint: disable=protected-access
+    prev_entry_hash = audit_logger._GENESIS_HASH  # pylint: disable=protected-access
     for entry in entries:
-        assert entry["prev_hash"] == prev_hash
+        expected_prev_hash = hashlib.sha256(prev_entry_hash.encode("utf-8")).hexdigest()
+        assert entry["prev_hash"] == expected_prev_hash
         canonical = audit_logger._canonical_payload(entry)  # pylint: disable=protected-access
         serialized = audit_logger._canonical_serialized(canonical)  # pylint: disable=protected-access
-        expected_hash = hashlib.sha256((prev_hash + serialized).encode("utf-8")).hexdigest()
+        expected_hash = hashlib.sha256((expected_prev_hash + serialized).encode("utf-8")).hexdigest()
         assert entry["hash"] == expected_hash
-        prev_hash = entry["hash"]
+        prev_entry_hash = entry["hash"]
 
     capsys.readouterr()
     result = audit_logger.main(["verify"])
