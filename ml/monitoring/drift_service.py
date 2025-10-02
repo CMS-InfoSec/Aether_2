@@ -367,6 +367,12 @@ class DriftMonitoringService:
     def notify_model_ready(self, model_version: str) -> None:
         LOGGER.info("Retrain completed with model version %s", model_version)
         self._retrain_requested = False
+        # Reset drift metrics captured for the previous production model so the
+        # canary evaluation starts from a clean slate. Stale alerts would
+        # otherwise cause an immediate rollback before the new model can
+        # observe any trades.
+        self._metrics = {}
+        self._last_checked = None
         if self._canary_manager is not None:
             self._canary_manager.deploy(model_version)
 
