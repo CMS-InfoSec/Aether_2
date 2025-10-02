@@ -24,3 +24,26 @@ stablecoin_monitor:
   trusted_feeds:
     - nyfed_fx
     - bloomberg_fx
+
+simulation:
+  enabled: true
+  slippage_bps_base: 2
+  vol_multiplier: 1.0
+
+sizing:
+  max_trade_risk_pct_nav: 0.5
+  max_trade_risk_pct_cash: 0.7
+  volatility_floor: 0.005
+  safety_margin_bps: 3
+
+diversification:
+  max_concentration_pct_per_asset: 35
+  max_sector_pct: 60
+  rebalance_threshold_pct: 3
+  buckets:
+    core: ["BTC/USD"]
+    top_caps: ["ETH/USD", "SOL/USD"]
+    growth: ["..."]
+
+fees:
+  drift_alert_bps: 2
