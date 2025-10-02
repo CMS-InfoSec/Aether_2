@@ -22,6 +22,7 @@ from typing import Any, Awaitable, Dict, Iterable, List, Optional, Set, Tuple
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 
+from services.common.security import require_admin_account
 from services.oms import reconcile as _oms_reconcile
 from services.oms.idempotency_store import _IdempotencyStore
 from services.oms.impact_store import ImpactAnalyticsStore, impact_store
@@ -2234,32 +2235,82 @@ warm_start = WarmStartCoordinator(lambda: manager)
 
 
 
-async def require_account_id(request: Request) -> str:
+def _record_auth_failure(
+    request: Request,
+    *,
+    raw_header: Optional[str],
+    reason: str,
+    status_code: int,
+    detail: Any,
+) -> None:
+    increment_oms_auth_failures(reason=reason)
+    logger.warning(
+        "Unauthorized OMS request rejected",
+        extra=_log_extra(
+            event="oms.auth_failure",
+            reason=reason,
+            status_code=status_code,
+            source_ip=_extract_source_ip(request),
+            account_header=_redact_account_header(raw_header),
+            path=request.url.path,
+            detail=str(detail),
+        ),
+    )
+
+
+def _resolve_account_header(request: Request) -> Tuple[str, Optional[str]]:
     raw_header = request.headers.get("X-Account-ID")
     account_id = raw_header.strip() if raw_header else ""
 
     if account_id:
-        return account_id
+        return account_id, raw_header
 
     reason = "missing_account_id" if raw_header is None else "empty_account_id"
-    increment_oms_auth_failures(reason=reason)
-
-    logger.warning(
-        "Unauthorized OMS request missing X-Account-ID header",
-        extra=_log_extra(
-            event="oms.auth_failure",
-            reason=reason,
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            source_ip=_extract_source_ip(request),
-            account_header=_redact_account_header(raw_header),
-            path=request.url.path,
-        ),
-    )
-
-    raise HTTPException(
+    detail = "Missing X-Account-ID header"
+    _record_auth_failure(
+        request,
+        raw_header=raw_header,
+        reason=reason,
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Missing X-Account-ID header",
+        detail=detail,
     )
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=detail)
+
+
+def require_authorized_account(request: Request) -> str:
+    account_id, raw_header = _resolve_account_header(request)
+    authorization = request.headers.get("Authorization")
+
+    try:
+        return require_admin_account(
+            request,
+            authorization=authorization,
+            x_account_id=account_id,
+        )
+    except HTTPException as exc:
+        if exc.status_code in {status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN}:
+            if (
+                exc.status_code == status.HTTP_403_FORBIDDEN
+                and exc.detail == "Account header does not match authenticated session."
+            ):
+                reason = "account_mismatch"
+            elif exc.status_code == status.HTTP_403_FORBIDDEN:
+                reason = "forbidden"
+            else:
+                reason = "unauthorized"
+            _record_auth_failure(
+                request,
+                raw_header=raw_header,
+                reason=reason,
+                status_code=exc.status_code,
+                detail=exc.detail,
+            )
+        raise
+
+
+async def require_account_id(request: Request) -> str:
+    account_id, _ = _resolve_account_header(request)
+    return account_id
 
 
 def _extract_source_ip(request: Request) -> str:
@@ -2373,7 +2424,7 @@ async def get_rate_limit_status(
 
 
 @app.get("/oms/warm_start/status")
-async def get_warm_start_status(_: str = Depends(require_account_id)) -> Dict[str, int]:
+async def get_warm_start_status(_: str = Depends(require_authorized_account)) -> Dict[str, int]:
     return await warm_start.status()
 
 
