@@ -10,7 +10,7 @@ spec:
     kind: Deployment
     name: policy-service
   minReplicas: 2
-  maxReplicas: 10
+  maxReplicas: 8
   metrics:
     - type: Resource
       resource:
@@ -24,6 +24,11 @@ spec:
         target:
           type: Utilization
           averageUtilization: 75
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 60
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
@@ -37,7 +42,7 @@ spec:
     kind: Deployment
     name: risk-service
   minReplicas: 2
-  maxReplicas: 10
+  maxReplicas: 8
   metrics:
     - type: Resource
       resource:
@@ -51,6 +56,11 @@ spec:
         target:
           type: Utilization
           averageUtilization: 75
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 60
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
@@ -64,7 +74,7 @@ spec:
     kind: Deployment
     name: oms-service
   minReplicas: 2
-  maxReplicas: 10
+  maxReplicas: 8
   metrics:
     - type: Resource
       resource:
@@ -78,3 +88,8 @@ spec:
         target:
           type: Utilization
           averageUtilization: 75
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 60
