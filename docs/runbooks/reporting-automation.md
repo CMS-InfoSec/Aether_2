@@ -24,3 +24,20 @@ If the script exits with a non-zero status:
    ```bash
    python docs/runbooks/scripts/daily_report.py --date $(date -u +%Y-%m-%d)
    ```
+
+## API authentication requirements
+
+Operations frequently uses the reporting and compliance endpoints while audit partners
+review daily exports. The following HTTP headers must be provided with each request to
+pass the new security dependencies:
+
+| Endpoint | Audience | Required headers |
+| --- | --- | --- |
+| `GET /reports/xai` | Admin only | `X-Account-ID` set to an account in `ADMIN_ACCOUNTS` |
+| `GET /logs/export` | Auditors | `X-Role: auditor` and `X-Account-ID` matching the configured auditor allow-list |
+| `GET /compliance/export` | Auditors | `X-Role: auditor` and `X-Account-ID` matching the configured auditor allow-list |
+| `GET /alerts/prioritized` | Admin only | `X-Account-ID` set to an account in `ADMIN_ACCOUNTS` |
+| `GET /alerts/active`, `GET /alerts/policies` | Admin only | `X-Account-ID` set to an account in `ADMIN_ACCOUNTS` |
+
+Auditor accounts are defined in the audit mode configuration (see `audit_mode.AuditModeConfig`).
+Administrative calls may additionally require MFA headers where noted by each service.

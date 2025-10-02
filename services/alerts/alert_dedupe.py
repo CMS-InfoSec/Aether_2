@@ -51,6 +51,8 @@ except ModuleNotFoundError:  # pragma: no cover - fallback stub for tests
 
 from prometheus_client import CollectorRegistry, Counter
 
+from services.common.security import require_admin_account
+
 if TYPE_CHECKING:
     import httpx
 
@@ -338,12 +340,18 @@ def get_alert_dedupe_service() -> AlertDedupeService:
 
 
 @router.get("/active")
-async def get_active_alerts(service: AlertDedupeService = Depends(get_alert_dedupe_service)) -> List[Dict[str, Any]]:
+async def get_active_alerts(
+    _: str = Depends(require_admin_account),
+    service: AlertDedupeService = Depends(get_alert_dedupe_service),
+) -> List[Dict[str, Any]]:
     return await service.refresh()
 
 
 @router.get("/policies")
-def get_alert_policies(service: AlertDedupeService = Depends(get_alert_dedupe_service)) -> Dict[str, Any]:
+def get_alert_policies(
+    _: str = Depends(require_admin_account),
+    service: AlertDedupeService = Depends(get_alert_dedupe_service),
+) -> Dict[str, Any]:
     return service.policies()
 
 
