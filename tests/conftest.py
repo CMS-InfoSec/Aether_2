@@ -6,6 +6,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import Dict
 
 import pytest
 
@@ -19,6 +20,34 @@ pytest_plugins = [
     "tests.fixtures.backends",
     "tests.fixtures.mock_kraken",
 ]
+
+if "pyotp" not in sys.modules:
+    pyotp_stub = ModuleType("pyotp")
+
+    class _TOTP:
+        def __init__(self, secret: str) -> None:
+            self._secret = secret
+
+        def verify(self, code: str, valid_window: int = 1) -> bool:  # pragma: no cover - simple stub
+            return bool(code)
+
+        def now(self) -> str:  # pragma: no cover - deterministic value
+            return "000000"
+
+    pyotp_stub.TOTP = _TOTP
+    pyotp_stub.random_base32 = lambda: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+    sys.modules["pyotp"] = pyotp_stub
+
+
+try:
+    from auth.service import InMemorySessionStore
+except Exception:  # pragma: no cover - optional dependency not available
+    InMemorySessionStore = None  # type: ignore[assignment]
+
+try:
+    from services.common import security as security_module
+except Exception:  # pragma: no cover - optional dependency not available
+    security_module = None
 
 
 def _install_sqlalchemy_stub() -> None:
@@ -290,6 +319,65 @@ if _class_validators is not None:
         return _original_root_validator(*args, **kwargs)
 
     _class_validators.root_validator = _compat_root_validator  # type: ignore[assignment]
+
+
+@pytest.fixture(autouse=True)
+def _configure_security_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
+    try:  # FastAPI is optional in some test environments
+        from fastapi.testclient import TestClient
+    except Exception:  # pragma: no cover - FastAPI not installed
+        if security_module is not None:
+            security_module.set_default_session_store(None)
+        yield
+        return
+
+    if InMemorySessionStore is None or security_module is None:
+        yield
+        return
+
+    store = InMemorySessionStore(ttl_minutes=240)
+    security_module.set_default_session_store(store)
+    issued_tokens: Dict[str, str] = {}
+
+    def _issue_token(account_id: str) -> str:
+        token = issued_tokens.get(account_id)
+        if token:
+            return token
+        session = store.create(account_id)
+        issued_tokens[account_id] = session.token
+        return session.token
+
+    original_request = TestClient.request
+
+    def _request_with_session(self, method: str, url: str, **kwargs):  # type: ignore[override]
+        headers = kwargs.setdefault("headers", {})
+        account = headers.get("X-Account-ID")
+        auth_header = headers.get("Authorization") or headers.get("authorization")
+        if account and not auth_header:
+            headers["Authorization"] = f"Bearer {_issue_token(str(account))}"
+
+        approvals = headers.get("X-Director-Approvals")
+        if approvals:
+            approval_tokens = []
+            for raw_part in approvals.split(","):
+                candidate = raw_part.strip()
+                if not candidate:
+                    continue
+                if candidate in issued_tokens.values():
+                    approval_tokens.append(candidate)
+                else:
+                    approval_tokens.append(_issue_token(candidate))
+            if approval_tokens:
+                headers["X-Director-Approvals"] = ",".join(approval_tokens)
+
+        return original_request(self, method, url, **kwargs)
+
+    monkeypatch.setattr(TestClient, "request", _request_with_session)
+    try:
+        yield
+    finally:
+        security_module.set_default_session_store(None)
+        monkeypatch.setattr(TestClient, "request", original_request, raising=False)
 
 
 @pytest.fixture
