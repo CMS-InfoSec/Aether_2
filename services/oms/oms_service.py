@@ -37,6 +37,7 @@ from services.oms.kraken_ws import (
 from services.oms.routing import LatencyRouter
 from services.oms.rate_limit_guard import rate_limit_guard
 from services.oms.warm_start import WarmStartCoordinator
+from shared.sim_mode import SimulatedOrderSnapshot, sim_broker, sim_mode_repository
 
 
 import websockets
@@ -718,6 +719,8 @@ class AccountContext:
         self._balances: Dict[str, Decimal] = {}
         self._balances_lock = asyncio.Lock()
         self.routing = LatencyRouter(account_id)
+        self._sim_mode_repo = sim_mode_repository
+        self._sim_broker = sim_broker
 
         self._impact_store: ImpactAnalyticsStore = impact_store
         self._reconcile_task: Optional[asyncio.Task[None]] = None
@@ -1390,9 +1393,6 @@ class AccountContext:
 
         async def _execute() -> OMSOrderStatusResponse:
 
-            assert self.ws_client is not None
-            assert self.rest_client is not None
-
             metadata = await self.credentials.get_metadata()
             qty, px = _PrecisionValidator.validate(
                 request.symbol,
@@ -1400,6 +1400,13 @@ class AccountContext:
                 request.limit_px,
                 metadata,
             )
+            sim_status = await self._sim_mode_repo.get_status_async()
+            if sim_status.active:
+                return await self._execute_simulated_order(request, qty, px)
+
+            assert self.ws_client is not None
+            assert self.rest_client is not None
+
             book_symbol = _resolve_book_symbol(request.symbol, metadata)
             depth: Optional[Decimal] = None
             book: _PublicOrderBookState | None = None
@@ -1584,11 +1591,35 @@ class AccountContext:
         await self.start()
 
         async def _execute_cancel() -> OMSOrderStatusResponse:
-            assert self.ws_client is not None
-            assert self.rest_client is not None
-
             async with self._orders_lock:
                 record = self._orders.get(request.client_id)
+
+            if record and record.transport == "simulation":
+                snapshot = await self._cancel_sim_order(request.client_id)
+                if snapshot is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Unknown simulated order for cancellation",
+                    )
+                sim_record = self._snapshot_to_record(snapshot)
+                await self._store_sim_record(sim_record)
+                return self._snapshot_to_response(snapshot)
+
+            if record is None:
+                sim_snapshot = await self._lookup_sim_snapshot(request.client_id)
+                if sim_snapshot is not None:
+                    snapshot = await self._cancel_sim_order(request.client_id)
+                    if snapshot is None:
+                        raise HTTPException(
+                            status_code=status.HTTP_404_NOT_FOUND,
+                            detail="Unknown simulated order for cancellation",
+                        )
+                    sim_record = self._snapshot_to_record(snapshot)
+                    await self._store_sim_record(sim_record)
+                    return self._snapshot_to_response(snapshot)
+
+            assert self.ws_client is not None
+            assert self.rest_client is not None
 
             target_txids: List[str] = []
             if request.exchange_order_id is not None:
@@ -2051,10 +2082,80 @@ class AccountContext:
 
     async def lookup(self, client_id: str) -> OrderRecord | None:
         async with self._orders_lock:
-            return self._orders.get(client_id)
+            record = self._orders.get(client_id)
+        if record is not None:
+            return record
+        snapshot = await self._lookup_sim_snapshot(client_id)
+        if snapshot is None:
+            return None
+        record = self._snapshot_to_record(snapshot)
+        await self._store_sim_record(record)
+        return record
 
     def routing_status(self) -> Dict[str, Optional[float] | str]:
         return self.routing.status()
+
+    def _snapshot_to_response(self, snapshot: SimulatedOrderSnapshot) -> OMSOrderStatusResponse:
+        return OMSOrderStatusResponse(
+            exchange_order_id=snapshot.client_id,
+            status=snapshot.status,
+            filled_qty=snapshot.filled_qty,
+            avg_price=snapshot.avg_price,
+            errors=None,
+        )
+
+    def _snapshot_to_record(self, snapshot: SimulatedOrderSnapshot) -> OrderRecord:
+        response = self._snapshot_to_response(snapshot)
+        return OrderRecord(
+            client_id=snapshot.client_id,
+            result=response,
+            transport="simulation",
+            children=None,
+            symbol=snapshot.symbol,
+            side=snapshot.side,
+            pre_trade_mid=snapshot.pre_trade_mid,
+            recorded_qty=response.filled_qty,
+            requested_qty=snapshot.qty,
+        )
+
+    async def _store_sim_record(self, record: OrderRecord) -> None:
+        async with self._orders_lock:
+            self._orders[record.client_id] = record
+
+    async def _lookup_sim_snapshot(self, client_id: str) -> SimulatedOrderSnapshot | None:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._sim_broker.lookup, self.account_id, client_id)
+
+    async def _cancel_sim_order(self, client_id: str) -> SimulatedOrderSnapshot | None:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._sim_broker.cancel_order, self.account_id, client_id)
+
+    async def _execute_simulated_order(
+        self, request: OMSPlaceRequest, qty: Decimal, limit_px: Optional[Decimal]
+    ) -> OMSOrderStatusResponse:
+        loop = asyncio.get_running_loop()
+        execution = await loop.run_in_executor(
+            None,
+            self._sim_broker.place_order,
+            request.account_id,
+            request.client_id,
+            request.symbol,
+            request.side,
+            request.order_type,
+            qty,
+            limit_px,
+            request.pre_trade_mid_px,
+        )
+        response = self._snapshot_to_response(execution.snapshot)
+        record = self._snapshot_to_record(execution.snapshot)
+        await self._store_sim_record(record)
+        logger.info(
+            "Simulated execution for %s on account %s",
+            request.client_id,
+            self.account_id,
+            extra=_log_extra(account_id=self.account_id, symbol=request.symbol, transport="simulation"),
+        )
+        return response
 
 
     async def _record_trade_impact(self, record: OrderRecord) -> None:
