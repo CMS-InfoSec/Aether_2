@@ -232,7 +232,7 @@ class PortfolioRiskAggregator:
                 PORTFOLIO_LOGGER.warning(
                     "Portfolio constraint breached",
                     extra={
-                        "constraint": breach.constraint,
+                        "constraint": breach.name,
                         "value": breach.value,
                         "limit": breach.limit,
                         "detail": breach.detail,
