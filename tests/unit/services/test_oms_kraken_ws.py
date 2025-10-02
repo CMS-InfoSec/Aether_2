@@ -259,3 +259,62 @@ def test_sign_auth_caches_rest_token_until_expiry() -> None:
 
     asyncio.run(_run())
 
+
+def test_ensure_connected_uses_transport_factory() -> None:
+    async def _creds() -> dict[str, str]:
+        return {}
+
+    client = KrakenWSClient(credential_getter=_creds)
+
+    calls: list[tuple[str, dict[str, str]]] = []
+    created_transport: list[object] = []
+
+    class _DummyTransport:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def send_json(self, payload: dict[str, object]) -> None:
+            return None
+
+        async def recv_json(self) -> dict[str, object]:  # pragma: no cover - not used
+            return {}
+
+        async def close(self) -> None:
+            self.closed = True
+
+    async def _transport_factory(
+        url: str, *, headers: dict[str, str] | None = None
+    ) -> _DummyTransport:
+        calls.append((url, dict(headers or {})))
+        transport = _DummyTransport()
+        created_transport.append(transport)
+        return transport
+
+    client._transport_factory = _transport_factory  # type: ignore[assignment]
+
+    async def _receiver_loop_stub(self: KrakenWSClient) -> None:
+        return None
+
+    client._receiver_loop = types.MethodType(_receiver_loop_stub, client)  # type: ignore[assignment]
+
+    async def _run() -> None:
+        await client.ensure_connected()
+        await asyncio.sleep(0)
+
+        assert len(created_transport) == 1
+        transport = created_transport[0]
+        assert client._transport is transport
+        assert not getattr(transport, "closed")
+
+        assert len(calls) == 1
+        url, headers = calls[0]
+        assert url == client._url
+        assert headers.get("X-Request-ID")
+
+        await client.ensure_connected()
+        await asyncio.sleep(0)
+
+        assert len(calls) == 1
+
+    asyncio.run(_run())
+

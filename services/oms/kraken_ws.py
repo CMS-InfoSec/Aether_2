@@ -7,6 +7,7 @@ import logging
 import random
 import time
 from dataclasses import dataclass
+from uuid import uuid4
 
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional
