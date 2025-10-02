@@ -6,11 +6,14 @@ import asyncio
 import logging
 import os
 from abc import ABC, abstractmethod
-from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
+
+from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional
+from uuid import uuid4
+
 
 import httpx
 
+from metrics import get_request_id
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +97,11 @@ def _join_url(base_url: str, path: str) -> str:
     return f"{base}{suffix}" if base else suffix
 
 
+def _account_headers(account_id: str) -> Dict[str, str]:
+    request_id = get_request_id() or str(uuid4())
+    return {"X-Account-ID": account_id, "X-Request-ID": request_id}
+
+
 class KrakenAdapter(ExchangeAdapter):
     """Adapter implementation for the Kraken OMS service."""
 
@@ -138,7 +146,7 @@ class KrakenAdapter(ExchangeAdapter):
             response = await client.post(
                 url,
                 json=dict(payload),
-                headers={"X-Account-ID": account_id},
+                headers=_account_headers(account_id),
             )
             response.raise_for_status()
             try:
@@ -166,7 +174,7 @@ class KrakenAdapter(ExchangeAdapter):
             response = await client.post(
                 url,
                 json=payload,
-                headers={"X-Account-ID": account_id},
+                headers=_account_headers(account_id),
             )
             response.raise_for_status()
             try:

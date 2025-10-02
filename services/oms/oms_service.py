@@ -42,6 +42,7 @@ from services.oms.warm_start import WarmStartCoordinator
 import websockets
 
 from metrics import (
+    get_request_id,
     increment_oms_auth_failures,
     increment_oms_child_orders_total,
     increment_oms_error_count,
@@ -57,6 +58,13 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Kraken OMS Async Service")
 setup_metrics(app)
+
+
+def _log_extra(**extra: Any) -> Dict[str, Any]:
+    request_id = get_request_id()
+    if request_id:
+        extra.setdefault("request_id", request_id)
+    return extra
 
 
 class OMSPlaceRequest(BaseModel):
@@ -1451,6 +1459,12 @@ class AccountContext:
                     request.symbol,
                     len(child_quantities),
                     depth,
+                    extra=_log_extra(
+                        account_id=self.account_id,
+                        symbol=request.symbol,
+                        child_orders=len(child_quantities),
+                        depth=float(depth) if depth is not None else None,
+                    ),
                 )
 
             child_results: List[OMSOrderStatusResponse] = []
@@ -1846,6 +1860,11 @@ class AccountContext:
                     self.account_id,
                     symbol,
                     exc,
+                    extra=_log_extra(
+                        account_id=self.account_id,
+                        symbol=symbol,
+                        transport="websocket",
+                    ),
                 )
                 ws_failed = True
                 last_ws_error = exc
@@ -1857,6 +1876,11 @@ class AccountContext:
                     self.account_id,
                     symbol,
                     rest_exc,
+                    extra=_log_extra(
+                        account_id=self.account_id,
+                        symbol=symbol,
+                        transport="rest",
+                    ),
                 )
                 last_rest_error = rest_exc
                 continue
@@ -1870,6 +1894,12 @@ class AccountContext:
                 symbol,
                 transport,
                 latency_ms,
+                extra=_log_extra(
+                    account_id=self.account_id,
+                    symbol=symbol,
+                    transport=transport,
+                    latency_ms=latency_ms,
+                ),
             )
             client_id_used = str(attempt_payload.get("clientOrderId", base_client_id))
             return ack, transport, client_id_used, latency_ms
@@ -1897,6 +1927,12 @@ class AccountContext:
                 self.account_id,
                 symbol,
                 latency_ms,
+                extra=_log_extra(
+                    account_id=self.account_id,
+                    symbol=symbol,
+                    transport="rest",
+                    latency_ms=latency_ms,
+                ),
             )
             client_id_used = str(rest_payload["clientOrderId"])
             return ack, "rest", client_id_used, latency_ms
@@ -2055,14 +2091,14 @@ async def require_account_id(request: Request) -> str:
 
     logger.warning(
         "Unauthorized OMS request missing X-Account-ID header",
-        extra={
-            "event": "oms.auth_failure",
-            "reason": reason,
-            "status_code": status.HTTP_401_UNAUTHORIZED,
-            "source_ip": _extract_source_ip(request),
-            "account_header": _redact_account_header(raw_header),
-            "path": request.url.path,
-        },
+        extra=_log_extra(
+            event="oms.auth_failure",
+            reason=reason,
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            source_ip=_extract_source_ip(request),
+            account_header=_redact_account_header(raw_header),
+            path=request.url.path,
+        ),
     )
 
     raise HTTPException(

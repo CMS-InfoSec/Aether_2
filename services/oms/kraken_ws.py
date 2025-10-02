@@ -6,12 +6,17 @@ import json
 import logging
 import random
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional
+
+from typing import Any, Awaitable, Callable, Dict, List, Optional
+from uuid import uuid4
+
 
 import websockets
 from websockets import WebSocketClientProtocol
 from websockets.exceptions import WebSocketException
 
+
+from metrics import get_request_id
 
 logger = logging.getLogger(__name__)
 
@@ -89,8 +94,16 @@ class _WebsocketTransport:
         await self._protocol.close()
 
 
-if TYPE_CHECKING:
-    from services.oms.kraken_rest import KrakenRESTClient
+
+def _log_extra(*, request_id: Optional[str] = None, **extra: Any) -> Dict[str, Any]:
+    """Return logging extras enriched with the active request identifier."""
+
+    resolved = dict(extra)
+    current_id = request_id or get_request_id()
+    if current_id:
+        resolved.setdefault("request_id", current_id)
+    return resolved
+
 
 
 class KrakenWSClient:
@@ -101,7 +114,9 @@ class KrakenWSClient:
         *,
         credential_getter: Callable[[], Awaitable[Dict[str, Any]]],
         url: str = KRAKEN_WS_URL,
-        transport_factory: Optional[Callable[[str], Awaitable[_WebsocketTransport]]] = None,
+        transport_factory: Optional[
+            Callable[..., Awaitable[_WebsocketTransport]]
+        ] = None,
         stream_update_cb: Optional[Callable[[OrderState], Awaitable[None]]] = None,
         rest_client: Optional["KrakenRESTClient"] = None,
         request_timeout: float = 5.0,
@@ -125,8 +140,12 @@ class KrakenWSClient:
         self._subscriptions: List[List[str]] = []
         self._last_private_heartbeat: Optional[float] = None
 
-    async def _default_transport(self, url: str) -> _WebsocketTransport:
-        protocol = await websockets.connect(url, ping_interval=None)
+    async def _default_transport(
+        self, url: str, *, headers: Optional[Dict[str, str]] = None
+    ) -> _WebsocketTransport:
+        protocol = await websockets.connect(
+            url, ping_interval=None, extra_headers=headers
+        )
         return _WebsocketTransport(protocol)
 
     def set_rest_client(self, rest_client: "KrakenRESTClient") -> None:
@@ -141,10 +160,18 @@ class KrakenWSClient:
             await self._connect_locked()
 
     async def _connect_locked(self) -> None:
+        request_id = get_request_id() or str(uuid4())
+        headers = {"X-Request-ID": request_id}
         while True:
             try:
-                logger.info("Connecting to Kraken websocket at %s", self._url)
-                transport = await self._transport_factory(self._url)
+                logger.info(
+                    "Connecting to Kraken websocket at %s",
+                    self._url,
+                    extra=_log_extra(request_id=request_id, url=self._url),
+                )
+                transport = await self._transport_factory(
+                    self._url, headers=headers
+                )
                 self._transport = transport
                 if self._receiver_task is None or self._receiver_task.done():
                     self._receiver_task = asyncio.create_task(
@@ -157,7 +184,12 @@ class KrakenWSClient:
                 return
             except (OSError, WebSocketException) as exc:
                 delay = self._backoff.next()
-                logger.warning("Websocket connection failed: %s. retrying in %.2fs", exc, delay)
+                logger.warning(
+                    "Websocket connection failed: %s. retrying in %.2fs",
+                    exc,
+                    delay,
+                    extra=_log_extra(request_id=request_id, delay=delay),
+                )
                 await asyncio.sleep(delay)
 
     async def close(self) -> None:
@@ -178,7 +210,11 @@ class KrakenWSClient:
         except Exception:  # pragma: no cover - defensive
             exc = None
         if exc:
-            logger.warning("Kraken websocket receiver terminated: %s", exc)
+            logger.warning(
+                "Kraken websocket receiver terminated: %s",
+                exc,
+                extra=_log_extra(),
+            )
         self._receiver_task = None
 
     async def subscribe_private(self, channels: List[str]) -> None:
@@ -356,7 +392,11 @@ class KrakenWSClient:
             except asyncio.CancelledError:  # pragma: no cover - cancellation path
                 raise
             except Exception as exc:
-                logger.warning("Websocket receiver stopped: %s", exc)
+                logger.warning(
+                    "Websocket receiver stopped: %s",
+                    exc,
+                    extra=_log_extra(),
+                )
                 if self._transport:
                     with contextlib.suppress(Exception):
                         await self._transport.close()
@@ -389,7 +429,11 @@ class KrakenWSClient:
             self._last_private_heartbeat = time.time()
             return
         else:
-            logger.debug("Unhandled websocket payload: %s", payload)
+            logger.debug(
+                "Unhandled websocket payload: %s",
+                payload,
+                extra=_log_extra(),
+            )
 
     async def _handle_open_orders(self, payload: Dict[str, Any]) -> None:
         data = payload.get("data") or payload.get("open") or []
