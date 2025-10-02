@@ -77,6 +77,11 @@ logging.basicConfig(
 )
 
 
+DEFAULT_BUCKET_PREFIX = "backups"
+DEFAULT_NONCE_SIZE = 12
+MANIFEST_NAME = "manifest.json"
+
+
 @dataclass
 class BackupConfig:
     """Configuration for the backup job."""
@@ -84,7 +89,7 @@ class BackupConfig:
     pg_dsn: str
     mlflow_artifact_dir: Path
     bucket_name: str
-    bucket_prefix: str = "backups"
+    bucket_prefix: str = DEFAULT_BUCKET_PREFIX
     region_name: Optional[str] = None
     endpoint_url: Optional[str] = None
     access_key: Optional[str] = None
@@ -126,7 +131,7 @@ class BackupConfig:
             pg_dsn=pg_dsn,
             mlflow_artifact_dir=Path(artifact_dir),
             bucket_name=bucket,
-            bucket_prefix=os.environ.get("LINODE_PREFIX", "backups"),
+            bucket_prefix=os.environ.get("LINODE_PREFIX", DEFAULT_BUCKET_PREFIX),
             region_name=os.environ.get("LINODE_REGION"),
             endpoint_url=os.environ.get("LINODE_ENDPOINT"),
             access_key=os.environ.get("LINODE_ACCESS_KEY"),
@@ -189,7 +194,7 @@ class BackupJob:
 
         manifest_id = str(uuid.uuid4())
         timestamp = dt.datetime.utcnow().replace(microsecond=0).isoformat()
-        backup_prefix = f"{self.config.bucket_prefix}/{timestamp}_{manifest_id}"
+        backup_prefix = self._build_backup_prefix(timestamp, manifest_id)
 
         LOGGER.info("Starting backup %s", manifest_id)
         artifacts: List[BackupArtifact] = []
@@ -201,7 +206,7 @@ class BackupJob:
                 mlflow_archive = temp_path / "mlflow_artifacts.tar.gz"
                 encrypted_dir = temp_path / "encrypted"
                 encrypted_dir.mkdir(parents=True, exist_ok=True)
-                manifest_path = temp_path / "manifest.json"
+                manifest_path = temp_path / MANIFEST_NAME
 
                 self._dump_database(db_dump)
                 encrypted_db_path = encrypted_dir / "timescaledb.dump.enc"
@@ -241,7 +246,7 @@ class BackupJob:
                         artifact.s3_key,
                     )
 
-                manifest_key = f"{backup_prefix}/manifest.json"
+                manifest_key = f"{backup_prefix}/{MANIFEST_NAME}"
                 self._upload_file(manifest_path, manifest_key)
 
             self._log_backup(manifest_id, timestamp, "SUCCESS", manifest)
@@ -388,17 +393,23 @@ class BackupJob:
                 ExtraArgs=extra_args,
             )
 
+    def _build_backup_prefix(self, timestamp: str, manifest_id: str) -> str:
+        prefix = (self.config.bucket_prefix or "").strip("/")
+        slug = f"{timestamp}_{manifest_id}"
+        return f"{prefix}/{slug}" if prefix else slug
+
     def _download_manifest(self, manifest_id: str) -> Dict[str, object]:
         LOGGER.info("Fetching manifest for %s", manifest_id)
         paginator = self._s3_client.get_paginator("list_objects_v2")
-        prefix = f"{self.config.bucket_prefix}/"
+        prefix_root = (self.config.bucket_prefix or "").strip("/")
+        prefix = f"{prefix_root}/" if prefix_root else ""
         for page in paginator.paginate(Bucket=self.config.bucket_name, Prefix=prefix):
             for obj in page.get("Contents", []):
-                if obj["Key"].endswith(f"{manifest_id}/manifest.json"):
+                if obj["Key"].endswith(f"{manifest_id}/{MANIFEST_NAME}"):
                     return self._fetch_manifest(obj["Key"])
-                if obj["Key"].endswith(f"{manifest_id}_manifest.json"):
+                if obj["Key"].endswith(f"{manifest_id}_{MANIFEST_NAME}"):
                     return self._fetch_manifest(obj["Key"])
-                if manifest_id in obj["Key"] and obj["Key"].endswith("manifest.json"):
+                if manifest_id in obj["Key"] and obj["Key"].endswith(MANIFEST_NAME):
                     return self._fetch_manifest(obj["Key"])
         raise FileNotFoundError(f"Manifest {manifest_id} not found in bucket")
 
@@ -433,7 +444,7 @@ class BackupJob:
             )
 
         aesgcm = AESGCM(self.config.encryption_key)
-        nonce = os.urandom(12)
+        nonce = os.urandom(DEFAULT_NONCE_SIZE)
         with source_path.open("rb") as handle:
             plaintext = handle.read()
         ciphertext = aesgcm.encrypt(nonce, plaintext, None)
@@ -451,6 +462,10 @@ class BackupJob:
 
         aesgcm = AESGCM(self.config.encryption_key)
         nonce = base64.b64decode(nonce_b64)
+        if len(nonce) != DEFAULT_NONCE_SIZE:
+            raise RuntimeError(
+                f"Unexpected nonce length {len(nonce)} for AES-GCM payload"
+            )
         with encrypted_path.open("rb") as handle:
             ciphertext = handle.read()
         plaintext = aesgcm.decrypt(nonce, ciphertext, None)
