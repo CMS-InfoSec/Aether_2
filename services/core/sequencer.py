@@ -132,6 +132,62 @@ class _LatencyRecorder:
         await asyncio.to_thread(_write)
 
 
+class _TradeLifecycleLogger:
+    """Persist lifecycle transitions to the ``trade_lifecycle_log`` table."""
+
+    def __init__(self, session: TimescaleSession) -> None:
+        self._session = session
+        self._engine: Engine = create_engine(session.dsn, pool_pre_ping=True, future=True)
+        self._Session = sessionmaker(bind=self._engine, expire_on_commit=False, future=True)
+
+        metadata = MetaData(schema=session.account_schema)
+        self._table = Table(
+            "trade_lifecycle_log",
+            metadata,
+            Column("correlation_id", String, nullable=False),
+            Column("account_id", String, nullable=False),
+            Column("symbol", String, nullable=False),
+            Column("stage", String, nullable=False),
+            Column("status", String, nullable=False),
+            Column("ts", DateTime(timezone=True), nullable=False),
+            schema=session.account_schema,
+        )
+        metadata.create_all(self._engine, checkfirst=True)
+
+    async def record(
+        self,
+        *,
+        correlation_id: str,
+        account_id: str,
+        symbol: str,
+        stage: str,
+        status: str,
+        ts: datetime,
+    ) -> None:
+        """Persist a lifecycle transition for an intent."""
+
+        payload = {
+            "correlation_id": correlation_id,
+            "account_id": account_id,
+            "symbol": symbol,
+            "stage": stage,
+            "status": status,
+            "ts": ts,
+        }
+
+        async def _write() -> None:
+            try:
+                with self._Session() as db:  # type: Session
+                    db.execute(self._table.insert(), [payload])
+                    db.commit()
+            except SQLAlchemyError:
+                LOGGER.exception(
+                    "Failed to persist lifecycle transition for schema %s", self._session.account_schema
+                )
+
+        await asyncio.to_thread(_write)
+
+
 class TradingSequencer:
     """Enforce the policy → risk → OMS trading loop with strict ordering."""
 
@@ -148,6 +204,7 @@ class TradingSequencer:
         self._pnl_tracker = pnl_tracker
         self._kafka_factory = kafka_factory
         self._latency_recorders: MutableMapping[str, _LatencyRecorder] = {}
+        self._lifecycle_loggers: MutableMapping[str, _TradeLifecycleLogger] = {}
 
     async def process_intent(self, event: IntentEvent) -> SequencerResult:
         """Process a single :class:`IntentEvent` through the trading pipeline."""
@@ -184,6 +241,16 @@ class TradingSequencer:
             intent_dump = event.model_dump(mode="json")
             tracing.attach_correlation(intent_dump, mutate=True)
 
+            lifecycle_logger = await self._lifecycle_logger(event.account_id)
+            await lifecycle_logger.record(
+                correlation_id=correlation_id,
+                account_id=event.account_id,
+                symbol=event.symbol,
+                stage="policy",
+                status="received",
+                ts=started_at,
+            )
+
             with tracing.policy_span(intent=intent_dump.get("intent", {})):
                 await self._publish(adapter, "intent", event.account_id, intent_dump)
 
@@ -211,11 +278,25 @@ class TradingSequencer:
                         decision_dump,
                     )
 
-                approved = bool(
-                    decision_payload.get("approved")
-                    or decision_payload.get("valid")
-                    or decision_payload.get("status") == "approved"
+                decision_status = (
+                    "approved"
+                    if bool(
+                        decision_payload.get("approved")
+                        or decision_payload.get("valid")
+                        or decision_payload.get("status") == "approved"
+                    )
+                    else "rejected"
                 )
+                await lifecycle_logger.record(
+                    correlation_id=correlation_id,
+                    account_id=event.account_id,
+                    symbol=event.symbol,
+                    stage="risk",
+                    status=decision_status,
+                    ts=decision_event.ts,
+                )
+
+                approved = decision_status == "approved"
 
                 if not approved:
                     status = "rejected"
@@ -250,6 +331,15 @@ class TradingSequencer:
                             order_dump,
                         )
 
+                        await lifecycle_logger.record(
+                            correlation_id=correlation_id,
+                            account_id=event.account_id,
+                            symbol=event.symbol,
+                            stage="oms",
+                            status=order_event.status,
+                            ts=order_event.ts,
+                        )
+
                         async for raw_fill in self._oms.stream_fills(
                             order_payload, correlation_id=correlation_id
                         ):
@@ -274,6 +364,15 @@ class TradingSequencer:
                                     fill_dump,
                                 )
 
+                                await lifecycle_logger.record(
+                                    correlation_id=correlation_id,
+                                    account_id=event.account_id,
+                                    symbol=event.symbol,
+                                    stage="fill",
+                                    status=str(fill_payload.get("status") or "filled"),
+                                    ts=fill_event.ts,
+                                )
+
                                 await self._risk_service.handle_fill(
                                     fill_event, correlation_id=correlation_id
                                 )
@@ -283,6 +382,23 @@ class TradingSequencer:
                                         fill_event, correlation_id=correlation_id
                                     )
                                     destinations.append("pnl")
+                                    await lifecycle_logger.record(
+                                        correlation_id=correlation_id,
+                                        account_id=event.account_id,
+                                        symbol=event.symbol,
+                                        stage="pnl",
+                                        status="updated",
+                                        ts=datetime.now(timezone.utc),
+                                    )
+                                else:
+                                    await lifecycle_logger.record(
+                                        correlation_id=correlation_id,
+                                        account_id=event.account_id,
+                                        symbol=event.symbol,
+                                        stage="pnl",
+                                        status="skipped",
+                                        ts=datetime.now(timezone.utc),
+                                    )
 
                                 update_payload = {
                                     "account_id": event.account_id,
@@ -316,6 +432,14 @@ class TradingSequencer:
                     "error",
                     event.account_id,
                     error_payload,
+                )
+                await lifecycle_logger.record(
+                    correlation_id=correlation_id,
+                    account_id=event.account_id,
+                    symbol=event.symbol,
+                    stage="error",
+                    status="raised",
+                    ts=datetime.now(timezone.utc),
                 )
                 raise
             finally:
@@ -353,6 +477,14 @@ class TradingSequencer:
             recorder = _LatencyRecorder(session)
             self._latency_recorders[account_id] = recorder
         return recorder
+
+    async def _lifecycle_logger(self, account_id: str) -> _TradeLifecycleLogger:
+        logger = self._lifecycle_loggers.get(account_id)
+        if logger is None:
+            session = get_timescale_session(account_id)
+            logger = _TradeLifecycleLogger(session)
+            self._lifecycle_loggers[account_id] = logger
+        return logger
 
     async def _publish(
         self,
