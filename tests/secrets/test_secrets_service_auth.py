@@ -3,13 +3,16 @@ from __future__ import annotations
 import base64
 import importlib
 import sys
+
 from types import ModuleType, SimpleNamespace
 from typing import Generator
 
 import pytest
 
+
 fastapi = pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
+
 
 
 class FakeSecretManager:
@@ -184,4 +187,5 @@ def test_test_endpoint_authorized_success(
 
     assert response.status_code == 200
     assert response.json()["result"] == "success"
+
 
