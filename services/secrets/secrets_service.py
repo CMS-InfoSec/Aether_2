@@ -652,10 +652,11 @@ def _upsert_secret(
 def rotate_secret(
     payload: KrakenSecretRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
+    *,
     actor_account: str = Depends(require_admin_account),
     _: str = Depends(require_mfa_context),
     director_approvals: Tuple[str, str] = Depends(require_dual_director_confirmation),
-    background_tasks: BackgroundTasks,
     api: CoreV1Api = Depends(get_core_v1_api),
 ) -> Response:
     if payload.account_id != actor_account:
@@ -719,10 +720,11 @@ def rotate_secret(
 def rotate_kraken_secret(
     payload: KrakenSecretRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
+    *,
     actor_account: str = Depends(require_admin_account),
     _: str = Depends(require_mfa_context),
     director_approvals: Tuple[str, str] = Depends(require_dual_director_confirmation),
-    background_tasks: BackgroundTasks,
     api: CoreV1Api = Depends(get_core_v1_api),
 ) -> Response:
     if payload.account_id != actor_account:
@@ -783,10 +785,11 @@ def rotate_kraken_secret(
 def rotate_encrypted_secret(
     payload: KrakenSecretRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
+    *,
     actor_account: str = Depends(require_admin_account),
     _: str = Depends(require_mfa_context),
     director_approvals: Tuple[str, str] = Depends(require_dual_director_confirmation),
-    background_tasks: BackgroundTasks,
     api: CoreV1Api = Depends(get_core_v1_api),
 ) -> Response:
     if payload.account_id != actor_account:
@@ -851,9 +854,10 @@ def rotate_encrypted_secret(
 def force_rotate_kraken_secret(
     payload: KrakenForceRotateRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
+    *,
     actor_account: str = Depends(require_admin_account),
     _: str = Depends(require_mfa_context),
-    background_tasks: BackgroundTasks,
     api: CoreV1Api = Depends(get_core_v1_api),
 ) -> Response:
     if payload.account_id != actor_account:
