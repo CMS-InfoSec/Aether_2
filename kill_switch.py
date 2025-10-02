@@ -53,10 +53,10 @@ def _normalize_account(account_id: str) -> str:
 
 @app.post("/risk/kill")
 def trigger_kill_switch(
+    request: Request,
     account_id: str = Query(..., min_length=1),
     reason_code: KillSwitchReason = Query(KillSwitchReason.LOSS_CAP_BREACH),
     actor_account: str = Depends(require_admin_account),
-    request: Request,
 ) -> Dict[str, Any]:
     """Trigger the kill switch for the provided account."""
 
