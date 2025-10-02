@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 
+import hashlib
 import logging
 import sys
 from pathlib import Path
@@ -28,6 +29,75 @@ AuthService = auth_service_module.AuthService
 SessionStore = auth_service_module.SessionStore
 hash_password = auth_service_module.hash_password
 from shared.correlation import CorrelationContext
+
+
+if not hasattr(auth_service_module, "_ARGON2_HASHER"):
+    class _DeterministicHasher:
+        def hash(self, password: str) -> str:
+            digest = hashlib.sha256(password.encode()).hexdigest()
+            return f"$argon2${digest}"
+
+        def verify(self, password: str, stored_hash: str) -> bool:
+            return stored_hash == self.hash(password)
+
+        def needs_update(self, stored_hash: str) -> bool:
+            del stored_hash
+            return False
+
+    auth_service_module._ARGON2_HASHER = _DeterministicHasher()
+
+
+if not hasattr(auth_service_module, "_LOGIN_FAILURE_COUNTER"):
+    class _MetricCounter:
+        def __init__(self) -> None:
+            self._value = 0.0
+            self._label_values: dict[tuple[tuple[str, str], ...], float] = {}
+            self._labelled_views: dict[
+                tuple[tuple[str, str], ...], "_LabelledCounter"
+            ] = {}
+
+        def labels(self, **labels: str) -> "_LabelledCounter":
+            key = tuple(sorted(labels.items()))
+            view = self._labelled_views.get(key)
+            if view is None:
+                view = _LabelledCounter(self, key)
+                view._value = self._label_values.get(key, 0.0)
+                self._labelled_views[key] = view
+            return view
+
+        def inc(self, amount: float = 1.0) -> None:
+            self._value += amount
+
+    class _LabelledCounter:
+        def __init__(
+            self, parent: _MetricCounter, key: tuple[tuple[str, str], ...]
+        ) -> None:
+            self._parent = parent
+            self._key = key
+            self._value = 0.0
+
+        def inc(self, amount: float = 1.0) -> None:
+            self._value += amount
+            self._parent._label_values[self._key] = self._value
+
+    auth_service_module._LOGIN_FAILURE_COUNTER = _MetricCounter()
+    auth_service_module._MFA_DENIED_COUNTER = _MetricCounter()
+    auth_service_module._LOGIN_SUCCESS_COUNTER = _MetricCounter()
+
+
+class _RecordingPostgresRepository:
+    def __init__(self, admin: AdminAccount) -> None:
+        self._admin = admin
+        self.saved_hashes: list[str] = []
+
+    def add(self, admin: AdminAccount) -> None:
+        self._admin = admin
+        self.saved_hashes.append(admin.password_hash)
+
+    def get_by_email(self, email: str) -> AdminAccount | None:
+        if self._admin.email == email:
+            return self._admin
+        return None
 
 
 def _metric_value(counter, labels: dict[str, str] | None = None) -> float:
@@ -115,6 +185,79 @@ def test_login_enforces_mfa_and_ip_allow_list():
     assert (
         _metric_value(auth_service_module._LOGIN_SUCCESS_COUNTER)
         == success_before + 1
+    )
+
+
+def test_login_upgrades_legacy_hash_and_persists() -> None:
+    secret = pyotp.random_base32()
+    legacy_hash = hashlib.sha256("Outdated!".encode()).hexdigest()
+    admin = AdminAccount(
+        admin_id="legacy-1",
+        email="legacy@example.com",
+        password_hash=legacy_hash,
+        mfa_secret=secret,
+    )
+    repository = _RecordingPostgresRepository(admin)
+    sessions = SessionStore()
+    service = AuthService(repository, sessions)
+
+    code = pyotp.TOTP(secret).now()
+
+    service.login(
+        email=admin.email,
+        password="Outdated!",
+        mfa_code=code,
+        ip_address=None,
+    )
+
+    assert len(repository.saved_hashes) == 1
+    persisted_hash = repository.saved_hashes[0]
+    assert persisted_hash.startswith("$argon2")
+    assert persisted_hash != legacy_hash
+    assert repository.get_by_email(admin.email).password_hash == persisted_hash
+
+
+def test_login_refreshes_outdated_argon_hash(monkeypatch: pytest.MonkeyPatch) -> None:
+    secret = pyotp.random_base32()
+    admin = AdminAccount(
+        admin_id="argon-1",
+        email="argon@example.com",
+        password_hash="$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$c29tZWhhc2g",
+        mfa_secret=secret,
+    )
+    repository = _RecordingPostgresRepository(admin)
+    sessions = SessionStore()
+    service = AuthService(repository, sessions)
+
+    class _StubHasher:
+        def verify(self, password: str, stored_hash: str) -> bool:
+            assert password == "Updatable!"
+            assert stored_hash == admin.password_hash
+            return True
+
+        def needs_update(self, stored_hash: str) -> bool:
+            assert stored_hash == admin.password_hash
+            return True
+
+        def hash(self, password: str) -> str:
+            assert password == "Updatable!"
+            return "$argon2id$v=19$m=65536,t=3,p=4$bmV3c2FsdA$bmV3aGFzaA"
+
+    monkeypatch.setattr(auth_service_module, "_ARGON2_HASHER", _StubHasher())
+
+    code = pyotp.TOTP(secret).now()
+
+    service.login(
+        email=admin.email,
+        password="Updatable!",
+        mfa_code=code,
+        ip_address=None,
+    )
+
+    assert repository.saved_hashes == ["$argon2id$v=19$m=65536,t=3,p=4$bmV3c2FsdA$bmV3aGFzaA"]
+    assert (
+        repository.get_by_email(admin.email).password_hash
+        == "$argon2id$v=19$m=65536,t=3,p=4$bmV3c2FsdA$bmV3aGFzaA"
     )
 
 

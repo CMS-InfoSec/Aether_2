@@ -303,6 +303,7 @@ class AuthService:
                 return False
             if _ARGON2_HASHER.needs_update(stored_hash):
                 admin.password_hash = hash_password(password)
+                self._repository.add(admin)
             return True
 
         # Backwards compatibility with legacy SHA-256 hashes.
@@ -310,6 +311,7 @@ class AuthService:
         if hmac.compare_digest(candidate, stored_hash):
             # Upgrade legacy hash on successful login.
             admin.password_hash = hash_password(password)
+            self._repository.add(admin)
             return True
         return False
 
