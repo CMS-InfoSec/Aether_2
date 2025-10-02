@@ -5,8 +5,9 @@ enterprise-grade authentication flow backed by Azure Active Directory
 (Azure AD / Microsoft 365).  The login process relies on OIDC for the
 initial identity verification and then enforces a time-based one-time
 password (TOTP) challenge.  Successful MFA verification results in a
-short-lived admin JWT (15 minutes) and an accompanying refresh token
-which can be traded in for new access tokens when the old one expires.
+short-lived JWT (15 minutes) tagged with the caller's role and an
+accompanying refresh token which can be traded in for new access tokens
+when the old one expires.
 
 The service exposes a handful of endpoints:
 
@@ -14,7 +15,7 @@ The service exposes a handful of endpoints:
 * ``POST /auth/callback`` - processes the authorization code and starts MFA.
 * ``POST /auth/mfa/totp`` - verifies the TOTP code and issues tokens.
 * ``POST /auth/refresh`` - exchanges a refresh token for a new access token.
-* ``GET /auth/status`` - reports whether the caller holds a valid admin JWT.
+* ``GET /auth/status`` - reports whether the caller holds a valid JWT and returns the claims.
 * ``POST /auth/logout`` - revokes refresh tokens and ends the session.
 
 The implementation intentionally keeps state in-memory for simplicity.  In a
@@ -63,12 +64,18 @@ class AzureOIDCSettings(BaseModel):
 
 
 class AuthSettings(BaseModel):
-    """Runtime configuration for token issuance and MFA."""
+    """Runtime configuration for token issuance, MFA and role mapping."""
 
     jwt_secret: SecretStr = Field(..., description="HS256 secret used for signing access tokens")
     jwt_issuer: str = Field(default="aether/auth", description="JWT issuer claim")
     access_token_ttl_seconds: int = Field(default=900, description="Access token lifetime (15 minutes)")
     refresh_token_ttl_seconds: int = Field(default=86400, description="Refresh token lifetime (1 day)")
+    auditor_accounts: tuple[str, ...] = Field(
+        default_factory=tuple,
+        description=(
+            "Accounts (email/UPN) that should receive the read-only 'auditor' role."
+        ),
+    )
 
 
 class AuthorizationURLResponse(BaseModel):
@@ -120,6 +127,7 @@ class _PendingSession(BaseModel):
 
 class _RefreshTokenState(BaseModel):
     user_id: str
+    role: str
     expires_at: float
 
 
@@ -159,6 +167,7 @@ class AuthService:
         self._sessions: Dict[str, _PendingSession] = {}
         self._refresh_tokens: Dict[str, _RefreshTokenState] = {}
         self._http_client = httpx.AsyncClient(timeout=10.0)
+        self._auditor_accounts = {acct.lower() for acct in self.settings.auditor_accounts}
 
     async def close(self) -> None:
         await self._http_client.aclose()
@@ -209,9 +218,11 @@ class AuthService:
         self._sessions[session_id] = _PendingSession(user_info=user_info, totp_secret=secret, expires_at=expires_at)
         return OIDCCallbackResponse(session_id=session_id, totp_provisioning_uri=provisioning_uri)
 
-    def _issue_tokens(self, user_info: Dict[str, Any]) -> TokenPair:
+    def _issue_tokens(self, user_info: Dict[str, Any], role: Optional[str] = None) -> TokenPair:
         now = int(time.time())
         expires_at = now + self.settings.access_token_ttl_seconds
+        resolved_role = role or self._resolve_role(user_info)
+        permissions = self._permissions_for_role(resolved_role)
         payload = {
             "iss": self.settings.jwt_issuer,
             "iat": now,
@@ -219,13 +230,42 @@ class AuthService:
             "sub": user_info.get("sub") or user_info.get("email"),
             "email": user_info.get("email"),
             "name": user_info.get("name") or user_info.get("given_name"),
-            "role": "admin",
+            "role": resolved_role,
+            "permissions": sorted(permissions),
+            "read_only": resolved_role == "auditor",
         }
         access_token = self._encode_jwt(payload)
         refresh_token = secrets.token_urlsafe(48)
         refresh_expires = now + self.settings.refresh_token_ttl_seconds
-        self._refresh_tokens[refresh_token] = _RefreshTokenState(user_id=payload["sub"], expires_at=refresh_expires)
+        self._refresh_tokens[refresh_token] = _RefreshTokenState(
+            user_id=payload["sub"], role=resolved_role, expires_at=refresh_expires
+        )
         return TokenPair(access_token=access_token, refresh_token=refresh_token, expires_in=self.settings.access_token_ttl_seconds)
+
+    def _resolve_role(self, user_info: Dict[str, Any]) -> str:
+        candidate = (
+            user_info.get("email")
+            or user_info.get("preferred_username")
+            or user_info.get("sub")
+            or ""
+        )
+        normalized = str(candidate).strip().lower()
+        if normalized and normalized in self._auditor_accounts:
+            return "auditor"
+        return "admin"
+
+    @staticmethod
+    def _permissions_for_role(role: str) -> set[str]:
+        base_permissions = {
+            "view_reports",
+            "view_logs",
+            "view_trades",
+        }
+        if role == "auditor":
+            return base_permissions
+        if role == "admin":
+            return base_permissions | {"place_orders", "modify_configs"}
+        return set()
 
     def _encode_jwt(self, payload: Dict[str, Any]) -> str:
         header = {"alg": "HS256", "typ": "JWT"}
@@ -259,8 +299,9 @@ class AuthService:
         payload = json.loads(self._b64decode(payload_b64))
         if payload.get("exp") and int(payload["exp"]) < int(time.time()):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired")
-        if payload.get("role") != "admin":
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin role required")
+        role = payload.get("role")
+        if role not in {"admin", "auditor"}:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unsupported role")
         return payload
 
     def verify_totp_and_issue_tokens(self, session_id: str, totp_code: str) -> TokenPair:
@@ -287,7 +328,7 @@ class AuthService:
         # Keep the refresh token one-time use by rotating it
         self._refresh_tokens.pop(refresh_token, None)
         user_info = {"sub": state.user_id, "email": state.user_id}
-        return self._issue_tokens(user_info)
+        return self._issue_tokens(user_info, role=state.role)
 
     def logout(self, refresh_token: Optional[str], token: Optional[str]) -> None:
         if refresh_token:
@@ -329,9 +370,16 @@ def _load_default_auth_service() -> AuthService:
         client_secret=SecretStr(os.getenv("AZURE_AD_CLIENT_SECRET", "development-secret")),
         redirect_uri=os.getenv("AZURE_AD_REDIRECT_URI", "http://localhost:8000/auth/callback"),
     )
+    auditors_env = os.getenv("AUTH_AUDITOR_ACCOUNTS", "")
+    auditor_accounts = tuple(
+        account.strip()
+        for account in auditors_env.split(",")
+        if account.strip()
+    )
     settings = AuthSettings(
         jwt_secret=SecretStr(os.getenv("AUTH_JWT_SECRET", secrets.token_urlsafe(32))),
         jwt_issuer=os.getenv("AUTH_JWT_ISSUER", "aether/auth"),
+        auditor_accounts=auditor_accounts,
     )
     return AuthService(oidc=oidc, settings=settings)
 

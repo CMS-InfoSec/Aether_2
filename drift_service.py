@@ -124,6 +124,9 @@ DRIFT_FLAGS_TOTAL = Gauge(
 
 PSI_THRESHOLD = 0.2
 ROLLBACK_THRESHOLD = 0.2
+PROMOTION_WINDOW = int(os.getenv("CANARY_PROMOTION_WINDOW", "3"))
+PROMOTION_THRESHOLD = float(os.getenv("CANARY_PROMOTION_THRESHOLD", "0.05"))
+PROMOTION_STABILITY_DELTA = float(os.getenv("CANARY_PROMOTION_STABILITY_DELTA", "0.1"))
 MAX_ALERTS_RETURNED = 100
 
 _daily_task: asyncio.Task[None] | None = None
@@ -695,19 +698,19 @@ def _submit_retraining_workflow(
         }
 
 
-def _rollback_canary_model() -> Dict[str, Any]:
-    """Rollback the canary model when it underperforms production."""
+def _get_mlflow_client() -> tuple[Any | None, str | None, Dict[str, Any] | None]:
+    """Initialise an MLflow client when model registry configuration is present."""
 
     model_name = os.getenv("MODEL_REGISTRY_NAME")
     if not model_name:
-        return {"status": "skipped", "reason": "model_registry_not_configured"}
+        return None, None, {"status": "skipped", "reason": "model_registry_not_configured"}
 
     try:  # pragma: no cover - optional dependency path.
         import mlflow
         from mlflow.tracking import MlflowClient
     except Exception as exc:  # pragma: no cover - optional dependency path.
-        LOGGER.warning("MLflow unavailable for rollback: %s", exc)
-        return {"status": "skipped", "reason": "mlflow_unavailable"}
+        LOGGER.warning("MLflow unavailable: %s", exc)
+        return None, model_name, {"status": "skipped", "reason": "mlflow_unavailable"}
 
     tracking_uri = os.getenv("MLFLOW_TRACKING_URI")
     registry_uri = os.getenv("MLFLOW_REGISTRY_URI", tracking_uri)
@@ -716,7 +719,131 @@ def _rollback_canary_model() -> Dict[str, Any]:
     if registry_uri:
         mlflow.set_registry_uri(registry_uri)
 
-    client = MlflowClient()
+    try:
+        client = MlflowClient()
+    except Exception as exc:  # pragma: no cover - network failure path.
+        LOGGER.exception("Failed to initialise MLflow client: %s", exc)
+        return None, model_name, {"status": "failed", "reason": str(exc)}
+
+    return client, model_name, None
+
+
+def _deploy_canary_model() -> Dict[str, Any]:
+    """Transition the latest staging model to the canary stage for live evaluation."""
+
+    client, model_name, failure = _get_mlflow_client()
+    if failure is not None:
+        return failure
+    if client is None or model_name is None:
+        return {"status": "skipped", "reason": "mlflow_client_unavailable"}
+
+    try:
+        versions = client.search_model_versions(f"name='{model_name}'")
+    except Exception as exc:  # pragma: no cover - network failure path.
+        LOGGER.exception("Failed to fetch model versions for canary deploy: %s", exc)
+        return {"status": "failed", "reason": str(exc)}
+
+    staging_versions = [
+        version
+        for version in versions
+        if str(version.current_stage).lower() == "staging"
+    ]
+    canary_versions = [
+        version
+        for version in versions
+        if str(version.current_stage).lower() == "canary"
+    ]
+
+    if not staging_versions:
+        return {"status": "skipped", "reason": "no_staging_model"}
+
+    latest_staging = max(staging_versions, key=lambda mv: int(mv.version))
+
+    for canary in canary_versions:
+        if int(canary.version) == int(latest_staging.version):
+            continue
+        try:
+            client.transition_model_version_stage(
+                name=model_name,
+                version=canary.version,
+                stage="Archived",
+                archive_existing_versions=False,
+            )
+        except Exception as exc:  # pragma: no cover - network failure path.
+            LOGGER.warning(
+                "Failed to archive previous canary version %s: %s", canary.version, exc
+            )
+
+    try:
+        client.transition_model_version_stage(
+            name=model_name,
+            version=latest_staging.version,
+            stage="Canary",
+            archive_existing_versions=False,
+        )
+    except Exception as exc:  # pragma: no cover - network failure path.
+        LOGGER.exception("Failed to transition model version %s to canary: %s", latest_staging.version, exc)
+        return {"status": "failed", "reason": str(exc)}
+
+    return {
+        "status": "deployed",
+        "model_name": model_name,
+        "canary_version": latest_staging.version,
+    }
+
+
+def _promote_canary_model() -> Dict[str, Any]:
+    """Promote the active canary to production when metrics are stable."""
+
+    client, model_name, failure = _get_mlflow_client()
+    if failure is not None:
+        return failure
+    if client is None or model_name is None:
+        return {"status": "skipped", "reason": "mlflow_client_unavailable"}
+
+    try:
+        versions = client.search_model_versions(f"name='{model_name}'")
+    except Exception as exc:  # pragma: no cover - network failure path.
+        LOGGER.exception("Failed to fetch model versions for promotion: %s", exc)
+        return {"status": "failed", "reason": str(exc)}
+
+    canary_versions = [
+        version
+        for version in versions
+        if str(version.current_stage).lower() == "canary"
+    ]
+    if not canary_versions:
+        return {"status": "skipped", "reason": "no_canary_model"}
+
+    latest_canary = max(canary_versions, key=lambda mv: int(mv.version))
+
+    try:
+        client.transition_model_version_stage(
+            name=model_name,
+            version=latest_canary.version,
+            stage="Production",
+            archive_existing_versions=True,
+        )
+    except Exception as exc:  # pragma: no cover - network failure path.
+        LOGGER.exception("Failed to promote canary model version %s: %s", latest_canary.version, exc)
+        return {"status": "failed", "reason": str(exc)}
+
+    return {
+        "status": "promoted",
+        "model_name": model_name,
+        "canary_version": latest_canary.version,
+    }
+
+
+def _rollback_canary_model() -> Dict[str, Any]:
+    """Rollback the canary model when it underperforms production."""
+
+    client, model_name, failure = _get_mlflow_client()
+    if failure is not None:
+        return failure
+    if client is None or model_name is None:
+        return {"status": "skipped", "reason": "mlflow_client_unavailable"}
+
     try:
         versions = client.search_model_versions(f"name='{model_name}'")
     except Exception as exc:  # pragma: no cover - network failure path.
@@ -811,6 +938,127 @@ def _evaluate_performance_and_mitigate(
     )
 
 
+def _fetch_performance_history(
+    conn: psycopg2.extensions.connection, stage: str, limit: int
+) -> List[ModelPerformance]:
+    """Return the most recent ``limit`` performance entries for a stage."""
+
+    if limit <= 0:
+        return []
+
+    query = """
+        SELECT model_stage, evaluated_at, sharpe_ratio, sortino_ratio
+        FROM model_performance
+        WHERE LOWER(model_stage) = LOWER(%s)
+        ORDER BY evaluated_at DESC
+        LIMIT %s
+    """
+
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            cursor.execute(query, (stage, limit))
+            rows = cursor.fetchall()
+    except errors.UndefinedTable:
+        return []
+
+    history: List[ModelPerformance] = []
+    for row in rows:
+        history.append(
+            ModelPerformance(
+                stage=str(row.get("model_stage", stage)).lower(),
+                evaluated_at=row["evaluated_at"],
+                sharpe=float(row.get("sharpe_ratio", 0.0)),
+                sortino=float(row.get("sortino_ratio", 0.0)),
+            )
+        )
+    return history
+
+
+def _is_metric_stable(values: Sequence[float]) -> bool:
+    """Return ``True`` when the metric range is below the configured delta."""
+
+    if len(values) < 2:
+        return True
+    upper = max(values)
+    lower = min(values)
+    return abs(upper - lower) <= PROMOTION_STABILITY_DELTA
+
+
+def _canary_ready_for_promotion(
+    conn: psycopg2.extensions.connection,
+) -> bool:
+    """Determine if the canary has met stability requirements for promotion."""
+
+    if PROMOTION_WINDOW <= 0:
+        return False
+
+    canary_history = _fetch_performance_history(conn, "canary", PROMOTION_WINDOW)
+    if len(canary_history) < PROMOTION_WINDOW:
+        return False
+
+    prod_history = _fetch_performance_history(conn, "prod", PROMOTION_WINDOW)
+    if len(prod_history) < PROMOTION_WINDOW:
+        prod_history = _fetch_performance_history(conn, "production", PROMOTION_WINDOW)
+    if len(prod_history) < PROMOTION_WINDOW:
+        return False
+
+    sharpe_drops = [
+        _relative_degradation(canary.sharpe, prod.sharpe)
+        for canary, prod in zip(canary_history, prod_history)
+    ]
+    sortino_drops = [
+        _relative_degradation(canary.sortino, prod.sortino)
+        for canary, prod in zip(canary_history, prod_history)
+    ]
+
+    if not sharpe_drops or not sortino_drops:
+        return False
+
+    if max(sharpe_drops) > PROMOTION_THRESHOLD:
+        return False
+    if max(sortino_drops) > PROMOTION_THRESHOLD:
+        return False
+
+    sharpe_stable = _is_metric_stable([entry.sharpe for entry in canary_history])
+    sortino_stable = _is_metric_stable([entry.sortino for entry in canary_history])
+    if not (sharpe_stable and sortino_stable):
+        return False
+
+    avg_sharpe_canary = sum(entry.sharpe for entry in canary_history) / len(canary_history)
+    avg_sharpe_prod = sum(entry.sharpe for entry in prod_history) / len(prod_history)
+    avg_sortino_canary = sum(entry.sortino for entry in canary_history) / len(canary_history)
+    avg_sortino_prod = sum(entry.sortino for entry in prod_history) / len(prod_history)
+
+    return avg_sharpe_canary >= avg_sharpe_prod and avg_sortino_canary >= avg_sortino_prod
+
+
+def _maybe_promote_canary(
+    conn: psycopg2.extensions.connection, checked_at: datetime
+) -> None:
+    """Promote a canary automatically when metrics are stable."""
+
+    if not _canary_ready_for_promotion(conn):
+        return
+
+    promotion_details = _promote_canary_model()
+    status_value = promotion_details.get("status")
+    if status_value == "promoted":
+        action = "canary_promoted"
+    elif status_value == "failed":
+        action = "canary_promotion_failed"
+    else:
+        return
+
+    _record_alert(
+        conn,
+        triggered_at=checked_at,
+        action=action,
+        feature_name=None,
+        psi_score=None,
+        details=promotion_details,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Drift evaluation
 # ---------------------------------------------------------------------------
@@ -870,21 +1118,45 @@ def _run_drift_detection() -> DriftStatus:
 
         _persist_results(conn, checked_at, metrics)
 
+        canary_deploy_details: Dict[str, Any] | None = None
         if psi_breaches:
             submission_details = _submit_retraining_workflow(
                 tuple(sorted(psi_breaches)), checked_at
             )
+            canary_deploy_details = _deploy_canary_model()
             for feature_name, psi_value in psi_breaches.items():
+                alert_details: Dict[str, Any] = {"psi": psi_value, **submission_details}
+                if canary_deploy_details is not None:
+                    alert_details["canary_deploy"] = canary_deploy_details
                 _record_alert(
                     conn,
                     triggered_at=checked_at,
                     feature_name=feature_name,
                     psi_score=psi_value,
                     action="retraining_triggered",
-                    details={"psi": psi_value, **submission_details},
+                    details=alert_details,
+                )
+
+        if canary_deploy_details is not None:
+            status_value = canary_deploy_details.get("status")
+            if status_value == "deployed":
+                action = "canary_deployed"
+            elif status_value == "failed":
+                action = "canary_deploy_failed"
+            else:
+                action = None
+            if action:
+                _record_alert(
+                    conn,
+                    triggered_at=checked_at,
+                    feature_name=None,
+                    psi_score=None,
+                    action=action,
+                    details=canary_deploy_details,
                 )
 
         _evaluate_performance_and_mitigate(conn, checked_at)
+        _maybe_promote_canary(conn, checked_at)
 
     DRIFT_FEATURES_TOTAL.set(len(metrics))
     DRIFT_FLAGS_TOTAL.set(sum(1 for metric in metrics if metric.flagged))

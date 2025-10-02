@@ -677,6 +677,8 @@ class AccountContext:
         self._child_results: Dict[str, OMSOrderStatusResponse] = {}
         self._positions: Dict[str, Dict[str, Decimal]] = {}
         self._positions_lock = asyncio.Lock()
+        self._balances: Dict[str, Decimal] = {}
+        self._balances_lock = asyncio.Lock()
         self.routing = LatencyRouter(account_id)
 
         self._impact_store: ImpactAnalyticsStore = impact_store
@@ -922,6 +924,46 @@ class AccountContext:
                 )
         return applied
 
+    async def resync_balances(self) -> int:
+        await self.start()
+
+        if self.rest_client is None:
+            return 0
+
+        try:
+            payload = await self.rest_client.balance()
+        except KrakenRESTError as exc:
+            logger.warning(
+                "Failed to fetch balances for account %s: %s",
+                self.account_id,
+                exc,
+            )
+            return 0
+
+        balances = self._parse_rest_balances(payload)
+        async with self._balances_lock:
+            previous = dict(self._balances)
+            self._balances.clear()
+            self._balances.update(balances)
+
+        changed = 0
+        for asset, amount in balances.items():
+            if previous.get(asset) != amount:
+                changed += 1
+        for asset in previous:
+            if asset not in balances:
+                changed += 1
+
+        return changed
+
+    async def get_local_balances(self) -> Dict[str, Decimal]:
+        async with self._balances_lock:
+            return dict(self._balances)
+
+    async def update_local_balances(self, balances: Dict[str, Decimal]) -> None:
+        async with self._balances_lock:
+            self._balances = dict(balances)
+
     async def apply_fill_event(self, payload: Dict[str, Any]) -> bool:
         state = self._state_from_payload(payload, default_status="filled", transport="kafka")
         if state is None:
@@ -1093,6 +1135,28 @@ class AccountContext:
                     position for position in positions_section.values() if isinstance(position, dict)
                 )
         return positions
+
+    def _parse_rest_balances(self, payload: Dict[str, Any] | None) -> Dict[str, Decimal]:
+        if not isinstance(payload, dict):
+            return {}
+
+        balances: Dict[str, Decimal] = {}
+        result = payload.get("result")
+        if isinstance(result, dict):
+            source = result
+        elif isinstance(payload.get("balances"), dict):
+            source = payload["balances"]
+        else:
+            source = None
+
+        if isinstance(source, dict):
+            for asset, value in source.items():
+                decimal_value = self._extract_decimal(value)
+                if decimal_value is None:
+                    continue
+                balances[str(asset)] = decimal_value
+
+        return balances
 
     def _state_from_payload(
         self,
