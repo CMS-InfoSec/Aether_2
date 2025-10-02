@@ -12,7 +12,7 @@ Features provided by the mock:
 * Behaviour toggles for probabilistic partial fills, rejections and cancels.
 * Latency simulation for both synchronous (WS) and asynchronous (REST) paths.
 * Random latency spikes and WebSocket failure simulation.
-* Runtime behaviour modes (``normal``, ``delayed``, ``failing``, ``crash``)
+* Runtime behaviour modes (``normal``, ``delayed``, ``failing``, ``crash``, ``timeout``)
   that allow tests to exercise orchestration logic under adverse conditions.
 * Random as well as scheduled error injection to exercise retry paths.
 * Pytest fixtures that expose the mock in a convenient form for integration
@@ -184,6 +184,7 @@ class MockKrakenExchange:
         self._error_rate = self.config.error_rate
         self._mode = "normal"
         self._crashed = False
+        self._timeout = False
         self._ws_sessions: set["MockKrakenWSSession"] = set()
         self._apply_mode(self.config.mode)
 
@@ -285,10 +286,11 @@ class MockKrakenExchange:
         self._cancel_rate = self._default_cancel_rate
         self._mode = normalised
         self._crashed = False
+        self._timeout = False
 
         if normalised == "normal":
             return
-        if normalised == "delayed":
+        if normalised in {"delayed", "delay"}:
             low, high = self._latency_range
             low = max(low, 0.25)
             high = max(high, 0.75)
@@ -309,6 +311,9 @@ class MockKrakenExchange:
             return
         if normalised == "crash":
             self._crashed = True
+            return
+        if normalised == "timeout":
+            self._timeout = True
             return
         raise ValueError(f"Unknown mock Kraken mode: {mode!r}")
 
@@ -343,6 +348,7 @@ class MockKrakenExchange:
         self._error_rate = self._default_error_rate
         self._mode = "normal"
         self._crashed = False
+        self._timeout = False
         self._apply_mode(self.config.mode)
         self.simulate_ws_failure()
 
@@ -588,6 +594,8 @@ class MockKrakenExchange:
     def _maybe_raise(self, method: str) -> None:
         if self._crashed:
             raise MockKrakenCrashed("Mock Kraken exchange is in crash mode")
+        if self._timeout:
+            raise asyncio.TimeoutError("Mock Kraken exchange timed out")
         queue = self._error_queues.get(method)
         if queue:
             raise queue.popleft()
@@ -640,14 +648,14 @@ class MockKrakenWSSession:
     def request(self, channel: str, payload: Dict[str, Any], timeout: float | None = None) -> Dict[str, Any]:
         if self._closed:
             raise MockKrakenTransportClosed("websocket session closed")
-        if channel == "add_order":
+        if channel in {"add_order", "addOrder"}:
             return self._exchange.place_order_ws(payload)
-        if channel == "cancel_order":
+        if channel in {"cancel_order", "cancelOrder"}:
             return self._exchange.cancel_order_ws(payload)
         if channel == "openOrders":
             account = payload.get("account") or payload.get("userref")
             return self._exchange.open_orders(account=account)
-        if channel == "ownTrades":
+        if channel in {"ownTrades", "getTrades"}:
             account = payload.get("account") or payload.get("userref")
             trades = [
                 trade
@@ -655,7 +663,7 @@ class MockKrakenWSSession:
                 if account is None or trade.account == account
             ]
             return {"trades": [trade.to_dict() for trade in trades]}
-        if channel == "getBalance":
+        if channel in {"getBalance", "get_balance"}:
             account = payload.get("account") or payload.get("userref") or "company"
             return {"balances": self._exchange._balances.get(account, {})}
         raise ValueError(f"Unsupported channel: {channel}")
@@ -678,8 +686,18 @@ class MockKrakenRESTClient:
     async def add_order(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         return await self._exchange.place_order_rest(payload)
 
+    async def addOrder(self, payload: Dict[str, Any]) -> Dict[str, Any]:  # noqa: N802
+        """CamelCase alias mirroring the real Kraken REST endpoint name."""
+
+        return await self.add_order(payload)
+
     async def cancel_order(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         return await self._exchange.cancel_order_rest(payload)
+
+    async def cancelOrder(self, payload: Dict[str, Any]) -> Dict[str, Any]:  # noqa: N802
+        """CamelCase alias mirroring the real Kraken REST endpoint name."""
+
+        return await self.cancel_order(payload)
 
     async def open_orders(self, *, account: Optional[str] = None) -> Dict[str, Any]:
         await self._exchange._simulate_latency_async()
@@ -688,6 +706,14 @@ class MockKrakenRESTClient:
     async def balance(self, account: str = "company") -> Dict[str, float]:
         return await self._exchange.get_balance(account)
 
+    async def get_balance(self, account: str = "company") -> Dict[str, float]:
+        return await self.balance(account)
+
+    async def getBalance(self, account: str = "company") -> Dict[str, float]:  # noqa: N802
+        """CamelCase alias for compatibility with existing test helpers."""
+
+        return await self.balance(account)
+
     async def trades(
         self,
         *,
@@ -695,6 +721,24 @@ class MockKrakenRESTClient:
         pair: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         return await self._exchange.get_trades(account=account, pair=pair)
+
+    async def get_trades(
+        self,
+        *,
+        account: Optional[str] = None,
+        pair: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        return await self.trades(account=account, pair=pair)
+
+    async def getTrades(
+        self,
+        *,
+        account: Optional[str] = None,
+        pair: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:  # noqa: N802
+        """CamelCase alias for ``get_trades``."""
+
+        return await self.trades(account=account, pair=pair)
 
     async def close(self) -> None:  # pragma: no cover - symmetry with aiohttp
         return None
