@@ -424,7 +424,10 @@ def test_full_pipeline_records_audit_metrics_and_safe_mode(
         "instrument": "BTC-USD",
         "side": "buy",
         "quantity": 0.2,
-        "price": 30000.0,
+        # The mock Kraken server only fills buy limits that cross the reference ask
+        # (base 30_000 plus half the 20 bps spread = 30_010).  Use a higher price so
+        # the order executes and produces a fill for the assertions below.
+        "price": 30050.0,
         "features": [0.12, 0.18, 0.22],
     }
 
@@ -921,4 +924,229 @@ def test_policy_risk_oms_flow_emits_hashed_audit_and_metrics(
     if prior_oms_latency:
         assert updated_oms_latency >= prior_oms_latency
     assert updated_oms_latency == pytest.approx(11.2, rel=1e-3)
+
+
+@pytest.mark.integration
+def test_trading_sequencer_lifecycle_preserves_correlation_and_audit_chain(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    kraken_mock_server: MockKrakenServer,
+) -> None:
+    """Exercise the sequencer against mock services and verify lifecycle integrity."""
+
+    TimescaleAdapter.reset()
+    KafkaNATSAdapter.reset()
+    safe_mode.controller.reset()
+
+    class _PsycopgStub:
+        def __init__(self) -> None:
+            self.statements: List[Dict[str, Any]] = []
+
+        class _Connection:
+            def __init__(self, outer: "_PsycopgStub") -> None:
+                self._outer = outer
+
+            def __enter__(self) -> "_PsycopgStub._Connection":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> bool:  # noqa: ANN001
+                return False
+
+            def cursor(self) -> "_PsycopgStub._Cursor":
+                return _PsycopgStub._Cursor(self._outer)
+
+        class _Cursor:
+            def __init__(self, outer: "_PsycopgStub") -> None:
+                self._outer = outer
+
+            def __enter__(self) -> "_PsycopgStub._Cursor":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> bool:  # noqa: ANN001
+                return False
+
+            def execute(self, query: str, params: Iterable[Any]) -> None:
+                self._outer.statements.append({"query": query, "params": list(params)})
+
+        def connect(self, dsn: str) -> "_PsycopgStub._Connection":  # noqa: D401 - stub signature
+            return _PsycopgStub._Connection(self)
+
+    psycopg_stub = _PsycopgStub()
+
+    audit_log_path = tmp_path / "audit_chain.log"
+    audit_state_path = tmp_path / "audit_chain_state.json"
+    monkeypatch.setenv("AUDIT_DATABASE_URL", "postgresql://audit:audit@localhost/audit")
+    monkeypatch.setenv("AUDIT_CHAIN_LOG", str(audit_log_path))
+    monkeypatch.setenv("AUDIT_CHAIN_STATE", str(audit_state_path))
+    monkeypatch.setattr(audit_logger, "psycopg", psycopg_stub)
+    monkeypatch.setattr(audit_logger, "_PSYCOPG_IMPORT_ERROR", None, raising=False)
+
+    policy_client = TestClient(policy_service.app)
+    risk_http_client = TestClient(risk_service.app)
+    fees_client = TestClient(fees_app)
+
+    confidence = factories.confidence(overall_confidence=0.96)
+    intent_stub = policy_service.Intent(
+        edge_bps=37.0,
+        confidence=confidence,
+        take_profit_bps=62.0,
+        stop_loss_bps=28.0,
+        selected_action="maker",
+        action_templates=list(factories.action_templates()),
+        approved=True,
+        reason=None,
+    )
+    monkeypatch.setattr(policy_service, "predict_intent", lambda **_: intent_stub)
+    policy_service.ENABLE_SHADOW_EXECUTION = False
+
+    async def fake_fetch_effective_fee(
+        account_id: str, symbol: str, liquidity: str, notional: float
+    ) -> float:
+        response = fees_client.get(
+            "/fees/effective",
+            params={
+                "pair": symbol,
+                "liquidity": liquidity,
+                "notional": f"{max(notional, 0.0):.8f}",
+            },
+            headers={"X-Account-ID": account_id},
+        )
+        response.raise_for_status()
+        return float(response.json()["bps"])
+
+    monkeypatch.setattr(policy_service, "_fetch_effective_fee", fake_fetch_effective_fee)
+
+    class _Limits:
+        def __init__(self) -> None:
+            self.account_id = "company"
+            self.max_daily_loss = 250_000.0
+            self.fee_budget = 50_000.0
+            self.max_nav_pct_per_trade = 0.35
+            self.notional_cap = 5_000_000.0
+            self.cooldown_minutes = 0
+
+    async def fake_evaluate(context: risk_service.RiskEvaluationContext) -> risk_service.RiskValidationResponse:
+        return risk_service.RiskValidationResponse(pass_=True, reasons=[])
+
+    monkeypatch.setattr(risk_service, "_load_account_limits", lambda _: _Limits())
+    monkeypatch.setattr(risk_service, "_evaluate", fake_evaluate)
+    monkeypatch.setattr(risk_service, "_refresh_usage_from_fills", lambda *_, **__: None)
+
+    account_id = "company"
+    order_id = "INT-END2END-001"
+    symbol = "BTC-USD"
+    features = [0.21, 0.34, 0.55]
+
+    decision_request = factories.policy_decision_request(
+        account_id=account_id,
+        order_id=order_id,
+        instrument=symbol,
+        side="BUY",
+        quantity=0.4,
+        price=30_150.0,
+        features=features,
+    )
+    decision_response = policy_client.post(
+        "/policy/decide",
+        json=decision_request.model_dump(mode="json"),
+        headers={"X-Account-ID": account_id},
+    )
+    decision_response.raise_for_status()
+    decision = PolicyDecisionResponse.model_validate(decision_response.json())
+    assert decision.approved is True
+
+    audit_store = AuditLogStore()
+    audit_writer = TimescaleAuditLogger(audit_store)
+    recorder = SensitiveActionRecorder(audit_writer)
+    pnl_tracker = TrackingPnLTracker(recorder=recorder, account_id=account_id)
+
+    risk_client = HttpRiskServiceClient(client=risk_http_client, risk_module=risk_service)
+    oms_client = MockOMSClient(server=kraken_mock_server)
+
+    sequencer = TradingSequencer(
+        risk_service=risk_client,
+        oms=oms_client,
+        pnl_tracker=pnl_tracker,
+    )
+
+    raw_intent = {
+        "account_id": account_id,
+        "order_id": order_id,
+        "instrument": symbol,
+        "symbol": symbol,
+        "side": "buy",
+        "quantity": decision_request.quantity,
+        "price": decision_request.price,
+        "features": features,
+    }
+    event = IntentEvent(
+        account_id=account_id,
+        symbol=symbol,
+        intent=raw_intent,
+        ts=datetime.now(timezone.utc),
+    )
+    pnl_tracker.register_intent(event)
+
+    result = asyncio.run(sequencer.process_intent(event))
+
+    assert result.status == "filled"
+    assert result.correlation_id
+    assert result.decision and result.decision.get("pass") is True
+    assert oms_client.orders and oms_client.orders[0]["decision"].get("approved", True)
+    assert oms_client.fills
+    assert risk_client.validations
+    assert risk_client.validations[0]["response"].get("pass") is True
+    assert risk_client.fill_events
+
+    kafka_events = KafkaNATSAdapter(account_id=account_id).history()
+    assert kafka_events
+    correlation_ids = {entry["correlation_id"] for entry in kafka_events}
+    assert correlation_ids == {result.correlation_id}
+    expected_topics = {
+        "sequencer.intent",
+        "sequencer.decision",
+        "sequencer.order",
+        "sequencer.fill",
+        "sequencer.update",
+    }
+    assert expected_topics.issubset({entry["topic"] for entry in kafka_events})
+
+    fills = list(result.fills)
+    assert fills and fills[0]["details"]["price"] > 0.0
+
+    adapter = TimescaleAdapter(account_id=account_id)
+    fill_events = adapter.events()["fills"]
+    assert fill_events
+    recorded_pnl = fill_events[0]["pnl"]
+    assert pnl_tracker.records
+    assert pnl_tracker.records[0]["correlation_id"] == result.correlation_id
+    assert pytest.approx(pnl_tracker.records[0]["pnl"]) == recorded_pnl
+    usage = adapter.get_daily_usage()
+    assert usage["fee"] > 0.0 or usage["loss"] >= 0.0
+
+    audit_logger.log_audit(
+        actor="sequencer",
+        action="sequencer.fill",
+        entity=account_id,
+        before={"order_id": order_id},
+        after={"fill": result.fill_event},
+        ip_hash=audit_logger.hash_ip("127.0.0.1"),
+    )
+
+    assert audit_log_path.exists()
+    with audit_log_path.open("r", encoding="utf-8") as fh:
+        audit_entries = [json.loads(line) for line in fh if line.strip()]
+
+    assert audit_entries
+    previous_hash = audit_logger._GENESIS_HASH  # pylint: disable=protected-access
+    for entry in audit_entries:
+        expected_prev = hashlib.sha256(previous_hash.encode("utf-8")).hexdigest()
+        assert entry["prev_hash"] == expected_prev
+        canonical = audit_logger._canonical_payload(entry)  # pylint: disable=protected-access
+        serialized = audit_logger._canonical_serialized(canonical)  # pylint: disable=protected-access
+        expected_hash = hashlib.sha256((expected_prev + serialized).encode("utf-8")).hexdigest()
+        assert entry["hash"] == expected_hash
+        previous_hash = entry["hash"]
+
+    assert psycopg_stub.statements
 
