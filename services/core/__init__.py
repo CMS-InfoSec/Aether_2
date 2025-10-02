@@ -7,12 +7,20 @@ from .backpressure import (
     backpressure_controller,
 )
 from .sequencer import SequencerResult, TradingSequencer
+from .startup_manager import (
+    StartupManager,
+    StartupMode,
+    register as register_startup_manager,
+    router as startup_router,
+)
 
 __all__ = [
-    "BackpressureStatus",
-    "IntentBackpressure",
+
     "SequencerResult",
     "TradingSequencer",
-    "backpressure_app",
-    "backpressure_controller",
+    "StartupManager",
+    "StartupMode",
+    "register_startup_manager",
+    "startup_router",
+
 ]
