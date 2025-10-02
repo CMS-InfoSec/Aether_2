@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import logging
 import os
@@ -155,10 +156,10 @@ class DataKey:
 class LocalKMSEmulator:
     """Simple AES-GCM based KMS emulator for envelope encryption.
 
-    The emulator derives its master key from ``LOCAL_KMS_MASTER_KEY`` if provided.
-    The value must be base64 encoded. When the environment variable is missing, a
-    deterministic key is derived from ``LOCAL_KMS_KEY_ID`` to keep behaviour
-    stable across restarts in development environments.
+    The emulator requires a base64-encoded master key either supplied directly or
+    via the ``LOCAL_KMS_MASTER_KEY`` environment variable. Without a master key
+    the emulator refuses to start so we never accidentally encrypt credentials
+    with predictable development defaults.
     """
 
     default_key_id: ClassVar[str] = "local/aether-secrets"
@@ -182,13 +183,14 @@ class LocalKMSEmulator:
             return
         if master_key is None:
             env_value = os.getenv("LOCAL_KMS_MASTER_KEY")
-            if env_value:
-                try:
-                    master_key = base64.b64decode(env_value)
-                except Exception as exc:  # pragma: no cover - defensive guard
-                    raise EncryptionError("Invalid LOCAL_KMS_MASTER_KEY value") from exc
-            else:
-                master_key = base64.b64decode(_b64encode(self.key_id.encode("utf-8")))
+            if not env_value:
+                raise EncryptionError(
+                    "LOCAL_KMS_MASTER_KEY environment variable must be provided"
+                )
+            try:
+                master_key = base64.b64decode(env_value)
+            except (ValueError, binascii.Error) as exc:
+                raise EncryptionError("Invalid LOCAL_KMS_MASTER_KEY value") from exc
         normalized_key = self._normalize_master_key(master_key)
         self._activate_master_key(normalized_key, datetime.now(timezone.utc))
 

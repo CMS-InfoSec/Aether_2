@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import logging
+import os
 import re
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
@@ -90,9 +93,30 @@ _audit_logger = TimescaleAuditLogger(_audit_store)
 _auditor = SensitiveActionRecorder(_audit_logger)
 
 _MASTER_KEY_ROTATION_INTERVAL = timedelta(days=90)
-_encryptor = EnvelopeEncryptor(
-    LocalKMSEmulator(rotation_interval=_MASTER_KEY_ROTATION_INTERVAL)
-)
+def _load_master_key_material() -> bytes:
+    """Load the base64-encoded master key from the deployment secret."""
+
+    raw_key = os.getenv("SECRET_ENCRYPTION_KEY") or os.getenv("LOCAL_KMS_MASTER_KEY")
+    if not raw_key:
+        raise RuntimeError(
+            "Secrets service encryption key is not configured; set SECRET_ENCRYPTION_KEY"
+        )
+    try:
+        return base64.b64decode(raw_key)
+    except (ValueError, binascii.Error) as exc:
+        raise RuntimeError("Secrets service encryption key must be base64 encoded") from exc
+
+
+def _build_encryptor() -> EnvelopeEncryptor:
+    master_key = _load_master_key_material()
+    kms = LocalKMSEmulator(
+        master_key=master_key,
+        rotation_interval=_MASTER_KEY_ROTATION_INTERVAL,
+    )
+    return EnvelopeEncryptor(kms)
+
+
+_encryptor = _build_encryptor()
 _MASTER_KEY_CHECK_INTERVAL = timedelta(hours=6)
 
 

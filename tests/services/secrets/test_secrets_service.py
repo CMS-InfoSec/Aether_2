@@ -20,12 +20,30 @@ MFA_HEADERS = {"X-MFA-Context": "verified"}
 def kubernetes_core() -> MagicMock:
     core = MagicMock()
     secrets_service.app.dependency_overrides[secrets_service.get_core_v1_api] = lambda: core
+    secrets_service.app.dependency_overrides[secrets_service.require_admin_account] = (
+        lambda: "admin-eu"
+    )
+    secrets_service.app.dependency_overrides[secrets_service.require_mfa_context] = (
+        lambda: "verified"
+    )
+    secrets_service.app.dependency_overrides[
+        secrets_service.require_dual_director_confirmation
+    ] = lambda: ("director-a", "director-b")
     security.ADMIN_ACCOUNTS.add("admin-eu")
     try:
         yield core
     finally:
         security.ADMIN_ACCOUNTS.discard("admin-eu")
         secrets_service.app.dependency_overrides.pop(secrets_service.get_core_v1_api, None)
+        secrets_service.app.dependency_overrides.pop(
+            secrets_service.require_admin_account, None
+        )
+        secrets_service.app.dependency_overrides.pop(
+            secrets_service.require_mfa_context, None
+        )
+        secrets_service.app.dependency_overrides.pop(
+            secrets_service.require_dual_director_confirmation, None
+        )
 
 
 @pytest.fixture()

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import base64
+import os
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -14,6 +16,11 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
+
+
+_DEFAULT_MASTER_KEY = base64.b64encode(b"\x00" * 32).decode("ascii")
+os.environ.setdefault("SECRET_ENCRYPTION_KEY", _DEFAULT_MASTER_KEY)
+os.environ.setdefault("LOCAL_KMS_MASTER_KEY", _DEFAULT_MASTER_KEY)
 
 
 pytest_plugins = [

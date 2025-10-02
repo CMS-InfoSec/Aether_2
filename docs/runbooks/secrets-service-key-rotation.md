@@ -59,6 +59,9 @@ Provide a standardized procedure for rotating the AES encryption key that protec
    ```
    > **Note:** The GitOps base no longer includes a placeholder `secrets-service-config` Secret. This manual apply (or a sealed
    > secret committed to a secure repo) is the source of truth for the rotated key.
+   > The Secrets Service refuses to start without this secret because it injects the
+   > `SECRET_ENCRYPTION_KEY` environment variable used to unlock the local KMS
+   > emulator.
 3. Restart the deployment to pick up the new key:
    ```bash
    kubectl --context aether-staging rollout restart deployment/secrets-service
