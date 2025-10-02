@@ -307,6 +307,7 @@ class KrakenSession:
     ) -> None:
         self.account_id = account_id
         self._credential_provider = credential_provider
+        self._rate_limit_guard: RateLimitGuard = rate_limit_guard or shared_rate_limit_guard
         self._rest_client = KrakenRESTClient(
             credential_getter=lambda: self._credential_provider.get(self.account_id)
         )
@@ -314,6 +315,8 @@ class KrakenSession:
             credential_getter=lambda: self._credential_provider.get(self.account_id),
             stream_update_cb=self._on_state,
             rest_client=self._rest_client,
+            rate_limit_guard=self._rate_limit_guard,
+            account_id=self.account_id,
         )
         self._ws_task: Optional[asyncio.Task[None]] = None
         self._ready = asyncio.Event()
@@ -322,7 +325,6 @@ class KrakenSession:
         self._contexts: Dict[str, OrderContext] = {}
         self._client_lookup: Dict[str, str] = {}
         self._kafka = KafkaNATSAdapter(account_id=self.account_id)
-        self._rate_limit_guard: RateLimitGuard = rate_limit_guard or shared_rate_limit_guard
 
     async def ensure_started(self) -> None:
         if self._ready.is_set():
