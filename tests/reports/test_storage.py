@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+import pytest
+
+import reports.storage as storage_module
 from reports.storage import ArtifactStorage
 
 
@@ -82,3 +86,52 @@ def test_store_artifact_writes_expected_audit_log(tmp_path: Path) -> None:
     assert metadata_payload["size_bytes"] == len(b"payload")
     assert metadata_payload["object_key"] == artifact.object_key
     assert metadata_payload["storage_backend"] == "filesystem"
+
+
+class StubS3Client:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def put_object(self, **kwargs: Any) -> None:
+        self.calls.append(kwargs)
+
+
+def test_store_artifact_logs_target_descriptor_on_audit_failure_s3(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = ArtifactStorage(
+        tmp_path,
+        s3_bucket="aether-bucket",
+        s3_prefix="reports",
+        s3_client=StubS3Client(),
+    )
+    session = StubSession()
+
+    def boom(
+        self,
+        *,
+        actor: str,
+        entity_id: str,
+        metadata: Mapping[str, Any],
+        event_time: datetime,
+    ) -> None:
+        raise RuntimeError("audit failure")
+
+    monkeypatch.setattr(storage_module.AuditLogWriter, "artifact_stored", boom)
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(RuntimeError):
+            storage.store_artifact(
+                session,
+                account_id="acct-123",
+                object_key="reports/output.csv",
+                data=b"payload",
+                content_type="text/csv",
+            )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "Failed to write audit log entry for s3://aether-bucket/reports/acct-123/reports/output.csv"
+        in message
+        for message in messages
+    )
