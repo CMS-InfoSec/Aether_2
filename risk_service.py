@@ -29,6 +29,7 @@ from sqlalchemy.pool import StaticPool
 from statistics import mean
 
 
+from alerts import push_exchange_adapter_failure
 from exchange_adapter import get_exchange_adapter
 from metrics import (
     increment_trade_rejection,
@@ -404,6 +405,9 @@ _STUB_ACCOUNT_RETURNS: Dict[str, List[float]] = {
 }
 
 
+_STUB_ACCOUNT_USAGE: Dict[str, Dict[str, float]] = {}
+
+
 _STUB_FILLS: List[Dict[str, object]] = [
     {
         "account_id": "ACC-DEFAULT",
@@ -686,6 +690,7 @@ async def get_risk_limits(
         logger.exception("Unable to load risk limits for account %s", account_id)
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    await _refresh_usage_from_balance(account_id)
     usage = _load_account_usage(account_id)
     limit_model = AccountRiskLimitModel(
         account_id=limits.account_id,
@@ -724,6 +729,7 @@ async def get_position_size(
         logger.exception("Unable to load risk limits for account %s", account_id)
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    await _refresh_usage_from_balance(account_id)
     usage = _load_account_usage(account_id)
     sizer = PositionSizer(
         account_id,
@@ -1680,11 +1686,7 @@ async def _load_recent_fills(account_id: str) -> List[Dict[str, object]]:
     except NotImplementedError:
         return fallback
     except Exception as exc:  # pragma: no cover - defensive guard for optional integrations
-        logger.debug(
-            "Exchange adapter trade fetch failed for account %s: %s",
-            account_id,
-            exc,
-        )
+        _handle_exchange_adapter_failure(account_id, "get_trades", exc)
         return fallback
 
     normalized: List[Dict[str, object]] = []
@@ -1718,6 +1720,66 @@ async def _refresh_usage_from_fills(account_id: str, state: AccountPortfolioStat
     usage = _STUB_ACCOUNT_USAGE.setdefault(account_id, {})
     usage["realized_daily_loss"] = realized_loss
     usage["fees_paid"] = total_fees
+
+
+def _handle_exchange_adapter_failure(account_id: str, operation: str, exc: Exception) -> None:
+    logger.error(
+        "Exchange adapter %s operation %s failed for account %s: %s",
+        EXCHANGE_ADAPTER.name,
+        operation,
+        account_id,
+        exc,
+        exc_info=exc,
+    )
+    try:
+        push_exchange_adapter_failure(
+            adapter=EXCHANGE_ADAPTER.name,
+            account_id=account_id,
+            operation=operation,
+            error=str(exc),
+        )
+    except Exception:  # pragma: no cover - best effort alerting
+        logger.debug("Failed to emit exchange adapter alert", exc_info=True)
+
+
+async def _refresh_usage_from_balance(account_id: str) -> None:
+    if not EXCHANGE_ADAPTER.supports("get_balance"):
+        return
+
+    try:
+        snapshot = await EXCHANGE_ADAPTER.get_balance(account_id)
+    except NotImplementedError:
+        return
+    except Exception as exc:  # pragma: no cover - defensive guard for optional integrations
+        _handle_exchange_adapter_failure(account_id, "get_balance", exc)
+        return
+
+    if not isinstance(snapshot, Mapping):
+        return
+
+    nav_value = snapshot.get("net_asset_value") or snapshot.get("nav") or snapshot.get("total_value")
+    nav = _coerce_float(nav_value)
+    if nav is None:
+        return
+
+    with get_session() as session:
+        record = session.get(AccountRiskUsage, account_id)
+        if record is None:
+            record = AccountRiskUsage(account_id=account_id)
+        record.net_asset_value = max(nav, 0.0)
+        record.updated_at = datetime.now(timezone.utc)
+        session.add(record)
+
+
+def _coerce_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def set_stub_price_history(instrument_id: str, history: List[Dict[str, float]]) -> None:
