@@ -72,6 +72,7 @@ def test_log_audit_inserts_and_logs(monkeypatch, tmp_path, capsys):
     assert payload["ts"] == "2023-01-01T12:00:00+00:00"
     assert payload["prev_hash"] == audit_logger._GENESIS_HASH  # pylint: disable=protected-access
     assert "hash" in payload
+    assert payload["sensitive"] is False
 
     assert audit_logger.psycopg.connect.called
     cursor.execute.assert_called_once()
@@ -106,6 +107,7 @@ def test_log_audit_allows_missing_ip(monkeypatch, tmp_path, capsys):
     captured = capsys.readouterr().out.strip()
     payload = json.loads(captured)
     assert payload["ip_hash"] is None
+    assert payload["sensitive"] is False
 
     chain_file = tmp_path / "chain.log"
     with chain_file.open("r", encoding="utf-8") as fh:
@@ -155,3 +157,29 @@ def test_verify_audit_chain(tmp_path, monkeypatch, capsys):
     assert audit_logger.verify_audit_chain() is True
     out = capsys.readouterr().out
     assert "Audit chain verified successfully." in out
+
+
+def test_sensitive_action_flag(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("AUDIT_DATABASE_URL", "postgresql://audit:audit@localhost:5432/audit")
+    monkeypatch.setenv("AUDIT_CHAIN_LOG", str(tmp_path / "chain.log"))
+    monkeypatch.setenv("AUDIT_CHAIN_STATE", str(tmp_path / "chain_state.json"))
+
+    conn, cursor = _make_connection_mock()
+    monkeypatch.setattr(audit_logger, "psycopg", MagicMock(connect=MagicMock(return_value=conn)))
+
+    audit_logger.log_audit(
+        actor="zoe",
+        action="config.change.requested",
+        entity="account-1:key",
+        before={},
+        after={"value": "42"},
+        ip_hash=audit_logger.hash_ip("198.51.100.10"),
+    )
+
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload["sensitive"] is True
+
+    sql, params = cursor.execute.call_args[0]
+    assert "INSERT INTO audit_log" in sql
+    assert params[6] == payload["hash"]
+    assert params[7] == payload["prev_hash"]

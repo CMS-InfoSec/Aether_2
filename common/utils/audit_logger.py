@@ -28,7 +28,21 @@ _CORE_FIELDS: Iterable[str] = (
     "after",
     "ip_hash",
     "ts",
+    "sensitive",
 )
+
+_SENSITIVE_ACTION_PREFIXES: Iterable[str] = (
+    "config.",
+    "secret.",
+    "override.",
+    "safe_mode.",
+)
+
+
+def is_sensitive_action(action: str) -> bool:
+    """Return ``True`` if the supplied action is considered sensitive."""
+
+    return any(action.startswith(prefix) for prefix in _SENSITIVE_ACTION_PREFIXES)
 
 
 def hash_ip(value: Optional[str]) -> Optional[str]:
@@ -98,7 +112,13 @@ def _append_chain_log(log_path: Path, entry: Dict[str, Any]) -> None:
 
 
 def _canonical_payload(entry: Dict[str, Any]) -> Dict[str, Any]:
-    return {field: entry[field] for field in _CORE_FIELDS}
+    canonical: Dict[str, Any] = {}
+    for field in _CORE_FIELDS:
+        if field == "sensitive":
+            canonical[field] = bool(entry.get(field, False))
+        else:
+            canonical[field] = entry[field]
+    return canonical
 
 
 def _canonical_serialized(entry: Dict[str, Any]) -> str:
@@ -135,6 +155,7 @@ def log_audit(
         "after": after,
         "ip_hash": ip_hash,
         "ts": timestamp_iso,
+        "sensitive": is_sensitive_action(action),
     }
 
     state_path = _chain_state_path()
@@ -267,5 +288,5 @@ if __name__ == "__main__":  # pragma: no cover - manual execution entry point
     sys.exit(main())
 
 
-__all__ = ["log_audit", "verify_audit_chain", "main", "hash_ip"]
+__all__ = ["log_audit", "verify_audit_chain", "main", "hash_ip", "is_sensitive_action"]
 
