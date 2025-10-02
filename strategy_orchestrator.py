@@ -193,9 +193,10 @@ class StrategyRegistry:
         metadata["strategy_id"] = strategy_name
 
         url = f"{self._risk_engine_url}/risk/validate"
+        headers = {"X-Account-ID": request.account_id}
         try:
             async with httpx.AsyncClient(timeout=self._http_timeout) as client:
-                response = await client.post(url, json=payload)
+                response = await client.post(url, json=payload, headers=headers)
                 response.raise_for_status()
         except httpx.HTTPStatusError as exc:  # pragma: no cover - defensive
             raise HTTPException(status_code=exc.response.status_code, detail=exc.response.text)
