@@ -10,12 +10,14 @@ it suitable for usage in Argo Workflows where the container entrypoint is
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import logging
 import math
 import os
-from dataclasses import dataclass, field
+import subprocess
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
@@ -129,6 +131,16 @@ class MLflowConfig:
 
 
 @dataclass
+class TrainingMetadata:
+    """Additional metadata captured for MLflow registration tags."""
+
+    feature_version: Optional[str] = None
+    label_horizon: Optional[str] = None
+    granularity: Optional[str] = None
+    symbols: List[str] = field(default_factory=list)
+
+
+@dataclass
 class TrainingJobConfig:
     """Aggregate configuration for the workflow."""
 
@@ -138,6 +150,7 @@ class TrainingJobConfig:
     thresholds: MetricThresholds = field(default_factory=MetricThresholds)
     artifacts: ObjectStorageConfig = field(default_factory=ObjectStorageConfig)
     mlflow: Optional[MLflowConfig] = None
+    metadata: TrainingMetadata = field(default_factory=TrainingMetadata)
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +160,89 @@ class TrainingJobConfig:
 def _create_engine(uri: str) -> Engine:
     LOGGER.debug("Creating SQLAlchemy engine for URI=%s", uri)
     return create_sqlalchemy_engine(uri, pool_pre_ping=True, pool_recycle=3600)
+
+
+def _resolve_git_commit() -> Optional[str]:
+    """Return the current Git commit hash if available."""
+
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except Exception:  # pragma: no cover - git may be unavailable in some envs
+        return None
+    return result.stdout.decode("utf-8").strip()
+
+
+def _compute_config_hash(config: TrainingJobConfig) -> str:
+    """Create a deterministic hash of the training configuration."""
+
+    config_dict = asdict(config)
+    payload = json.dumps(config_dict, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _format_timestamp(value: pd.Timestamp) -> Optional[str]:
+    if pd.isna(value):
+        return None
+    if value.tzinfo is None:
+        value = value.tz_localize(timezone.utc)
+    return value.to_pydatetime().isoformat()
+
+
+def _build_registration_tags(
+    config: TrainingJobConfig,
+    frame: pd.DataFrame,
+    *,
+    git_commit: Optional[str] = None,
+) -> Dict[str, str]:
+    """Construct MLflow model version tags describing the training run."""
+
+    metadata = config.metadata
+    tags: Dict[str, str] = {}
+
+    if metadata.feature_version:
+        tags["feature_version"] = metadata.feature_version
+    if metadata.label_horizon:
+        tags["label_horizon"] = metadata.label_horizon
+    if metadata.granularity:
+        tags["granularity"] = metadata.granularity
+
+    symbols: List[str] = []
+    if metadata.symbols:
+        symbols = sorted({symbol.strip() for symbol in metadata.symbols if symbol.strip()})
+    elif config.timescale.entity_column in frame.columns:
+        unique = (
+            frame[config.timescale.entity_column]
+            .dropna()
+            .astype(str)
+            .unique()
+            .tolist()
+        )
+        symbols = sorted(set(unique))
+    if symbols:
+        tags["symbols"] = ", ".join(symbols)
+
+    ts_column = config.timescale.timestamp_column
+    if ts_column in frame.columns and not frame.empty:
+        timestamps = pd.to_datetime(frame[ts_column], utc=True)
+        data_from = _format_timestamp(timestamps.min())
+        data_to = _format_timestamp(timestamps.max())
+        if data_from:
+            tags["data_from"] = data_from
+        if data_to:
+            tags["data_to"] = data_to
+
+    commit = git_commit if git_commit is not None else _resolve_git_commit()
+    if commit:
+        tags["git_commit"] = commit
+
+    tags["config_hash"] = _compute_config_hash(config)
+
+    return tags
 
 
 def _load_timescale_frame(config: TimescaleSourceConfig, engine: Optional[Engine] = None) -> pd.DataFrame:
@@ -495,6 +591,7 @@ def run_training_job(
     LOGGER.info("Persisted artifacts: %s", artifact_locations)
 
     if config.mlflow and mlflow is not None:
+        registration_tags = _build_registration_tags(config, frame)
         mlflow.set_tracking_uri(config.mlflow.tracking_uri)
         mlflow.set_experiment(config.mlflow.experiment_name)
         run_args = {}
@@ -515,6 +612,8 @@ def run_training_job(
                 }
             )
             mlflow.log_metrics(metrics)
+            if registration_tags:
+                mlflow.set_tags(registration_tags)
 
             artifact_dir = Path(config.artifacts.base_path) / run_prefix
             if not config.artifacts.is_s3() and artifact_dir.exists():
@@ -528,6 +627,13 @@ def run_training_job(
                 model_uri = f"runs:/{run.info.run_id}/model"
                 result = mlflow.register_model(model_uri, config.mlflow.registry_model_name)
                 client = mlflow.tracking.MlflowClient()
+                for key, value in registration_tags.items():
+                    client.set_model_version_tag(
+                        name=config.mlflow.registry_model_name,
+                        version=result.version,
+                        key=key,
+                        value=value,
+                    )
                 client.transition_model_version_stage(
                     name=config.mlflow.registry_model_name,
                     version=result.version,
@@ -572,6 +678,10 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--threshold-sortino", type=float, default=1.5)
     parser.add_argument("--threshold-maxdd", type=float, default=-0.1)
     parser.add_argument("--threshold-cvar", type=float, default=-0.05)
+    parser.add_argument("--feature-version")
+    parser.add_argument("--label-horizon")
+    parser.add_argument("--granularity")
+    parser.add_argument("--symbols", help="Comma separated list of instrument symbols")
     return parser.parse_args(argv)
 
 
@@ -614,6 +724,13 @@ def _build_config(args: argparse.Namespace) -> TrainingJobConfig:
         s3_prefix=args.s3_prefix,
     )
 
+    metadata = TrainingMetadata(
+        feature_version=args.feature_version,
+        label_horizon=args.label_horizon,
+        granularity=args.granularity,
+        symbols=[sym.strip() for sym in (args.symbols or "").split(",") if sym.strip()],
+    )
+
     mlflow_config = None
     if args.mlflow_tracking_uri and args.mlflow_experiment:
         mlflow_config = MLflowConfig(
@@ -630,6 +747,7 @@ def _build_config(args: argparse.Namespace) -> TrainingJobConfig:
         thresholds=thresholds,
         artifacts=artifacts,
         mlflow=mlflow_config,
+        metadata=metadata,
     )
 
 
