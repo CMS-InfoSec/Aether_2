@@ -31,6 +31,12 @@ from exposure_forecast import router as exposure_router
 from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
 from shared.correlation import CorrelationIdMiddleware
 
+from scaling_controller import (
+    build_scaling_controller_from_env,
+    configure_scaling_controller,
+    router as scaling_router,
+)
+
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Aether Admin Platform")
