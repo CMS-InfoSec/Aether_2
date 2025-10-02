@@ -200,6 +200,29 @@ _JOB_REGISTRY: Dict[str, TrainingJobState] = {}
 _JOB_REGISTRY_LOCK = asyncio.Lock()
 
 
+def _normalize_usd_pair(symbol: str) -> Optional[str]:
+    """Return a canonical ``BASE-USD`` identifier when quoted in USD."""
+
+    if not symbol:
+        return None
+
+    token = symbol.strip().upper()
+    if not token:
+        return None
+
+    token = token.replace("/", "-")
+    parts = [part for part in token.split("-") if part]
+
+    if len(parts) != 2:
+        return None
+
+    base, quote = parts
+    if quote != "USD":
+        return None
+
+    return f"{base}-USD"
+
+
 async def _set_job_state(run_id: str, **updates: Any) -> TrainingJobState:
     async with _JOB_REGISTRY_LOCK:
         state = _JOB_REGISTRY.get(run_id)
@@ -737,6 +760,24 @@ app = FastAPI(title="Aether Training Service", version="1.0.0")
 
 @app.post("/ml/train/start", response_model=TrainingStartResponse, status_code=status.HTTP_202_ACCEPTED)
 async def start_training(request: TrainingRequest) -> TrainingStartResponse:
+    normalized_symbols: List[str] = []
+    invalid_symbols: List[str] = []
+
+    for symbol in request.symbols:
+        normalized = _normalize_usd_pair(symbol)
+        if not normalized:
+            invalid_symbols.append(symbol)
+        else:
+            normalized_symbols.append(normalized)
+
+    if invalid_symbols:
+        detail = "Only USD-quoted symbols are supported"
+        if invalid_symbols:
+            detail += f": {', '.join(invalid_symbols)}"
+        raise HTTPException(status_code=400, detail=detail)
+
+    request = request.model_copy(update={"symbols": normalized_symbols})
+
     run_id = str(uuid4())
     correlation_id = str(uuid4())
     state = TrainingJobState(run_id=run_id, run_name=request.run_name, correlation_id=correlation_id)

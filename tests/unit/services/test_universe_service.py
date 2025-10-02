@@ -121,3 +121,10 @@ def test_override_symbol_rejects_unauthorized(universe_client: TestClient) -> No
         universe_service.app.dependency_overrides[universe_service.require_admin_account] = lambda: "ops-admin"
 
     assert response.status_code == 403
+
+
+def test_normalize_market_requires_usd_quote() -> None:
+    assert universe_service._normalize_market("BTC-EUR") is None
+    assert universe_service._normalize_market("XBTEUR") is None
+    assert universe_service._normalize_market("BTC/USDT") is None
+    assert universe_service._normalize_market("XXBTZUSD") == "BTC-USD"
