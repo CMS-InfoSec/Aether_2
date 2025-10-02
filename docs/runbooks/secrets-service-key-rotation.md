@@ -14,27 +14,42 @@ Provide a standardized procedure for rotating the AES encryption key that protec
    ```bash
    openssl rand -base64 32 > /tmp/secrets-service.aes
    ```
-2. Copy the value into a password manager entry for audit purposes.
+2. Store the value in the "Secrets Service Encryption Key" item in the team password manager so the previous key remains recoverable.
 
 ## Update the Kubernetes Secret
-1. Edit `deploy/k8s/base/aether-services/secret-secrets-service-config.yaml` and replace the placeholder with the new base64 value.
-2. Commit the change and open a pull request for review.
-3. After approval, deploy to staging:
+> ⚠️ **Do not commit encryption keys to Git.** The key must only live in secure secret storage and the Kubernetes Secret resource.
+
+1. Export the key for the current shell session:
    ```bash
-   kubectl --context aether-staging apply -f deploy/k8s/base/aether-services/secret-secrets-service-config.yaml
+   export SECRET_ENCRYPTION_KEY="$(cat /tmp/secrets-service.aes)"
+   ```
+2. Apply the updated Secret to staging without writing the value to disk or Git:
+   ```bash
+   kubectl --context aether-staging create secret generic secrets-service-config \
+     --from-literal=SECRET_ENCRYPTION_KEY="$SECRET_ENCRYPTION_KEY" \
+     --dry-run=client -o yaml | \
+     kubectl --context aether-staging apply -f -
    kubectl --context aether-staging rollout restart deployment/secrets-service
    kubectl --context aether-staging rollout status deployment/secrets-service
    ```
-4. Verify the service logs show successful startup and encryption operations.
+3. Verify the service logs show successful startup and encryption operations.
+4. Update the password manager entry with the rotation timestamp and operator name.
 
 ## Promote to Production
-1. Once staging validation passes, apply the manifest to production:
+1. Once staging validation passes, repeat the Secret update against production:
    ```bash
-   kubectl --context aether-production apply -f deploy/k8s/base/aether-services/secret-secrets-service-config.yaml
+   kubectl --context aether-production create secret generic secrets-service-config \
+     --from-literal=SECRET_ENCRYPTION_KEY="$SECRET_ENCRYPTION_KEY" \
+     --dry-run=client -o yaml | \
+     kubectl --context aether-production apply -f -
    kubectl --context aether-production rollout restart deployment/secrets-service
    kubectl --context aether-production rollout status deployment/secrets-service
    ```
 2. Confirm production logs and metrics (error rate, latency) remain healthy for 30 minutes.
+3. Unset the exported variable from your shell:
+   ```bash
+   unset SECRET_ENCRYPTION_KEY
+   ```
 
 ## Post-Rotation Validation
 - Run the integration suite focused on encryption/decryption (`pytest tests/integration/test_audit_chain.py -k encryption`).
@@ -42,7 +57,7 @@ Provide a standardized procedure for rotating the AES encryption key that protec
 - Update the rotation record in the secrets ledger with timestamp, operator, and key fingerprint (hash the base64 value using SHA-256).
 
 ## Rollback Plan
-- If issues occur, reapply the previous manifest from Git history and restart the deployment.
+- If issues occur, retrieve the previous key from the password manager entry and reapply it using the `kubectl create secret … | kubectl apply -f -` workflow above.
 - Notify stakeholders via #security-ops and #platform-alerts channels.
 - Conduct a post-incident review to determine root cause before attempting rotation again.
 
