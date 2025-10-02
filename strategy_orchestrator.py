@@ -27,6 +27,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import NullPool
 
+from auth.service import InMemorySessionStore, RedisSessionStore, SessionStoreProtocol
 from services.common.schemas import RiskValidationRequest, RiskValidationResponse
 from services.common.security import require_admin_account
 from strategy_bus import StrategySignalBus, ensure_signal_tables
@@ -259,6 +260,19 @@ def _create_engine(url: str) -> Engine:
     return create_engine(url, **kwargs)
 
 
+def _build_session_store_from_env() -> SessionStoreProtocol:
+    ttl_minutes = int(os.getenv("SESSION_TTL_MINUTES", "60"))
+    redis_url = os.getenv("SESSION_REDIS_URL")
+    if redis_url:
+        try:  # pragma: no cover - optional dependency for Redis-backed sessions
+            import redis  # type: ignore[import-not-found]
+        except ImportError as exc:  # pragma: no cover - surfaced when redis is missing at runtime
+            raise RuntimeError("redis package is required when SESSION_REDIS_URL is set") from exc
+        client = redis.Redis.from_url(redis_url)
+        return RedisSessionStore(client, ttl_minutes=ttl_minutes)
+    return InMemorySessionStore(ttl_minutes=ttl_minutes)
+
+
 DATABASE_URL = _database_url()
 ENGINE = _create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
@@ -286,6 +300,8 @@ SIGNAL_BUS = StrategySignalBus(
 )
 
 app = FastAPI(title="Strategy Orchestrator", version="0.1.0")
+SESSION_STORE = _build_session_store_from_env()
+app.state.session_store = SESSION_STORE
 
 
 @app.post("/strategy/register", response_model=StrategyStatusResponse)
