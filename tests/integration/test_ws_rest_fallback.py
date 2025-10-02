@@ -127,6 +127,9 @@ class _StubRESTClient:
         response = await self._exchange.place_order_rest(dict(payload))
         return _ack_from_exchange_response(response)
 
+    async def asset_pairs(self) -> Dict[str, Any]:
+        return {}
+
 
 @pytest.mark.integration
 @pytest.mark.asyncio

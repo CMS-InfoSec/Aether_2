@@ -57,6 +57,41 @@ class KrakenRESTClient:
         response = await self._request("/private/CancelOrder", payload)
         return self._parse_response(response)
 
+    async def asset_pairs(self) -> Dict[str, Any]:
+        session = await self._session_or_create()
+        url = f"{self._base_url}/public/AssetPairs"
+        attempt = 0
+        backoff = 0.5
+        while True:
+            attempt += 1
+            try:
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp:
+                    text = await resp.text()
+                    if resp.status >= 500:
+                        raise KrakenRESTError(f"server error {resp.status}: {text}")
+                    payload = json.loads(text) if text else {}
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                if attempt >= self._max_retries:
+                    raise KrakenRESTError(f"REST request failed: {exc}") from exc
+                delay = min(backoff * random.uniform(0.8, 1.2), 5.0)
+                await asyncio.sleep(delay)
+                backoff *= 2
+                continue
+
+            errors = payload.get("error", [])
+            if errors:
+                if attempt >= self._max_retries or not _is_retryable(errors):
+                    raise KrakenRESTError(f"Kraken API error: {errors}")
+                delay = min(backoff * random.uniform(0.8, 1.2), 5.0)
+                await asyncio.sleep(delay)
+                backoff *= 2
+                continue
+
+            result = payload.get("result")
+            return result if isinstance(result, dict) else {}
+
     async def open_orders(self) -> Dict[str, Any]:
         return await self._request("/private/OpenOrders", {})
 
