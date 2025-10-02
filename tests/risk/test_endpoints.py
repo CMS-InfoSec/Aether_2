@@ -37,9 +37,7 @@ def base_payload_fixture() -> dict[str, object]:
 def test_validate_risk_authorized_accounts(client: TestClient, base_payload: dict[str, object], account_id: str) -> None:
     payload = deepcopy(base_payload)
     payload["account_id"] = account_id
-
-        payload["instrument"] = "SOL-USD"
-
+    payload["instrument"] = "SOL-USD"
 
     response = client.post("/risk/validate", json=payload, headers={"X-Account-ID": account_id})
 
@@ -59,10 +57,8 @@ def test_validate_risk_rejects_non_admin(client: TestClient, base_payload: dict[
 
 def test_validate_risk_mismatched_account(client: TestClient, base_payload: dict[str, object]) -> None:
     payload = deepcopy(base_payload)
-
     payload["account_id"] = "director-1"
     response = client.post("/risk/validate", json=payload, headers={"X-Account-ID": "company"})
-
 
     assert response.status_code == 403
     assert response.json()["detail"] == "Account mismatch between header and payload."
