@@ -25,6 +25,9 @@ jobs:
         run: |
           if [ -f pyproject.toml ]; then poe lint || true; fi
           if [ -f Makefile ]; then make lint || true; fi
+      - name: Validate OMS NetworkPolicy manifest
+        run: |
+          pytest tests/test_networkpolicy_oms_manifest.py -q
       - name: Run tests
         run: |
           if [ -f pytest.ini ] || [ -d tests ]; then pytest --maxfail=1 --disable-warnings -q; else echo "No tests"; fi

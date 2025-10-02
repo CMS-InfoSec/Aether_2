@@ -2,7 +2,10 @@ from __future__ import annotations
 
 
 import asyncio
+import base64
 import contextlib
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -562,6 +565,10 @@ def _split_quantities(
     return [qty for qty in quantities if qty > 0]
 
 
+class CredentialLoadError(RuntimeError):
+    """Raised when credential secrets cannot be loaded."""
+
+
 class CredentialWatcher:
     """Watches Kubernetes mounted secrets for key rotation."""
 
@@ -633,18 +640,33 @@ class CredentialWatcher:
     async def _load(self) -> None:
         try:
             raw = self._secret_path.read_text()
-        except FileNotFoundError:
-            logger.warning("Credential file missing for account %s", self.account_id)
-            return
+        except FileNotFoundError as exc:
+            message = (
+                f"Credential file missing for account {self.account_id}"
+                f" at {self._secret_path}"
+            )
+            logger.error(message)
+            raise CredentialLoadError(message) from exc
 
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as exc:
-            logger.error("Invalid credential payload for %s: %s", self.account_id, exc)
-            return
+            message = f"Invalid credential payload for {self.account_id}: {exc}"
+            logger.error(message)
+            raise CredentialLoadError(message) from exc
+
+        api_key = data.get("api_key") or data.get("key")
+        api_secret = data.get("api_secret") or data.get("secret")
+        if not api_key or not api_secret:
+            message = (
+                f"Credential payload for {self.account_id} missing required fields"
+            )
+            logger.error(message)
+            raise CredentialLoadError(message)
+
         credentials = {
-            "api_key": data.get("api_key") or data.get("key"),
-            "api_secret": data.get("api_secret") or data.get("secret"),
+            "api_key": api_key,
+            "api_secret": api_secret,
         }
         metadata = data.get("asset_pairs") or data.get("metadata")
 
@@ -730,7 +752,16 @@ class AccountContext:
 
     async def start(self) -> None:
         async with self._startup_lock:
-            await self.credentials.start()
+            try:
+                await self.credentials.start()
+            except CredentialLoadError as exc:
+                increment_oms_error_count(self.account_id, "credentials", "startup")
+                logger.error(
+                    "Failed to start account %s due to credential load error: %s",
+                    self.account_id,
+                    exc,
+                )
+                raise
             if self.ws_client is None:
                 self.ws_client = KrakenWSClient(
                     credential_getter=self.credentials.get_credentials,
@@ -1957,6 +1988,7 @@ manager = OMSManager()
 warm_start = WarmStartCoordinator(lambda: manager)
 
 
+
 async def require_account_id(request: Request) -> str:
     raw_header = request.headers.get("X-Account-ID")
     account_id = raw_header.strip() if raw_header else ""
@@ -2017,6 +2049,7 @@ def _redact_account_header(value: Optional[str]) -> str:
     return f"{trimmed[:3]}***{trimmed[-2:]}"
 
 
+
 @app.on_event("shutdown")
 async def _shutdown() -> None:
     await manager.shutdown()
@@ -2031,7 +2064,7 @@ async def _startup() -> None:
 @app.post("/oms/place", response_model=OMSPlaceResponse)
 async def place_order(
     payload: OMSPlaceRequest,
-    account_id: str = Depends(require_account_id),
+    account_id: str = Depends(require_authorized_account),
 ) -> OMSPlaceResponse:
     if payload.account_id != account_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account mismatch")
@@ -2048,7 +2081,7 @@ async def place_order(
 @app.post("/oms/cancel", response_model=OMSOrderStatusResponse)
 async def cancel_order(
     payload: OMSCancelRequest,
-    account_id: str = Depends(require_account_id),
+    account_id: str = Depends(require_authorized_account),
 ) -> OMSOrderStatusResponse:
     if payload.account_id != account_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account mismatch")
@@ -2063,7 +2096,7 @@ async def cancel_order(
 async def get_status(
     account_id: str,
     client_id: str,
-    header_account: str = Depends(require_account_id),
+    header_account: str = Depends(require_authorized_account),
 ) -> OMSOrderStatusResponse:
     if account_id != header_account:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account mismatch")
@@ -2078,7 +2111,7 @@ async def get_status(
 @app.get("/oms/routing/status")
 async def get_routing_status(
     account_id: str,
-    header_account: str = Depends(require_account_id),
+    header_account: str = Depends(require_authorized_account),
 ) -> Dict[str, Optional[float] | str]:
     if account_id != header_account:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account mismatch")
@@ -2089,7 +2122,7 @@ async def get_routing_status(
 
 @app.get("/oms/rate_limits/status")
 async def get_rate_limit_status(
-    header_account: str = Depends(require_account_id),
+    header_account: str = Depends(require_authorized_account),
 ) -> Dict[str, Dict[str, Dict[str, float | int]]]:
     return await rate_limit_guard.status(header_account)
 
@@ -2100,14 +2133,14 @@ async def get_warm_start_status(_: str = Depends(require_account_id)) -> Dict[st
 
 
 @app.get("/oms/warm_start/report")
-async def get_warm_start_report(_: str = Depends(require_account_id)) -> Dict[str, int]:
+async def get_warm_start_report(_: str = Depends(require_authorized_account)) -> Dict[str, int]:
     return await warm_start.status()
 
 
 @app.get("/oms/impact_curve", response_model=ImpactCurveResponse)
 async def get_impact_curve(
     symbol: str,
-    account_id: str = Depends(require_account_id),
+    account_id: str = Depends(require_authorized_account),
 ) -> ImpactCurveResponse:
     points_raw = await impact_store.impact_curve(account_id=account_id, symbol=symbol)
     points = [
