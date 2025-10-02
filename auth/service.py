@@ -15,6 +15,8 @@ from typing import Dict, Optional, Protocol, Set, runtime_checkable
 
 import pyotp
 
+from shared.correlation import get_correlation_id
+
 
 logger = logging.getLogger(__name__)
 
