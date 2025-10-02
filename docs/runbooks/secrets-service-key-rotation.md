@@ -17,10 +17,12 @@ Provide a standardized procedure for rotating the AES encryption key that protec
 2. Copy the value into a password manager entry for audit purposes.
 
 ## Update the Kubernetes Secret
-1. Export the key into an environment variable without writing it to disk:
+1. Export the previously generated key into an environment variable without exposing it in shell history. If you stored it in
+   `/tmp/secrets-service.aes`, run:
    ```bash
-   export SECRET_ENCRYPTION_KEY=$(openssl rand -base64 32)
+   export SECRET_ENCRYPTION_KEY="$(tr -d '\n' < /tmp/secrets-service.aes)"
    ```
+   If the key was copied into a password manager, retrieve it from there instead of regenerating a new value.
 2. Create an updated secret manifest locally. If the cluster uses Sealed Secrets, run:
    ```bash
    kubectl --context aether-staging \
@@ -43,6 +45,8 @@ Provide a standardized procedure for rotating the AES encryption key that protec
      --dry-run=client -o yaml \
    | kubectl --context aether-staging apply -f -
    ```
+   > **Note:** The GitOps base no longer includes a placeholder `secrets-service-config` Secret. This manual apply (or a sealed
+   > secret committed to a secure repo) is the source of truth for the rotated key.
 3. Restart the deployment to pick up the new key:
    ```bash
    kubectl --context aether-staging rollout restart deployment/secrets-service
@@ -54,9 +58,11 @@ Provide a standardized procedure for rotating the AES encryption key that protec
    ```
 
 ## Promote to Production
-1. Once staging validation passes, repeat the secret creation process against production. Generate a fresh key and apply it using the appropriate secure method (Sealed Secrets or direct `kubectl apply -f -`).
+1. Once staging validation passes, repeat the secret creation process against production using the exact same key that was
+   recorded earlier. Retrieve it securely (for example, `cat /tmp/secrets-service.aes` or copy it from the password manager)
+   and apply it using the appropriate secure method (Sealed Secrets or direct `kubectl apply -f -`).
    ```bash
-   export SECRET_ENCRYPTION_KEY=$(openssl rand -base64 32)
+   export SECRET_ENCRYPTION_KEY="$(tr -d '\n' < /tmp/secrets-service.aes)"
    kubectl --context aether-production \
      create secret generic secrets-service-config \
      --namespace aether-services \
@@ -66,6 +72,7 @@ Provide a standardized procedure for rotating the AES encryption key that protec
    kubectl --context aether-production rollout restart deployment/secrets-service
    kubectl --context aether-production rollout status deployment/secrets-service
    unset SECRET_ENCRYPTION_KEY
+   rm -f /tmp/secrets-service.aes
    ```
 2. Confirm production logs and metrics (error rate, latency) remain healthy for 30 minutes.
 
