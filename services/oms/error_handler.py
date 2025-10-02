@@ -4,13 +4,22 @@ import asyncio
 import logging
 import random
 from dataclasses import replace
+from datetime import datetime, timezone
 from typing import Awaitable, Callable, Iterable, List, Optional, Sequence, Tuple
 
 from shared.correlation import get_correlation_id
+from services.common.config import TimescaleSession, get_timescale_session
 from services.oms.kraken_rest import KrakenRESTError
 from services.oms.kraken_ws import KrakenWSError, KrakenWSTimeout, OrderAck
 
 logger = logging.getLogger(__name__)
+
+try:  # pragma: no cover - optional dependency in CI
+    import psycopg
+    from psycopg import sql
+except Exception:  # pragma: no cover - psycopg is optional
+    psycopg = None  # type: ignore[assignment]
+    sql = None  # type: ignore[assignment]
 
 # Kraken error code families considered transient (retryable)
 _TRANSIENT_PREFIXES = {
@@ -61,6 +70,8 @@ class KrakenErrorHandler:
     def __init__(
         self,
         *,
+        account_id: Optional[str] = None,
+        timescale_session: Optional[TimescaleSession] = None,
         max_retries: int = 3,
         base_delay: float = 0.5,
         max_delay: float = 5.0,
@@ -70,6 +81,18 @@ class KrakenErrorHandler:
         self._base_delay = base_delay
         self._max_delay = max_delay
         self._logger = logger_instance or logger
+        self._account_id = account_id
+        self._timescale_session = timescale_session
+        if self._timescale_session is None and self._account_id:
+            try:
+                self._timescale_session = get_timescale_session(self._account_id)
+            except Exception:  # pragma: no cover - configuration issues
+                self._timescale_session = None
+        if self._account_id is None and self._timescale_session is not None:
+            self._account_id = self._timescale_session.account_schema
+        self._recorded_errors: List[dict[str, object]] = []
+
+    _SCHEMA_INITIALISED: set[str] = set()
 
     async def submit_with_fallback(
         self,
@@ -146,8 +169,17 @@ class KrakenErrorHandler:
                 continue
 
             classification = self._classify_errors(ack.errors)
-            if classification == "permanent":
+            errors: List[str] = []
+            if classification in {"permanent", "transient"}:
                 errors = self._normalize_errors(ack.errors)
+                await self._record_oms_errors(
+                    errors=errors,
+                    transport=transport,
+                    correlation_id=correlation_id,
+                    operation=operation,
+                    attempt=attempt,
+                )
+            if classification == "permanent":
                 failed_ack = self._mark_failed(ack, errors)
                 self._logger.error(
                     "Permanent Kraken error via %s for %s correlation_id=%s errors=%s",
@@ -159,7 +191,6 @@ class KrakenErrorHandler:
                 return failed_ack
 
             if classification == "transient":
-                errors = self._normalize_errors(ack.errors)
                 self._logger.warning(
                     "Transient Kraken error via %s for %s attempt=%s/%s correlation_id=%s errors=%s",
                     transport,
@@ -208,10 +239,7 @@ class KrakenErrorHandler:
         return normalized
 
     def _mark_failed(self, ack: OrderAck, errors: List[str]) -> OrderAck:
-        status_value = ack.status or "failed"
-        if status_value.lower() == "ok":
-            status_value = "failed"
-        return replace(ack, status=status_value, errors=errors or None)
+        return replace(ack, status="FAILED", errors=errors or None)
 
     def _next_delay(self, current: float) -> float:
         jitter = random.uniform(0.8, 1.2)
@@ -237,6 +265,131 @@ class KrakenErrorHandler:
             correlation_id,
             exc,
         )
+
+    async def _record_oms_errors(
+        self,
+        *,
+        errors: Sequence[str],
+        transport: str,
+        correlation_id: Optional[str],
+        operation: str,
+        attempt: int,
+    ) -> None:
+        if not errors:
+            return
+
+        retry_count = max(0, attempt - 1)
+        timestamp = datetime.now(timezone.utc)
+        account_id = self._account_id or "unknown"
+        entries = [
+            {
+                "account_id": account_id,
+                "correlation_id": correlation_id or "unknown",
+                "operation": operation,
+                "transport": transport,
+                "error_code": error,
+                "retry_count": retry_count,
+                "last_retry_ts": timestamp,
+            }
+            for error in errors
+        ]
+        self._recorded_errors.extend(entries)
+
+        if not entries:
+            return
+
+        if (
+            psycopg is None
+            or sql is None
+            or self._timescale_session is None
+            or not self._timescale_session.dsn
+        ):
+            return
+
+        await asyncio.to_thread(self._persist_errors_sync, entries)
+
+    def _persist_errors_sync(self, entries: Sequence[dict[str, object]]) -> None:
+        assert self._timescale_session is not None  # nosec - guarded by caller
+        session = self._timescale_session
+        if psycopg is None or sql is None:  # pragma: no cover - defensive
+            return
+
+        with psycopg.connect(session.dsn, autocommit=True) as conn:
+            self._ensure_schema(conn, session.account_schema)
+            insert_sql = sql.SQL(
+                """
+                INSERT INTO {}.{} (
+                    account_id,
+                    correlation_id,
+                    operation,
+                    transport,
+                    error_code,
+                    retry_count,
+                    last_retry_ts
+                )
+                VALUES (
+                    %(account_id)s,
+                    %(correlation_id)s,
+                    %(operation)s,
+                    %(transport)s,
+                    %(error_code)s,
+                    %(retry_count)s,
+                    %(last_retry_ts)s
+                )
+                ON CONFLICT (account_id, correlation_id, operation, transport, error_code)
+                DO UPDATE SET
+                    retry_count = EXCLUDED.retry_count,
+                    last_retry_ts = EXCLUDED.last_retry_ts
+                """
+            ).format(
+                sql.Identifier(session.account_schema),
+                sql.Identifier("oms_errors"),
+            )
+            with conn.cursor() as cursor:
+                cursor.executemany(insert_sql, entries)
+
+    @classmethod
+    def _ensure_schema(cls, conn: "psycopg.Connection[object]", schema: str) -> None:
+        if psycopg is None or sql is None:  # pragma: no cover - defensive
+            return
+        if schema in cls._SCHEMA_INITIALISED:
+            return
+        with conn.cursor() as cursor:
+            cursor.execute(
+                sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(schema))
+            )
+            cursor.execute(
+                sql.SQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS {}.{} (
+                        account_id TEXT NOT NULL,
+                        correlation_id TEXT NOT NULL,
+                        operation TEXT NOT NULL,
+                        transport TEXT NOT NULL,
+                        error_code TEXT NOT NULL,
+                        retry_count INTEGER NOT NULL,
+                        last_retry_ts TIMESTAMPTZ NOT NULL,
+                        PRIMARY KEY (account_id, correlation_id, operation, transport, error_code)
+                    )
+                    """
+                ).format(sql.Identifier(schema), sql.Identifier("oms_errors"))
+            )
+            cursor.execute(
+                sql.SQL(
+                    """
+                    CREATE INDEX IF NOT EXISTS {} ON {}.{} (last_retry_ts DESC)
+                    """
+                ).format(
+                    sql.Identifier(f"{schema}_oms_errors_last_retry_ts_idx"),
+                    sql.Identifier(schema),
+                    sql.Identifier("oms_errors"),
+                )
+            )
+        cls._SCHEMA_INITIALISED.add(schema)
+
+    @property
+    def recorded_errors(self) -> List[dict[str, object]]:
+        return list(self._recorded_errors)
 
 
 __all__ = ["KrakenErrorHandler"]
