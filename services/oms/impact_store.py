@@ -252,8 +252,18 @@ class ImpactAnalyticsStore:
                     avg_price NUMERIC NOT NULL,
                     pre_trade_mid NUMERIC NOT NULL,
                     impact_bps DOUBLE PRECISION NOT NULL,
+                    simulated BOOLEAN NOT NULL DEFAULT FALSE,
                     PRIMARY KEY (recorded_at, account_id, symbol, client_order_id)
                 )
+                """
+            ).format(
+                sql.Identifier(schema),
+                sql.Identifier("oms_fill_impact"),
+            )
+            add_simulated_column = sql.SQL(
+                """
+                ALTER TABLE {}.{}
+                ADD COLUMN IF NOT EXISTS simulated BOOLEAN NOT NULL DEFAULT FALSE
                 """
             ).format(
                 sql.Identifier(schema),
@@ -271,6 +281,7 @@ class ImpactAnalyticsStore:
             with conn.cursor() as cursor:
                 cursor.execute(create_schema)
                 cursor.execute(create_table)
+                cursor.execute(add_simulated_column)
                 cursor.execute(create_index)
 
             self._initialized_accounts.add(schema)
