@@ -4,11 +4,13 @@ import asyncio
 import contextlib
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from fastapi import APIRouter, FastAPI, HTTPException
 
+from services.alert_manager import OMSError, get_alert_manager_instance
 from services.oms.kraken_rest import KrakenRESTError
 from services.oms.kraken_ws import KrakenWSError, KrakenWSTimeout, OrderState
 
@@ -22,8 +24,17 @@ router = APIRouter()
 
 @dataclass
 class ReconcileStats:
+    balances_checked: int = 0
     orders_checked: int = 0
     mismatches_fixed: int = 0
+
+
+@dataclass
+class AccountReconcileResult:
+    balances_checked: int = 0
+    orders_checked: int = 0
+    mismatches_fixed: int = 0
+    mismatches_remaining: int = 0
 
 
 class OMSReconciler:
@@ -52,6 +63,7 @@ class OMSReconciler:
     async def status(self) -> Dict[str, int]:
         async with self._stats_lock:
             return {
+                "balances_checked": self._stats.balances_checked,
                 "orders_checked": self._stats.orders_checked,
                 "mismatches_fixed": self._stats.mismatches_fixed,
             }
@@ -75,12 +87,13 @@ class OMSReconciler:
         if not accounts:
             return
 
-        total_checked = 0
+        total_balances = 0
+        total_orders = 0
         total_fixed = 0
 
         for account in accounts:
             try:
-                checked, fixed = await self._reconcile_account(account)
+                result = await self._reconcile_account(account)
             except Exception as exc:  # pragma: no cover - defensive logging
                 logger.warning(
                     "Reconciliation failed for account %s: %s",
@@ -88,29 +101,78 @@ class OMSReconciler:
                     exc,
                 )
                 continue
-            total_checked += checked
-            total_fixed += fixed
 
-        if total_checked or total_fixed:
+            total_balances += result.balances_checked
+            total_orders += result.orders_checked
+            total_fixed += result.mismatches_fixed
+
+            timestamp = datetime.now(timezone.utc).isoformat()
+            logger.info(
+                "reconcile_log(%s, %s, mismatches=%s)",
+                timestamp,
+                account.account_id,
+                result.mismatches_fixed,
+            )
+
+            if result.mismatches_remaining:
+                self._raise_alert(account.account_id, result.mismatches_remaining)
+
+        if total_balances or total_orders or total_fixed:
             async with self._stats_lock:
-                self._stats.orders_checked += total_checked
+                self._stats.balances_checked += total_balances
+                self._stats.orders_checked += total_orders
                 self._stats.mismatches_fixed += total_fixed
 
-    async def _reconcile_account(self, account: "AccountContext") -> Tuple[int, int]:
+    async def _reconcile_account(self, account: "AccountContext") -> AccountReconcileResult:
         await account.start()
 
-        trades_payload = await self._fetch_trades(account)
-        trade_mismatches = await self._apply_trade_mismatches(account, trades_payload)
-
+        balances_payload = await self._fetch_balances(account)
         orders_payload, has_remote_snapshot = await self._fetch_open_orders(account)
-        order_mismatches = await self._apply_order_mismatches(
+
+        balances_checked = len(balances_payload)
+        orders_checked = len(orders_payload)
+
+        balance_fixed, balance_remaining = await self._reconcile_balances(account, balances_payload)
+        order_fixed, order_remaining = await self._reconcile_orders(
             account, orders_payload, has_remote_snapshot
         )
 
-        checked = len(trades_payload) + len(orders_payload)
-        fixed = trade_mismatches + order_mismatches
+        return AccountReconcileResult(
+            balances_checked=balances_checked,
+            orders_checked=orders_checked,
+            mismatches_fixed=balance_fixed + order_fixed,
+            mismatches_remaining=balance_remaining + order_remaining,
+        )
 
-        return checked, fixed
+    async def _fetch_balances(self, account: "AccountContext") -> Dict[str, Decimal]:
+        balances: Dict[str, Decimal] = {}
+        if account.rest_client is None:
+            return balances
+        try:
+            payload = await account.rest_client.balance()
+        except KrakenRESTError as exc:
+            logger.warning(
+                "Reconcile balances via REST failed for account %s: %s",
+                account.account_id,
+                exc,
+            )
+            return balances
+        return account._parse_rest_balances(payload)
+
+    async def _reconcile_balances(
+        self, account: "AccountContext", remote_balances: Dict[str, Decimal]
+    ) -> Tuple[int, int]:
+        if not remote_balances:
+            return 0, 0
+
+        local_balances = await account.get_local_balances()
+        mismatches = _diff_balances(local_balances, remote_balances)
+        if mismatches:
+            await account.update_local_balances(remote_balances)
+
+        updated_local = await account.get_local_balances()
+        remaining = _diff_balances(updated_local, remote_balances)
+        return len(mismatches), len(remaining)
 
     async def _fetch_open_orders(
         self, account: "AccountContext"
@@ -145,89 +207,15 @@ class OMSReconciler:
 
         return orders, authoritative
 
-    async def _fetch_trades(self, account: "AccountContext") -> List[Dict[str, object]]:
-        trades: List[Dict[str, object]] = []
-        if account.ws_client is not None:
-            try:
-                snapshot = await account.ws_client.fetch_own_trades_snapshot()
-                trades.extend(trade for trade in snapshot if isinstance(trade, dict))
-            except (KrakenWSError, KrakenWSTimeout) as exc:
-                logger.warning(
-                    "Reconcile own trades via websocket failed for account %s: %s",
-                    account.account_id,
-                    exc,
-                )
-
-        if not trades and account.rest_client is not None:
-            try:
-                payload = await account.rest_client.own_trades()
-            except KrakenRESTError as exc:
-                logger.warning(
-                    "Reconcile own trades via REST failed for account %s: %s",
-                    account.account_id,
-                    exc,
-                )
-            else:
-                trades.extend(account._parse_rest_trades(payload))
-
-        return trades
-
-    async def _apply_trade_mismatches(
-        self,
-        account: "AccountContext",
-        trades: Iterable[Dict[str, object]],
-    ) -> int:
-        mismatches = 0
-        for trade in trades:
-            state = account._state_from_payload(
-                trade,
-                default_status="filled",
-                transport="reconcile",
-            )
-            if state is None or not state.client_order_id:
-                continue
-
-            record = await account.lookup(state.client_order_id)
-            if record is None:
-                parent = account._child_parent.get(state.client_order_id)
-                if parent:
-                    record = await account.lookup(parent)
-
-            filled_remote = _to_decimal(state.filled_qty)
-            avg_remote = _to_decimal(state.avg_price)
-
-            needs_update = False
-            if record is None:
-                needs_update = True
-            else:
-                filled_local = record.result.filled_qty
-                avg_local = record.result.avg_price
-                if filled_remote > filled_local:
-                    needs_update = True
-                elif filled_remote > ZERO and avg_remote != ZERO and avg_remote != avg_local:
-                    needs_update = True
-
-            if needs_update:
-                applied = await account.apply_fill_event(trade)
-                if applied:
-                    mismatches += 1
-                    logger.info(
-                        "Reconciler applied fill update for %s on account %s",
-                        state.client_order_id,
-                        account.account_id,
-                    )
-
-        return mismatches
-
-    async def _apply_order_mismatches(
+    async def _reconcile_orders(
         self,
         account: "AccountContext",
         orders: Iterable[Dict[str, object]],
         snapshot_authoritative: bool,
-    ) -> int:
-        mismatches = 0
-
+    ) -> Tuple[int, int]:
         remote_states: List[OrderState] = []
+        mismatches_fixed = 0
+
         for order in orders:
             state = account._state_from_payload(
                 order,
@@ -270,7 +258,7 @@ class OMSReconciler:
                     needs_update = True
 
             if needs_update:
-                mismatches += 1
+                mismatches_fixed += 1
                 await account._apply_stream_state(state)
                 logger.info(
                     "Reconciler corrected order %s on account %s (status=%s)",
@@ -289,7 +277,7 @@ class OMSReconciler:
                 record = await account.lookup(order_id)
                 if record is None:
                     continue
-                mismatches += 1
+                mismatches_fixed += 1
                 state = OrderState(
                     client_order_id=order_id,
                     exchange_order_id=record.result.exchange_order_id,
@@ -311,7 +299,27 @@ class OMSReconciler:
                 account.account_id,
             )
 
-        return mismatches
+        remaining = await _count_order_mismatches(
+            account, remote_states, remote_ids, snapshot_authoritative
+        )
+        return mismatches_fixed, remaining
+
+    def _raise_alert(self, account_id: str, mismatches: int) -> None:
+        manager = get_alert_manager_instance()
+        description = (
+            f"Persistent reconciliation mismatch for account {account_id} after corrective actions"
+        )
+        labels = {"account_id": account_id, "mismatches": str(mismatches)}
+        error = OMSError(
+            error_code="OMS_RECONCILE_MISMATCH",
+            description=description,
+            severity="critical",
+            labels=labels,
+        )
+        if manager is not None:
+            manager.handle_oms_error(error)
+        else:  # pragma: no cover - depends on Alertmanager configuration
+            logger.error("%s (mismatches=%s)", description, mismatches)
 
 
 def _normalize_status(value: Optional[str]) -> str:
@@ -324,6 +332,73 @@ def _to_decimal(value: Optional[float]) -> Decimal:
     if value is None:
         return ZERO
     return Decimal(str(value))
+
+
+def _diff_balances(
+    local: Dict[str, Decimal], remote: Dict[str, Decimal], tolerance: Decimal = Decimal("0")
+) -> List[str]:
+    mismatches: List[str] = []
+    for asset, remote_amount in remote.items():
+        local_amount = local.get(asset)
+        if local_amount is None:
+            mismatches.append(asset)
+            continue
+        if abs(local_amount - remote_amount) > tolerance:
+            mismatches.append(asset)
+    for asset in local:
+        if asset not in remote:
+            mismatches.append(asset)
+    return mismatches
+
+
+async def _count_order_mismatches(
+    account: "AccountContext",
+    remote_states: Sequence[OrderState],
+    remote_ids: Iterable[Optional[str]],
+    snapshot_authoritative: bool,
+) -> int:
+    remaining = 0
+    remote_id_set = {order_id for order_id in remote_ids if order_id}
+
+    for state in remote_states:
+        client_id = state.client_order_id
+        if client_id is None:
+            continue
+        record = await account.lookup(client_id)
+        if record is None:
+            parent = account._child_parent.get(client_id)
+            if parent:
+                record = await account.lookup(parent)
+        filled_remote = _to_decimal(state.filled_qty)
+        avg_remote = _to_decimal(state.avg_price)
+        normalized_remote = _normalize_status(state.status)
+
+        if record is None:
+            remaining += 1
+            continue
+
+        normalized_local = _normalize_status(record.result.status)
+        if normalized_local != normalized_remote:
+            remaining += 1
+            continue
+        if record.result.filled_qty != filled_remote:
+            remaining += 1
+            continue
+        if (
+            filled_remote > ZERO
+            and avg_remote != ZERO
+            and record.result.avg_price != avg_remote
+        ):
+            remaining += 1
+            continue
+
+    if snapshot_authoritative:
+        local_open_ids = await _collect_open_local_orders(account)
+        for order_id in local_open_ids:
+            if order_id not in remote_id_set:
+                remaining += 1
+
+    return remaining
 
 
 async def _collect_open_local_orders(account: "AccountContext") -> List[str]:
@@ -365,4 +440,3 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover
     from services.oms.oms_service import AccountContext, OMSManager
-

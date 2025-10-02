@@ -10,7 +10,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from sqlalchemy import JSON, Column, DateTime, MetaData, String, Table, create_engine, func, select
 from sqlalchemy.engine import Engine
@@ -398,6 +398,31 @@ def _diff_versions(category: str, expected: Dict[str, str], actual: Dict[str, st
     return messages
 
 
+def verify_release_manifest_by_id(
+    manifest_id: str,
+    *,
+    services_dir: Path = DEFAULT_SERVICES_DIR,
+    models_dir: Path = DEFAULT_MODELS_DIR,
+    config_db_url: str = DEFAULT_CONFIG_DB_URL,
+    session_factory: Callable[[], Session] = SessionLocal,
+) -> Tuple[Manifest, List[str]]:
+    """Fetch a stored manifest and compare it with the live environment."""
+
+    with session_factory() as session:
+        manifest = fetch_manifest(session, manifest_id)
+
+    if manifest is None:
+        raise LookupError(f"Manifest '{manifest_id}' was not found")
+
+    mismatches = verify_release_manifest(
+        manifest,
+        services_dir=services_dir,
+        models_dir=models_dir,
+        config_db_url=config_db_url,
+    )
+    return manifest, mismatches
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -429,17 +454,15 @@ def list_command(args: argparse.Namespace) -> int:
 
 
 def verify_command(args: argparse.Namespace) -> int:
-    with SessionLocal() as session:
-        manifest = fetch_manifest(session, args.id)
-    if manifest is None:
-        raise SystemExit(f"Manifest '{args.id}' was not found")
-
-    mismatches = verify_release_manifest(
-        manifest,
-        services_dir=Path(args.services_dir),
-        models_dir=Path(args.models_dir),
-        config_db_url=args.config_db,
-    )
+    try:
+        _, mismatches = verify_release_manifest_by_id(
+            args.id,
+            services_dir=Path(args.services_dir),
+            models_dir=Path(args.models_dir),
+            config_db_url=args.config_db,
+        )
+    except LookupError as exc:
+        raise SystemExit(str(exc))
 
     if mismatches:
         for message in mismatches:
