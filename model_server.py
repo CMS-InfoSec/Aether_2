@@ -11,6 +11,8 @@ from fastapi import Depends, FastAPI, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from services.common.security import require_admin_account
+
 try:  # pragma: no cover - mlflow is optional for local tests.
     import mlflow
     from mlflow import pyfunc
@@ -108,11 +110,18 @@ class ModelCache:
             self._models.clear()
 
 
-def inference_log(symbol: str, model_id: str, confidence: float, ts: float) -> None:
+def inference_log(
+    symbol: str,
+    model_id: str,
+    confidence: float,
+    ts: float,
+    actor_account: str | None = None,
+) -> None:
     """Lightweight structured log for inference events."""
-    LOGGER.info(
-        "inference_log", extra={"symbol": symbol, "model_id": model_id, "confidence": confidence, "ts": ts}
-    )
+    extra = {"symbol": symbol, "model_id": model_id, "confidence": confidence, "ts": ts}
+    if actor_account:
+        extra["actor_account"] = actor_account
+    LOGGER.info("inference_log", extra=extra)
 
 
 model_cache = ModelCache(ttl=MODEL_CACHE_TTL)
@@ -255,7 +264,7 @@ app = FastAPI(title="Policy Model Server", version="1.0.0")
 
 
 @app.post("/models/predict", response_model=IntentResponse)
-async def predict(request: PredictRequest) -> IntentResponse:
+async def predict(request: PredictRequest, caller: str = Depends(require_admin_account)) -> IntentResponse:
     model_entry = get_model(request.symbol)
     ts = time.time()
 
@@ -278,12 +287,24 @@ async def predict(request: PredictRequest) -> IntentResponse:
         )
 
     intent = make_intent_response(raw_result)
-    inference_log(request.symbol, model_entry.model_id, intent.confidence, ts)
+    inference_log(request.symbol, model_entry.model_id, intent.confidence, ts, caller)
     return intent
 
 
 @app.get("/models/active", response_model=ModelInfo)
-async def active_model(info: CachedModel = Depends(get_cached_model)) -> ModelInfo:
+async def active_model(
+    info: CachedModel = Depends(get_cached_model), caller: str = Depends(require_admin_account)
+) -> ModelInfo:
+    LOGGER.info(
+        "active_model_lookup",
+        extra={
+            "symbol": info.symbol,
+            "model_id": info.model_id,
+            "stage": info.stage,
+            "source": info.source,
+            "actor_account": caller,
+        },
+    )
     return ModelInfo(symbol=info.symbol, model_id=info.model_id, stage=info.stage, source=info.source)
 
 
