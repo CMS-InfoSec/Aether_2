@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from app import create_app
 import pack_exporter
+from services.common.security import require_admin_account
 
 
 def test_knowledge_router_available(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -23,6 +24,7 @@ def test_knowledge_router_available(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(pack_exporter, "KnowledgePackRepository", lambda *_, **__: Repo())
 
     app = create_app()
+    app.dependency_overrides[require_admin_account] = lambda: "company"
     with TestClient(app) as client:
         response = client.get("/knowledge/export/latest")
 
