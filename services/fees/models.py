@@ -30,6 +30,9 @@ class AccountVolume30d(Base):
     account_id = Column(String(64), primary_key=True)
     notional_usd_30d = Column(Numeric(20, 2), nullable=False, default=0)
     updated_at = Column(DateTime(timezone=True), nullable=False)
+    maker_fee_bps_estimate = Column(Numeric(10, 4), nullable=True)
+    taker_fee_bps_estimate = Column(Numeric(10, 4), nullable=True)
+    fee_estimate_updated_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class AccountFill(Base):
