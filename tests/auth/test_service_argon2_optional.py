@@ -93,6 +93,41 @@ def test_login_flow_without_argon2(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert session.admin_id == admin.admin_id
     assert getattr(service_module._ARGON2_HASHER, "hash_prefix", "").startswith("$pbkdf2-sha256$")
+    assert repository.get_by_email(admin.email).password_hash == admin.password_hash
+
+
+def test_login_upgrades_legacy_pbkdf2_hash_without_argon2(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service_module = _reload_auth_service(monkeypatch, block_argon2=True)
+    _install_totp_stub(monkeypatch, service_module)
+    service, repository = _build_service(service_module)
+
+    legacy_hasher = service_module._FallbackPasswordHasher(iterations=1000)
+    legacy_hash = legacy_hasher.hash("hunter2")
+
+    admin = service_module.AdminAccount(
+        admin_id="fallback-legacy",
+        email="legacy@example.com",
+        password_hash=legacy_hash,
+        mfa_secret="STUBSECRET",
+    )
+    repository.add(admin)
+
+    session = service.login(
+        email=admin.email,
+        password="hunter2",
+        mfa_code="123456",
+        ip_address=None,
+    )
+
+    assert session.admin_id == admin.admin_id
+
+    updated_admin = repository.get_by_email(admin.email)
+    assert updated_admin is not None
+    assert updated_admin.password_hash != legacy_hash
+    assert updated_admin.password_hash.startswith(service_module._ARGON2_HASHER.hash_prefix)
+    assert updated_admin.password_hash.split("$")[2] == str(service_module._ARGON2_HASHER._iterations)
 
 
 @pytest.mark.skipif(not ARGON2_AVAILABLE, reason="argon2 is required for this test")

@@ -95,22 +95,26 @@ except ImportError:  # pragma: no cover - fallback when argon2 is unavailable
                 raise VerifyMismatchError("Password does not match stored hash")
             return True
 
+        def needs_update(self, hashed: str) -> bool:
+            """Return ``True`` when the stored hash should be upgraded."""
 
-    def needs_update(self, hashed: str) -> bool:
-        checker = getattr(self._delegate, "check_needs_rehash", None)
-        if callable(checker):
-            try:
-                return bool(checker(hashed))
-            except (InvalidHash, AttributeError):
+            if not hashed.startswith(self.hash_prefix):
                 return False
-        fallback = getattr(self._delegate, "needs_update", None)
-        if callable(fallback):
-            try:
-                return bool(fallback(hashed))
-            except AttributeError:
-                return False
-        return False
 
+            try:
+                _, prefix_name, iterations_str, *_rest = hashed.split("$", 4)
+            except ValueError:
+                return False
+
+            if prefix_name != "pbkdf2-sha256":
+                return False
+
+            try:
+                iterations = int(iterations_str)
+            except ValueError:
+                return False
+
+            return iterations < self._iterations
 
 
     PasswordHasher = _FallbackPasswordHasher  # type: ignore[assignment]
@@ -155,6 +159,26 @@ _LOGIN_SUCCESS_COUNTER = Counter(
     "Number of successful administrator logins.",
 )
 
+
+
+def _password_needs_update(stored_hash: str) -> bool:
+    """Determine whether the stored hash should be upgraded."""
+
+    check_rehash = getattr(_ARGON2_HASHER, "check_needs_rehash", None)
+    if callable(check_rehash):
+        try:
+            return bool(check_rehash(stored_hash))
+        except (InvalidHash, AttributeError):
+            return False
+
+    needs_update = getattr(_ARGON2_HASHER, "needs_update", None)
+    if callable(needs_update):
+        try:
+            return bool(needs_update(stored_hash))
+        except (InvalidHash, AttributeError):
+            return False
+
+    return False
 
 
 @dataclass
@@ -434,11 +458,7 @@ class AuthService:
 
         try:
             if _ARGON2_HASHER.verify(stored_hash, password):
-                if hasattr(_ARGON2_HASHER, "check_needs_rehash"):
-                    needs_update = _ARGON2_HASHER.check_needs_rehash(stored_hash)
-                else:
-                    needs_update = _ARGON2_HASHER.needs_update(stored_hash)
-                if needs_update:
+                if _password_needs_update(stored_hash):
                     admin.password_hash = hash_password(password)
                     self._repository.add(admin)
                 return True
