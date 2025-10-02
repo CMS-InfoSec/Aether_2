@@ -4,6 +4,23 @@ metadata:
   name: policy-service
   labels:
     app: policy-service
+  annotations:
+    aether.io/readinessProbe: |
+      httpGet:
+        path: /metrics
+        port: http
+      initialDelaySeconds: 20
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 3
+    aether.io/livenessProbe: |
+      httpGet:
+        path: /metrics
+        port: http
+      initialDelaySeconds: 30
+      periodSeconds: 20
+      timeoutSeconds: 5
+      failureThreshold: 3
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
@@ -36,6 +53,23 @@ metadata:
   name: risk-service
   labels:
     app: risk-service
+  annotations:
+    aether.io/readinessProbe: |
+      httpGet:
+        path: /metrics
+        port: http
+      initialDelaySeconds: 20
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 3
+    aether.io/livenessProbe: |
+      httpGet:
+        path: /metrics
+        port: http
+      initialDelaySeconds: 30
+      periodSeconds: 20
+      timeoutSeconds: 5
+      failureThreshold: 3
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
@@ -68,6 +102,23 @@ metadata:
   name: oms-service
   labels:
     app: oms-service
+  annotations:
+    aether.io/readinessProbe: |
+      httpGet:
+        path: /metrics
+        port: http
+      initialDelaySeconds: 20
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 3
+    aether.io/livenessProbe: |
+      httpGet:
+        path: /metrics
+        port: http
+      initialDelaySeconds: 30
+      periodSeconds: 20
+      timeoutSeconds: 5
+      failureThreshold: 3
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
