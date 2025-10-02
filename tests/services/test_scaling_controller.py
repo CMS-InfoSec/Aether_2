@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import asyncio
@@ -129,8 +130,10 @@ class FakeOmsScaler:
 
     async def scale_to(self, replicas: int) -> None:
         self.replicas = replicas
+
         self._replica_cache = replicas
         self.scale_calls.append(replicas)
+
 
 
 class FakeGpuManager:
@@ -146,6 +149,7 @@ class FakeGpuManager:
         self.provision_calls += 1
         if not self.nodes:
             self.nodes = ["gpu-a", "gpu-b"]
+
         return list(self.nodes)
 
     async def deprovision_gpu_pool(self) -> None:

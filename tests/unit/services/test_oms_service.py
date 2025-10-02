@@ -6,8 +6,14 @@ from decimal import Decimal
 from types import SimpleNamespace
 from typing import Dict
 
+import os
+
 import pytest
 from fastapi.testclient import TestClient
+
+from auth_service import create_jwt
+
+os.environ["AUTH_JWT_SECRET"] = "test-secret"
 
 from services.oms import oms_service
 
@@ -74,6 +80,11 @@ def oms_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     return TestClient(oms_service.app)
 
 
+def _auth_headers(account_id: str) -> Dict[str, str]:
+    token, _ = create_jwt(subject=account_id, ttl_seconds=3600)
+    return {"Authorization": f"Bearer {token}"}
+
+
 def test_place_order_requires_auth_header(oms_client: TestClient) -> None:
     payload = {
         "account_id": "ACC1",
@@ -98,7 +109,7 @@ def test_place_order_succeeds_with_matching_account(oms_client: TestClient) -> N
         "qty": "1",
         "limit_px": "50000",
     }
-    headers = {"X-Account-ID": "ACC1"}
+    headers = _auth_headers("ACC1")
     response = oms_client.post("/oms/place", json=payload, headers=headers)
     assert response.status_code == 200
     body = response.json()
@@ -113,13 +124,13 @@ def test_status_requires_matching_account(oms_client: TestClient) -> None:
     response = oms_client.get(
         "/oms/status",
         params={"account_id": "ACC1", "client_id": "CID-1"},
-        headers={"X-Account-ID": "ACC2"},
+        headers=_auth_headers("ACC2"),
     )
     assert response.status_code == 403
 
 
 def test_status_returns_last_known_result(oms_client: TestClient) -> None:
-    headers = {"X-Account-ID": "ACC1"}
+    headers = _auth_headers("ACC1")
     payload = {
         "account_id": "ACC1",
         "client_id": "CID-1",
@@ -148,13 +159,13 @@ def test_routing_status_requires_auth(oms_client: TestClient) -> None:
     response = oms_client.get(
         "/oms/routing/status",
         params={"account_id": "ACC1"},
-        headers={"X-Account-ID": "ACC2"},
+        headers=_auth_headers("ACC2"),
     )
     assert response.status_code == 403
 
 
 def test_routing_status_returns_router_state(oms_client: TestClient) -> None:
-    headers = {"X-Account-ID": "ACC1"}
+    headers = _auth_headers("ACC1")
     response = oms_client.get(
         "/oms/routing/status",
         params={"account_id": "ACC1"},
@@ -170,7 +181,7 @@ def test_routing_status_returns_router_state(oms_client: TestClient) -> None:
 
 
 def test_warm_start_status_endpoint(oms_client: TestClient) -> None:
-    response = oms_client.get("/oms/warm_start/status")
+    response = oms_client.get("/oms/warm_start/report", headers=_auth_headers("ACC1"))
     assert response.status_code == 200
     body = response.json()
-    assert body == {"orders_resynced": 0, "fills_replayed": 0}
+    assert body == {"orders_resynced": 0, "fills_replayed": 0, "latency_ms": 0}
