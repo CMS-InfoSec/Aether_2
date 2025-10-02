@@ -10,9 +10,10 @@ from threading import Lock
 import logging
 from typing import Dict, List, Optional, Union
 
-from fastapi import Body, FastAPI, Header, HTTPException, Request, status
+from fastapi import Body, Depends, FastAPI, HTTPException, Request, status
 
 from metrics import increment_safe_mode_triggers, setup_metrics
+from services.common.security import require_admin_account
 
 
 try:  # pragma: no cover - optional audit dependency
@@ -432,12 +433,12 @@ controller = SafeModeController()
 def enter_safe_mode(
     request: Request,
     payload: Dict[str, str] = Body(...),
-    actor: Optional[str] = Header(default="system", alias="X-Actor"),
+    actor_account: str = Depends(require_admin_account),
 ) -> Dict[str, object]:
     before_snapshot = dict(controller.status().to_response())
     reason = payload.get("reason", "").strip()
     try:
-        controller.enter(reason=reason, actor=actor)
+        controller.enter(reason=reason, actor=actor_account)
     except ValueError as exc:  # invalid reason
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
@@ -448,7 +449,7 @@ def enter_safe_mode(
         try:
             ip_hash = audit_hash_ip(request.client.host if request.client else None)
             chain_log_audit(
-                actor=actor or "system",
+                actor=actor_account,
                 action="safe_mode.enter",
                 entity="safe_mode",
                 before=before_snapshot,
@@ -464,11 +465,11 @@ def enter_safe_mode(
 @app.post("/safe_mode/exit", response_model=Dict[str, object])
 def exit_safe_mode(
     request: Request,
-    actor: Optional[str] = Header(default="system", alias="X-Actor"),
+    actor_account: str = Depends(require_admin_account),
 ) -> Dict[str, object]:
     before_snapshot = dict(controller.status().to_response())
     try:
-        controller.exit(actor=actor)
+        controller.exit(actor=actor_account)
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     response = controller.status().to_response()
@@ -477,7 +478,7 @@ def exit_safe_mode(
         try:
             ip_hash = audit_hash_ip(request.client.host if request.client else None)
             chain_log_audit(
-                actor=actor or "system",
+                actor=actor_account,
                 action="safe_mode.exit",
                 entity="safe_mode",
                 before=before_snapshot,
