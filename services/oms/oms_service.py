@@ -561,6 +561,10 @@ def _split_quantities(
     return [qty for qty in quantities if qty > 0]
 
 
+class CredentialLoadError(RuntimeError):
+    """Raised when credential secrets cannot be loaded."""
+
+
 class CredentialWatcher:
     """Watches Kubernetes mounted secrets for key rotation."""
 
@@ -632,18 +636,33 @@ class CredentialWatcher:
     async def _load(self) -> None:
         try:
             raw = self._secret_path.read_text()
-        except FileNotFoundError:
-            logger.warning("Credential file missing for account %s", self.account_id)
-            return
+        except FileNotFoundError as exc:
+            message = (
+                f"Credential file missing for account {self.account_id}"
+                f" at {self._secret_path}"
+            )
+            logger.error(message)
+            raise CredentialLoadError(message) from exc
 
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as exc:
-            logger.error("Invalid credential payload for %s: %s", self.account_id, exc)
-            return
+            message = f"Invalid credential payload for {self.account_id}: {exc}"
+            logger.error(message)
+            raise CredentialLoadError(message) from exc
+
+        api_key = data.get("api_key") or data.get("key")
+        api_secret = data.get("api_secret") or data.get("secret")
+        if not api_key or not api_secret:
+            message = (
+                f"Credential payload for {self.account_id} missing required fields"
+            )
+            logger.error(message)
+            raise CredentialLoadError(message)
+
         credentials = {
-            "api_key": data.get("api_key") or data.get("key"),
-            "api_secret": data.get("api_secret") or data.get("secret"),
+            "api_key": api_key,
+            "api_secret": api_secret,
         }
         metadata = data.get("asset_pairs") or data.get("metadata")
 
@@ -729,7 +748,16 @@ class AccountContext:
 
     async def start(self) -> None:
         async with self._startup_lock:
-            await self.credentials.start()
+            try:
+                await self.credentials.start()
+            except CredentialLoadError as exc:
+                increment_oms_error_count(self.account_id, "credentials", "startup")
+                logger.error(
+                    "Failed to start account %s due to credential load error: %s",
+                    self.account_id,
+                    exc,
+                )
+                raise
             if self.ws_client is None:
                 self.ws_client = KrakenWSClient(
                     credential_getter=self.credentials.get_credentials,
