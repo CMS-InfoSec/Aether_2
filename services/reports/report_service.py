@@ -110,7 +110,7 @@ REPORTS_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS reports (
     account_id TEXT NOT NULL,
     date DATE NOT NULL,
-    json_blob JSONB NOT NULL,
+    data_json JSONB NOT NULL,
     ts TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (account_id, date)
 );
@@ -121,17 +121,17 @@ UPSERT_REPORT_SQL = """
 INSERT INTO reports (
     account_id,
     date,
-    json_blob,
+    data_json,
     ts
 ) VALUES (
     %(account_id)s,
     %(date)s,
-    %(json_blob)s::jsonb,
+    %(data_json)s::jsonb,
     %(ts)s
 )
 ON CONFLICT (account_id, date) DO UPDATE
 SET
-    json_blob = EXCLUDED.json_blob,
+    data_json = EXCLUDED.data_json,
     ts = EXCLUDED.ts
 """
 
@@ -365,7 +365,7 @@ class DailyReportService:
         params = {
             "account_id": account_id,
             "date": report.report_date,
-            "json_blob": serialized_payload,
+            "data_json": serialized_payload,
             "ts": now,
         }
         cutoff = now - timedelta(days=self._retention_days)
