@@ -7,9 +7,11 @@ import pytest
 
 pytest.importorskip("fastapi", reason="FastAPI is required for signal graph tests")
 
+from fastapi import HTTPException, status
 from fastapi.testclient import TestClient
 
 import signal_graph
+from services.common.security import require_admin_account
 
 
 class StubRepository:
@@ -66,6 +68,7 @@ def _client_with_dataset():
     )
     signal_graph.GRAPH_SERVICE = service
     client = TestClient(signal_graph.app)
+    client.app.dependency_overrides[require_admin_account] = lambda: "company"
     return client, service
 
 
@@ -117,4 +120,30 @@ def test_trade_not_found_returns_404():
         response = client.get("/signals/graph/trade", params={"trade_id": "missing"})
     assert response.status_code == 404
     assert response.json()["detail"] == "Unknown trade"
+
+
+def test_trade_subgraph_requires_authorization():
+    client, _ = _client_with_dataset()
+
+    def _deny() -> str:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    client.app.dependency_overrides[require_admin_account] = _deny
+    with client:
+        response = client.get("/signals/graph/trade", params={"trade_id": "trade-1"})
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert response.json()["detail"] == "Access denied"
+
+
+def test_feature_subgraph_requires_authorization():
+    client, _ = _client_with_dataset()
+
+    def _deny() -> str:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    client.app.dependency_overrides[require_admin_account] = _deny
+    with client:
+        response = client.get("/signals/graph/feature", params={"name": "rsi"})
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert response.json()["detail"] == "Access denied"
 

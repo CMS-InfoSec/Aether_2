@@ -20,9 +20,11 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping
 
 import networkx as nx
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from networkx.readwrite import json_graph
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+
+from services.common.security import require_admin_account
 
 
 LOGGER = logging.getLogger(__name__)
@@ -598,18 +600,22 @@ def _refresh_graph() -> None:
 @app.get("/signals/graph/trade", response_model=TradeSubgraphResponse)
 def get_trade_subgraph(
     trade_id: str = Query(..., min_length=1, max_length=128, description="Trade identifier"),
+    actor_account: str = Depends(require_admin_account),
 ) -> TradeSubgraphResponse:
     """Return the feature → model → trade → outcome subgraph for ``trade_id``."""
 
+    LOGGER.info("Trade subgraph requested for trade %s by %s", trade_id, actor_account)
     return GRAPH_SERVICE.trade_subgraph(trade_id)
 
 
 @app.get("/signals/graph/feature", response_model=FeatureSubgraphResponse)
 def get_feature_subgraph(
     name: str = Query(..., min_length=1, max_length=128, description="Feature name"),
+    actor_account: str = Depends(require_admin_account),
 ) -> FeatureSubgraphResponse:
     """Return trades connected to ``name`` and the estimated PnL impact."""
 
+    LOGGER.info("Feature subgraph requested for feature %s by %s", name, actor_account)
     return GRAPH_SERVICE.feature_subgraph(name)
 
 
