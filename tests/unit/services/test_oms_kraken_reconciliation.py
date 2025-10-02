@@ -63,6 +63,7 @@ fastapi_stub.Request = _Request
 fastapi_stub.Response = object
 fastapi_stub.Header = lambda *args, **kwargs: None
 fastapi_stub.status = _status
+fastapi_stub.APIRouter = _FastAPIStub
 sys.modules['fastapi'] = fastapi_stub
 
 pydantic_stub = types.ModuleType('pydantic')
@@ -123,6 +124,36 @@ sys.modules['websockets'] = websockets_stub
 sys.modules['websockets.exceptions'] = types.ModuleType('websockets.exceptions')
 sys.modules['websockets.exceptions'].WebSocketException = _WebSocketException
 
+httpx_stub = types.ModuleType('httpx')
+
+
+class _HTTPXAsyncClient:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def __aenter__(self) -> '_HTTPXAsyncClient':
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+    async def post(self, *args: Any, **kwargs: Any) -> '_HTTPXResponse':
+        return _HTTPXResponse()
+
+
+class _HTTPXResponse:
+    def raise_for_status(self) -> None:
+        return None
+
+
+class _HTTPXError(Exception):
+    pass
+
+
+httpx_stub.AsyncClient = _HTTPXAsyncClient
+httpx_stub.HTTPError = _HTTPXError
+sys.modules['httpx'] = httpx_stub
+
 metrics_stub = types.ModuleType('metrics')
 
 
@@ -136,6 +167,7 @@ metrics_stub.record_oms_latency = _noop
 metrics_stub.setup_metrics = _noop
 metrics_stub.record_scaling_state = _noop
 metrics_stub.observe_scaling_evaluation = _noop
+metrics_stub._REGISTRY = object()
 sys.modules['metrics'] = metrics_stub
 
 
