@@ -137,6 +137,8 @@ def _install_sqlalchemy_stub() -> None:
             return cls
 
     class DeclarativeBase(metaclass=_BaseMeta):
+        metadata = SimpleNamespace(create_all=lambda *a, **k: None)
+
         def __init__(self, **kwargs: object) -> None:
             for key, value in kwargs.items():
                 setattr(self, key, value)
@@ -161,6 +163,7 @@ def _install_sqlalchemy_stub() -> None:
 
     pool = ModuleType("sqlalchemy.pool")
     pool.NullPool = object
+    pool.StaticPool = object
     sa.pool = pool
     sys.modules["sqlalchemy.pool"] = pool
 
@@ -250,6 +253,7 @@ def _install_prometheus_stub() -> None:
     prom.Summary = _Metric
     prom.Histogram = _Metric
     prom.CollectorRegistry = SimpleNamespace
+    prom.REGISTRY = SimpleNamespace()
     prom.CONTENT_TYPE_LATEST = "text/plain"
     prom.generate_latest = lambda registry: b""
     sys.modules["prometheus_client"] = prom
