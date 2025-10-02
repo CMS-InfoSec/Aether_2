@@ -511,7 +511,7 @@ class BackupJob:
                         """
                         CREATE TABLE IF NOT EXISTS backup_log (
                             manifest_id TEXT PRIMARY KEY,
-                            backup_ts TIMESTAMPTZ,
+                            ts TIMESTAMPTZ,
                             status TEXT,
                             manifest JSONB
                         )
@@ -519,10 +519,10 @@ class BackupJob:
                     )
                     cursor.execute(
                         """
-                        INSERT INTO backup_log (manifest_id, backup_ts, status, manifest)
+                        INSERT INTO backup_log (manifest_id, ts, status, manifest)
                         VALUES (%s, %s, %s, %s)
                         ON CONFLICT (manifest_id)
-                        DO UPDATE SET status = EXCLUDED.status, manifest = EXCLUDED.manifest
+                        DO UPDATE SET status = EXCLUDED.status, manifest = EXCLUDED.manifest, ts = EXCLUDED.ts
                         """,
                         (
                             manifest_id,
