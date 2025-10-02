@@ -6,9 +6,10 @@ import logging
 import os
 from typing import Any, Iterable, Mapping, MutableMapping, Sequence
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
+from services.common.security import require_admin_account
 from services.models.model_server import get_active_model
 
 try:  # pragma: no cover - optional dependency in some environments
@@ -198,8 +199,16 @@ app = FastAPI(title="Explainability Service", version="1.0.0")
 
 
 @app.get("/explain/trade")
-def get_trade_explanation(trade_id: str = Query(..., description="Unique trade/fill identifier")) -> JSONResponse:
+def get_trade_explanation(
+    trade_id: str = Query(..., description="Unique trade/fill identifier"),
+    actor_account: str = Depends(require_admin_account),
+) -> JSONResponse:
     """Return the key drivers behind a trade intent for UI consumption."""
+
+    LOGGER.info(
+        "Trade explanation requested",
+        extra={"trade_id": trade_id, "actor_account": actor_account},
+    )
 
     trade = _load_trade_record(trade_id)
 
@@ -218,7 +227,12 @@ def get_trade_explanation(trade_id: str = Query(..., description="Unique trade/f
         raw_importance = model.explain(features)
     except Exception as exc:  # pragma: no cover - unexpected model errors
         LOGGER.exception(
-            "Model explanation failed", extra={"trade_id": trade_id, "account_id": account_id}
+            "Model explanation failed",
+            extra={
+                "trade_id": trade_id,
+                "account_id": account_id,
+                "actor_account": actor_account,
+            },
         )
         raise HTTPException(status_code=500, detail="Unable to generate explanation") from exc
 
