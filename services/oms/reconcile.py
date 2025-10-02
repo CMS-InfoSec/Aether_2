@@ -17,6 +17,7 @@ from fastapi import APIRouter, FastAPI, HTTPException
 
 from services.oms.kraken_rest import KrakenRESTError
 from services.oms.kraken_ws import KrakenWSError, KrakenWSTimeout, OrderState
+from services.oms.rate_limit_guard import rate_limit_guard
 
 logger = logging.getLogger(__name__)
 
@@ -248,6 +249,11 @@ class OMSReconciler:
         if account.rest_client is None:
             return balances
         try:
+            await rate_limit_guard.acquire(
+                account.account_id,
+                "/private/Balance",
+                transport="rest",
+            )
             payload = await account.rest_client.balance()
         except KrakenRESTError as exc:
             logger.warning(
@@ -286,6 +292,11 @@ class OMSReconciler:
         authoritative = False
         if account.ws_client is not None:
             try:
+                await rate_limit_guard.acquire(
+                    account.account_id,
+                    "open_orders_snapshot",
+                    transport="websocket",
+                )
                 snapshot = await account.ws_client.fetch_open_orders_snapshot()
             except (KrakenWSError, KrakenWSTimeout) as exc:
                 logger.warning(
@@ -299,6 +310,11 @@ class OMSReconciler:
 
         if not authoritative and account.rest_client is not None:
             try:
+                await rate_limit_guard.acquire(
+                    account.account_id,
+                    "/private/OpenOrders",
+                    transport="rest",
+                )
                 payload = await account.rest_client.open_orders()
             except KrakenRESTError as exc:
                 logger.warning(

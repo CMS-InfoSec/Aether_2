@@ -31,6 +31,7 @@ from services.oms.kraken_ws import (
 )
 
 from services.oms.routing import LatencyRouter
+from services.oms.rate_limit_guard import rate_limit_guard
 from services.oms.warm_start import WarmStartCoordinator
 
 
@@ -668,6 +669,7 @@ class AccountContext:
         self.credentials = CredentialWatcher.instance(account_id)
         self.ws_client: Optional[KrakenWSClient] = None
         self.rest_client: Optional[KrakenRESTClient] = None
+        self.rate_limits = rate_limit_guard
         self.idempotency = _IdempotencyStore()
         self._orders: Dict[str, OrderRecord] = {}
         self._orders_lock = asyncio.Lock()
@@ -686,6 +688,44 @@ class AccountContext:
         self._reconcile_interval = max(float(os.environ.get("OMS_RECONCILE_INTERVAL", "30")), 0.0)
         self._reconcile_lock = asyncio.Lock()
 
+
+    async def _throttle_ws(self, endpoint: str, *, urgent: bool = False) -> None:
+        await self.rate_limits.acquire(
+            self.account_id,
+            endpoint,
+            transport="websocket",
+            urgent=urgent,
+        )
+
+    async def _throttle_rest(self, endpoint: str, *, urgent: bool = False) -> None:
+        await self.rate_limits.acquire(
+            self.account_id,
+            endpoint,
+            transport="rest",
+            urgent=urgent,
+        )
+
+    @staticmethod
+    def _is_urgent_order(payload: Dict[str, Any]) -> bool:
+        flags = (
+            payload.get("hedge"),
+            payload.get("is_hedge"),
+            payload.get("safe_mode"),
+            payload.get("urgent"),
+        )
+        if any(isinstance(flag, bool) and flag for flag in flags):
+            return True
+        flag_candidates = []
+        oflags = payload.get("oflags")
+        if isinstance(oflags, str):
+            flag_candidates.extend(oflags.split(","))
+        tags = payload.get("tags")
+        if isinstance(tags, (list, tuple, set)):
+            flag_candidates.extend(tags)
+        for candidate in flag_candidates:
+            if isinstance(candidate, str) and "hedge" in candidate.lower():
+                return True
+        return False
 
     async def start(self) -> None:
         async with self._startup_lock:
@@ -843,6 +883,7 @@ class AccountContext:
 
         if self.ws_client is not None:
             try:
+                await self._throttle_ws("open_orders_snapshot")
                 snapshot = await self.ws_client.fetch_open_orders_snapshot()
             except (KrakenWSError, KrakenWSTimeout) as exc:
                 logger.warning(
@@ -853,6 +894,7 @@ class AccountContext:
 
         if not snapshot and self.rest_client is not None:
             try:
+                await self._throttle_rest("/private/OpenOrders")
                 payload = await self.rest_client.open_orders()
                 snapshot = self._parse_rest_open_orders(payload)
             except KrakenRESTError as exc:
@@ -872,6 +914,7 @@ class AccountContext:
             return 0
 
         try:
+            await self._throttle_rest("/private/OpenPositions")
             payload = await self.rest_client.open_positions()
         except KrakenRESTError as exc:
             logger.warning(
@@ -891,6 +934,7 @@ class AccountContext:
 
         if self.ws_client is not None:
             try:
+                await self._throttle_ws("own_trades_snapshot")
                 trades = await self.ws_client.fetch_own_trades_snapshot()
             except (KrakenWSError, KrakenWSTimeout) as exc:
                 logger.warning(
@@ -901,6 +945,7 @@ class AccountContext:
 
         if not trades and self.rest_client is not None:
             try:
+                await self._throttle_rest("/private/TradesHistory")
                 payload = await self.rest_client.own_trades()
                 trades = self._parse_rest_trades(payload)
             except KrakenRESTError as exc:
@@ -931,6 +976,7 @@ class AccountContext:
             return 0
 
         try:
+            await self._throttle_rest("/private/Balance")
             payload = await self.rest_client.balance()
         except KrakenRESTError as exc:
             logger.warning(
@@ -1700,9 +1746,12 @@ class AccountContext:
 
             start = time.perf_counter()
             try:
+                urgent = self._is_urgent_order(attempt_payload)
                 if transport == "websocket":
+                    await self._throttle_ws("add_order", urgent=urgent)
                     ack = await self.ws_client.add_order(attempt_payload)
                 else:
+                    await self._throttle_rest("/private/AddOrder", urgent=urgent)
                     ack = await self.rest_client.add_order(attempt_payload)
             except (KrakenWSTimeout, KrakenWSError) as exc:
                 increment_oms_error_count(self.account_id, symbol, "websocket")
@@ -1745,6 +1794,8 @@ class AccountContext:
             rest_payload.setdefault("idempotencyKey", base_client_id)
             start = time.perf_counter()
             try:
+                urgent = self._is_urgent_order(rest_payload)
+                await self._throttle_rest("/private/AddOrder", urgent=urgent)
                 ack = await self.rest_client.add_order(rest_payload)
             except KrakenRESTError as rest_exc:
                 increment_oms_error_count(self.account_id, symbol, "rest")
@@ -1786,6 +1837,7 @@ class AccountContext:
         assert self.rest_client is not None
 
         try:
+            await self._throttle_ws("cancel_order", urgent=True)
             ack = await self.ws_client.cancel_order({"txid": txid})
             return ack, "websocket"
         except (KrakenWSTimeout, KrakenWSError) as exc:
@@ -1796,6 +1848,7 @@ class AccountContext:
                 exc,
             )
             try:
+                await self._throttle_rest("/private/CancelOrder", urgent=True)
                 ack = await self.rest_client.cancel_order({"txid": txid})
             except KrakenRESTError as rest_exc:
                 raise HTTPException(
@@ -1978,6 +2031,13 @@ async def get_routing_status(
 
     account = await manager.get_account(account_id)
     return account.routing_status()
+
+
+@app.get("/oms/rate_limits/status")
+async def get_rate_limit_status(
+    header_account: str = Depends(require_account_id),
+) -> Dict[str, Dict[str, Dict[str, float | int]]]:
+    return await rate_limit_guard.status(header_account)
 
 
 @app.get("/oms/warm_start/report")

@@ -14,6 +14,7 @@ from typing import Any, Deque, Dict, Optional
 from services.common.config import get_timescale_session
 from services.oms.kraken_rest import KrakenRESTClient, KrakenRESTError
 from services.oms.kraken_ws import KrakenWSClient, KrakenWSError, KrakenWSTimeout
+from services.oms.rate_limit_guard import rate_limit_guard
 
 try:  # pragma: no cover - optional dependency in CI
     import psycopg
@@ -233,6 +234,7 @@ class LatencyRouter:
         payload = self._build_probe_payload()
         start = time.perf_counter()
         try:
+            await rate_limit_guard.acquire(self.account_id, "ws_latency_probe", transport="websocket")
             await self._ws_client.add_order(payload)
         except (KrakenWSTimeout, KrakenWSError) as exc:
             LOGGER.debug("Websocket probe failed: %s", exc)
@@ -245,6 +247,7 @@ class LatencyRouter:
         payload = self._build_probe_payload()
         start = time.perf_counter()
         try:
+            await rate_limit_guard.acquire(self.account_id, "rest_latency_probe", transport="rest")
             await self._rest_client.add_order(payload)
         except KrakenRESTError as exc:
             LOGGER.debug("REST probe failed: %s", exc)
