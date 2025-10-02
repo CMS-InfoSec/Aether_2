@@ -527,6 +527,21 @@ async def store_kraken_secret(
         authorized_actor,
     )
 
+    request_actor = (payload.actor or "").strip()
+    if request_actor and request_actor.lower() != "unknown" and request_actor != authorized_actor:
+        LOGGER.warning(
+            "Actor mismatch for Kraken secret rotation on account %s: payload actor %s does not match authorized actor %s",
+            payload.account_id,
+            request_actor,
+            authorized_actor,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Actor identity does not match provided credentials",
+        )
+
+    verified_actor = authorized_actor
+
     before_snapshot: Dict[str, Any] = {}
     if log_audit is not None:
         try:
@@ -585,7 +600,7 @@ async def store_kraken_secret(
         result = manager.upsert_secret(
             account_id=payload.account_id,
             payload={"api_key": payload.api_key, "api_secret": payload.api_secret},
-            actor=payload.actor,
+            actor=verified_actor,
         )
     except ApiException as exc:
         raise HTTPException(
@@ -593,14 +608,14 @@ async def store_kraken_secret(
             detail="Unable to update Kubernetes secret",
         ) from exc
 
-    log_rotation(payload.account_id, payload.actor, result["last_rotated"])
+    log_rotation(payload.account_id, verified_actor, result["last_rotated"])
 
     if log_audit is not None:
         try:
             audit_after = dict(result)
-            audit_after["actor"] = payload.actor
+            audit_after["actor"] = verified_actor
             log_audit(
-                actor=payload.actor,
+                actor=verified_actor,
                 action="secret.kraken.rotate",
                 entity=payload.account_id,
                 before=before_snapshot,

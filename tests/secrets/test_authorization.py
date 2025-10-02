@@ -100,6 +100,25 @@ def test_store_secret_allows_authorized_admin(secrets_client: TestClient) -> Non
     assert response.status_code == 201
     payload = response.json()
     assert payload["secret_name"] == "kraken-keys-acct"
+    manager = secrets_client._fake_manager  # type: ignore[attr-defined]
+    assert manager.last_upsert is not None
+    assert manager.last_upsert["actor"] == "svc"
+
+
+def test_store_secret_rejects_actor_mismatch(secrets_client: TestClient) -> None:
+    response = secrets_client.post(
+        "/secrets/kraken",
+        json={
+            "account_id": "acct",
+            "api_key": "key",
+            "api_secret": "secret",
+            "actor": "spoofed",
+        },
+        headers={"Authorization": "Bearer service-token-123"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Actor identity does not match provided credentials"
 
 
 def test_status_requires_authorization(secrets_client: TestClient) -> None:
