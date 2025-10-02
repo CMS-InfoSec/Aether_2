@@ -26,14 +26,14 @@ interface KillSwitchResponse {
 
 type KillSwitchReason = "loss_cap_breach" | "spread_widening" | "latency_stall";
 
-type DirectorAction = {
-  id?: string | number;
+interface DirectorAction {
+  id?: string;
   action: string;
-  actor?: string | null;
-  target?: string | null;
-  details?: string | null;
-  timestamp?: string | null;
-};
+  actor: string;
+  entity: string;
+  timestamp: string;
+  details?: string;
+}
 
 interface AssetOverridePayload {
   asset: string;
@@ -47,6 +47,8 @@ const KILL_SWITCH_REASONS: { label: string; value: KillSwitchReason }[] = [
   { label: "Latency Stall", value: "latency_stall" },
 ];
 
+const DIRECTOR_ACCOUNTS = new Set(["director-1", "director-2", "company"]);
+
 const formatTimestamp = (timestamp?: string | null) => {
   if (!timestamp) {
     return "Unknown";
@@ -58,6 +60,100 @@ const formatTimestamp = (timestamp?: string | null) => {
   }
 
   return date.toLocaleString();
+};
+
+const ensureString = (value: unknown): string => {
+  if (value === null || value === undefined) {
+    return "";
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  return String(value);
+};
+
+const mapAuditEntry = (raw: unknown): DirectorAction | null => {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+
+  const record = raw as Record<string, unknown>;
+
+  const actor = ensureString(
+    record.actor ?? record.actor_id ?? record.user ?? record.principal ?? ""
+  );
+  if (!DIRECTOR_ACCOUNTS.has(actor)) {
+    return null;
+  }
+
+  const action = ensureString(record.action ?? record.event ?? "");
+  const entity = ensureString(
+    record.entity ??
+      record.entity_id ??
+      record.target ??
+      record.resource ??
+      record.subject ??
+      record.object ??
+      ""
+  );
+  const timestamp = ensureString(
+    record.ts ?? record.timestamp ?? record.created_at ?? record.event_time ?? ""
+  );
+
+  if (!action || !timestamp) {
+    return null;
+  }
+
+  const idValue = record.id ?? record.event_id ?? record.audit_id ?? null;
+  const id =
+    idValue === null || idValue === undefined ? undefined : ensureString(idValue);
+
+  const detailsValue = record.details ?? record.after ?? record.metadata ?? null;
+  const details =
+    detailsValue && typeof detailsValue === "object"
+      ? JSON.stringify(detailsValue)
+      : ensureString(detailsValue);
+
+  return {
+    id,
+    action,
+    actor,
+    entity: entity || "—",
+    timestamp,
+    details: details || undefined,
+  };
+};
+
+const extractDirectorActions = (payload: unknown): DirectorAction[] => {
+  const tryExtractArray = (value: unknown): unknown[] => {
+    if (Array.isArray(value)) {
+      return value;
+    }
+    if (value && typeof value === "object") {
+      const container = value as Record<string, unknown>;
+      const candidateKeys = ["logs", "results", "data", "entries"] as const;
+      for (const key of candidateKeys) {
+        const candidate = container[key];
+        if (Array.isArray(candidate)) {
+          return candidate as unknown[];
+        }
+      }
+    }
+    return [];
+  };
+
+  return tryExtractArray(payload)
+    .map((item) => mapAuditEntry(item))
+    .filter((entry): entry is DirectorAction => entry !== null)
+    .sort((first, second) => {
+      const a = Date.parse(first.timestamp);
+      const b = Date.parse(second.timestamp);
+      if (!Number.isNaN(a) && !Number.isNaN(b)) {
+        return b - a;
+      }
+      return second.timestamp.localeCompare(first.timestamp);
+    })
+    .slice(0, 20);
 };
 
 const DirectorControls: React.FC = () => {
@@ -79,6 +175,7 @@ const DirectorControls: React.FC = () => {
     useState<KillSwitchReason>("loss_cap_breach");
   const [firstApproval, setFirstApproval] = useState<string>("");
   const [secondApproval, setSecondApproval] = useState<string>("");
+  const [initiatingAccount, setInitiatingAccount] = useState<string>("director-1");
   const [killArmed, setKillArmed] = useState<boolean>(false);
   const [killLoading, setKillLoading] = useState<boolean>(false);
   const [killMessage, setKillMessage] = useState<string | null>(null);
@@ -89,6 +186,7 @@ const DirectorControls: React.FC = () => {
   const [overrideAction, setOverrideAction] = useState<"block" | "unblock">(
     "block"
   );
+  const [overrideActor, setOverrideActor] = useState<string>("");
   const [overrideLoading, setOverrideLoading] = useState<boolean>(false);
   const [overrideMessage, setOverrideMessage] = useState<string | null>(null);
   const [overrideError, setOverrideError] = useState<string | null>(null);
@@ -140,7 +238,7 @@ const DirectorControls: React.FC = () => {
     async (signal: AbortSignal) => {
       try {
         setAuditLoading(true);
-        const response = await fetch("/director/actions?limit=20", {
+        const response = await fetch("/audit/query", {
           method: "GET",
           headers: { Accept: "application/json" },
           signal,
@@ -150,8 +248,8 @@ const DirectorControls: React.FC = () => {
           throw new Error(`Failed to load director actions (${response.status})`);
         }
 
-        const data = (await response.json()) as DirectorAction[];
-        setAuditTrail(Array.isArray(data) ? data.slice(0, 20) : []);
+        const data = await response.json();
+        setAuditTrail(extractDirectorActions(data));
         setAuditError(null);
       } catch (error) {
         if (signal.aborted) {
@@ -201,6 +299,14 @@ const DirectorControls: React.FC = () => {
   }, [loadSafeModeStatus]);
 
   useEffect(() => {
+    if (killArmed) {
+      setKillArmed(false);
+      setKillMessage(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [killAccount, killReason, initiatingAccount, firstApproval, secondApproval]);
+
+  useEffect(() => {
     const controller = new AbortController();
 
     loadAuditTrail(controller.signal).catch((error) => {
@@ -238,6 +344,9 @@ const DirectorControls: React.FC = () => {
         headers: {
           "Content-Type": "application/json",
           Accept: "application/json",
+          ...(safeModeActor.trim()
+            ? { "X-Actor": safeModeActor.trim() }
+            : {}),
         },
         body: JSON.stringify(payload),
       });
@@ -299,6 +408,11 @@ const DirectorControls: React.FC = () => {
       return;
     }
 
+    if (!initiatingAccount.trim()) {
+      setKillError("Select an initiating administrator account.");
+      return;
+    }
+
     setKillLoading(true);
 
     try {
@@ -312,6 +426,7 @@ const DirectorControls: React.FC = () => {
         headers: {
           Accept: "application/json",
           "X-Director-Approvals": approvals.join(","),
+          "X-Account-ID": initiatingAccount.trim(),
         },
       });
 
@@ -323,7 +438,7 @@ const DirectorControls: React.FC = () => {
       setKillMessage(
         `Kill switch engaged${
           payload.ts ? ` at ${formatTimestamp(payload.ts)}` : ""
-        }.`
+        }. All open orders cancelled and OMS halted.`
       );
       setKillArmed(false);
       setFirstApproval("");
@@ -364,13 +479,18 @@ const DirectorControls: React.FC = () => {
     setOverrideLoading(true);
 
     try {
-      const response = await fetch("/director/assets/override", {
+      const response = await fetch("/universe/override", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Accept: "application/json",
         },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({
+          symbol: payload.asset,
+          enabled: payload.action === "unblock",
+          reason: payload.reason,
+          actor: overrideActor.trim() || undefined,
+        }),
       });
 
       if (!response.ok) {
@@ -384,6 +504,7 @@ const DirectorControls: React.FC = () => {
       );
       setOverrideAsset("");
       setOverrideReason("");
+      setOverrideActor("");
       await refreshAuditTrail();
     } catch (error) {
       console.error("Override action failed", error);
@@ -467,25 +588,35 @@ const DirectorControls: React.FC = () => {
               onChange={(event) => setKillAccount(event.target.value)}
               placeholder="Account identifier"
             />
-            <label htmlFor="kill-reason">Reason</label>
-            <select
-              id="kill-reason"
-              value={killReason}
-              onChange={(event) =>
-                setKillReason(event.target.value as KillSwitchReason)
-              }
-            >
-              {KILL_SWITCH_REASONS.map((reason) => (
-                <option key={reason.value} value={reason.value}>
-                  {reason.label}
-                </option>
-              ))}
-            </select>
-            <label htmlFor="first-approval">Director Approval #1</label>
-            <input
-              id="first-approval"
-              type="text"
-              value={firstApproval}
+          <label htmlFor="kill-reason">Reason</label>
+          <select
+            id="kill-reason"
+            value={killReason}
+            onChange={(event) =>
+              setKillReason(event.target.value as KillSwitchReason)
+            }
+          >
+            {KILL_SWITCH_REASONS.map((reason) => (
+              <option key={reason.value} value={reason.value}>
+                {reason.label}
+              </option>
+            ))}
+          </select>
+          <label htmlFor="initiating-account">Initiating Account</label>
+          <select
+            id="initiating-account"
+            value={initiatingAccount}
+            onChange={(event) => setInitiatingAccount(event.target.value)}
+          >
+            <option value="director-1">director-1</option>
+            <option value="director-2">director-2</option>
+            <option value="company">company</option>
+          </select>
+          <label htmlFor="first-approval">Director Approval #1</label>
+          <input
+            id="first-approval"
+            type="text"
+            value={firstApproval}
               onChange={(event) => setFirstApproval(event.target.value)}
               placeholder="director-1"
             />
@@ -526,22 +657,30 @@ const DirectorControls: React.FC = () => {
               onChange={(event) => setOverrideReason(event.target.value)}
               placeholder="Why this override is needed"
             />
-            <label htmlFor="override-action">Action</label>
-            <select
-              id="override-action"
-              value={overrideAction}
-              onChange={(event) =>
-                setOverrideAction(event.target.value as "block" | "unblock")
-              }
-            >
-              <option value="block">Block Asset</option>
-              <option value="unblock">Unblock Asset</option>
-            </select>
-          </div>
-          <button type="submit" disabled={overrideLoading}>
-            Submit Override
-          </button>
-        </form>
+          <label htmlFor="override-action">Action</label>
+          <select
+            id="override-action"
+            value={overrideAction}
+            onChange={(event) =>
+              setOverrideAction(event.target.value as "block" | "unblock")
+            }
+          >
+            <option value="block">Block Asset</option>
+            <option value="unblock">Unblock Asset</option>
+          </select>
+          <label htmlFor="override-actor">Actor (optional)</label>
+          <input
+            id="override-actor"
+            type="text"
+            value={overrideActor}
+            onChange={(event) => setOverrideActor(event.target.value)}
+            placeholder="Recorded actor"
+          />
+        </div>
+        <button type="submit" disabled={overrideLoading}>
+          Submit Override
+        </button>
+      </form>
         {overrideMessage && <p className="success">{overrideMessage}</p>}
         {overrideError && <p className="error">{overrideError}</p>}
       </div>
@@ -560,7 +699,7 @@ const DirectorControls: React.FC = () => {
                 <th>Timestamp</th>
                 <th>Action</th>
                 <th>Actor</th>
-                <th>Target</th>
+                <th>Entity</th>
                 <th>Details</th>
               </tr>
             </thead>
@@ -569,8 +708,8 @@ const DirectorControls: React.FC = () => {
                 <tr key={entry.id ?? `${entry.action}-${index}`}>
                   <td>{formatTimestamp(entry.timestamp)}</td>
                   <td>{entry.action}</td>
-                  <td>{entry.actor ?? "Unknown"}</td>
-                  <td>{entry.target ?? "—"}</td>
+                  <td>{entry.actor || "Unknown"}</td>
+                  <td>{entry.entity}</td>
                   <td>{entry.details ?? ""}</td>
                 </tr>
               ))}
