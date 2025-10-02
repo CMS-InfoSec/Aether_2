@@ -13,6 +13,7 @@ from services.oms.kraken_rest import KrakenRESTError
 from services.oms.kraken_ws import KrakenWSError, KrakenWSTimeout, OrderAck
 
 logger = logging.getLogger(__name__)
+error_logger = logging.getLogger("oms_error_log")
 
 try:  # pragma: no cover - optional dependency in CI
     import psycopg
@@ -255,16 +256,19 @@ class KrakenErrorHandler:
         operation: str,
     ) -> None:
         level = logging.ERROR if attempt >= self._max_retries else logging.WARNING
-        self._logger.log(
-            level,
-            "Kraken %s transport error via %s attempt=%s/%s correlation_id=%s error=%s",
-            operation,
-            transport,
-            attempt,
-            self._max_retries,
-            correlation_id,
-            exc,
+        message = (
+            "Kraken %s transport error via %s attempt=%s/%s correlation_id=%s error=%s"
+            % (
+                operation,
+                transport,
+                attempt,
+                self._max_retries,
+                correlation_id,
+                exc,
+            )
         )
+        self._logger.log(level, message)
+        error_logger.log(level, message)
 
     async def _record_oms_errors(
         self,
@@ -294,6 +298,19 @@ class KrakenErrorHandler:
             for error in errors
         ]
         self._recorded_errors.extend(entries)
+
+        for entry in entries:
+            error_logger.error(
+                "OMS error transport=%s operation=%s correlation_id=%s account_id=%s "
+                "error_code=%s retry_count=%s attempt=%s",
+                entry["transport"],
+                entry["operation"],
+                entry["correlation_id"],
+                entry["account_id"],
+                entry["error_code"],
+                entry["retry_count"],
+                attempt,
+            )
 
         if not entries:
             return
