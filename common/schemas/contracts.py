@@ -80,6 +80,15 @@ class FillEvent(MessageModel):
     ts: datetime = Field(..., description="Event timestamp")
 
 
+class SimModeEvent(MessageModel):
+    """Event capturing transitions into or out of platform simulation mode."""
+
+    active: bool = Field(..., description="True when the platform is in simulation mode")
+    reason: str | None = Field(default=None, description="Human readable reason for the state change")
+    ts: datetime = Field(..., description="Timestamp of the state change")
+    actor: str = Field(..., min_length=1, max_length=64, description="Actor responsible for the change")
+
+
 class AnomalyEvent(MessageModel):
     """Anomaly detection event."""
 
@@ -105,6 +114,7 @@ __all__ = [
     "RiskDecisionEvent",
     "OrderEvent",
     "FillEvent",
+    "SimModeEvent",
     "AnomalyEvent",
     "ConfigChangeEvent",
 ]
