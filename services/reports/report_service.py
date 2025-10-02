@@ -12,12 +12,13 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, MutableMapping, Optional, Sequence
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from psycopg2 import sql
 from psycopg2.extras import RealDictCursor
 
 from services.common.config import TimescaleSession, get_timescale_session
+from services.common.security import require_admin_account
 from services.models.model_server import get_active_model
 
 LOGGER = logging.getLogger(__name__)
@@ -836,6 +837,7 @@ def get_daily_report_service() -> DailyReportService:
 async def get_daily_report(
     account_id: str | None = Query(default=None),
     report_date: date | None = Query(default=None),
+    _: str = Depends(require_admin_account),
 ) -> Dict[str, Any]:
     service = get_daily_report_service()
     try:
@@ -855,6 +857,7 @@ async def export_daily_report(
     format: str = Query(..., regex="^(?i)(pdf|csv|json)$"),
     account_id: str | None = Query(default=None),
     report_date: date | None = Query(default=None),
+    _: str = Depends(require_admin_account),
 ) -> StreamingResponse:
     service = get_daily_report_service()
     try:
@@ -877,7 +880,10 @@ async def export_daily_report(
 
 
 @router.get("/explain")
-async def explain_trade(trade_id: str = Query(..., description="Unique trade or order identifier")) -> Dict[str, Any]:
+async def explain_trade(
+    trade_id: str = Query(..., description="Unique trade or order identifier"),
+    _: str = Depends(require_admin_account),
+) -> Dict[str, Any]:
     service = get_daily_report_service()
     try:
         return service.explain_trade(trade_id)

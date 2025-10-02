@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Mapping
 
 import pytest
 
@@ -17,6 +17,7 @@ import alert_prioritizer
 import compliance_pack
 import multiformat_export
 import services.report_service as account_report_service
+import services.reports.report_service as reporting_service
 from audit_mode import AuditorPrincipal
 from services.alerts import alert_dedupe
 from services.common.security import require_admin_account
@@ -46,6 +47,66 @@ def report_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
         app.dependency_overrides.clear()
 
 
+@pytest.fixture
+def daily_report_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    """Test client for the trading reports service endpoints."""
+
+    app = FastAPI()
+    app.include_router(reporting_service.router)
+
+    class StubReport:
+        def __init__(self, account_id: str, report_date: dt.date) -> None:
+            self.account_id = account_id
+            self.report_date = report_date
+
+        def to_dict(self) -> Dict[str, Any]:
+            return {
+                "account_id": self.account_id,
+                "report_date": self.report_date.isoformat(),
+            }
+
+    class StubDailyReportService:
+        def __init__(self) -> None:
+            self.last_report: StubReport | None = None
+
+        def build_daily_report(
+            self,
+            *,
+            account_id: str | None = None,
+            report_date: dt.date | None = None,
+        ) -> StubReport:
+            target = account_id or "default"
+            day = report_date or dt.date(2024, 1, 1)
+            self.last_report = StubReport(target, day)
+            return self.last_report
+
+        def persist_report(self, report: StubReport, payload: Mapping[str, Any]) -> None:  # pragma: no cover - stub
+            return None
+
+        def export_daily_report(
+            self,
+            report: StubReport,
+            *,
+            fmt: str,
+        ) -> tuple[bytes, str, str]:
+            return b"{}", f"{report.account_id}.json", "application/json"
+
+        def explain_trade(self, trade_id: str) -> Dict[str, Any]:
+            return {
+                "trade_id": trade_id,
+                "account_id": (self.last_report.account_id if self.last_report else "default"),
+            }
+
+    stub_service = StubDailyReportService()
+    app.dependency_overrides[reporting_service.get_daily_report_service] = lambda: stub_service
+
+    client = TestClient(app)
+    try:
+        yield client
+    finally:
+        app.dependency_overrides.clear()
+
+
 def test_recent_xai_requires_admin_header(report_client: TestClient) -> None:
     response = report_client.get("/reports/xai")
     assert response.status_code == 403
@@ -60,6 +121,55 @@ def test_recent_xai_allows_admin_override(report_client: TestClient) -> None:
 
     assert response.status_code == 200
     assert response.json()["account_id"] == "default"
+
+
+def test_daily_report_requires_admin_header(daily_report_client: TestClient) -> None:
+    response = daily_report_client.get("/reports/daily")
+    assert response.status_code == 401
+
+
+def test_daily_report_allows_admin_override(daily_report_client: TestClient) -> None:
+    daily_report_client.app.dependency_overrides[require_admin_account] = lambda: "ops-admin"
+    try:
+        response = daily_report_client.get("/reports/daily")
+    finally:
+        daily_report_client.app.dependency_overrides.pop(require_admin_account, None)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["account_id"] == "default"
+
+
+def test_export_report_requires_admin_header(daily_report_client: TestClient) -> None:
+    response = daily_report_client.post("/reports/export", params={"format": "json"})
+    assert response.status_code == 401
+
+
+def test_export_report_allows_admin_override(daily_report_client: TestClient) -> None:
+    daily_report_client.app.dependency_overrides[require_admin_account] = lambda: "ops-admin"
+    try:
+        response = daily_report_client.post("/reports/export", params={"format": "json"})
+    finally:
+        daily_report_client.app.dependency_overrides.pop(require_admin_account, None)
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+
+
+def test_explain_trade_requires_admin_header(daily_report_client: TestClient) -> None:
+    response = daily_report_client.get("/reports/explain", params={"trade_id": "ord-1"})
+    assert response.status_code == 401
+
+
+def test_explain_trade_allows_admin_override(daily_report_client: TestClient) -> None:
+    daily_report_client.app.dependency_overrides[require_admin_account] = lambda: "ops-admin"
+    try:
+        response = daily_report_client.get("/reports/explain", params={"trade_id": "ord-1"})
+    finally:
+        daily_report_client.app.dependency_overrides.pop(require_admin_account, None)
+
+    assert response.status_code == 200
+    assert response.json()["trade_id"] == "ord-1"
 
 
 @pytest.fixture
