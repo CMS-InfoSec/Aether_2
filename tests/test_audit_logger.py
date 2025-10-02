@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import datetime as dt
-import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -71,9 +70,7 @@ def test_log_audit_inserts_and_logs(monkeypatch, tmp_path, capsys):
 
     assert payload["ip_hash"] == hashed_ip
     assert payload["ts"] == "2023-01-01T12:00:00+00:00"
-    expected_prev_hash = hashlib.sha256(
-        audit_logger._GENESIS_HASH.encode("utf-8")
-    ).hexdigest()  # pylint: disable=protected-access
+    expected_prev_hash = audit_logger._GENESIS_HASH  # pylint: disable=protected-access
     assert payload["prev_hash"] == expected_prev_hash
     assert "hash" in payload
     assert payload["sensitive"] is False
