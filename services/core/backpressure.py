@@ -9,7 +9,7 @@ import itertools
 import logging
 import os
 import time
-from collections import Counter, defaultdict, deque
+from collections import Counter as CollectionCounter, defaultdict, deque
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Deque, Dict, Iterable, Mapping, MutableMapping
@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 
 from common.schemas.contracts import IntentEvent
 from services.common.adapters import KafkaNATSAdapter
-from prometheus_client import Gauge
+from prometheus_client import Counter as PrometheusCounter, Gauge
 
 LOGGER = logging.getLogger(__name__)
 
@@ -32,6 +32,12 @@ BACKPRESSURE_QUEUE_DEPTH = Gauge(
     "Number of intents currently buffered by the backpressure controller.",
 )
 BACKPRESSURE_QUEUE_DEPTH.set(0.0)
+
+DROPPED_INTENTS_TOTAL = PrometheusCounter(
+    "dropped_intents_total",
+    "Total number of intents dropped by the backpressure controller.",
+    ["account_id"],
+)
 
 
 def _env_int(name: str, default: int, *, minimum: int | None = None) -> int:
@@ -93,6 +99,7 @@ class QueueItem:
     enqueued_at: float = field(compare=False)
     sequence: int = field(compare=False)
     hedge: bool = field(compare=False)
+    safe_mode: bool = field(compare=False)
     event: IntentEvent = field(compare=False)
 
     def __post_init__(self) -> None:
@@ -102,8 +109,9 @@ class QueueItem:
         """Return the key used to decide which items to drop when saturated."""
 
         is_new = 1 if prefer_new else 0
+        protection_level = 2 if self.safe_mode else 1 if self.hedge else 0
         return (
-            0 if not self.hedge else 1,
+            protection_level,
             self.priority,
             is_new,
             -self.enqueued_at,
@@ -176,7 +184,7 @@ class IntentBackpressure:
         self._sequence = itertools.count()
         self._queue_lock = asyncio.Lock()
         self._stats_lock = asyncio.Lock()
-        self._dropped: Counter[str] = Counter()
+        self._dropped: CollectionCounter[str] = CollectionCounter()
         self._rate_windows: MutableMapping[str, Deque[float]] = defaultdict(deque)
 
     async def enqueue_intent(
@@ -198,7 +206,7 @@ class IntentBackpressure:
                 return False
 
         new_item = self._build_item(resolved_priority, now, event)
-        drop_counts: Counter[str] = Counter()
+        drop_counts: CollectionCounter[str] = CollectionCounter()
         accepted = False
 
         async with self._queue_lock:
@@ -245,6 +253,7 @@ class IntentBackpressure:
             enqueued_at=enqueued_at,
             sequence=next(self._sequence),
             hedge=self._is_hedge(event),
+            safe_mode=self._is_safe_mode(event),
             event=event,
         )
 
@@ -280,6 +289,32 @@ class IntentBackpressure:
                 return True
         return False
 
+    def _is_safe_mode(self, event: IntentEvent) -> bool:
+        payload = event.intent or {}
+
+        bool_flags = (
+            payload.get("safe_mode"),
+            payload.get("safe-mode"),
+            payload.get("safeMode"),
+        )
+        if any(isinstance(flag, bool) and flag for flag in bool_flags):
+            return True
+
+        textual_fields = (
+            payload.get("mode"),
+            payload.get("state"),
+            payload.get("intent_type"),
+            payload.get("type"),
+            payload.get("category"),
+            payload.get("reason"),
+        )
+        for value in textual_fields:
+            if isinstance(value, str):
+                normalized = value.replace("-", "_").lower()
+                if normalized in {"safe_mode", "safe", "safemode"}:
+                    return True
+        return False
+
     async def _record_drops(self, drop_counts: Mapping[str, int], ts: datetime) -> None:
         if not drop_counts:
             return
@@ -287,6 +322,7 @@ class IntentBackpressure:
         async with self._stats_lock:
             for account_id, count in drop_counts.items():
                 self._dropped[account_id] += count
+                DROPPED_INTENTS_TOTAL.labels(account_id=account_id).inc(count)
 
         if not self._publisher:
             return
@@ -307,7 +343,7 @@ class IntentBackpressure:
             )
 
 
-DEFAULT_QUEUE_SIZE = _env_int("BACKPRESSURE_QUEUE_SIZE", 256, minimum=1)
+DEFAULT_QUEUE_SIZE = 500
 DEFAULT_RATE_LIMIT = _env_int("BACKPRESSURE_MAX_RATE", 10, minimum=0)
 
 backpressure_controller = IntentBackpressure(
