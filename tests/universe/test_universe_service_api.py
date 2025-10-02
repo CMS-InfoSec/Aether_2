@@ -141,8 +141,8 @@ def test_manual_override_migrates_legacy_symbols(session: Session) -> None:
     )
     session.commit()
 
-    request = OverrideRequest(symbol="xbt/usd", enabled=True, reason="Enable trading", actor="tester")
-    response = universe_service.override_symbol(request, session=session)
+    request = OverrideRequest(symbol="xbt/usd", enabled=True, reason="Enable trading")
+    response = universe_service.override_symbol(request, session=session, actor_account="ops-admin")
 
     assert response.symbol == "BTC-USD"
 

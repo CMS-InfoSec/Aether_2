@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Dict
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from services.universe import universe_service
@@ -58,6 +59,7 @@ def universe_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     monkeypatch.setattr(universe_service, "_kraken_volume_24h", lambda session: volumes)
     monkeypatch.setattr(universe_service, "_latest_manual_overrides", lambda session, migrate=False: overrides)
     universe_service.app.dependency_overrides[universe_service.get_session] = override_session
+    universe_service.app.dependency_overrides[universe_service.require_admin_account] = lambda: "ops-admin"
     return TestClient(universe_service.app)
 
 
@@ -66,7 +68,10 @@ def teardown_module(module) -> None:  # type: ignore[override]
 
 
 def test_universe_approved_filters_thresholds(universe_client: TestClient) -> None:
-    response = universe_client.get("/universe/approved")
+    response = universe_client.get(
+        "/universe/approved",
+        headers={"X-Account-ID": "ops-admin"},
+    )
     assert response.status_code == 200
     payload = response.json()
     assert payload["symbols"] == ["BTC-USD"]
@@ -75,7 +80,8 @@ def test_universe_approved_filters_thresholds(universe_client: TestClient) -> No
 def test_override_symbol_validates_reason(universe_client: TestClient) -> None:
     response = universe_client.post(
         "/universe/override",
-        json={"symbol": " BTC/USD ", "enabled": True, "reason": "  ", "actor": "ops"},
+        json={"symbol": " BTC/USD ", "enabled": True, "reason": "  "},
+        headers={"X-Account-ID": "ops-admin"},
     )
     assert response.status_code == 400
 
@@ -90,9 +96,28 @@ def test_override_symbol_creates_entry(universe_client: TestClient, monkeypatch:
     monkeypatch.setattr(universe_service, "_latest_manual_overrides", fake_latest_overrides)
     response = universe_client.post(
         "/universe/override",
-        json={"symbol": "ETH/USD", "enabled": True, "reason": "Listing", "actor": "ops"},
+        json={"symbol": "ETH/USD", "enabled": True, "reason": "Listing"},
+        headers={"X-Account-ID": "ops-admin"},
     )
     assert response.status_code == 201
     body = response.json()
     assert body["symbol"] == "ETH-USD"
+    assert body["actor"] == "ops-admin"
     assert recorded
+
+
+def test_override_symbol_rejects_unauthorized(universe_client: TestClient) -> None:
+    def deny() -> str:
+        raise HTTPException(status_code=403, detail="forbidden")
+
+    universe_service.app.dependency_overrides[universe_service.require_admin_account] = deny
+    try:
+        response = universe_client.post(
+            "/universe/override",
+            json={"symbol": "ETH/USD", "enabled": False, "reason": "maintenance"},
+            headers={"X-Account-ID": "ops-admin"},
+        )
+    finally:
+        universe_service.app.dependency_overrides[universe_service.require_admin_account] = lambda: "ops-admin"
+
+    assert response.status_code == 403
