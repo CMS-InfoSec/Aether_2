@@ -2,7 +2,10 @@ from __future__ import annotations
 
 
 import asyncio
+import base64
 import contextlib
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -1956,11 +1959,70 @@ manager = OMSManager()
 warm_start = WarmStartCoordinator(lambda: manager)
 
 
-async def require_account_id(request: Request) -> str:
-    header = request.headers.get("X-Account-ID")
-    if not header:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing X-Account-ID header")
-    return header
+def _decode_segment(segment: str) -> bytes:
+    padding = "=" * (-len(segment) % 4)
+    return base64.urlsafe_b64decode(segment + padding)
+
+
+def _verify_authorization_token(token: str) -> Dict[str, Any]:
+    try:
+        header_segment, payload_segment, signature_segment = token.split(".")
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authorization token format",
+        ) from exc
+
+    secret = os.getenv("AUTH_JWT_SECRET", "change-me").encode("utf-8")
+    signing_input = f"{header_segment}.{payload_segment}".encode("ascii")
+    expected_signature = hmac.new(secret, signing_input, hashlib.sha256).digest()
+
+    try:
+        provided_signature = _decode_segment(signature_segment)
+    except Exception as exc:  # pragma: no cover - defensive guard
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authorization token signature",
+        ) from exc
+
+    if not hmac.compare_digest(expected_signature, provided_signature):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token signature")
+
+    try:
+        payload_bytes = _decode_segment(payload_segment)
+    except Exception as exc:  # pragma: no cover - defensive guard
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid token payload") from exc
+
+    try:
+        payload: Dict[str, Any] = json.loads(payload_bytes)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Malformed token payload") from exc
+
+    exp = payload.get("exp")
+    if exp is not None and int(exp) < int(time.time()):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired")
+
+    return payload
+
+
+async def require_authorized_account(request: Request) -> str:
+    authorization = request.headers.get("Authorization")
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token")
+
+    token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authorization token missing")
+
+    payload = _verify_authorization_token(token)
+
+    account_id = payload.get("account") or payload.get("sub")
+    if not isinstance(account_id, str) or not account_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Token missing account claim")
+
+    request.state.account_id = account_id
+    request.state.token_claims = payload
+    return account_id
 
 
 @app.on_event("shutdown")
@@ -1977,7 +2039,7 @@ async def _startup() -> None:
 @app.post("/oms/place", response_model=OMSPlaceResponse)
 async def place_order(
     payload: OMSPlaceRequest,
-    account_id: str = Depends(require_account_id),
+    account_id: str = Depends(require_authorized_account),
 ) -> OMSPlaceResponse:
     if payload.account_id != account_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account mismatch")
@@ -1994,7 +2056,7 @@ async def place_order(
 @app.post("/oms/cancel", response_model=OMSOrderStatusResponse)
 async def cancel_order(
     payload: OMSCancelRequest,
-    account_id: str = Depends(require_account_id),
+    account_id: str = Depends(require_authorized_account),
 ) -> OMSOrderStatusResponse:
     if payload.account_id != account_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account mismatch")
@@ -2009,7 +2071,7 @@ async def cancel_order(
 async def get_status(
     account_id: str,
     client_id: str,
-    header_account: str = Depends(require_account_id),
+    header_account: str = Depends(require_authorized_account),
 ) -> OMSOrderStatusResponse:
     if account_id != header_account:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account mismatch")
@@ -2024,7 +2086,7 @@ async def get_status(
 @app.get("/oms/routing/status")
 async def get_routing_status(
     account_id: str,
-    header_account: str = Depends(require_account_id),
+    header_account: str = Depends(require_authorized_account),
 ) -> Dict[str, Optional[float] | str]:
     if account_id != header_account:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account mismatch")
@@ -2035,20 +2097,20 @@ async def get_routing_status(
 
 @app.get("/oms/rate_limits/status")
 async def get_rate_limit_status(
-    header_account: str = Depends(require_account_id),
+    header_account: str = Depends(require_authorized_account),
 ) -> Dict[str, Dict[str, Dict[str, float | int]]]:
     return await rate_limit_guard.status(header_account)
 
 
 @app.get("/oms/warm_start/report")
-async def get_warm_start_report(_: str = Depends(require_account_id)) -> Dict[str, int]:
+async def get_warm_start_report(_: str = Depends(require_authorized_account)) -> Dict[str, int]:
     return await warm_start.status()
 
 
 @app.get("/oms/impact_curve", response_model=ImpactCurveResponse)
 async def get_impact_curve(
     symbol: str,
-    account_id: str = Depends(require_account_id),
+    account_id: str = Depends(require_authorized_account),
 ) -> ImpactCurveResponse:
     points_raw = await impact_store.impact_curve(account_id=account_id, symbol=symbol)
     points = [
