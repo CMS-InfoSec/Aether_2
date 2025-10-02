@@ -48,12 +48,16 @@ from battle_mode import BattleModeController, create_battle_mode_tables
 
 from cost_throttler import CostThrottler
 from services.risk.position_sizer import PositionSizer
+from services.common.adapters import TimescaleAdapter
+from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
 
 
 logger = logging.getLogger(__name__)
 audit_logger = logging.getLogger("risk.audit")
 logging.basicConfig(level=logging.INFO)
 
+
+SHUTDOWN_TIMEOUT = float(os.getenv("RISK_SHUTDOWN_TIMEOUT", os.getenv("SERVICE_SHUTDOWN_TIMEOUT", "75.0")))
 
 _CAPITAL_ALLOCATOR_URL = os.getenv("CAPITAL_ALLOCATOR_URL")
 _CAPITAL_ALLOCATOR_TIMEOUT = float(os.getenv("CAPITAL_ALLOCATOR_TIMEOUT", "1.5"))
@@ -566,6 +570,26 @@ app = FastAPI(title="Risk Validation Service", version="1.0.0")
 setup_metrics(app, service_name="risk-service")
 COST_THROTTLER = CostThrottler()
 EXCHANGE_ADAPTER = get_exchange_adapter(DEFAULT_EXCHANGE)
+
+shutdown_manager = setup_graceful_shutdown(
+    app,
+    service_name="risk-service",
+    allowed_paths={"/", "/docs", "/openapi.json"},
+    shutdown_timeout=SHUTDOWN_TIMEOUT,
+    logger_instance=logger,
+)
+
+
+def _flush_risk_event_buffers() -> None:
+    """Flush buffered risk service artifacts before shutdown."""
+
+    flush_logging_handlers("", __name__, "risk.audit")
+    summary = TimescaleAdapter.flush_event_buffers()
+    if summary:
+        logger.info("Flushed Timescale event buffers", extra={"buckets": summary})
+
+
+shutdown_manager.register_flush_callback(_flush_risk_event_buffers)
 
 
 _UNIVERSE_CACHE_LOCK = asyncio.Lock()
