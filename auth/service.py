@@ -15,8 +15,67 @@ from typing import Dict, Optional, Protocol, Set, runtime_checkable
 
 import pyotp
 
+try:  # pragma: no cover - optional dependency in some test environments
+    from argon2 import PasswordHasher
+    from argon2.exceptions import VerificationError
+except ImportError:  # pragma: no cover - fallback when argon2 is unavailable
+    PasswordHasher = None  # type: ignore[assignment]
+
+    class VerificationError(ValueError):
+        """Minimal stand-in for argon2's verification errors."""
+
+    class _MissingPasswordHasher:
+        def hash(self, password: str) -> str:
+            raise RuntimeError("argon2-cffi must be installed to hash passwords")
+
+        def verify(self, hashed: str, password: str) -> bool:
+            raise RuntimeError("argon2-cffi must be installed to verify passwords")
+
+        def needs_update(self, hashed: str) -> bool:
+            return False
+
+        def check_needs_rehash(self, hashed: str) -> bool:
+            return False
+
+    _ARGON2_HASHER = _MissingPasswordHasher()
+else:
+    _ARGON2_HASHER = PasswordHasher()
+
+try:  # pragma: no cover - prometheus is optional outside production
+    from prometheus_client import Counter
+except Exception:  # pragma: no cover - provide a no-op fallback
+    class Counter:  # type: ignore[override]
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self._value = 0.0
+
+        def labels(self, **kwargs: object) -> "Counter":
+            return self
+
+        def inc(self, value: float = 1.0) -> None:
+            self._value = getattr(self, "_value", 0.0) + value
+
+        def set(self, value: float) -> None:
+            self._value = value
+
+from shared.correlation import get_correlation_id
+
 
 logger = logging.getLogger(__name__)
+
+
+_LOGIN_FAILURE_COUNTER = Counter(
+    "auth_login_failures_total",
+    "Number of failed administrator authentication attempts.",
+    ["reason"],
+)
+_MFA_DENIED_COUNTER = Counter(
+    "auth_mfa_denied_total",
+    "Number of administrator logins denied due to MFA.",
+)
+_LOGIN_SUCCESS_COUNTER = Counter(
+    "auth_login_success_total",
+    "Number of successful administrator logins.",
+)
 
 
 
@@ -297,11 +356,15 @@ class AuthService:
         # Prefer Argon2id verification for new credentials.
         if stored_hash.startswith("$argon2"):
             try:
-                if not _ARGON2_HASHER.verify(password, stored_hash):
+                if not _ARGON2_HASHER.verify(stored_hash, password):
                     return False
-            except ValueError:
+            except VerificationError:
                 return False
-            if _ARGON2_HASHER.needs_update(stored_hash):
+            if hasattr(_ARGON2_HASHER, "check_needs_rehash"):
+                needs_update = _ARGON2_HASHER.check_needs_rehash(stored_hash)
+            else:
+                needs_update = _ARGON2_HASHER.needs_update(stored_hash)
+            if needs_update:
                 admin.password_hash = hash_password(password)
             return True
 
