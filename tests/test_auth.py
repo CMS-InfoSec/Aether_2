@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 
+import hashlib
 import logging
 import sys
 from pathlib import Path
@@ -224,4 +225,84 @@ def test_auth_service_failure_branches_emit_structured_logs_and_metrics(caplog):
         ip_address="203.0.113.10",
         admin_id_expected=True,
     )
+
+
+def test_hash_password_delegates_to_module_hasher(monkeypatch):
+    captured: dict[str, str] = {}
+
+    class StubHasher:
+        def hash(self, password: str) -> str:
+            captured["password"] = password
+            return "argon-hash"
+
+    monkeypatch.setattr(auth_service_module, "_ARGON2_HASHER", StubHasher())
+
+    result = auth_service_module.hash_password("hunter2")
+
+    assert result == "argon-hash"
+    assert captured["password"] == "hunter2"
+
+
+def test_verify_password_with_argon2_hash(monkeypatch):
+    stored_hash = "$argon2id$v=19$m=65536,t=3,p=4$abc$def"
+    admin = AdminAccount(
+        admin_id="admin-argon",
+        email="argon@example.com",
+        password_hash=stored_hash,
+        mfa_secret=pyotp.random_base32(),
+    )
+
+    class StubHasher:
+        def __init__(self) -> None:
+            self.needs_update_called = False
+
+        def hash(self, password: str) -> str:
+            return "rehashed"
+
+        def verify(self, hashed: str, password: str) -> bool:
+            assert hashed == stored_hash
+            assert password == "correcthorsebatterystaple"
+            return True
+
+        def needs_update(self, hashed: str) -> bool:
+            assert hashed == stored_hash
+            self.needs_update_called = True
+            return True
+
+    hasher = StubHasher()
+    monkeypatch.setattr(auth_service_module, "_ARGON2_HASHER", hasher)
+
+    service = AuthService(AdminRepository(), SessionStore())
+
+    assert service._verify_password(admin, "correcthorsebatterystaple") is True
+    assert admin.password_hash == "rehashed"
+    assert hasher.needs_update_called is True
+
+
+def test_verify_password_with_legacy_sha256_hash(monkeypatch):
+    password = "legacy-secret"
+    stored_hash = hashlib.sha256(password.encode()).hexdigest()
+    admin = AdminAccount(
+        admin_id="admin-legacy",
+        email="legacy@example.com",
+        password_hash=stored_hash,
+        mfa_secret=pyotp.random_base32(),
+    )
+
+    class StubHasher:
+        def __init__(self) -> None:
+            self.hash_calls: list[str] = []
+
+        def hash(self, password: str) -> str:
+            self.hash_calls.append(password)
+            return "argon-upgrade"
+
+    hasher = StubHasher()
+    monkeypatch.setattr(auth_service_module, "_ARGON2_HASHER", hasher)
+
+    service = AuthService(AdminRepository(), SessionStore())
+
+    assert service._verify_password(admin, password) is True
+    assert admin.password_hash == "argon-upgrade"
+    assert hasher.hash_calls == [password]
 

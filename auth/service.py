@@ -13,6 +13,8 @@ import json
 import logging
 from typing import Dict, Optional, Protocol, Set, runtime_checkable
 
+from argon2 import PasswordHasher, Type
+from argon2.exceptions import InvalidHash, VerifyMismatchError
 import pyotp
 
 from prometheus_client import CollectorRegistry, Counter
@@ -47,41 +49,9 @@ except Exception:  # pragma: no cover - fall back to a minimal stub for tests
 logger = logging.getLogger(__name__)
 
 
-_METRICS_REGISTRY: CollectorRegistry
 
+_ARGON2_HASHER = PasswordHasher(type=Type.ID)
 
-def _init_metrics(registry: Optional[CollectorRegistry] = None) -> None:
-    """Initialise Prometheus counters for the module.
-
-    A dedicated registry is used so tests can swap in an isolated registry to
-    ensure metric state does not leak between test cases.
-    """
-
-    global _METRICS_REGISTRY
-    global _LOGIN_FAILURE_COUNTER
-    global _LOGIN_SUCCESS_COUNTER
-    global _MFA_DENIED_COUNTER
-
-    _METRICS_REGISTRY = registry or CollectorRegistry()
-    _LOGIN_FAILURE_COUNTER = Counter(
-        "admin_login_failures_total",
-        "Total number of administrator login failures partitioned by reason.",
-        ["reason"],
-        registry=_METRICS_REGISTRY,
-    )
-    _LOGIN_SUCCESS_COUNTER = Counter(
-        "admin_login_success_total",
-        "Total number of successful administrator logins.",
-        registry=_METRICS_REGISTRY,
-    )
-    _MFA_DENIED_COUNTER = Counter(
-        "admin_mfa_denied_total",
-        "Total number of administrator login attempts denied due to MFA.",
-        registry=_METRICS_REGISTRY,
-    )
-
-
-_init_metrics()
 
 
 
@@ -362,9 +332,9 @@ class AuthService:
         # Prefer Argon2id verification for new credentials.
         if stored_hash.startswith("$argon2"):
             try:
-                if not _ARGON2_HASHER.verify(password, stored_hash):
+                if not _ARGON2_HASHER.verify(stored_hash, password):
                     return False
-            except ValueError:
+            except (InvalidHash, VerifyMismatchError):
                 return False
             if _ARGON2_HASHER.needs_update(stored_hash):
                 admin.password_hash = hash_password(password)
