@@ -14,6 +14,8 @@ from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, s
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
+from services.common.security import require_admin_account
+
 try:  # pragma: no cover - import guarded for optional dependency
     from common.utils.audit_logger import hash_ip, log_audit
 except Exception:  # pragma: no cover - degrade gracefully if audit logger unavailable
@@ -143,14 +145,14 @@ def record_override(
     payload: OverrideRequest,
     request: Request,
     session: Session = Depends(get_session),
-    actor: str = Depends(get_actor),
+    admin_account: str = Depends(require_admin_account),
     account_id: Optional[str] = Header(None, alias="X-Account-ID"),
 ) -> OverrideRecord:
-    normalized_account = _normalize_account(account_id)
+    normalized_account = _normalize_account(account_id or admin_account)
     entry = OverrideLogEntry(
         intent_id=payload.intent_id,
         account_id=normalized_account,
-        actor=actor,
+        actor=admin_account,
         decision=payload.decision.value,
         reason=payload.reason,
         ts=datetime.now(timezone.utc),
@@ -162,7 +164,7 @@ def record_override(
         try:
             ip_hash = hash_ip(request.client.host if request.client else None)
             log_audit(
-                actor=actor,
+                actor=admin_account,
                 action="override.human_decision",
                 entity=payload.intent_id,
                 before={},
@@ -185,6 +187,7 @@ def record_override(
 def override_history(
     account_id: Optional[str] = Query(None, description="Filter overrides for a specific account"),
     session: Session = Depends(get_session),
+    _: str = Depends(require_admin_account),
 ) -> OverrideHistoryResponse:
     stmt = select(OverrideLogEntry).order_by(OverrideLogEntry.ts.desc())
     if account_id:
