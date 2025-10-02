@@ -395,7 +395,7 @@ class DiversificationAllocator:
 
         exposures = self.timescale.open_positions()
         current_weights = {
-            symbol: abs(notional) / nav for symbol, notional in exposures.items() if nav > 0
+            symbol: notional / nav for symbol, notional in exposures.items() if nav > 0
         }
         instructions = self._build_rebalance_instructions(
             targets, current_weights, nav, exposures
