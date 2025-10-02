@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import json
 import logging
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Mapping, MutableMapping, Optional
@@ -33,12 +34,16 @@ class StartupManager:
         | Callable[[Mapping[str, int]], int | None]
         | None = None,
         offset_log_path: str | Path | None = None,
+        startup_state_path: str | Path | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._balance_loader = self._wrap_loader(balance_loader)
         self._position_loader = self._wrap_loader(position_loader)
         self._reconcile_runner = self._wrap_loader(reconcile_runner)
         self._kafka_replay_handler = kafka_replay_handler
         self._offset_log_path = Path(offset_log_path) if offset_log_path else None
+        self._startup_state_path = Path(startup_state_path) if startup_state_path else None
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
 
         self._mode: Optional[StartupMode] = None
         self._synced = False
@@ -49,10 +54,16 @@ class StartupManager:
         self._status_lock = asyncio.Lock()
         self._run_lock = asyncio.Lock()
 
-    async def start(self, mode: StartupMode | str) -> None:
-        """Execute the bootstrap workflow for *mode*."""
+        self._persisted_state: Optional[Dict[str, Any]] = self._read_startup_state()
+        if self._persisted_state is not None:
+            persisted_offset = self._persisted_state.get("last_offset")
+            if isinstance(persisted_offset, int):
+                self._last_offset = persisted_offset
 
-        mode_value = self._ensure_mode(mode)
+    async def start(self, mode: StartupMode | str | None = None) -> StartupMode:
+        """Execute the bootstrap workflow using *mode* or auto-detect if omitted."""
+
+        mode_value = await self._resolve_mode(mode)
         async with self._run_lock:
             LOGGER.info("Startup manager beginning %s start", mode_value.value)
             async with self._status_lock:
@@ -63,10 +74,10 @@ class StartupManager:
             try:
                 if mode_value is StartupMode.COLD:
                     await self._run_cold_start()
+                    await self._replay_from_offsets()
                 else:
+                    await self._replay_from_offsets()
                     await self._run_warm_start()
-
-                await self._replay_from_offsets()
             except Exception as exc:  # pragma: no cover - defensive logging
                 LOGGER.exception("Startup manager failed during %s start", mode_value.value)
                 async with self._status_lock:
@@ -77,15 +88,40 @@ class StartupManager:
                 LOGGER.info("Startup manager completed %s start", mode_value.value)
                 async with self._status_lock:
                     self._synced = True
+                await self._persist_state(mode_value)
+
+        return mode_value
+
+    async def _resolve_mode(self, mode: StartupMode | str | None) -> StartupMode:
+        if mode is not None:
+            return self._ensure_mode(mode)
+
+        state = await self._load_startup_state()
+        if state is None:
+            LOGGER.debug("No persisted startup state found; defaulting to cold start")
+            return StartupMode.COLD
+
+        LOGGER.debug("Persisted startup state detected; defaulting to warm restart")
+        return StartupMode.WARM
 
     async def status(self) -> Dict[str, Any]:
         """Return the most recent startup status snapshot."""
 
         async with self._status_lock:
+            mode = self._mode.value if self._mode else None
+            offset = self._last_offset
+            if mode is None and self._persisted_state:
+                persisted_mode = self._persisted_state.get("mode")
+                if isinstance(persisted_mode, str):
+                    mode = persisted_mode
+                if offset is None:
+                    persisted_offset = self._persisted_state.get("last_offset")
+                    if isinstance(persisted_offset, int):
+                        offset = persisted_offset
             return {
-                "mode": self._mode.value if self._mode else None,
+                "mode": mode,
                 "synced": self._synced,
-                "last_offset": self._last_offset,
+                "offset": offset,
             }
 
     async def _run_cold_start(self) -> None:
@@ -98,6 +134,42 @@ class StartupManager:
             return
         await self._invoke_loader(self._reconcile_runner, "reconcile")
 
+    async def _load_startup_state(self) -> Optional[Dict[str, Any]]:
+        if self._startup_state_path is None:
+            async with self._status_lock:
+                self._persisted_state = None
+            return None
+
+        state = await asyncio.to_thread(self._read_startup_state)
+        async with self._status_lock:
+            self._persisted_state = state
+            if state and self._mode is None:
+                persisted_offset = state.get("last_offset")
+                if isinstance(persisted_offset, int):
+                    self._last_offset = persisted_offset
+        return state
+
+    async def _persist_state(self, mode: StartupMode) -> None:
+        if self._startup_state_path is None:
+            return
+
+        ts = self._clock()
+        if isinstance(ts, datetime) and ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+
+        payload = {
+            "mode": mode.value,
+            "last_offset": self._last_offset,
+            "ts": ts.isoformat() if isinstance(ts, datetime) else str(ts),
+        }
+
+        try:
+            await asyncio.to_thread(self._write_startup_state, payload)
+        except Exception as exc:  # pragma: no cover - IO failures should not crash startup
+            LOGGER.warning("Unable to persist startup state: %s", exc)
+        async with self._status_lock:
+            self._persisted_state = payload
+
     async def _replay_from_offsets(self) -> None:
         offsets = await self._load_offset_logs()
         if offsets:
@@ -107,6 +179,64 @@ class StartupManager:
         else:
             self._last_offset = None
             self._offset_sources.clear()
+
+    def _read_startup_state(self) -> Optional[Dict[str, Any]]:
+        path = self._startup_state_path
+        if path is None or not path.exists():
+            return None
+
+        try:
+            raw = path.read_text(encoding="utf-8").strip()
+        except OSError as exc:  # pragma: no cover - defensive IO guard
+            LOGGER.warning("Unable to read startup state from %s: %s", path, exc)
+            return None
+
+        if not raw:
+            return None
+
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            LOGGER.warning("Invalid startup state payload in %s: %s", path, exc)
+            return None
+
+        if not isinstance(payload, dict):
+            LOGGER.debug("Ignoring startup state from %s because payload is not an object", path)
+            return None
+
+        mode: Optional[str]
+        raw_mode = payload.get("mode")
+        if isinstance(raw_mode, str):
+            mode = raw_mode
+        elif raw_mode is None:
+            mode = None
+        else:
+            mode = str(raw_mode)
+
+        if mode is not None:
+            try:
+                StartupMode(mode)
+            except ValueError:
+                LOGGER.debug("Encountered unsupported startup mode %s in %s", mode, path)
+                mode = None
+
+        last_offset = self._coerce_int(payload.get("last_offset"))
+        ts = payload.get("ts")
+        if ts is not None and not isinstance(ts, str):
+            ts = str(ts)
+
+        return {"mode": mode, "last_offset": last_offset, "ts": ts}
+
+    def _write_startup_state(self, payload: Mapping[str, Any]) -> None:
+        path = self._startup_state_path
+        if path is None:
+            return
+
+        if not path.parent.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+
+        text = json.dumps(payload, sort_keys=True)
+        path.write_text(text, encoding="utf-8")
 
     async def _dispatch_replay(self, offsets: Mapping[str, int]) -> None:
         if self._kafka_replay_handler is None:
