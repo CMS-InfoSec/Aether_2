@@ -12,8 +12,10 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from services.portfolio.balance_reader import BalanceReader, BalanceRetrievalError
+
 try:  # pragma: no cover - shared middleware may be unavailable in minimal environments
-    from shared.authz_middleware import (  # type: ignore
+from shared.authz_middleware import (  # type: ignore
         BearerTokenError,
         _coerce_account_scopes as _shared_coerce_account_scopes,
         _decode_jwt as _shared_decode_jwt,
@@ -183,6 +185,15 @@ app = FastAPI(title="Portfolio Service")
 app.add_middleware(AccountScopeMiddleware)
 
 
+BALANCE_READER = BalanceReader()
+
+
+def invalidate_balance_cache(account_id: str | None = None) -> None:
+    """Expose cache invalidation for external event hooks."""
+
+    BALANCE_READER.invalidate(account_id)
+
+
 def _resolve_format(format: str | None, request: Request) -> str:
     if format:
         return format.lower()
@@ -190,6 +201,16 @@ def _resolve_format(format: str | None, request: Request) -> str:
     if "text/csv" in accept:
         return "csv"
     return "json"
+
+
+@app.get("/portfolio/balances")
+async def get_balances(
+    account_id: str = Depends(requires_account_scope),
+) -> Mapping[str, float]:
+    try:
+        return await BALANCE_READER.get_account_balances(account_id)
+    except BalanceRetrievalError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
 
 @app.get("/portfolio/positions")
