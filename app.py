@@ -17,6 +17,11 @@ from multiformat_export import router as log_export_router
 from compliance_pack import router as compliance_router
 
 from pack_exporter import router as knowledge_router
+from scaling_controller import (
+    build_scaling_controller_from_env,
+    configure_scaling_controller,
+    router as scaling_router,
+)
 
 
 from services.models.meta_learner import router as meta_router
