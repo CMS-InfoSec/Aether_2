@@ -17,11 +17,41 @@ from argon2 import PasswordHasher, Type
 from argon2.exceptions import InvalidHash, VerifyMismatchError
 import pyotp
 
+from prometheus_client import CollectorRegistry, Counter
+
+from shared.correlation import get_correlation_id
+
+try:  # pragma: no cover - prefer the real Argon2 implementation when available
+    from passlib.hash import argon2 as _ARGON2_HASHER
+except Exception:  # pragma: no cover - fall back to a minimal stub for tests
+
+    class _StubArgon2Hasher:
+        """Minimal Argon2 interface used for unit tests when passlib is absent."""
+
+        _PREFIX = "$argon2$stub$"
+
+        def hash(self, password: str) -> str:
+            digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
+            return f"{self._PREFIX}{digest}"
+
+        def verify(self, password: str, stored_hash: str) -> bool:
+            if not stored_hash.startswith(self._PREFIX):
+                raise ValueError("invalid argon2 hash")
+            candidate = self.hash(password)
+            return hmac.compare_digest(candidate, stored_hash)
+
+        def needs_update(self, stored_hash: str) -> bool:
+            return not stored_hash.startswith(self._PREFIX)
+
+    _ARGON2_HASHER = _StubArgon2Hasher()
+
 
 logger = logging.getLogger(__name__)
 
 
+
 _ARGON2_HASHER = PasswordHasher(type=Type.ID)
+
 
 
 
