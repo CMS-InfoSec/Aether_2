@@ -43,7 +43,7 @@ class ReleaseRecord(Base):
     manifest_id = Column(String, primary_key=True)
     manifest_json = Column(JSON, nullable=False)
     manifest_hash = Column(String, nullable=False)
-    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    ts = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
 
 @dataclass
@@ -53,12 +53,12 @@ class Manifest:
     manifest_id: str
     payload: Dict[str, Dict[str, str]]
     manifest_hash: str
-    created_at: datetime
+    ts: datetime
 
     def to_dict(self) -> Dict[str, object]:
         return {
             "manifest_id": self.manifest_id,
-            "created_at": self.created_at.isoformat(),
+            "ts": self.ts.isoformat(),
             "manifest_hash": self.manifest_hash,
             "payload": self.payload,
         }
@@ -239,8 +239,8 @@ def create_manifest(
         "models": collect_model_versions(models_dir),
     }
     manifest_hash = compute_manifest_hash(payload)
-    created_at = datetime.now(timezone.utc)
-    return Manifest(manifest_id=manifest_id, payload=payload, manifest_hash=manifest_hash, created_at=created_at)
+    ts = datetime.now(timezone.utc)
+    return Manifest(manifest_id=manifest_id, payload=payload, manifest_hash=manifest_hash, ts=ts)
 
 
 def save_manifest(session: Session, manifest: Manifest) -> Manifest:
@@ -250,7 +250,7 @@ def save_manifest(session: Session, manifest: Manifest) -> Manifest:
         manifest_id=manifest.manifest_id,
         manifest_json=manifest.payload,
         manifest_hash=manifest.manifest_hash,
-        created_at=manifest.created_at,
+        ts=manifest.ts,
     )
     session.add(record)
     session.commit()
@@ -259,7 +259,7 @@ def save_manifest(session: Session, manifest: Manifest) -> Manifest:
         manifest_id=record.manifest_id,
         payload=record.manifest_json,
         manifest_hash=record.manifest_hash,
-        created_at=record.created_at,
+        ts=record.ts,
     )
 
 
@@ -271,12 +271,12 @@ def fetch_manifest(session: Session, manifest_id: str) -> Optional[Manifest]:
         manifest_id=record.manifest_id,
         payload=record.manifest_json,
         manifest_hash=record.manifest_hash,
-        created_at=record.created_at,
+        ts=record.ts,
     )
 
 
 def list_manifests(session: Session, limit: Optional[int] = None) -> List[Manifest]:
-    stmt = select(ReleaseRecord).order_by(ReleaseRecord.created_at.desc())
+    stmt = select(ReleaseRecord).order_by(ReleaseRecord.ts.desc())
     if limit is not None:
         stmt = stmt.limit(limit)
     rows = session.execute(stmt).scalars().all()
@@ -287,7 +287,7 @@ def list_manifests(session: Session, limit: Optional[int] = None) -> List[Manife
                 manifest_id=row.manifest_id,
                 payload=row.manifest_json,
                 manifest_hash=row.manifest_hash,
-                created_at=row.created_at,
+                ts=row.ts,
             )
         )
     return manifests
@@ -306,7 +306,7 @@ def manifest_to_markdown(manifest: Manifest) -> str:
     lines = [
         f"# Release Manifest {manifest.manifest_id}",
         "",
-        f"- Timestamp: {manifest.created_at.isoformat()}",
+        f"- Timestamp: {manifest.ts.isoformat()}",
         f"- Hash: {manifest.manifest_hash}",
         "",
     ]

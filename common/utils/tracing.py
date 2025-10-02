@@ -1,11 +1,13 @@
 """Tracing helpers for correlation identifiers and OpenTelemetry instrumentation."""
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import time
 from contextlib import contextmanager, nullcontext
-from typing import Any, Dict, Iterator, Mapping, MutableMapping, Optional
+from functools import wraps
+from typing import Any, Awaitable, Callable, Dict, Iterator, Mapping, MutableMapping, Optional, TypeVar, cast
 from uuid import uuid4
 
 from shared.correlation import CorrelationContext, get_correlation_id
@@ -45,6 +47,8 @@ LOGGER = logging.getLogger(__name__)
 _SERVICE_NAME = "service"
 _TRACING_INITIALISED = False
 _LOG_FILTER_INSTALLED = False
+
+R = TypeVar("R")
 
 _STAGE_LATENCY_HISTOGRAM = (
     Histogram(
@@ -176,13 +180,19 @@ def current_correlation_id(default: Optional[str] = None) -> Optional[str]:
     return default
 
 
+def generate_correlation_id() -> str:
+    """Return a brand new correlation identifier."""
+
+    return str(uuid4())
+
+
 @contextmanager
 def correlation_scope(correlation_id: Optional[str] = None) -> Iterator[str]:
     """Bind *correlation_id* to the current context, generating one if needed."""
 
     candidate = (correlation_id or get_correlation_id() or "").strip()
     if not candidate:
-        candidate = str(uuid4())
+        candidate = generate_correlation_id()
     with CorrelationContext(candidate) as bound:
         yield bound
 
@@ -200,6 +210,8 @@ def attach_correlation(
     """
 
     corr = correlation_id or current_correlation_id()
+    if not corr:
+        corr = generate_correlation_id()
     if corr:
         if mutate and isinstance(payload, MutableMapping):
             payload["correlation_id"] = corr
@@ -252,6 +264,7 @@ def stage_span(
                 span.set_attribute("service.name", _SERVICE_NAME)
                 span.set_attribute("trading.stage", normalized_stage)
                 span.set_attribute("trading.correlation_id", corr)
+                span.set_attribute("trading.span_name", span_label)
                 if intent:
                     account = intent.get("account_id") or intent.get("account")
                     symbol = intent.get("symbol") or intent.get("instrument")
@@ -270,6 +283,7 @@ def stage_span(
 def policy_span(**attributes: Any) -> Iterator[Optional["Span"]]:
     """Convenience wrapper for ``stage_span`` with the ``policy`` label."""
 
+    attributes.setdefault("span_name", "policy_decision")
     with stage_span("policy", **attributes) as span:
         yield span
 
@@ -278,6 +292,7 @@ def policy_span(**attributes: Any) -> Iterator[Optional["Span"]]:
 def risk_span(**attributes: Any) -> Iterator[Optional["Span"]]:
     """Convenience wrapper for ``stage_span`` with the ``risk`` label."""
 
+    attributes.setdefault("span_name", "risk_validation")
     with stage_span("risk", **attributes) as span:
         yield span
 
@@ -286,6 +301,7 @@ def risk_span(**attributes: Any) -> Iterator[Optional["Span"]]:
 def oms_span(**attributes: Any) -> Iterator[Optional["Span"]]:
     """Convenience wrapper for ``stage_span`` with the ``oms`` label."""
 
+    attributes.setdefault("span_name", "oms_execution")
     with stage_span("oms", **attributes) as span:
         yield span
 
@@ -294,18 +310,82 @@ def oms_span(**attributes: Any) -> Iterator[Optional["Span"]]:
 def fill_span(**attributes: Any) -> Iterator[Optional["Span"]]:
     """Convenience wrapper for ``stage_span`` with the ``fill`` label."""
 
+    attributes.setdefault("span_name", "fill_event")
     with stage_span("fill", **attributes) as span:
         yield span
+
+
+def _extract_request(args: tuple[Any, ...], kwargs: Dict[str, Any]) -> Any:
+    """Return a FastAPI/Starlette request object when present in call arguments."""
+
+    for value in list(args) + list(kwargs.values()):
+        if value is None:
+            continue
+        if hasattr(value, "headers") and hasattr(value, "state"):
+            return value
+    return None
+
+
+def _request_correlation_hint(request: Any) -> Optional[str]:
+    if request is None:
+        return None
+    headers = getattr(request, "headers", None)
+    if headers is None:
+        return None
+    for key in ("x-correlation-id", "X-Correlation-ID"):
+        if key in headers:
+            value = headers[key]
+            if value:
+                return str(value)
+    return None
+
+
+def _enrich_result(result: R, correlation_id: str) -> R:
+    if isinstance(result, MutableMapping):
+        attach_correlation(result, correlation_id=correlation_id, mutate=True)
+    return result
+
+
+def trace_request(func: Callable[..., R] | Callable[..., Awaitable[R]]) -> Callable[..., Awaitable[R] | R]:
+    """Wrap a FastAPI endpoint ensuring correlation IDs propagate to handlers."""
+
+    if inspect.iscoroutinefunction(func):
+
+        @wraps(func)
+        async def async_wrapper(*args: Any, **kwargs: Any) -> R:
+            request = _extract_request(args, kwargs)
+            hint = _request_correlation_hint(request)
+            with correlation_scope(hint) as corr:
+                if request is not None and hasattr(request, "state"):
+                    setattr(request.state, "correlation_id", corr)
+                result = await cast(Callable[..., Awaitable[R]], func)(*args, **kwargs)
+                return _enrich_result(result, corr)
+
+        return async_wrapper
+
+    @wraps(func)
+    def sync_wrapper(*args: Any, **kwargs: Any) -> R:
+        request = _extract_request(args, kwargs)
+        hint = _request_correlation_hint(request)
+        with correlation_scope(hint) as corr:
+            if request is not None and hasattr(request, "state"):
+                setattr(request.state, "correlation_id", corr)
+            result = cast(Callable[..., R], func)(*args, **kwargs)
+            return _enrich_result(result, corr)
+
+    return sync_wrapper
 
 
 __all__ = [
     "attach_correlation",
     "correlation_scope",
     "current_correlation_id",
+    "generate_correlation_id",
     "fill_span",
     "init_tracing",
     "oms_span",
     "policy_span",
     "risk_span",
+    "trace_request",
     "stage_span",
 ]

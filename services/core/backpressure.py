@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import bisect
 import inspect
 import itertools
 import logging
@@ -10,20 +11,27 @@ import os
 import time
 from collections import Counter, defaultdict, deque
 from datetime import datetime, timezone
-from typing import Awaitable, Callable, Deque, Dict, Mapping, MutableMapping, Tuple
+from dataclasses import dataclass, field
+from typing import Awaitable, Callable, Deque, Dict, Iterable, Mapping, MutableMapping
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
 from common.schemas.contracts import IntentEvent
 from services.common.adapters import KafkaNATSAdapter
+from prometheus_client import Gauge
 
 LOGGER = logging.getLogger(__name__)
 
 BackpressurePublisher = Callable[[str, int, datetime], Awaitable[None] | None]
-QueueItem = Tuple[int, float, int, IntentEvent]
 
 _BACKPRESSURE_TOPIC = "backpressure.events"
+
+BACKPRESSURE_QUEUE_DEPTH = Gauge(
+    "backpressure_queue_depth",
+    "Number of intents currently buffered by the backpressure controller.",
+)
+BACKPRESSURE_QUEUE_DEPTH.set(0.0)
 
 
 def _env_int(name: str, default: int, *, minimum: int | None = None) -> int:
@@ -42,19 +50,28 @@ def _env_int(name: str, default: int, *, minimum: int | None = None) -> int:
     return value
 
 
+class BackpressureEvent(BaseModel):
+    """Event emitted when intents are dropped due to queue backpressure."""
+
+    account_id: str = Field(..., description="Account associated with the dropped intents")
+    dropped_count: int = Field(..., ge=1, description="Number of intents dropped")
+    ts: datetime = Field(..., description="Timestamp when the drop occurred")
+
+    def to_payload(self) -> Dict[str, str | int]:
+        """Serialise the event for transport over Kafka/NATS."""
+
+        data = self.model_dump()
+        data["type"] = "backpressure_event"
+        data["ts"] = self.ts.isoformat()
+        return data
+
+
 def _default_publisher(account_id: str, dropped_count: int, ts: datetime) -> None:
     """Publish a backpressure event using the in-memory Kafka/NATS adapter."""
 
     adapter = KafkaNATSAdapter(account_id=account_id)
-    adapter.publish(
-        _BACKPRESSURE_TOPIC,
-        {
-            "type": "backpressure_event",
-            "account_id": account_id,
-            "dropped_count": dropped_count,
-            "ts": ts.isoformat(),
-        },
-    )
+    event = BackpressureEvent(account_id=account_id, dropped_count=dropped_count, ts=ts)
+    adapter.publish(_BACKPRESSURE_TOPIC, event.to_payload())
 
 
 class BackpressureStatus(BaseModel):
@@ -65,6 +82,76 @@ class BackpressureStatus(BaseModel):
         default_factory=dict,
         description="Mapping of account id → intents dropped due to backpressure",
     )
+
+
+@dataclass(order=True)
+class QueueItem:
+    """Internal representation of queued intents with ordering metadata."""
+
+    sort_key: tuple[int, float, int] = field(init=False, repr=False)
+    priority: int = field(compare=False)
+    enqueued_at: float = field(compare=False)
+    sequence: int = field(compare=False)
+    hedge: bool = field(compare=False)
+    event: IntentEvent = field(compare=False)
+
+    def __post_init__(self) -> None:
+        self.sort_key = (-self.priority, self.enqueued_at, self.sequence)
+
+    def drop_key(self, *, prefer_new: bool) -> tuple[int, int, int, float, int]:
+        """Return the key used to decide which items to drop when saturated."""
+
+        is_new = 1 if prefer_new else 0
+        return (
+            0 if not self.hedge else 1,
+            self.priority,
+            is_new,
+            -self.enqueued_at,
+            -self.sequence,
+        )
+
+
+class PrioritizedIntentQueue(asyncio.Queue[QueueItem]):
+    """Priority queue built on :class:`asyncio.Queue` preserving hedge intents."""
+
+    def _init(self, maxsize: int) -> None:  # pragma: no cover - behaviour exercised indirectly
+        self._queue: list[QueueItem] = []
+
+    def _put(self, item: QueueItem) -> None:  # pragma: no cover - thin wrapper
+        bisect.insort(self._queue, item)
+
+    def _get(self) -> QueueItem:  # pragma: no cover - thin wrapper
+        return self._queue.pop(0)
+
+    def put_with_drop(self, item: QueueItem) -> tuple[bool, list[QueueItem]]:
+        """Insert *item* dropping lower priority intents if the queue is full."""
+
+        dropped: list[QueueItem] = []
+        if self.full():
+            candidates = list(self._queue)
+            candidates.append(item)
+            drop_list = self._select_drops(candidates, item)
+            if item in drop_list:
+                return False, []
+            for drop in drop_list:
+                self._queue.remove(drop)
+                self._unfinished_tasks -= 1
+                dropped.append(drop)
+        super().put_nowait(item)
+        return True, dropped
+
+    def _select_drops(
+        self, candidates: Iterable[QueueItem], new_item: QueueItem
+    ) -> list[QueueItem]:
+        items = list(candidates)
+        excess = len(items) - self._maxsize
+        if excess <= 0:
+            return []
+        sorted_items = sorted(
+            items,
+            key=lambda entry: entry.drop_key(prefer_new=entry is new_item),
+        )
+        return sorted_items[:excess]
 
 
 class IntentBackpressure:
@@ -82,7 +169,7 @@ class IntentBackpressure:
         if max_rate_per_account < 0:
             raise ValueError("max_rate_per_account cannot be negative")
 
-        self._queue: asyncio.PriorityQueue[QueueItem] = asyncio.PriorityQueue(max_queue_size)
+        self._queue: PrioritizedIntentQueue = PrioritizedIntentQueue(max_queue_size)
         self._maxsize = max_queue_size
         self._max_rate = max_rate_per_account
         self._publisher = publisher or _default_publisher
@@ -115,35 +202,16 @@ class IntentBackpressure:
         accepted = False
 
         async with self._queue_lock:
-            if not self._queue.full():
-                self._queue.put_nowait(new_item)
-                accepted = True
-            else:
-                removed: list[QueueItem] = []
-                while True:
-                    try:
-                        item = self._queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-                    removed.append(item)
-                    self._queue.task_done()
-
-                removed.append(new_item)
-                removed.sort()
-
-                keep = removed[: self._maxsize]
-                dropped = removed[self._maxsize :]
-
-                for entry in keep:
-                    self._queue.put_nowait(entry)
-
-                for entry in dropped:
-                    drop_counts[entry[3].account_id] += 1
-
-                accepted = new_item in keep
+            accepted, dropped_items = self._queue.put_with_drop(new_item)
+            for entry in dropped_items:
+                drop_counts[entry.event.account_id] += 1
+            BACKPRESSURE_QUEUE_DEPTH.set(float(self._queue.qsize()))
 
         if accepted and self._max_rate:
             self._rate_windows[event.account_id].append(now)
+
+        if not accepted:
+            drop_counts[event.account_id] += 1
 
         if drop_counts:
             await self._record_drops(drop_counts, ts)
@@ -153,8 +221,9 @@ class IntentBackpressure:
     async def get_intent(self) -> IntentEvent:
         """Retrieve the next intent in priority order."""
 
-        _, _, _, event = await self._queue.get()
-        return event
+        item = await self._queue.get()
+        BACKPRESSURE_QUEUE_DEPTH.set(float(self._queue.qsize()))
+        return item.event
 
     def task_done(self) -> None:
         """Mark the most recently retrieved intent as processed."""
@@ -171,7 +240,13 @@ class IntentBackpressure:
     def _build_item(
         self, priority: int, enqueued_at: float, event: IntentEvent
     ) -> QueueItem:
-        return (-priority, enqueued_at, next(self._sequence), event)
+        return QueueItem(
+            priority=priority,
+            enqueued_at=enqueued_at,
+            sequence=next(self._sequence),
+            hedge=self._is_hedge(event),
+            event=event,
+        )
 
     def _resolve_priority(self, event: IntentEvent, explicit: int | None) -> int:
         if explicit is not None:
@@ -188,6 +263,22 @@ class IntentBackpressure:
             return max(0, int(raw))
         except (TypeError, ValueError):
             return 1
+
+    def _is_hedge(self, event: IntentEvent) -> bool:
+        payload = event.intent or {}
+        hedge_flags = (
+            payload.get("hedge"),
+            payload.get("is_hedge"),
+            payload.get("hedging"),
+        )
+        if any(isinstance(flag, bool) and flag for flag in hedge_flags):
+            return True
+
+        for key in ("intent_type", "type", "category", "strategy", "purpose"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.lower() in {"hedge", "hedging"}:
+                return True
+        return False
 
     async def _record_drops(self, drop_counts: Mapping[str, int], ts: datetime) -> None:
         if not drop_counts:
@@ -235,6 +326,7 @@ async def get_backpressure_status() -> BackpressureStatus:
 
 
 __all__ = [
+    "BackpressureEvent",
     "BackpressureStatus",
     "IntentBackpressure",
     "app",

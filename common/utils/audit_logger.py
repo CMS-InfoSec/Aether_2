@@ -111,6 +111,12 @@ def _append_chain_log(log_path: Path, entry: Dict[str, Any]) -> None:
         fh.write(json.dumps(entry, separators=(",", ":"), sort_keys=True) + "\n")
 
 
+def _chain_previous_hash(prev_hash: str) -> str:
+    """Return the SHA-256 digest of the previous hash value."""
+
+    return hashlib.sha256(prev_hash.encode("utf-8")).hexdigest()
+
+
 def _canonical_payload(entry: Dict[str, Any]) -> Dict[str, Any]:
     canonical: Dict[str, Any] = {}
     for field in _CORE_FIELDS:
@@ -159,12 +165,13 @@ def log_audit(
     }
 
     state_path = _chain_state_path()
-    prev_hash = _read_last_hash(state_path)
+    prev_entry_hash = _read_last_hash(state_path)
+    chained_prev_hash = _chain_previous_hash(prev_entry_hash)
     canonical_serialized = _canonical_serialized(core_payload)
-    entry_hash = hashlib.sha256((prev_hash + canonical_serialized).encode("utf-8")).hexdigest()
+    entry_hash = hashlib.sha256((chained_prev_hash + canonical_serialized).encode("utf-8")).hexdigest()
 
     chained_payload = dict(core_payload)
-    chained_payload["prev_hash"] = prev_hash
+    chained_payload["prev_hash"] = chained_prev_hash
     chained_payload["hash"] = entry_hash
 
     sys.stdout.write(_canonical_serialized(chained_payload) + "\n")
@@ -185,8 +192,8 @@ def log_audit(
                     actor,
                     action,
                     entity,
-                    before_json,
-                    after_json,
+                    before,
+                    after,
                     ts,
                     hash,
                     prev_hash
@@ -201,7 +208,7 @@ def log_audit(
                     after_json,
                     timestamp,
                     entry_hash,
-                    prev_hash,
+                    chained_prev_hash,
                 ),
             )
 
@@ -217,7 +224,7 @@ def verify_audit_chain() -> bool:
         print("No audit chain entries found.")
         return True
 
-    prev_hash = _GENESIS_HASH
+    prev_entry_hash = _GENESIS_HASH
     valid = True
 
     with log_path.open("r", encoding="utf-8") as fh:
@@ -239,16 +246,19 @@ def verify_audit_chain() -> bool:
                 valid = False
                 break
 
-            if entry_prev != prev_hash:
+            expected_prev_hash = _chain_previous_hash(prev_entry_hash)
+
+            if entry_prev != expected_prev_hash:
                 print(
-                    f"Chain break at line {line_number}: expected prev_hash {prev_hash}, got {entry_prev}"
+                    "Chain break at line "
+                    f"{line_number}: expected prev_hash {expected_prev_hash}, got {entry_prev}"
                 )
                 valid = False
                 break
 
             canonical_payload = _canonical_payload(entry)
             recalculated = hashlib.sha256(
-                (prev_hash + _canonical_serialized(canonical_payload)).encode("utf-8")
+                (expected_prev_hash + _canonical_serialized(canonical_payload)).encode("utf-8")
             ).hexdigest()
 
             if recalculated != entry_hash:
@@ -258,7 +268,7 @@ def verify_audit_chain() -> bool:
                 valid = False
                 break
 
-            prev_hash = entry_hash
+            prev_entry_hash = entry_hash
 
     if valid:
         print("Audit chain verified successfully.")

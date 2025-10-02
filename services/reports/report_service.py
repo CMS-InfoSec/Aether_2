@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import csv
 import io
 import json
@@ -110,14 +109,10 @@ WHERE o.account_id = %(account_id)s
 REPORTS_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS reports (
     account_id TEXT NOT NULL,
-    report_date DATE NOT NULL,
-    format TEXT NOT NULL,
-    content_type TEXT NOT NULL,
-    payload TEXT NOT NULL,
-    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-    created_at TIMESTAMPTZ NOT NULL,
-    expires_at TIMESTAMPTZ NOT NULL,
-    PRIMARY KEY (account_id, report_date, format)
+    date DATE NOT NULL,
+    json_blob JSONB NOT NULL,
+    ts TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (account_id, date)
 );
 """
 
@@ -125,36 +120,25 @@ CREATE TABLE IF NOT EXISTS reports (
 UPSERT_REPORT_SQL = """
 INSERT INTO reports (
     account_id,
-    report_date,
-    format,
-    content_type,
-    payload,
-    metadata,
-    created_at,
-    expires_at
+    date,
+    json_blob,
+    ts
 ) VALUES (
     %(account_id)s,
-    %(report_date)s,
-    %(format)s,
-    %(content_type)s,
-    %(payload)s,
-    %(metadata)s::jsonb,
-    %(created_at)s,
-    %(expires_at)s
+    %(date)s,
+    %(json_blob)s::jsonb,
+    %(ts)s
 )
-ON CONFLICT (account_id, report_date, format) DO UPDATE
+ON CONFLICT (account_id, date) DO UPDATE
 SET
-    content_type = EXCLUDED.content_type,
-    payload = EXCLUDED.payload,
-    metadata = EXCLUDED.metadata,
-    created_at = EXCLUDED.created_at,
-    expires_at = EXCLUDED.expires_at
+    json_blob = EXCLUDED.json_blob,
+    ts = EXCLUDED.ts
 """
 
 
 DELETE_EXPIRED_REPORTS_SQL = """
 DELETE FROM reports
-WHERE expires_at < %(now)s
+WHERE ts < %(cutoff)s
 """
 
 
@@ -373,34 +357,22 @@ class DailyReportService:
             raise ValueError("Unsupported export format; choose 'csv' or 'pdf'")
         return data, filename, content_type
 
-    def persist_report(
-        self,
-        report: DailyReport,
-        *,
-        fmt: str,
-        payload: bytes,
-        content_type: str,
-    ) -> None:
+    def persist_report(self, report: DailyReport, payload: Mapping[str, Any]) -> None:
         account_id = report.account_id
         config = self._timescale(account_id)
-        encoded_payload = base64.b64encode(payload).decode("ascii")
-        metadata = json.dumps(report.summary_metadata())
-        created_at = datetime.now(timezone.utc)
-        expires_at = created_at + timedelta(days=self._retention_days)
+        now = datetime.now(timezone.utc)
+        serialized_payload = json.dumps(payload, separators=(",", ":"))
         params = {
             "account_id": account_id,
-            "report_date": report.report_date,
-            "format": fmt.lower(),
-            "content_type": content_type,
-            "payload": encoded_payload,
-            "metadata": metadata,
-            "created_at": created_at,
-            "expires_at": expires_at,
+            "date": report.report_date,
+            "json_blob": serialized_payload,
+            "ts": now,
         }
+        cutoff = now - timedelta(days=self._retention_days)
         with self._session(config) as cursor:
             cursor.execute(REPORTS_TABLE_DDL)
             cursor.execute(UPSERT_REPORT_SQL, params)
-            cursor.execute(DELETE_EXPIRED_REPORTS_SQL, {"now": datetime.now(timezone.utc)})
+            cursor.execute(DELETE_EXPIRED_REPORTS_SQL, {"cutoff": cutoff})
 
     # ------------------------------------------------------------------
     # Helpers
@@ -616,14 +588,9 @@ async def get_daily_report(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     payload = report.to_dict()
     try:
-        service.persist_report(
-            report,
-            fmt="json",
-            payload=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
-            content_type="application/json",
-        )
+        service.persist_report(report, payload)
     except Exception:  # pragma: no cover - best effort persistence
-        LOGGER.exception("Failed to persist JSON report for account %s", report.account_id)
+        LOGGER.exception("Failed to persist daily report for account %s", report.account_id)
     return payload
 
 
@@ -639,13 +606,13 @@ async def export_daily_report(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:
+        service.persist_report(report, report.to_dict())
+    except Exception:  # pragma: no cover - best effort persistence
+        LOGGER.exception("Failed to persist daily report for account %s", report.account_id)
+    try:
         payload, filename, content_type = service.export_daily_report(report, fmt=format)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    try:
-        service.persist_report(report, fmt=format, payload=payload, content_type=content_type)
-    except Exception:  # pragma: no cover - best effort persistence
-        LOGGER.exception("Failed to persist %s report for account %s", format, report.account_id)
     return StreamingResponse(
         io.BytesIO(payload),
         media_type=content_type,

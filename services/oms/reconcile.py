@@ -3,14 +3,17 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+import httpx
 from fastapi import APIRouter, FastAPI, HTTPException
 
-from services.alert_manager import OMSError, get_alert_manager_instance
 from services.oms.kraken_rest import KrakenRESTError
 from services.oms.kraken_ws import KrakenWSError, KrakenWSTimeout, OrderState
 
@@ -20,6 +23,35 @@ ZERO = Decimal("0")
 
 
 router = APIRouter()
+
+
+class ReconcileLogStore:
+    """Minimal persistence layer for reconciliation outcomes."""
+
+    def __init__(self, db_path: str = "data/oms_reconcile.db") -> None:
+        path = Path(db_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(path, check_same_thread=False, detect_types=sqlite3.PARSE_DECLTYPES)
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reconcile_log (
+                ts TIMESTAMP NOT NULL,
+                account_id TEXT NOT NULL,
+                mismatches INTEGER NOT NULL
+            )
+            """
+        )
+        self._conn.commit()
+        self._lock = asyncio.Lock()
+
+    async def record(self, account_id: str, mismatches: int) -> None:
+        timestamp = datetime.now(timezone.utc)
+        async with self._lock:
+            self._conn.execute(
+                "INSERT INTO reconcile_log(ts, account_id, mismatches) VALUES(?, ?, ?)",
+                (timestamp, account_id, mismatches),
+            )
+            self._conn.commit()
 
 
 @dataclass
@@ -40,12 +72,24 @@ class AccountReconcileResult:
 class OMSReconciler:
     """Periodically compares Kraken snapshots with OMS local state."""
 
-    def __init__(self, manager: "OMSManager", interval: float = 60.0) -> None:
+    def __init__(
+        self,
+        manager: "OMSManager",
+        *,
+        interval: float = 60.0,
+        alert_base_url: Optional[str] = None,
+        log_store: Optional[ReconcileLogStore] = None,
+    ) -> None:
         self._manager = manager
         self._interval = max(interval, 1.0)
         self._stats = ReconcileStats()
         self._stats_lock = asyncio.Lock()
         self._task: Optional[asyncio.Task[None]] = None
+        self._log_store = log_store or ReconcileLogStore()
+        base_url = alert_base_url or os.getenv("ALERTS_SERVICE_URL", "http://localhost:8000")
+        self._alerts_base_url = base_url.rstrip("/")
+        self._mismatch_counters: Dict[str, int] = {}
+        self._alerted_accounts: set[str] = set()
 
     async def start(self) -> None:
         if self._task and not self._task.done():
@@ -106,16 +150,18 @@ class OMSReconciler:
             total_orders += result.orders_checked
             total_fixed += result.mismatches_fixed
 
-            timestamp = datetime.now(timezone.utc).isoformat()
+            total_mismatches = result.mismatches_fixed + result.mismatches_remaining
+            await self._log_store.record(account.account_id, total_mismatches)
             logger.info(
                 "reconcile_log(%s, %s, mismatches=%s)",
-                timestamp,
+                datetime.now(timezone.utc).isoformat(),
                 account.account_id,
-                result.mismatches_fixed,
+                total_mismatches,
             )
 
-            if result.mismatches_remaining:
-                self._raise_alert(account.account_id, result.mismatches_remaining)
+            await self._handle_persistent_mismatch(
+                account.account_id, result.mismatches_remaining
+            )
 
         if total_balances or total_orders or total_fixed:
             async with self._stats_lock:
@@ -304,22 +350,33 @@ class OMSReconciler:
         )
         return mismatches_fixed, remaining
 
-    def _raise_alert(self, account_id: str, mismatches: int) -> None:
-        manager = get_alert_manager_instance()
-        description = (
-            f"Persistent reconciliation mismatch for account {account_id} after corrective actions"
-        )
-        labels = {"account_id": account_id, "mismatches": str(mismatches)}
-        error = OMSError(
-            error_code="OMS_RECONCILE_MISMATCH",
-            description=description,
-            severity="critical",
-            labels=labels,
-        )
-        if manager is not None:
-            manager.handle_oms_error(error)
-        else:  # pragma: no cover - depends on Alertmanager configuration
-            logger.error("%s (mismatches=%s)", description, mismatches)
+    async def _handle_persistent_mismatch(self, account_id: str, remaining: int) -> None:
+        if remaining > 0:
+            count = self._mismatch_counters.get(account_id, 0) + 1
+            self._mismatch_counters[account_id] = count
+            if count > 2 and account_id not in self._alerted_accounts:
+                await self._publish_alert(account_id, remaining)
+                self._alerted_accounts.add(account_id)
+        else:
+            self._mismatch_counters.pop(account_id, None)
+            self._alerted_accounts.discard(account_id)
+
+    async def _publish_alert(self, account_id: str, mismatches: int) -> None:
+        payload = {
+            "account_id": account_id,
+            "type": "oms_reconcile_mismatch",
+            "mismatches": mismatches,
+            "description": "Persistent OMS reconciliation mismatch detected",
+        }
+        url = f"{self._alerts_base_url}/alerts/publish"
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.post(url, json=payload)
+                response.raise_for_status()
+        except httpx.HTTPError as exc:  # pragma: no cover - defensive logging
+            logger.warning(
+                "Failed to publish reconcile alert for account %s: %s", account_id, exc
+            )
 
 
 def _normalize_status(value: Optional[str]) -> str:
@@ -425,9 +482,21 @@ async def reconcile_status() -> Dict[str, int]:
     return await _RECONCILER.status()
 
 
-def register(app: FastAPI, manager: "OMSManager", interval: float = 60.0) -> OMSReconciler:
+def register(
+    app: FastAPI,
+    manager: "OMSManager",
+    interval: float = 60.0,
+    *,
+    alert_base_url: Optional[str] = None,
+    log_store: Optional[ReconcileLogStore] = None,
+) -> OMSReconciler:
     global _RECONCILER
-    reconciler = OMSReconciler(manager, interval=interval)
+    reconciler = OMSReconciler(
+        manager,
+        interval=interval,
+        alert_base_url=alert_base_url,
+        log_store=log_store,
+    )
     _RECONCILER = reconciler
     app.add_event_handler("startup", reconciler.start)
     app.add_event_handler("shutdown", reconciler.stop)
