@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from app import create_app
 import pack_exporter
+from services.common.security import require_admin_account
 
 
 class _StubS3Client:
@@ -41,6 +42,7 @@ def test_knowledge_router_is_registered(monkeypatch: pytest.MonkeyPatch) -> None
 
     app = create_app()
     with TestClient(app) as client:
+        client.app.dependency_overrides[require_admin_account] = lambda: "company"
         response = client.get("/knowledge/export/latest")
 
     assert response.status_code == 200
