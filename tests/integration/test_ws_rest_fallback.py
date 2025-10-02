@@ -114,6 +114,9 @@ class _StubWSClient:
             await self._stream_update_cb(state)
         return ack
 
+    def heartbeat_age(self) -> float:
+        return 0.0
+
 
 class _StubRESTClient:
     def __init__(self, *, credential_getter, exchange) -> None:

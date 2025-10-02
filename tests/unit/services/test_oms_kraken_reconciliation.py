@@ -478,6 +478,9 @@ class StubWSClient(_BaseKrakenStub):
             await self._stream_update_cb(state)
         return ack
 
+    def heartbeat_age(self) -> float:
+        return 0.0
+
 
 class StubRESTClient(_BaseKrakenStub):
     def __init__(self, *, credential_getter: Any, stream_update_cb: Any | None = None, server: Any, userrefs: Dict[str, str], **_: Any) -> None:
