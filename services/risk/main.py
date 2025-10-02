@@ -6,6 +6,7 @@ import time
 from services.common.schemas import RiskValidationRequest, RiskValidationResponse
 from services.common.security import require_admin_account
 from services.risk.engine import RiskEngine
+from services.risk.circuit_breakers import router as circuit_router
 from services.risk.cvar_forecast import router as cvar_router
 from services.risk.nav_forecaster import router as nav_router
 
@@ -22,6 +23,7 @@ setup_metrics(app, service_name="risk-service")
 
 
 app.include_router(cvar_router)
+app.include_router(circuit_router)
 app.include_router(nav_router)
 
 
