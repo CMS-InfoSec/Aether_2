@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import csv
 import io
+import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from services.portfolio.balance_reader import BalanceReader, BalanceRetrievalError
+
 try:  # pragma: no cover - shared middleware may be unavailable in minimal environments
-    from shared.authz_middleware import (  # type: ignore
+from shared.authz_middleware import (  # type: ignore
         BearerTokenError,
         _coerce_account_scopes as _shared_coerce_account_scopes,
         _decode_jwt as _shared_decode_jwt,
@@ -34,6 +37,9 @@ except Exception:  # pragma: no cover - executed when psycopg is unavailable
 
 
 DEFAULT_DSN = "postgresql://timescale:password@localhost:5432/aether"
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class AccountScopeMiddleware(BaseHTTPMiddleware):
@@ -183,6 +189,15 @@ app = FastAPI(title="Portfolio Service")
 app.add_middleware(AccountScopeMiddleware)
 
 
+BALANCE_READER = BalanceReader()
+
+
+def invalidate_balance_cache(account_id: str | None = None) -> None:
+    """Expose cache invalidation for external event hooks."""
+
+    BALANCE_READER.invalidate(account_id)
+
+
 def _resolve_format(format: str | None, request: Request) -> str:
     if format:
         return format.lower()
@@ -190,6 +205,16 @@ def _resolve_format(format: str | None, request: Request) -> str:
     if "text/csv" in accept:
         return "csv"
     return "json"
+
+
+@app.get("/portfolio/balances")
+async def get_balances(
+    account_id: str = Depends(requires_account_scope),
+) -> Mapping[str, float]:
+    try:
+        return await BALANCE_READER.get_account_balances(account_id)
+    except BalanceRetrievalError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
 
 @app.get("/portfolio/positions")
@@ -403,4 +428,145 @@ def query_fills(
 
     query = "SELECT * FROM fills ORDER BY fill_time DESC LIMIT %(limit)s"
     return _execute_scoped_query(account_scopes, query, {"limit": limit})
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _coerce_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):  # pragma: no cover - defensive guard
+        return None
+
+
+def _extract_nav_pair(row: Mapping[str, Any]) -> tuple[float, float] | None:
+    if not isinstance(row, Mapping):
+        return None
+
+    str_keys = {str(key).lower(): key for key in row.keys() if isinstance(key, str)}
+    candidates: list[tuple[float, float, tuple[int, int, str]]] = []
+
+    for lower_key, original_key in str_keys.items():
+        if "nav" not in lower_key or "open" not in lower_key:
+            continue
+        close_lower = lower_key.replace("open", "close", 1)
+        close_key = str_keys.get(close_lower)
+        if close_key is None:
+            continue
+
+        open_val = _coerce_float(row.get(original_key))
+        close_val = _coerce_float(row.get(close_key))
+        if open_val is None or close_val is None:
+            continue
+
+        usd_priority = 0 if "usd" in lower_key else 1
+        if "mid" in lower_key:
+            source_priority = 0
+        elif "mark" in lower_key:
+            source_priority = 1
+        else:
+            source_priority = 2
+        priority = (usd_priority, source_priority, lower_key)
+        candidates.append((open_val, close_val, priority))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: item[2])
+    open_val, close_val, _ = candidates[0]
+    return float(open_val), float(close_val)
+
+
+def _nav_value_from_row(row: Mapping[str, Any]) -> float | None:
+    if not isinstance(row, Mapping):
+        return None
+
+    preferred_keys = (
+        "nav_usd_mid",
+        "nav_usd",
+        "nav",
+        "net_asset_value_usd",
+        "net_asset_value",
+        "equity",
+        "balance",
+        "total_value",
+    )
+
+    lower_map = {str(key).lower(): key for key in row.keys() if isinstance(key, str)}
+    for key in preferred_keys:
+        actual = lower_map.get(key)
+        if actual is None:
+            continue
+        value = _coerce_float(row.get(actual))
+        if value is not None:
+            return value
+
+    for lower_key, original_key in lower_map.items():
+        if "nav" in lower_key or "value" in lower_key or "equity" in lower_key:
+            value = _coerce_float(row.get(original_key))
+            if value is not None:
+                return value
+    return None
+
+
+def compute_daily_return_pct(account_id: str, ts_now: datetime | None = None) -> float:
+    """Return the intraday NAV change in percentage for *account_id*."""
+
+    ts_now = _as_utc(ts_now or datetime.now(timezone.utc))
+    session_start = datetime(ts_now.year, ts_now.month, ts_now.day, tzinfo=timezone.utc)
+
+    query = """
+        SELECT *
+        FROM pnl_curves
+        WHERE account_id = %(account_id)s
+          AND COALESCE(curve_ts, valuation_ts, ts, created_at) >= %(start)s
+          AND COALESCE(curve_ts, valuation_ts, ts, created_at) <= %(end)s
+        ORDER BY COALESCE(curve_ts, valuation_ts, ts, created_at)
+    """
+
+    with _connect() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                query,
+                {"account_id": account_id, "start": session_start, "end": ts_now},
+            )
+            rows = [dict(row) for row in cursor.fetchall()]
+
+    nav_pair: tuple[float, float] | None = None
+    nav_values: list[float] = []
+
+    for row in rows:
+        if nav_pair is None:
+            nav_pair = _extract_nav_pair(row)
+            if nav_pair is not None:
+                break
+        value = _nav_value_from_row(row)
+        if value is not None:
+            nav_values.append(value)
+
+    if nav_pair is not None:
+        nav_open, nav_close = nav_pair
+    elif nav_values:
+        nav_open = nav_values[0]
+        nav_close = nav_values[-1]
+    else:
+        return 0.0
+
+    if nav_open <= 0:
+        LOGGER.warning(
+            "Daily return computation for account %s has nav_open_usd=%s; returning 0.0%%",
+            account_id,
+            nav_open,
+        )
+        return 0.0
+
+    return ((nav_close - nav_open) / nav_open) * 100.0
 

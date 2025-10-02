@@ -9,6 +9,7 @@ from services.risk.engine import RiskEngine
 from services.risk.circuit_breakers import router as circuit_router
 from services.risk.cvar_forecast import router as cvar_router
 from services.risk.nav_forecaster import router as nav_router
+from services.risk.diversification_allocator import router as diversification_router
 from services.risk.pretrade_sanity import PRETRADE_SANITY, router as pretrade_router
 
 from metrics import (
@@ -27,6 +28,7 @@ app.include_router(cvar_router)
 app.include_router(circuit_router)
 app.include_router(nav_router)
 app.include_router(pretrade_router)
+app.include_router(diversification_router)
 
 
 @app.post("/risk/validate", response_model=RiskValidationResponse)

@@ -22,6 +22,7 @@ from typing import Any, Awaitable, Dict, Iterable, List, Optional, Set, Tuple
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 
+from services.common.security import require_admin_account
 from services.oms import reconcile as _oms_reconcile
 from services.oms.idempotency_store import _IdempotencyStore
 from services.oms.impact_store import ImpactAnalyticsStore, impact_store
@@ -37,6 +38,7 @@ from services.oms.kraken_ws import (
 from services.oms.routing import LatencyRouter
 from services.oms.rate_limit_guard import rate_limit_guard
 from services.oms.warm_start import WarmStartCoordinator
+from shared.sim_mode import SimulatedOrderSnapshot, sim_broker, sim_mode_repository
 
 
 import websockets
@@ -722,6 +724,7 @@ class AccountContext:
         self._balances: Dict[str, Decimal] = {}
         self._balances_lock = asyncio.Lock()
         self.routing = LatencyRouter(account_id)
+
         self._sim_broker = sim_broker
 
         self._impact_store: ImpactAnalyticsStore = impact_store
@@ -1451,9 +1454,6 @@ class AccountContext:
 
         async def _execute() -> OMSOrderStatusResponse:
 
-            assert self.ws_client is not None
-            assert self.rest_client is not None
-
             metadata = await self.credentials.get_metadata()
             qty, px = _PrecisionValidator.validate(
                 request.symbol,
@@ -1461,6 +1461,13 @@ class AccountContext:
                 request.limit_px,
                 metadata,
             )
+            sim_status = await self._sim_mode_repo.get_status_async()
+            if sim_status.active:
+                return await self._execute_simulated_order(request, qty, px)
+
+            assert self.ws_client is not None
+            assert self.rest_client is not None
+
             book_symbol = _resolve_book_symbol(request.symbol, metadata)
             depth: Optional[Decimal] = None
             book: _PublicOrderBookState | None = None
@@ -1647,11 +1654,35 @@ class AccountContext:
         await self.start()
 
         async def _execute_cancel() -> OMSOrderStatusResponse:
-            assert self.ws_client is not None
-            assert self.rest_client is not None
-
             async with self._orders_lock:
                 record = self._orders.get(request.client_id)
+
+            if record and record.transport == "simulation":
+                snapshot = await self._cancel_sim_order(request.client_id)
+                if snapshot is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Unknown simulated order for cancellation",
+                    )
+                sim_record = self._snapshot_to_record(snapshot)
+                await self._store_sim_record(sim_record)
+                return self._snapshot_to_response(snapshot)
+
+            if record is None:
+                sim_snapshot = await self._lookup_sim_snapshot(request.client_id)
+                if sim_snapshot is not None:
+                    snapshot = await self._cancel_sim_order(request.client_id)
+                    if snapshot is None:
+                        raise HTTPException(
+                            status_code=status.HTTP_404_NOT_FOUND,
+                            detail="Unknown simulated order for cancellation",
+                        )
+                    sim_record = self._snapshot_to_record(snapshot)
+                    await self._store_sim_record(sim_record)
+                    return self._snapshot_to_response(snapshot)
+
+            assert self.ws_client is not None
+            assert self.rest_client is not None
 
             target_txids: List[str] = []
             if request.exchange_order_id is not None:
@@ -2114,10 +2145,80 @@ class AccountContext:
 
     async def lookup(self, client_id: str) -> OrderRecord | None:
         async with self._orders_lock:
-            return self._orders.get(client_id)
+            record = self._orders.get(client_id)
+        if record is not None:
+            return record
+        snapshot = await self._lookup_sim_snapshot(client_id)
+        if snapshot is None:
+            return None
+        record = self._snapshot_to_record(snapshot)
+        await self._store_sim_record(record)
+        return record
 
     def routing_status(self) -> Dict[str, Optional[float] | str]:
         return self.routing.status()
+
+    def _snapshot_to_response(self, snapshot: SimulatedOrderSnapshot) -> OMSOrderStatusResponse:
+        return OMSOrderStatusResponse(
+            exchange_order_id=snapshot.client_id,
+            status=snapshot.status,
+            filled_qty=snapshot.filled_qty,
+            avg_price=snapshot.avg_price,
+            errors=None,
+        )
+
+    def _snapshot_to_record(self, snapshot: SimulatedOrderSnapshot) -> OrderRecord:
+        response = self._snapshot_to_response(snapshot)
+        return OrderRecord(
+            client_id=snapshot.client_id,
+            result=response,
+            transport="simulation",
+            children=None,
+            symbol=snapshot.symbol,
+            side=snapshot.side,
+            pre_trade_mid=snapshot.pre_trade_mid,
+            recorded_qty=response.filled_qty,
+            requested_qty=snapshot.qty,
+        )
+
+    async def _store_sim_record(self, record: OrderRecord) -> None:
+        async with self._orders_lock:
+            self._orders[record.client_id] = record
+
+    async def _lookup_sim_snapshot(self, client_id: str) -> SimulatedOrderSnapshot | None:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._sim_broker.lookup, self.account_id, client_id)
+
+    async def _cancel_sim_order(self, client_id: str) -> SimulatedOrderSnapshot | None:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._sim_broker.cancel_order, self.account_id, client_id)
+
+    async def _execute_simulated_order(
+        self, request: OMSPlaceRequest, qty: Decimal, limit_px: Optional[Decimal]
+    ) -> OMSOrderStatusResponse:
+        loop = asyncio.get_running_loop()
+        execution = await loop.run_in_executor(
+            None,
+            self._sim_broker.place_order,
+            request.account_id,
+            request.client_id,
+            request.symbol,
+            request.side,
+            request.order_type,
+            qty,
+            limit_px,
+            request.pre_trade_mid_px,
+        )
+        response = self._snapshot_to_response(execution.snapshot)
+        record = self._snapshot_to_record(execution.snapshot)
+        await self._store_sim_record(record)
+        logger.info(
+            "Simulated execution for %s on account %s",
+            request.client_id,
+            self.account_id,
+            extra=_log_extra(account_id=self.account_id, symbol=request.symbol, transport="simulation"),
+        )
+        return response
 
 
     async def _record_trade_impact(self, record: OrderRecord) -> None:
@@ -2197,32 +2298,82 @@ warm_start = WarmStartCoordinator(lambda: manager)
 
 
 
-async def require_account_id(request: Request) -> str:
+def _record_auth_failure(
+    request: Request,
+    *,
+    raw_header: Optional[str],
+    reason: str,
+    status_code: int,
+    detail: Any,
+) -> None:
+    increment_oms_auth_failures(reason=reason)
+    logger.warning(
+        "Unauthorized OMS request rejected",
+        extra=_log_extra(
+            event="oms.auth_failure",
+            reason=reason,
+            status_code=status_code,
+            source_ip=_extract_source_ip(request),
+            account_header=_redact_account_header(raw_header),
+            path=request.url.path,
+            detail=str(detail),
+        ),
+    )
+
+
+def _resolve_account_header(request: Request) -> Tuple[str, Optional[str]]:
     raw_header = request.headers.get("X-Account-ID")
     account_id = raw_header.strip() if raw_header else ""
 
     if account_id:
-        return account_id
+        return account_id, raw_header
 
     reason = "missing_account_id" if raw_header is None else "empty_account_id"
-    increment_oms_auth_failures(reason=reason)
-
-    logger.warning(
-        "Unauthorized OMS request missing X-Account-ID header",
-        extra=_log_extra(
-            event="oms.auth_failure",
-            reason=reason,
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            source_ip=_extract_source_ip(request),
-            account_header=_redact_account_header(raw_header),
-            path=request.url.path,
-        ),
-    )
-
-    raise HTTPException(
+    detail = "Missing X-Account-ID header"
+    _record_auth_failure(
+        request,
+        raw_header=raw_header,
+        reason=reason,
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Missing X-Account-ID header",
+        detail=detail,
     )
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=detail)
+
+
+def require_authorized_account(request: Request) -> str:
+    account_id, raw_header = _resolve_account_header(request)
+    authorization = request.headers.get("Authorization")
+
+    try:
+        return require_admin_account(
+            request,
+            authorization=authorization,
+            x_account_id=account_id,
+        )
+    except HTTPException as exc:
+        if exc.status_code in {status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN}:
+            if (
+                exc.status_code == status.HTTP_403_FORBIDDEN
+                and exc.detail == "Account header does not match authenticated session."
+            ):
+                reason = "account_mismatch"
+            elif exc.status_code == status.HTTP_403_FORBIDDEN:
+                reason = "forbidden"
+            else:
+                reason = "unauthorized"
+            _record_auth_failure(
+                request,
+                raw_header=raw_header,
+                reason=reason,
+                status_code=exc.status_code,
+                detail=exc.detail,
+            )
+        raise
+
+
+async def require_account_id(request: Request) -> str:
+    account_id, _ = _resolve_account_header(request)
+    return account_id
 
 
 def _extract_source_ip(request: Request) -> str:
@@ -2336,7 +2487,7 @@ async def get_rate_limit_status(
 
 
 @app.get("/oms/warm_start/status")
-async def get_warm_start_status(_: str = Depends(require_account_id)) -> Dict[str, int]:
+async def get_warm_start_status(_: str = Depends(require_authorized_account)) -> Dict[str, int]:
     return await warm_start.status()
 
 

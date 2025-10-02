@@ -86,7 +86,18 @@ WHERE account_id = %(account_id)s
 """
 
 
-NAV_QUERY = """
+NAV_OPEN_QUERY = """
+SELECT nav
+FROM pnl_curves
+WHERE account_id = %(account_id)s
+  AND as_of >= %(start)s
+  AND as_of < %(end)s
+ORDER BY as_of ASC
+LIMIT 1
+"""
+
+
+NAV_CLOSE_QUERY = """
 SELECT nav
 FROM pnl_curves
 WHERE account_id = %(account_id)s
@@ -95,6 +106,9 @@ WHERE account_id = %(account_id)s
 ORDER BY as_of DESC
 LIMIT 1
 """
+
+# Backwards compatibility for modules importing the previous constant name
+NAV_QUERY = NAV_CLOSE_QUERY
 
 
 FEES_SUMMARY_QUERY = """
@@ -141,6 +155,41 @@ SET
 DELETE_EXPIRED_REPORTS_SQL = """
 DELETE FROM reports
 WHERE ts < %(cutoff)s
+"""
+
+
+DAILY_NAV_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS daily_nav (
+    date DATE NOT NULL,
+    account_id TEXT NOT NULL,
+    open_nav NUMERIC NOT NULL,
+    close_nav NUMERIC NOT NULL,
+    daily_return_pct NUMERIC NOT NULL,
+    PRIMARY KEY (date, account_id)
+);
+"""
+
+
+UPSERT_DAILY_NAV_SQL = """
+INSERT INTO daily_nav (
+    date,
+    account_id,
+    open_nav,
+    close_nav,
+    daily_return_pct
+)
+VALUES (
+    %(date)s,
+    %(account_id)s,
+    %(open_nav)s,
+    %(close_nav)s,
+    %(daily_return_pct)s
+)
+ON CONFLICT (date, account_id) DO UPDATE
+SET
+    open_nav = EXCLUDED.open_nav,
+    close_nav = EXCLUDED.close_nav,
+    daily_return_pct = EXCLUDED.daily_return_pct
 """
 
 
@@ -344,7 +393,7 @@ class DailyReportService:
             trade_rows = self._fetch(cursor, TRADES_QUERY, params)
             fill_rows = self._fetch_fills(cursor, params)
             pnl_row = self._fetch_one(cursor, PNL_SUMMARY_QUERY, params) or {}
-            nav_row = self._fetch_one(cursor, NAV_QUERY, params) or {}
+            nav_row = self._fetch_one(cursor, NAV_CLOSE_QUERY, params) or {}
             fees_row = self._fetch_one(cursor, FEES_SUMMARY_QUERY, params) or {}
 
         trades = [self._build_trade(row) for row in trade_rows]
@@ -368,6 +417,61 @@ class DailyReportService:
             trades=trades,
             fills=fills,
         )
+
+    def get_daily_return_summary(
+        self,
+        *,
+        account_id: str | None = None,
+        nav_date: date | None = None,
+    ) -> Dict[str, Any]:
+        target_account = (account_id or self._default_account_id).strip()
+        if not target_account:
+            raise ValueError("account_id must be provided")
+        summary_date = nav_date or date.today()
+        start = datetime.combine(summary_date, datetime.min.time(), tzinfo=timezone.utc)
+        end = start + timedelta(days=1)
+        config = self._timescale(target_account)
+
+        with self._session(config) as cursor:
+            params = {"account_id": target_account, "start": start, "end": end}
+            open_row = self._fetch_one(cursor, NAV_OPEN_QUERY, params) or {}
+            close_row = self._fetch_one(cursor, NAV_CLOSE_QUERY, params) or {}
+            pnl_row = self._fetch_one(cursor, PNL_SUMMARY_QUERY, params) or {}
+            fees_row = self._fetch_one(cursor, FEES_SUMMARY_QUERY, params) or {}
+
+        open_nav = _as_float(open_row.get("nav", 0.0))
+        close_nav = _as_float(close_row.get("nav", 0.0))
+        realized = _as_float(pnl_row.get("realized_pnl", 0.0))
+        unrealized = _as_float(pnl_row.get("unrealized_pnl", 0.0))
+        fees = _as_float(fees_row.get("fees", 0.0))
+
+        daily_return_pct = 0.0
+        if open_nav:
+            daily_return_pct = ((close_nav - open_nav) / open_nav) * 100.0
+
+        summary = {
+            "account_id": target_account,
+            "date": summary_date.isoformat(),
+            "daily_return_pct": daily_return_pct,
+            "open_nav": open_nav,
+            "close_nav": close_nav,
+            "realized_pnl_usd": realized,
+            "unrealized_pnl_usd": unrealized,
+            "fees_usd": fees,
+        }
+
+        try:
+            self._persist_daily_nav(
+                account_id=target_account,
+                nav_date=summary_date,
+                open_nav=open_nav,
+                close_nav=close_nav,
+                daily_return_pct=daily_return_pct,
+            )
+        except Exception:  # pragma: no cover - best effort persistence
+            LOGGER.exception("Failed to persist daily NAV for account %s", target_account)
+
+        return summary
 
     def export_daily_report(self, report: DailyReport, *, fmt: str) -> tuple[bytes, str, str]:
         fmt_lower = fmt.lower()
@@ -403,6 +507,27 @@ class DailyReportService:
             cursor.execute(REPORTS_TABLE_DDL)
             cursor.execute(UPSERT_REPORT_SQL, params)
             cursor.execute(DELETE_EXPIRED_REPORTS_SQL, {"cutoff": cutoff})
+
+    def _persist_daily_nav(
+        self,
+        *,
+        account_id: str,
+        nav_date: date,
+        open_nav: float,
+        close_nav: float,
+        daily_return_pct: float,
+    ) -> None:
+        config = self._timescale(account_id)
+        params = {
+            "date": nav_date,
+            "account_id": account_id,
+            "open_nav": open_nav,
+            "close_nav": close_nav,
+            "daily_return_pct": daily_return_pct,
+        }
+        with self._session(config) as cursor:
+            cursor.execute(DAILY_NAV_TABLE_DDL)
+            cursor.execute(UPSERT_DAILY_NAV_SQL, params)
 
     def explain_trade(self, trade_id: str) -> Dict[str, Any]:
         identifier = (trade_id or "").strip()
@@ -852,6 +977,19 @@ async def get_daily_report(
     return payload
 
 
+@router.get("/pnl/daily_pct")
+async def get_daily_return_pct(
+    account_id: str | None = Query(default=None),
+    nav_date: date | None = Query(default=None, alias="date"),
+    _: str = Depends(require_admin_account),
+) -> Dict[str, Any]:
+    service = get_daily_report_service()
+    try:
+        return service.get_daily_return_summary(account_id=account_id, nav_date=nav_date)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/export")
 async def export_daily_report(
     format: str = Query(..., regex="^(?i)(pdf|csv|json)$"),
@@ -898,10 +1036,40 @@ async def explain_trade(
         raise HTTPException(status_code=500, detail="Unable to generate explanation") from exc
 
 
+def compute_daily_return_pct(account_id: Optional[str] = None) -> Optional[float]:
+    """Return the daily net return percentage for *account_id*.
+
+    The helper uses :class:`DailyReportService` to build the latest daily report
+    and derives the net return as ``(realized + unrealized - fees) / nav``. A
+    ``None`` result indicates that the computation could not be completed (for
+    example due to missing NAV data or connectivity issues).
+    """
+
+    service = get_daily_report_service()
+    try:
+        report = service.build_daily_report(account_id=account_id)
+    except ValueError:
+        return None
+    except Exception:  # pragma: no cover - surfaced when backend storage fails
+        LOGGER.exception(
+            "Failed to build daily report for return calculation",
+            extra={"account_id": account_id},
+        )
+        return None
+
+    nav = float(report.nav or 0.0)
+    if nav <= 0.0:
+        return None
+
+    net_pnl = float(report.realized_pnl) + float(report.unrealized_pnl) - float(report.fees)
+    return (net_pnl / nav) * 100.0
+
+
 __all__ = [
     "DailyReport",
     "DailyReportService",
     "TradeContextError",
     "router",
     "get_daily_report_service",
+    "compute_daily_return_pct",
 ]

@@ -51,7 +51,7 @@ from battle_mode import BattleModeController, create_battle_mode_tables
 
 from cost_throttler import CostThrottler
 from services.risk.position_sizer import PositionSizer
-from services.common.adapters import TimescaleAdapter
+from services.common.adapters import RedisFeastAdapter, TimescaleAdapter
 from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
 
 
@@ -762,14 +762,48 @@ async def get_position_size(
 
     await _refresh_usage_from_balance(account_id)
     usage = _load_account_usage(account_id)
+
+    nav_value = float(usage.net_asset_value) if usage.net_asset_value else 0.0
+    available_balance: Optional[float] = None
+
+    if EXCHANGE_ADAPTER.supports("get_balance"):
+        try:
+            snapshot = await EXCHANGE_ADAPTER.get_balance(account_id)
+        except NotImplementedError:
+            snapshot = None
+        except Exception as exc:  # pragma: no cover - best effort diagnostics
+            logger.debug(
+                "Balance snapshot unavailable for account %s: %s",
+                account_id,
+                exc,
+            )
+            snapshot = None
+        if isinstance(snapshot, Mapping):
+            nav_override = _coerce_float(
+                snapshot.get("net_asset_value")
+                or snapshot.get("nav")
+                or snapshot.get("total_value")
+            )
+            if nav_override is not None and nav_override > 0:
+                nav_value = nav_override
+            available_balance = _extract_available_usd(snapshot)
+
+    timescale_adapter = TimescaleAdapter(account_id=account_id)
+    feature_store = RedisFeastAdapter(account_id=account_id)
     sizer = PositionSizer(
         account_id,
         limits=limits,
+        timescale=timescale_adapter,
+        feature_store=feature_store,
         log_callback=_log_position_size,
     )
 
     try:
-        result = sizer.suggest_max_position(symbol, nav=usage.net_asset_value)
+        result = sizer.suggest_max_position(
+            symbol,
+            nav=nav_value,
+            available_balance=available_balance,
+        )
     except Exception as exc:  # pragma: no cover - defensive programming
         logger.exception(
             "Position sizing failed for account %s symbol %s", account_id, symbol
@@ -778,18 +812,31 @@ async def get_position_size(
 
     payload = {
         "account_id": result.account_id,
-        "symbol": symbol.upper(),
-        "volatility": result.volatility,
+        "symbol": result.symbol,
+        "max_size_usd": result.max_size_usd,
+        "size_units": result.size_units,
+        "reason": result.reason,
         "nav": result.nav,
+        "available_balance": result.available_balance,
+        "volatility": result.volatility,
         "risk_budget": result.risk_budget,
-        "max_position": result.max_position,
+        "base_size_usd": result.base_size_usd,
+        "expected_edge_bps": result.expected_edge_bps,
+        "fee_bps_estimate": result.fee_bps_estimate,
+        "slippage_bps": result.slippage_bps,
+        "safety_margin_bps": result.safety_margin_bps,
+        "regime": result.regime,
+        "price": result.price,
         "timestamp": result.timestamp,
+        "diagnostics": result.diagnostics,
     }
+    payload["max_position"] = result.max_size_usd  # Backwards compatibility
     logger.info(
-        "Computed position size for account %s symbol %s: %.2f",
+        "Computed position size for account %s symbol %s: %.2f USD (reason=%s)",
         account_id,
         symbol,
-        result.max_position,
+        result.max_size_usd,
+        result.reason,
     )
     return payload
 
@@ -982,9 +1029,13 @@ async def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
             feature_store=RedisFeastAdapter(account_id=context.request.account_id),
             log_callback=_log_position_size,
         )
+        nav_value = float(state.net_asset_value)
+        exposure = float(state.notional_exposure or 0.0)
+        available_balance = max(nav_value - exposure, 0.0)
         sizing_result = sizer.suggest_max_position(
             normalized_instrument,
-            nav=float(state.net_asset_value),
+            nav=nav_value,
+            available_balance=available_balance,
         )
     except Exception:  # pragma: no cover - defensive programming
         logger.exception(
@@ -1822,6 +1873,25 @@ def _coerce_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _extract_available_usd(snapshot: Mapping[str, Any]) -> Optional[float]:
+    balances = snapshot.get("balances") if isinstance(snapshot, Mapping) else None
+    candidates: List[float] = []
+    if isinstance(balances, Mapping):
+        for key in ("USD", "ZUSD", "USDC", "USDT"):
+            candidate = _coerce_float(balances.get(key)) if key in balances else None
+            if candidate is not None:
+                candidates.append(candidate)
+    if candidates:
+        return max(candidates)
+
+    fallback: Any = None
+    if isinstance(snapshot, Mapping):
+        fallback = snapshot.get("available_balance")
+        if fallback is None:
+            fallback = snapshot.get("available_cash")
+    return _coerce_float(fallback)
 
 
 def set_stub_price_history(instrument_id: str, history: List[Dict[str, float]]) -> None:

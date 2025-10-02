@@ -27,6 +27,31 @@ POLICY_VOLUME_SIGNAL_TIMEOUT = float(os.getenv("POLICY_VOLUME_SIGNAL_TIMEOUT", "
 NEXT_TIER_ALERT_THRESHOLD = Decimal("0.95")
 
 
+def _decimal_setting(env_var: str, default: str) -> Decimal:
+    """Parse a decimal value from the environment with a safe fallback."""
+
+    try:
+        return Decimal(os.getenv(env_var, default))
+    except Exception:
+        return Decimal(default)
+
+
+_DEFAULT_FEE_ALPHA = Decimal("0.2")
+FEE_ESTIMATE_SMOOTHING_ALPHA = _decimal_setting("FEE_ESTIMATE_SMOOTHING_ALPHA", "0.2")
+if FEE_ESTIMATE_SMOOTHING_ALPHA <= 0 or FEE_ESTIMATE_SMOOTHING_ALPHA > Decimal("1"):
+    FEE_ESTIMATE_SMOOTHING_ALPHA = _DEFAULT_FEE_ALPHA
+
+FEE_DRIFT_ALERT_THRESHOLD_BPS = _decimal_setting("FEE_DRIFT_ALERT_THRESHOLD_BPS", "5")
+if FEE_DRIFT_ALERT_THRESHOLD_BPS < 0:
+    FEE_DRIFT_ALERT_THRESHOLD_BPS = Decimal("5")
+
+FEE_DRIFT_ALERT_THRESHOLD_RATIO = _decimal_setting("FEE_DRIFT_ALERT_THRESHOLD_RATIO", "0.25")
+if FEE_DRIFT_ALERT_THRESHOLD_RATIO < 0:
+    FEE_DRIFT_ALERT_THRESHOLD_RATIO = Decimal("0.25")
+
+FEE_ESTIMATE_QUANTIZE = Decimal("0.0001")
+
+
 def _database_url() -> str:
     url = os.getenv("TIMESCALE_DSN") or os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
     if url.startswith("postgresql://"):
@@ -122,6 +147,28 @@ class AccountSummaryResponse(BaseModel):
     basis_ts: datetime = Field(..., description="Timestamp anchoring the rolling window")
 
 
+class FeeEstimateResponse(BaseModel):
+    account_id: str = Field(..., description="Account identifier")
+    symbol: str = Field(..., description="Trading pair symbol for the estimate")
+    side: str = Field(..., description="Order side being evaluated")
+    order_type: str = Field(..., description="Order type driving liquidity inference")
+    tier: str = Field(..., description="Matched Kraken fee tier")
+    volume_usd_30d: float = Field(..., ge=0.0, description="Rolling 30-day USD volume basis")
+    maker_fee_bps_estimate: float = Field(
+        ..., ge=0.0, description="Maker fee estimate expressed in basis points"
+    )
+    taker_fee_bps_estimate: float = Field(
+        ..., ge=0.0, description="Taker fee estimate expressed in basis points"
+    )
+    inferred_liquidity: str | None = Field(
+        None, description="Liquidity classification inferred from the order type"
+    )
+    fee_bps_estimate: float = Field(
+        ..., ge=0.0, description="Fee estimate aligned with inferred liquidity"
+    )
+    basis_ts: datetime = Field(..., description="Timestamp anchoring the rolling window")
+
+
 class NextTierStatusResponse(BaseModel):
     current_tier: str = Field(..., description="Identifier of the active fee tier")
     next_tier: str | None = Field(
@@ -157,6 +204,104 @@ def _ordered_tiers(session: Session) -> list[FeeTier]:
     """Return the configured fee tiers ordered by threshold."""
 
     return optimizer.ordered_tiers(session)
+
+
+def _account_volume_snapshot(
+    session: Session, account_id: str, as_of: datetime | None = None
+) -> tuple[Decimal, datetime, AccountVolume30d | None]:
+    """Return the stored rolling volume snapshot, falling back to raw fills."""
+
+    record = session.get(AccountVolume30d, account_id)
+    if record is not None and record.updated_at is not None:
+        return _to_decimal(record.notional_usd_30d or 0), record.updated_at, record
+
+    volume, basis_ts = _rolling_volume(session, account_id, as_of)
+    return volume, basis_ts, record
+
+
+def _infer_liquidity_hint(order_type: str) -> str | None:
+    """Best-effort inference of liquidity from the order type."""
+
+    normalized = order_type.lower()
+    if normalized in {"limit", "post_only", "maker"}:
+        return "maker"
+    if normalized in {"market", "ioc", "fok", "taker"}:
+        return "taker"
+    return None
+
+
+def _update_fee_estimate(
+    record: AccountVolume30d,
+    liquidity: str,
+    actual_bps: Decimal,
+    timestamp: datetime,
+) -> Decimal:
+    """Update the exponentially-weighted moving average fee estimate."""
+
+    field = "maker_fee_bps_estimate" if liquidity == "maker" else "taker_fee_bps_estimate"
+    existing_value = getattr(record, field)
+    if existing_value is not None:
+        current = Decimal(existing_value)
+        weight_existing = Decimal("1") - FEE_ESTIMATE_SMOOTHING_ALPHA
+        updated = (current * weight_existing) + (
+            actual_bps * FEE_ESTIMATE_SMOOTHING_ALPHA
+        )
+    else:
+        updated = actual_bps
+
+    updated = updated.quantize(FEE_ESTIMATE_QUANTIZE, rounding=ROUND_HALF_UP)
+    setattr(record, field, updated)
+    record.fee_estimate_updated_at = timestamp
+    return updated
+
+
+def _maybe_alert_fee_drift(
+    account_id: str,
+    liquidity: str | None,
+    notional: Decimal,
+    actual_bps: Decimal | None,
+    expected_bps: Decimal | None,
+    actual_fee: Decimal | None,
+    expected_fee_usd_hint: Decimal | None,
+    expected_source: str | None,
+) -> None:
+    """Emit a warning when realized fees deviate materially from expectations."""
+
+    if liquidity is None or actual_bps is None or expected_bps is None:
+        return
+
+    drift_bps = actual_bps - expected_bps
+    drift_ratio: Decimal | None = None
+    if expected_bps != 0:
+        drift_ratio = drift_bps / expected_bps
+
+    if (
+        abs(drift_bps) < FEE_DRIFT_ALERT_THRESHOLD_BPS
+        and (drift_ratio is None or abs(drift_ratio) < FEE_DRIFT_ALERT_THRESHOLD_RATIO)
+    ):
+        return
+
+    expected_fee_usd = (
+        expected_fee_usd_hint
+        if expected_fee_usd_hint is not None
+        else _fee_amount(notional, expected_bps)
+    )
+
+    logger.warning(
+        "fee_estimate_drift",
+        extra={
+            "account_id": account_id,
+            "liquidity": liquidity,
+            "notional_usd": float(notional),
+            "actual_fee_bps": float(actual_bps),
+            "expected_fee_bps": float(expected_bps),
+            "drift_bps": float(drift_bps),
+            "drift_ratio": float(drift_ratio) if drift_ratio is not None else None,
+            "actual_fee_usd": float(actual_fee) if actual_fee is not None else None,
+            "expected_fee_usd": float(expected_fee_usd),
+            "expected_source": expected_source,
+        },
+    )
 
 
 def _rolling_window(as_of: datetime | None = None) -> Tuple[datetime, datetime]:
@@ -224,7 +369,7 @@ def get_effective_fee(
     if not tiers:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Fee schedule is not configured")
 
-    rolling_volume, basis_ts = _rolling_volume(session, account_id)
+    rolling_volume, basis_ts, _ = _account_volume_snapshot(session, account_id)
 
     try:
         tier = optimizer.determine_tier(tiers, rolling_volume)
@@ -268,10 +413,58 @@ def get_volume_30d(
     session: Session = Depends(get_session),
     account_id: str = Depends(require_admin_account),
 ) -> Volume30dResponse:
-    volume, basis_ts = _rolling_volume(session, account_id)
+    volume, basis_ts, _ = _account_volume_snapshot(session, account_id)
     return Volume30dResponse(
         notional_usd_30d=float(volume),
         updated_at=basis_ts,
+    )
+
+
+@app.get("/fees/estimate", response_model=FeeEstimateResponse)
+def get_fee_estimate(
+    account_id: str = Query(..., min_length=1, max_length=64, description="Account identifier"),
+    symbol: str = Query(..., min_length=3, max_length=32, description="Trading pair symbol"),
+    side: str = Query(..., pattern=r"(?i)^(buy|sell)$", description="Order side"),
+    order_type: str = Query(
+        ..., min_length=3, max_length=32, description="Order type (e.g. limit, market, post_only)"
+    ),
+    session: Session = Depends(get_session),
+    _: str = Depends(require_admin_account),
+) -> FeeEstimateResponse:
+    tiers = _ordered_tiers(session)
+    if not tiers:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Fee schedule is not configured")
+
+    volume, basis_ts, record = _account_volume_snapshot(session, account_id)
+
+    try:
+        tier = optimizer.determine_tier(tiers, volume)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    maker_bps = Decimal(tier.maker_bps)
+    taker_bps = Decimal(tier.taker_bps)
+
+    if record is not None and record.maker_fee_bps_estimate is not None:
+        maker_bps = Decimal(record.maker_fee_bps_estimate)
+    if record is not None and record.taker_fee_bps_estimate is not None:
+        taker_bps = Decimal(record.taker_fee_bps_estimate)
+
+    liquidity_hint = _infer_liquidity_hint(order_type)
+    selected_bps = maker_bps if liquidity_hint == "maker" else taker_bps
+
+    return FeeEstimateResponse(
+        account_id=account_id,
+        symbol=symbol.upper(),
+        side=side.lower(),
+        order_type=order_type.lower(),
+        tier=tier.tier_id,
+        volume_usd_30d=float(volume),
+        maker_fee_bps_estimate=float(maker_bps),
+        taker_fee_bps_estimate=float(taker_bps),
+        inferred_liquidity=liquidity_hint,
+        fee_bps_estimate=float(selected_bps),
+        basis_ts=basis_ts,
     )
 
 
@@ -285,7 +478,7 @@ def get_account_summary(
     if not tiers:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Fee schedule is not configured")
 
-    volume, basis_ts = _rolling_volume(session, account_id)
+    volume, basis_ts, _ = _account_volume_snapshot(session, account_id)
     try:
         tier = optimizer.determine_tier(tiers, volume)
     except ValueError as exc:
@@ -335,6 +528,8 @@ def update_account_volume_30d(
     if notional_delta < 0:
         raise ValueError("fill_notional_usd must be non-negative")
 
+    normalized_liquidity = liquidity.lower() if liquidity is not None else None
+
     estimated_bps = Decimal(str(estimated_fee_bps)) if estimated_fee_bps is not None else None
     estimated_fee_usd = (
         _fee_amount(notional_delta, estimated_bps) if estimated_bps is not None else None
@@ -344,7 +539,7 @@ def update_account_volume_30d(
     session.add(
         AccountFill(
             account_id=account_id,
-            liquidity=liquidity,
+            liquidity=normalized_liquidity,
             notional_usd=notional_delta,
             estimated_fee_bps=estimated_bps,
             estimated_fee_usd=estimated_fee_usd,
@@ -365,6 +560,16 @@ def update_account_volume_30d(
     rolling_volume, basis_ts = _rolling_volume(session, account_id, timestamp)
 
     record = session.get(AccountVolume30d, account_id)
+    existing_maker_estimate = (
+        Decimal(record.maker_fee_bps_estimate)
+        if record is not None and record.maker_fee_bps_estimate is not None
+        else None
+    )
+    existing_taker_estimate = (
+        Decimal(record.taker_fee_bps_estimate)
+        if record is not None and record.taker_fee_bps_estimate is not None
+        else None
+    )
     if record is None:
         record = AccountVolume30d(
             account_id=account_id,
@@ -376,28 +581,71 @@ def update_account_volume_30d(
         record.notional_usd_30d = rolling_volume
         record.updated_at = basis_ts
 
+    actual_bps: Decimal | None = None
+    if actual_fee is not None:
+        actual_bps = (
+            (actual_fee / notional_delta) * Decimal("10000")
+            if notional_delta > 0
+            else Decimal("0")
+        )
+
+    expected_bps: Decimal | None = None
+    expected_source: str | None = None
+    if estimated_bps is not None:
+        expected_bps = estimated_bps
+        expected_source = "request"
+    elif normalized_liquidity == "maker" and existing_maker_estimate is not None:
+        expected_bps = existing_maker_estimate
+        expected_source = "historical"
+    elif normalized_liquidity == "taker" and existing_taker_estimate is not None:
+        expected_bps = existing_taker_estimate
+        expected_source = "historical"
+
+    if actual_bps is not None and normalized_liquidity in {"maker", "taker"}:
+        _update_fee_estimate(record, normalized_liquidity, actual_bps, timestamp)
+
     session.commit()
     session.refresh(record)
 
-    if actual_fee is not None and estimated_fee_usd is not None and notional_delta > 0:
-        actual_bps = (actual_fee / notional_delta) * Decimal("10000") if actual_fee > 0 else Decimal("0")
-        estimated_bps_value = estimated_bps if estimated_bps is not None else Decimal("0")
-        discrepancy = actual_fee - estimated_fee_usd
-        logger.info(
-            "fee_reconciliation",
-            extra={
-                "account_id": account_id,
-                "liquidity": liquidity,
-                "notional_usd": float(notional_delta),
-                "estimated_fee_bps": float(estimated_bps_value),
-                "actual_fee_bps": float(actual_bps),
-                "estimated_fee_usd": float(estimated_fee_usd),
-                "actual_fee_usd": float(actual_fee),
-                "discrepancy_bps": float(
-                    actual_bps - estimated_bps_value if notional_delta > 0 else Decimal("0")
-                ),
-                "discrepancy_usd": float(discrepancy),
-            },
+    if actual_bps is not None:
+        expected_fee_usd = None
+        if expected_bps is not None:
+            expected_fee_usd = (
+                estimated_fee_usd
+                if estimated_fee_usd is not None and expected_source == "request"
+                else _fee_amount(notional_delta, expected_bps)
+            )
+
+        log_extra: dict[str, float | str | None] = {
+            "account_id": account_id,
+            "liquidity": normalized_liquidity,
+            "notional_usd": float(notional_delta),
+            "actual_fee_bps": float(actual_bps),
+        }
+        if actual_fee is not None:
+            log_extra["actual_fee_usd"] = float(actual_fee)
+        if expected_bps is not None:
+            log_extra["estimated_fee_bps"] = float(expected_bps)
+            log_extra["estimated_fee_source"] = expected_source
+            log_extra["discrepancy_bps"] = float(actual_bps - expected_bps)
+            if expected_fee_usd is not None:
+                log_extra["estimated_fee_usd"] = float(expected_fee_usd)
+                if actual_fee is not None:
+                    log_extra["discrepancy_usd"] = float(actual_fee - expected_fee_usd)
+        elif estimated_fee_usd is not None:
+            log_extra["estimated_fee_usd"] = float(estimated_fee_usd)
+
+        logger.info("fee_reconciliation", extra=log_extra)
+
+        _maybe_alert_fee_drift(
+            account_id,
+            normalized_liquidity,
+            notional_delta,
+            actual_bps,
+            expected_bps,
+            actual_fee,
+            expected_fee_usd,
+            expected_source,
         )
 
     optimizer.monitor_account(
