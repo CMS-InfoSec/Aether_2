@@ -430,8 +430,8 @@ controller = SafeModeController()
 
 @app.post("/safe_mode/enter", response_model=Dict[str, object])
 def enter_safe_mode(
-    payload: Dict[str, str] = Body(...),
     request: Request,
+    payload: Dict[str, str] = Body(...),
     actor: Optional[str] = Header(default="system", alias="X-Actor"),
 ) -> Dict[str, object]:
     before_snapshot = dict(controller.status().to_response())
