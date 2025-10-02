@@ -10,7 +10,7 @@ import logging
 import random
 import time
 import urllib.parse
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 from uuid import uuid4
 
 import aiohttp
@@ -82,7 +82,7 @@ class KrakenRESTClient:
         payload: Dict[str, Any] = {"docalcs": bool(docalcs)}
         return await self._request("/private/OpenPositions", payload)
 
-    async def websocket_token(self) -> str:
+    async def websocket_token(self) -> Tuple[str, Optional[float]]:
         """Fetch a websocket authentication token for the current credentials."""
 
         payload = await self._request("/private/GetWebSocketsToken", {})
@@ -90,7 +90,16 @@ class KrakenRESTClient:
         token = result.get("token")
         if not token:
             raise KrakenRESTError("Kraken REST token response missing token")
-        return str(token)
+        expires = result.get("expires")
+        ttl: Optional[float]
+        if expires is None:
+            ttl = None
+        else:
+            try:
+                ttl = float(expires)
+            except (TypeError, ValueError):
+                ttl = None
+        return str(token), ttl
 
     async def _request(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         credentials = await self._credential_getter()
