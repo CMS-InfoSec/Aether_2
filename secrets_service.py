@@ -104,7 +104,7 @@ class Settings(BaseModel):
     class Config:
         allow_population_by_field_name = True
 
-    @validator("authorized_token_labels", pre=True)
+    @validator("authorized_token_labels", pre=True, allow_reuse=True)
     def _normalize_authorized_token_labels(  # type: ignore[override]
         cls, value: Any
     ) -> Dict[str, str]:
@@ -121,7 +121,7 @@ class Settings(BaseModel):
             return cleaned
         raise ValueError("authorized token labels must be provided as a string or mapping")
 
-    @validator("authorized_token_ids", pre=True)
+    @validator("authorized_token_ids", pre=True, allow_reuse=True)
     def _split_tokens(cls, value: Any) -> Tuple[str, ...]:  # type: ignore[override]
         if isinstance(value, str):
             tokens = [item.strip() for item in value.split(",") if item.strip()]
@@ -484,16 +484,21 @@ def _extract_bearer_token(header_value: Optional[str]) -> Optional[str]:
     return value
 
 
-def require_authorized_caller(authorization: Optional[str] = Header(default=None)) -> str:
+async def require_authorized_caller(
+    authorization: Optional[str] = Header(default=None),
+) -> str:
     token = _extract_bearer_token(authorization)
     if token is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing or invalid authorization token",
         )
-    assert SETTINGS is not None  # for type-checkers
-    actor = SETTINGS.authorized_token_labels.get(token)
-    if actor is None or token not in SETTINGS.authorized_token_ids:
+    if SETTINGS is None:
+        await initialize_dependencies()
+
+    settings = _require_settings()
+    actor = settings.authorized_token_labels.get(token)
+    if actor is None or token not in settings.authorized_token_ids:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Caller is not authorized to access Kraken secrets",
