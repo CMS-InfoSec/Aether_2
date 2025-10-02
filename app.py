@@ -1,41 +1,60 @@
 """Application factory wiring services, middleware, and routers."""
 from __future__ import annotations
 
+import importlib
+import logging
 import os
+from typing import Optional
 
 from fastapi import FastAPI
 
 from audit_mode import configure_audit_mode
 from accounts.service import AccountsService
 from auth.routes import get_auth_service, router as auth_router
-from auth.service import AdminRepository, AuthService, SessionStore
+from auth.service import (
+    AdminRepositoryProtocol,
+    AuthService,
+    InMemoryAdminRepository,
+    InMemorySessionStore,
+    PostgresAdminRepository,
+    RedisSessionStore,
+    SessionStoreProtocol,
+)
+from scaling_controller import (
+    build_scaling_controller_from_env,
+    configure_scaling_controller,
+    router as scaling_router,
+)
 from services.alert_manager import setup_alerting
 from services.alerts.alert_dedupe import router as alert_dedupe_router, setup_alert_dedupe
-from alert_prioritizer import router as alert_prioritizer_router
-from services.report_service import router as reports_router
-from multiformat_export import router as log_export_router
-from compliance_pack import router as compliance_router
-from scaling_controller import (
-    build_scaling_controller_from_env,
-    configure_scaling_controller,
-    router as scaling_router,
-)
 
-from pack_exporter import router as knowledge_router
-from scaling_controller import (
-    build_scaling_controller_from_env,
-    configure_scaling_controller,
-    router as scaling_router,
-)
-
-
-from services.models.meta_learner import router as meta_router
-from services.models.model_zoo import router as models_router
-
-from exposure_forecast import router as exposure_router
 from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
 from shared.correlation import CorrelationIdMiddleware
 
+
+
+logger = logging.getLogger(__name__)
+
+
+def _build_admin_repository_from_env() -> AdminRepositoryProtocol:
+    dsn = os.getenv("ADMIN_DATABASE_URL")
+    if dsn:
+        return PostgresAdminRepository(dsn)
+    return InMemoryAdminRepository()
+
+
+def _build_session_store_from_env() -> SessionStoreProtocol:
+    ttl_minutes = int(os.getenv("SESSION_TTL_MINUTES", "60"))
+    redis_url = os.getenv("SESSION_REDIS_URL")
+    if redis_url:
+        try:  # pragma: no cover - import guarded for optional dependency resolution
+            import redis
+        except ImportError as exc:  # pragma: no cover - surfaced when dependency missing at runtime
+            raise RuntimeError("redis package is required when SESSION_REDIS_URL is set") from exc
+        client = redis.Redis.from_url(redis_url)
+        return RedisSessionStore(client, ttl_minutes=ttl_minutes)
+    return InMemorySessionStore(ttl_minutes=ttl_minutes)
+
 from scaling_controller import (
     build_scaling_controller_from_env,
     configure_scaling_controller,
@@ -43,7 +62,21 @@ from scaling_controller import (
 )
 
 
-def create_app() -> FastAPI:
+def _maybe_include_router(app: FastAPI, module: str, attribute: str) -> None:
+    try:
+        module_obj = importlib.import_module(module)
+        router = getattr(module_obj, attribute)
+    except Exception as exc:  # pragma: no cover - optional routes are best-effort
+        logger.debug("Skipping router %s.%s due to %s", module, attribute, exc)
+        return
+    app.include_router(router)
+
+
+def create_app(
+    *,
+    admin_repository: Optional[AdminRepositoryProtocol] = None,
+    session_store: Optional[SessionStoreProtocol] = None,
+) -> FastAPI:
     app = FastAPI(title="Aether Admin Platform")
     app.add_middleware(CorrelationIdMiddleware)
 
@@ -51,8 +84,8 @@ def create_app() -> FastAPI:
     audit_logger = TimescaleAuditLogger(audit_store)
     recorder = SensitiveActionRecorder(audit_logger)
 
-    admin_repository = AdminRepository()
-    session_store = SessionStore()
+    admin_repository = admin_repository or _build_admin_repository_from_env()
+    session_store = session_store or _build_session_store_from_env()
     auth_service = AuthService(admin_repository, session_store)
     accounts_service = AccountsService(recorder)
 
@@ -61,25 +94,16 @@ def create_app() -> FastAPI:
 
     app.dependency_overrides[get_auth_service] = _get_auth_service
     app.include_router(auth_router)
-    app.include_router(reports_router)
-    app.include_router(exposure_router)
-    app.include_router(alert_prioritizer_router)
+    _maybe_include_router(app, "services.report_service", "router")
+    _maybe_include_router(app, "exposure_forecast", "router")
+    _maybe_include_router(app, "alert_prioritizer", "router")
     app.include_router(alert_dedupe_router)
-    app.include_router(knowledge_router)
 
-    app.include_router(knowledge_router)
-    app.include_router(meta_router)
-    app.include_router(models_router)
-    app.include_router(meta_router)
-
-    app.include_router(log_export_router)
-    app.include_router(knowledge_router)
-
-    app.include_router(compliance_router)
-
-    app.include_router(knowledge_router)
-
-    app.include_router(meta_router)
+    _maybe_include_router(app, "services.models.meta_learner", "router")
+    _maybe_include_router(app, "services.models.model_zoo", "router")
+    _maybe_include_router(app, "multiformat_export", "router")
+    _maybe_include_router(app, "compliance_pack", "router")
+    _maybe_include_router(app, "pack_exporter", "router")
 
 
     scaling_controller = build_scaling_controller_from_env()

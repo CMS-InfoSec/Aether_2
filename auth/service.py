@@ -5,42 +5,18 @@ import base64
 import hashlib
 import hmac
 
-import logging
-import secrets
+import os
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional, Set
+import json
+import logging
+from typing import Dict, Optional, Protocol, Set, runtime_checkable
 
 import pyotp
 
-from prometheus_client import Counter
-
-from metrics import _REGISTRY
-from shared.correlation import get_correlation_id
-
 
 logger = logging.getLogger(__name__)
-
-
-_LOGIN_SUCCESS_COUNTER = Counter(
-    "auth_login_success_total",
-    "Total number of successful administrator login attempts.",
-    registry=_REGISTRY,
-)
-
-_LOGIN_FAILURE_COUNTER = Counter(
-    "auth_login_failure_total",
-    "Total number of failed administrator login attempts by reason.",
-    ["reason"],
-    registry=_REGISTRY,
-)
-
-_MFA_DENIED_COUNTER = Counter(
-    "auth_mfa_denied_total",
-    "Total number of administrator logins denied due to MFA failure.",
-    registry=_REGISTRY,
-)
 
 
 
@@ -53,21 +29,20 @@ class AdminAccount:
     allowed_ips: Optional[Set[str]] = None
 
 
-_ARGON2_HASHER = argon2.using(type="ID")
 
-try:
-    from secrets import token_urlsafe as _token_urlsafe
-except (ImportError, AttributeError):  # pragma: no cover - defensive fallback
-    _token_urlsafe = None
+@runtime_checkable
+class AdminRepositoryProtocol(Protocol):
+    """Minimal interface for persisting administrator accounts."""
 
+    def add(self, admin: AdminAccount) -> None:  # pragma: no cover - Protocol definition
+        ...
 
-def _generate_session_token() -> str:
-    if _token_urlsafe is not None:
-        return _token_urlsafe(32)
-    return base64.urlsafe_b64encode(os.urandom(32)).decode("ascii").rstrip("=")
+    def get_by_email(self, email: str) -> Optional[AdminAccount]:  # pragma: no cover - Protocol definition
+        ...
 
 
-class AdminRepository:
+class InMemoryAdminRepository(AdminRepositoryProtocol):
+
     """Simple in-memory repository for administrator accounts."""
 
     def __init__(self) -> None:
@@ -92,8 +67,24 @@ class Session:
         return datetime.now(timezone.utc) < self.expires_at
 
 
-class SessionStore:
-    """Tracks authenticated admin sessions."""
+@runtime_checkable
+class SessionStoreProtocol(Protocol):
+    """Abstraction for storing login sessions."""
+
+    def create(self, admin_id: str) -> Session:  # pragma: no cover - Protocol definition
+        ...
+
+    def get(self, token: str) -> Optional[Session]:  # pragma: no cover - Protocol definition
+        ...
+
+
+def _generate_session_token() -> str:
+    raw = os.urandom(32)
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+class InMemorySessionStore(SessionStoreProtocol):
+    """Tracks authenticated admin sessions in memory."""
 
     def __init__(self, ttl_minutes: int = 60) -> None:
         self._sessions: Dict[str, Session] = {}
@@ -119,10 +110,162 @@ class SessionStore:
         return session
 
 
+class PostgresAdminRepository(AdminRepositoryProtocol):
+    """PostgreSQL-backed implementation of the admin repository."""
+
+    def __init__(self, dsn: str, *, psycopg_module=None) -> None:
+        if psycopg_module is None:  # pragma: no cover - executed in production
+            import psycopg
+
+            psycopg_module = psycopg
+
+        self._dsn = dsn
+        self._psycopg = psycopg_module
+        self._ensure_schema()
+
+    def _connect(self):
+        return self._psycopg.connect(self._dsn)
+
+    def _ensure_schema(self) -> None:
+        try:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS admin_accounts (
+                            email TEXT PRIMARY KEY,
+                            admin_id TEXT NOT NULL,
+                            password_hash TEXT NOT NULL,
+                            mfa_secret TEXT NOT NULL,
+                            allowed_ips TEXT
+                        )
+                        """
+                    )
+                conn.commit()
+        except Exception:  # pragma: no cover - defensive logging for production observability
+            logger.exception("Failed to ensure admin account schema is present")
+            raise
+
+    def add(self, admin: AdminAccount) -> None:
+        allowed_ips = None
+        if admin.allowed_ips:
+            allowed_ips = json.dumps(sorted(admin.allowed_ips))
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO admin_accounts (email, admin_id, password_hash, mfa_secret, allowed_ips)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (email) DO UPDATE
+                    SET admin_id = EXCLUDED.admin_id,
+                        password_hash = EXCLUDED.password_hash,
+                        mfa_secret = EXCLUDED.mfa_secret,
+                        allowed_ips = EXCLUDED.allowed_ips
+                    """,
+                    (
+                        admin.email,
+                        admin.admin_id,
+                        admin.password_hash,
+                        admin.mfa_secret,
+                        allowed_ips,
+                    ),
+                )
+            conn.commit()
+
+    def get_by_email(self, email: str) -> Optional[AdminAccount]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT email, admin_id, password_hash, mfa_secret, allowed_ips
+                    FROM admin_accounts
+                    WHERE email = %s
+                    LIMIT 1
+                    """,
+                    (email,),
+                )
+                row = cur.fetchone()
+        if not row:
+            return None
+        allowed_ips_raw = row[4]
+        allowed_ips: Optional[Set[str]]
+        if allowed_ips_raw:
+            allowed_ips = set(json.loads(allowed_ips_raw))
+        else:
+            allowed_ips = None
+        return AdminAccount(
+            admin_id=row[1],
+            email=row[0],
+            password_hash=row[2],
+            mfa_secret=row[3],
+            allowed_ips=allowed_ips,
+        )
+
+
+class RedisSessionStore(SessionStoreProtocol):
+    """Redis-backed implementation for persistent sessions."""
+
+    def __init__(self, redis_client, ttl_minutes: int = 60) -> None:
+        self._redis = redis_client
+        self._ttl = timedelta(minutes=ttl_minutes)
+
+    def create(self, admin_id: str) -> Session:
+        now = datetime.now(timezone.utc)
+        token = _generate_session_token()
+        expires_at = now + self._ttl
+        payload = {
+            "token": token,
+            "admin_id": admin_id,
+            "created_at": now.isoformat(),
+            "expires_at": expires_at.isoformat(),
+        }
+        serialized = json.dumps(payload)
+        ttl_seconds = int(self._ttl.total_seconds())
+        self._redis.setex(token, ttl_seconds, serialized)
+        return Session(
+            token=token,
+            admin_id=admin_id,
+            created_at=now,
+            expires_at=expires_at,
+        )
+
+    def get(self, token: str) -> Optional[Session]:
+        data = self._redis.get(token)
+        if data is None:
+            return None
+        if isinstance(data, bytes):
+            data = data.decode("utf-8")
+        payload = json.loads(data)
+        created_at = datetime.fromisoformat(payload["created_at"])
+        expires_at = datetime.fromisoformat(payload["expires_at"])
+        session = Session(
+            token=payload["token"],
+            admin_id=payload["admin_id"],
+            created_at=created_at,
+            expires_at=expires_at,
+        )
+        if not session.is_active:
+            try:
+                self._redis.delete(token)
+            except AttributeError:  # pragma: no cover - fall back for minimal stubs
+                pass
+            return None
+        return session
+
+
+# Backwards-compatible aliases for legacy imports
+AdminRepository = InMemoryAdminRepository
+SessionStore = InMemorySessionStore
+
+
 class AuthService:
     """Authenticates admins and enforces MFA and IP allow-listing."""
 
-    def __init__(self, repository: AdminRepository, sessions: SessionStore) -> None:
+    def __init__(
+        self,
+        repository: AdminRepositoryProtocol,
+        sessions: SessionStoreProtocol,
+    ) -> None:
         self._repository = repository
         self._sessions = sessions
 
@@ -231,8 +374,14 @@ def hash_password(password: str) -> str:
 
 __all__ = [
     "AdminAccount",
+    "AdminRepositoryProtocol",
+    "InMemoryAdminRepository",
+    "PostgresAdminRepository",
     "AdminRepository",
     "Session",
+    "SessionStoreProtocol",
+    "InMemorySessionStore",
+    "RedisSessionStore",
     "SessionStore",
     "AuthService",
     "hash_password",
