@@ -44,7 +44,6 @@ encoder to avoid adding new packages to the environment.
 """
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import os
@@ -64,6 +63,8 @@ from sqlalchemy import Boolean, Column, DateTime, String, create_engine
 from sqlalchemy.orm import Session as OrmSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
+
+from services.auth.jwt_tokens import create_jwt
 
 
 logger = logging.getLogger("auth_service")
@@ -280,6 +281,7 @@ class MFAVerifier:
 # ---------------------------------------------------------------------------
 # JWT handling
 # ---------------------------------------------------------------------------
+
 
 
 def _b64url(data: bytes) -> str:
