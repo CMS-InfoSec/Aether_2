@@ -13,6 +13,13 @@ from .startup_manager import (
     register as register_startup_manager,
     router as startup_router,
 )
+from .cache_warmer import (
+    CacheWarmer,
+    CacheWarmupReport,
+    ModuleWarmupResult,
+    register as register_cache_warmer,
+    router as warmup_router,
+)
 
 __all__ = [
 
@@ -20,7 +27,12 @@ __all__ = [
     "TradingSequencer",
     "StartupManager",
     "StartupMode",
+    "CacheWarmer",
+    "CacheWarmupReport",
+    "ModuleWarmupResult",
     "register_startup_manager",
+    "register_cache_warmer",
     "startup_router",
+    "warmup_router",
 
 ]
