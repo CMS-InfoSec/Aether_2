@@ -30,7 +30,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any, Iterable, Mapping, MutableMapping, Sequence
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import Column, DateTime, Float, MetaData, String, create_engine, text
 from sqlalchemy.engine import Engine
@@ -38,8 +38,19 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from services.common.security import require_admin_account
+
+try:  # pragma: no cover - optional audit dependency
+    from common.utils.audit_logger import hash_ip, log_audit
+except Exception:  # pragma: no cover - degrade gracefully
+    log_audit = None  # type: ignore[assignment]
+
+    def hash_ip(_: str | None) -> str | None:  # type: ignore[override]
+        return None
+
 
 LOGGER = logging.getLogger(__name__)
+AUDIT_LOGGER = logging.getLogger("tca.audit")
 
 
 DEFAULT_DATABASE_URL = "sqlite:///./tca.db"
@@ -103,6 +114,35 @@ class TCAReport(Base):
 
 
 Base.metadata.create_all(bind=ENGINE)
+
+
+def _audit_access(
+    request: Request,
+    actor: str,
+    *,
+    action: str,
+    entity: str,
+    metadata: Mapping[str, Any] | None = None,
+) -> None:
+    """Record audit information for report access using the verified identity."""
+
+    if log_audit is None:
+        return
+
+    try:
+        ip_address = request.client.host if request.client else None
+        log_audit(
+            actor=actor,
+            action=action,
+            entity=entity,
+            before={},
+            after=dict(metadata or {}),
+            ip_hash=hash_ip(ip_address),
+        )
+    except Exception:  # pragma: no cover - defensive best effort
+        AUDIT_LOGGER.exception(
+            "Failed to write audit log for action=%s entity=%s", action, entity
+        )
 
 
 def _ensure_datetime(value: datetime | None) -> datetime | None:
@@ -708,7 +748,11 @@ def _build_report_response(
 
 
 @app.get("/tca/trade", response_model=TradeReportModel)
-def get_trade_report(trade_id: str = Query(..., description="Unique identifier for the trade/order")):
+def get_trade_report(
+    request: Request,
+    trade_id: str = Query(..., description="Unique identifier for the trade/order"),
+    actor_account: str = Depends(require_admin_account),
+):
     with SessionLocal() as session:
         try:
             rows = _fetch_trade_rows(session, trade_id)
@@ -756,13 +800,25 @@ def get_trade_report(trade_id: str = Query(..., description="Unique identifier f
                 for fill in fills
             ],
         )
+        _audit_access(
+            request,
+            actor_account,
+            action="tca.trade.report",
+            entity=str(order_info["trade_id"]),
+            metadata={
+                "account_id": str(order_info["account_id"]),
+                "market": str(order_info["market"]),
+            },
+        )
         return response
 
 
 @app.get("/tca/summary", response_model=DailySummaryModel)
 def get_daily_summary(
+    request: Request,
     account_id: str = Query(..., description="Account identifier"),
     date_str: str | None = Query(None, alias="date", description="Trading day in ISO format"),
+    actor_account: str = Depends(require_admin_account),
 ):
     target_date = date.fromisoformat(date_str) if date_str else datetime.now(UTC).date()
     start, end = _daterange_bounds(target_date)
@@ -773,14 +829,23 @@ def get_daily_summary(
         except SQLAlchemyError as exc:  # pragma: no cover - defensive guard
             LOGGER.exception("Failed to compute TCA summary for account=%s", account_id)
             raise HTTPException(status_code=500, detail="Database error") from exc
+    _audit_access(
+        request,
+        actor_account,
+        action="tca.summary",
+        entity=f"{account_id}:{target_date.isoformat()}",
+        metadata={"account_id": account_id, "date": target_date.isoformat()},
+    )
     return summary
 
 
 @app.get("/tca/report", response_model=TCAReportModel)
 def get_tca_report(
+    request: Request,
     account_id: str = Query(..., description="Account identifier"),
     symbol: str = Query(..., description="Market or symbol identifier"),
     date_str: str | None = Query(None, alias="date", description="Trading day in ISO format"),
+    actor_account: str = Depends(require_admin_account),
 ):
     target_date = date.fromisoformat(date_str) if date_str else datetime.now(UTC).date()
     start, end = _daterange_bounds(target_date)
@@ -824,12 +889,25 @@ def get_tca_report(
             )
             raise HTTPException(status_code=500, detail="Database error") from exc
 
-    return _build_report_response(
+    response = _build_report_response(
         account_id=account_id,
         symbol=symbol,
         target_date=target_date,
         metrics=metrics,
     )
+    _audit_access(
+        request,
+        actor_account,
+        action="tca.report",
+        entity=f"{account_id}:{symbol}:{target_date.isoformat()}",
+        metadata={
+            "account_id": account_id,
+            "symbol": symbol,
+            "date": target_date.isoformat(),
+            "trade_count": metrics.trade_count,
+        },
+    )
+    return response
 
 
 def generate_daily_reports(target_date: date | None = None) -> list[TCAReportModel]:
