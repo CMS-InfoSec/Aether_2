@@ -137,6 +137,20 @@ _oms_submit_latency = Histogram(
     buckets=(5, 10, 25, 50, 100, 250, 500, 1000, float("inf")),
 )
 
+_late_events_total = Counter(
+    "late_events_total",
+    "Number of market data events that exceeded the lateness watermark.",
+    ["service", "stream"],
+    registry=_REGISTRY,
+)
+
+_reorder_buffer_depth = Gauge(
+    "reorder_buffer_depth",
+    "Current depth of the event reordering buffer.",
+    ["service", "stream"],
+    registry=_REGISTRY,
+)
+
 _METRICS: Dict[str, Counter | Gauge | Histogram] = {
     "trades_submitted_total": _trades_submitted_total,
     "trades_rejected_total": _trades_rejected_total,
@@ -153,6 +167,8 @@ _METRICS: Dict[str, Counter | Gauge | Histogram] = {
     "policy_inference_latency": _policy_inference_latency,
     "risk_validation_latency": _risk_validation_latency,
     "oms_submit_latency": _oms_submit_latency,
+    "late_events_total": _late_events_total,
+    "reorder_buffer_depth": _reorder_buffer_depth,
 }
 
 _INITIALISED = False
@@ -248,6 +264,8 @@ def init_metrics(service_name: str = "service") -> Dict[str, Counter | Gauge | H
     _policy_inference_latency.labels(service=_service_value())
     _risk_validation_latency.labels(service=_service_value())
     _oms_submit_latency.labels(service=_service_value(), transport="unknown")
+    _late_events_total.labels(service=_service_value(), stream="unknown")
+    _reorder_buffer_depth.labels(service=_service_value(), stream="unknown").set(0)
 
     return _METRICS
 
@@ -287,6 +305,25 @@ def increment_trades_rejected(
     _trades_rejected_total.labels(
         service=_service_value(service), reason=_normalised(reason, "unknown")
     ).inc(amount)
+
+
+def increment_late_events(
+    stream: str,
+    amount: float = 1.0,
+    *,
+    service: Optional[str] = None,
+) -> None:
+    _late_events_total.labels(
+        service=_service_value(service), stream=_normalised(stream, "unknown")
+    ).inc(amount)
+
+
+def set_reorder_buffer_depth(
+    stream: str, depth: int, *, service: Optional[str] = None
+) -> None:
+    _reorder_buffer_depth.labels(
+        service=_service_value(service), stream=_normalised(stream, "unknown")
+    ).set(depth)
 
 
 def increment_trade_rejection(
