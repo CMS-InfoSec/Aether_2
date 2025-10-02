@@ -9,7 +9,7 @@ when MLflow is not available or when invalid parameters are supplied.
 from __future__ import annotations
 
 import os
-from typing import List, Optional
+from typing import List, Mapping, Optional
 
 # Provide stub configuration values so local development environments have a
 # deterministic tracking location without requiring additional setup.
@@ -60,13 +60,20 @@ def _normalize_stage(stage: str) -> str:
     return normalized
 
 
-def register_model(run_id: str, name: str, stage: str) -> ModelVersion:
+def register_model(
+    run_id: str,
+    name: str,
+    stage: str,
+    *,
+    tags: Optional[Mapping[str, str]] = None,
+) -> ModelVersion:
     """Register a model for the provided run and promote it to the desired stage.
 
     Args:
         run_id: Identifier of the MLflow run that produced the model artifact.
         name: Name of the registered model.
         stage: Desired stage for the model (staging, canary, or prod).
+        tags: Optional key/value metadata to attach to the resulting model version.
 
     Returns:
         The :class:`mlflow.entities.model_registry.ModelVersion` that was
@@ -95,6 +102,14 @@ def register_model(run_id: str, name: str, stage: str) -> ModelVersion:
             stage=target_stage,
             archive_existing_versions=False,
         )
+        if tags:
+            for key, value in tags.items():
+                client.set_model_version_tag(
+                    name=name,
+                    version=model_version.version,
+                    key=key,
+                    value=str(value),
+                )
         return model_version
     except MlflowException as exc:  # pragma: no cover - network/remote failure.
         raise RuntimeError(
