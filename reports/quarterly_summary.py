@@ -9,11 +9,15 @@ import logging
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence
 
 from reports.storage import ArtifactStorage, TimescaleSession, build_storage_from_env
 
 LOGGER = logging.getLogger(__name__)
+
+DECIMAL_ZERO = Decimal("0")
+DECIMAL_QUANTIZE_UNIT = Decimal("0.0000000001")
 
 ORDER_QUERY = """
 SELECT
@@ -53,9 +57,23 @@ class QuarterlyAccountSummary:
     instrument: str
     order_count: int
     fill_count: int
-    submitted_qty: float
-    notional: float
+    submitted_qty: Decimal
+    notional: Decimal
     audit_events: int
+
+
+def _to_decimal(value: Any) -> Decimal:
+    if isinstance(value, Decimal):
+        return value
+    if value is None:
+        return DECIMAL_ZERO
+    if isinstance(value, (int,)):
+        return Decimal(value)
+    return Decimal(str(value))
+
+
+def _format_decimal(value: Decimal) -> str:
+    return str(value.quantize(DECIMAL_QUANTIZE_UNIT, rounding=ROUND_HALF_UP))
 
 
 class ResultSetAdapter:
@@ -82,8 +100,8 @@ def merge_quarterly_metrics(
         lambda: {
             "order_count": 0,
             "fill_count": 0,
-            "submitted_qty": 0.0,
-            "notional": 0.0,
+            "submitted_qty": DECIMAL_ZERO,
+            "notional": DECIMAL_ZERO,
             "audit_events": 0,
         }
     )
@@ -92,13 +110,13 @@ def merge_quarterly_metrics(
         key = (str(order["account_id"]), str(order["instrument"]))
         bucket = aggregates[key]
         bucket["order_count"] += int(order.get("order_count", 0))
-        bucket["submitted_qty"] += float(order.get("submitted_qty", 0.0))
+        bucket["submitted_qty"] += _to_decimal(order.get("submitted_qty", 0))
 
     for fill in fills:
         key = (str(fill["account_id"]), str(fill["instrument"]))
         bucket = aggregates[key]
         bucket["fill_count"] += int(fill.get("fill_count", 0))
-        bucket["notional"] += float(fill.get("notional", 0.0))
+        bucket["notional"] += _to_decimal(fill.get("notional", 0))
 
     audit_counts: Dict[str, int] = defaultdict(int)
     for audit in audits:
@@ -153,8 +171,8 @@ def _serialize_csv(rows: Sequence[QuarterlyAccountSummary]) -> bytes:
                 row.instrument,
                 row.order_count,
                 row.fill_count,
-                f"{row.submitted_qty:.10f}",
-                f"{row.notional:.10f}",
+                _format_decimal(row.submitted_qty),
+                _format_decimal(row.notional),
                 row.audit_events,
             ]
         )
@@ -167,7 +185,20 @@ def _serialize_parquet(rows: Sequence[QuarterlyAccountSummary]) -> bytes:
     except Exception as exc:  # pragma: no cover
         raise RuntimeError("pandas is required for Parquet serialization") from exc
 
-    frame = pd.DataFrame([row.__dict__ for row in rows])
+    frame = pd.DataFrame(
+        [
+            {
+                "account_id": row.account_id,
+                "instrument": row.instrument,
+                "order_count": row.order_count,
+                "fill_count": row.fill_count,
+                "submitted_qty": _format_decimal(row.submitted_qty),
+                "notional": _format_decimal(row.notional),
+                "audit_events": row.audit_events,
+            }
+            for row in rows
+        ]
+    )
     buffer = io.BytesIO()
     frame.to_parquet(buffer, index=False)
     return buffer.getvalue()

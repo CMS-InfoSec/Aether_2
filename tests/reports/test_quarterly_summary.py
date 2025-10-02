@@ -3,12 +3,17 @@ from __future__ import annotations
 import csv
 import json
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping
 
 import pytest
 
-from reports.quarterly_summary import AUDIT_QUERY, generate_quarterly_summary
+from reports.quarterly_summary import (
+    AUDIT_QUERY,
+    generate_quarterly_summary,
+    merge_quarterly_metrics,
+)
 from reports.storage import ArtifactStorage
 
 
@@ -236,6 +241,45 @@ def test_generate_quarterly_summary_outputs_expected_metrics(
     assert int(beta_eth["audit_events"]) == 1
 
     assert quarterly_session.audit_entries, "expected audit entries to be recorded"
+
+
+def test_merge_quarterly_metrics_preserves_decimal_precision() -> None:
+    orders = [
+        {
+            "account_id": "acct-1",
+            "instrument": "BTC-USD",
+            "order_count": 1,
+            "submitted_qty": Decimal("0.1"),
+        },
+        {
+            "account_id": "acct-1",
+            "instrument": "BTC-USD",
+            "order_count": 1,
+            "submitted_qty": Decimal("0.2"),
+        },
+    ]
+    fills = [
+        {
+            "account_id": "acct-1",
+            "instrument": "BTC-USD",
+            "fill_count": 1,
+            "notional": Decimal("0.03"),
+        },
+        {
+            "account_id": "acct-1",
+            "instrument": "BTC-USD",
+            "fill_count": 1,
+            "notional": Decimal("0.07"),
+        },
+    ]
+    audits: List[Mapping[str, Any]] = []
+
+    summaries = merge_quarterly_metrics(orders, fills, audits)
+
+    assert len(summaries) == 1
+    summary = summaries[0]
+    assert summary.submitted_qty == Decimal("0.3")
+    assert summary.notional == Decimal("0.10")
 
 
 def test_audit_query_returns_actor_created_at_rows(
