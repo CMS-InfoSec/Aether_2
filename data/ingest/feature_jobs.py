@@ -30,9 +30,11 @@ if feast_spec is not None:  # pragma: no cover - optional dependency
 else:  # pragma: no cover - optional dependency
     FeatureStore = None  # type: ignore
 
-from sqlalchemy import Column, DateTime, Float, MetaData, String, Table, create_engine
+from sqlalchemy import Column, DateTime, Float, MetaData, String, Table, Text, create_engine
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Engine
+
+from services.ingest import EventOrderingBuffer, OrderedEvent
 
 LOGGER = logging.getLogger(__name__)
 
@@ -47,6 +49,7 @@ FEATURE_VIEW_NAME = os.getenv(
 )
 ROLLING_WINDOW_SECONDS = int(os.getenv("ROLLING_WINDOW_SECONDS", "300"))
 BOOK_LEVELS = int(os.getenv("BOOK_LEVELS", "5"))
+MAX_EVENT_LATENESS_MS = int(os.getenv("MAX_EVENT_LATENESS_MS", "5000"))
 
 
 @dataclass
@@ -149,6 +152,25 @@ microstructure_table = Table(
 )
 
 
+late_events_table = Table(
+    "market_data_late_events",
+    metadata,
+    Column("stream", String, primary_key=True),
+    Column("symbol", String, primary_key=True),
+    Column("event_timestamp", DateTime(timezone=True), primary_key=True),
+    Column("arrival_timestamp", DateTime(timezone=True), primary_key=True),
+    Column("payload", Text, nullable=False),
+)
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, dt.datetime):
+        return value.isoformat()
+    if isinstance(value, dt.date):
+        return value.isoformat()
+    return value
+
+
 class FeatureWriter:
     """Persists engineered features to TimescaleDB and Redis via Feast."""
 
@@ -162,7 +184,9 @@ class FeatureWriter:
         self.engine = engine
         self.store = store
         self.feature_view = feature_view
-        metadata.create_all(engine, tables=[microstructure_table])
+        metadata.create_all(
+            engine, tables=[microstructure_table, late_events_table]
+        )
 
     def persist(
         self, *, symbol: str, event_ts: dt.datetime, feature_payload: Mapping[str, float]
@@ -229,6 +253,24 @@ class FeatureWriter:
         dataframe = pd.DataFrame([payload])
         self.store.write_to_online_store(self.feature_view, dataframe)
 
+    def record_late_event(self, stream: str, event: OrderedEvent) -> None:
+        symbol = str(event.payload.get("symbol", "UNKNOWN")).upper()
+        payload_copy = dict(event.payload)
+        payload_copy["late"] = True
+        payload_copy["lateness_ms"] = event.lateness_ms
+        payload_copy["stream"] = stream
+        serialised = json.dumps(payload_copy, default=_json_default)
+        stmt = pg_insert(late_events_table).values(
+            stream=stream,
+            symbol=symbol,
+            event_timestamp=event.event_ts,
+            arrival_timestamp=event.arrival_ts,
+            payload=serialised,
+        )
+        stmt = stmt.on_conflict_do_nothing()
+        with self.engine.begin() as connection:
+            connection.execute(stmt)
+
 
 class MarketFeatureJob:
     """Consumes Kafka topics and emits engineered features."""
@@ -243,6 +285,7 @@ class MarketFeatureJob:
         window_seconds: int = ROLLING_WINDOW_SECONDS,
         book_levels: int = BOOK_LEVELS,
         engine: Engine | None = None,
+        max_lateness_ms: int = MAX_EVENT_LATENESS_MS,
     ) -> None:
         self.bootstrap_servers = bootstrap_servers
         self.group_id = group_id
@@ -252,6 +295,7 @@ class MarketFeatureJob:
         self.book_levels = book_levels
         self.state: MutableMapping[str, FeatureState] = {}
         self.engine = engine or create_engine(DATABASE_URL)
+        self.max_lateness_ms = max_lateness_ms
         self.store = (
             FeatureStore(repo_path=repo_path)
             if FeatureStore is not None
@@ -262,6 +306,22 @@ class MarketFeatureJob:
             store=self.store,
             feature_view=self.feature_view,
         )
+        self.service_name = "feature_jobs"
+        self.trade_ordering = EventOrderingBuffer(
+            stream_name="md.trades",
+            max_lateness_ms=self.max_lateness_ms,
+            timestamp_getter=self._timestamp_from_payload,
+            key_getter=lambda payload: str(payload.get("symbol", "")).upper(),
+            service_name=self.service_name,
+        )
+        self.book_ordering = EventOrderingBuffer(
+            stream_name="md.book",
+            max_lateness_ms=self.max_lateness_ms,
+            timestamp_getter=self._timestamp_from_payload,
+            key_getter=lambda payload: str(payload.get("symbol", "")).upper(),
+            service_name=self.service_name,
+        )
+        self._late_events: Deque[OrderedEvent] = deque()
 
     def _state_for(self, symbol: str) -> FeatureState:
         state = self.state.get(symbol)
@@ -270,20 +330,25 @@ class MarketFeatureJob:
             self.state[symbol] = state
         return state
 
-    def process_trade(self, payload: Mapping[str, Any]) -> None:
-        symbol = payload["symbol"].upper()
+    def _timestamp_from_payload(self, payload: Mapping[str, Any]) -> dt.datetime:
+        return self._parse_timestamp(payload.get("event_ts") or payload.get("timestamp"))
+
+    def process_trade(self, event: OrderedEvent) -> None:
+        payload = event.payload
+        symbol = str(payload["symbol"]).upper()
         price = float(payload["price"])
         quantity = float(payload.get("quantity", payload.get("size", 0.0)))
-        timestamp = self._parse_timestamp(payload.get("event_ts") or payload.get("timestamp"))
+        timestamp = event.event_ts
         trade = TradeEvent(symbol=symbol, price=price, quantity=quantity, event_ts=timestamp)
         state = self._state_for(symbol)
         state.update_trade(trade)
         features = state.compute_features()
         self.writer.persist(symbol=symbol, event_ts=timestamp, feature_payload=features)
 
-    def process_book(self, payload: Mapping[str, Any]) -> None:
-        symbol = payload["symbol"].upper()
-        timestamp = self._parse_timestamp(payload.get("event_ts") or payload.get("timestamp"))
+    def process_book(self, event: OrderedEvent) -> None:
+        payload = event.payload
+        symbol = str(payload["symbol"]).upper()
+        timestamp = event.event_ts
         bids = self._parse_levels(payload.get("bids", []))
         asks = self._parse_levels(payload.get("asks", []))
         book = BookEvent(symbol=symbol, bids=bids, asks=asks, event_ts=timestamp)
@@ -291,6 +356,32 @@ class MarketFeatureJob:
         state.update_book(book)
         features = state.compute_features()
         self.writer.persist(symbol=symbol, event_ts=timestamp, feature_payload=features)
+
+    def _handle_late_trade(self, event: OrderedEvent) -> None:
+        self._record_late_event(event)
+
+    def _handle_late_book(self, event: OrderedEvent) -> None:
+        self._record_late_event(event)
+
+    def _record_late_event(self, event: OrderedEvent) -> None:
+        payload_symbol = str(event.payload.get("symbol", "UNKNOWN")).upper()
+        LOGGER.warning(
+            "Late event routed to compensating path",
+            extra={
+                "stream": event.stream,
+                "symbol": payload_symbol,
+                "event_ts": event.event_ts.isoformat(),
+                "lateness_ms": event.lateness_ms,
+            },
+        )
+        self.writer.record_late_event(event.stream, event)
+        self._late_events.append(event)
+
+    def _flush_ordering_buffers(self) -> None:
+        for event in self.trade_ordering.drain(force=True):
+            self.process_trade(event)
+        for event in self.book_ordering.drain(force=True):
+            self.process_book(event)
 
     async def run(self) -> None:
         if AIOKafkaConsumer is None:
@@ -312,13 +403,22 @@ class MarketFeatureJob:
             async for message in consumer:
                 try:
                     if message.topic == "md.trades":
-                        self.process_trade(message.value)
+                        ready, late = self.trade_ordering.add(message.value)
+                        for event in ready:
+                            self.process_trade(event)
+                        for event in late:
+                            self._handle_late_trade(event)
                     elif message.topic == "md.book":
-                        self.process_book(message.value)
+                        ready, late = self.book_ordering.add(message.value)
+                        for event in ready:
+                            self.process_book(event)
+                        for event in late:
+                            self._handle_late_book(event)
                     await consumer.commit()
                 except Exception as exc:  # pragma: no cover - defensive logging
                     LOGGER.exception("Failed to process message", exc_info=exc)
         finally:
+            self._flush_ordering_buffers()
             await consumer.stop()
             LOGGER.info("Market feature job stopped")
 
@@ -393,6 +493,12 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     run_parser.add_argument(
         "--group", default=KAFKA_CONSUMER_GROUP, help="Kafka consumer group"
     )
+    run_parser.add_argument(
+        "--max-lateness-ms",
+        type=int,
+        default=MAX_EVENT_LATENESS_MS,
+        help="Maximum tolerated event lateness before routing to compensation",
+    )
 
     register_parser = subparsers.add_parser(
         "register", help="Register feature definitions with Feast"
@@ -419,6 +525,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
             bootstrap_servers=args.bootstrap,
             group_id=args.group,
             repo_path=args.repo,
+            max_lateness_ms=args.max_lateness_ms,
         )
         asyncio.run(job.run())
     elif args.command == "register":
