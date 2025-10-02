@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Dict, List
+from pathlib import Path
+from typing import Any, AsyncIterator, Dict, Iterable, List
 
 import pytest
 
@@ -25,6 +28,7 @@ from metrics import (
     set_pipeline_latency,
 )
 from common.schemas.contracts import IntentEvent
+from common.utils import audit_logger
 from sequencer import PipelineHistory, SequencerPipeline, Stage, StageResult
 from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
 from services.common.schemas import PolicyDecisionResponse
@@ -620,4 +624,301 @@ async def test_trading_sequencer_loop_preserves_correlation_and_audit(
     assert audit_entries
     assert audit_entries[0].action == "pnl.recorded"
     assert audit_entries[0].correlation_id == result.correlation_id
+
+
+@pytest.mark.integration
+def test_policy_risk_oms_flow_emits_hashed_audit_and_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    kraken_mock_server: MockKrakenServer,
+) -> None:
+    """Verify the full policy → risk → OMS pipeline with audit and metrics side effects."""
+
+    TimescaleAdapter.reset()
+    KafkaNATSAdapter.reset()
+
+    metrics_module.init_metrics("sequencer")
+
+    account_id = "company"
+    normalized_account = account_id.lower()
+    symbol = "BTC-USD"
+    normalized_symbol = symbol.lower()
+
+    class _AuditStub:
+        def __init__(self) -> None:
+            self.statements: List[Dict[str, Any]] = []
+
+        class _Connection:
+            def __init__(self, outer: "_AuditStub") -> None:
+                self._outer = outer
+                self._cursor = _AuditStub._Cursor(self._outer)
+
+            def __enter__(self) -> "_AuditStub._Connection":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> bool:  # noqa: ANN001
+                return False
+
+            def cursor(self) -> "_AuditStub._Cursor":
+                return self._cursor
+
+        class _Cursor:
+            def __init__(self, outer: "_AuditStub") -> None:
+                self._outer = outer
+
+            def __enter__(self) -> "_AuditStub._Cursor":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> bool:  # noqa: ANN001
+                return False
+
+            def execute(self, query: str, params: Iterable[Any]) -> None:
+                self._outer.statements.append({"query": query, "params": list(params)})
+
+        def connect(self, dsn: str) -> "_AuditStub._Connection":  # noqa: D401 - interface stub
+            return _AuditStub._Connection(self)
+
+    audit_stub = _AuditStub()
+
+    audit_log_path = tmp_path / "audit_chain.log"
+    audit_state_path = tmp_path / "audit_chain_state.json"
+    monkeypatch.setenv("AUDIT_DATABASE_URL", "postgresql://audit:audit@localhost/audit")
+    monkeypatch.setenv("AUDIT_CHAIN_LOG", str(audit_log_path))
+    monkeypatch.setenv("AUDIT_CHAIN_STATE", str(audit_state_path))
+    monkeypatch.setattr(audit_logger, "psycopg", audit_stub)
+    monkeypatch.setattr(audit_logger, "_PSYCOPG_IMPORT_ERROR", None, raising=False)
+
+    policy_client = TestClient(policy_service.app)
+    risk_client = TestClient(risk_service.app)
+    fees_client = TestClient(fees_app)
+
+    confidence = factories.confidence(overall_confidence=0.94)
+    intent_stub = policy_service.Intent(
+        edge_bps=41.0,
+        confidence=confidence,
+        take_profit_bps=55.0,
+        stop_loss_bps=22.0,
+        selected_action="maker",
+        action_templates=list(factories.action_templates()),
+        approved=True,
+        reason=None,
+    )
+    monkeypatch.setattr(policy_service, "predict_intent", lambda **_: intent_stub)
+    policy_service.ENABLE_SHADOW_EXECUTION = False
+
+    async def fake_fetch_effective_fee(
+        account_id: str, symbol: str, liquidity: str, notional: float
+    ) -> float:
+        response = fees_client.get(
+            "/fees/effective",
+            params={
+                "pair": symbol,
+                "liquidity": liquidity,
+                "notional": f"{max(notional, 0.0):.8f}",
+            },
+            headers={"X-Account-ID": account_id},
+        )
+        response.raise_for_status()
+        return float(response.json()["bps"])
+
+    monkeypatch.setattr(policy_service, "_fetch_effective_fee", fake_fetch_effective_fee)
+
+    class _Limits:
+        def __init__(self) -> None:
+            self.account_id = account_id
+            self.max_daily_loss = 250_000.0
+            self.fee_budget = 50_000.0
+            self.max_nav_pct_per_trade = 0.35
+            self.notional_cap = 5_000_000.0
+            self.cooldown_minutes = 0
+
+    async def fake_evaluate(context: risk_service.RiskEvaluationContext) -> risk_service.RiskValidationResponse:
+        return risk_service.RiskValidationResponse(pass_=True, reasons=[])
+
+    monkeypatch.setattr(risk_service, "_load_account_limits", lambda _: _Limits())
+    monkeypatch.setattr(risk_service, "_evaluate", fake_evaluate)
+    monkeypatch.setattr(risk_service, "_refresh_usage_from_fills", lambda *_, **__: None)
+
+    async def policy_stage(payload: Dict[str, Any], ctx) -> StageResult:
+        intent = payload["intent"]
+        request_model = factories.policy_decision_request(
+            account_id=intent["account_id"],
+            order_id=intent["order_id"],
+            instrument=intent["instrument"],
+            side=intent["side"].upper(),
+            quantity=float(intent["quantity"]),
+            price=float(intent["price"]),
+            features=list(intent.get("features", [])),
+        )
+        response = await asyncio.to_thread(
+            policy_client.post,
+            "/policy/decide",
+            json=request_model.model_dump(mode="json"),
+            headers={"X-Account-ID": intent["account_id"]},
+        )
+        response.raise_for_status()
+        decision = PolicyDecisionResponse.model_validate(response.json())
+        artifact = decision.model_dump(mode="json")
+        new_payload = dict(payload)
+        new_payload["policy_decision"] = artifact
+        observe_policy_inference_latency(6.4)
+        return StageResult(payload=new_payload, artifact=artifact)
+
+    async def risk_stage(payload: Dict[str, Any], ctx) -> StageResult:
+        intent = payload["intent"]
+        trade_intent = risk_service.TradeIntent(
+            policy_id=intent["order_id"],
+            instrument_id=intent["instrument"],
+            side=intent["side"].lower(),
+            quantity=float(intent["quantity"]),
+            price=float(intent["price"]),
+        )
+        portfolio_state = risk_service.AccountPortfolioState(
+            net_asset_value=1_500_000.0,
+            notional_exposure=250_000.0,
+            realized_daily_loss=0.0,
+            fees_paid=0.0,
+        )
+        request_model = risk_service.RiskValidationRequest(
+            account_id=intent["account_id"],
+            intent=trade_intent,
+            portfolio_state=portfolio_state,
+        )
+        response = await asyncio.to_thread(
+            risk_client.post,
+            "/risk/validate",
+            json=request_model.model_dump(by_alias=True, mode="json"),
+            headers={"X-Account-ID": intent["account_id"]},
+        )
+        response.raise_for_status()
+        decision: Dict[str, Any] = response.json()
+        artifact = dict(decision)
+        new_payload = dict(payload)
+        new_payload["risk_validation"] = artifact
+        observe_risk_validation_latency(4.8)
+        return StageResult(payload=new_payload, artifact=artifact)
+
+    async def oms_stage(payload: Dict[str, Any], ctx) -> StageResult:
+        intent = payload["intent"]
+        response = await kraken_mock_server.add_order(
+            pair=intent["instrument"].replace("-", "/"),
+            side=intent["side"].lower(),
+            volume=float(intent["quantity"]),
+            price=float(intent["price"]),
+            ordertype="limit",
+            account=intent["account_id"],
+            userref=intent["order_id"],
+        )
+        order = response["order"]
+        fills = response.get("fills", [])
+        filled_qty = sum(float(fill.get("volume", 0.0)) for fill in fills) or float(intent["quantity"])
+        notional = sum(float(fill.get("price", 0.0)) * float(fill.get("volume", 0.0)) for fill in fills)
+        avg_price = notional / filled_qty if filled_qty and notional else float(intent["price"])
+        artifact = {
+            "accepted": True,
+            "client_order_id": order.get("order_id"),
+            "filled_qty": filled_qty,
+            "avg_price": avg_price,
+            "fills": fills,
+        }
+        new_payload = dict(payload)
+        new_payload["oms_result"] = artifact
+        set_oms_latency(11.2, account=normalized_account, symbol=normalized_symbol, transport="mock-kraken")
+        return StageResult(payload=new_payload, artifact=artifact)
+
+    history = PipelineHistory(capacity=8)
+    pipeline = SequencerPipeline(
+        stages=[
+            Stage(name="policy", handler=policy_stage),
+            Stage(name="risk", handler=risk_stage),
+            Stage(name="oms", handler=oms_stage),
+        ],
+        history=history,
+    )
+
+    intent_payload = {
+        "account_id": account_id,
+        "order_id": "INT-E2E-PIPELINE",
+        "instrument": symbol,
+        "side": "buy",
+        "quantity": 0.3,
+        "price": 30250.0,
+        "features": [0.15, 0.22, 0.31],
+    }
+
+    intent_metric_labels = {"service": "sequencer"}
+    prior_intent_count = metrics_module._REGISTRY.get_sample_value(
+        "trades_submitted_total", intent_metric_labels
+    ) or 0.0
+
+    oms_metric_labels = {
+        "service": "sequencer",
+        "account": normalized_account,
+        "symbol": normalized_symbol,
+        "transport": "mock-kraken",
+    }
+    prior_oms_latency = metrics_module._REGISTRY.get_sample_value(
+        "oms_latency_ms", oms_metric_labels
+    ) or 0.0
+
+    result = asyncio.run(pipeline.submit(intent_payload))
+
+    assert result.status == "success"
+    assert result.fill_event["filled_qty"] > 0
+    assert result.fill_event["avg_price"] > 0
+
+    pipeline_history = asyncio.run(history.snapshot())
+    assert len(pipeline_history) == 1
+
+    kafka_events = KafkaNATSAdapter(account_id=normalized_account).history()
+    topics = [event["topic"] for event in kafka_events]
+    assert topics == [
+        "sequencer.pipeline.start",
+        "sequencer.policy.start",
+        "sequencer.policy.complete",
+        "sequencer.risk.start",
+        "sequencer.risk.complete",
+        "sequencer.oms.start",
+        "sequencer.oms.complete",
+        "sequencer.fill.publish",
+        "sequencer.pipeline.complete",
+    ]
+
+    correlation_id = result.fill_event.get("correlation_id")
+    assert correlation_id
+    assert all(event["correlation_id"] == correlation_id for event in kafka_events)
+
+    audit_logger.log_audit(
+        actor="sequencer",
+        action="sequencer.fill",
+        entity=normalized_account,
+        before={"stage": "oms"},
+        after={"fill": result.fill_event},
+        ip_hash=audit_logger.hash_ip("127.0.0.1"),
+    )
+
+    assert audit_log_path.exists()
+    with audit_log_path.open("r", encoding="utf-8") as fh:
+        audit_entries = [json.loads(line) for line in fh if line.strip()]
+
+    assert audit_entries
+    latest_entry = audit_entries[-1]
+    canonical = audit_logger._canonical_payload(latest_entry)  # pylint: disable=protected-access
+    serialized = audit_logger._canonical_serialized(canonical)  # pylint: disable=protected-access
+    expected_hash = hashlib.sha256((latest_entry["prev_hash"] + serialized).encode("utf-8")).hexdigest()
+    assert latest_entry["hash"] == expected_hash
+
+    updated_intent_count = metrics_module._REGISTRY.get_sample_value(
+        "trades_submitted_total", intent_metric_labels
+    )
+    assert updated_intent_count is not None
+    assert updated_intent_count == pytest.approx(prior_intent_count + 1.0)
+
+    updated_oms_latency = metrics_module._REGISTRY.get_sample_value(
+        "oms_latency_ms", oms_metric_labels
+    )
+    assert updated_oms_latency is not None
+    if prior_oms_latency:
+        assert updated_oms_latency >= prior_oms_latency
+    assert updated_oms_latency == pytest.approx(11.2, rel=1e-3)
 
