@@ -1,0 +1,116 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  name: ml-train-workflow
+  labels:
+    workflows.argoproj.io/controller-instanceid: ml-platform
+spec:
+  entrypoint: run-train-pipeline
+  arguments:
+    parameters:
+      - name: symbols
+      - name: from
+      - name: to
+      - name: gran
+      - name: feature_version
+      - name: model
+      - name: curriculum
+      - name: label_horizon
+      - name: run_name
+      - name: auto_promotion
+        value: "false"
+  templates:
+    - name: run-train-pipeline
+      steps:
+        - - name: data-loader-coingecko
+            template: data-loader-coingecko
+        - - name: build-features
+            template: build-features
+        - - name: train-model
+            template: train-model
+        - - name: promote-run
+            template: promote-run
+            when: '{{workflow.parameters.auto_promotion}} == "true"'
+            arguments:
+              parameters:
+                - name: run-id
+                  value: "{{steps.train-model.outputs.parameters.run-id}}"
+    - name: data-loader-coingecko
+      container:
+        image: ghcr.io/aether/ml-runtime:latest
+        command: ["python", "-m", "services.coingecko_ingest"]
+        args:
+          - "--symbols"
+          - "{{workflow.parameters.symbols}}"
+          - "--from"
+          - "{{workflow.parameters.from}}"
+          - "--to"
+          - "{{workflow.parameters.to}}"
+          - "--granularity"
+          - "{{workflow.parameters.gran}}"
+      outputs:
+        artifacts:
+          - name: feature-ingest-log
+            path: /tmp/ingest.log
+    - name: build-features
+      container:
+        image: ghcr.io/aether/ml-runtime:latest
+        command: ["python", "-m", "ml.features.materialize"]
+        args:
+          - "--version"
+          - "{{workflow.parameters.feature_version}}"
+          - "--symbols"
+          - "{{workflow.parameters.symbols}}"
+          - "--from"
+          - "{{workflow.parameters.from}}"
+          - "--to"
+          - "{{workflow.parameters.to}}"
+          - "--label-horizon"
+          - "{{workflow.parameters.label_horizon}}"
+      outputs:
+        artifacts:
+          - name: feature-version
+            path: /artifacts/feature_version.txt
+    - name: train-model
+      container:
+        image: ghcr.io/aether/ml-runtime:latest
+        command: ["python", "-m", "ml.training.workflow"]
+        args:
+          - "--symbols"
+          - "{{workflow.parameters.symbols}}"
+          - "--feature-version"
+          - "{{workflow.parameters.feature_version}}"
+          - "--model"
+          - "{{workflow.parameters.model}}"
+          - "--curriculum"
+          - "{{workflow.parameters.curriculum}}"
+          - "--label-horizon"
+          - "{{workflow.parameters.label_horizon}}"
+          - "--run-name"
+          - "{{workflow.parameters.run_name}}"
+      outputs:
+        artifacts:
+          - name: training-metrics
+            path: /artifacts/metrics.json
+          - name: feature-version
+            path: /artifacts/feature_version.txt
+          - name: model-id
+            path: /artifacts/model_id.txt
+        parameters:
+          - name: run-id
+            valueFrom:
+              path: /artifacts/run_id.txt
+    - name: promote-run
+      inputs:
+        parameters:
+          - name: run-id
+      container:
+        image: curlimages/curl:8.5.0
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            set -euo pipefail
+            curl -sS -X POST \
+              -H 'Content-Type: application/json' \
+              -d '{"run_id": "{{inputs.parameters.run-id}}"}' \
+              http://model-service/ml/train/promote

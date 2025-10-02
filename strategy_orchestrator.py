@@ -11,19 +11,23 @@ UI.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from threading import RLock
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 import httpx
+
 from fastapi import Depends, FastAPI, HTTPException
+
 from pydantic import BaseModel, Field, PositiveFloat, constr
 from sqlalchemy import Boolean, Column, DateTime, Float, String, create_engine, func, select
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import NullPool
 
@@ -286,37 +290,128 @@ DEFAULT_STRATEGIES: List[tuple[str, str, float]] = [
 RISK_ENGINE_URL = os.getenv("RISK_ENGINE_URL", "http://localhost:8000")
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 
-Base.metadata.create_all(bind=ENGINE)
-ensure_signal_tables(ENGINE)
+REGISTRY: Optional[StrategyRegistry] = None
+SIGNAL_BUS: Optional[StrategySignalBus] = None
+INITIALIZATION_ERROR: Optional[Exception] = None
 
-REGISTRY = StrategyRegistry(
-    SessionLocal,
-    risk_engine_url=RISK_ENGINE_URL,
-    default_strategies=DEFAULT_STRATEGIES,
-)
-SIGNAL_BUS = StrategySignalBus(
-    SessionLocal,
-    kafka_bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-)
+MAX_STARTUP_RETRIES = int(os.getenv("STRATEGY_DB_STARTUP_RETRIES", "5"))
+INITIAL_BACKOFF_SECONDS = float(os.getenv("STRATEGY_DB_STARTUP_BACKOFF", "1.0"))
+MAX_BACKOFF_SECONDS = float(os.getenv("STRATEGY_DB_STARTUP_BACKOFF_CAP", "30.0"))
+
+
+def _initialization_message() -> str:
+    if INITIALIZATION_ERROR is None:
+        return "Strategy orchestrator is initialising dependencies."
+    return f"Strategy orchestrator failed to initialise database: {INITIALIZATION_ERROR}"
+
+
+def _set_components(registry: StrategyRegistry, signal_bus: StrategySignalBus) -> None:
+    global REGISTRY, SIGNAL_BUS, INITIALIZATION_ERROR
+    REGISTRY = registry
+    SIGNAL_BUS = signal_bus
+    INITIALIZATION_ERROR = None
+
+
+def _initialise_components() -> None:
+    Base.metadata.create_all(bind=ENGINE)
+    ensure_signal_tables(ENGINE)
+
+    registry = StrategyRegistry(
+        SessionLocal,
+        risk_engine_url=RISK_ENGINE_URL,
+        default_strategies=DEFAULT_STRATEGIES,
+    )
+    signal_bus = StrategySignalBus(
+        SessionLocal,
+        kafka_bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+    )
+    _set_components(registry, signal_bus)
+
+
+async def _initialise_with_retry(
+    *,
+    max_attempts: Optional[int] = None,
+    base_delay: Optional[float] = None,
+    max_delay: Optional[float] = None,
+) -> None:
+    global INITIALIZATION_ERROR, REGISTRY, SIGNAL_BUS
+
+    attempts = max_attempts or MAX_STARTUP_RETRIES
+    delay = base_delay if base_delay is not None else INITIAL_BACKOFF_SECONDS
+    max_backoff = max_delay if max_delay is not None else MAX_BACKOFF_SECONDS
+
+    REGISTRY = None
+    SIGNAL_BUS = None
+    INITIALIZATION_ERROR = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            _initialise_components()
+        except (OperationalError, SQLAlchemyError) as exc:
+            INITIALIZATION_ERROR = exc
+            LOGGER.warning(
+                "Database initialisation attempt %s/%s failed: %s",
+                attempt,
+                attempts,
+                exc,
+            )
+            if attempt == attempts:
+                LOGGER.error(
+                    "Exhausted database initialisation retries; service will return 503 until the database is reachable."
+                )
+                return
+            sleep_for = max(delay, 0.0)
+            if sleep_for:
+                await asyncio.sleep(sleep_for)
+            delay = min(delay * 2 or INITIAL_BACKOFF_SECONDS, max_backoff)
+        except Exception:
+            # Bubble unexpected exceptions so FastAPI startup fails loudly.
+            INITIALIZATION_ERROR = None
+            REGISTRY = None
+            SIGNAL_BUS = None
+            raise
+        else:
+            LOGGER.info("Database initialisation succeeded on attempt %s.", attempt)
+            return
+
+
+def _require_registry() -> StrategyRegistry:
+    if REGISTRY is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=_initialization_message())
+    return REGISTRY
+
+
+def _require_signal_bus() -> StrategySignalBus:
+    if SIGNAL_BUS is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=_initialization_message())
+    return SIGNAL_BUS
 
 app = FastAPI(title="Strategy Orchestrator", version="0.1.0")
 SESSION_STORE = _build_session_store_from_env()
 app.state.session_store = SESSION_STORE
 
 
+@app.on_event("startup")
+async def _startup_event() -> None:
+    await _initialise_with_retry()
+
+
 @app.post("/strategy/register", response_model=StrategyStatusResponse)
+
 async def register_strategy(
     payload: StrategyRegisterRequest, actor: str = Depends(require_admin_account)
 ) -> StrategyStatusResponse:
     try:
         LOGGER.info("Registering strategy '%s' by %s", payload.name.lower(), actor)
         snapshot = REGISTRY.register(payload.name.lower(), payload.description, payload.max_nav_pct)
+
     except StrategyAllocationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return StrategyStatusResponse(**snapshot.__dict__)
 
 
 @app.post("/strategy/toggle", response_model=StrategyStatusResponse)
+
 async def toggle_strategy(
     payload: StrategyToggleRequest, actor: str = Depends(require_admin_account)
 ) -> StrategyStatusResponse:
@@ -325,19 +420,23 @@ async def toggle_strategy(
             "Toggling strategy '%s' to %s by %s", payload.name.lower(), payload.enabled, actor
         )
         snapshot = REGISTRY.toggle(payload.name.lower(), payload.enabled)
+
     except StrategyNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return StrategyStatusResponse(**snapshot.__dict__)
 
 
 @app.get("/strategy/status", response_model=List[StrategyStatusResponse])
+
 async def strategy_status(actor: str = Depends(require_admin_account)) -> List[StrategyStatusResponse]:
     LOGGER.info("Fetching strategy status for %s", actor)
     snapshots = REGISTRY.status()
+
     return [StrategyStatusResponse(**snapshot.__dict__) for snapshot in snapshots]
 
 
 @app.post("/strategy/intent", response_model=RiskValidationResponse)
+
 async def route_intent(
     payload: StrategyIntentRequest, actor: str = Depends(require_admin_account)
 ) -> RiskValidationResponse:
@@ -348,6 +447,7 @@ async def route_intent(
             actor,
         )
         return await REGISTRY.route_trade_intent(payload.strategy_name.lower(), payload.request)
+
     except StrategyNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except StrategyAllocationError as exc:
@@ -355,9 +455,11 @@ async def route_intent(
 
 
 @app.get("/strategy/signals", response_model=List[StrategySignalResponse])
+
 async def strategy_signals(actor: str = Depends(require_admin_account)) -> List[StrategySignalResponse]:
     LOGGER.info("Listing strategy signals for %s", actor)
     signals = SIGNAL_BUS.list_signals()
+
     return [
         StrategySignalResponse(
             name=signal.name,

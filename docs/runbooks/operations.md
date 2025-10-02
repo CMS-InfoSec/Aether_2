@@ -37,6 +37,11 @@ This runbook describes the day-2 operational workflows for the Aether risk platf
    kubectl exec -n aether-prod deploy/marketdata-ingestor-prod -- nats-server --help
    ```
 
+### Strategy orchestrator startup diagnostics
+* The service now retries database initialisation during FastAPI startup with exponential backoff (configurable via `STRATEGY_DB_STARTUP_RETRIES`, `STRATEGY_DB_STARTUP_BACKOFF`, and `STRATEGY_DB_STARTUP_BACKOFF_CAP`).
+* Review pod logs for entries like `Database initialisation attempt 1/5 failed` and `Database initialisation succeeded` to confirm retry progress.
+* Until initialisation completes, HTTP endpoints return `503 Service Unavailable` with details surfaced from the last database error; use `kubectl logs deploy/strategy-orchestrator -n aether-prod` to monitor recovery.
+
 ## 3. Data freshness verification
 1. Query TimescaleDB for the latest market tick:
    ```bash

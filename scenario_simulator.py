@@ -17,10 +17,11 @@ from typing import Dict, Iterable, Mapping
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
 
 from services.common.config import get_timescale_session
+from services.common.security import require_admin_account
 from shared.correlation import CorrelationIdMiddleware
 
 try:  # pragma: no cover - psycopg is an optional dependency in some environments
@@ -253,9 +254,14 @@ def _aggregate_metrics(pnl_series: pd.Series, exposures: pd.Series, shock_pct: f
     }
 
 
-def _store_run(conn: psycopg.Connection, results: Mapping[str, float], payload: ScenarioRunRequest) -> None:
+def _store_run(
+    conn: psycopg.Connection,
+    results: Mapping[str, float],
+    payload: ScenarioRunRequest,
+    actor_account: str,
+) -> None:
     params = {
-        "account_id": ACCOUNT_ID,
+        "account_id": actor_account,
         "shock_pct": float(payload.shock_pct),
         "vol_multiplier": float(payload.vol_multiplier),
         "results_json": json.dumps(results),
@@ -266,7 +272,10 @@ def _store_run(conn: psycopg.Connection, results: Mapping[str, float], payload: 
 
 
 @app.post("/scenario/run", response_model=ScenarioRunResponse)
-def run_scenario(payload: ScenarioRunRequest) -> ScenarioRunResponse:
+def run_scenario(
+    payload: ScenarioRunRequest,
+    actor_account: str = Depends(require_admin_account),
+) -> ScenarioRunResponse:
     """Simulate the portfolio under a combined price shock and volatility shift."""
 
     try:
@@ -283,7 +292,7 @@ def run_scenario(payload: ScenarioRunRequest) -> ScenarioRunResponse:
                 vol_multiplier=payload.vol_multiplier,
             )
             metrics = _aggregate_metrics(pnl_series, exposures, payload.shock_pct)
-            _store_run(conn, metrics, payload)
+            _store_run(conn, metrics, payload, actor_account)
     except HTTPException:
         raise
     except Exception as exc:  # pragma: no cover - protects against database/runtime issues

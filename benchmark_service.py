@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Iterable, Mapping, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import Column, DateTime, Float, String, create_engine, select
 from sqlalchemy.engine import Engine
@@ -197,7 +197,10 @@ class BenchmarkCurvePayload(BaseModel):
 
 
 @app.post("/benchmark/curves", status_code=204)
-def upsert_benchmark_curves(payload: BenchmarkCurvePayload) -> None:
+def upsert_benchmark_curves(
+    payload: BenchmarkCurvePayload,
+    actor_account: str = Depends(require_admin_account),
+) -> None:
     """Persist benchmark returns for an account at a point in time."""
 
     ts = payload.timestamp
@@ -205,6 +208,13 @@ def upsert_benchmark_curves(payload: BenchmarkCurvePayload) -> None:
         ts = ts.replace(tzinfo=timezone.utc)
 
     snapshots: list[BenchmarkSnapshot] = []
+
+    LOGGER.info(
+        "Benchmark curve upsert requested by %s for account %s at %s",
+        actor_account,
+        payload.account_id,
+        ts.isoformat(),
+    )
 
     if payload.aether_return is not None:
         snapshots.append(
@@ -245,10 +255,18 @@ def upsert_benchmark_curves(payload: BenchmarkCurvePayload) -> None:
 def compare_benchmarks(
     account_id: str = Query(..., description="Account identifier"),
     date: Optional[str] = Query(None, description="ISO8601 date or timestamp"),
+    actor_account: str = Depends(require_admin_account),
 ) -> BenchmarkComparison:
     """Compare account performance to BTC, ETH and an equal-weight basket."""
 
     as_of = _parse_date(date)
+
+    LOGGER.info(
+        "Benchmark comparison requested by %s for account %s at %s",
+        actor_account,
+        account_id,
+        as_of.isoformat(),
+    )
 
     with SessionLocal() as session:
         repo = BenchmarkCurveRepository(session)
@@ -268,3 +286,4 @@ def compare_benchmarks(
         basket_return=basket,
         excess_return=excess,
     )
+from services.common.security import require_admin_account
