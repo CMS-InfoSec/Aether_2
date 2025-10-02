@@ -6,6 +6,7 @@ import React, {
   useRef,
   useState,
 } from "react";
+import { formatLondonTime } from "./timezone";
 import { useAuthClaims } from "./useAuthClaims";
 
 type TradeSide = "buy" | "sell";
@@ -291,15 +292,11 @@ const formatTimestamp = (value?: string) => {
   if (!value) {
     return "—";
   }
-  const parsed = Date.parse(value);
-  if (Number.isNaN(parsed)) {
+  const formatted = formatLondonTime(value);
+  if (!formatted) {
     return value;
   }
-  try {
-    return new Date(parsed).toLocaleString();
-  } catch (error) {
-    return value;
-  }
+  return formatted;
 };
 
 const DevSandbox: React.FC = () => {

@@ -12,6 +12,7 @@ from typing import List
 import pytest
 
 pytest.importorskip("fastapi")
+from fastapi import status
 from fastapi.testclient import TestClient
 
 if "metrics" not in sys.modules:
@@ -36,6 +37,7 @@ from services.common.schemas import (
 )
 
 from services.models.model_server import Intent
+from services.risk.stablecoin_monitor import StablecoinMonitor, StablecoinMonitorConfig
 
 
 @pytest.fixture(name="client")
@@ -90,22 +92,31 @@ def _intent(*, edge_bps: float, approved: bool, selected: str, reason: str | Non
 def _validate_response(payload: dict) -> PolicyDecisionResponse:
     return PolicyDecisionResponse.model_validate(payload)
 
+
+def _coerce_decimal(value: float | Decimal) -> Decimal:
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
+
 def test_policy_decide_approves_when_edge_beats_costs(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
     recorded: List[dict[str, object]] = []
     dispatched: List[dict[str, object]] = []
 
-    async def _fake_fee(account_id: str, symbol: str, liquidity: str, notional: float) -> float:
+    async def _fake_fee(
+        account_id: str, symbol: str, liquidity: str, notional: float | Decimal
+    ) -> Decimal:
+        dec_notional = _coerce_decimal(notional)
         recorded.append(
             {
                 "account_id": account_id,
                 "symbol": symbol,
                 "liquidity": liquidity,
-                "notional": notional,
+                "notional": dec_notional,
             }
         )
-        return {"maker": 4.5, "taker": 7.5}[liquidity]
+        return {"maker": Decimal("4.5"), "taker": Decimal("7.5")}[liquidity]
 
     monkeypatch.setattr(policy_service, "_fetch_effective_fee", _fake_fee)
     monkeypatch.setattr(
@@ -172,19 +183,19 @@ def test_policy_decide_approves_when_edge_beats_costs(
 
     snapped_price = Decimal("30120.5")
     snapped_quantity = Decimal("0.1235")
-    expected_notional = float(snapped_price * snapped_quantity)
+    expected_notional = snapped_price * snapped_quantity
     assert recorded == [
         {
             "account_id": "company",
             "symbol": "BTC-USD",
             "liquidity": "maker",
-            "notional": pytest.approx(expected_notional),
+            "notional": expected_notional,
         },
         {
             "account_id": "company",
             "symbol": "BTC-USD",
             "liquidity": "taker",
-            "notional": pytest.approx(expected_notional),
+            "notional": expected_notional,
         },
     ]
     assert dispatched == [
@@ -192,11 +203,55 @@ def test_policy_decide_approves_when_edge_beats_costs(
     ]
 
 
+def test_policy_decide_preserves_tick_precision(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    captured: list[Decimal] = []
+
+    async def _fake_fee(
+        account_id: str, symbol: str, liquidity: str, notional: float | Decimal
+    ) -> Decimal:
+        dec_notional = _coerce_decimal(notional)
+        captured.append(dec_notional)
+        return {"maker": Decimal("1.2345"), "taker": Decimal("2.3456")}[liquidity]
+
+    monkeypatch.setattr(policy_service, "_fetch_effective_fee", _fake_fee)
+    monkeypatch.setitem(
+        policy_service.KRAKEN_PRECISION,
+        "TST-USD",
+        {"tick": 0.00000001, "lot": 0.00000001},
+    )
+
+    payload = {
+        "account_id": "company",
+        "order_id": "precise-1",
+        "instrument": "TST-USD",
+        "side": "BUY",
+        "quantity": 0.12345678,
+        "price": 1.23456789,
+        "fee": {"currency": "USD", "maker": 0.0, "taker": 0.0},
+        "features": [0.0, 0.0],
+        "book_snapshot": {"mid_price": 1.23456789, "spread_bps": 0.1, "imbalance": 0.0},
+    }
+
+    response = client.post("/policy/decide", json=payload)
+    assert response.status_code == 200
+
+    expected_notional = Decimal("1.23456789") * Decimal("0.12345678")
+    assert captured == [expected_notional, expected_notional]
+
+    body = _validate_response(response.json())
+    assert body.effective_fee.maker == pytest.approx(1.2345)
+    assert body.effective_fee.taker == pytest.approx(2.3456)
+
+
 def test_policy_decide_rejects_when_slippage_erodes_edge(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
-    async def _fake_fee(account_id: str, symbol: str, liquidity: str, notional: float) -> float:
-        return {"maker": 4.0, "taker": 6.0}[liquidity]
+    async def _fake_fee(
+        account_id: str, symbol: str, liquidity: str, notional: float | Decimal
+    ) -> Decimal:
+        return {"maker": Decimal("4.0"), "taker": Decimal("6.0")}[liquidity]
 
     monkeypatch.setattr(policy_service, "_fetch_effective_fee", _fake_fee)
     monkeypatch.setattr(
@@ -230,8 +285,10 @@ def test_policy_decide_rejects_when_slippage_erodes_edge(
 def test_policy_decide_honours_request_risk_overrides(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
-    async def _fake_fee(account_id: str, symbol: str, liquidity: str, notional: float) -> float:
-        return 4.5
+    async def _fake_fee(
+        account_id: str, symbol: str, liquidity: str, notional: float | Decimal
+    ) -> Decimal:
+        return Decimal("4.5")
 
     monkeypatch.setattr(policy_service, "_fetch_effective_fee", _fake_fee)
     monkeypatch.setattr(
@@ -263,8 +320,8 @@ def test_policy_decide_honours_request_risk_overrides(
 
 
 def test_policy_decide_rejects_unknown_account(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
-    async def _fake_fee(*_: object, **__: object) -> float:
-        return 4.5
+    async def _fake_fee(*_: object, **__: object) -> Decimal:
+        return Decimal("4.5")
 
     monkeypatch.setattr(policy_service, "_fetch_effective_fee", _fake_fee)
     monkeypatch.setattr(
@@ -321,8 +378,10 @@ def test_policy_decide_requires_authorization(client: TestClient) -> None:
 def test_policy_decide_rejects_when_costs_exceed_edge(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
-    async def _fake_fee(account_id: str, symbol: str, liquidity: str, notional: float) -> float:
-        return {"maker": 18.0, "taker": 21.0}[liquidity]
+    async def _fake_fee(
+        account_id: str, symbol: str, liquidity: str, notional: float | Decimal
+    ) -> Decimal:
+        return {"maker": Decimal("18.0"), "taker": Decimal("21.0")}[liquidity]
 
     monkeypatch.setattr(policy_service, "_fetch_effective_fee", _fake_fee)
     monkeypatch.setattr(
@@ -355,6 +414,40 @@ def test_policy_decide_rejects_when_costs_exceed_edge(
 
     maker_template = next(template for template in body.action_templates if template.name == "maker")
     assert maker_template.edge_bps <= 0.0
+
+
+def test_policy_decide_rejects_when_stablecoin_depegged(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    monitor = StablecoinMonitor(
+        config=StablecoinMonitorConfig(
+            depeg_threshold_bps=50,
+            recovery_threshold_bps=10,
+            feed_max_age_seconds=60,
+            monitored_symbols=("USDC-USD",),
+            trusted_feeds=("primary_fx",),
+        )
+    )
+    monitor.update("USDC-USD", 0.9920, feed="primary_fx")
+
+    monkeypatch.setattr(policy_service, "get_global_monitor", lambda: monitor)
+
+    payload = {
+        "account_id": "company",
+        "order_id": "depeg-1",
+        "instrument": "BTC-USD",
+        "side": "BUY",
+        "quantity": 0.5,
+        "price": 30100.0,
+        "fee": {"currency": "USD", "maker": 4.0, "taker": 6.0},
+        "features": [0.2, -0.1, 0.7],
+        "book_snapshot": {"mid_price": 30110.0, "spread_bps": 3.5, "imbalance": 0.1},
+    }
+
+    response = client.post("/policy/decide", json=payload)
+    assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+    detail = response.json()["detail"]
+    assert "Stablecoin deviation" in detail
 
 
 @pytest.mark.anyio("asyncio")
@@ -541,7 +634,8 @@ async def test_fetch_effective_fee_parses_flat_payload(monkeypatch: pytest.Monke
         notional=123.456789,
     )
 
-    assert fee == pytest.approx(5.25)
+    assert isinstance(fee, Decimal)
+    assert fee == Decimal("5.25")
     request = recorded["request"]
     assert request["path"] == "/fees/effective"
     assert request["headers"] == {"X-Account-ID": "acct-123"}

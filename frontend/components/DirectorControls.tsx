@@ -5,6 +5,7 @@ import React, {
   useMemo,
   useState,
 } from "react";
+import { formatLondonTime } from "./timezone";
 import { useAuthClaims } from "./useAuthClaims";
 
 interface SafeModeStatusResponse {
@@ -58,12 +59,8 @@ const formatTimestamp = (timestamp?: string | null) => {
     return "Unknown";
   }
 
-  const date = new Date(timestamp);
-  if (Number.isNaN(date.getTime())) {
-    return timestamp;
-  }
-
-  return date.toLocaleString();
+  const formatted = formatLondonTime(timestamp);
+  return formatted || "Unknown";
 };
 
 const ensureString = (value: unknown): string => {

@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, Iterable, List
 
@@ -246,20 +247,22 @@ def test_full_pipeline_records_audit_metrics_and_safe_mode(
     fees_client = TestClient(fees_app)
 
     async def fake_fetch_effective_fee(
-        account_id: str, symbol: str, liquidity: str, notional: float
-    ) -> float:
+        account_id: str, symbol: str, liquidity: str, notional: float | Decimal
+    ) -> Decimal:
+        notional_decimal = notional if isinstance(notional, Decimal) else Decimal(str(notional))
+        notional_str = f"{notional_decimal.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP)}"
         response = fees_client.get(
             "/fees/effective",
             params={
                 "pair": symbol,
                 "liquidity": liquidity,
-                "notional": f"{max(notional, 0.0):.8f}",
+                "notional": notional_str,
             },
             headers={"X-Account-ID": account_id},
         )
         response.raise_for_status()
         payload = response.json()
-        return float(payload["bps"])
+        return Decimal(str(payload["bps"]))
 
     monkeypatch.setattr(policy_service, "_fetch_effective_fee", fake_fetch_effective_fee)
 
@@ -505,19 +508,21 @@ async def test_trading_sequencer_loop_preserves_correlation_and_audit(
     policy_service.ENABLE_SHADOW_EXECUTION = False
 
     async def fake_fetch_effective_fee(
-        account_id: str, symbol: str, liquidity: str, notional: float
-    ) -> float:
+        account_id: str, symbol: str, liquidity: str, notional: float | Decimal
+    ) -> Decimal:
+        notional_decimal = notional if isinstance(notional, Decimal) else Decimal(str(notional))
+        notional_str = f"{notional_decimal.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP)}"
         response = fees_client.get(
             "/fees/effective",
             params={
                 "pair": symbol,
                 "liquidity": liquidity,
-                "notional": f"{max(notional, 0.0):.8f}",
+                "notional": notional_str,
             },
             headers={"X-Account-ID": account_id},
         )
         response.raise_for_status()
-        return float(response.json()["bps"])
+        return Decimal(str(response.json()["bps"]))
 
     async def noop_submit_execution(*_: Any, **__: Any) -> None:
         return None
@@ -710,19 +715,21 @@ def test_policy_risk_oms_flow_emits_hashed_audit_and_metrics(
     policy_service.ENABLE_SHADOW_EXECUTION = False
 
     async def fake_fetch_effective_fee(
-        account_id: str, symbol: str, liquidity: str, notional: float
-    ) -> float:
+        account_id: str, symbol: str, liquidity: str, notional: float | Decimal
+    ) -> Decimal:
+        notional_decimal = notional if isinstance(notional, Decimal) else Decimal(str(notional))
+        notional_str = f"{notional_decimal.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP)}"
         response = fees_client.get(
             "/fees/effective",
             params={
                 "pair": symbol,
                 "liquidity": liquidity,
-                "notional": f"{max(notional, 0.0):.8f}",
+                "notional": notional_str,
             },
             headers={"X-Account-ID": account_id},
         )
         response.raise_for_status()
-        return float(response.json()["bps"])
+        return Decimal(str(response.json()["bps"]))
 
     monkeypatch.setattr(policy_service, "_fetch_effective_fee", fake_fetch_effective_fee)
 
@@ -964,19 +971,21 @@ def test_pipeline_handles_flash_crash_and_feed_outage(
     policy_service.ENABLE_SHADOW_EXECUTION = False
 
     async def fake_fetch_effective_fee(
-        account: str, pair: str, liquidity: str, notional: float
-    ) -> float:
+        account: str, pair: str, liquidity: str, notional: float | Decimal
+    ) -> Decimal:
+        notional_decimal = notional if isinstance(notional, Decimal) else Decimal(str(notional))
+        notional_str = f"{notional_decimal.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP)}"
         response = fees_client.get(
             "/fees/effective",
             params={
                 "pair": pair,
                 "liquidity": liquidity,
-                "notional": f"{max(notional, 0.0):.8f}",
+                "notional": notional_str,
             },
             headers={"X-Account-ID": account},
         )
         response.raise_for_status()
-        return float(response.json()["bps"])
+        return Decimal(str(response.json()["bps"]))
 
     async def noop_submit_execution(*_: Any, **__: Any) -> None:
         return None
@@ -1238,19 +1247,21 @@ def test_trading_sequencer_lifecycle_preserves_correlation_and_audit_chain(
     policy_service.ENABLE_SHADOW_EXECUTION = False
 
     async def fake_fetch_effective_fee(
-        account_id: str, symbol: str, liquidity: str, notional: float
-    ) -> float:
+        account_id: str, symbol: str, liquidity: str, notional: float | Decimal
+    ) -> Decimal:
+        notional_decimal = notional if isinstance(notional, Decimal) else Decimal(str(notional))
+        notional_str = f"{notional_decimal.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP)}"
         response = fees_client.get(
             "/fees/effective",
             params={
                 "pair": symbol,
                 "liquidity": liquidity,
-                "notional": f"{max(notional, 0.0):.8f}",
+                "notional": notional_str,
             },
             headers={"X-Account-ID": account_id},
         )
         response.raise_for_status()
-        return float(response.json()["bps"])
+        return Decimal(str(response.json()["bps"]))
 
     monkeypatch.setattr(policy_service, "_fetch_effective_fee", fake_fetch_effective_fee)
 

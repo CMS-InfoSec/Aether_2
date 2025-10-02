@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any, Dict, List
 
@@ -36,9 +37,9 @@ def policy_test_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     def fake_predict_intent(**_: Any) -> DummyIntent:
         return stub_intent
 
-    async def fake_fetch(*args: Any, **kwargs: Any) -> float:
+    async def fake_fetch(*args: Any, **kwargs: Any) -> Decimal:
         del args, kwargs
-        return 5.0
+        return Decimal("5.0")
 
     monkeypatch.setattr("policy_service.predict_intent", fake_predict_intent)
     monkeypatch.setattr("policy_service._fetch_effective_fee", fake_fetch)
@@ -64,14 +65,17 @@ def test_policy_decision_rejects_when_fee_erases_edge(monkeypatch: pytest.Monkey
 
     fees: List[Dict[str, Any]] = []
 
-    async def fake_fetch(account_id: str, symbol: str, liquidity: str, notional: float) -> float:
+    async def fake_fetch(
+        account_id: str, symbol: str, liquidity: str, notional: float | Decimal
+    ) -> Decimal:
+        notional_decimal = notional if isinstance(notional, Decimal) else Decimal(str(notional))
         fees.append({
             "account": account_id,
             "symbol": symbol,
             "liquidity": liquidity,
-            "notional": notional,
+            "notional": notional_decimal,
         })
-        return 6.0 if liquidity == "maker" else 8.0
+        return Decimal("6.0") if liquidity == "maker" else Decimal("8.0")
 
     monkeypatch.setattr("policy_service.predict_intent", fake_predict_intent)
     monkeypatch.setattr("policy_service._fetch_effective_fee", fake_fetch)

@@ -8,3 +8,19 @@ coingecko:
   max_retries: 5
   backoff_initial_ms: 200
   timeout_sec: 30
+
+stablecoin_monitor:
+  # Trading halts when absolute deviation exceeds this threshold (in basis points).
+  depeg_threshold_bps: 75
+  # Trading resumes once deviation falls back within this tighter band (in bps).
+  recovery_threshold_bps: 15
+  # Quotes older than this many seconds are treated as stale and ignored.
+  feed_max_age_seconds: 180
+  # Stablecoin symbols tracked for depeg monitoring.
+  monitored_symbols:
+    - USDC-USD
+    - USDT-USD
+  # Names of FX feeds considered trustworthy for depeg detection.
+  trusted_feeds:
+    - nyfed_fx
+    - bloomberg_fx
