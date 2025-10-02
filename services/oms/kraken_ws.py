@@ -5,6 +5,7 @@ import contextlib
 import json
 import logging
 import random
+import time
 from dataclasses import dataclass
 
 from typing import Any, Awaitable, Callable, Dict, List, Optional
@@ -17,6 +18,10 @@ from websockets.exceptions import WebSocketException
 
 
 from metrics import get_request_id
+from services.oms.rate_limit_guard import (
+    RateLimitGuard,
+    rate_limit_guard as shared_rate_limit_guard,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +125,8 @@ class KrakenWSClient:
         stream_update_cb: Optional[Callable[[OrderState], Awaitable[None]]] = None,
         rest_client: Optional["KrakenRESTClient"] = None,
         request_timeout: float = 5.0,
+        rate_limit_guard: Optional[RateLimitGuard] = None,
+        account_id: Optional[str] = None,
     ) -> None:
         self._credential_getter = credential_getter
         self._url = url
@@ -127,6 +134,8 @@ class KrakenWSClient:
         self._stream_update_cb = stream_update_cb
         self._request_timeout = request_timeout
         self._rest_client = rest_client
+        self._rate_limit_guard = rate_limit_guard or shared_rate_limit_guard
+        self._account_id = account_id
 
         self._transport: Optional[_WebsocketTransport] = None
         self._receiver_task: Optional[asyncio.Task[None]] = None
@@ -139,6 +148,8 @@ class KrakenWSClient:
         self._backoff = _JitterBackoff()
         self._subscriptions: List[List[str]] = []
         self._last_private_heartbeat: Optional[float] = None
+        self._ws_token: Optional[str] = None
+        self._ws_token_expiry: Optional[float] = None
 
     async def _default_transport(
         self, url: str, *, headers: Optional[Dict[str, str]] = None
@@ -471,14 +482,34 @@ class KrakenWSClient:
         credentials = await self._credential_getter()
         token = credentials.get("ws_token")
         if token:
-            return str(token)
+            token_str = str(token)
+            self._ws_token = token_str
+            self._ws_token_expiry = None
+            return token_str
+
+        now = time.monotonic()
+        if self._ws_token and self._ws_token_expiry is not None:
+            if now < self._ws_token_expiry:
+                return self._ws_token
+        elif self._ws_token:
+            return self._ws_token
 
         rest_client = self._rest_client
         if rest_client is None:
             raise KrakenWSError("ws_token missing and REST client unavailable")
 
+        account_id = self._account_id or credentials.get("account_id")
+        if account_id is None:
+            account_id = credentials.get("api_key") or "default"
+        account_id = str(account_id)
+        self._account_id = account_id
+
+        guard = self._rate_limit_guard
+        if guard is not None:
+            await guard.acquire(account_id, "websocket_token", transport="rest", urgent=False)
+
         try:
-            token = await rest_client.websocket_token()
+            token, ttl = await rest_client.websocket_token()
         except Exception as exc:
             logger.error("Failed to obtain Kraken websocket token: %s", exc)
             raise KrakenWSError("failed to obtain websocket token") from exc
@@ -486,7 +517,23 @@ class KrakenWSClient:
         if not token:
             raise KrakenWSError("Kraken REST token response missing token")
 
-        return str(token)
+        token_str = str(token)
+        ttl_seconds = 0.0
+        if ttl is not None:
+            try:
+                ttl_seconds = float(ttl)
+            except (TypeError, ValueError):
+                ttl_seconds = 0.0
+
+        if ttl_seconds <= 0:
+            expiry = time.monotonic()
+        else:
+            refresh_margin = max(ttl_seconds - 30.0, ttl_seconds * 0.5, 1.0)
+            expiry = time.monotonic() + refresh_margin
+
+        self._ws_token = token_str
+        self._ws_token_expiry = expiry
+        return token_str
 
     def _ack_from_payload(self, payload: Dict[str, Any]) -> OrderAck:
         status = payload.get("status") or payload.get("result", {}).get("status")
