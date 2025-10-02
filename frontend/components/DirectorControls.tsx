@@ -357,6 +357,17 @@ const DirectorControls: React.FC = () => {
     };
   }, [loadTradingPairs]);
 
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      void refreshSafeModeStatus();
+      void refreshAuditTrail();
+    }, 30_000);
+
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, [refreshAuditTrail, refreshSafeModeStatus]);
+
   const handleSafeMode = async (action: "enter" | "exit") => {
     setSafeModeActionError(null);
     setSafeModeMessage(null);
