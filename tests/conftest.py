@@ -350,7 +350,13 @@ def _configure_security_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
     original_request = TestClient.request
 
     def _request_with_session(self, method: str, url: str, **kwargs):  # type: ignore[override]
-        headers = kwargs.setdefault("headers", {})
+        headers = kwargs.get("headers")
+        if headers is None:
+            headers = {}
+            kwargs["headers"] = headers
+        elif not isinstance(headers, dict):
+            headers = dict(headers)
+            kwargs["headers"] = headers
         account = headers.get("X-Account-ID")
         auth_header = headers.get("Authorization") or headers.get("authorization")
         if account and not auth_header:

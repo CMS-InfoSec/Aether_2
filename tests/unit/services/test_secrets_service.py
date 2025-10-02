@@ -43,6 +43,9 @@ def secrets_client(monkeypatch: pytest.MonkeyPatch, fake_auditor) -> TestClient:
     secrets_service.app.dependency_overrides[secrets_service.ensure_secure_transport] = lambda: None
     secrets_service.app.dependency_overrides[secrets_service.require_admin_account] = lambda: "company"
     secrets_service.app.dependency_overrides[secrets_service.require_mfa_context] = lambda: "verified"
+    secrets_service.app.dependency_overrides[
+        secrets_service.require_dual_director_confirmation
+    ] = lambda: ("director-a", "director-b")
     secrets_service.app.dependency_overrides[secrets_service.get_core_v1_api] = lambda: fake_api
     monkeypatch.setattr(secrets_service, "validate_kraken_credentials", lambda *_, **__: True)
     monkeypatch.setattr(secrets_service, "_auditor", fake_auditor)
