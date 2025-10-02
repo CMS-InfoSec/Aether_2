@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 import pytest
@@ -67,13 +68,13 @@ class DummyCredentialProvider:
 class _Ack:
     exchange_order_id: Optional[str] = "order-1"
     status: Optional[str] = "ok"
-    filled_qty: Optional[float] = None
-    avg_price: Optional[float] = None
+    filled_qty: Optional[Decimal] = None
+    avg_price: Optional[Decimal] = None
     errors: Optional[List[str]] = None
 
 
 class SuccessfulWSClient:
-    def __init__(self, *, credential_getter, stream_update_cb) -> None:
+    def __init__(self, *, credential_getter, stream_update_cb, **_: Any) -> None:
         self._stream_update_cb = stream_update_cb
         self.add_order_calls: List[Dict[str, Any]] = []
         self.cancel_order_calls: List[Dict[str, Any]] = []

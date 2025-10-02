@@ -3,6 +3,7 @@ import base64
 import json
 import sys
 import types
+from decimal import Decimal
 from urllib.parse import parse_qs
 
 class _DummyAiohttp(types.ModuleType):
@@ -115,3 +116,25 @@ async def _run_nonce_test() -> None:
     assert len(nonces) == 20
     assert nonces == sorted(nonces)
     assert len(set(nonces)) == len(nonces)
+
+
+def test_parse_response_preserves_decimal_precision() -> None:
+    async def credential_getter() -> dict[str, str]:
+        return {}
+
+    client = KrakenRESTClient(credential_getter=credential_getter)
+    payload = {
+        "result": {
+            "status": "ok",
+            "txid": ["ABC123"],
+            "filled": "0.987654321098",
+            "avg_price": "123.4500006789",
+        }
+    }
+
+    ack = client._parse_response(payload)
+
+    assert ack.filled_qty == Decimal("0.987654321098")
+    assert ack.avg_price == Decimal("123.4500006789")
+    assert str(ack.filled_qty) == "0.987654321098"
+    assert str(ack.avg_price) == "123.4500006789"

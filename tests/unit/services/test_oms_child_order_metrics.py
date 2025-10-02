@@ -373,7 +373,7 @@ async def _run_multi_child_slice_increments_metric() -> None:
 
     account = oms_service.AccountContext("ACC-METRIC")
     account.credentials = StubCredentials()
-    account.ws_client = object()  # type: ignore[assignment]
+    account.ws_client = types.SimpleNamespace(heartbeat_age=lambda: 0.0)  # type: ignore[assignment]
     account.rest_client = object()  # type: ignore[assignment]
     account._record_trade_impact = types.MethodType(  # type: ignore[attr-defined]
         lambda self, record: asyncio.sleep(0), account
@@ -402,11 +402,15 @@ async def _run_multi_child_slice_increments_metric() -> None:
         payload: dict[str, object],
         symbol: str,
         base_client_id: str,
+        *,
+        preferred_transport: str | None = None,
+        allow_fallback: bool = True,
     ) -> tuple[OrderAck, str, str, float]:
+        del preferred_transport, allow_fallback
         ack = OrderAck(
             exchange_order_id=f"EX-{base_client_id}",
             status="accepted",
-            filled_qty=0.0,
+            filled_qty=Decimal("0"),
             avg_price=None,
             errors=None,
         )
