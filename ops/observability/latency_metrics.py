@@ -1,9 +1,10 @@
-"""Latency observability helpers for core trading services.
+"""Latency metrics collection and exposition helpers.
 
-This module keeps a rolling window of latency samples for key services and
-exposes latency distributions via Prometheus histograms.  For each service we
-track the p50, p95 and p99 latencies and mark SLO violations whenever the
-p95 latency exceeds ``ALERT_THRESHOLD_MS``.
+This module wires Prometheus histograms for the critical stages of the
+trade lifecycle and maintains rolling windows that allow us to compute
+p95 latency based alerts.  The metrics are exported through a lightweight
+FastAPI application that serves the ``/metrics`` endpoint which can be
+scraped by a Prometheus server.
 """
 
 from __future__ import annotations
@@ -11,19 +12,23 @@ from __future__ import annotations
 from bisect import bisect_left, insort
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import Deque, Dict, Iterable, MutableMapping, Optional
+from typing import Deque, Dict, Iterable, MutableMapping, Optional, Tuple
 
-from prometheus_client import CollectorRegistry, Gauge, Histogram
+from fastapi import FastAPI, Response
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    CollectorRegistry,
+    Gauge,
+    Histogram,
+    generate_latest,
+)
 
-__all__ = [
-    "LatencySnapshot",
-    "LatencyMetrics",
-]
+__all__ = ["LatencySnapshot", "LatencyMetrics", "create_metrics_app"]
 
 
 @dataclass(frozen=True)
 class LatencySnapshot:
-    """Latency percentiles for a service stage."""
+    """Latency percentiles for a metric."""
 
     p50: float
     p95: float
@@ -31,13 +36,7 @@ class LatencySnapshot:
 
 
 class _PercentileWindow:
-    """Maintain a rolling, order-aware collection of samples.
-
-    The window keeps the last ``maxlen`` samples in both insertion order and
-    sorted order to provide deterministic percentile calculations without
-    relying on external dependencies.  While this comes with a modest memory
-    footprint, it keeps the implementation portable and easy to unit test.
-    """
+    """Maintain a rolling, order-aware collection of samples."""
 
     def __init__(self, maxlen: int = 1024) -> None:
         if maxlen <= 0:
@@ -51,8 +50,6 @@ class _PercentileWindow:
             expired = self._samples.popleft()
             idx = bisect_left(self._sorted, expired)
             if 0 <= idx < len(self._sorted):
-                # Remove the first match. There may be duplicates so we check
-                # that the element exists before deleting.
                 del self._sorted[idx]
         self._samples.append(value)
         insort(self._sorted, value)
@@ -83,23 +80,15 @@ class _PercentileWindow:
 
 
 class LatencyMetrics:
-    """Collect latency metrics for mission critical services."""
+    """Collect latency metrics for trading services."""
 
-    _DEFAULT_BUCKETS = (
-        5,
-        10,
-        25,
-        50,
-        100,
-        250,
-        500,
-        1000,
-        2000,
-        float("inf"),
-    )
+    _HISTOGRAM_SPECS = {
+        "policy_latency": 200.0,
+        "risk_latency": 200.0,
+        "oms_latency": 500.0,
+    }
 
-    _STAGES = ("policy_inference", "risk_validation", "oms_execution")
-    ALERT_THRESHOLD_MS = 250.0
+    _BUCKETS = (5, 10, 25, 50, 100, 200, 300, 500, 750, 1000, float("inf"))
 
     def __init__(
         self,
@@ -108,73 +97,87 @@ class LatencyMetrics:
     ) -> None:
         self._registry = registry or CollectorRegistry()
         self._histograms: Dict[str, Histogram] = {
-            stage: Histogram(
-                f"{stage}_latency_ms",
-                f"Latency distribution for {stage.replace('_', ' ')} in milliseconds.",
-                ["service"],
-                buckets=self._DEFAULT_BUCKETS,
+            name: Histogram(
+                name,
+                f"Latency distribution for {name.replace('_', ' ')} in milliseconds.",
+                ["symbol", "account_id"],
+                buckets=self._BUCKETS,
                 registry=self._registry,
             )
-            for stage in self._STAGES
+            for name in self._HISTOGRAM_SPECS
         }
         self._alerts = Gauge(
-            "latency_slo_violation",
-            "Whether the p95 latency breached the 250ms SLO.",
-            ["stage", "service"],
+            "latency_p95_alert",
+            "1 when the p95 latency breaches the configured SLO threshold.",
+            ["metric", "symbol", "account_id"],
             registry=self._registry,
         )
-        self._windows: Dict[str, MutableMapping[str, _PercentileWindow]] = {
-            stage: defaultdict(lambda: _PercentileWindow(window_size))
-            for stage in self._STAGES
+        self._windows: Dict[str, MutableMapping[Tuple[str, str], _PercentileWindow]] = {
+            name: defaultdict(lambda: _PercentileWindow(window_size))
+            for name in self._HISTOGRAM_SPECS
         }
 
     @property
     def registry(self) -> CollectorRegistry:
         return self._registry
 
-    def observe(self, stage: str, service: str, latency_ms: float) -> LatencySnapshot:
-        """Record a new latency observation.
+    def observe(
+        self,
+        metric: str,
+        symbol: str,
+        account_id: str,
+        latency_ms: float,
+    ) -> LatencySnapshot:
+        """Record a new latency observation and update alerting state."""
 
-        Parameters
-        ----------
-        stage:
-            One of ``policy_inference``, ``risk_validation`` or ``oms_execution``.
-        service:
-            Name of the service emitting the metric.
-        latency_ms:
-            Observed latency in milliseconds.
-        """
-
-        if stage not in self._STAGES:
-            raise ValueError(f"Unknown stage '{stage}'. Expected one of {self._STAGES}")
+        if metric not in self._histograms:
+            raise ValueError(
+                f"Unknown metric '{metric}'. Expected one of {tuple(self._histograms)}"
+            )
         if latency_ms < 0:
             raise ValueError("latency_ms must be non-negative")
 
-        histogram = self._histograms[stage]
-        histogram.labels(service=service).observe(latency_ms)
+        histogram = self._histograms[metric]
+        histogram.labels(symbol=symbol, account_id=account_id).observe(latency_ms)
 
-        window = self._windows[stage][service]
+        window = self._windows[metric][(symbol, account_id)]
         window.add(latency_ms)
         snapshot = window.snapshot()
 
-        alert_gauge = self._alerts.labels(stage=stage, service=service)
-        if snapshot.p95 > self.ALERT_THRESHOLD_MS:
+        threshold = self._HISTOGRAM_SPECS[metric]
+        alert_gauge = self._alerts.labels(metric=metric, symbol=symbol, account_id=account_id)
+        if snapshot.p95 > threshold:
             alert_gauge.set(1)
         else:
             alert_gauge.set(0)
         return snapshot
 
-    def get_snapshot(self, stage: str, service: str) -> LatencySnapshot:
-        if stage not in self._STAGES:
-            raise ValueError(f"Unknown stage '{stage}'. Expected one of {self._STAGES}")
-        window = self._windows[stage].get(service)
+    def get_snapshot(self, metric: str, symbol: str, account_id: str) -> LatencySnapshot:
+        if metric not in self._histograms:
+            raise ValueError(
+                f"Unknown metric '{metric}'. Expected one of {tuple(self._histograms)}"
+            )
+        window = self._windows[metric].get((symbol, account_id))
         if window is None:
             return LatencySnapshot(0.0, 0.0, 0.0)
         return window.snapshot()
 
-    def iter_snapshots(self) -> Iterable[tuple[str, str, LatencySnapshot]]:
-        """Iterate over all known stage/service snapshots."""
+    def iter_snapshots(self) -> Iterable[tuple[str, str, str, LatencySnapshot]]:
+        """Iterate over all known metric/symbol/account snapshots."""
 
-        for stage, per_service in self._windows.items():
-            for service, window in per_service.items():
-                yield stage, service, window.snapshot()
+        for metric, per_entity in self._windows.items():
+            for (symbol, account_id), window in per_entity.items():
+                yield metric, symbol, account_id, window.snapshot()
+
+
+def create_metrics_app(metrics: LatencyMetrics) -> FastAPI:
+    """Return a FastAPI application exposing the Prometheus registry."""
+
+    app = FastAPI()
+
+    @app.get("/metrics")
+    def metrics_endpoint() -> Response:
+        payload = generate_latest(metrics.registry)
+        return Response(content=payload, media_type=CONTENT_TYPE_LATEST)
+
+    return app
