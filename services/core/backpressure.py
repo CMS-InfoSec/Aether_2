@@ -118,7 +118,7 @@ class PrioritizedIntentQueue(asyncio.Queue[QueueItem]):
         self._queue: list[QueueItem] = []
 
     def _put(self, item: QueueItem) -> None:  # pragma: no cover - thin wrapper
-        bisect.insort(self._queue, item, key=lambda entry: entry.sort_key)
+        bisect.insort(self._queue, item)
 
     def _get(self) -> QueueItem:  # pragma: no cover - thin wrapper
         return self._queue.pop(0)
