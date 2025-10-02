@@ -15,8 +15,73 @@ from typing import Dict, Optional, Protocol, Set, runtime_checkable
 
 import pyotp
 
+from prometheus_client import CollectorRegistry, Counter
+
+from shared.correlation import get_correlation_id
+
+try:  # pragma: no cover - prefer the real Argon2 implementation when available
+    from passlib.hash import argon2 as _ARGON2_HASHER
+except Exception:  # pragma: no cover - fall back to a minimal stub for tests
+
+    class _StubArgon2Hasher:
+        """Minimal Argon2 interface used for unit tests when passlib is absent."""
+
+        _PREFIX = "$argon2$stub$"
+
+        def hash(self, password: str) -> str:
+            digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
+            return f"{self._PREFIX}{digest}"
+
+        def verify(self, password: str, stored_hash: str) -> bool:
+            if not stored_hash.startswith(self._PREFIX):
+                raise ValueError("invalid argon2 hash")
+            candidate = self.hash(password)
+            return hmac.compare_digest(candidate, stored_hash)
+
+        def needs_update(self, stored_hash: str) -> bool:
+            return not stored_hash.startswith(self._PREFIX)
+
+    _ARGON2_HASHER = _StubArgon2Hasher()
+
 
 logger = logging.getLogger(__name__)
+
+
+_METRICS_REGISTRY: CollectorRegistry
+
+
+def _init_metrics(registry: Optional[CollectorRegistry] = None) -> None:
+    """Initialise Prometheus counters for the module.
+
+    A dedicated registry is used so tests can swap in an isolated registry to
+    ensure metric state does not leak between test cases.
+    """
+
+    global _METRICS_REGISTRY
+    global _LOGIN_FAILURE_COUNTER
+    global _LOGIN_SUCCESS_COUNTER
+    global _MFA_DENIED_COUNTER
+
+    _METRICS_REGISTRY = registry or CollectorRegistry()
+    _LOGIN_FAILURE_COUNTER = Counter(
+        "admin_login_failures_total",
+        "Total number of administrator login failures partitioned by reason.",
+        ["reason"],
+        registry=_METRICS_REGISTRY,
+    )
+    _LOGIN_SUCCESS_COUNTER = Counter(
+        "admin_login_success_total",
+        "Total number of successful administrator logins.",
+        registry=_METRICS_REGISTRY,
+    )
+    _MFA_DENIED_COUNTER = Counter(
+        "admin_mfa_denied_total",
+        "Total number of administrator login attempts denied due to MFA.",
+        registry=_METRICS_REGISTRY,
+    )
+
+
+_init_metrics()
 
 
 
