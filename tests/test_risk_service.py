@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import sys
+from decimal import Decimal
 from pathlib import Path
 from typing import Iterator, Tuple
 
@@ -92,14 +93,12 @@ def test_get_risk_limits_returns_whitelists(risk_app: AccountClient) -> None:
         body = response.json()
         assert body["account_id"] == account
         assert body["limits"]["instrument_whitelist"] == expected[account]
-        assert body["usage"] == {
-            "account_id": account,
-            "realized_daily_loss": 0.0,
-            "fees_paid": 0.0,
-            "net_asset_value": 0.0,
-            "var_95": None,
-            "var_99": None,
-        }
+        usage = body["usage"]
+        assert usage["account_id"] == account
+        for metric in ("realized_daily_loss", "fees_paid", "net_asset_value"):
+            assert Decimal(str(usage[metric])) == Decimal("0")
+        assert usage["var_95"] is None
+        assert usage["var_99"] is None
 
 
 def test_missing_account_returns_404(risk_app: AccountClient) -> None:
@@ -130,3 +129,42 @@ def test_validate_risk_rejects_mismatched_header(risk_app: AccountClient) -> Non
 
     assert response.status_code == 403
     assert response.json()["detail"] == "Account mismatch between header and payload."
+
+
+def test_limits_preserve_large_decimal_usage(risk_app: AccountClient) -> None:
+    client, module = risk_app
+    account_id = "company"
+    large_nav = Decimal("10000000.55")
+    realized_loss = Decimal("1234.56")
+    fees_paid = Decimal("789.01")
+
+    module.set_stub_account_usage(
+        account_id,
+        {
+            "net_asset_value": large_nav,
+            "realized_daily_loss": realized_loss,
+            "fees_paid": fees_paid,
+            "var_95": Decimal("4567.89"),
+            "var_99": Decimal("5678.90"),
+        },
+    )
+
+    response = client.get("/risk/limits", params={"account_id": account_id})
+    assert response.status_code == 200
+    usage = response.json()["usage"]
+    assert Decimal(str(usage["net_asset_value"])) == large_nav
+    assert Decimal(str(usage["realized_daily_loss"])) == realized_loss
+    assert Decimal(str(usage["fees_paid"])) == fees_paid
+    assert Decimal(str(usage["var_95"])) == Decimal("4567.89")
+    assert Decimal(str(usage["var_99"])) == Decimal("5678.90")
+
+    module.set_stub_account_usage(
+        account_id,
+        {
+            "net_asset_value": Decimal("0"),
+            "realized_daily_loss": Decimal("0"),
+            "fees_paid": Decimal("0"),
+            "var_95": None,
+            "var_99": None,
+        },
+    )
