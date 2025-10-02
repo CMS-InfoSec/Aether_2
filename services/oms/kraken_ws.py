@@ -123,6 +123,7 @@ class KrakenWSClient:
         self._reqid = 1
         self._backoff = _JitterBackoff()
         self._subscriptions: List[List[str]] = []
+        self._last_private_heartbeat: Optional[float] = None
 
     async def _default_transport(self, url: str) -> _WebsocketTransport:
         protocol = await websockets.connect(url, ping_interval=None)
@@ -385,6 +386,7 @@ class KrakenWSClient:
         elif channel == "ownTrades":
             await self._handle_own_trades(payload)
         elif channel == "heartbeat":
+            self._last_private_heartbeat = time.time()
             return
         else:
             logger.debug("Unhandled websocket payload: %s", payload)
@@ -462,6 +464,11 @@ class KrakenWSClient:
     def _next_reqid(self) -> int:
         self._reqid += 1
         return self._reqid
+
+    def heartbeat_age(self) -> Optional[float]:
+        if self._last_private_heartbeat is None:
+            return None
+        return max(time.time() - self._last_private_heartbeat, 0.0)
 
 
 def _to_float(value: Any) -> Optional[float]:
