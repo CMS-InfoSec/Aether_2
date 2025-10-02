@@ -10,21 +10,30 @@ Provide a standardized procedure for rotating the AES encryption key that protec
 - Coordinated maintenance window approved by Security and Platform teams if production traffic will be impacted.
 
 ## Generate a Replacement Key
-1. On a secure host, generate a 32-byte AES key and encode it with base64:
+1. On a secure host, define a temporary location for the key and generate a 32-byte
+   AES value encoded with base64:
    ```bash
-   openssl rand -base64 32 > /tmp/secrets-service.aes
+   export KEY_FILE=/tmp/secrets-service.aes
+   umask 077
+   openssl rand -base64 32 > "$KEY_FILE"
    ```
-2. Copy the value into a password manager entry for audit purposes.
+   > **Note:** Setting a restrictive `umask` ensures the file is readable only by the
+   > current operator.
+2. Copy the value stored in `$KEY_FILE` into a password manager entry for audit
+   purposes. The exact same key must be reused for every environment updated during
+   this rotation.
 
 ## Update the Kubernetes Secret
 
 1. Export the previously generated key into an environment variable without exposing it in shell history. If you stored it in
-   `/tmp/secrets-service.aes`, run:
+   `$KEY_FILE`, run:
    ```bash
-   export SECRET_ENCRYPTION_KEY="$(tr -d '\n' < /tmp/secrets-service.aes)"
+   export SECRET_ENCRYPTION_KEY="$(tr -d '\n' < "$KEY_FILE")"
 
    ```
-   If the key was copied into a password manager, retrieve it from there instead of regenerating a new value.
+   If the key was copied into a password manager and the temporary file was removed, set
+   `SECRET_ENCRYPTION_KEY` by pasting the stored base64 value instead of reading
+   from `$KEY_FILE`.
 2. Create an updated secret manifest locally. If the cluster uses Sealed Secrets, run:
    ```bash
    kubectl --context aether-staging \
@@ -61,10 +70,12 @@ Provide a standardized procedure for rotating the AES encryption key that protec
 
 ## Promote to Production
 1. Once staging validation passes, repeat the secret creation process against production using the exact same key that was
-   recorded earlier. Retrieve it securely (for example, `cat /tmp/secrets-service.aes` or copy it from the password manager)
-   and apply it using the appropriate secure method (Sealed Secrets or direct `kubectl apply -f -`).
+   recorded earlier. Retrieve it securely (for example, `cat "$KEY_FILE"` or copy it from the password manager)
+   and apply it using the appropriate secure method (Sealed Secrets or direct `kubectl apply -f -`). If
+   the temporary file was already deleted, paste the stored value directly when exporting
+   `SECRET_ENCRYPTION_KEY`.
    ```bash
-   export SECRET_ENCRYPTION_KEY="$(tr -d '\n' < /tmp/secrets-service.aes)"
+   export SECRET_ENCRYPTION_KEY="$(tr -d '\n' < "$KEY_FILE")"
    kubectl --context aether-production \
      create secret generic secrets-service-config \
      --namespace aether-services \
@@ -74,7 +85,8 @@ Provide a standardized procedure for rotating the AES encryption key that protec
    kubectl --context aether-production rollout restart deployment/secrets-service
    kubectl --context aether-production rollout status deployment/secrets-service
    unset SECRET_ENCRYPTION_KEY
-   rm -f /tmp/secrets-service.aes
+   rm -f "$KEY_FILE"
+   unset KEY_FILE
    ```
 2. Confirm production logs and metrics (error rate, latency) remain healthy for 30 minutes.
 
