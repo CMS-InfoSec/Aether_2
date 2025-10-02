@@ -9,15 +9,17 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status, Header
+
 from fastapi.responses import JSONResponse
 from kubernetes import client, config
 from kubernetes.client import ApiException
 from kubernetes.config.config_exception import ConfigException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 try:  # pragma: no cover - optional audit dependency
@@ -33,6 +35,17 @@ LOGGER = logging.getLogger(__name__)
 SECRETS_LOGGER = logging.getLogger("secrets_log")
 
 
+DEFAULT_ADMIN_ACCOUNTS = {"company", "director-1", "director-2"}
+
+
+def _csv_env(var_name: str, *, default: Optional[Set[str]] = None) -> Set[str]:
+    raw = os.getenv(var_name, "")
+    values = {item.strip() for item in raw.split(",") if item.strip()}
+    if values:
+        return values
+    return set() if default is None else set(default)
+
+
 class Settings(BaseModel):
     kubernetes_namespace: str = Field(
         default_factory=lambda: os.getenv("KRAKEN_SECRET_NAMESPACE", "default")
@@ -42,15 +55,38 @@ class Settings(BaseModel):
         default_factory=lambda: os.getenv("KRAKEN_API_URL", "https://api.kraken.com")
     )
 
+    authorized_tokens: Tuple[str, ...] = Field(..., alias="SECRETS_SERVICE_AUTH_TOKENS")
+
+
     class Config:
         allow_population_by_field_name = True
+
+    @validator("authorized_tokens", pre=True)
+    def _split_tokens(cls, value: Any) -> Tuple[str, ...]:  # type: ignore[override]
+        if isinstance(value, str):
+            tokens = [item.strip() for item in value.split(",") if item.strip()]
+        elif isinstance(value, (list, tuple, set)):
+            tokens = [str(item).strip() for item in value if str(item).strip()]
+        else:
+            raise ValueError("authorized tokens must be provided as a string or sequence")
+
+        if not tokens:
+            raise ValueError("at least one authorized token must be configured")
+
+        return tuple(tokens)
 
 
 def load_settings() -> Settings:
     secret_key = os.getenv("SECRET_ENCRYPTION_KEY")
     if not secret_key:
         raise RuntimeError("SECRET_ENCRYPTION_KEY environment variable must be set")
-    return Settings(SECRET_ENCRYPTION_KEY=secret_key)
+    tokens = os.getenv("SECRETS_SERVICE_AUTH_TOKENS")
+    if not tokens:
+        raise RuntimeError("SECRETS_SERVICE_AUTH_TOKENS environment variable must be set")
+    return Settings(
+        SECRET_ENCRYPTION_KEY=secret_key,
+        SECRETS_SERVICE_AUTH_TOKENS=tokens,
+    )
 
 
 SETTINGS = load_settings()
@@ -95,6 +131,37 @@ class SecretCipher:
 
 
 CIPHER = SecretCipher(_decode_encryption_key(SETTINGS.encryption_key_b64))
+AUTHORIZED_TOKENS = set(SETTINGS.authorized_tokens)
+
+
+def require_authorized_caller(
+    authorization: Optional[str] = Header(None, alias="Authorization")
+) -> str:
+    """Ensure that the caller presents a valid bearer token."""
+
+    if not authorization:
+        LOGGER.warning("Rejected request without authorization header")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authorization header is required",
+        )
+
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        LOGGER.warning("Rejected request with malformed authorization header")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authorization header",
+        )
+
+    if token not in AUTHORIZED_TOKENS:
+        LOGGER.warning("Rejected request with unauthorized token")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Caller is not authorized",
+        )
+
+    return token
 
 
 class KrakenSecretManager:
@@ -259,10 +326,45 @@ def get_secret_manager() -> KrakenSecretManager:
     return secret_manager
 
 
+def authorize_request(
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    admin_id: Optional[str] = Header(default=None, alias="X-Admin-ID"),
+) -> str:
+    if admin_id:
+        if admin_id in SETTINGS.authorized_admins:
+            return admin_id
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin identity is not authorized to manage Kraken secrets.",
+        )
+
+    if authorization:
+        if not authorization.startswith("Bearer "):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authorization header must use the Bearer scheme.",
+            )
+        token = authorization.partition(" ")[2].strip()
+        if token and token in SETTINGS.service_tokens:
+            return f"service:{token}"
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Service token is not authorized to access Kraken secrets.",
+        )
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Authentication is required to access Kraken secrets.",
+    )
+
+
 @app.post("/secrets/kraken", status_code=status.HTTP_201_CREATED)
 async def store_kraken_secret(
     payload: KrakenSecretRequest,
     request: Request,
+
+    _: str = Depends(require_authorized_caller),
+
     manager: KrakenSecretManager = Depends(get_secret_manager),
 ) -> JSONResponse:
     masked_key = redact_secret(payload.api_key)
@@ -321,6 +423,9 @@ async def store_kraken_secret(
 @app.get("/secrets/kraken/status")
 async def kraken_secret_status(
     account_id: str = Query(..., min_length=1),
+
+    _: str = Depends(require_authorized_caller),
+
     manager: KrakenSecretManager = Depends(get_secret_manager),
 ) -> Dict[str, str]:
     LOGGER.info("Status requested for Kraken secret %s", account_id)
@@ -330,7 +435,11 @@ async def kraken_secret_status(
 
 @app.post("/secrets/kraken/test")
 async def test_kraken_credentials(
-    payload: KrakenTestRequest, manager: KrakenSecretManager = Depends(get_secret_manager)
+    payload: KrakenTestRequest,
+
+    _: str = Depends(require_authorized_caller),
+
+    manager: KrakenSecretManager = Depends(get_secret_manager),
 ) -> Dict[str, Any]:
     LOGGER.info("Testing Kraken credentials for account %s", payload.account_id)
     credentials = manager.get_decrypted_credentials(payload.account_id)
@@ -370,5 +479,5 @@ async def test_kraken_credentials(
     return {"result": "success", "data": response.get("result", {})}
 
 
-__all__ = ["app"]
+__all__ = ["app", "require_authorized_caller", "get_secret_manager"]
 

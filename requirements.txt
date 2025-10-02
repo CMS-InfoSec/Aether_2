@@ -25,3 +25,4 @@ markdown2>=2.4
 
 
 cryptography>=41.0.0
+passlib[argon2]>=1.7.4

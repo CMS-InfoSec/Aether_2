@@ -27,8 +27,10 @@ from scaling_controller import (
 )
 from services.alert_manager import setup_alerting
 from services.alerts.alert_dedupe import router as alert_dedupe_router, setup_alert_dedupe
+
 from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
 from shared.correlation import CorrelationIdMiddleware
+
 
 
 logger = logging.getLogger(__name__)
@@ -52,6 +54,12 @@ def _build_session_store_from_env() -> SessionStoreProtocol:
         client = redis.Redis.from_url(redis_url)
         return RedisSessionStore(client, ttl_minutes=ttl_minutes)
     return InMemorySessionStore(ttl_minutes=ttl_minutes)
+
+from scaling_controller import (
+    build_scaling_controller_from_env,
+    configure_scaling_controller,
+    router as scaling_router,
+)
 
 
 def _maybe_include_router(app: FastAPI, module: str, attribute: str) -> None:
@@ -90,11 +98,13 @@ def create_app(
     _maybe_include_router(app, "exposure_forecast", "router")
     _maybe_include_router(app, "alert_prioritizer", "router")
     app.include_router(alert_dedupe_router)
+
     _maybe_include_router(app, "services.models.meta_learner", "router")
     _maybe_include_router(app, "services.models.model_zoo", "router")
     _maybe_include_router(app, "multiformat_export", "router")
     _maybe_include_router(app, "compliance_pack", "router")
     _maybe_include_router(app, "pack_exporter", "router")
+
 
     scaling_controller = build_scaling_controller_from_env()
     configure_scaling_controller(scaling_controller)

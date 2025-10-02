@@ -6,7 +6,7 @@ workflow:
 * Exchanges an OAuth2 authorization code for tokens with Microsoft Entra ID or Google
   Identity using OIDC discovery metadata.
 * Enforces multi-factor authentication (MFA) with support for TOTP codes and SMS codes.
-* Issues a short-lived JWT where ``role=admin`` to integrate with downstream services.
+* Issues a short-lived JWT using the caller's resolved role for downstream services.
 * Persists login sessions to the ``auth_sessions`` table for auditing and analytics.
 * Returns Builder.io Fusion specific context needed by the frontend to complete the
   authentication flow.
@@ -44,7 +44,6 @@ encoder to avoid adding new packages to the environment.
 """
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import os
@@ -65,9 +64,23 @@ from sqlalchemy.orm import Session as OrmSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from services.auth.jwt_tokens import create_jwt
+
 
 logger = logging.getLogger("auth_service")
 logging.basicConfig(level=logging.INFO)
+
+
+def _require_env(name: str) -> str:
+    """Return a required environment variable or raise a runtime error."""
+
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"{name} environment variable must be set before starting the auth service")
+    return value
+
+
+JWT_SECRET = _require_env("AUTH_JWT_SECRET")
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +283,7 @@ class MFAVerifier:
 # ---------------------------------------------------------------------------
 
 
+
 def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
@@ -282,22 +296,21 @@ def _sign(data: bytes, secret: str) -> str:
     return _b64url(digest)
 
 
-def create_jwt(*, subject: str, ttl_seconds: Optional[int] = None) -> tuple[str, datetime]:
+def create_jwt(*, subject: str, role: str, ttl_seconds: Optional[int] = None) -> tuple[str, datetime]:
     ttl = ttl_seconds or int(os.getenv("AUTH_JWT_TTL_SECONDS", "3600"))
     now = datetime.now(timezone.utc)
     payload = {
         "sub": subject,
-        "role": "admin",
+        "role": role,
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(seconds=ttl)).timestamp()),
     }
     header = {"alg": "HS256", "typ": "JWT"}
-    secret = os.getenv("AUTH_JWT_SECRET", "change-me")
 
     header_b64 = _b64url(json.dumps(header, separators=(",", ":"), sort_keys=True).encode("utf-8"))
     payload_b64 = _b64url(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
     signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
-    signature = _sign(signing_input, secret)
+    signature = _sign(signing_input, JWT_SECRET)
     token = f"{header_b64}.{payload_b64}.{signature}"
     return token, now + timedelta(seconds=ttl)
 
@@ -322,7 +335,7 @@ class LoginResponse(BaseModel):
     access_token: str = Field(..., description="Signed JWT access token")
     token_type: Literal["bearer"] = Field("bearer", description="Token type indicator")
     expires_at: datetime = Field(..., description="Token expiration timestamp")
-    role: Literal["admin"] = Field("admin", description="Role claim included in the token")
+    role: str = Field(..., description="Role claim included in the token")
     session_token: str = Field(..., description="Identifier for the persisted auth session")
     builder_fusion: BuilderFusionPayload
 
@@ -373,6 +386,22 @@ async def _persist_session(repo: SessionRepository, *, user_id: str) -> AuthSess
     return await run_in_threadpool(repo.create, user_id=user_id, mfa_verified=True)
 
 
+def _resolve_role(claims: Mapping[str, Any]) -> str:
+    """Determine the role claim to embed in the issued JWT."""
+
+    role_claim = claims.get("role")
+    if isinstance(role_claim, str) and role_claim:
+        return role_claim
+
+    roles_claim = claims.get("roles")
+    if isinstance(roles_claim, (list, tuple)):
+        for candidate in roles_claim:
+            if isinstance(candidate, str) and candidate:
+                return candidate
+
+    return os.getenv("AUTH_DEFAULT_ROLE", "admin")
+
+
 async def authenticate(
     payload: LoginRequest,
     *,
@@ -400,7 +429,9 @@ async def authenticate(
     if not mfa.verify(user_id=user_id, method=payload.mfa_method, code=payload.mfa_code):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="mfa_verification_failed")
 
-    token, expires_at = create_jwt(subject=user_id)
+    role = _resolve_role(userinfo)
+
+    token, expires_at = create_jwt(subject=user_id, role=role)
     session = await _persist_session(sessions, user_id=user_id)
 
     builder_payload = BuilderFusionPayload(
@@ -413,7 +444,7 @@ async def authenticate(
         access_token=token,
         token_type="bearer",
         expires_at=expires_at,
-        role="admin",
+        role=role,
         session_token=session.session_token,
         builder_fusion=builder_payload,
     )

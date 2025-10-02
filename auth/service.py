@@ -4,7 +4,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+
 import os
+
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
@@ -13,7 +15,9 @@ from typing import Dict, Optional, Protocol, Set, runtime_checkable
 
 import pyotp
 
+
 logger = logging.getLogger(__name__)
+
 
 
 @dataclass
@@ -23,6 +27,7 @@ class AdminAccount:
     password_hash: str
     mfa_secret: str
     allowed_ips: Optional[Set[str]] = None
+
 
 
 @runtime_checkable
@@ -37,6 +42,7 @@ class AdminRepositoryProtocol(Protocol):
 
 
 class InMemoryAdminRepository(AdminRepositoryProtocol):
+
     """Simple in-memory repository for administrator accounts."""
 
     def __init__(self) -> None:
@@ -263,9 +269,49 @@ class AuthService:
         self._repository = repository
         self._sessions = sessions
 
+    def _record_failure(
+        self,
+        *,
+        reason: str,
+        email: str,
+        ip_address: Optional[str],
+        admin_id: Optional[str] = None,
+    ) -> None:
+        correlation_id = get_correlation_id()
+        extra = {
+            "auth_event": "auth_login_failure",
+            "auth_reason": reason,
+            "auth_email": email,
+            "auth_ip": ip_address,
+            "correlation_id": correlation_id,
+        }
+        if admin_id:
+            extra["auth_admin_id"] = admin_id
+        logger.warning("Admin login failed", extra=extra)
+        _LOGIN_FAILURE_COUNTER.labels(reason=reason).inc()
+        if reason == "mfa_required":
+            _MFA_DENIED_COUNTER.inc()
+
     def _verify_password(self, admin: AdminAccount, password: str) -> bool:
+        stored_hash = admin.password_hash
+        # Prefer Argon2id verification for new credentials.
+        if stored_hash.startswith("$argon2"):
+            try:
+                if not _ARGON2_HASHER.verify(password, stored_hash):
+                    return False
+            except ValueError:
+                return False
+            if _ARGON2_HASHER.needs_update(stored_hash):
+                admin.password_hash = hash_password(password)
+            return True
+
+        # Backwards compatibility with legacy SHA-256 hashes.
         candidate = hashlib.sha256(password.encode()).hexdigest()
-        return hmac.compare_digest(candidate, admin.password_hash)
+        if hmac.compare_digest(candidate, stored_hash):
+            # Upgrade legacy hash on successful login.
+            admin.password_hash = hash_password(password)
+            return True
+        return False
 
     def _verify_mfa(self, admin: AdminAccount, code: str) -> bool:
         totp = pyotp.TOTP(admin.mfa_secret)
@@ -286,18 +332,44 @@ class AuthService:
     ) -> Session:
         admin = self._repository.get_by_email(email)
         if admin is None:
+            self._record_failure(
+                reason="invalid_credentials",
+                email=email,
+                ip_address=ip_address,
+                admin_id=None,
+            )
             raise PermissionError("invalid credentials")
         if not self._verify_ip(admin, ip_address):
+            self._record_failure(
+                reason="ip_not_allowed",
+                email=email,
+                ip_address=ip_address,
+                admin_id=admin.admin_id,
+            )
             raise PermissionError("ip_not_allowed")
         if not self._verify_password(admin, password):
+            self._record_failure(
+                reason="invalid_credentials",
+                email=email,
+                ip_address=ip_address,
+                admin_id=admin.admin_id,
+            )
             raise PermissionError("invalid credentials")
         if not mfa_code or not self._verify_mfa(admin, mfa_code):
+            self._record_failure(
+                reason="mfa_required",
+                email=email,
+                ip_address=ip_address,
+                admin_id=admin.admin_id,
+            )
             raise PermissionError("mfa_required")
-        return self._sessions.create(admin.admin_id)
+        session = self._sessions.create(admin.admin_id)
+        _LOGIN_SUCCESS_COUNTER.inc()
+        return session
 
 
 def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
+    return _ARGON2_HASHER.hash(password)
 
 
 __all__ = [
