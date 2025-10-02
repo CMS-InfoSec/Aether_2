@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import types
+from decimal import Decimal
 
 import pytest
 
@@ -30,6 +31,33 @@ _websocket_exceptions.WebSocketException = _DummyWebSocketException
 sys.modules.setdefault("websockets", _websockets_stub)
 sys.modules.setdefault("websockets.exceptions", _websocket_exceptions)
 
+_aiohttp_stub = types.ModuleType("aiohttp")
+
+
+class _DummyClientSession:
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        return None
+
+    async def close(self) -> None:  # pragma: no cover - not used in tests
+        return None
+
+
+class _DummyClientTimeout:
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        return None
+
+
+class _DummyClientError(Exception):
+    pass
+
+
+_aiohttp_stub.ClientSession = _DummyClientSession  # type: ignore[attr-defined]
+_aiohttp_stub.ClientTimeout = _DummyClientTimeout  # type: ignore[attr-defined]
+_aiohttp_stub.ClientError = _DummyClientError  # type: ignore[attr-defined]
+
+sys.modules.setdefault("aiohttp", _aiohttp_stub)
+
+from services.oms.kraken_rest import KrakenRESTClient
 from services.oms.kraken_ws import KrakenWSClient, KrakenWSError
 
 
@@ -94,3 +122,49 @@ def test_sign_auth_rest_failure_raises() -> None:
             await client._sign_auth()
 
     asyncio.run(_run())
+
+
+def test_ack_from_payload_preserves_decimal_precision() -> None:
+    async def _creds() -> dict[str, str]:
+        return {}
+
+    client = KrakenWSClient(credential_getter=_creds)
+
+    payload = {
+        "result": {
+            "txid": "ABC123",
+            "status": "filled",
+            "filled": "0.123456789",  # 9 decimal places
+            "avg_price": "12345.67890123",  # high precision price
+        }
+    }
+
+    ack = client._ack_from_payload(payload)
+
+    assert isinstance(ack.filled_qty, Decimal)
+    assert isinstance(ack.avg_price, Decimal)
+    assert ack.filled_qty == Decimal("0.123456789")
+    assert ack.avg_price == Decimal("12345.67890123")
+
+
+def test_rest_parse_response_preserves_decimal_precision() -> None:
+    async def _creds() -> dict[str, str]:
+        return {}
+
+    client = KrakenRESTClient(credential_getter=_creds)
+
+    payload = {
+        "result": {
+            "txid": ["XYZ987"],
+            "status": "ok",
+            "filled": "0.000000123456789",  # 15 decimal places
+            "avg_price": "98765.432109876",  # high precision price
+        }
+    }
+
+    ack = client._parse_response(payload)
+
+    assert isinstance(ack.filled_qty, Decimal)
+    assert isinstance(ack.avg_price, Decimal)
+    assert ack.filled_qty == Decimal("0.000000123456789")
+    assert ack.avg_price == Decimal("98765.432109876")

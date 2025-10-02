@@ -9,6 +9,7 @@ import logging
 import random
 import time
 import urllib.parse
+from decimal import Decimal, InvalidOperation
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 import aiohttp
@@ -149,8 +150,8 @@ class KrakenRESTClient:
         return OrderAck(
             status=status_value or "ok",
             exchange_order_id=str(txid) if txid else None,
-            filled_qty=_to_float(filled),
-            avg_price=_to_float(avg_price),
+            filled_qty=_to_decimal(filled),
+            avg_price=_to_decimal(avg_price),
             errors=None,
         )
 
@@ -168,13 +169,25 @@ class KrakenRESTClient:
         return base64.b64encode(mac.digest()).decode()
 
 
-def _to_float(value: Any) -> Optional[float]:
+def _to_decimal(value: Any) -> Optional[Decimal]:
     if value is None:
         return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):  # pragma: no cover
-        return None
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            return Decimal(stripped)
+        except InvalidOperation:
+            return None
+    if isinstance(value, (int, float)):
+        try:
+            return Decimal(str(value))
+        except InvalidOperation:  # pragma: no cover - defensive
+            return None
+    return None
 
 
 def _is_retryable(errors: list[Any]) -> bool:

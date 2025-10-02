@@ -6,6 +6,7 @@ import json
 import logging
 import random
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional
 
 import websockets
@@ -30,8 +31,8 @@ class KrakenWSTimeout(asyncio.TimeoutError):
 class OrderAck:
     exchange_order_id: Optional[str]
     status: Optional[str]
-    filled_qty: Optional[float]
-    avg_price: Optional[float]
+    filled_qty: Optional[Decimal]
+    avg_price: Optional[Decimal]
     errors: Optional[List[str]]
 
 
@@ -40,8 +41,8 @@ class OrderState:
     client_order_id: Optional[str]
     exchange_order_id: Optional[str]
     status: str
-    filled_qty: Optional[float]
-    avg_price: Optional[float]
+    filled_qty: Optional[Decimal]
+    avg_price: Optional[Decimal]
     errors: Optional[List[str]]
     transport: str = "websocket"
 
@@ -415,8 +416,8 @@ class KrakenWSClient:
             client_order_id=str(client) if client is not None else None,
             exchange_order_id=str(exchange) if exchange is not None else None,
             status=str(data.get("status", "open")),
-            filled_qty=_to_float(data.get("filled") or data.get("vol_exec")),
-            avg_price=_to_float(data.get("avg_price") or data.get("price")),
+            filled_qty=_to_decimal(data.get("filled") or data.get("vol_exec")),
+            avg_price=_to_decimal(data.get("avg_price") or data.get("price")),
             errors=None,
         )
         await self._queue.put(state)
@@ -446,8 +447,8 @@ class KrakenWSClient:
         status = payload.get("status") or payload.get("result", {}).get("status")
         txid = payload.get("txid") or payload.get("result", {}).get("txid")
         result = payload.get("result") or {}
-        filled = _to_float(result.get("filled"))
-        price = _to_float(result.get("avg_price"))
+        filled = _to_decimal(result.get("filled"))
+        price = _to_decimal(result.get("avg_price"))
         errors = payload.get("error") or result.get("error")
         if isinstance(errors, str):
             errors = [errors]
@@ -464,11 +465,23 @@ class KrakenWSClient:
         return self._reqid
 
 
-def _to_float(value: Any) -> Optional[float]:
+def _to_decimal(value: Any) -> Optional[Decimal]:
     if value is None:
         return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):  # pragma: no cover - defensive
-        return None
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            return Decimal(stripped)
+        except InvalidOperation:
+            return None
+    if isinstance(value, (int, float)):
+        try:
+            return Decimal(str(value))
+        except InvalidOperation:  # pragma: no cover - defensive
+            return None
+    return None
 

@@ -810,8 +810,8 @@ class AccountContext:
         result = OMSOrderStatusResponse(
             exchange_order_id=state.exchange_order_id or state.client_order_id,
             status=state.status,
-            filled_qty=Decimal(str(state.filled_qty or 0)),
-            avg_price=Decimal(str(state.avg_price or 0)),
+            filled_qty=state.filled_qty if state.filled_qty is not None else Decimal("0"),
+            avg_price=state.avg_price if state.avg_price is not None else Decimal("0"),
             errors=state.errors or None,
         )
         async with self._orders_lock:
@@ -1311,17 +1311,16 @@ class AccountContext:
                 return decimal_value
         return None
 
-    def _extract_float(self, payload: Dict[str, Any], keys: List[str]) -> float | None:
+    def _extract_float(self, payload: Dict[str, Any], keys: List[str]) -> Decimal | None:
         for key in keys:
             if key not in payload:
                 continue
             value = payload.get(key)
             if value is None:
                 continue
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                continue
+            decimal_value = self._extract_decimal(value)
+            if decimal_value is not None:
+                return decimal_value
         return None
 
     def _extract_decimal(self, value: Any) -> Decimal | None:
@@ -1496,8 +1495,8 @@ class AccountContext:
                     OMSOrderStatusResponse(
                         exchange_order_id=ack.exchange_order_id or txid,
                         status=status_value,
-                        filled_qty=Decimal(str(ack.filled_qty or 0)),
-                        avg_price=Decimal(str(ack.avg_price or 0)),
+                        filled_qty=ack.filled_qty if ack.filled_qty is not None else Decimal("0"),
+                        avg_price=ack.avg_price if ack.avg_price is not None else Decimal("0"),
                         errors=ack.errors or None,
                     )
                 )
@@ -1866,8 +1865,8 @@ class AccountContext:
         ack: OrderAck,
     ) -> OMSOrderStatusResponse:
         status_value = ack.status or ("rejected" if ack.errors else "accepted")
-        filled = Decimal(str(ack.filled_qty or 0))
-        avg_price = Decimal(str(ack.avg_price or 0))
+        filled = ack.filled_qty if ack.filled_qty is not None else Decimal("0")
+        avg_price = ack.avg_price if ack.avg_price is not None else Decimal("0")
         return OMSOrderStatusResponse(
             exchange_order_id=ack.exchange_order_id or client_id,
             status=status_value,

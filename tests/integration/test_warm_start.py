@@ -364,16 +364,22 @@ class _ExchangeClientBase:
         filled_value = response.get("filled")
         if filled_value is None and {"volume", "remaining"} <= response.keys():
             try:
-                filled_value = float(response["volume"]) - float(response["remaining"])
+                filled_value = Decimal(str(response["volume"])) - Decimal(str(response["remaining"]))
+            except Exception:  # pragma: no cover - defensive
+                filled_value = None
+        elif filled_value is not None:
+            try:
+                filled_value = Decimal(str(filled_value))
             except Exception:  # pragma: no cover - defensive
                 filled_value = None
 
         avg_price = None
         fills = response.get("fills") or []
         if fills:
-            total_qty = sum(float(fill.get("volume", 0.0)) for fill in fills)
+            total_qty = sum(Decimal(str(fill.get("volume", 0.0))) for fill in fills)
             total_notional = sum(
-                float(fill.get("price", 0.0)) * float(fill.get("volume", 0.0)) for fill in fills
+                Decimal(str(fill.get("price", 0.0))) * Decimal(str(fill.get("volume", 0.0)))
+                for fill in fills
             )
             if total_qty:
                 avg_price = total_notional / total_qty
@@ -381,7 +387,7 @@ class _ExchangeClientBase:
         return OrderAck(
             exchange_order_id=str(exchange_order_id) if exchange_order_id is not None else None,
             status=str(status) if status is not None else None,
-            filled_qty=float(filled_value) if filled_value is not None else None,
+            filled_qty=filled_value,
             avg_price=avg_price,
             errors=None,
         )
@@ -391,14 +397,14 @@ class _ExchangeClientBase:
             return
         order_id = str(response.get("txid"))
         fills = response.get("fills") or []
-        total_filled = float(response.get("filled", 0.0))
+        total_filled = Decimal(str(response.get("filled", 0.0)))
         status = str(response.get("status", "open"))
         if not fills:
             state = OrderState(
                 client_order_id=client_id,
                 exchange_order_id=order_id,
                 status=status,
-                filled_qty=total_filled if total_filled else None,
+                filled_qty=total_filled if total_filled != Decimal("0") else None,
                 avg_price=None,
                 errors=None,
                 transport=transport,
@@ -406,15 +412,16 @@ class _ExchangeClientBase:
             await self._stream_update_cb(state)
             return
 
-        cumulative = 0.0
-        notional = 0.0
+        cumulative = Decimal("0")
+        notional = Decimal("0")
+        tolerance = Decimal("1e-9")
         for fill in fills:
-            volume = float(fill.get("volume", 0.0))
-            price = float(fill.get("price", 0.0))
+            volume = Decimal(str(fill.get("volume", 0.0)))
+            price = Decimal(str(fill.get("price", 0.0)))
             cumulative += volume
             notional += price * volume
-            avg_price = notional / cumulative if cumulative else None
-            final_fill = total_filled and abs(cumulative - total_filled) < 1e-9
+            avg_price = (notional / cumulative) if cumulative else None
+            final_fill = total_filled != Decimal("0") and abs(cumulative - total_filled) <= tolerance
             state = OrderState(
                 client_order_id=client_id,
                 exchange_order_id=order_id,
@@ -453,12 +460,12 @@ class _ExchangeClientBase:
                     "userref": self._lookup_client(order_id),
                     "pair": trade.get("pair"),
                     "status": "filled",
-                    "filled": 0.0,
-                    "notional": 0.0,
+                    "filled": Decimal("0"),
+                    "notional": Decimal("0"),
                 },
             )
-            volume = float(trade.get("volume", 0.0))
-            price = float(trade.get("price", 0.0))
+            volume = Decimal(str(trade.get("volume", 0.0)))
+            price = Decimal(str(trade.get("price", 0.0)))
             entry["filled"] += volume
             entry["notional"] += price * volume
 
@@ -466,7 +473,7 @@ class _ExchangeClientBase:
         for order_id, data in aggregates.items():
             filled = data.pop("filled")
             notional = data.pop("notional")
-            avg_price = notional / filled if filled else None
+            avg_price = (notional / filled) if filled else None
             order = self._exchange._orders.get(order_id)  # noqa: SLF001 - test helper access
             if order is not None and getattr(order, "remaining", 0.0) > 0:
                 data["status"] = "partially_filled"
