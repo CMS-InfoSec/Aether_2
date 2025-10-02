@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Query, status
@@ -32,6 +34,11 @@ from services.oms.kraken_ws import (
 from services.oms.rate_limit_guard import RateLimitGuard, rate_limit_guard as shared_rate_limit_guard
 
 from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
+from services.oms.oms_service import (  # type: ignore  # pragma: no cover - shared helpers
+    _PrecisionValidator,
+    _normalize_symbol,
+    _resolve_pair_metadata,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -73,11 +80,33 @@ def _flush_oms_event_buffers() -> None:
 shutdown_manager.register_flush_callback(_flush_oms_event_buffers)
 
 
-def _format_decimal(value: float) -> str:
-    text = f"{value:.16f}"
-    if "." in text:
-        text = text.rstrip("0").rstrip(".")
-    return text or "0"
+def _coerce_decimal(value: Any) -> Decimal:
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, (int, str)):
+        candidate = str(value)
+    elif isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("Non-finite numeric values are not supported")
+        candidate = repr(value)
+    else:
+        candidate = str(value)
+    try:
+        return Decimal(candidate)
+    except (InvalidOperation, TypeError) as exc:
+        raise ValueError(f"Invalid decimal value: {value}") from exc
+
+
+def _coerce_optional_decimal(value: Any) -> Optional[Decimal]:
+    if value is None:
+        return None
+    return _coerce_decimal(value)
+
+
+def _format_decimal(value: Decimal) -> str:
+    normalized = value.normalize()
+    # Ensure we always render in fixed-point form to match Kraken expectations
+    return format(normalized, "f")
 
 
 def oms_log(order_id: Optional[str], account_id: str, status: str, ts: datetime | None = None) -> None:
@@ -122,24 +151,40 @@ class PlaceOrderRequest(BaseModel):
     client_id: str = Field(..., description="Client supplied idempotency key")
     symbol: str = Field(..., description="Trading symbol e.g. BTC/USD")
     side: str = Field(..., description="BUY or SELL")
-    order_type: str = Field(..., alias="type", description="Order type (limit, market, stop)" )
-    qty: float = Field(..., gt=0, description="Quantity to trade")
-    limit_px: Optional[float] = Field(None, gt=0, description="Limit price when applicable")
+    order_type: str = Field(..., alias="type", description="Order type (limit, market, stop)")
+    qty: Decimal = Field(..., gt=Decimal("0"), description="Quantity to trade")
+    limit_px: Optional[Decimal] = Field(
+        None,
+        gt=Decimal("0"),
+        description="Limit price when applicable",
+    )
     tif: Optional[str] = Field(None, description="Time in force (GTC, IOC, FOK)")
-    tp: Optional[float] = Field(None, gt=0, description="Take profit price")
-    sl: Optional[float] = Field(None, gt=0, description="Stop loss price")
-    trailing: Optional[float] = Field(None, gt=0, description="Trailing stop offset")
+    tp: Optional[Decimal] = Field(
+        None,
+        gt=Decimal("0"),
+        description="Take profit price",
+    )
+    sl: Optional[Decimal] = Field(
+        None,
+        gt=Decimal("0"),
+        description="Stop loss price",
+    )
+    trailing: Optional[Decimal] = Field(
+        None,
+        gt=Decimal("0"),
+        description="Trailing stop offset",
+    )
     flags: List[str] = Field(default_factory=list, description="Additional Kraken oflags")
     post_only: bool = Field(False, description="Whether the order is post-only")
     reduce_only: bool = Field(False, description="Whether the order is reduce-only")
-    expected_fee_bps: Optional[float] = Field(
+    expected_fee_bps: Optional[Decimal] = Field(
         None,
-        ge=0.0,
+        ge=Decimal("0"),
         description="Fee estimate in basis points provided by the caller",
     )
-    expected_slippage_bps: Optional[float] = Field(
+    expected_slippage_bps: Optional[Decimal] = Field(
         None,
-        ge=0.0,
+        ge=Decimal("0"),
         description="Slippage estimate in basis points provided by the caller",
     )
 
@@ -173,6 +218,21 @@ class PlaceOrderRequest(BaseModel):
         if isinstance(value, (set, tuple)):
             return list(value)
         raise ValueError("flags must be a list of strings")
+
+    @field_validator("qty", mode="before")
+    @classmethod
+    def parse_qty(cls, value: Any) -> Decimal:
+        return _coerce_decimal(value)
+
+    @field_validator("limit_px", "tp", "sl", "trailing", mode="before")
+    @classmethod
+    def parse_optional_price(cls, value: Any) -> Optional[Decimal]:
+        return _coerce_optional_decimal(value)
+
+    @field_validator("expected_fee_bps", "expected_slippage_bps", mode="before")
+    @classmethod
+    def parse_optional_bps(cls, value: Any) -> Optional[Decimal]:
+        return _coerce_optional_decimal(value)
 
 
 class CancelOrderRequest(BaseModel):
@@ -274,16 +334,25 @@ class OrderContext:
     account_id: str
     symbol: str
     side: str
-    qty: float
+    qty: Decimal
     client_id: str
     post_only: bool
     reduce_only: bool
     tif: Optional[str]
-    price: Optional[float] = None
-    expected_fee_bps: float = 0.0
-    expected_slippage_bps: float = 0.0
-    last_filled: float = 0.0
-    last_fee: float = 0.0
+    price: Optional[Decimal] = None
+    expected_fee_bps: Decimal = Decimal("0")
+    expected_slippage_bps: Decimal = Decimal("0")
+    last_filled: Decimal = Decimal("0")
+    last_fee: Decimal = Decimal("0")
+
+
+@dataclass
+class _SnappedOrderFields:
+    qty: Decimal
+    limit_px: Optional[Decimal]
+    take_profit: Optional[Decimal]
+    stop_loss: Optional[Decimal]
+    trailing: Optional[Decimal]
 
 
 @dataclass
@@ -325,6 +394,8 @@ class KrakenSession:
         self._contexts: Dict[str, OrderContext] = {}
         self._client_lookup: Dict[str, str] = {}
         self._kafka = KafkaNATSAdapter(account_id=self.account_id)
+        self._metadata: Optional[Dict[str, Any]] = None
+        self._metadata_lock = asyncio.Lock()
 
     async def ensure_started(self) -> None:
         if self._ready.is_set():
@@ -347,6 +418,7 @@ class KrakenSession:
         await self._ws_client.close()
         await self._rest_client.close()
         self._ready.clear()
+        self._metadata = None
 
     async def place_order(self, payload: Dict[str, Any], context: OrderContext) -> Tuple[OrderAck, str]:
         await self.ensure_started()
@@ -433,6 +505,34 @@ class KrakenSession:
 
     def get_order(self, order_id: str) -> Optional[OrderRecord]:
         return self._orders.get(order_id)
+
+    async def get_metadata(self) -> Optional[Dict[str, Any]]:
+        if self._metadata is not None:
+            return self._metadata
+
+        async with self._metadata_lock:
+            if self._metadata is not None:
+                return self._metadata
+
+            fetcher = getattr(self._rest_client, "asset_pairs", None)
+            if fetcher is None:
+                logger.debug(
+                    "Kraken REST client missing asset_pairs() method; skipping metadata preload",
+                )
+                self._metadata = None
+                return None
+
+            try:
+                result = await fetcher()
+            except Exception as exc:  # pragma: no cover - network errors
+                logger.warning(
+                    "Failed to load Kraken metadata for %s: %s", self.account_id, exc
+                )
+                self._metadata = None
+            else:
+                self._metadata = result if isinstance(result, dict) else None
+
+        return self._metadata
 
     def resolve_order_id(self, client_id: str) -> Optional[str]:
         return self._client_lookup.get(client_id)
@@ -525,25 +625,27 @@ class KrakenSession:
         oms_log(exchange_id, self.account_id, self._orders[exchange_id].status, updated_at)
 
     def _maybe_publish_fill(self, exchange_id: str, context: OrderContext, state: OrderState) -> None:
-        filled = state.filled_qty
-        if filled is None:
+        filled_decimal = _coerce_optional_decimal(state.filled_qty)
+        if filled_decimal is None:
             return
-        if filled <= context.last_filled:
+        if filled_decimal <= context.last_filled:
             return
-        delta = filled - context.last_filled
-        context.last_filled = filled
-        fee = 0.0
+        delta = filled_decimal - context.last_filled
+        context.last_filled = filled_decimal
+        fee = Decimal("0")
         liquidity = "maker" if context.post_only else "taker"
         own_trades = getattr(self._ws_client, "_own_trades", {})
         trade = own_trades.get(exchange_id)
         if isinstance(trade, dict):
             fee_value = trade.get("fee") or trade.get("fee_paid")
             try:
-                total_fee = float(fee_value)
-            except (TypeError, ValueError):
+                total_fee = _coerce_decimal(fee_value)
+            except ValueError:
                 total_fee = context.last_fee
-            fee = max(total_fee - context.last_fee, 0.0)
-            context.last_fee = max(total_fee, context.last_fee)
+            fee_delta = total_fee - context.last_fee
+            fee = fee_delta if fee_delta > 0 else Decimal("0")
+            if total_fee > context.last_fee:
+                context.last_fee = total_fee
             liquidity_hint = trade.get("liquidity") or trade.get("type")
             if isinstance(liquidity_hint, str):
                 liquidity_hint = liquidity_hint.lower()
@@ -551,12 +653,22 @@ class KrakenSession:
                     liquidity = "maker"
                 elif liquidity_hint in {"taker", "t"}:
                     liquidity = "taker"
-        avg_price = state.avg_price if state.avg_price is not None else context.price or 0.0
-        notional = max(delta * float(avg_price), 0.0)
-        estimated_fee_bps = max(context.expected_fee_bps, 0.0)
-        estimated_fee_usd = notional * (estimated_fee_bps / 10_000) if notional > 0 else 0.0
-        actual_fee_usd = max(fee, 0.0)
-        actual_fee_bps = (actual_fee_usd / notional * 10_000) if notional > 0 else 0.0
+        avg_price_decimal = _coerce_optional_decimal(state.avg_price) or context.price or Decimal("0")
+        notional = delta * avg_price_decimal
+        if notional < 0:
+            notional = -notional
+        estimated_fee_bps = context.expected_fee_bps if context.expected_fee_bps > 0 else Decimal("0")
+        estimated_fee_usd = (
+            notional * (estimated_fee_bps / Decimal("10000"))
+            if notional > 0
+            else Decimal("0")
+        )
+        actual_fee_usd = fee if fee > 0 else Decimal("0")
+        actual_fee_bps = (
+            actual_fee_usd / notional * Decimal("10000")
+            if notional > 0
+            else Decimal("0")
+        )
         discrepancy_bps = actual_fee_bps - estimated_fee_bps
         logger.info(
             "oms_fee_reconciliation",
@@ -565,21 +677,21 @@ class KrakenSession:
                 "account_id": self.account_id,
                 "symbol": context.symbol,
                 "liquidity": liquidity,
-                "notional_usd": notional,
-                "estimated_fee_bps": estimated_fee_bps,
-                "actual_fee_bps": actual_fee_bps,
-                "estimated_fee_usd": estimated_fee_usd,
-                "actual_fee_usd": actual_fee_usd,
-                "expected_slippage_bps": context.expected_slippage_bps,
-                "discrepancy_bps": discrepancy_bps,
+                "notional_usd": float(notional),
+                "estimated_fee_bps": float(estimated_fee_bps),
+                "actual_fee_bps": float(actual_fee_bps),
+                "estimated_fee_usd": float(estimated_fee_usd),
+                "actual_fee_usd": float(actual_fee_usd),
+                "expected_slippage_bps": float(context.expected_slippage_bps),
+                "discrepancy_bps": float(discrepancy_bps),
             },
         )
         event = FillEvent(
             account_id=self.account_id,
             symbol=context.symbol,
-            qty=delta,
-            price=state.avg_price or 0.0,
-            fee=fee,
+            qty=float(delta),
+            price=float(avg_price_decimal),
+            fee=float(actual_fee_usd),
             liquidity=liquidity,
             ts=datetime.now(timezone.utc),
         )
@@ -612,19 +724,21 @@ class OMSService:
     async def place_order(self, request: PlaceOrderRequest) -> PlaceOrderResponse:
         _enforce_stablecoin_guard()
         session = await self._session(request.account_id)
-        payload = self._build_payload(request)
+        metadata = await session.get_metadata()
+        snapped = self._snap_order_fields(request, metadata)
+        payload = self._build_payload(request, snapped)
         context = OrderContext(
             account_id=request.account_id,
             symbol=request.symbol,
             side=request.side,
-            qty=request.qty,
+            qty=snapped.qty,
             client_id=request.client_id,
             post_only=request.post_only,
             reduce_only=request.reduce_only,
             tif=request.tif,
-            price=request.limit_px,
-            expected_fee_bps=float(request.expected_fee_bps or 0.0),
-            expected_slippage_bps=float(request.expected_slippage_bps or 0.0),
+            price=snapped.limit_px,
+            expected_fee_bps=request.expected_fee_bps or Decimal("0"),
+            expected_slippage_bps=request.expected_slippage_bps or Decimal("0"),
         )
         cache_key = f"place:{request.account_id}:{request.client_id}"
 
@@ -710,16 +824,70 @@ class OMSService:
             updated_at=record.updated_at,
         )
 
-    def _build_payload(self, request: PlaceOrderRequest) -> Dict[str, Any]:
+    def _snap_order_fields(
+        self,
+        request: PlaceOrderRequest,
+        metadata: Optional[Dict[str, Any]],
+    ) -> _SnappedOrderFields:
+        snapped_qty = request.qty
+        snapped_limit = request.limit_px
+        snapped_tp = request.tp
+        snapped_sl = request.sl
+        snapped_trailing = request.trailing
+
+        pair_meta: Optional[Dict[str, Any]] = None
+        if metadata:
+            pair_meta = _resolve_pair_metadata(request.symbol, metadata)
+            try:
+                snapped_qty, snapped_limit = _PrecisionValidator.validate(
+                    request.symbol,
+                    request.qty,
+                    request.limit_px,
+                    pair_meta or metadata,
+                )
+            except HTTPException:
+                raise
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.warning(
+                    "Precision validation failed for %s: %s", request.symbol, exc
+                )
+                snapped_qty = request.qty
+                snapped_limit = request.limit_px
+
+        price_step: Optional[Decimal] = None
+        if pair_meta:
+            price_step = _PrecisionValidator._step(  # type: ignore[attr-defined]
+                pair_meta,
+                ["price_increment", "pair_decimals", "tick_size"],
+            )
+        if price_step:
+            if snapped_tp is not None:
+                snapped_tp = _PrecisionValidator._snap(snapped_tp, price_step)
+            if snapped_sl is not None:
+                snapped_sl = _PrecisionValidator._snap(snapped_sl, price_step)
+            if snapped_trailing is not None:
+                snapped_trailing = _PrecisionValidator._snap(snapped_trailing, price_step)
+
+        return _SnappedOrderFields(
+            qty=snapped_qty,
+            limit_px=snapped_limit,
+            take_profit=snapped_tp,
+            stop_loss=snapped_sl,
+            trailing=snapped_trailing,
+        )
+
+    def _build_payload(
+        self, request: PlaceOrderRequest, snapped: _SnappedOrderFields
+    ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "clientOrderId": request.client_id,
-            "pair": request.symbol,
+            "pair": _normalize_symbol(request.symbol),
             "type": request.side,
             "ordertype": request.order_type.lower(),
-            "volume": _format_decimal(request.qty),
+            "volume": _format_decimal(snapped.qty),
         }
-        if request.limit_px is not None:
-            payload["price"] = _format_decimal(request.limit_px)
+        if snapped.limit_px is not None:
+            payload["price"] = _format_decimal(snapped.limit_px)
 
         oflags = {flag.lower() for flag in request.flags}
         if request.post_only:
@@ -731,12 +899,12 @@ class OMSService:
 
         if request.tif:
             payload["timeInForce"] = request.tif.upper()
-        if request.tp is not None:
-            payload["takeProfit"] = _format_decimal(request.tp)
-        if request.sl is not None:
-            payload["stopLoss"] = _format_decimal(request.sl)
-        if request.trailing is not None:
-            payload["trailingStopOffset"] = _format_decimal(request.trailing)
+        if snapped.take_profit is not None:
+            payload["takeProfit"] = _format_decimal(snapped.take_profit)
+        if snapped.stop_loss is not None:
+            payload["stopLoss"] = _format_decimal(snapped.stop_loss)
+        if snapped.trailing is not None:
+            payload["trailingStopOffset"] = _format_decimal(snapped.trailing)
 
         return payload
 
