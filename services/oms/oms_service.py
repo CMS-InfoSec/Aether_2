@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Dict, Iterable, List, Optional, Set, Tuple
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, ConfigDict
 
 from services.oms import reconcile as _oms_reconcile
 from services.oms.idempotency_store import _IdempotencyStore
@@ -68,6 +68,7 @@ def _log_extra(**extra: Any) -> Dict[str, Any]:
 
 
 class OMSPlaceRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
     account_id: str = Field(..., description="Account identifier for credential lookup")
     client_id: str = Field(..., description="Client supplied idempotency key")
     symbol: str = Field(..., description="Trading symbol (e.g. BTC/USD)")
@@ -86,6 +87,7 @@ class OMSPlaceRequest(BaseModel):
     flags: List[str] = Field(default_factory=list, description="Additional Kraken oflags")
     post_only: bool = Field(False, description="Convenience flag for post-only")
     reduce_only: bool = Field(False, description="Convenience flag for reduce-only")
+    shadow: bool = Field(False, description="True when the order should execute in shadow mode")
     take_profit: Optional[Decimal] = Field(
         default=None,
         gt=Decimal("0"),

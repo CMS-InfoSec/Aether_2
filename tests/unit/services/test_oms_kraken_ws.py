@@ -259,3 +259,51 @@ def test_sign_auth_caches_rest_token_until_expiry() -> None:
 
     asyncio.run(_run())
 
+
+def test_ack_from_payload_preserves_decimal_precision() -> None:
+    async def _creds() -> dict[str, str]:
+        return {}
+
+    client = KrakenWSClient(credential_getter=_creds)
+    payload = {
+        "status": "ok",
+        "txid": ["TX123"],
+        "result": {
+            "filled": "0.123456789012",
+            "avg_price": "12345.6789012345",
+        },
+    }
+
+    ack = client._ack_from_payload(payload)
+
+    assert ack.filled_qty == Decimal("0.123456789012")
+    assert ack.avg_price == Decimal("12345.6789012345")
+    assert str(ack.filled_qty) == "0.123456789012"
+    assert str(ack.avg_price) == "12345.6789012345"
+
+
+def test_publish_state_preserves_decimal_precision() -> None:
+    async def _creds() -> dict[str, str]:
+        return {}
+
+    client = KrakenWSClient(credential_getter=_creds)
+
+    async def _run() -> None:
+        data = {
+            "clientOrderId": "CID-1",
+            "order_id": "EX-1",
+            "status": "filled",
+            "filled": "0.000000123456789",
+            "avg_price": "98765.4321098765",
+        }
+
+        await client._publish_state(data)
+        state = await client._queue.get()
+
+        assert state.filled_qty == Decimal("0.000000123456789")
+        assert state.avg_price == Decimal("98765.4321098765")
+        assert format(state.filled_qty, "f") == "0.000000123456789"
+        assert format(state.avg_price, "f") == "98765.4321098765"
+
+    asyncio.run(_run())
+

@@ -243,8 +243,8 @@ class CancelOrderRequest(BaseModel):
 class OrderStatus(BaseModel):
     order_id: str
     status: str
-    filled_qty: float | None = Field(default=None, description="Executed quantity")
-    avg_price: float | None = Field(default=None, description="Average execution price")
+    filled_qty: Decimal | None = Field(default=None, description="Executed quantity")
+    avg_price: Decimal | None = Field(default=None, description="Average execution price")
     errors: Optional[List[str]] = Field(default=None, description="Transport errors if any")
 
 
@@ -358,8 +358,8 @@ class _SnappedOrderFields:
 @dataclass
 class OrderRecord:
     status: str
-    filled_qty: float | None
-    avg_price: float | None
+    filled_qty: Decimal | None
+    avg_price: Decimal | None
     errors: Optional[List[str]]
     updated_at: datetime
 
