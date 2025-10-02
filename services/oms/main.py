@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
+import os
+import asyncio
+from contextlib import suppress
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
-import logging
 import time
 from typing import Any, Dict, List
 
@@ -16,7 +19,9 @@ from services.oms.kraken_client import (
     KrakenWSClient,
     KrakenWebsocketError,
 )
+from services.oms.rate_limit_guard import rate_limit_guard
 from services.oms.shadow_oms import shadow_oms
+from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
 
 from metrics import (
     increment_trade_rejection,
@@ -25,11 +30,99 @@ from metrics import (
     setup_metrics,
 )
 
+SHUTDOWN_TIMEOUT = float(
+    os.getenv("OMS_SHUTDOWN_TIMEOUT", os.getenv("SERVICE_SHUTDOWN_TIMEOUT", "60.0"))
+)
+
 app = FastAPI(title="OMS Service")
 setup_metrics(app)
 
 
 logger = logging.getLogger(__name__)
+
+
+shutdown_manager = setup_graceful_shutdown(
+    app,
+    service_name="oms-core",
+    allowed_paths={"/", "/docs", "/openapi.json"},
+    shutdown_timeout=SHUTDOWN_TIMEOUT,
+    logger_instance=logger,
+)
+
+
+def _flush_adapters() -> None:
+    """Flush buffered adapter state before terminating."""
+
+    flush_logging_handlers("", __name__)
+
+    kafka_counts = KafkaNATSAdapter.flush_events()
+    if kafka_counts:
+        logger.info("Flushed Kafka/NATS buffers", extra={"event_counts": kafka_counts})
+
+    timescale_summary = TimescaleAdapter.flush_event_buffers()
+    if timescale_summary:
+        logger.info(
+            "Flushed Timescale buffers", extra={"bucket_counts": timescale_summary}
+        )
+
+
+shutdown_manager.register_flush_callback(_flush_adapters)
+
+
+async def _await_background_tasks(timeout: float) -> None:
+    """Wait for OMS async tasks (rate limits, websocket/rest) to settle."""
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(timeout, 0.0)
+
+    remaining = max(deadline - loop.time(), 0.0)
+    if remaining > 0:
+        guard_completed = await rate_limit_guard.wait_for_idle(timeout=remaining)
+        if not guard_completed:
+            logger.warning("Timed out waiting for rate limit guard to drain")
+
+    remaining = max(deadline - loop.time(), 0.0)
+    if remaining <= 0:
+        return
+
+    current_task = asyncio.current_task(loop=loop)
+    pending: List[asyncio.Task[Any]] = []
+    for task in asyncio.all_tasks(loop):
+        if task is current_task or task.done():
+            continue
+        coro = task.get_coro()
+        code = getattr(coro, "cr_code", None) or getattr(coro, "gi_code", None)
+        if not code:
+            continue
+        filename = getattr(code, "co_filename", "")
+        if "/services/oms/" not in filename.replace("\\", "/"):
+            continue
+        pending.append(task)
+
+    if not pending:
+        return
+
+    done, still_pending = await asyncio.wait(
+        pending,
+        timeout=remaining,
+        return_when=asyncio.ALL_COMPLETED,
+    )
+
+    for task in done:
+        with suppress(Exception):
+            task.result()
+
+    if still_pending:
+        for task in still_pending:
+            logger.warning(
+                "Background OMS task pending during shutdown", extra={"task": task.get_name()}
+            )
+
+
+@app.on_event("shutdown")
+async def _on_shutdown_complete() -> None:
+    await _await_background_tasks(shutdown_manager.shutdown_timeout)
+    _flush_adapters()
 
 
 class CircuitBreaker:

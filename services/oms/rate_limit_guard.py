@@ -164,6 +164,52 @@ class RateLimitGuard:
                 # Yield momentarily to give urgent callers priority after waking up.
                 await asyncio.sleep(self._sleep_floor)
 
+    async def release(
+        self,
+        account_id: str,
+        *,
+        transport: str = "rest",
+        successful: bool = True,
+        remaining: Optional[int] = None,
+    ) -> None:
+        """Record the completion of a guarded call.
+
+        When ``successful`` is ``False`` the reservation created during
+        :meth:`acquire` is released immediately to avoid penalising failed
+        transports.  Callers may optionally provide Kraken's reported
+        ``remaining`` capacity which, when supplied, is used to update the
+        exported gauge metrics.
+        """
+
+        transport_key = self._normalise_transport(transport)
+        limiter = self._limits[transport_key]
+        key = (account_id, transport_key)
+        lock = self._locks.get(key)
+
+        if lock is None:
+            current = self._coerce_remaining(remaining, limiter.limit)
+            _RATE_LIMIT_REMAINING.labels(account=account_id, transport=transport_key).set(current)
+            return
+
+        async with lock:
+            bucket = self._usage.get(key)
+            now = time.monotonic()
+            if bucket is not None:
+                self._prune(bucket, now, limiter.window)
+                if not successful and bucket:
+                    bucket.pop()
+
+                current_remaining = limiter.limit - len(bucket)
+            else:
+                current_remaining = limiter.limit
+
+            if remaining is not None:
+                current_remaining = self._coerce_remaining(remaining, limiter.limit)
+            else:
+                current_remaining = max(current_remaining, 0)
+
+            _RATE_LIMIT_REMAINING.labels(account=account_id, transport=transport_key).set(current_remaining)
+
     async def status(self, account_id: Optional[str] = None) -> Dict[str, Dict[str, Dict[str, float | int]]]:
         """Return a snapshot of remaining capacity per account."""
 
@@ -215,6 +261,27 @@ class RateLimitGuard:
             snapshot[account] = entry
         return snapshot
 
+    async def wait_for_idle(self, timeout: Optional[float] = None) -> bool:
+        """Wait until no callers are queued behind the rate limit guard."""
+
+        deadline = None if timeout is None else time.monotonic() + max(timeout, 0.0)
+        poll_interval = max(self._sleep_floor, 0.05)
+
+        while True:
+            async with self._waiter_lock:
+                pending = sum(self._waiter_counts.values())
+
+            if pending == 0:
+                return True
+
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                await asyncio.sleep(min(poll_interval, remaining))
+            else:
+                await asyncio.sleep(poll_interval)
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -230,6 +297,16 @@ class RateLimitGuard:
     def _prune(bucket: Deque[float], now: float, window: float) -> None:
         while bucket and now - bucket[0] > window:
             bucket.popleft()
+
+    @staticmethod
+    def _coerce_remaining(value: Optional[int], limit: int) -> int:
+        if value is None:
+            return max(limit, 0)
+        try:
+            remaining = int(value)
+        except (TypeError, ValueError):
+            return max(limit, 0)
+        return max(min(remaining, limit), 0)
 
     async def _sleep_with_waiters(self, key: Tuple[str, str], delay: float) -> int:
         async with self._waiter_lock:

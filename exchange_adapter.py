@@ -6,8 +6,10 @@ import asyncio
 import logging
 import os
 from abc import ABC, abstractmethod
+
 from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional
 from uuid import uuid4
+
 
 import httpx
 
@@ -112,7 +114,12 @@ class KrakenAdapter(ExchangeAdapter):
     ) -> None:
         super().__init__(
             "kraken",
-            capabilities={"place_order": True, "cancel_order": True},
+            capabilities={
+                "place_order": True,
+                "cancel_order": True,
+                "get_balance": True,
+                "get_trades": True,
+            },
         )
         self._primary_url = (primary_url or _DEFAULT_PRIMARY_URL or "").strip()
         self._paper_url = (paper_url or _DEFAULT_PAPER_URL or "").strip()
@@ -176,7 +183,11 @@ class KrakenAdapter(ExchangeAdapter):
                 return {}
 
     async def get_balance(self, account_id: str) -> Mapping[str, Any]:
-        raise NotImplementedError("Balance retrieval is not implemented for KrakenAdapter")
+        payload = await self._fetch_oms_payload(
+            path=f"/oms/accounts/{account_id}/balances",
+            account_id=account_id,
+        )
+        return self._normalize_balances(account_id, payload)
 
     async def get_trades(
         self,
@@ -184,7 +195,191 @@ class KrakenAdapter(ExchangeAdapter):
         *,
         limit: int = 50,
     ) -> List[Mapping[str, Any]]:
-        raise NotImplementedError("Trade history retrieval is not implemented for KrakenAdapter")
+        payload = await self._fetch_oms_payload(
+            path=f"/oms/accounts/{account_id}/trades",
+            account_id=account_id,
+            params={"limit": max(1, min(int(limit), 500))},
+        )
+        return self._normalize_trades(account_id, payload)
+
+    async def _fetch_oms_payload(
+        self,
+        *,
+        path: str,
+        account_id: str,
+        params: Optional[Mapping[str, Any]] = None,
+    ) -> Mapping[str, Any]:
+        if not self._primary_url:
+            raise RuntimeError("Kraken OMS URL is not configured")
+
+        url = _join_url(self._primary_url, path)
+        headers = {"X-Account-ID": account_id}
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            response = await client.get(url, params=dict(params or {}), headers=headers)
+            response.raise_for_status()
+            try:
+                payload = response.json()
+            except ValueError:  # pragma: no cover - defensive guard
+                return {}
+            if isinstance(payload, Mapping):
+                return payload
+            if isinstance(payload, list):
+                return {"result": payload}
+            return {}
+
+    @staticmethod
+    def _normalize_balances(account_id: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        balances: Dict[str, float] = {}
+        nav: Optional[float] = None
+        timestamp: Optional[str] = None
+
+        source: Mapping[str, Any] | Sequence[Any] = payload
+        if isinstance(payload.get("result"), Mapping):
+            source = payload["result"]
+        elif isinstance(payload.get("result"), Sequence):
+            source = payload["result"]
+
+        if isinstance(source, Mapping):
+            raw_balances = source.get("balances")
+            if isinstance(raw_balances, Mapping):
+                balances.update(KrakenAdapter._extract_balance_mapping(raw_balances))
+            elif isinstance(raw_balances, Sequence):
+                balances.update(KrakenAdapter._extract_balance_sequence(raw_balances))
+            elif not raw_balances and isinstance(payload.get("result"), Mapping):
+                balances.update(
+                    KrakenAdapter._extract_balance_mapping(payload["result"])
+                )
+
+            nav = KrakenAdapter._to_float(
+                source.get("net_asset_value")
+                or source.get("nav")
+                or source.get("total_value")
+                or source.get("equity")
+                or source.get("portfolio_value")
+            )
+            timestamp = KrakenAdapter._normalize_timestamp(source.get("timestamp") or source.get("as_of"))
+        elif isinstance(source, Sequence):
+            balances.update(KrakenAdapter._extract_balance_sequence(source))
+
+        result: Dict[str, Any] = {"account_id": account_id, "balances": balances}
+        if nav is not None:
+            result["net_asset_value"] = nav
+        if timestamp:
+            result["timestamp"] = timestamp
+        return result
+
+    @staticmethod
+    def _extract_balance_mapping(source: Mapping[str, Any]) -> Dict[str, float]:
+        parsed: Dict[str, float] = {}
+        for asset, value in source.items():
+            amount = KrakenAdapter._to_float(value)
+            if amount is None:
+                continue
+            parsed[str(asset).upper()] = amount
+        return parsed
+
+    @staticmethod
+    def _extract_balance_sequence(source: Sequence[Any]) -> Dict[str, float]:
+        parsed: Dict[str, float] = {}
+        for entry in source:
+            if not isinstance(entry, Mapping):
+                continue
+            asset = entry.get("asset") or entry.get("currency") or entry.get("symbol")
+            if not asset:
+                continue
+            amount = (
+                KrakenAdapter._to_float(entry.get("balance"))
+                or KrakenAdapter._to_float(entry.get("amount"))
+                or KrakenAdapter._to_float(entry.get("available"))
+            )
+            if amount is None:
+                continue
+            parsed[str(asset).upper()] = amount
+        return parsed
+
+    @staticmethod
+    def _normalize_trades(account_id: str, payload: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+        records: Sequence[Any]
+        if isinstance(payload.get("trades"), Sequence):
+            records = payload["trades"]  # type: ignore[assignment]
+        elif isinstance(payload.get("result"), Mapping) and isinstance(payload["result"].get("trades"), Sequence):
+            records = payload["result"]["trades"]  # type: ignore[assignment]
+        elif isinstance(payload.get("result"), Sequence):
+            records = payload["result"]  # type: ignore[assignment]
+        else:
+            records = []
+
+        normalized: List[Dict[str, Any]] = []
+        for entry in records:
+            if not isinstance(entry, Mapping):
+                continue
+            record: Dict[str, Any] = {"account_id": account_id}
+            record["trade_id"] = entry.get("trade_id") or entry.get("id") or entry.get("txid") or entry.get("ordertxid")
+            record["order_id"] = entry.get("order_id") or entry.get("client_id") or entry.get("ordertxid")
+            symbol = entry.get("instrument") or entry.get("symbol") or entry.get("pair")
+            if symbol is not None:
+                record["instrument_id"] = str(symbol).replace("/", "-").upper()
+            side = entry.get("side") or entry.get("type")
+            if side is not None:
+                record["side"] = str(side).lower()
+            price = KrakenAdapter._to_float(entry.get("price") or entry.get("avg_price") or entry.get("cost") or entry.get("trade_price"))
+            if price is not None:
+                record["price"] = price
+            quantity = KrakenAdapter._to_float(entry.get("quantity") or entry.get("volume") or entry.get("qty"))
+            if quantity is not None:
+                record["quantity"] = quantity
+            fee = KrakenAdapter._to_float(entry.get("fee") or entry.get("fees") or entry.get("commission"))
+            record["fee"] = fee if fee is not None else 0.0
+            pnl = KrakenAdapter._to_float(entry.get("pnl") or entry.get("realized_pnl") or entry.get("realizedProfit"))
+            record["pnl"] = pnl if pnl is not None else 0.0
+            liquidity = entry.get("liquidity") or entry.get("role")
+            if liquidity is not None:
+                record["liquidity"] = str(liquidity).lower()
+            timestamp = KrakenAdapter._normalize_timestamp(
+                entry.get("timestamp")
+                or entry.get("time")
+                or entry.get("executed")
+                or entry.get("execution_timestamp")
+            )
+            if timestamp:
+                record["timestamp"] = timestamp
+            record["raw"] = dict(entry)
+            normalized.append(record)
+        return normalized
+
+    @staticmethod
+    def _normalize_timestamp(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value)
+            except ValueError:
+                try:
+                    parsed = datetime.fromtimestamp(float(value), tz=timezone.utc)
+                except (TypeError, ValueError):
+                    return value
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc).isoformat()
+        if isinstance(value, (int, float)):
+            try:
+                parsed = datetime.fromtimestamp(float(value), tz=timezone.utc)
+            except (OSError, OverflowError, ValueError):  # pragma: no cover - defensive guard
+                return None
+            return parsed.isoformat()
+        return None
+
+    @staticmethod
+    def _to_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     async def status(self) -> Mapping[str, Any]:
         async def _probe(url: str) -> Mapping[str, Any]:

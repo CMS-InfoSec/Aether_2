@@ -123,3 +123,18 @@ spec:
             summary: OMS submission latency p95 above 500 ms for {{ $labels.symbol }}/{{ $labels.account_id }}
             runbook: docs/runbooks/oms_latency.md
             slo_reference: docs/slo.md#oms-latency
+    - name: infra.clock
+      rules:
+        - alert: clock_drift_exceeds_200ms
+          expr: |
+            max_over_time(abs(chrony_tracking_last_offset_seconds)[5m]) > 0.2
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: Clock drift above 200 ms detected on {{ $labels.instance }}
+            description: >-
+              The Chrony exporter reported wall-clock drift greater than 200 ms for the
+              last 10 minutes. Trading systems rely on sub-200 ms synchronisation to
+              validate exchange timestamps and regulatory audit trails.
+            runbook: docs/runbooks/clock_drift.md

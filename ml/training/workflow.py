@@ -45,6 +45,8 @@ except Exception:  # pragma: no cover - boto3 is optional for local development.
 
 LOGGER = logging.getLogger(__name__)
 
+_TARGET_COLUMN = "__target__"
+
 
 # ---------------------------------------------------------------------------
 # Configuration dataclasses
@@ -61,6 +63,7 @@ class TimescaleSourceConfig:
     label_column: str
     feature_columns: Sequence[str]
     lookback_days: int = 90
+    label_horizon: int = 1
 
     def select_columns(self) -> List[str]:
         columns = [self.entity_column, self.timestamp_column, *self.feature_columns, self.label_column]
@@ -141,6 +144,44 @@ class TrainingMetadata:
 
 
 @dataclass
+class ChronologicalSplitConfig:
+    """Fractions used for chronological train/validation/test splits."""
+
+    train_fraction: float = 0.7
+    validation_fraction: float = 0.15
+    test_fraction: float = 0.15
+
+    def __post_init__(self) -> None:
+        total = self.train_fraction + self.validation_fraction + self.test_fraction
+        if not math.isclose(total, 1.0, rel_tol=1e-6):
+            raise ValueError("Split fractions must sum to 1.0")
+        for name, value in (
+            ("train_fraction", self.train_fraction),
+            ("validation_fraction", self.validation_fraction),
+            ("test_fraction", self.test_fraction),
+        ):
+            if value <= 0:
+                raise ValueError(f"{name} must be positive")
+
+
+@dataclass
+class OutlierConfig:
+    """Configuration for pre-training outlier handling."""
+
+    method: str = "none"
+    lower_quantile: float = 0.01
+    upper_quantile: float = 0.99
+
+    def normalise_method(self) -> str:
+        method = self.method.lower()
+        if method not in {"none", "clip", "drop"}:
+            raise ValueError("Outlier method must be one of 'none', 'clip', or 'drop'")
+        if not 0.0 <= self.lower_quantile < self.upper_quantile <= 1.0:
+            raise ValueError("Quantiles must satisfy 0 <= lower < upper <= 1")
+        return method
+
+
+@dataclass
 class TrainingJobConfig:
     """Aggregate configuration for the workflow."""
 
@@ -151,6 +192,8 @@ class TrainingJobConfig:
     artifacts: ObjectStorageConfig = field(default_factory=ObjectStorageConfig)
     mlflow: Optional[MLflowConfig] = None
     metadata: TrainingMetadata = field(default_factory=TrainingMetadata)
+    split: ChronologicalSplitConfig = field(default_factory=ChronologicalSplitConfig)
+    outliers: OutlierConfig = field(default_factory=OutlierConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +314,104 @@ def _load_timescale_frame(config: TimescaleSourceConfig, engine: Optional[Engine
     return frame
 
 
+def _prepare_supervised_frame(frame: pd.DataFrame, config: TimescaleSourceConfig) -> pd.DataFrame:
+    """Generate forward-return labels aligned with feature timestamps."""
+
+    if config.label_horizon <= 0:
+        raise ValueError("label_horizon must be positive")
+
+    working = frame.copy()
+    working.sort_values([config.entity_column, config.timestamp_column], inplace=True)
+
+    grouped = working.groupby(config.entity_column, group_keys=False)
+    future = grouped[config.label_column].shift(-config.label_horizon)
+    base = working[config.label_column]
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        returns = (future - base) / base
+
+    working[_TARGET_COLUMN] = returns
+    working = working.replace([np.inf, -np.inf], np.nan)
+    working = working.dropna(subset=[_TARGET_COLUMN])
+    return working
+
+
+def _apply_outlier_handling(
+    frame: pd.DataFrame,
+    column: str,
+    config: OutlierConfig,
+) -> pd.DataFrame:
+    """Apply the configured outlier handling strategy to ``column``."""
+
+    method = config.normalise_method()
+    if method == "none" or frame.empty:
+        return frame
+
+    lower = frame[column].quantile(config.lower_quantile)
+    upper = frame[column].quantile(config.upper_quantile)
+    if pd.isna(lower) or pd.isna(upper):
+        return frame
+
+    if method == "clip":
+        clipped = frame.copy()
+        clipped[column] = clipped[column].clip(lower, upper)
+        return clipped
+
+    mask = frame[column].between(lower, upper)
+    return frame.loc[mask].copy()
+
+
+def _chronological_split(
+    frame: pd.DataFrame,
+    timestamp_column: str,
+    split: ChronologicalSplitConfig,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Split ``frame`` into chronological train/validation/test windows."""
+
+    if frame.empty:
+        raise ValueError("Cannot split an empty frame")
+
+    ordered = frame.sort_values(timestamp_column)
+    unique_timestamps = ordered[timestamp_column].drop_duplicates().to_numpy()
+    if unique_timestamps.size < 3:
+        raise ValueError("At least three unique timestamps are required for splitting")
+
+    n_timestamps = unique_timestamps.size
+    train_boundary = max(1, int(round(n_timestamps * split.train_fraction)))
+    val_boundary = max(
+        train_boundary + 1,
+        int(round(n_timestamps * (split.train_fraction + split.validation_fraction))),
+    )
+    if val_boundary >= n_timestamps:
+        val_boundary = n_timestamps - 1
+        train_boundary = min(train_boundary, val_boundary - 1)
+        train_boundary = max(train_boundary, 1)
+
+    train_end = unique_timestamps[train_boundary - 1]
+    val_end = unique_timestamps[val_boundary - 1]
+
+    train_mask = ordered[timestamp_column] <= train_end
+    val_mask = (ordered[timestamp_column] > train_end) & (ordered[timestamp_column] <= val_end)
+    test_mask = ordered[timestamp_column] > val_end
+
+    train_frame = ordered.loc[train_mask].copy()
+    val_frame = ordered.loc[val_mask].copy()
+    test_frame = ordered.loc[test_mask].copy()
+
+    if val_frame.empty or test_frame.empty:
+        raise ValueError("Validation and test splits must be non-empty")
+
+    return train_frame, val_frame, test_frame
+
+
+def _compute_feature_set_hash(frame: pd.DataFrame, feature_columns: Sequence[str]) -> str:
+    """Deterministically hash the feature values used for training."""
+
+    subset = frame[list(feature_columns)].copy()
+    hashed = pd.util.hash_pandas_object(subset, index=False).to_numpy()
+    return hashlib.sha256(hashed.tobytes()).hexdigest()
+
+
 def _build_sequences(
     frame: pd.DataFrame,
     config: TimescaleSourceConfig,
@@ -287,14 +428,16 @@ def _build_sequences(
 
     for entity, entity_frame in frame.groupby(config.entity_column):
         entity_frame = entity_frame.sort_values(config.timestamp_column)
-        features_matrix = entity_frame[feature_columns].to_numpy(dtype=np.float32)
-        labels_array = entity_frame[config.label_column].to_numpy(dtype=np.float32)
-        if len(features_matrix) <= sequence_length:
+        if len(entity_frame) < sequence_length:
             LOGGER.debug("Skipping entity %s because it has fewer than %d rows", entity, sequence_length)
             continue
-        for idx in range(len(features_matrix) - sequence_length):
-            window = features_matrix[idx : idx + sequence_length]
-            label = labels_array[idx + sequence_length]
+
+        features_matrix = entity_frame[feature_columns].to_numpy(dtype=np.float32)
+        labels_array = entity_frame[_TARGET_COLUMN].to_numpy(dtype=np.float32)
+
+        for idx in range(sequence_length - 1, len(entity_frame)):
+            window = features_matrix[idx - sequence_length + 1 : idx + 1]
+            label = labels_array[idx]
             if np.isnan(window).any() or np.isnan(label):
                 continue
             sequences.append(window)
@@ -552,21 +695,27 @@ def run_training_job(
 ) -> Dict[str, float]:
     """Execute the full workflow and return evaluation metrics."""
 
-    frame = override_frame if override_frame is not None else _load_timescale_frame(config.timescale, engine)
-    sequences, targets = _build_sequences(frame, config.timescale, config.model.sequence_length)
+    raw_frame = override_frame if override_frame is not None else _load_timescale_frame(config.timescale, engine)
+    supervised = _prepare_supervised_frame(raw_frame, config.timescale)
+    supervised = _apply_outlier_handling(supervised, _TARGET_COLUMN, config.outliers)
+    train_frame, val_frame, test_frame = _chronological_split(
+        supervised, config.timescale.timestamp_column, config.split
+    )
 
-    split_index = int(len(sequences) * 0.8)
-    train_sequences, val_sequences = sequences[:split_index], sequences[split_index:]
-    train_targets, val_targets = targets[:split_index], targets[split_index:]
+    train_sequences, train_targets = _build_sequences(train_frame, config.timescale, config.model.sequence_length)
+    val_sequences, val_targets = _build_sequences(val_frame, config.timescale, config.model.sequence_length)
+    test_sequences, test_targets = _build_sequences(test_frame, config.timescale, config.model.sequence_length)
 
-    if len(val_sequences) == 0:
-        raise RuntimeError("Validation split is empty; adjust sequence length or dataset size")
+    if len(val_sequences) == 0 or len(test_sequences) == 0:
+        raise RuntimeError("Validation and test splits must contain at least one sequence")
 
     train_dataset = SequenceDataset(train_sequences, train_targets)
     val_dataset = SequenceDataset(val_sequences, val_targets)
+    test_dataset = SequenceDataset(test_sequences, test_targets)
 
     train_loader = DataLoader(train_dataset, batch_size=config.training.batch_size, shuffle=True, drop_last=False)
     val_loader = DataLoader(val_dataset, batch_size=config.training.batch_size, shuffle=False, drop_last=False)
+    test_loader = DataLoader(test_dataset, batch_size=config.training.batch_size, shuffle=False, drop_last=False)
 
     input_size = train_sequences.shape[-1]
     model = _build_model(config.model, input_size)
@@ -574,8 +723,8 @@ def run_training_job(
     device = torch.device(config.training.device)
     model, history = _train_model(model, train_loader, val_loader, config.training, device)
 
-    predictions = _predict(model, val_loader, device)
-    metrics = _evaluate_strategy(predictions, val_targets[: len(predictions)])
+    predictions = _predict(model, test_loader, device)
+    metrics = _evaluate_strategy(predictions, test_targets[: len(predictions)])
 
     run_prefix = datetime.now(timezone.utc).strftime("run_%Y%m%dT%H%M%SZ")
     artifacts: Dict[str, bytes] = {
@@ -591,7 +740,7 @@ def run_training_job(
     LOGGER.info("Persisted artifacts: %s", artifact_locations)
 
     if config.mlflow and mlflow is not None:
-        registration_tags = _build_registration_tags(config, frame)
+        registration_tags = _build_registration_tags(config, raw_frame)
         mlflow.set_tracking_uri(config.mlflow.tracking_uri)
         mlflow.set_experiment(config.mlflow.experiment_name)
         run_args = {}
@@ -612,6 +761,8 @@ def run_training_job(
                 }
             )
             mlflow.log_metrics(metrics)
+            feature_hash = _compute_feature_set_hash(train_frame, config.timescale.feature_columns)
+            mlflow.set_tag("feature_set_hash", feature_hash)
             if registration_tags:
                 mlflow.set_tags(registration_tags)
 
@@ -658,6 +809,7 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--timestamp-column", required=True)
     parser.add_argument("--label-column", default="return_15m")
     parser.add_argument("--feature-columns", required=True, help="Comma separated list of feature columns")
+    parser.add_argument("--label-horizon-steps", type=int, default=1, help="Number of future bars used for label generation")
     parser.add_argument("--model-type", choices=["lstm", "transformer"], default="lstm")
     parser.add_argument("--sequence-length", type=int, default=32)
     parser.add_argument("--hidden-size", type=int, default=64)
@@ -682,6 +834,12 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--label-horizon")
     parser.add_argument("--granularity")
     parser.add_argument("--symbols", help="Comma separated list of instrument symbols")
+    parser.add_argument("--split-train-fraction", type=float, default=0.7)
+    parser.add_argument("--split-validation-fraction", type=float, default=0.15)
+    parser.add_argument("--split-test-fraction", type=float, default=0.15)
+    parser.add_argument("--outlier-method", default="none", choices=["none", "clip", "drop"], help="Outlier handling strategy")
+    parser.add_argument("--outlier-lower-quantile", type=float, default=0.01)
+    parser.add_argument("--outlier-upper-quantile", type=float, default=0.99)
     return parser.parse_args(argv)
 
 
@@ -693,6 +851,7 @@ def _build_config(args: argparse.Namespace) -> TrainingJobConfig:
         timestamp_column=args.timestamp_column,
         label_column=args.label_column,
         feature_columns=[col.strip() for col in args.feature_columns.split(",") if col.strip()],
+        label_horizon=args.label_horizon_steps,
     )
 
     model = ModelConfig(
@@ -731,6 +890,18 @@ def _build_config(args: argparse.Namespace) -> TrainingJobConfig:
         symbols=[sym.strip() for sym in (args.symbols or "").split(",") if sym.strip()],
     )
 
+    split = ChronologicalSplitConfig(
+        train_fraction=args.split_train_fraction,
+        validation_fraction=args.split_validation_fraction,
+        test_fraction=args.split_test_fraction,
+    )
+
+    outliers = OutlierConfig(
+        method=args.outlier_method,
+        lower_quantile=args.outlier_lower_quantile,
+        upper_quantile=args.outlier_upper_quantile,
+    )
+
     mlflow_config = None
     if args.mlflow_tracking_uri and args.mlflow_experiment:
         mlflow_config = MLflowConfig(
@@ -748,6 +919,8 @@ def _build_config(args: argparse.Namespace) -> TrainingJobConfig:
         artifacts=artifacts,
         mlflow=mlflow_config,
         metadata=metadata,
+        split=split,
+        outliers=outliers,
     )
 
 

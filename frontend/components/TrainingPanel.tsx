@@ -5,6 +5,7 @@ import React, {
   useMemo,
   useState,
 } from "react";
+import { formatLondonTime } from "./timezone";
 import { useAuthClaims } from "./useAuthClaims";
 
 type TrainingStartResponse = {
@@ -66,22 +67,12 @@ const normalizeTimestamp = (value?: string | number) => {
     return "—";
   }
 
-  const parsed =
-    typeof value === "number"
-      ? value
-      : Number.isNaN(Date.parse(value))
-      ? null
-      : Date.parse(value);
-
-  if (!parsed || Number.isNaN(parsed)) {
+  const formatted = formatLondonTime(value ?? null);
+  if (!formatted) {
     return typeof value === "string" ? value : String(value);
   }
 
-  try {
-    return new Date(parsed).toLocaleString();
-  } catch (error) {
-    return typeof value === "string" ? value : String(value);
-  }
+  return formatted;
 };
 
 const normalizeProgress = (value: unknown): string => {

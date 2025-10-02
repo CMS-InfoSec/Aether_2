@@ -1,4 +1,5 @@
 import React, { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { formatLondonTime } from "./timezone";
 import { useAuthClaims } from "./useAuthClaims";
 
 type SafeModeStatusResponse = {
@@ -20,12 +21,8 @@ const formatTimestamp = (timestamp?: string | null) => {
     return "Unknown";
   }
 
-  const date = new Date(timestamp);
-  if (Number.isNaN(date.getTime())) {
-    return timestamp;
-  }
-
-  return date.toLocaleString();
+  const formatted = formatLondonTime(timestamp);
+  return formatted || "Unknown";
 };
 
 const deriveEventLabel = (entry: SafeModeAuditEntry) => {

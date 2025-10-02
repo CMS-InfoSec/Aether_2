@@ -1,4 +1,5 @@
 import React, { FormEvent, useEffect, useMemo, useState } from "react";
+import { formatLondonTime } from "./timezone";
 import { useAuthClaims } from "./useAuthClaims";
 
 interface ExposureBreakdown {
@@ -415,7 +416,7 @@ const Dashboard: React.FC = () => {
 
       const payload = (await response.json()) as KrakenRotationResponse;
       const rotatedAt = payload.rotated_at
-        ? new Date(payload.rotated_at).toLocaleString()
+        ? formatLondonTime(payload.rotated_at) || payload.rotated_at
         : null;
 
       setRotationMessage(
@@ -495,7 +496,7 @@ const Dashboard: React.FC = () => {
           </span>
           {state.reportGeneratedAt && (
             <span>
-              Report synced {new Date(state.reportGeneratedAt).toLocaleString()}
+              Report synced {formatLondonTime(state.reportGeneratedAt) || state.reportGeneratedAt}
             </span>
           )}
           <button
@@ -614,7 +615,8 @@ const Dashboard: React.FC = () => {
                   <div>
                     <span className="text-slate-400">Generated</span>
                     <div className="font-medium text-white">
-                      {new Date(state.universe.generated_at).toLocaleString()}
+                      {formatLondonTime(state.universe.generated_at) ||
+                        state.universe.generated_at}
                     </div>
                   </div>
                   <div className="space-y-2">
@@ -751,7 +753,7 @@ const Dashboard: React.FC = () => {
                     <dt className="uppercase tracking-wide">Since</dt>
                     <dd className="text-slate-200">
                       {state.safeMode?.since
-                        ? new Date(state.safeMode.since).toLocaleString()
+                        ? formatLondonTime(state.safeMode.since) || state.safeMode.since
                         : "--"}
                     </dd>
                   </div>

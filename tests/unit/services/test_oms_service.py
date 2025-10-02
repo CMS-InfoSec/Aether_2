@@ -18,6 +18,7 @@ from auth_service import create_jwt
 os.environ["AUTH_JWT_SECRET"] = "test-secret"
 
 from services.oms import oms_service
+from services.risk.stablecoin_monitor import StablecoinMonitor, StablecoinMonitorConfig
 
 
 class FakeAccount:
@@ -173,6 +174,36 @@ def test_place_order_succeeds_with_matching_account(oms_client: TestClient) -> N
     body = response.json()
     assert body["status"] == "placed"
     assert body["reused"] is False
+
+
+def test_place_order_blocked_when_stablecoin_depegged(
+    monkeypatch: pytest.MonkeyPatch, oms_client: TestClient
+) -> None:
+    monitor = StablecoinMonitor(
+        config=StablecoinMonitorConfig(
+            depeg_threshold_bps=50,
+            recovery_threshold_bps=10,
+            feed_max_age_seconds=60,
+            monitored_symbols=("USDC-USD",),
+            trusted_feeds=("primary_fx",),
+        )
+    )
+    monitor.update("USDC-USD", 0.9900, feed="primary_fx")
+    monkeypatch.setattr(oms_service, "get_global_monitor", lambda: monitor)
+
+    payload = {
+        "account_id": "ACC1",
+        "client_id": "CID-1",
+        "symbol": "BTC/USD",
+        "side": "buy",
+        "type": "limit",
+        "qty": "1",
+        "limit_px": "50000",
+    }
+    headers = _auth_headers("ACC1")
+    response = oms_client.post("/oms/place", json=payload, headers=headers)
+    assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+    assert "Stablecoin deviation" in response.json()["detail"]
 
 
 def test_status_requires_matching_account(oms_client: TestClient) -> None:

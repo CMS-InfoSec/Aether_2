@@ -22,8 +22,9 @@ from typing import Any, Awaitable, Dict, Iterable, List, Optional, Set, Tuple
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
 
-from services.oms.impact_store import ImpactAnalyticsStore, impact_store
 from services.oms import reconcile as _oms_reconcile
+from services.oms.idempotency_store import _IdempotencyStore
+from services.oms.impact_store import ImpactAnalyticsStore, impact_store
 from services.oms.kraken_rest import KrakenRESTClient, KrakenRESTError
 from services.oms.kraken_ws import (
     KrakenWSError,
@@ -45,6 +46,7 @@ from metrics import (
     increment_oms_auth_failures,
     increment_oms_child_orders_total,
     increment_oms_error_count,
+    increment_oms_stale_feed,
     record_oms_latency,
     setup_metrics,
 )
@@ -171,69 +173,6 @@ class ImpactCurveResponse(BaseModel):
     symbol: str
     points: List[ImpactCurvePoint]
     as_of: datetime
-
-
-@dataclass
-class _IdempotencyEntry:
-    future: asyncio.Future[OMSOrderStatusResponse]
-    timestamp: float = 0.0
-
-
-class _IdempotencyStore:
-    """Cooperative idempotency cache used per-account."""
-
-    def __init__(self, ttl_seconds: float = 300.0) -> None:
-        self._lock = asyncio.Lock()
-        self._entries: Dict[str, _IdempotencyEntry] = {}
-        self._ttl_seconds = ttl_seconds
-
-    def _purge_expired(self) -> None:
-        if not self._entries:
-            return
-
-        now = time.monotonic()
-        expired = [
-            key
-            for key, entry in self._entries.items()
-            if entry.future.done() and now - entry.timestamp >= self._ttl_seconds
-        ]
-        for key in expired:
-            self._entries.pop(key, None)
-
-    async def get_or_create(
-        self, key: str, factory: Awaitable[OMSOrderStatusResponse]
-    ) -> Tuple[OMSOrderStatusResponse, bool]:
-        async with self._lock:
-            self._purge_expired()
-            entry = self._entries.get(key)
-            if entry is None:
-                loop = asyncio.get_event_loop()
-                future = loop.create_future()
-                entry = _IdempotencyEntry(future=future)
-                self._entries[key] = entry
-                create_future = True
-            else:
-                future = entry.future
-                create_future = False
-
-        if create_future:
-            try:
-                result = await factory
-            except Exception as exc:  # pragma: no cover - propagate to awaiting callers
-                future.set_exception(exc)
-                async with self._lock:
-                    self._entries.pop(key, None)
-                raise
-            else:
-                completion_time = time.monotonic()
-                async with self._lock:
-                    entry = self._entries.get(key)
-                    if entry is not None:
-                        entry.timestamp = completion_time
-                future.set_result(result)
-                return result, False
-
-        return await future, True
 
 
 @dataclass
@@ -458,6 +397,16 @@ class _PublicOrderBookState:
     async def last_update(self) -> Optional[float]:
         async with self._lock:
             return self._last_ts
+
+    async def is_stale(self, threshold_seconds: float) -> bool:
+        if threshold_seconds <= 0:
+            return False
+        async with self._lock:
+            last_ts = self._last_ts
+            ready = self._ready.is_set()
+        if not ready or last_ts is None:
+            return True
+        return (time.time() - last_ts) > threshold_seconds
 
 
 class KrakenOrderBookStore:
@@ -731,7 +680,7 @@ class AccountContext:
         self.ws_client: Optional[KrakenWSClient] = None
         self.rest_client: Optional[KrakenRESTClient] = None
         self.rate_limits = rate_limit_guard
-        self.idempotency = _IdempotencyStore()
+        self.idempotency = _IdempotencyStore(account_id)
         self._orders: Dict[str, OrderRecord] = {}
         self._orders_lock = asyncio.Lock()
         self._startup_lock = asyncio.Lock()
@@ -748,6 +697,13 @@ class AccountContext:
         self._reconcile_task: Optional[asyncio.Task[None]] = None
         self._reconcile_interval = max(float(os.environ.get("OMS_RECONCILE_INTERVAL", "30")), 0.0)
         self._reconcile_lock = asyncio.Lock()
+        try:
+            self._feed_sla_seconds = max(
+                float(os.environ.get("OMS_FEED_SLA_SECONDS", "2.0")),
+                0.0,
+            )
+        except ValueError:
+            self._feed_sla_seconds = 2.0
 
 
     async def _throttle_ws(self, endpoint: str, *, urgent: bool = False) -> None:
@@ -800,14 +756,17 @@ class AccountContext:
                     exc,
                 )
                 raise
+            if self.rest_client is None:
+                self.rest_client = KrakenRESTClient(credential_getter=self.credentials.get_credentials)
             if self.ws_client is None:
                 self.ws_client = KrakenWSClient(
                     credential_getter=self.credentials.get_credentials,
                     stream_update_cb=self._apply_stream_state,
+                    rest_client=self.rest_client,
                 )
                 self._stream_task = asyncio.create_task(self.ws_client.stream_handler())
-            if self.rest_client is None:
-                self.rest_client = KrakenRESTClient(credential_getter=self.credentials.get_credentials)
+            else:
+                self.ws_client.set_rest_client(self.rest_client)
 
             await self.ws_client.ensure_connected()
             await self.ws_client.subscribe_private(["openOrders", "ownTrades"])
@@ -1418,16 +1377,74 @@ class AccountContext:
             )
             book_symbol = _resolve_book_symbol(request.symbol, metadata)
             depth: Optional[Decimal] = None
+            book: _PublicOrderBookState | None = None
             try:
                 book = await order_book_store.ensure_book(book_symbol)
-                depth = await book.depth(request.side, levels=10)
             except Exception as exc:
                 logger.debug(
-                    "Unable to fetch order book depth for %s on account %s: %s",
+                    "Unable to fetch order book for %s on account %s: %s",
                     book_symbol,
                     self.account_id,
                     exc,
                 )
+            if book is not None:
+                try:
+                    if self._feed_sla_seconds > 0 and await book.is_stale(
+                        self._feed_sla_seconds
+                    ):
+                        last_update = await book.last_update()
+                        age = (
+                            max(time.time() - last_update, 0.0)
+                            if last_update is not None
+                            else None
+                        )
+                        increment_oms_stale_feed(
+                            self.account_id,
+                            request.symbol,
+                            source="public_order_book",
+                            action="rejected",
+                        )
+                        age_display = f"{age:.2f}s" if age is not None else "unknown"
+                        logger.warning(
+                            "Rejecting order for account %s symbol %s due to stale public order book (age=%s, threshold=%.2fs)",
+                            self.account_id,
+                            request.symbol,
+                            age_display,
+                            self._feed_sla_seconds,
+                        )
+                        raise HTTPException(
+                            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="Market data is stale; please retry",
+                        )
+                    depth = await book.depth(request.side, levels=10)
+                except HTTPException:
+                    raise
+                except Exception as exc:
+                    logger.debug(
+                        "Unable to fetch order book depth for %s on account %s: %s",
+                        book_symbol,
+                        self.account_id,
+                        exc,
+                    )
+
+            force_rest = False
+            if self._feed_sla_seconds > 0:
+                heartbeat_age = self.ws_client.heartbeat_age()
+                if heartbeat_age is not None and heartbeat_age > self._feed_sla_seconds:
+                    force_rest = True
+                    increment_oms_stale_feed(
+                        self.account_id,
+                        request.symbol,
+                        source="private_stream",
+                        action="rerouted",
+                    )
+                    logger.warning(
+                        "Private stream heartbeat stale for account %s symbol %s (age=%.2fs > %.2fs); forcing REST submission",
+                        self.account_id,
+                        request.symbol,
+                        heartbeat_age,
+                        self._feed_sla_seconds,
+                    )
 
             child_quantities = self._plan_child_quantities(request, qty, metadata, depth)
             if not child_quantities:
@@ -1464,7 +1481,11 @@ class AccountContext:
                     request, child_qty, px, client_id=child_client_base
                 )
                 ack, transport, client_id_used, _ = await self._submit_order_with_preference(
-                    payload, request.symbol, child_client_base
+                    payload,
+                    request.symbol,
+                    child_client_base,
+                    preferred_transport="rest" if force_rest else None,
+                    allow_fallback=not force_rest,
                 )
                 transports_used.add(transport)
                 child_result = self._order_result_from_ack(client_id_used, ack)
@@ -1795,6 +1816,9 @@ class AccountContext:
         payload: Dict[str, Any],
         symbol: str,
         base_client_id: str,
+        *,
+        preferred_transport: Optional[str] = None,
+        allow_fallback: bool = True,
     ) -> Tuple[OrderAck, str, str, float]:
         assert self.ws_client is not None
         assert self.rest_client is not None
@@ -1802,10 +1826,10 @@ class AccountContext:
         base_payload = dict(payload)
         base_payload.setdefault("idempotencyKey", base_client_id)
         self.routing.update_probe_template(base_payload)
-        preferred = self.routing.preferred_path
+        preferred = preferred_transport or self.routing.preferred_path
         transports = [preferred]
         fallback = "rest" if preferred == "websocket" else "websocket"
-        if fallback not in transports:
+        if allow_fallback and fallback not in transports:
             transports.append(fallback)
 
         ws_failed = False

@@ -79,6 +79,16 @@ class KrakenRESTClient:
         payload: Dict[str, Any] = {"docalcs": bool(docalcs)}
         return await self._request("/private/OpenPositions", payload)
 
+    async def websocket_token(self) -> str:
+        """Fetch a websocket authentication token for the current credentials."""
+
+        payload = await self._request("/private/GetWebSocketsToken", {})
+        result = payload.get("result") or {}
+        token = result.get("token")
+        if not token:
+            raise KrakenRESTError("Kraken REST token response missing token")
+        return str(token)
+
     async def _request(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         credentials = await self._credential_getter()
         session = await self._session_or_create()

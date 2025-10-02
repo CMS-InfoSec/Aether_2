@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
 
 from common.schemas.contracts import FillEvent
@@ -28,6 +28,9 @@ from services.oms.kraken_ws import (
     OrderAck,
     OrderState,
 )
+
+from services.oms.rate_limit_guard import RateLimitGuard, rate_limit_guard as shared_rate_limit_guard
+
 from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
 
 
@@ -84,6 +87,34 @@ def oms_log(order_id: Optional[str], account_id: str, status: str, ts: datetime 
     entry = {"order_id": order_id, "account_id": account_id, "status": status, "ts": timestamp}
     _OMS_ACTIVITY_LOG.append(entry)
     logger.info("oms_log", extra={"order_id": order_id, "account_id": account_id, "status": status, "ts": timestamp.isoformat()})
+
+
+def _enforce_stablecoin_guard() -> None:
+    monitor = get_global_monitor()
+    statuses = monitor.active_depegs()
+    if not statuses:
+        return
+
+    detail = format_depeg_alert(statuses, monitor.config.depeg_threshold_bps)
+    logger.error(
+        "Stablecoin depeg guard triggered; refusing OMS order",
+        extra={
+            "threshold_bps": monitor.config.depeg_threshold_bps,
+            "stablecoin_status": [
+                {
+                    "symbol": status.symbol,
+                    "deviation_bps": round(status.deviation_bps, 3),
+                    "price": round(status.price, 6),
+                    "feed": status.feed,
+                }
+                for status in statuses
+            ],
+        },
+    )
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=detail,
+    )
 
 
 class PlaceOrderRequest(BaseModel):
@@ -267,15 +298,22 @@ class OrderRecord:
 class KrakenSession:
     """Manages Kraken websocket and REST transports for an account."""
 
-    def __init__(self, account_id: str, credential_provider: CredentialProvider) -> None:
+    def __init__(
+        self,
+        account_id: str,
+        credential_provider: CredentialProvider,
+        *,
+        rate_limit_guard: RateLimitGuard | None = None,
+    ) -> None:
         self.account_id = account_id
         self._credential_provider = credential_provider
+        self._rest_client = KrakenRESTClient(
+            credential_getter=lambda: self._credential_provider.get(self.account_id)
+        )
         self._ws_client = KrakenWSClient(
             credential_getter=lambda: self._credential_provider.get(self.account_id),
             stream_update_cb=self._on_state,
-        )
-        self._rest_client = KrakenRESTClient(
-            credential_getter=lambda: self._credential_provider.get(self.account_id)
+            rest_client=self._rest_client,
         )
         self._ws_task: Optional[asyncio.Task[None]] = None
         self._ready = asyncio.Event()
@@ -284,6 +322,7 @@ class KrakenSession:
         self._contexts: Dict[str, OrderContext] = {}
         self._client_lookup: Dict[str, str] = {}
         self._kafka = KafkaNATSAdapter(account_id=self.account_id)
+        self._rate_limit_guard: RateLimitGuard = rate_limit_guard or shared_rate_limit_guard
 
     async def ensure_started(self) -> None:
         if self._ready.is_set():
@@ -310,13 +349,30 @@ class KrakenSession:
     async def place_order(self, payload: Dict[str, Any], context: OrderContext) -> Tuple[OrderAck, str]:
         await self.ensure_started()
         start = time.perf_counter()
+        await self._rate_limit_guard.acquire(
+            self.account_id,
+            "add_order",
+            transport="websocket",
+            urgent=False,
+        )
         try:
             ack = await self._ws_client.add_order(payload)
-            transport = "websocket"
         except (KrakenWSError, KrakenWSTimeout) as exc:
+            await self._rate_limit_guard.release(
+                self.account_id,
+                transport="websocket",
+                successful=False,
+            )
             increment_oms_error_count(self.account_id, context.symbol, "websocket")
             ack = await self._place_via_rest(payload)
             transport = "rest"
+        else:
+            await self._rate_limit_guard.release(
+                self.account_id,
+                transport="websocket",
+                successful=True,
+            )
+            transport = "websocket"
         latency_ms = (time.perf_counter() - start) * 1000.0
         record_oms_latency(self.account_id, context.symbol, transport, latency_ms)
         exchange_id = ack.exchange_order_id or context.client_id
@@ -336,13 +392,30 @@ class KrakenSession:
         await self.ensure_started()
         payload = {"order_id": order_id}
         start = time.perf_counter()
+        await self._rate_limit_guard.acquire(
+            self.account_id,
+            "cancel_order",
+            transport="websocket",
+            urgent=True,
+        )
         try:
             ack = await self._ws_client.cancel_order(payload)
-            transport = "websocket"
         except (KrakenWSError, KrakenWSTimeout):
+            await self._rate_limit_guard.release(
+                self.account_id,
+                transport="websocket",
+                successful=False,
+            )
             increment_oms_error_count(self.account_id, symbol or "unknown", "websocket")
             ack = await self._cancel_via_rest(payload)
             transport = "rest"
+        else:
+            await self._rate_limit_guard.release(
+                self.account_id,
+                transport="websocket",
+                successful=True,
+            )
+            transport = "websocket"
         latency_ms = (time.perf_counter() - start) * 1000.0
         record_oms_latency(self.account_id, symbol or "unknown", transport, latency_ms)
         exchange_id = ack.exchange_order_id or order_id
@@ -372,16 +445,52 @@ class KrakenSession:
         return None
 
     async def _place_via_rest(self, payload: Dict[str, Any]) -> OrderAck:
+        await self._rate_limit_guard.acquire(
+            self.account_id,
+            "add_order",
+            transport="rest",
+            urgent=False,
+        )
         try:
-            return await self._rest_client.add_order(payload)
+            result = await self._rest_client.add_order(payload)
         except KrakenRESTError as exc:
+            await self._rate_limit_guard.release(
+                self.account_id,
+                transport="rest",
+                successful=False,
+            )
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+        else:
+            await self._rate_limit_guard.release(
+                self.account_id,
+                transport="rest",
+                successful=True,
+            )
+            return result
 
     async def _cancel_via_rest(self, payload: Dict[str, Any]) -> OrderAck:
+        await self._rate_limit_guard.acquire(
+            self.account_id,
+            "cancel_order",
+            transport="rest",
+            urgent=True,
+        )
         try:
-            return await self._rest_client.cancel_order(payload)
+            result = await self._rest_client.cancel_order(payload)
         except KrakenRESTError as exc:
+            await self._rate_limit_guard.release(
+                self.account_id,
+                transport="rest",
+                successful=False,
+            )
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+        else:
+            await self._rate_limit_guard.release(
+                self.account_id,
+                transport="rest",
+                successful=True,
+            )
+            return result
 
     async def _on_state(self, state: OrderState) -> None:
         exchange_id = state.exchange_order_id or state.client_order_id
@@ -499,6 +608,7 @@ class OMSService:
                 await session.close()
 
     async def place_order(self, request: PlaceOrderRequest) -> PlaceOrderResponse:
+        _enforce_stablecoin_guard()
         session = await self._session(request.account_id)
         payload = self._build_payload(request)
         context = OrderContext(

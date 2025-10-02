@@ -89,6 +89,30 @@ def push_no_trade_stall(
     _post_alert(payload, alertmanager_url)
 
 
+def push_exchange_adapter_failure(
+    adapter: str,
+    account_id: str,
+    operation: str,
+    error: str,
+    alertmanager_url: Optional[str] = None,
+) -> None:
+    """Emit a high severity alert when an exchange adapter call fails."""
+
+    summary = f"{adapter} adapter {operation} failure"
+    description = f"Operation {operation} failed for {account_id}: {error}"
+    payload = _build_payload(
+        alertname="ExchangeAdapterFailure",
+        labels={
+            "severity": "critical",
+            "adapter": adapter,
+            "account_id": account_id,
+            "operation": operation,
+        },
+        annotations={"summary": summary, "description": description},
+    )
+    _post_alert(payload, alertmanager_url)
+
+
 def push_universe_shrink(
     account_id: str,
     removed_symbols: int,

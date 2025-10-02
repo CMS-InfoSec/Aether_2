@@ -1,0 +1,185 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: chrony-monitor
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: chrony-monitor
+    app.kubernetes.io/component: time-sync
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chrony-config
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: chrony-monitor
+    app.kubernetes.io/component: time-sync
+  annotations:
+    description: Chrony configuration tuned for low-latency trading workloads
+data:
+  chrony.conf: |
+    driftfile /var/lib/chrony/chrony.drift
+    makestep 0.5 3
+    rtcsync
+    logdir /var/log/chrony
+    cmdallow 127.0.0.1
+    noclientlog
+    pool time.cloudflare.com iburst maxsources 4
+    pool time.google.com iburst maxsources 4
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: chrony-monitor
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: chrony-monitor
+    app.kubernetes.io/component: time-sync
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: chrony-monitor
+      app.kubernetes.io/component: time-sync
+  updateStrategy:
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: chrony-monitor
+        app.kubernetes.io/component: time-sync
+    spec:
+      serviceAccountName: chrony-monitor
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      tolerations:
+        - operator: Exists
+          effect: NoSchedule
+      securityContext:
+        runAsNonRoot: false
+      volumes:
+        - name: chrony-config
+          configMap:
+            name: chrony-config
+        - name: chrony-state
+          hostPath:
+            path: /var/lib/chrony
+            type: DirectoryOrCreate
+        - name: chrony-run
+          hostPath:
+            path: /run/chrony
+            type: DirectoryOrCreate
+      containers:
+        - name: chronyd
+          image: ghcr.io/cloudnativelabs/chrony:0.5.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - -f
+            - /etc/chrony/chrony.conf
+            - -d
+          securityContext:
+            capabilities:
+              add:
+                - SYS_TIME
+                - SYS_NICE
+          ports:
+            - containerPort: 323
+              name: ntp
+              protocol: UDP
+          volumeMounts:
+            - mountPath: /etc/chrony
+              name: chrony-config
+            - mountPath: /var/lib/chrony
+              name: chrony-state
+            - mountPath: /run/chrony
+              name: chrony-run
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+        - name: chrony-exporter
+          image: ghcr.io/cloudnativelabs/chrony-exporter:0.6.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --addr=0.0.0.0:9123
+            - --chronyc-path=/usr/bin/chronyc
+            - --tracking
+          env:
+            - name: CHRONYC_HOST
+              value: 127.0.0.1
+            - name: CHRONYC_PORT
+              value: "323"
+          ports:
+            - containerPort: 9123
+              name: metrics
+              protocol: TCP
+          volumeMounts:
+            - mountPath: /run/chrony
+              name: chrony-run
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chrony-monitor
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: chrony-monitor
+    app.kubernetes.io/component: time-sync
+spec:
+  selector:
+    app.kubernetes.io/name: chrony-monitor
+    app.kubernetes.io/component: time-sync
+  ports:
+    - name: metrics
+      protocol: TCP
+      port: 9123
+      targetPort: metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: chrony-monitor
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: chrony-monitor
+    app.kubernetes.io/component: time-sync
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: chrony-monitor
+      app.kubernetes.io/component: time-sync
+  namespaceSelector:
+    matchNames:
+      - observability
+  endpoints:
+    - port: metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      honorLabels: true
+      metricRelabelings:
+        - action: replace
+          sourceLabels: [instance]
+          targetLabel: node
