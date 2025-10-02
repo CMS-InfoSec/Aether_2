@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { formatLondonTime } from "./timezone";
 
 type AuditLogEntry = {
   id?: string;
@@ -207,15 +208,11 @@ const formatTimestamp = (value: string): string => {
   if (!value) {
     return "—";
   }
-  const parsed = Date.parse(value);
-  if (Number.isNaN(parsed)) {
+  const formatted = formatLondonTime(value);
+  if (!formatted) {
     return value;
   }
-  try {
-    return new Date(parsed).toLocaleString();
-  } catch (error) {
-    return value;
-  }
+  return formatted;
 };
 
 const toCsvValue = (value: string): string => `"${value.replace(/"/g, '""')}"`;
