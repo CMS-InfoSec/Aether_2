@@ -9,10 +9,10 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Header, Query, Request, status
 from fastapi.responses import JSONResponse
 from kubernetes import client, config
 from kubernetes.client import ApiException
@@ -33,6 +33,17 @@ LOGGER = logging.getLogger(__name__)
 SECRETS_LOGGER = logging.getLogger("secrets_log")
 
 
+DEFAULT_ADMIN_ACCOUNTS = {"company", "director-1", "director-2"}
+
+
+def _csv_env(var_name: str, *, default: Optional[Set[str]] = None) -> Set[str]:
+    raw = os.getenv(var_name, "")
+    values = {item.strip() for item in raw.split(",") if item.strip()}
+    if values:
+        return values
+    return set() if default is None else set(default)
+
+
 class Settings(BaseModel):
     kubernetes_namespace: str = Field(
         default_factory=lambda: os.getenv("KRAKEN_SECRET_NAMESPACE", "default")
@@ -40,6 +51,14 @@ class Settings(BaseModel):
     encryption_key_b64: str = Field(..., alias="SECRET_ENCRYPTION_KEY")
     kraken_api_url: str = Field(
         default_factory=lambda: os.getenv("KRAKEN_API_URL", "https://api.kraken.com")
+    )
+    authorized_admins: Set[str] = Field(
+        default_factory=lambda: _csv_env(
+            "KRAKEN_SECRETS_ALLOWED_ADMINS", default=DEFAULT_ADMIN_ACCOUNTS
+        )
+    )
+    service_tokens: Set[str] = Field(
+        default_factory=lambda: _csv_env("KRAKEN_SECRETS_SERVICE_TOKENS")
     )
 
     class Config:
@@ -259,10 +278,43 @@ def get_secret_manager() -> KrakenSecretManager:
     return secret_manager
 
 
+def authorize_request(
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    admin_id: Optional[str] = Header(default=None, alias="X-Admin-ID"),
+) -> str:
+    if admin_id:
+        if admin_id in SETTINGS.authorized_admins:
+            return admin_id
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin identity is not authorized to manage Kraken secrets.",
+        )
+
+    if authorization:
+        if not authorization.startswith("Bearer "):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authorization header must use the Bearer scheme.",
+            )
+        token = authorization.partition(" ")[2].strip()
+        if token and token in SETTINGS.service_tokens:
+            return f"service:{token}"
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Service token is not authorized to access Kraken secrets.",
+        )
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Authentication is required to access Kraken secrets.",
+    )
+
+
 @app.post("/secrets/kraken", status_code=status.HTTP_201_CREATED)
 async def store_kraken_secret(
     payload: KrakenSecretRequest,
     request: Request,
+    _: str = Depends(authorize_request),
     manager: KrakenSecretManager = Depends(get_secret_manager),
 ) -> JSONResponse:
     masked_key = redact_secret(payload.api_key)
@@ -321,6 +373,7 @@ async def store_kraken_secret(
 @app.get("/secrets/kraken/status")
 async def kraken_secret_status(
     account_id: str = Query(..., min_length=1),
+    _: str = Depends(authorize_request),
     manager: KrakenSecretManager = Depends(get_secret_manager),
 ) -> Dict[str, str]:
     LOGGER.info("Status requested for Kraken secret %s", account_id)
@@ -330,7 +383,9 @@ async def kraken_secret_status(
 
 @app.post("/secrets/kraken/test")
 async def test_kraken_credentials(
-    payload: KrakenTestRequest, manager: KrakenSecretManager = Depends(get_secret_manager)
+    payload: KrakenTestRequest,
+    _: str = Depends(authorize_request),
+    manager: KrakenSecretManager = Depends(get_secret_manager),
 ) -> Dict[str, Any]:
     LOGGER.info("Testing Kraken credentials for account %s", payload.account_id)
     credentials = manager.get_decrypted_credentials(payload.account_id)
