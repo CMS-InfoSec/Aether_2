@@ -233,11 +233,13 @@ def create_manifest(
     """Collect live state and build a manifest object."""
 
     manifest_id = manifest_id or datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-    payload = {
-        "services": collect_service_versions(services_dir),
-        "configs": collect_config_versions(config_db_url),
-        "models": collect_model_versions(models_dir),
-    }
+    payload = _normalise_payload(
+        {
+            "services": collect_service_versions(services_dir),
+            "configs": collect_config_versions(config_db_url),
+            "models": collect_model_versions(models_dir),
+        }
+    )
     manifest_hash = compute_manifest_hash(payload)
     ts = datetime.now(timezone.utc)
     return Manifest(manifest_id=manifest_id, payload=payload, manifest_hash=manifest_hash, ts=ts)
@@ -257,7 +259,7 @@ def save_manifest(session: Session, manifest: Manifest) -> Manifest:
     session.refresh(record)
     return Manifest(
         manifest_id=record.manifest_id,
-        payload=record.manifest_json,
+        payload=_normalise_payload(record.manifest_json),
         manifest_hash=record.manifest_hash,
         ts=record.ts,
     )
@@ -269,7 +271,7 @@ def fetch_manifest(session: Session, manifest_id: str) -> Optional[Manifest]:
         return None
     return Manifest(
         manifest_id=record.manifest_id,
-        payload=record.manifest_json,
+        payload=_normalise_payload(record.manifest_json),
         manifest_hash=record.manifest_hash,
         ts=record.ts,
     )
@@ -285,7 +287,7 @@ def list_manifests(session: Session, limit: Optional[int] = None) -> List[Manife
         manifests.append(
             Manifest(
                 manifest_id=row.manifest_id,
-                payload=row.manifest_json,
+                payload=_normalise_payload(row.manifest_json),
                 manifest_hash=row.manifest_hash,
                 ts=row.ts,
             )
@@ -322,9 +324,9 @@ def manifest_to_markdown(manifest: Manifest) -> str:
             lines.append(f"| {name} | {version} |")
         lines.append("")
 
-    _append_table("Services", manifest.payload.get("services", {}))
-    _append_table("Configs", manifest.payload.get("configs", {}))
-    _append_table("Models", manifest.payload.get("models", {}))
+    _append_table("Services", _coerce_str_mapping(manifest.payload.get("services")))
+    _append_table("Configs", _coerce_str_mapping(manifest.payload.get("configs")))
+    _append_table("Models", _coerce_str_mapping(manifest.payload.get("models")))
 
     return "\n".join(lines)
 
@@ -358,17 +360,17 @@ def verify_release_manifest(
     """Compare live state against a stored manifest and return mismatch messages."""
 
     mismatches: List[str] = []
-    expected_services = manifest.payload.get("services", {})
-    expected_configs = manifest.payload.get("configs", {})
-    expected_models = manifest.payload.get("models", {})
+    expected_services = _coerce_str_mapping(manifest.payload.get("services"))
+    expected_configs = _coerce_str_mapping(manifest.payload.get("configs"))
+    expected_models = _coerce_str_mapping(manifest.payload.get("models"))
 
-    actual_services = collect_service_versions(services_dir)
+    actual_services = {k: str(v) for k, v in collect_service_versions(services_dir).items()}
     mismatches.extend(_diff_versions("services", expected_services, actual_services))
 
-    actual_configs = collect_config_versions(config_db_url)
+    actual_configs = {k: str(v) for k, v in collect_config_versions(config_db_url).items()}
     mismatches.extend(_diff_versions("configs", expected_configs, actual_configs))
 
-    actual_models = collect_model_versions(models_dir)
+    actual_models = {k: str(v) for k, v in collect_model_versions(models_dir).items()}
     mismatches.extend(_diff_versions("models", expected_models, actual_models))
 
     recomputed_hash = compute_manifest_hash(manifest.payload)
@@ -396,6 +398,22 @@ def _diff_versions(category: str, expected: Dict[str, str], actual: Dict[str, st
             f"{category}: version mismatch for '{key}' (expected {expected[key]!r}, found {actual[key]!r})"
         )
     return messages
+
+
+def _coerce_str_mapping(value: Optional[Dict[str, object]]) -> Dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    return {str(key): str(val) for key, val in value.items() if key is not None and val is not None}
+
+
+def _normalise_payload(payload: Optional[Dict[str, object]]) -> Dict[str, Dict[str, str]]:
+    if not isinstance(payload, dict):
+        payload = {}
+    return {
+        "services": _coerce_str_mapping(payload.get("services")),
+        "configs": _coerce_str_mapping(payload.get("configs")),
+        "models": _coerce_str_mapping(payload.get("models")),
+    }
 
 
 def verify_release_manifest_by_id(
