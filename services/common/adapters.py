@@ -118,6 +118,14 @@ class TimescaleAdapter:
         "volatility_overrides": {},
         "correlation_matrix": {},
         "circuit_breakers": {},
+        "position_sizer": {
+            "max_trade_risk_pct_nav": 0.1,
+            "max_trade_risk_pct_cash": 0.5,
+            "volatility_floor": 0.05,
+            "slippage_bps": 2.0,
+            "safety_margin_bps": 5.0,
+            "min_trade_notional": 10.0,
+        },
     }
 
     def __post_init__(self) -> None:
