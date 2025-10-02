@@ -164,13 +164,19 @@ class CanaryDeploymentManager:
         self._active_version = model_version
         self._trades_seen = 0
 
-    def observe_trade(self, *, drift_flagged: bool, trade_metrics: Mapping[str, float] | None = None) -> None:
+    def observe_trade(
+        self,
+        *,
+        drift_alerts: Sequence[str],
+        has_metrics: bool,
+        trade_metrics: Mapping[str, float] | None = None,
+    ) -> None:
         """Record an executed trade for stability checks."""
 
         if self._active_version is None:
             return
 
-        if drift_flagged:
+        if drift_alerts:
             LOGGER.info(
                 "Drift detected while canary version %s active. Triggering rollback.",
                 self._active_version,
@@ -183,6 +189,12 @@ class CanaryDeploymentManager:
             "Observed trade %d/%d for canary %s", self._trades_seen, self.promote_after_trades, self._active_version
         )
         if self._trades_seen >= self.promote_after_trades:
+            if not has_metrics:
+                LOGGER.debug(
+                    "Skipping canary promotion for %s because no drift metrics are available yet.",
+                    self._active_version,
+                )
+                return
             self._promote()
 
     def _promote(self) -> None:
@@ -379,8 +391,14 @@ class DriftMonitoringService:
     def record_trade(self, trade_metrics: Mapping[str, float] | None = None) -> None:
         if self._canary_manager is None:
             return
-        drift_flagged = any(metric.alert for metric in self._metrics.values())
-        self._canary_manager.observe_trade(drift_flagged=drift_flagged, trade_metrics=trade_metrics)
+
+        alerts = [feature for feature, metric in self._metrics.items() if metric.alert]
+        has_metrics = bool(self._metrics)
+        self._canary_manager.observe_trade(
+            drift_alerts=alerts,
+            has_metrics=has_metrics,
+            trade_metrics=trade_metrics,
+        )
 
     def status(self) -> DriftStatusResponse:
         return DriftStatusResponse(
@@ -430,13 +448,7 @@ def get_drift_monitoring_service() -> DriftMonitoringService:
 def get_drift_status(service: DriftMonitoringService = Depends(get_drift_monitoring_service)) -> DriftStatusResponse:
     """Return the most recent drift evaluation metrics."""
 
-    status_payload = service.status()
-    if not status_payload.features:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No drift evaluations have been recorded yet.",
-        )
-    return status_payload
+    return service.status()
 
 
 __all__ = [
