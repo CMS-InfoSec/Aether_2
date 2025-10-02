@@ -7,6 +7,7 @@ resources:
   - deployment-oms.yaml
   - deployment-fees.yaml
   - deployment-secrets.yaml
+  - secret-secrets-service-config.yaml
   - deployment-universe.yaml
   - service-policy.yaml
   - service-risk.yaml
