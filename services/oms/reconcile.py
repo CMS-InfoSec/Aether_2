@@ -38,6 +38,7 @@ class ReconcileLogStore:
             CREATE TABLE IF NOT EXISTS reconcile_log (
                 ts TIMESTAMP NOT NULL,
                 account_id TEXT NOT NULL,
+                mismatches INTEGER NOT NULL DEFAULT 0,
                 mismatches_json TEXT NOT NULL
             )
             """
@@ -46,12 +47,18 @@ class ReconcileLogStore:
             row[1]
             for row in self._conn.execute("PRAGMA table_info(reconcile_log)")
         }
+        if "mismatches" not in columns:
+            self._conn.execute(
+                "ALTER TABLE reconcile_log ADD COLUMN mismatches INTEGER NOT NULL DEFAULT 0"
+            )
+            columns.add("mismatches")
         if "mismatches_json" not in columns:
             self._conn.execute("ALTER TABLE reconcile_log ADD COLUMN mismatches_json TEXT")
             self._conn.execute(
                 "UPDATE reconcile_log SET mismatches_json = ? WHERE mismatches_json IS NULL",
                 (json.dumps({}, sort_keys=True),),
             )
+        self._has_mismatches_column = "mismatches" in columns
         self._conn.commit()
         self._lock = asyncio.Lock()
 
@@ -60,11 +67,21 @@ class ReconcileLogStore:
     ) -> None:
         timestamp = datetime.now(timezone.utc)
         payload = json.dumps(mismatches, sort_keys=True)
+        mismatch_count = sum(len(entries) for entries in mismatches.values())
         async with self._lock:
-            self._conn.execute(
-                "INSERT INTO reconcile_log(ts, account_id, mismatches_json) VALUES(?, ?, ?)",
-                (timestamp, account_id, payload),
-            )
+            if self._has_mismatches_column:
+                self._conn.execute(
+                    """
+                    INSERT INTO reconcile_log(ts, account_id, mismatches, mismatches_json)
+                    VALUES(?, ?, ?, ?)
+                    """,
+                    (timestamp, account_id, mismatch_count, payload),
+                )
+            else:
+                self._conn.execute(
+                    "INSERT INTO reconcile_log(ts, account_id, mismatches_json) VALUES(?, ?, ?)",
+                    (timestamp, account_id, payload),
+                )
             self._conn.commit()
 
 
