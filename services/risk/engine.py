@@ -9,6 +9,7 @@ from compliance_filter import COMPLIANCE_REASON, compliance_filter
 from esg_filter import ESG_REASON, esg_filter
 from services.common.adapters import RedisFeastAdapter, TimescaleAdapter
 from services.common.schemas import RiskValidationRequest, RiskValidationResponse
+from services.risk.circuit_breakers import CircuitBreakerDecision, get_circuit_breaker
 
 
 @dataclass
@@ -27,6 +28,9 @@ class RiskEngine:
         self._config = self.timescale.load_risk_config()
         if self.universe_source is None:
             self.universe_source = RedisFeastAdapter(account_id=self.account_id)
+        self._circuit_breaker = get_circuit_breaker(
+            self.account_id, timescale=self.timescale
+        )
 
     def validate(self, request: RiskValidationRequest) -> RiskValidationResponse:
         if self.timescale is None:
@@ -61,6 +65,7 @@ class RiskEngine:
         self._validate_universe(request, reasons, context)
         self._validate_caps(request, reasons, context)
         self._validate_market_health(request, reasons, context)
+        self._validate_circuit_breakers(request, reasons, context)
         self._validate_diversification(request, reasons, context)
 
         if reasons:
@@ -196,6 +201,29 @@ class RiskEngine:
             )
             reasons.append(reason)
             self._record_event("latency_circuit_breaker", reason, context)
+
+    def _validate_circuit_breakers(
+        self,
+        request: RiskValidationRequest,
+        reasons: List[str],
+        context: Dict[str, Any],
+    ) -> None:
+        decision: CircuitBreakerDecision | None = self._circuit_breaker.evaluate(request)
+        if decision is None:
+            return
+        message = (
+            f"Intent blocked by circuit breaker for {decision.symbol}: {decision.reason}"
+        )
+        reasons.append(message)
+        payload = {
+            **context,
+            "symbol": decision.symbol,
+            "spread_bps": decision.spread_bps,
+            "realized_volatility": decision.volatility,
+            "triggered_at": decision.triggered_at,
+            "safe_mode": decision.safe_mode_engaged,
+        }
+        self._record_event("intent_circuit_breaker", message, payload)
 
     def _validate_diversification(
         self,

@@ -103,6 +103,7 @@ class TimescaleAdapter:
         "kill_switch": False,
         "volatility_overrides": {},
         "correlation_matrix": {},
+        "circuit_breakers": {},
     }
 
     def __post_init__(self) -> None:
