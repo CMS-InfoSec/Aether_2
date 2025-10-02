@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import pytest
 
@@ -187,15 +187,58 @@ def test_row_level_security_applies_session_scope(monkeypatch: pytest.MonkeyPatc
 
     captured_queries: List[str] = []
 
+    table_rows: Dict[str, List[Dict[str, Any]]] = {
+        "positions": [
+            {"account_id": "company", "symbol": "BTC/USD", "notional": 100000.0},
+            {"account_id": "director1", "symbol": "ETH/USD", "notional": 50000.0},
+        ],
+        "pnl_curves": [
+            {"account_id": "company", "nav": 1_200_000.0, "curve_ts": "2024-01-01T00:00:00Z"},
+            {"account_id": "director1", "nav": 850_000.0, "curve_ts": "2024-01-01T00:00:00Z"},
+        ],
+        "orders": [
+            {"account_id": "company", "order_id": "order-1", "submitted_at": "2024-01-01T00:00:00Z"},
+            {"account_id": "director1", "order_id": "order-2", "submitted_at": "2024-01-01T01:00:00Z"},
+        ],
+        "fills": [
+            {"account_id": "company", "fill_id": "fill-1", "fill_time": "2024-01-01T00:05:00Z"},
+            {"account_id": "director1", "fill_id": "fill-2", "fill_time": "2024-01-01T01:05:00Z"},
+        ],
+    }
+
     class _CursorStub:
-        def __init__(self, rows: List[Dict[str, Any]]) -> None:
-            self._rows = rows
+        def __init__(self, rows_by_table: Dict[str, List[Dict[str, Any]]]) -> None:
+            self._rows_by_table = rows_by_table
+            self._active_table: str | None = None
+            self._scopes: Tuple[str, ...] = tuple()
 
         def execute(self, query: str, params: Dict[str, Any] | None = None) -> None:
             captured_queries.append(query)
+            if "set_config" in query:
+                scope_value = ""
+                if params is not None:
+                    raw_scopes = params.get("scopes")
+                    if isinstance(raw_scopes, str):
+                        scope_value = raw_scopes
+                self._scopes = tuple(
+                    scope.strip() for scope in scope_value.split(",") if scope and scope.strip()
+                )
+                return
+
+            lowered = query.lower()
+            for table in self._rows_by_table:
+                if f"from {table}" in lowered:
+                    self._active_table = table
+                    break
 
         def fetchall(self) -> List[Dict[str, Any]]:
-            return self._rows
+            if not self._active_table:
+                return []
+            rows = [dict(row) for row in self._rows_by_table.get(self._active_table, [])]
+            if not self._scopes:
+                return []
+            allowed = set(self._scopes)
+            return [row for row in rows if row.get("account_id") in allowed]
 
         def __enter__(self) -> "_CursorStub":
             return self
@@ -205,16 +248,16 @@ def test_row_level_security_applies_session_scope(monkeypatch: pytest.MonkeyPatc
 
     class _ConnectionStub:
         def __init__(self) -> None:
-            self.rows = [
-                {"account_id": "company", "symbol": "BTC/USD", "notional": 100000.0},
-                {"account_id": "director1", "symbol": "ETH/USD", "notional": 50000.0},
-            ]
+            self.rows = table_rows
 
         def cursor(self) -> _CursorStub:
             return _CursorStub(self.rows)
 
-        def close(self) -> None:  # pragma: no cover - compatibility shim
-            return None
+        def __enter__(self) -> "_ConnectionStub":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> bool:  # noqa: ANN001
+            return False
 
     def _fake_connect(*_: Any, **__: Any) -> _ConnectionStub:
         return _ConnectionStub()
@@ -225,5 +268,18 @@ def test_row_level_security_applies_session_scope(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(portfolio_service, "_connect", _fake_connect, raising=False)
 
     rows = portfolio_service.query_positions(account_scopes=["company"])
-    assert all(row["account_id"] == "company" for row in rows)
+    assert rows == [table_rows["positions"][0]]
+
+    curve_rows = portfolio_service.query_pnl_curves(account_scopes=["director1"])
+    assert curve_rows == [table_rows["pnl_curves"][1]]
+
+    order_rows = portfolio_service.query_orders(account_scopes=["director1", "company"])
+    assert {entry["account_id"] for entry in order_rows} == {"company", "director1"}
+
+    fill_rows = portfolio_service.query_fills(account_scopes=["director1"])
+    assert fill_rows == [table_rows["fills"][1]]
+
+    with pytest.raises(ValueError):
+        portfolio_service.query_positions(account_scopes=[])
+
     assert any("set_config" in query for query in captured_queries), "Session scope not configured"
