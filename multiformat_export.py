@@ -347,7 +347,7 @@ class LogExporter:
             with conn.cursor(row_factory=dict_row) as cur:  # type: ignore[arg-type]
                 cur.execute(
                     """
-                    SELECT id, actor, action, entity, before_json, after_json, ts, ip_hash
+                    SELECT id, actor, action, entity, before, after, ts, ip_hash, hash, prev_hash
                     FROM audit_log
                     WHERE ts >= %s AND ts < %s
                     ORDER BY ts ASC
@@ -389,7 +389,7 @@ class LogExporter:
     def _normalise_record(self, row: Mapping[str, Any]) -> Dict[str, Any]:
         normalised: Dict[str, Any] = {}
         for key, value in dict(row).items():
-            if key in {"before_json", "after_json", "payload"}:
+            if key in {"before", "after", "payload"}:
                 value = _normalise_json(value)
             value = _normalise_datetime(value)
             normalised[key] = value
