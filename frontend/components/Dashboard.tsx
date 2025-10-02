@@ -381,6 +381,11 @@ const Dashboard: React.FC = () => {
 
   const handleRotateSecrets = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (readOnly) {
+      setRotationError("Auditor access is read-only. Credential rotation is disabled.");
+      setRotationMessage(null);
+      return;
+    }
     if (!apiKey || !apiSecret) {
       setRotationError("API key and secret are required");
       setRotationMessage(null);
@@ -753,8 +758,8 @@ const Dashboard: React.FC = () => {
                 </dl>
               </div>
 
-              {!readOnly ? (
-                <form onSubmit={handleRotateSecrets} className="space-y-3">
+              <form onSubmit={handleRotateSecrets} className="space-y-3" aria-disabled={readOnly}>
+                <fieldset disabled={readOnly} className="space-y-3">
                   <div className="text-xs uppercase tracking-wide text-slate-500">
                     Rotate Kraken API Keys
                   </div>
@@ -782,7 +787,7 @@ const Dashboard: React.FC = () => {
                   </label>
                   <button
                     type="submit"
-                    disabled={rotationSubmitting}
+                    disabled={readOnly || rotationSubmitting}
                     className="w-full rounded-md bg-emerald-500 px-3 py-2 text-sm font-semibold text-slate-950 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-slate-800 disabled:text-slate-400"
                   >
                     {rotationSubmitting ? "Rotating..." : "Rotate Credentials"}
@@ -797,8 +802,9 @@ const Dashboard: React.FC = () => {
                       {rotationMessage}
                     </div>
                   )}
-                </form>
-              ) : (
+                </fieldset>
+              </form>
+              {readOnly && (
                 <div className="rounded-md border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-300">
                   Auditor access is read-only. Credential rotation is disabled.
                 </div>
