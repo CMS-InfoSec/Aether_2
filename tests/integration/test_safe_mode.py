@@ -51,7 +51,11 @@ def test_safe_mode_blocks_intents_but_allows_hedging_orders() -> None:
     assert engine.submit_intent() == "intent-submitted"
     assert engine.place_order(hedging=False) == "order-placed"
 
-    response = client.post("/safe_mode/enter", json={"reason": "test"})
+    response = client.post(
+        "/safe_mode/enter",
+        json={"reason": "test"},
+        headers={"X-Account-ID": "company"},
+    )
     assert response.status_code == 200
     payload = response.json()
     assert payload["active"] is True
@@ -66,7 +70,9 @@ def test_safe_mode_blocks_intents_but_allows_hedging_orders() -> None:
         engine.place_order(hedging=False)
     assert engine.place_order(hedging=True) == "order-placed"
 
-    response = client.post("/safe_mode/exit")
+    response = client.post(
+        "/safe_mode/exit", headers={"X-Account-ID": "company"}
+    )
     assert response.status_code == 200
     payload = response.json()
     assert payload["active"] is False

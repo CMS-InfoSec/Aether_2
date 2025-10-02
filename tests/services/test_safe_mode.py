@@ -25,7 +25,7 @@ def test_enter_safe_mode_enforces_controls() -> None:
     response = client.post(
         "/safe_mode/enter",
         json={"reason": "volatility"},
-        headers={"X-Actor": "ops"},
+        headers={"X-Account-ID": "company"},
     )
 
     assert response.status_code == 200
@@ -47,16 +47,20 @@ def test_enter_safe_mode_enforces_controls() -> None:
     log_entries = safe_mode.get_safe_mode_log()
     assert log_entries
     assert log_entries[-1]["state"] == "entered"
-    assert log_entries[-1]["actor"] == "ops"
+    assert log_entries[-1]["actor"] == "company"
 
 
 def test_exit_safe_mode_restores_controls() -> None:
     client = TestClient(safe_mode.app)
     controller = safe_mode.controller
 
-    client.post("/safe_mode/enter", json={"reason": "latency"}, headers={"X-Actor": "ops"})
+    client.post(
+        "/safe_mode/enter",
+        json={"reason": "latency"},
+        headers={"X-Account-ID": "company"},
+    )
 
-    response = client.post("/safe_mode/exit", headers={"X-Actor": "ops"})
+    response = client.post("/safe_mode/exit", headers={"X-Account-ID": "company"})
     assert response.status_code == 200
     payload = response.json()
     assert payload["active"] is False
@@ -79,10 +83,33 @@ def test_status_endpoint_reports_current_state() -> None:
     assert response.status_code == 200
     assert response.json()["active"] is False
 
-    client.post("/safe_mode/enter", json={"reason": "stress"})
+    client.post(
+        "/safe_mode/enter",
+        json={"reason": "stress"},
+        headers={"X-Account-ID": "company"},
+    )
 
     response = client.get("/safe_mode/status")
     assert response.status_code == 200
     payload = response.json()
     assert payload["active"] is True
     assert payload["reason"] == "stress"
+
+
+def test_safe_mode_endpoints_enforce_authentication() -> None:
+    client = TestClient(safe_mode.app)
+
+    unauthenticated_response = client.post(
+        "/safe_mode/enter", json={"reason": "volatility"}
+    )
+    assert unauthenticated_response.status_code == 401
+
+    non_admin_response = client.post(
+        "/safe_mode/enter",
+        json={"reason": "volatility"},
+        headers={"X-Account-ID": "trader"},
+    )
+    assert non_admin_response.status_code == 403
+
+    unauthenticated_exit = client.post("/safe_mode/exit")
+    assert unauthenticated_exit.status_code == 401
