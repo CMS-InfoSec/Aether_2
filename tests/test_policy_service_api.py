@@ -12,6 +12,7 @@ from typing import List
 import pytest
 
 pytest.importorskip("fastapi")
+from fastapi import status
 from fastapi.testclient import TestClient
 
 if "metrics" not in sys.modules:
@@ -36,6 +37,7 @@ from services.common.schemas import (
 )
 
 from services.models.model_server import Intent
+from services.risk.stablecoin_monitor import StablecoinMonitor, StablecoinMonitorConfig
 
 
 @pytest.fixture(name="client")
@@ -355,6 +357,40 @@ def test_policy_decide_rejects_when_costs_exceed_edge(
 
     maker_template = next(template for template in body.action_templates if template.name == "maker")
     assert maker_template.edge_bps <= 0.0
+
+
+def test_policy_decide_rejects_when_stablecoin_depegged(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    monitor = StablecoinMonitor(
+        config=StablecoinMonitorConfig(
+            depeg_threshold_bps=50,
+            recovery_threshold_bps=10,
+            feed_max_age_seconds=60,
+            monitored_symbols=("USDC-USD",),
+            trusted_feeds=("primary_fx",),
+        )
+    )
+    monitor.update("USDC-USD", 0.9920, feed="primary_fx")
+
+    monkeypatch.setattr(policy_service, "get_global_monitor", lambda: monitor)
+
+    payload = {
+        "account_id": "company",
+        "order_id": "depeg-1",
+        "instrument": "BTC-USD",
+        "side": "BUY",
+        "quantity": 0.5,
+        "price": 30100.0,
+        "fee": {"currency": "USD", "maker": 4.0, "taker": 6.0},
+        "features": [0.2, -0.1, 0.7],
+        "book_snapshot": {"mid_price": 30110.0, "spread_bps": 3.5, "imbalance": 0.1},
+    }
+
+    response = client.post("/policy/decide", json=payload)
+    assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+    detail = response.json()["detail"]
+    assert "Stablecoin deviation" in detail
 
 
 @pytest.mark.anyio("asyncio")

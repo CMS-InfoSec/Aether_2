@@ -29,6 +29,10 @@ from services.common.schemas import (
     PolicyState,
 )
 from services.policy.adaptive_horizon import get_horizon
+from services.risk.stablecoin_monitor import (
+    format_depeg_alert,
+    get_global_monitor,
+)
 
 from ml.policy.fallback_policy import FallbackDecision, FallbackPolicy
 
@@ -100,6 +104,34 @@ def predict_intent(**kwargs) -> "Intent":
     """Compatibility wrapper for callers patching predict_intent."""
 
     return _predict_intent(**kwargs)
+
+
+def _enforce_stablecoin_guard() -> None:
+    monitor = get_global_monitor()
+    statuses = monitor.active_depegs()
+    if not statuses:
+        return
+
+    detail = format_depeg_alert(statuses, monitor.config.depeg_threshold_bps)
+    logger.error(
+        "Stablecoin depeg guard triggered; refusing policy decision",
+        extra={
+            "threshold_bps": monitor.config.depeg_threshold_bps,
+            "stablecoin_status": [
+                {
+                    "symbol": status.symbol,
+                    "deviation_bps": round(status.deviation_bps, 3),
+                    "price": round(status.price, 6),
+                    "feed": status.feed,
+                }
+                for status in statuses
+            ],
+        },
+    )
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=detail,
+    )
 
 
 @app.get("/exchange/adapters", tags=["exchange"])
@@ -584,6 +616,8 @@ async def decide_policy(
         )
 
     book_snapshot = request.book_snapshot
+
+    _enforce_stablecoin_guard()
 
     state_model = request.state or _default_state()
     state_payload = (
