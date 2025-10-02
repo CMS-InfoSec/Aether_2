@@ -60,6 +60,11 @@ class KrakenRESTClient:
     async def open_orders(self) -> Dict[str, Any]:
         return await self._request("/private/OpenOrders", {})
 
+    async def balance(self) -> Dict[str, Any]:
+        """Return the latest balance snapshot for the authenticated account."""
+
+        return await self._request("/private/Balance", {})
+
     async def own_trades(self, *, start: Optional[int] = None, end: Optional[int] = None) -> Dict[str, Any]:
         payload: Dict[str, Any] = {"trades": True}
         if start is not None:
