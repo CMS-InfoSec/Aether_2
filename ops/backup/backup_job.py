@@ -255,7 +255,12 @@ class BackupJob:
 
         except Exception as exc:  # noqa: BLE001 - log & rethrow
             LOGGER.exception("Backup %s failed", manifest_id)
-            self._log_backup(manifest_id, timestamp, "FAILED")
+            failure_manifest = {
+                "manifest_id": manifest_id,
+                "timestamp": timestamp,
+                "error": str(exc),
+            }
+            self._log_backup(manifest_id, timestamp, "FAILED", failure_manifest)
             raise exc
 
     def restore_backup(self, manifest_id: str) -> None:
@@ -368,6 +373,11 @@ class BackupJob:
             "manifest_id": manifest_id,
             "timestamp": timestamp,
             "artifacts": [artifact.to_dict() for artifact in artifacts],
+            "config": {
+                "bucket": self.config.bucket_name,
+                "bucket_prefix": self.config.bucket_prefix,
+                "retention_days": self.config.retention_days,
+            },
         }
         manifest["hash"] = self._hash_manifest(manifest["artifacts"])
 
