@@ -1,14 +1,88 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 from fastapi import Header, HTTPException, Request, status
 
 from auth.service import Session, SessionStoreProtocol
 
-ADMIN_ACCOUNTS = {"company", "director-1", "director-2"}
-DIRECTOR_ACCOUNTS = {account for account in ADMIN_ACCOUNTS if account.startswith("director-")}
+_DEFAULT_ADMIN_ACCOUNTS = frozenset({"company", "director-1", "director-2"})
+_ADMIN_ENV_VARIABLE = "AETHER_ADMIN_ACCOUNTS"
+
+
+def _sanitize_account_id(value: str) -> str:
+    return value.strip()
+
+
+def _normalize_account_id(value: str) -> str:
+    return _sanitize_account_id(value).lower()
+
+
+def _load_admin_accounts_from_env() -> set[str]:
+    raw = os.environ.get(_ADMIN_ENV_VARIABLE)
+    if not raw:
+        return set(_DEFAULT_ADMIN_ACCOUNTS)
+    accounts = {
+        _sanitize_account_id(part)
+        for part in raw.split(",")
+        if _sanitize_account_id(part)
+    }
+    if not accounts:
+        return set(_DEFAULT_ADMIN_ACCOUNTS)
+    return accounts
+
+
+def reload_admin_accounts(source: Optional[Iterable[str]] = None) -> set[str]:
+    """Refresh administrator accounts from the configured source."""
+
+    if source is None:
+        accounts = _load_admin_accounts_from_env()
+    else:
+        accounts = {
+            _sanitize_account_id(account)
+            for account in source
+            if _sanitize_account_id(account)
+        }
+    if not accounts:
+        accounts = set(_DEFAULT_ADMIN_ACCOUNTS)
+
+    ADMIN_ACCOUNTS.clear()
+    ADMIN_ACCOUNTS.update(accounts)
+
+    DIRECTOR_ACCOUNTS.clear()
+    DIRECTOR_ACCOUNTS.update(
+        {
+            account
+            for account in ADMIN_ACCOUNTS
+            if _normalize_account_id(account).startswith("director-")
+        }
+    )
+    return set(ADMIN_ACCOUNTS)
+
+
+ADMIN_ACCOUNTS: set[str] = set()
+DIRECTOR_ACCOUNTS: set[str] = set()
+reload_admin_accounts()
+
+
+def get_admin_accounts(*, normalized: bool = False) -> set[str]:
+    """Return the configured administrator accounts."""
+
+    accounts = {_sanitize_account_id(account) for account in ADMIN_ACCOUNTS if _sanitize_account_id(account)}
+    if normalized:
+        return {_normalize_account_id(account) for account in accounts}
+    return accounts
+
+
+def get_director_accounts(*, normalized: bool = False) -> set[str]:
+    """Return the configured director accounts."""
+
+    directors = {_sanitize_account_id(account) for account in DIRECTOR_ACCOUNTS if _sanitize_account_id(account)}
+    if normalized:
+        return {_normalize_account_id(account) for account in directors}
+    return directors
 
 
 @dataclass(frozen=True)
@@ -119,7 +193,7 @@ def require_admin_account(
             detail="Account header does not match authenticated session.",
         )
 
-    if principal.normalized_account not in {acct.lower() for acct in ADMIN_ACCOUNTS}:
+    if principal.normalized_account not in get_admin_accounts(normalized=True):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account is not authorized for administrative access.",
@@ -134,7 +208,7 @@ def require_mfa_context(
     """Ensure the caller has completed MFA challenges via a verified session."""
 
     principal = require_authenticated_principal(request, authorization)
-    if principal.normalized_account not in {acct.lower() for acct in ADMIN_ACCOUNTS}:
+    if principal.normalized_account not in get_admin_accounts(normalized=True):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account is not authorized for administrative access.",
@@ -199,7 +273,7 @@ def require_dual_director_confirmation(
             detail="Two distinct director approvals are required.",
         )
 
-    valid_directors = {acct.lower() for acct in DIRECTOR_ACCOUNTS}
+    valid_directors = get_director_accounts(normalized=True)
     for account in accounts:
         if account not in valid_directors:
             raise HTTPException(
