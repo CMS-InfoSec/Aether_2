@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping
 
@@ -225,9 +226,9 @@ def test_generate_daily_pnl_fee_attribution(tmp_path: Path, sample_session: Reco
     rows = read_csv(csv_path)
     assert len(rows) == 2
     alpha_row = next(row for row in rows if row["account_id"] == "101")
-    assert pytest.approx(float(alpha_row["gross_pnl"])) == 10.0
-    assert pytest.approx(float(alpha_row["fees"])) == 1.1
-    assert pytest.approx(float(alpha_row["net_pnl"])) == 8.9
+    assert Decimal(alpha_row["gross_pnl"]) == Decimal("10.00")
+    assert Decimal(alpha_row["fees"]) == Decimal("1.1")
+    assert Decimal(alpha_row["net_pnl"]) == Decimal("8.90")
 
 
 def test_generate_daily_pnl_account_isolation(tmp_path: Path, sample_session: RecordingSession) -> None:
@@ -314,4 +315,71 @@ def test_generate_daily_pnl_creates_audit_log_entries(tmp_path: Path, sample_ses
 
     payload = json.loads(sample_session.audit_entries[0]["payload"])
     assert "daily_pnl/2024-05-01.csv" in payload["metadata"]["object_key"]
+
+
+def test_generate_daily_pnl_high_precision_serialization(tmp_path: Path) -> None:
+    from datetime import datetime, timezone
+
+    pd = pytest.importorskip("pandas")
+
+    accounts = [{"account_id": 404, "admin_slug": "gamma"}]
+    orders = [
+        {
+            "order_id": "ord-hp",
+            "account_id": 404,
+            "market": "BTC-USD",
+            "symbol": "BTC-USD",
+            "side": "SELL",
+            "size": "0.00012345",
+            "submitted_at": datetime(2024, 5, 2, 0, 0, tzinfo=timezone.utc),
+        }
+    ]
+    fills = [
+        {
+            "fill_id": "fill-hp",
+            "order_id": "ord-hp",
+            "market": "BTC-USD",
+            "symbol": "BTC-USD",
+            "fill_time": datetime(2024, 5, 2, 0, 5, tzinfo=timezone.utc),
+            "price": "52345.67",
+            "size": "0.00012345",
+            "fee": "0.12345678",
+        }
+    ]
+    session = RecordingSession(accounts, orders, fills)
+    storage = ArtifactStorage(tmp_path)
+
+    keys = generate_daily_pnl(
+        session,
+        storage,
+        report_date=date(2024, 5, 2),
+        output_formats=("csv", "parquet"),
+    )
+
+    assert keys == ["daily_pnl/2024-05-02.csv", "daily_pnl/2024-05-02.parquet"]
+
+    quantity = Decimal("0.00012345")
+    price = Decimal("52345.67")
+    fee = Decimal("0.12345678")
+    gross = quantity * price
+    net = gross - fee
+    reporting_scale = Decimal("0.01")
+
+    csv_path = tmp_path / "global" / keys[0]
+    rows = read_csv(csv_path)
+    assert len(rows) == 1
+    row = rows[0]
+    assert Decimal(row["executed_quantity"]) == quantity
+    assert Decimal(row["gross_pnl"]) == gross.quantize(reporting_scale)
+    assert Decimal(row["fees"]) == fee
+    assert Decimal(row["net_pnl"]) == net.quantize(reporting_scale)
+
+    parquet_path = tmp_path / "global" / keys[1]
+    frame = pd.read_parquet(parquet_path)
+    assert len(frame) == 1
+    parquet_row = frame.iloc[0]
+    assert Decimal(str(parquet_row["executed_quantity"])) == quantity
+    assert Decimal(str(parquet_row["gross_pnl"])) == gross.quantize(reporting_scale)
+    assert Decimal(str(parquet_row["fees"])) == fee
+    assert Decimal(str(parquet_row["net_pnl"])) == net.quantize(reporting_scale)
 

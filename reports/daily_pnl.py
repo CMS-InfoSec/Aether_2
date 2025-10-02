@@ -8,11 +8,15 @@ import logging
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence
 
 from reports.storage import ArtifactStorage, TimescaleSession, build_storage_from_env
 
 LOGGER = logging.getLogger(__name__)
+
+REPORTING_SCALE = Decimal("0.01")
+ZERO = Decimal("0")
 
 FILL_QUERY = """
 SELECT
@@ -49,10 +53,16 @@ WHERE o.submitted_at >= %(start)s AND o.submitted_at < %(end)s
 class DailyPnlRow:
     account_id: str
     instrument: str
-    executed_quantity: float
-    gross_pnl: float
-    fees: float
-    net_pnl: float
+    executed_quantity: Decimal
+    gross_pnl: Decimal
+    fees: Decimal
+    net_pnl: Decimal
+
+    def quantized_gross(self) -> Decimal:
+        return self.gross_pnl.quantize(REPORTING_SCALE)
+
+    def quantized_net(self) -> Decimal:
+        return self.net_pnl.quantize(REPORTING_SCALE)
 
 
 class ResultSetAdapter:
@@ -164,12 +174,22 @@ def fetch_daily_orders(
     return order_to_instrument
 
 
+def _to_decimal(value: Any) -> Decimal:
+    """Convert *value* to :class:`Decimal` with string-based coercion."""
+
+    if isinstance(value, Decimal):
+        return value
+    if value is None:
+        return ZERO
+    return Decimal(str(value))
+
+
 def compute_daily_pnl(
     fills: Iterable[Mapping[str, Any]],
     order_instruments: Mapping[str, str],
 ) -> List[DailyPnlRow]:
-    aggregates: MutableMapping[tuple[str, str], Dict[str, float]] = defaultdict(
-        lambda: {"executed_quantity": 0.0, "gross_pnl": 0.0, "fees": 0.0}
+    aggregates: MutableMapping[tuple[str, str], Dict[str, Decimal]] = defaultdict(
+        lambda: {"executed_quantity": ZERO, "gross_pnl": ZERO, "fees": ZERO}
     )
     for fill in fills:
         account_id = str(fill["account_id"])
@@ -180,9 +200,9 @@ def compute_daily_pnl(
 
         )
         side = str(fill["side"]).upper()
-        quantity = float(fill["size"])
-        price = float(fill["price"])
-        fee = float(fill.get("fee", 0.0))
+        quantity = _to_decimal(fill["size"])
+        price = _to_decimal(fill["price"])
+        fee = _to_decimal(fill.get("fee", ZERO))
         notional = quantity * price
         signed_notional = notional if side == "SELL" else -notional
         aggregate = aggregates[(account_id, instrument)]
@@ -190,7 +210,7 @@ def compute_daily_pnl(
         aggregate["gross_pnl"] += signed_notional
         aggregate["fees"] += fee
         LOGGER.debug(
-            "Processed fill order_id=%s account=%s instrument=%s notional=%f fee=%f",
+            "Processed fill order_id=%s account=%s instrument=%s notional=%s fee=%s",
             order_id,
             account_id,
             instrument,
@@ -213,18 +233,24 @@ def compute_daily_pnl(
     return rows
 
 
+def _format_decimal(value: Decimal) -> str:
+    return format(value, "f")
+
+
 def _serialize_csv(rows: Sequence[DailyPnlRow]) -> bytes:
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["account_id", "instrument", "executed_quantity", "gross_pnl", "fees", "net_pnl"])
     for row in rows:
+        gross = row.quantized_gross()
+        net = row.quantized_net()
         writer.writerow([
             row.account_id,
             row.instrument,
-            f"{row.executed_quantity:.10f}",
-            f"{row.gross_pnl:.10f}",
-            f"{row.fees:.10f}",
-            f"{row.net_pnl:.10f}",
+            _format_decimal(row.executed_quantity),
+            _format_decimal(gross),
+            _format_decimal(row.fees),
+            _format_decimal(net),
         ])
     return output.getvalue().encode()
 
@@ -235,7 +261,18 @@ def _serialize_parquet(rows: Sequence[DailyPnlRow]) -> bytes:
     except Exception as exc:  # pragma: no cover - optional dependency
         raise RuntimeError("pandas is required for Parquet serialization") from exc
 
-    frame = pd.DataFrame([row.__dict__ for row in rows])
+    serialized_rows = [
+        {
+            "account_id": row.account_id,
+            "instrument": row.instrument,
+            "executed_quantity": _format_decimal(row.executed_quantity),
+            "gross_pnl": _format_decimal(row.quantized_gross()),
+            "fees": _format_decimal(row.fees),
+            "net_pnl": _format_decimal(row.quantized_net()),
+        }
+        for row in rows
+    ]
+    frame = pd.DataFrame(serialized_rows)
     buffer = io.BytesIO()
     frame.to_parquet(buffer, index=False)
     return buffer.getvalue()
