@@ -4,6 +4,7 @@ export interface AuthClaims {
   role?: string;
   permissions?: string[];
   read_only?: boolean;
+  account_scopes?: string[] | string;
   [key: string]: unknown;
 }
 
