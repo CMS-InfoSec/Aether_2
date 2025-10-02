@@ -6,7 +6,7 @@ import base64
 import json
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Tuple
+from typing import Any, Mapping, Optional, Tuple
 
 
 def _b64url(data: bytes) -> str:
@@ -22,12 +22,20 @@ def _sign(data: bytes, secret: str) -> str:
     return _b64url(digest)
 
 
-def create_jwt(*, subject: str, ttl_seconds: Optional[int] = None) -> Tuple[str, datetime]:
+def create_jwt(
+    *,
+    subject: str,
+    role: Optional[str] = None,
+    claims: Optional[Mapping[str, Any]] = None,
+    ttl_seconds: Optional[int] = None,
+) -> Tuple[str, datetime]:
     """Create a signed JWT for the given subject.
 
-    The JWT role claim is hard-coded to ``admin`` to align with existing downstream
-    expectations.  The token TTL can be overridden either via the ``ttl_seconds``
-    argument or the ``AUTH_JWT_TTL_SECONDS`` environment variable.
+    ``role`` can be provided explicitly or embedded within the optional ``claims``
+    mapping.  At least one of those two mechanisms must supply the role claim so
+    downstream services can enforce authorization policies.  The token TTL can be
+    overridden either via the ``ttl_seconds`` argument or the
+    ``AUTH_JWT_TTL_SECONDS`` environment variable.
     """
 
     secret = os.getenv("AUTH_JWT_SECRET")
@@ -38,10 +46,21 @@ def create_jwt(*, subject: str, ttl_seconds: Optional[int] = None) -> Tuple[str,
     now = datetime.now(timezone.utc)
     payload = {
         "sub": subject,
-        "role": "admin",
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(seconds=ttl)).timestamp()),
     }
+
+    if claims:
+        for key, value in claims.items():
+            if key in {"sub", "iat", "exp"}:
+                continue
+            payload[key] = value
+
+    if role is not None:
+        payload["role"] = role
+
+    if "role" not in payload:
+        raise ValueError("JWT role claim must be provided via the role argument or claims mapping")
     header = {"alg": "HS256", "typ": "JWT"}
 
     header_b64 = _b64url(json.dumps(header, separators=(",", ":"), sort_keys=True).encode("utf-8"))
