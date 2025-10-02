@@ -5,7 +5,7 @@ Provide a standardized procedure for rotating the AES encryption key that protec
 
 ## Preconditions
 - Access to the Aether Kubernetes clusters (staging and production) with permissions to update Secrets and restart Deployments.
-- Access to the Git repository to update the declarative manifest `deploy/k8s/base/aether-services/secret-secrets-service-config.yaml`.
+- Access to the secret management tooling for the cluster (Sealed Secrets controller or direct `kubectl` access to the namespace).
 - A secure workstation with OpenSSL (or equivalent tooling) for generating random keys.
 - Coordinated maintenance window approved by Security and Platform teams if production traffic will be impacted.
 
@@ -17,22 +17,55 @@ Provide a standardized procedure for rotating the AES encryption key that protec
 2. Copy the value into a password manager entry for audit purposes.
 
 ## Update the Kubernetes Secret
-1. Edit `deploy/k8s/base/aether-services/secret-secrets-service-config.yaml` and replace the placeholder with the new base64 value.
-2. Commit the change and open a pull request for review.
-3. After approval, deploy to staging:
+1. Export the key into an environment variable without writing it to disk:
    ```bash
-   kubectl --context aether-staging apply -f deploy/k8s/base/aether-services/secret-secrets-service-config.yaml
+   export SECRET_ENCRYPTION_KEY=$(openssl rand -base64 32)
+   ```
+2. Create an updated secret manifest locally. If the cluster uses Sealed Secrets, run:
+   ```bash
+   kubectl --context aether-staging \
+     create secret generic secrets-service-config \
+     --namespace aether-services \
+     --from-literal=SECRET_ENCRYPTION_KEY="$SECRET_ENCRYPTION_KEY" \
+     --dry-run=client -o yaml \
+   | kubeseal --format yaml --scope cluster-wide > /tmp/secrets-service-config.sealed.yaml
+   ```
+   Apply the sealed secret:
+   ```bash
+   kubectl --context aether-staging apply -f /tmp/secrets-service-config.sealed.yaml
+   ```
+   For clusters without Sealed Secrets, apply the secret directly without persisting it:
+   ```bash
+   kubectl --context aether-staging \
+     create secret generic secrets-service-config \
+     --namespace aether-services \
+     --from-literal=SECRET_ENCRYPTION_KEY="$SECRET_ENCRYPTION_KEY" \
+     --dry-run=client -o yaml \
+   | kubectl --context aether-staging apply -f -
+   ```
+3. Restart the deployment to pick up the new key:
+   ```bash
    kubectl --context aether-staging rollout restart deployment/secrets-service
    kubectl --context aether-staging rollout status deployment/secrets-service
    ```
-4. Verify the service logs show successful startup and encryption operations.
+4. Verify the service logs show successful startup and encryption operations, then clear the environment variable:
+   ```bash
+   unset SECRET_ENCRYPTION_KEY
+   ```
 
 ## Promote to Production
-1. Once staging validation passes, apply the manifest to production:
+1. Once staging validation passes, repeat the secret creation process against production. Generate a fresh key and apply it using the appropriate secure method (Sealed Secrets or direct `kubectl apply -f -`).
    ```bash
-   kubectl --context aether-production apply -f deploy/k8s/base/aether-services/secret-secrets-service-config.yaml
+   export SECRET_ENCRYPTION_KEY=$(openssl rand -base64 32)
+   kubectl --context aether-production \
+     create secret generic secrets-service-config \
+     --namespace aether-services \
+     --from-literal=SECRET_ENCRYPTION_KEY="$SECRET_ENCRYPTION_KEY" \
+     --dry-run=client -o yaml \
+   | kubectl --context aether-production apply -f -
    kubectl --context aether-production rollout restart deployment/secrets-service
    kubectl --context aether-production rollout status deployment/secrets-service
+   unset SECRET_ENCRYPTION_KEY
    ```
 2. Confirm production logs and metrics (error rate, latency) remain healthy for 30 minutes.
 
