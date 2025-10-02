@@ -8,7 +8,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, Union
 
 try:  # pragma: no cover - import is validated in unit tests indirectly
     import psycopg  # type: ignore
@@ -206,19 +206,24 @@ def log_audit(
             )
 
 
-def verify_audit_chain() -> bool:
+def verify_audit_chain(
+    *, log_path: Optional[Union[str, Path]] = None, state_path: Optional[Union[str, Path]] = None
+) -> bool:
     """Validate the audit chain log for tamper evidence.
 
     Returns ``True`` when the chain is valid, otherwise ``False``.
     """
 
-    log_path = _chain_log_path()
+    log_path = Path(log_path) if log_path is not None else _chain_log_path()
+    state_path = Path(state_path) if state_path is not None else _chain_state_path()
+
     if not log_path.exists():
         print("No audit chain entries found.")
         return True
 
     prev_entry_hash = _GENESIS_HASH
     valid = True
+    final_entry_hash = prev_entry_hash
 
     with log_path.open("r", encoding="utf-8") as fh:
         for line_number, line in enumerate(fh, start=1):
@@ -262,6 +267,16 @@ def verify_audit_chain() -> bool:
                 break
 
             prev_entry_hash = entry_hash
+            final_entry_hash = entry_hash
+
+    if valid:
+        recorded_state_hash = _read_last_hash(state_path)
+        if recorded_state_hash != final_entry_hash:
+            print(
+                "State hash mismatch: "
+                f"expected {final_entry_hash}, found {recorded_state_hash} in state file"
+            )
+            valid = False
 
     if valid:
         print("Audit chain verified successfully.")
@@ -272,7 +287,21 @@ def _build_cli() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Audit logger utilities")
     subparsers = parser.add_subparsers(dest="command")
     subparsers.required = True
-    subparsers.add_parser("verify", help="Verify the audit chain integrity")
+    verify_parser = subparsers.add_parser("verify", help="Verify the audit chain integrity")
+    verify_parser.add_argument(
+        "--log",
+        dest="log_path",
+        type=Path,
+        default=None,
+        help="Path to the audit chain log file (defaults to AUDIT_CHAIN_LOG)",
+    )
+    verify_parser.add_argument(
+        "--state",
+        dest="state_path",
+        type=Path,
+        default=None,
+        help="Path to the audit chain state file (defaults to AUDIT_CHAIN_STATE)",
+    )
     return parser
 
 
@@ -281,7 +310,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     if args.command == "verify":
-        return 0 if verify_audit_chain() else 1
+        return 0 if verify_audit_chain(log_path=args.log_path, state_path=args.state_path) else 1
 
     parser.print_help()
     return 1
