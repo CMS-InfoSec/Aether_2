@@ -2,7 +2,10 @@ from __future__ import annotations
 
 
 import asyncio
+import base64
 import contextlib
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -38,6 +41,7 @@ from services.oms.warm_start import WarmStartCoordinator
 import websockets
 
 from metrics import (
+    increment_oms_auth_failures,
     increment_oms_child_orders_total,
     increment_oms_error_count,
     record_oms_latency,
@@ -161,24 +165,47 @@ class ImpactCurveResponse(BaseModel):
     as_of: datetime
 
 
+@dataclass
+class _IdempotencyEntry:
+    future: asyncio.Future[OMSOrderStatusResponse]
+    timestamp: float = 0.0
+
+
 class _IdempotencyStore:
     """Cooperative idempotency cache used per-account."""
 
-    def __init__(self) -> None:
+    def __init__(self, ttl_seconds: float = 300.0) -> None:
         self._lock = asyncio.Lock()
-        self._entries: Dict[str, asyncio.Future[OMSOrderStatusResponse]] = {}
+        self._entries: Dict[str, _IdempotencyEntry] = {}
+        self._ttl_seconds = ttl_seconds
+
+    def _purge_expired(self) -> None:
+        if not self._entries:
+            return
+
+        now = time.monotonic()
+        expired = [
+            key
+            for key, entry in self._entries.items()
+            if entry.future.done() and now - entry.timestamp >= self._ttl_seconds
+        ]
+        for key in expired:
+            self._entries.pop(key, None)
 
     async def get_or_create(
         self, key: str, factory: Awaitable[OMSOrderStatusResponse]
     ) -> Tuple[OMSOrderStatusResponse, bool]:
         async with self._lock:
-            future = self._entries.get(key)
-            if future is None:
+            self._purge_expired()
+            entry = self._entries.get(key)
+            if entry is None:
                 loop = asyncio.get_event_loop()
                 future = loop.create_future()
-                self._entries[key] = future
+                entry = _IdempotencyEntry(future=future)
+                self._entries[key] = entry
                 create_future = True
             else:
+                future = entry.future
                 create_future = False
 
         if create_future:
@@ -186,8 +213,15 @@ class _IdempotencyStore:
                 result = await factory
             except Exception as exc:  # pragma: no cover - propagate to awaiting callers
                 future.set_exception(exc)
+                async with self._lock:
+                    self._entries.pop(key, None)
                 raise
             else:
+                completion_time = time.monotonic()
+                async with self._lock:
+                    entry = self._entries.get(key)
+                    if entry is not None:
+                        entry.timestamp = completion_time
                 future.set_result(result)
                 return result, False
 
@@ -561,6 +595,10 @@ def _split_quantities(
     return [qty for qty in quantities if qty > 0]
 
 
+class CredentialLoadError(RuntimeError):
+    """Raised when credential secrets cannot be loaded."""
+
+
 class CredentialWatcher:
     """Watches Kubernetes mounted secrets for key rotation."""
 
@@ -632,18 +670,33 @@ class CredentialWatcher:
     async def _load(self) -> None:
         try:
             raw = self._secret_path.read_text()
-        except FileNotFoundError:
-            logger.warning("Credential file missing for account %s", self.account_id)
-            return
+        except FileNotFoundError as exc:
+            message = (
+                f"Credential file missing for account {self.account_id}"
+                f" at {self._secret_path}"
+            )
+            logger.error(message)
+            raise CredentialLoadError(message) from exc
 
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as exc:
-            logger.error("Invalid credential payload for %s: %s", self.account_id, exc)
-            return
+            message = f"Invalid credential payload for {self.account_id}: {exc}"
+            logger.error(message)
+            raise CredentialLoadError(message) from exc
+
+        api_key = data.get("api_key") or data.get("key")
+        api_secret = data.get("api_secret") or data.get("secret")
+        if not api_key or not api_secret:
+            message = (
+                f"Credential payload for {self.account_id} missing required fields"
+            )
+            logger.error(message)
+            raise CredentialLoadError(message)
+
         credentials = {
-            "api_key": data.get("api_key") or data.get("key"),
-            "api_secret": data.get("api_secret") or data.get("secret"),
+            "api_key": api_key,
+            "api_secret": api_secret,
         }
         metadata = data.get("asset_pairs") or data.get("metadata")
 
@@ -729,7 +782,16 @@ class AccountContext:
 
     async def start(self) -> None:
         async with self._startup_lock:
-            await self.credentials.start()
+            try:
+                await self.credentials.start()
+            except CredentialLoadError as exc:
+                increment_oms_error_count(self.account_id, "credentials", "startup")
+                logger.error(
+                    "Failed to start account %s due to credential load error: %s",
+                    self.account_id,
+                    exc,
+                )
+                raise
             if self.ws_client is None:
                 self.ws_client = KrakenWSClient(
                     credential_getter=self.credentials.get_credentials,
@@ -1956,11 +2018,66 @@ manager = OMSManager()
 warm_start = WarmStartCoordinator(lambda: manager)
 
 
+
 async def require_account_id(request: Request) -> str:
-    header = request.headers.get("X-Account-ID")
-    if not header:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing X-Account-ID header")
-    return header
+    raw_header = request.headers.get("X-Account-ID")
+    account_id = raw_header.strip() if raw_header else ""
+
+    if account_id:
+        return account_id
+
+    reason = "missing_account_id" if raw_header is None else "empty_account_id"
+    increment_oms_auth_failures(reason=reason)
+
+    logger.warning(
+        "Unauthorized OMS request missing X-Account-ID header",
+        extra={
+            "event": "oms.auth_failure",
+            "reason": reason,
+            "status_code": status.HTTP_401_UNAUTHORIZED,
+            "source_ip": _extract_source_ip(request),
+            "account_header": _redact_account_header(raw_header),
+            "path": request.url.path,
+        },
+    )
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Missing X-Account-ID header",
+    )
+
+
+def _extract_source_ip(request: Request) -> str:
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        first_hop = forwarded_for.split(",")[0].strip()
+        if first_hop:
+            return first_hop
+
+    client = request.client
+    if client and getattr(client, "host", None):
+        return str(client.host)
+
+    scope_client = request.scope.get("client") if hasattr(request, "scope") else None
+    if scope_client and scope_client[0]:
+        return str(scope_client[0])
+
+    return "unknown"
+
+
+def _redact_account_header(value: Optional[str]) -> str:
+    if value is None:
+        return "missing"
+
+    trimmed = value.strip()
+    if not trimmed:
+        return "missing"
+
+    if len(trimmed) <= 4:
+        return f"{trimmed[0]}***"
+
+    return f"{trimmed[:3]}***{trimmed[-2:]}"
+
 
 
 @app.on_event("shutdown")
@@ -1977,7 +2094,7 @@ async def _startup() -> None:
 @app.post("/oms/place", response_model=OMSPlaceResponse)
 async def place_order(
     payload: OMSPlaceRequest,
-    account_id: str = Depends(require_account_id),
+    account_id: str = Depends(require_authorized_account),
 ) -> OMSPlaceResponse:
     if payload.account_id != account_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account mismatch")
@@ -1994,7 +2111,7 @@ async def place_order(
 @app.post("/oms/cancel", response_model=OMSOrderStatusResponse)
 async def cancel_order(
     payload: OMSCancelRequest,
-    account_id: str = Depends(require_account_id),
+    account_id: str = Depends(require_authorized_account),
 ) -> OMSOrderStatusResponse:
     if payload.account_id != account_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account mismatch")
@@ -2009,7 +2126,7 @@ async def cancel_order(
 async def get_status(
     account_id: str,
     client_id: str,
-    header_account: str = Depends(require_account_id),
+    header_account: str = Depends(require_authorized_account),
 ) -> OMSOrderStatusResponse:
     if account_id != header_account:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account mismatch")
@@ -2024,7 +2141,7 @@ async def get_status(
 @app.get("/oms/routing/status")
 async def get_routing_status(
     account_id: str,
-    header_account: str = Depends(require_account_id),
+    header_account: str = Depends(require_authorized_account),
 ) -> Dict[str, Optional[float] | str]:
     if account_id != header_account:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account mismatch")
@@ -2035,20 +2152,25 @@ async def get_routing_status(
 
 @app.get("/oms/rate_limits/status")
 async def get_rate_limit_status(
-    header_account: str = Depends(require_account_id),
+    header_account: str = Depends(require_authorized_account),
 ) -> Dict[str, Dict[str, Dict[str, float | int]]]:
     return await rate_limit_guard.status(header_account)
 
 
+@app.get("/oms/warm_start/status")
+async def get_warm_start_status(_: str = Depends(require_account_id)) -> Dict[str, int]:
+    return await warm_start.status()
+
+
 @app.get("/oms/warm_start/report")
-async def get_warm_start_report(_: str = Depends(require_account_id)) -> Dict[str, int]:
+async def get_warm_start_report(_: str = Depends(require_authorized_account)) -> Dict[str, int]:
     return await warm_start.status()
 
 
 @app.get("/oms/impact_curve", response_model=ImpactCurveResponse)
 async def get_impact_curve(
     symbol: str,
-    account_id: str = Depends(require_account_id),
+    account_id: str = Depends(require_authorized_account),
 ) -> ImpactCurveResponse:
     points_raw = await impact_store.impact_curve(account_id=account_id, symbol=symbol)
     points = [

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import uuid
 from copy import deepcopy
 from dataclasses import dataclass, field
 
@@ -88,6 +89,7 @@ class TimescaleAdapter:
 
     _telemetry: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
     _events: ClassVar[Dict[str, Dict[str, List[Dict[str, Any]]]]] = {}
+    _audit_logs: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
     _credential_events: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
     _risk_configs: ClassVar[Dict[str, Dict[str, Any]]] = {}
     _credential_rotations: ClassVar[Dict[str, Dict[str, Any]]] = {}
@@ -180,6 +182,21 @@ class TimescaleAdapter:
     def record_shadow_fill(self, payload: Dict[str, Any]) -> None:
         record = {"payload": deepcopy(payload), "recorded_at": datetime.now(timezone.utc)}
         self._events[self.account_id]["shadow_fills"].append(record)
+
+    def record_audit_log(self, record: Mapping[str, Any]) -> None:
+        """Persist an audit log entry scoped to this adapter's account."""
+
+        stored = deepcopy(dict(record))
+        stored.setdefault("id", uuid.uuid4())
+        stored.setdefault("created_at", datetime.now(timezone.utc))
+        entries = self._audit_logs.setdefault(self.account_id, [])
+        entries.append(stored)
+
+    def audit_logs(self) -> List[Dict[str, Any]]:
+        """Return recorded audit logs for the adapter's account."""
+
+        entries = self._audit_logs.get(self.account_id, [])
+        return [deepcopy(entry) for entry in entries]
 
     def events(self) -> Dict[str, List[Dict[str, Any]]]:
 
@@ -549,6 +566,7 @@ class TimescaleAdapter:
             cls._daily_usage,
             cls._instrument_exposures,
             cls._events,
+            cls._audit_logs,
             cls._credential_rotations,
             cls._credential_events,
             cls._rolling_volume,
