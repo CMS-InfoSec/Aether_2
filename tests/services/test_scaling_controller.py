@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import asyncio
@@ -129,8 +130,10 @@ class FakeOmsScaler:
 
     async def scale_to(self, replicas: int) -> None:
         self.replicas = replicas
+
         self._replica_cache = replicas
         self.scale_calls.append(replicas)
+
 
 
 class FakeGpuManager:
@@ -146,11 +149,13 @@ class FakeGpuManager:
         self.provision_calls += 1
         if not self.nodes:
             self.nodes = ["gpu-a", "gpu-b"]
+
         return list(self.nodes)
 
     async def deprovision_gpu_pool(self) -> None:
         self.deprovision_calls += 1
         self.nodes = []
+
 
 
 class SequenceGetter:
@@ -335,3 +340,4 @@ def test_http_json_field_getter_returns_default_on_cast_error(monkeypatch: pytes
     )
 
     assert asyncio.run(getter()) == 99.0
+

@@ -44,7 +44,6 @@ encoder to avoid adding new packages to the environment.
 """
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import os
@@ -64,6 +63,8 @@ from sqlalchemy import Boolean, Column, DateTime, String, create_engine
 from sqlalchemy.orm import Session as OrmSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
+
+from services.auth.jwt_tokens import create_jwt
 
 
 logger = logging.getLogger("auth_service")
@@ -268,40 +269,6 @@ class MFAVerifier:
 # ---------------------------------------------------------------------------
 # JWT handling
 # ---------------------------------------------------------------------------
-
-
-def _b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
-
-
-def _sign(data: bytes, secret: str) -> str:
-    import hmac
-    import hashlib
-
-    digest = hmac.new(secret.encode("utf-8"), data, hashlib.sha256).digest()
-    return _b64url(digest)
-
-
-def create_jwt(*, subject: str, ttl_seconds: Optional[int] = None) -> tuple[str, datetime]:
-    ttl = ttl_seconds or int(os.getenv("AUTH_JWT_TTL_SECONDS", "3600"))
-    now = datetime.now(timezone.utc)
-    payload = {
-        "sub": subject,
-        "role": "admin",
-        "iat": int(now.timestamp()),
-        "exp": int((now + timedelta(seconds=ttl)).timestamp()),
-    }
-    header = {"alg": "HS256", "typ": "JWT"}
-    secret = os.getenv("AUTH_JWT_SECRET", "change-me")
-
-    header_b64 = _b64url(json.dumps(header, separators=(",", ":"), sort_keys=True).encode("utf-8"))
-    payload_b64 = _b64url(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
-    signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
-    signature = _sign(signing_input, secret)
-    token = f"{header_b64}.{payload_b64}.{signature}"
-    return token, now + timedelta(seconds=ttl)
-
-
 # ---------------------------------------------------------------------------
 # Builder.io Fusion integration helper
 # ---------------------------------------------------------------------------
