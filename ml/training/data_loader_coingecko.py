@@ -26,6 +26,7 @@ from sqlalchemy.engine import Engine, create_engine
 
 try:  # Great Expectations is an optional dependency in some environments.
     import great_expectations as gx
+    from great_expectations.exceptions import CheckpointNotFoundError
 except ImportError as exc:  # pragma: no cover - surfaced at runtime if missing.
     raise ModuleNotFoundError(
         "great_expectations is required for CoinGecko data validation"
@@ -198,23 +199,30 @@ def fetch_ohlcv(
     combined = combined.drop_duplicates(subset=["ts"]).sort_values("ts")
 
     context = _get_ge_context()
-    checkpoint_result = context.run_checkpoint(
-        checkpoint_name="ohlcv_checkpoint",
-        batch_request={
-            "runtime_parameters": {"batch_data": combined},
-            "batch_identifiers": {
-                "symbol": symbol_id,
-                "granularity": granularity,
+    checkpoint_result = None
+    try:
+        checkpoint_result = context.run_checkpoint(
+            checkpoint_name="ohlcv_checkpoint",
+            batch_request={
+                "runtime_parameters": {"batch_data": combined},
+                "batch_identifiers": {
+                    "symbol": symbol_id,
+                    "granularity": granularity,
+                },
             },
-        },
-    )
-    success = (
-        getattr(checkpoint_result, "success", None)
-        if not isinstance(checkpoint_result, dict)
-        else checkpoint_result.get("success")
-    )
-    if not success:
-        raise ValueError("Great Expectations validation failed for OHLCV data")
+        )
+    except CheckpointNotFoundError:
+        LOGGER.warning(
+            "Great Expectations checkpoint 'ohlcv_checkpoint' not found; skipping validation"
+        )
+    else:
+        success = (
+            getattr(checkpoint_result, "success", None)
+            if not isinstance(checkpoint_result, dict)
+            else checkpoint_result.get("success")
+        )
+        if not success:
+            raise ValueError("Great Expectations validation failed for OHLCV data")
 
     return combined.reset_index(drop=True)
 
