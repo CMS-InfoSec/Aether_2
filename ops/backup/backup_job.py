@@ -1,10 +1,11 @@
 """Backup and restore orchestration for TimescaleDB and MLflow artifacts.
 
 This module provides a nightly backup job that snapshots the primary TimescaleDB
-instance and the MLflow artifact store, uploads the resulting archives to Linode
-Object Storage with server-side encryption, and records a manifest that can be
-used to restore the system. Restores are performed from the manifest to ensure
-integrity by validating recorded hashes before any data is put back in place.
+instance and the MLflow artifact store, encrypts the artifacts locally with
+AES-GCM, uploads the resulting archives to Linode Object Storage, and records a
+manifest that can be used to restore the system. Restores are performed from the
+manifest to ensure integrity by validating recorded hashes before any data is
+put back in place.
 
 Environment variables
 ---------------------
@@ -20,6 +21,7 @@ LINODE_SECRET_KEY     Secret key for Linode Object Storage
 LINODE_SSE_ALGO       Server-side encryption algorithm (default ``AES256``)
 LINODE_SSE_KMS_KEY    Optional KMS key id if using kms encryption
 BACKUP_RETENTION_DAYS Optional retention policy (not yet enforced, but stored)
+BACKUP_ENCRYPTION_KEY Base64 encoded 256-bit key used for AES-GCM encryption
 
 The script exposes a CLI with two commands:
 
@@ -38,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import base64
 import hashlib
 import json
 import logging
@@ -60,6 +63,11 @@ try:  # pragma: no cover - optional dependency
     import psycopg2
 except Exception:  # pragma: no cover - psycopg2 not required for static analysis
     psycopg2 = None  # type: ignore
+
+try:  # pragma: no cover - optional dependency
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+except Exception:  # pragma: no cover - cryptography optional for static analysis
+    AESGCM = None  # type: ignore
 
 
 LOGGER = logging.getLogger(__name__)
@@ -85,6 +93,7 @@ class BackupConfig:
     kms_key_id: Optional[str] = None
     pg_database: Optional[str] = None
     retention_days: Optional[int] = None
+    encryption_key: bytes = b""
 
     @classmethod
     def from_env(cls) -> "BackupConfig":
@@ -100,6 +109,18 @@ class BackupConfig:
             raise RuntimeError("MLFLOW_ARTIFACT_DIR environment variable is required")
         if not bucket:
             raise RuntimeError("LINODE_BUCKET environment variable is required")
+
+        encryption_key_b64 = os.environ.get("BACKUP_ENCRYPTION_KEY")
+        if not encryption_key_b64:
+            raise RuntimeError("BACKUP_ENCRYPTION_KEY environment variable is required")
+
+        try:
+            encryption_key = base64.b64decode(encryption_key_b64)
+        except Exception as exc:  # pragma: no cover - validation logic
+            raise RuntimeError("Invalid BACKUP_ENCRYPTION_KEY encoding") from exc
+
+        if len(encryption_key) not in {16, 24, 32}:
+            raise RuntimeError("BACKUP_ENCRYPTION_KEY must be 128/192/256 bits")
 
         return cls(
             pg_dsn=pg_dsn,
@@ -118,6 +139,7 @@ class BackupConfig:
                 if os.environ.get("BACKUP_RETENTION_DAYS")
                 else None
             ),
+            encryption_key=encryption_key,
         )
 
 
@@ -130,6 +152,8 @@ class BackupArtifact:
     s3_key: str
     sha256: str
     size_bytes: int
+    nonce_b64: str
+    encryption: str = "AESGCM"
     type: str
 
     def to_dict(self) -> Dict[str, object]:
@@ -139,6 +163,8 @@ class BackupArtifact:
             "sha256": self.sha256,
             "size_bytes": self.size_bytes,
             "type": self.type,
+            "nonce": self.nonce_b64,
+            "encryption": self.encryption,
         }
 
 
@@ -173,24 +199,30 @@ class BackupJob:
                 temp_path = Path(tmp_dir)
                 db_dump = temp_path / "timescaledb.dump"
                 mlflow_archive = temp_path / "mlflow_artifacts.tar.gz"
+                encrypted_dir = temp_path / "encrypted"
+                encrypted_dir.mkdir(parents=True, exist_ok=True)
                 manifest_path = temp_path / "manifest.json"
 
                 self._dump_database(db_dump)
+                encrypted_db_path = encrypted_dir / "timescaledb.dump.enc"
                 artifacts.append(
                     self._stage_artifact(
                         name="timescaledb",
                         source_path=db_dump,
-                        s3_key=f"{backup_prefix}/timescaledb.dump",
+                        encrypted_path=encrypted_db_path,
+                        s3_key=f"{backup_prefix}/timescaledb.dump.enc",
                         artifact_type="database",
                     )
                 )
 
                 self._archive_mlflow(mlflow_archive)
+                encrypted_mlflow_path = encrypted_dir / "mlflow_artifacts.tar.gz.enc"
                 artifacts.append(
                     self._stage_artifact(
                         name="mlflow_artifacts",
                         source_path=mlflow_archive,
-                        s3_key=f"{backup_prefix}/mlflow_artifacts.tar.gz",
+                        encrypted_path=encrypted_mlflow_path,
+                        s3_key=f"{backup_prefix}/mlflow_artifacts.tar.gz.enc",
                         artifact_type="mlflow",
                     )
                 )
@@ -237,7 +269,13 @@ class BackupJob:
                 artifact_path = download_dir / Path(entry["s3_key"]).name
                 LOGGER.info("Downloading %s", entry["s3_key"])
                 self._download_file(entry["s3_key"], artifact_path)
-                computed_hash = self._hash_file(artifact_path)
+                decrypted_path = download_dir / f"{Path(entry['s3_key']).stem}.decrypted"
+                self._decrypt_file(
+                    encrypted_path=artifact_path,
+                    destination=decrypted_path,
+                    nonce_b64=entry.get("nonce", ""),
+                )
+                computed_hash = self._hash_file(decrypted_path)
                 if computed_hash != entry["sha256"]:
                     raise RuntimeError(
                         "Hash mismatch for %s: expected %s got %s"
@@ -245,9 +283,9 @@ class BackupJob:
                     )
 
                 if entry["type"] == "database":
-                    self._restore_database(artifact_path)
+                    self._restore_database(decrypted_path)
                 elif entry["type"] == "mlflow":
-                    self._restore_mlflow_artifacts(artifact_path)
+                    self._restore_mlflow_artifacts(decrypted_path)
                 else:
                     LOGGER.warning("Unknown artifact type %s", entry["type"])
 
@@ -295,15 +333,23 @@ class BackupJob:
             )
 
     def _stage_artifact(
-        self, name: str, source_path: Path, s3_key: str, artifact_type: str
+        self,
+        name: str,
+        source_path: Path,
+        encrypted_path: Path,
+        s3_key: str,
+        artifact_type: str,
     ) -> BackupArtifact:
+        plaintext_hash = self._hash_file(source_path)
+        nonce_b64 = self._encrypt_file(source_path, encrypted_path)
         return BackupArtifact(
             name=name,
-            path=source_path,
+            path=encrypted_path,
             s3_key=s3_key,
-            sha256=self._hash_file(source_path),
+            sha256=plaintext_hash,
             size_bytes=source_path.stat().st_size,
             type=artifact_type,
+            nonce_b64=nonce_b64,
         )
 
     def _write_manifest(
@@ -379,6 +425,37 @@ class BackupJob:
                 Key=key,
                 Fileobj=handle,
             )
+
+    def _encrypt_file(self, source_path: Path, destination: Path) -> str:
+        if AESGCM is None:
+            raise RuntimeError(
+                "cryptography is required for AES-GCM encryption but is not installed"
+            )
+
+        aesgcm = AESGCM(self.config.encryption_key)
+        nonce = os.urandom(12)
+        with source_path.open("rb") as handle:
+            plaintext = handle.read()
+        ciphertext = aesgcm.encrypt(nonce, plaintext, None)
+        with destination.open("wb") as handle:
+            handle.write(ciphertext)
+        return base64.b64encode(nonce).decode("ascii")
+
+    def _decrypt_file(self, encrypted_path: Path, destination: Path, nonce_b64: str) -> None:
+        if AESGCM is None:
+            raise RuntimeError(
+                "cryptography is required for AES-GCM decryption but is not installed"
+            )
+        if not nonce_b64:
+            raise RuntimeError("Missing nonce for encrypted artifact")
+
+        aesgcm = AESGCM(self.config.encryption_key)
+        nonce = base64.b64decode(nonce_b64)
+        with encrypted_path.open("rb") as handle:
+            ciphertext = handle.read()
+        plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+        with destination.open("wb") as handle:
+            handle.write(plaintext)
 
     def _restore_database(self, dump_path: Path) -> None:
         database = self.config.pg_database or self._extract_db_name(self.config.pg_dsn)
