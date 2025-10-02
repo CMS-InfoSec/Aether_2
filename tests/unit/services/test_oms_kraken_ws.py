@@ -5,6 +5,7 @@ import importlib.util
 import sys
 import time
 import types
+from decimal import Decimal
 
 import pytest
 
@@ -46,6 +47,45 @@ _websocket_exceptions.WebSocketException = _DummyWebSocketException
 
 sys.modules.setdefault("websockets", _websockets_stub)
 sys.modules.setdefault("websockets.exceptions", _websocket_exceptions)
+_fastapi_stub.FastAPI = _DummyFastAPI  # type: ignore[attr-defined]
+_fastapi_stub.Request = _DummyRequest  # type: ignore[attr-defined]
+_fastapi_stub.Response = _DummyResponse  # type: ignore[attr-defined]
+sys.modules.setdefault("fastapi", _fastapi_stub)
+_starlette_stub = types.ModuleType("starlette")
+_starlette_middleware_stub = types.ModuleType("starlette.middleware")
+_starlette_middleware_base_stub = types.ModuleType("starlette.middleware.base")
+
+
+class _DummyBaseHTTPMiddleware:
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        pass
+
+
+_starlette_middleware_base_stub.BaseHTTPMiddleware = _DummyBaseHTTPMiddleware  # type: ignore[attr-defined]
+sys.modules.setdefault("starlette", _starlette_stub)
+sys.modules.setdefault("starlette.middleware", _starlette_middleware_stub)
+sys.modules.setdefault("starlette.middleware.base", _starlette_middleware_base_stub)
+
+_aiohttp_stub = types.ModuleType("aiohttp")
+
+
+class _DummyClientSession:
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        return None
+
+    async def close(self) -> None:  # pragma: no cover - not used in tests
+        return None
+
+
+class _DummyClientTimeout:
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        return None
+
+
+class _DummyClientError(Exception):
+    pass
+
+
 
 def _module_available(name: str) -> bool:
     try:
@@ -75,6 +115,7 @@ if not _module_available("starlette.middleware.base"):
     sys.modules.setdefault("starlette", _starlette_stub)
     sys.modules.setdefault("starlette.middleware", _starlette_middleware_stub)
     sys.modules.setdefault("starlette.middleware.base", _starlette_middleware_base_stub)
+
 
 from services.oms.kraken_ws import KrakenWSClient, KrakenWSError
 
@@ -158,6 +199,7 @@ def test_sign_auth_rest_failure_raises() -> None:
     asyncio.run(_run())
 
 
+
 def test_sign_auth_caches_rest_token_until_expiry() -> None:
     async def _creds() -> dict[str, str]:
         return {"api_key": "api", "api_secret": "secret"}
@@ -189,3 +231,4 @@ def test_sign_auth_caches_rest_token_until_expiry() -> None:
         assert guard.calls[-1] == ("acct-1", "websocket_token", "rest")
 
     asyncio.run(_run())
+

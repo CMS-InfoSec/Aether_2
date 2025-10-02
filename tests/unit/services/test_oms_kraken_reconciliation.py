@@ -63,6 +63,7 @@ fastapi_stub.Request = _Request
 fastapi_stub.Response = object
 fastapi_stub.Header = lambda *args, **kwargs: None
 fastapi_stub.status = _status
+fastapi_stub.APIRouter = _FastAPIStub
 sys.modules['fastapi'] = fastapi_stub
 
 pydantic_stub = types.ModuleType('pydantic')
@@ -123,6 +124,36 @@ sys.modules['websockets'] = websockets_stub
 sys.modules['websockets.exceptions'] = types.ModuleType('websockets.exceptions')
 sys.modules['websockets.exceptions'].WebSocketException = _WebSocketException
 
+httpx_stub = types.ModuleType('httpx')
+
+
+class _HTTPXAsyncClient:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def __aenter__(self) -> '_HTTPXAsyncClient':
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+    async def post(self, *args: Any, **kwargs: Any) -> '_HTTPXResponse':
+        return _HTTPXResponse()
+
+
+class _HTTPXResponse:
+    def raise_for_status(self) -> None:
+        return None
+
+
+class _HTTPXError(Exception):
+    pass
+
+
+httpx_stub.AsyncClient = _HTTPXAsyncClient
+httpx_stub.HTTPError = _HTTPXError
+sys.modules['httpx'] = httpx_stub
+
 metrics_stub = types.ModuleType('metrics')
 
 
@@ -136,6 +167,7 @@ metrics_stub.record_oms_latency = _noop
 metrics_stub.setup_metrics = _noop
 metrics_stub.record_scaling_state = _noop
 metrics_stub.observe_scaling_evaluation = _noop
+metrics_stub._REGISTRY = object()
 sys.modules['metrics'] = metrics_stub
 
 
@@ -323,12 +355,14 @@ class _BaseKrakenStub:
         fills = response["fills"]
         self._userrefs[order["order_id"]] = str(client_id or order["order_id"])
 
-        filled_qty = float(order["volume"] - order["remaining"])
+        filled_qty = Decimal(str(order["volume"])) - Decimal(str(order["remaining"]))
         avg_price = None
         if fills:
-            notional = sum(float(fill["price"]) * float(fill["volume"]) for fill in fills)
-            quantity = sum(float(fill["volume"]) for fill in fills)
-            avg_price = notional / quantity if quantity else None
+            notional = sum(
+                Decimal(str(fill["price"])) * Decimal(str(fill["volume"])) for fill in fills
+            )
+            quantity = sum(Decimal(str(fill["volume"])) for fill in fills)
+            avg_price = (notional / quantity) if quantity else None
 
         if emit_updates and self._stream_update_cb is not None:
             await self._emit_updates(order, fills)
@@ -343,7 +377,7 @@ class _BaseKrakenStub:
 
     async def _emit_updates(self, order: Dict[str, Any], fills: List[Dict[str, Any]]) -> None:
         client_id = str(order.get("userref") or order["order_id"])
-        total_filled = float(order["volume"] - order["remaining"])
+        total_filled = Decimal(str(order["volume"])) - Decimal(str(order["remaining"]))
         if not fills:
             state = OrderState(
                 client_order_id=client_id,
@@ -357,15 +391,16 @@ class _BaseKrakenStub:
             await self._stream_update_cb(state)
             return
 
-        cumulative = 0.0
-        notional = 0.0
+        cumulative = Decimal("0")
+        notional = Decimal("0")
+        tolerance = Decimal("1e-9")
         for fill in fills:
-            volume = float(fill["volume"])
-            price = float(fill["price"])
+            volume = Decimal(str(fill["volume"]))
+            price = Decimal(str(fill["price"]))
             cumulative += volume
             notional += price * volume
-            avg_price = notional / cumulative if cumulative else None
-            is_final = total_filled and abs(cumulative - total_filled) < 1e-9
+            avg_price = (notional / cumulative) if cumulative else None
+            is_final = total_filled != Decimal("0") and abs(cumulative - total_filled) <= tolerance
             status = str(order.get("status", "open")) if is_final else "partially_filled"
             state = OrderState(
                 client_order_id=client_id,

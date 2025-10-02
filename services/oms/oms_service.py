@@ -836,8 +836,8 @@ class AccountContext:
         result = OMSOrderStatusResponse(
             exchange_order_id=state.exchange_order_id or state.client_order_id,
             status=state.status,
-            filled_qty=Decimal(str(state.filled_qty or 0)),
-            avg_price=Decimal(str(state.avg_price or 0)),
+            filled_qty=state.filled_qty if state.filled_qty is not None else Decimal("0"),
+            avg_price=state.avg_price if state.avg_price is not None else Decimal("0"),
             errors=state.errors or None,
         )
         async with self._orders_lock:
@@ -1337,17 +1337,16 @@ class AccountContext:
                 return decimal_value
         return None
 
-    def _extract_float(self, payload: Dict[str, Any], keys: List[str]) -> float | None:
+    def _extract_float(self, payload: Dict[str, Any], keys: List[str]) -> Decimal | None:
         for key in keys:
             if key not in payload:
                 continue
             value = payload.get(key)
             if value is None:
                 continue
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                continue
+            decimal_value = self._extract_decimal(value)
+            if decimal_value is not None:
+                return decimal_value
         return None
 
     def _extract_decimal(self, value: Any) -> Decimal | None:
@@ -1449,9 +1448,6 @@ class AccountContext:
             child_quantities = self._plan_child_quantities(request, qty, metadata, depth)
             if not child_quantities:
                 child_quantities = [qty]
-            increment_oms_child_orders_total(
-                self.account_id, request.symbol, len(child_quantities)
-            )
             if len(child_quantities) > 1:
                 logger.info(
                     "Slicing order for account %s symbol %s into %d child orders (depth=%s)",
@@ -1478,7 +1474,11 @@ class AccountContext:
             for index, child_qty in enumerate(child_quantities):
                 child_client_base = self._child_client_id(request.client_id, index)
                 payload = self._build_payload(
-                    request, child_qty, px, client_id=child_client_base
+                    request,
+                    child_qty,
+                    px,
+                    metadata,
+                    client_id=child_client_base,
                 )
                 ack, transport, client_id_used, _ = await self._submit_order_with_preference(
                     payload,
@@ -1503,6 +1503,13 @@ class AccountContext:
                 request.client_id, child_results, child_records
             )
             aggregate_transport = self._aggregate_transport(transports_used)
+
+            increment_oms_child_orders_total(
+                self.account_id,
+                request.symbol,
+                aggregate_transport,
+                count=len(child_quantities),
+            )
 
 
             async with self._orders_lock:
@@ -1590,8 +1597,8 @@ class AccountContext:
                     OMSOrderStatusResponse(
                         exchange_order_id=ack.exchange_order_id or txid,
                         status=status_value,
-                        filled_qty=Decimal(str(ack.filled_qty or 0)),
-                        avg_price=Decimal(str(ack.avg_price or 0)),
+                        filled_qty=ack.filled_qty if ack.filled_qty is not None else Decimal("0"),
+                        avg_price=ack.avg_price if ack.avg_price is not None else Decimal("0"),
                         errors=ack.errors or None,
                     )
                 )
@@ -1652,8 +1659,25 @@ class AccountContext:
         request: OMSPlaceRequest,
         qty: Decimal,
         price: Optional[Decimal],
+        metadata: Dict[str, Any] | None = None,
+        *,
         client_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        pair_meta = _resolve_pair_metadata(request.symbol, metadata)
+        price_step = (
+            _PrecisionValidator._step(
+                pair_meta,
+                ["price_increment", "pair_decimals", "tick_size"],
+            )
+            if pair_meta
+            else None
+        )
+
+        def _snap_price(value: Optional[Decimal]) -> Optional[Decimal]:
+            if value is None or price_step is None:
+                return value
+            return _PrecisionValidator._snap(value, price_step)
+
         payload: Dict[str, Any] = {
             "clientOrderId": client_id or request.client_id,
             "pair": _normalize_symbol(request.symbol),
@@ -1662,8 +1686,9 @@ class AccountContext:
             "volume": str(qty),
         }
         payload["idempotencyKey"] = client_id or request.client_id
-        if price is not None:
-            payload["price"] = str(price)
+        snapped_price = _snap_price(price)
+        if snapped_price is not None:
+            payload["price"] = str(snapped_price)
 
         oflags = set(flag.lower() for flag in request.flags)
         if request.post_only:
@@ -1675,12 +1700,15 @@ class AccountContext:
 
         if request.tif:
             payload["timeInForce"] = request.tif.upper()
-        if request.take_profit is not None:
-            payload["takeProfit"] = str(request.take_profit)
-        if request.stop_loss is not None:
-            payload["stopLoss"] = str(request.stop_loss)
-        if request.trailing_offset is not None:
-            payload["trailingStopOffset"] = str(request.trailing_offset)
+        snapped_take_profit = _snap_price(request.take_profit)
+        if snapped_take_profit is not None:
+            payload["takeProfit"] = str(snapped_take_profit)
+        snapped_stop_loss = _snap_price(request.stop_loss)
+        if snapped_stop_loss is not None:
+            payload["stopLoss"] = str(snapped_stop_loss)
+        snapped_trailing_offset = _snap_price(request.trailing_offset)
+        if snapped_trailing_offset is not None:
+            payload["trailingStopOffset"] = str(snapped_trailing_offset)
 
         return payload
 
@@ -1985,8 +2013,8 @@ class AccountContext:
         ack: OrderAck,
     ) -> OMSOrderStatusResponse:
         status_value = ack.status or ("rejected" if ack.errors else "accepted")
-        filled = Decimal(str(ack.filled_qty or 0))
-        avg_price = Decimal(str(ack.avg_price or 0))
+        filled = ack.filled_qty if ack.filled_qty is not None else Decimal("0")
+        avg_price = ack.avg_price if ack.avg_price is not None else Decimal("0")
         return OMSOrderStatusResponse(
             exchange_order_id=ack.exchange_order_id or client_id,
             status=status_value,

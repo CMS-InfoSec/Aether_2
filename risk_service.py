@@ -14,7 +14,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Set
+from decimal import Decimal
+
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Set, Union
 
 
 import httpx
@@ -22,7 +24,7 @@ import httpx
 from fastapi import Depends, FastAPI, HTTPException, Header, Query, status
 
 from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, model_validator
-from sqlalchemy import Column, DateTime, Float, Integer, String, create_engine, select
+from sqlalchemy import Column, DateTime, Float, Integer, Numeric, String, create_engine, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -58,6 +60,35 @@ audit_logger = logging.getLogger("risk.audit")
 logging.basicConfig(level=logging.INFO)
 
 
+NUMERIC_PRECISION = 28
+NUMERIC_SCALE = 8
+DECIMAL_ZERO = Decimal("0")
+
+
+def _as_decimal(
+    value: Optional[Union[Decimal, float, int, str]], *, default: Decimal = DECIMAL_ZERO
+) -> Decimal:
+    """Normalize numeric inputs to :class:`~decimal.Decimal` instances."""
+
+    if value is None:
+        return default
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, (int, str)):
+        return Decimal(value)
+    if isinstance(value, float):
+        return Decimal(str(value))
+    return Decimal(str(value))
+
+
+def _maybe_decimal(value: Optional[Union[Decimal, float, int, str]]) -> Optional[Decimal]:
+    """Return ``None`` or the normalized decimal representation of *value*."""
+
+    if value is None:
+        return None
+    return _as_decimal(value)
+
+
 SHUTDOWN_TIMEOUT = float(os.getenv("RISK_SHUTDOWN_TIMEOUT", os.getenv("SERVICE_SHUTDOWN_TIMEOUT", "75.0")))
 
 _CAPITAL_ALLOCATOR_URL = os.getenv("CAPITAL_ALLOCATOR_URL")
@@ -80,11 +111,23 @@ class AccountRiskUsage(Base):
     __tablename__ = "account_risk_usage"
 
     account_id = Column(String, primary_key=True)
-    realized_daily_loss = Column(Float, nullable=False, default=0.0)
-    fees_paid = Column(Float, nullable=False, default=0.0)
-    net_asset_value = Column(Float, nullable=False, default=0.0)
-    var_95 = Column(Float, nullable=True)
-    var_99 = Column(Float, nullable=True)
+    realized_daily_loss = Column(
+        Numeric(precision=NUMERIC_PRECISION, scale=NUMERIC_SCALE),
+        nullable=False,
+        default=DECIMAL_ZERO,
+    )
+    fees_paid = Column(
+        Numeric(precision=NUMERIC_PRECISION, scale=NUMERIC_SCALE),
+        nullable=False,
+        default=DECIMAL_ZERO,
+    )
+    net_asset_value = Column(
+        Numeric(precision=NUMERIC_PRECISION, scale=NUMERIC_SCALE),
+        nullable=False,
+        default=DECIMAL_ZERO,
+    )
+    var_95 = Column(Numeric(precision=NUMERIC_PRECISION, scale=NUMERIC_SCALE), nullable=True)
+    var_99 = Column(Numeric(precision=NUMERIC_PRECISION, scale=NUMERIC_SCALE), nullable=True)
     updated_at = Column(DateTime(timezone=True), nullable=True)
 
 
@@ -122,19 +165,31 @@ class AccountRiskLimit(Base):
     __tablename__ = "account_risk_limits"
 
     account_id = Column(String, primary_key=True)
-    max_daily_loss = Column(Float, nullable=False)
-    fee_budget = Column(Float, nullable=False)
-    max_nav_pct_per_trade = Column(Float, nullable=False)
-    notional_cap = Column(Float, nullable=False)
+    max_daily_loss = Column(Numeric(precision=NUMERIC_PRECISION, scale=NUMERIC_SCALE), nullable=False)
+    fee_budget = Column(Numeric(precision=NUMERIC_PRECISION, scale=NUMERIC_SCALE), nullable=False)
+    max_nav_pct_per_trade = Column(
+        Numeric(precision=NUMERIC_PRECISION, scale=NUMERIC_SCALE),
+        nullable=False,
+    )
+    notional_cap = Column(Numeric(precision=NUMERIC_PRECISION, scale=NUMERIC_SCALE), nullable=False)
     cooldown_minutes = Column(Integer, nullable=False, default=0)
     instrument_whitelist = Column(String, nullable=True)
-    var_95_limit = Column(Float, nullable=True)
-    var_99_limit = Column(Float, nullable=True)
-    spread_threshold_bps = Column(Float, nullable=True)
-    latency_stall_seconds = Column(Float, nullable=True)
+    var_95_limit = Column(Numeric(precision=NUMERIC_PRECISION, scale=NUMERIC_SCALE), nullable=True)
+    var_99_limit = Column(Numeric(precision=NUMERIC_PRECISION, scale=NUMERIC_SCALE), nullable=True)
+    spread_threshold_bps = Column(
+        Numeric(precision=NUMERIC_PRECISION, scale=NUMERIC_SCALE),
+        nullable=True,
+    )
+    latency_stall_seconds = Column(
+        Numeric(precision=NUMERIC_PRECISION, scale=NUMERIC_SCALE),
+        nullable=True,
+    )
     exchange_outage_block = Column(Integer, nullable=False, default=0)
 
-    correlation_threshold = Column(Float, nullable=True)
+    correlation_threshold = Column(
+        Numeric(precision=NUMERIC_PRECISION, scale=NUMERIC_SCALE),
+        nullable=True,
+    )
     correlation_lookback = Column(Integer, nullable=True)
     diversification_cluster_limits = Column(String, nullable=True)
 
@@ -272,54 +327,30 @@ def _seed_default_limits(session: Session) -> None:
         if record is None:
             record = AccountRiskLimit(
                 account_id=payload["account_id"],
-                max_daily_loss=float(payload["max_daily_loss"]),
-                fee_budget=float(payload["fee_budget"]),
-                max_nav_pct_per_trade=float(payload["max_nav_pct_per_trade"]),
-                notional_cap=float(payload["notional_cap"]),
+                max_daily_loss=_as_decimal(payload["max_daily_loss"]),
+                fee_budget=_as_decimal(payload["fee_budget"]),
+                max_nav_pct_per_trade=_as_decimal(payload["max_nav_pct_per_trade"]),
+                notional_cap=_as_decimal(payload["notional_cap"]),
                 cooldown_minutes=int(payload["cooldown_minutes"]),
                 instrument_whitelist=whitelist_blob,
-                var_95_limit=float(payload["var_95_limit"])
-                if payload.get("var_95_limit") is not None
-                else None,
-                var_99_limit=float(payload["var_99_limit"])
-                if payload.get("var_99_limit") is not None
-                else None,
-                spread_threshold_bps=float(payload["spread_threshold_bps"])
-                if payload.get("spread_threshold_bps") is not None
-                else None,
-                latency_stall_seconds=float(payload["latency_stall_seconds"])
-                if payload.get("latency_stall_seconds") is not None
-                else None,
+                var_95_limit=_maybe_decimal(payload.get("var_95_limit")),
+                var_99_limit=_maybe_decimal(payload.get("var_99_limit")),
+                spread_threshold_bps=_maybe_decimal(payload.get("spread_threshold_bps")),
+                latency_stall_seconds=_maybe_decimal(payload.get("latency_stall_seconds")),
                 exchange_outage_block=int(payload["exchange_outage_block"]),
             )
             session.add(record)
         else:
-            record.max_daily_loss = float(payload["max_daily_loss"])
-            record.fee_budget = float(payload["fee_budget"])
-            record.max_nav_pct_per_trade = float(payload["max_nav_pct_per_trade"])
-            record.notional_cap = float(payload["notional_cap"])
+            record.max_daily_loss = _as_decimal(payload["max_daily_loss"])
+            record.fee_budget = _as_decimal(payload["fee_budget"])
+            record.max_nav_pct_per_trade = _as_decimal(payload["max_nav_pct_per_trade"])
+            record.notional_cap = _as_decimal(payload["notional_cap"])
             record.cooldown_minutes = int(payload["cooldown_minutes"])
             record.instrument_whitelist = whitelist_blob
-            record.var_95_limit = (
-                float(payload["var_95_limit"])
-                if payload.get("var_95_limit") is not None
-                else None
-            )
-            record.var_99_limit = (
-                float(payload["var_99_limit"])
-                if payload.get("var_99_limit") is not None
-                else None
-            )
-            record.spread_threshold_bps = (
-                float(payload["spread_threshold_bps"])
-                if payload.get("spread_threshold_bps") is not None
-                else None
-            )
-            record.latency_stall_seconds = (
-                float(payload["latency_stall_seconds"])
-                if payload.get("latency_stall_seconds") is not None
-                else None
-            )
+            record.var_95_limit = _maybe_decimal(payload.get("var_95_limit"))
+            record.var_99_limit = _maybe_decimal(payload.get("var_99_limit"))
+            record.spread_threshold_bps = _maybe_decimal(payload.get("spread_threshold_bps"))
+            record.latency_stall_seconds = _maybe_decimal(payload.get("latency_stall_seconds"))
             record.exchange_outage_block = int(payload["exchange_outage_block"])
 
 
@@ -405,7 +436,7 @@ _STUB_ACCOUNT_RETURNS: Dict[str, List[float]] = {
 }
 
 
-_STUB_ACCOUNT_USAGE: Dict[str, Dict[str, float]] = {}
+_STUB_ACCOUNT_USAGE: Dict[str, Dict[str, Decimal]] = {}
 
 
 _STUB_FILLS: List[Dict[str, object]] = [
@@ -526,11 +557,11 @@ class RiskEvaluationContext(BaseModel):
 
 class AccountUsage(BaseModel):
     account_id: str
-    realized_daily_loss: float = Field(..., ge=0.0)
-    fees_paid: float = Field(..., ge=0.0)
-    net_asset_value: float = Field(..., ge=0.0)
-    var_95: Optional[float] = Field(None, ge=0.0)
-    var_99: Optional[float] = Field(None, ge=0.0)
+    realized_daily_loss: Decimal = Field(..., ge=DECIMAL_ZERO)
+    fees_paid: Decimal = Field(..., ge=DECIMAL_ZERO)
+    net_asset_value: Decimal = Field(..., ge=DECIMAL_ZERO)
+    var_95: Optional[Decimal] = Field(None, ge=DECIMAL_ZERO)
+    var_99: Optional[Decimal] = Field(None, ge=DECIMAL_ZERO)
 
 
 class AccountRiskLimitModel(BaseModel):
@@ -1370,20 +1401,20 @@ def _load_account_usage(account_id: str) -> AccountUsage:
     if record is None:
         return AccountUsage(
             account_id=account_id,
-            realized_daily_loss=0.0,
-            fees_paid=0.0,
-            net_asset_value=0.0,
+            realized_daily_loss=DECIMAL_ZERO,
+            fees_paid=DECIMAL_ZERO,
+            net_asset_value=DECIMAL_ZERO,
             var_95=None,
             var_99=None,
         )
 
     return AccountUsage(
         account_id=account_id,
-        realized_daily_loss=float(record.realized_daily_loss or 0.0),
-        fees_paid=float(record.fees_paid or 0.0),
-        net_asset_value=float(record.net_asset_value or 0.0),
-        var_95=float(record.var_95) if record.var_95 is not None else None,
-        var_99=float(record.var_99) if record.var_99 is not None else None,
+        realized_daily_loss=_as_decimal(record.realized_daily_loss),
+        fees_paid=_as_decimal(record.fees_paid),
+        net_asset_value=_as_decimal(record.net_asset_value),
+        var_95=_maybe_decimal(record.var_95),
+        var_99=_maybe_decimal(record.var_99),
     )
 
 
@@ -1545,17 +1576,26 @@ def _max_trade_notional_for_correlation(
     return max(0.0, min(allowed, requested_notional))
 
 
-def set_stub_account_usage(account_id: str, usage: Dict[str, float]) -> None:
+def set_stub_account_usage(
+    account_id: str, usage: Mapping[str, Union[Decimal, float, int, str]]
+) -> None:
     with get_session() as session:
         record = session.get(AccountRiskUsage, account_id)
         if record is None:
             record = AccountRiskUsage(account_id=account_id)
-        record.realized_daily_loss = float(usage.get("realized_daily_loss", 0.0) or 0.0)
-        record.fees_paid = float(usage.get("fees_paid", 0.0) or 0.0)
-        record.net_asset_value = float(usage.get("net_asset_value", 0.0) or 0.0)
-        record.var_95 = float(usage["var_95"]) if usage.get("var_95") is not None else None
-        record.var_99 = float(usage["var_99"]) if usage.get("var_99") is not None else None
+        record.realized_daily_loss = _as_decimal(usage.get("realized_daily_loss"))
+        record.fees_paid = _as_decimal(usage.get("fees_paid"))
+        record.net_asset_value = _as_decimal(usage.get("net_asset_value"))
+        record.var_95 = _maybe_decimal(usage.get("var_95"))
+        record.var_99 = _maybe_decimal(usage.get("var_99"))
         session.add(record)
+
+    stored = _STUB_ACCOUNT_USAGE.setdefault(account_id, {})
+    stored["realized_daily_loss"] = _as_decimal(usage.get("realized_daily_loss"))
+    stored["fees_paid"] = _as_decimal(usage.get("fees_paid"))
+    stored["net_asset_value"] = _as_decimal(usage.get("net_asset_value"))
+    stored["var_95"] = _maybe_decimal(usage.get("var_95"))
+    stored["var_99"] = _maybe_decimal(usage.get("var_99"))
 
 
 def set_stub_market_telemetry(instrument_id: str, telemetry: Dict[str, float]) -> None:
@@ -1706,17 +1746,17 @@ async def _refresh_usage_from_fills(account_id: str, state: AccountPortfolioStat
     if not fills:
         return
 
-    total_pnl = 0.0
-    total_fees = 0.0
+    total_pnl = DECIMAL_ZERO
+    total_fees = DECIMAL_ZERO
     for record in fills:
-        pnl = float(record.get("pnl", 0.0))
-        fee = float(record.get("fee", 0.0))
+        pnl = _as_decimal(record.get("pnl"))
+        fee = _as_decimal(record.get("fee"))
         total_pnl += pnl
         total_fees += fee
 
-    realized_loss = max(-total_pnl, 0.0)
-    state.realized_daily_loss = realized_loss
-    state.fees_paid = total_fees
+    realized_loss = max(-total_pnl, DECIMAL_ZERO)
+    state.realized_daily_loss = float(realized_loss)
+    state.fees_paid = float(total_fees)
     usage = _STUB_ACCOUNT_USAGE.setdefault(account_id, {})
     usage["realized_daily_loss"] = realized_loss
     usage["fees_paid"] = total_fees
@@ -1762,11 +1802,13 @@ async def _refresh_usage_from_balance(account_id: str) -> None:
     if nav is None:
         return
 
+    nav_decimal = max(_as_decimal(nav), DECIMAL_ZERO)
+
     with get_session() as session:
         record = session.get(AccountRiskUsage, account_id)
         if record is None:
             record = AccountRiskUsage(account_id=account_id)
-        record.net_asset_value = max(nav, 0.0)
+        record.net_asset_value = nav_decimal
         record.updated_at = datetime.now(timezone.utc)
         session.add(record)
 
