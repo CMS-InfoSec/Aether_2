@@ -403,22 +403,22 @@ class SequencerPipeline:
                 )
                 await self._rollback(executed, ctx)
                 raise StageFailedError("pipeline", error_message) from exc
-        finally:
-            completed_at = datetime.now(timezone.utc)
-            total_latency = (time.perf_counter() - pipeline_start) * 1000.0
-            set_pipeline_latency(total_latency)
-            summary = PipelineRunSummary(
-                run_id=run_id,
-                account_id=normalized_account,
-                intent_id=intent_id,
-                status=status_value,
-                started_at=started_at,
-                completed_at=completed_at,
-                latency_ms=total_latency,
-                stage_latencies_ms=stage_latencies,
-                error=error_message,
-            )
-            await self._history.record(summary)
+            finally:
+                completed_at = datetime.now(timezone.utc)
+                total_latency = (time.perf_counter() - pipeline_start) * 1000.0
+                set_pipeline_latency(total_latency)
+                summary = PipelineRunSummary(
+                    run_id=run_id,
+                    account_id=normalized_account,
+                    intent_id=intent_id,
+                    status=status_value,
+                    started_at=started_at,
+                    completed_at=completed_at,
+                    latency_ms=total_latency,
+                    stage_latencies_ms=stage_latencies,
+                    error=error_message,
+                )
+                await self._history.record(summary)
 
         if fill_event is None:
             raise StageFailedError("pipeline", error_message or "Pipeline failed to produce fill event")
