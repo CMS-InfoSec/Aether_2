@@ -163,6 +163,9 @@ class MFAService:
         return totp.verify(code, valid_window=1)
 
 
+SUPPORTED_ROLES = {"admin", "auditor"}
+
+
 class AuthService:
     """Encapsulates Azure AD OIDC authentication and token issuance."""
 
@@ -262,7 +265,7 @@ class AuthService:
         explicit_role = user_info.get("role")
         if isinstance(explicit_role, str):
             normalized_role = explicit_role.strip().lower()
-            if normalized_role in {"admin", "auditor"}:
+            if normalized_role in SUPPORTED_ROLES:
                 return normalized_role
 
         normalized = str(candidate).strip().lower()
@@ -284,6 +287,8 @@ class AuthService:
                 "view_trades",
                 "place_orders",
                 "modify_configs",
+                "submit_trades",
+                "update_configs",
             }
         return set()
 
@@ -320,7 +325,7 @@ class AuthService:
         if payload.get("exp") and int(payload["exp"]) < int(time.time()):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired")
         role = payload.get("role")
-        if role not in {"admin", "auditor"}:
+        if role not in SUPPORTED_ROLES:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unsupported role")
         # Enforce server-side role semantics regardless of what the caller provided.
         permissions = self._permissions_for_role(role)
