@@ -50,6 +50,8 @@ from metrics import (
     record_oms_latency,
     setup_metrics,
 )
+from shared.correlation import get_correlation_id
+from shared.simulation import SimulatedOrder, sim_broker, sim_mode_state
 
 
 
@@ -189,6 +191,7 @@ class OrderRecord:
     pre_trade_mid: Optional[Decimal] = None
     recorded_qty: Decimal = Decimal("0")
     requested_qty: Optional[Decimal] = None
+    origin: Optional[str] = None
 
 
 @dataclass
@@ -197,6 +200,7 @@ class ChildOrderRecord:
     exchange_order_id: str
     transport: str
     quantity: Decimal = Decimal("0")
+    origin: Optional[str] = None
 
 
 
@@ -718,6 +722,7 @@ class AccountContext:
         self._balances: Dict[str, Decimal] = {}
         self._balances_lock = asyncio.Lock()
         self.routing = LatencyRouter(account_id)
+        self._sim_broker = sim_broker
 
         self._impact_store: ImpactAnalyticsStore = impact_store
         self._reconcile_task: Optional[asyncio.Task[None]] = None
@@ -1388,6 +1393,62 @@ class AccountContext:
     async def place_order(self, request: OMSPlaceRequest) -> OMSPlaceResponse:
         await self.start()
 
+        async def _simulate() -> OMSOrderStatusResponse:
+            metadata = await self.credentials.get_metadata()
+            qty, px = _PrecisionValidator.validate(
+                request.symbol,
+                request.qty,
+                request.limit_px,
+                metadata,
+            )
+            payload = self._build_payload(request, qty, px, metadata)
+            client_id_used = payload.get("clientOrderId", request.client_id)
+            correlation_id = get_correlation_id()
+            simulated: SimulatedOrder = await self._sim_broker.place_order(
+                account_id=self.account_id,
+                payload=payload,
+                correlation_id=correlation_id,
+            )
+            result = self._order_result_from_ack(
+                client_id_used,
+                simulated.ack,
+            )
+            child_record = ChildOrderRecord(
+                client_id=client_id_used,
+                exchange_order_id=result.exchange_order_id,
+                transport=simulated.transport,
+                quantity=qty,
+                origin="SIM",
+            )
+            order_record = OrderRecord(
+                client_id=request.client_id,
+                result=result,
+                transport=simulated.transport,
+                children=[child_record],
+                symbol=request.symbol,
+                side=request.side,
+                pre_trade_mid=request.pre_trade_mid_px,
+                requested_qty=qty,
+                origin="SIM",
+            )
+            async with self._orders_lock:
+                self._orders[request.client_id] = order_record
+                self._child_results[client_id_used] = result
+                if client_id_used != request.client_id:
+                    self._orders[client_id_used] = OrderRecord(
+                        client_id=client_id_used,
+                        result=result,
+                        transport=simulated.transport,
+                        children=None,
+                        requested_qty=qty,
+                        origin="SIM",
+                        symbol=request.symbol,
+                        side=request.side,
+                        pre_trade_mid=request.pre_trade_mid_px,
+                    )
+                self._update_child_mapping(request.client_id, [child_record])
+            return result
+
         async def _execute() -> OMSOrderStatusResponse:
 
             assert self.ws_client is not None
@@ -1563,10 +1624,12 @@ class AccountContext:
 
 
         cache_key = f"place:{request.client_id}"
-        result, reused = await self.idempotency.get_or_create(cache_key, _execute())
+        factory = _simulate() if sim_mode_state.active else _execute()
+        result, reused = await self.idempotency.get_or_create(cache_key, factory)
         async with self._orders_lock:
             record = self._orders.get(request.client_id)
-        transport = record.transport if record else "websocket"
+        default_transport = "simulation" if sim_mode_state.active else "websocket"
+        transport = record.transport if record else default_transport
         if record is not None:
             await self._record_trade_impact(record)
         return OMSPlaceResponse(
@@ -2095,6 +2158,7 @@ class AccountContext:
             pre_trade_mid=mid_px,
             impact_bps=impact_bps,
             recorded_at=datetime.now(timezone.utc),
+            simulated=record.origin == "SIM",
         )
 
         async with self._orders_lock:
