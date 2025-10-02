@@ -31,6 +31,7 @@ from sqlalchemy.pool import StaticPool
 
 from common.schemas.contracts import IntentEvent
 from services.common.adapters import KafkaNATSAdapter
+from services.common.security import require_admin_account
 
 try:  # pragma: no cover - LightGBM is optional in many environments
     import lightgbm as lgb  # type: ignore
@@ -802,6 +803,7 @@ def get_repository() -> WatchdogRepository:
 async def oversight_status(
     limit: int = Query(20, ge=1, le=200, description="Maximum number of recent vetoes to return"),
     repository: WatchdogRepository = Depends(get_repository),
+    _admin_account: str = Depends(require_admin_account),
 ) -> OversightStatusResponse:
     total, entries, counts = await asyncio.to_thread(repository.summary, limit)
 
