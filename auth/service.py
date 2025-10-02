@@ -13,38 +13,83 @@ import json
 import logging
 from typing import Dict, Optional, Protocol, Set, runtime_checkable
 
-from argon2 import PasswordHasher, Type
-from argon2.exceptions import InvalidHash, VerifyMismatchError
-import pyotp
-
-from shared.correlation import get_correlation_id
-
-
 try:  # pragma: no cover - optional dependency in some test environments
-    from argon2 import PasswordHasher
-    from argon2.exceptions import VerificationError
+    from argon2 import PasswordHasher, Type
+    from argon2.exceptions import InvalidHash, VerificationError, VerifyMismatchError
 except ImportError:  # pragma: no cover - fallback when argon2 is unavailable
     PasswordHasher = None  # type: ignore[assignment]
+    Type = None  # type: ignore[assignment]
 
     class VerificationError(ValueError):
         """Minimal stand-in for argon2's verification errors."""
 
-    class _MissingPasswordHasher:
-        def hash(self, password: str) -> str:
-            raise RuntimeError("argon2-cffi must be installed to hash passwords")
+    class VerifyMismatchError(VerificationError):
+        """Stand-in for argon2 mismatch error."""
 
-        def verify(self, hashed: str, password: str) -> bool:
-            raise RuntimeError("argon2-cffi must be installed to verify passwords")
+    class InvalidHash(VerificationError):
+        """Stand-in for argon2 invalid hash error."""
 
-        def needs_update(self, hashed: str) -> bool:
-            return False
 
-        def check_needs_rehash(self, hashed: str) -> bool:
-            return False
+class _MissingPasswordHasher:
+    def hash(self, password: str) -> str:
+        raise RuntimeError("argon2-cffi must be installed to hash passwords")
 
-    _ARGON2_HASHER = _MissingPasswordHasher()
-else:
-    _ARGON2_HASHER = PasswordHasher()
+    def verify(self, hashed: str, password: str) -> bool:
+        raise RuntimeError("argon2-cffi must be installed to verify passwords")
+
+    def needs_update(self, hashed: str) -> bool:
+        return False
+
+    def check_needs_rehash(self, hashed: str) -> bool:
+        return False
+
+
+class _Argon2PasswordHasher:
+    """Wrapper that normalizes access to argon2 password hashing APIs."""
+
+    def __init__(self, delegate: Optional[object] = None) -> None:
+        if delegate is None:
+            delegate = self._build_default_hasher()
+        self._delegate = delegate
+
+    @staticmethod
+    def _build_default_hasher() -> object:
+        if PasswordHasher is None:  # pragma: no cover - argon2 optional in tests
+            return _MissingPasswordHasher()
+        kwargs: Dict[str, object] = {}
+        if Type is not None:
+            kwargs["type"] = Type.ID
+        return PasswordHasher(**kwargs)
+
+    def hash(self, password: str) -> str:
+        hasher = getattr(self._delegate, "hash")
+        return hasher(password)
+
+    def verify(self, hashed: str, password: str) -> bool:
+        verifier = getattr(self._delegate, "verify")
+        return verifier(hashed, password)
+
+    def needs_update(self, hashed: str) -> bool:
+        checker = getattr(self._delegate, "check_needs_rehash", None)
+        if callable(checker):
+            try:
+                return bool(checker(hashed))
+            except (InvalidHash, AttributeError):
+                return False
+        fallback = getattr(self._delegate, "needs_update", None)
+        if callable(fallback):
+            try:
+                return bool(fallback(hashed))
+            except AttributeError:
+                return False
+        return False
+
+
+_ARGON2_HASHER = _Argon2PasswordHasher()
+
+import pyotp
+
+from shared.correlation import get_correlation_id
 
 try:  # pragma: no cover - prometheus is optional outside production
     from prometheus_client import Counter
@@ -61,8 +106,6 @@ except Exception:  # pragma: no cover - provide a no-op fallback
 
         def set(self, value: float) -> None:
             self._value = value
-
-from shared.correlation import get_correlation_id
 
 
 
@@ -82,11 +125,6 @@ _LOGIN_SUCCESS_COUNTER = Counter(
     "auth_login_success_total",
     "Number of successful administrator logins.",
 )
-
-
-
-_ARGON2_HASHER = PasswordHasher(type=Type.ID)
-
 
 
 
@@ -369,14 +407,12 @@ class AuthService:
             try:
                 if not _ARGON2_HASHER.verify(stored_hash, password):
                     return False
-
-            except VerificationError:
-
+            except (VerificationError, AttributeError):
                 return False
-            if hasattr(_ARGON2_HASHER, "check_needs_rehash"):
-                needs_update = _ARGON2_HASHER.check_needs_rehash(stored_hash)
-            else:
+            try:
                 needs_update = _ARGON2_HASHER.needs_update(stored_hash)
+            except AttributeError:
+                needs_update = False
             if needs_update:
                 admin.password_hash = hash_password(password)
                 self._repository.add(admin)
