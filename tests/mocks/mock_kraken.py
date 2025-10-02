@@ -355,23 +355,31 @@ class MockKrakenExchange:
     # ------------------------------------------------------------------
     # Public API used by transports
     # ------------------------------------------------------------------
-    def place_order_ws(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        self._simulate_latency_sync()
+    def place_order_ws(
+        self, payload: Dict[str, Any], *, timeout: float | None = None
+    ) -> Dict[str, Any]:
+        self._simulate_latency_sync(timeout)
         self._maybe_raise("place_order")
         return self._execute_order(payload, transport="websocket")
 
-    async def place_order_rest(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        await self._simulate_latency_async()
+    async def place_order_rest(
+        self, payload: Dict[str, Any], *, timeout: float | None = None
+    ) -> Dict[str, Any]:
+        await self._simulate_latency_async(timeout)
         self._maybe_raise("place_order")
         return self._execute_order(payload, transport="rest")
 
-    def cancel_order_ws(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        self._simulate_latency_sync()
+    def cancel_order_ws(
+        self, payload: Dict[str, Any], *, timeout: float | None = None
+    ) -> Dict[str, Any]:
+        self._simulate_latency_sync(timeout)
         self._maybe_raise("cancel_order")
         return self._cancel_order(payload, transport="websocket")
 
-    async def cancel_order_rest(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        await self._simulate_latency_async()
+    async def cancel_order_rest(
+        self, payload: Dict[str, Any], *, timeout: float | None = None
+    ) -> Dict[str, Any]:
+        await self._simulate_latency_async(timeout)
         self._maybe_raise("cancel_order")
         return self._cancel_order(payload, transport="rest")
 
@@ -385,8 +393,10 @@ class MockKrakenExchange:
         ]
         return {"open": orders, "count": len(orders)}
 
-    async def get_balance(self, account: str = "company") -> Dict[str, float]:
-        await self._simulate_latency_async()
+    async def get_balance(
+        self, account: str = "company", *, timeout: float | None = None
+    ) -> Dict[str, float]:
+        await self._simulate_latency_async(timeout)
         self._maybe_raise("get_balance")
         return dict(self._balances.setdefault(account, {}))
 
@@ -395,8 +405,9 @@ class MockKrakenExchange:
         *,
         account: Optional[str] = None,
         pair: Optional[str] = None,
+        timeout: float | None = None,
     ) -> List[Dict[str, Any]]:
-        await self._simulate_latency_async()
+        await self._simulate_latency_async(timeout)
         self._maybe_raise("get_trades")
         trades: Iterable[MockTrade] = self._trades
         if account is not None:
@@ -567,13 +578,17 @@ class MockKrakenExchange:
                 return [first, 1.0 - first]
         return list(self.config.default_fill)
 
-    def _simulate_latency_sync(self) -> None:
+    def _simulate_latency_sync(self, timeout: float | None = None) -> None:
         delay = self._latency_value()
+        if timeout is not None and delay > timeout:
+            raise asyncio.TimeoutError("Mock Kraken exchange timed out (sync)")
         if delay > 0:
             time.sleep(delay)
 
-    async def _simulate_latency_async(self) -> None:
+    async def _simulate_latency_async(self, timeout: float | None = None) -> None:
         delay = self._latency_value()
+        if timeout is not None and delay > timeout:
+            raise asyncio.TimeoutError("Mock Kraken exchange timed out (async)")
         if delay > 0:
             await asyncio.sleep(delay)
 
@@ -649,13 +664,15 @@ class MockKrakenWSSession:
         if self._closed:
             raise MockKrakenTransportClosed("websocket session closed")
         if channel in {"add_order", "addOrder"}:
-            return self._exchange.place_order_ws(payload)
+            return self._exchange.place_order_ws(payload, timeout=timeout)
         if channel in {"cancel_order", "cancelOrder"}:
-            return self._exchange.cancel_order_ws(payload)
+            return self._exchange.cancel_order_ws(payload, timeout=timeout)
         if channel == "openOrders":
+            self._exchange._simulate_latency_sync(timeout)
             account = payload.get("account") or payload.get("userref")
             return self._exchange.open_orders(account=account)
         if channel in {"ownTrades", "getTrades"}:
+            self._exchange._simulate_latency_sync(timeout)
             account = payload.get("account") or payload.get("userref")
             trades = [
                 trade
@@ -664,6 +681,7 @@ class MockKrakenWSSession:
             ]
             return {"trades": [trade.to_dict() for trade in trades]}
         if channel in {"getBalance", "get_balance"}:
+            self._exchange._simulate_latency_sync(timeout)
             account = payload.get("account") or payload.get("userref") or "company"
             return {"balances": self._exchange._balances.get(account, {})}
         raise ValueError(f"Unsupported channel: {channel}")
@@ -683,62 +701,86 @@ class MockKrakenRESTClient:
     def __init__(self, exchange: MockKrakenExchange) -> None:
         self._exchange = exchange
 
-    async def add_order(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        return await self._exchange.place_order_rest(payload)
+    async def add_order(
+        self, payload: Dict[str, Any], *, timeout: float | None = None
+    ) -> Dict[str, Any]:
+        return await self._exchange.place_order_rest(payload, timeout=timeout)
 
-    async def addOrder(self, payload: Dict[str, Any]) -> Dict[str, Any]:  # noqa: N802
+    async def addOrder(  # noqa: N802
+        self, payload: Dict[str, Any], *, timeout: float | None = None
+    ) -> Dict[str, Any]:
         """CamelCase alias mirroring the real Kraken REST endpoint name."""
 
-        return await self.add_order(payload)
+        return await self.add_order(payload, timeout=timeout)
 
-    async def cancel_order(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        return await self._exchange.cancel_order_rest(payload)
+    async def cancel_order(
+        self, payload: Dict[str, Any], *, timeout: float | None = None
+    ) -> Dict[str, Any]:
+        return await self._exchange.cancel_order_rest(payload, timeout=timeout)
 
-    async def cancelOrder(self, payload: Dict[str, Any]) -> Dict[str, Any]:  # noqa: N802
+    async def cancelOrder(  # noqa: N802
+        self, payload: Dict[str, Any], *, timeout: float | None = None
+    ) -> Dict[str, Any]:
         """CamelCase alias mirroring the real Kraken REST endpoint name."""
 
-        return await self.cancel_order(payload)
+        return await self.cancel_order(payload, timeout=timeout)
 
-    async def open_orders(self, *, account: Optional[str] = None) -> Dict[str, Any]:
-        await self._exchange._simulate_latency_async()
+    async def open_orders(
+        self,
+        *,
+        account: Optional[str] = None,
+        timeout: float | None = None,
+    ) -> Dict[str, Any]:
+        await self._exchange._simulate_latency_async(timeout)
         return self._exchange.open_orders(account=account)
 
-    async def balance(self, account: str = "company") -> Dict[str, float]:
-        return await self._exchange.get_balance(account)
+    async def balance(
+        self, account: str = "company", *, timeout: float | None = None
+    ) -> Dict[str, float]:
+        return await self._exchange.get_balance(account, timeout=timeout)
 
-    async def get_balance(self, account: str = "company") -> Dict[str, float]:
-        return await self.balance(account)
+    async def get_balance(
+        self, account: str = "company", *, timeout: float | None = None
+    ) -> Dict[str, float]:
+        return await self.balance(account, timeout=timeout)
 
-    async def getBalance(self, account: str = "company") -> Dict[str, float]:  # noqa: N802
+    async def getBalance(  # noqa: N802
+        self, account: str = "company", *, timeout: float | None = None
+    ) -> Dict[str, float]:
         """CamelCase alias for compatibility with existing test helpers."""
 
-        return await self.balance(account)
+        return await self.balance(account, timeout=timeout)
 
     async def trades(
         self,
         *,
         account: Optional[str] = None,
         pair: Optional[str] = None,
+        timeout: float | None = None,
     ) -> List[Dict[str, Any]]:
-        return await self._exchange.get_trades(account=account, pair=pair)
+        return await self._exchange.get_trades(
+            account=account, pair=pair, timeout=timeout
+        )
 
     async def get_trades(
         self,
         *,
         account: Optional[str] = None,
         pair: Optional[str] = None,
+        timeout: float | None = None,
     ) -> List[Dict[str, Any]]:
-        return await self.trades(account=account, pair=pair)
+        return await self.trades(account=account, pair=pair, timeout=timeout)
 
     async def getTrades(
         self,
         *,
         account: Optional[str] = None,
         pair: Optional[str] = None,
+        timeout: float | None = None,
     ) -> List[Dict[str, Any]]:  # noqa: N802
         """CamelCase alias for ``get_trades``."""
 
-        return await self.trades(account=account, pair=pair)
+        return await self.trades(account=account, pair=pair, timeout=timeout)
 
     async def close(self) -> None:  # pragma: no cover - symmetry with aiohttp
         return None
