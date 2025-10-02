@@ -38,6 +38,7 @@ async def test_record_fill_preserves_decimal_precision() -> None:
     assert fill.avg_price == avg_px
     assert fill.pre_trade_mid == mid_px
     assert fill.impact_bps == impact
+    assert fill.simulated is False
 
 
 def test_build_curve_uses_decimal_averages() -> None:

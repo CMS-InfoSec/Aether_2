@@ -75,7 +75,7 @@ fastapi_stub.Request = _Request
 fastapi_stub.Response = object
 fastapi_stub.Header = lambda *args, **kwargs: None
 fastapi_stub.status = _status
-sys.modules.setdefault("fastapi", fastapi_stub)
+sys.modules["fastapi"] = fastapi_stub
 
 
 class _BaseModel:
@@ -169,7 +169,12 @@ metrics_stub.record_oms_submit_ack = _noop
 metrics_stub.record_ws_latency = _noop
 metrics_stub.setup_metrics = _noop
 metrics_stub.get_request_id = lambda: None
-metrics_stub._REGISTRY = object()
+
+class _RegistryStub:
+    def register(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+metrics_stub._REGISTRY = _RegistryStub()
 sys.modules.setdefault("metrics", metrics_stub)
 
 
@@ -194,6 +199,8 @@ MODULE_SPEC.loader.exec_module(oms_service)
 
 from services.oms.oms_service import AccountContext, OMSPlaceRequest
 from services.oms.kraken_ws import OrderAck
+from shared.correlation import CorrelationContext
+from shared.simulation import sim_broker, sim_mode_state
 
 
 class _StubCredentialWatcher:
@@ -246,8 +253,11 @@ class _StubLatencyRouter:
 
 
 class _StubImpactStore:
-    async def record_fill(self, **_: Any) -> None:
-        return None
+    def __init__(self) -> None:
+        self.calls: List[Dict[str, Any]] = []
+
+    async def record_fill(self, **payload: Any) -> None:
+        self.calls.append(payload)
 
     async def impact_curve(self, **_: Any) -> List[Dict[str, Any]]:
         return []
@@ -291,6 +301,9 @@ class _RecordingWSClient:
 
     def heartbeat_age(self) -> Optional[float]:
         return 0.1
+
+    def set_rest_client(self, rest_client: Any) -> None:
+        self._rest_client = rest_client
 
 
 class _StubRESTClient:
@@ -346,13 +359,19 @@ def pair_metadata() -> Dict[str, Any]:
 @pytest.fixture
 def account_setup(
     monkeypatch: pytest.MonkeyPatch, pair_metadata: Dict[str, Any]
-) -> Tuple[AccountContext, List[_RecordingWSClient], List[_StubRESTClient]]:
+) -> Tuple[
+    AccountContext,
+    List[_RecordingWSClient],
+    List[_StubRESTClient],
+    _StubImpactStore,
+]:
     _StubCredentialWatcher._instances = {}
     _StubCredentialWatcher.metadata = pair_metadata
 
     monkeypatch.setattr(oms_service, "CredentialWatcher", _StubCredentialWatcher)
     monkeypatch.setattr(oms_service, "LatencyRouter", _StubLatencyRouter)
-    monkeypatch.setattr(oms_service, "impact_store", _StubImpactStore())
+    impact_store = _StubImpactStore()
+    monkeypatch.setattr(oms_service, "impact_store", impact_store)
 
     ws_clients: List[_RecordingWSClient] = []
     rest_clients: List[_StubRESTClient] = []
@@ -376,17 +395,27 @@ def account_setup(
     class _StubIdempotencyStore:
         def __init__(self, account_id: str) -> None:
             self.account_id = account_id
+            self._cache: Dict[str, Any] = {}
 
         async def get_or_create(
             self, cache_key: str, producer: Any
         ) -> Tuple[Any, bool]:
+            if cache_key in self._cache:
+                closer = getattr(producer, "close", None)
+                if callable(closer):
+                    closer()
+                return self._cache[cache_key], True
             result = await producer
+            self._cache[cache_key] = result
             return result, False
 
     monkeypatch.setattr(oms_service, "_IdempotencyStore", _StubIdempotencyStore)
 
+    sim_mode_state.deactivate()
+    asyncio.run(sim_broker.clear())
+
     account = AccountContext("ACC-TEST")
-    return account, ws_clients, rest_clients
+    return account, ws_clients, rest_clients, impact_store
 
 
 @pytest.fixture
@@ -409,10 +438,15 @@ def off_tick_request() -> OMSPlaceRequest:
 
 
 def test_place_order_snaps_take_profit_stop_loss_and_trailing(
-    account_setup: Tuple[AccountContext, List[_RecordingWSClient], List[_StubRESTClient]],
+    account_setup: Tuple[
+        AccountContext,
+        List[_RecordingWSClient],
+        List[_StubRESTClient],
+        _StubImpactStore,
+    ],
     off_tick_request: OMSPlaceRequest,
 ) -> None:
-    account, ws_clients, _ = account_setup
+    account, ws_clients, _, _ = account_setup
 
     response = asyncio.run(account.place_order(off_tick_request))
     assert response.status == "accepted"
@@ -426,3 +460,56 @@ def test_place_order_snaps_take_profit_stop_loss_and_trailing(
     assert payload["trailingStopOffset"] == "1.2"
 
     asyncio.run(account.close())
+
+
+def test_simulated_place_order_marks_records_and_reuses_idempotency(
+    account_setup: Tuple[
+        AccountContext,
+        List[_RecordingWSClient],
+        List[_StubRESTClient],
+        _StubImpactStore,
+    ],
+    off_tick_request: OMSPlaceRequest,
+) -> None:
+    account, ws_clients, rest_clients, impact_store = account_setup
+
+    off_tick_request.pre_trade_mid_px = Decimal("20000")
+    sim_mode_state.activate()
+
+    try:
+        with CorrelationContext("corr-sim-1"):
+            first = asyncio.run(account.place_order(off_tick_request))
+
+        assert first.transport == "simulation"
+        assert first.reused is False
+
+        if ws_clients:
+            assert ws_clients[0].add_calls == []
+        if rest_clients:
+            assert rest_clients[0].add_calls == []
+
+        record = asyncio.run(account.lookup(off_tick_request.client_id))
+        assert record is not None
+        assert record.origin == "SIM"
+        assert record.children and record.children[0].origin == "SIM"
+
+        assert impact_store.calls, "expected simulated fill to be recorded"
+        fill_payload = impact_store.calls[-1]
+        assert fill_payload.get("simulated") is True
+
+        cached = sim_broker.inspect(account.account_id, off_tick_request.client_id)
+        assert cached is not None
+        assert cached.payload["clientOrderId"] == off_tick_request.client_id
+        assert cached.payload["idempotencyKey"] == off_tick_request.client_id
+        assert cached.correlation_id == "corr-sim-1"
+
+        with CorrelationContext("corr-sim-2"):
+            second = asyncio.run(account.place_order(off_tick_request))
+
+        assert second.reused is True
+        assert second.exchange_order_id == first.exchange_order_id
+        assert len(impact_store.calls) == 1
+    finally:
+        sim_mode_state.deactivate()
+        asyncio.run(sim_broker.clear())
+        asyncio.run(account.close())
