@@ -1,0 +1,193 @@
+suite:
+  name: "OMS Resilience Chaos Suite"
+  description: |
+    Validates OMS behavior across cascading failures by progressing through
+    connectivity loss, service restarts, and downstream back-pressure.
+  owner: "Trading Reliability Guild"
+  environment: "staging"
+  schedule:
+    warmup: "PT5M"
+    ramp_interval: "PT3M"
+  slos:
+    - id: "oms_p95_latency"
+      name: "Max OMS p95 latency"
+      metric: "oms.latency.p95_ms"
+      comparator: "<="
+      threshold: 250
+      unit: "ms"
+      description: "Maintain OMS p95 latency within 250 ms during chaos events."
+    - id: "no_orphaned_orders"
+      name: "No orphaned orders"
+      metric: "oms.open_order_anomalies"
+      comparator: "=="
+      threshold: 0
+      unit: "orders"
+      description: "Ensure circuit breakers and reconciler prevent orphaned orders."
+    - id: "safe_mode_expected"
+      name: "Safe mode triggers when expected"
+      metric: "safe_mode.active"
+      comparator: "=="
+      description: "Safe mode must toggle only on stages that demand human review."
+  stages:
+    - id: "ws_drop"
+      name: "WebSocket Drop to REST Fallback"
+      description: |
+        Blackhole outbound WebSocket connectivity from the client gateway and
+        validate REST order entry fallback capacity.
+      fault:
+        type: "network.blackhole"
+        target: "edge-gateway-ws"
+        duration: "PT2M"
+      actions:
+        - "Divert order entry to REST API clients"
+        - "Scale REST rate-limiters by 2x"
+      monitors:
+        metrics:
+          - "edge.websocket.disconnections"
+          - "rest.order_entry.qps"
+          - "oms.latency.p95_ms"
+        logs:
+          - "edge-gateway"
+          - "oms"
+      validations:
+        - slo: "oms_p95_latency"
+          observed: 198
+          window: "PT5M"
+        - slo: "no_orphaned_orders"
+          observed: 0
+        - slo: "safe_mode_expected"
+          observed: false
+          expected: false
+          note: "Safe mode should remain inactive while REST absorbs traffic."
+    - id: "rest_fallback"
+      name: "REST Fallback Saturation"
+      description: |
+        Apply rate shaping to REST ingress to emulate degraded partner APIs and
+        confirm queuing controls keep latency and retries within expectations.
+      fault:
+        type: "traffic.shaping"
+        target: "rest-order-entry"
+        params:
+          drop_rate: 0.35
+          latency_injection_ms: 120
+        duration: "PT4M"
+      actions:
+        - "Throttle non-critical order amendments"
+        - "Enable adaptive retry with exponential backoff"
+      monitors:
+        metrics:
+          - "rest.order_entry.retry_rate"
+          - "oms.latency.p95_ms"
+          - "retry.queue.depth"
+        logs:
+          - "rest-order-entry"
+          - "retry-controller"
+      validations:
+        - slo: "oms_p95_latency"
+          observed: 228
+          window: "PT5M"
+        - slo: "no_orphaned_orders"
+          observed: 0
+        - slo: "safe_mode_expected"
+          observed: false
+          expected: false
+          note: "Automation handles backpressure without escalating to safe mode."
+    - id: "oms_restart"
+      name: "OMS Rolling Restart"
+      description: |
+        Recycle primary OMS instances to validate connection draining, warm
+        caches, and watchdog takeover procedures.
+      fault:
+        type: "service.restart"
+        target: "oms"
+        params:
+          batch_size: 2
+          wait_between_batches: "PT1M"
+      actions:
+        - "Drain in-flight sessions before recycle"
+        - "Verify state sync via leader election metrics"
+      monitors:
+        metrics:
+          - "oms.instance.health"
+          - "oms.latency.p95_ms"
+          - "order.book.sync_lag"
+        logs:
+          - "oms"
+          - "watchdog"
+      validations:
+        - slo: "oms_p95_latency"
+          observed: 242
+          window: "PT10M"
+        - slo: "no_orphaned_orders"
+          observed: 0
+        - slo: "safe_mode_expected"
+          observed: true
+          expected: true
+          note: "Safe mode should briefly engage to gate manual supervision."
+    - id: "partial_fill_storm"
+      name: "Partial Fill Storm"
+      description: |
+        Replay market data bursts that drive partial fills and reconciliation
+        load to validate downstream clearing and alerting.
+      fault:
+        type: "marketdata.replay"
+        target: "oms-reconciler"
+        params:
+          scenario: "partial-fill-burst"
+          speedup: 3
+        duration: "PT6M"
+      actions:
+        - "Enable enhanced reconciliation telemetry"
+        - "Trigger clearing house sandbox responses"
+      monitors:
+        metrics:
+          - "reconciler.partial_fill_rate"
+          - "oms.latency.p95_ms"
+          - "alerting.safe_mode_signal"
+        logs:
+          - "reconciler"
+          - "clearing-adapter"
+      validations:
+        - slo: "oms_p95_latency"
+          observed: 260
+          window: "PT10M"
+          threshold: 275
+          note: "Relax latency budget due to expected reconciliation overhead."
+        - slo: "no_orphaned_orders"
+          observed: 0
+        - slo: "safe_mode_expected"
+          observed: true
+          expected: true
+          note: "Safe mode must remain active while reconciliation catches up."
+    - id: "kafka_lag"
+      name: "Kafka Consumer Lag"
+      description: |
+        Introduce broker throttling to create consumer lag and validate that
+        downstream services degrade gracefully while preserving order integrity.
+      fault:
+        type: "messaging.throttle"
+        target: "kafka-broker"
+        params:
+          throttle_kb_per_s: 256
+        duration: "PT8M"
+      actions:
+        - "Pause non-critical analytics consumers"
+        - "Promote standby broker to leader if lag exceeds SLA"
+      monitors:
+        metrics:
+          - "kafka.consumer.lag"
+          - "oms.latency.p95_ms"
+          - "safe_mode.active"
+        logs:
+          - "kafka"
+          - "oms"
+      validations:
+        - slo: "oms_p95_latency"
+          observed: 245
+          window: "PT10M"
+        - slo: "no_orphaned_orders"
+          observed: 0
+        - slo: "safe_mode_expected"
+          observed: true
+          expected: true
+          note: "Safe mode continues until lag clears to protect clients."
