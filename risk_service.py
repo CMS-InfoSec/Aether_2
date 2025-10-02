@@ -19,7 +19,7 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optio
 
 import httpx
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Header, Query, status
 
 from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, model_validator
 from sqlalchemy import Column, DateTime, Float, Integer, String, create_engine, select
@@ -611,14 +611,12 @@ battle_mode_controller = BattleModeController(
 
 
 @app.post("/risk/validate", response_model=RiskValidationResponse)
-async def validate_risk(request: RiskValidationRequest) -> RiskValidationResponse:
+async def validate_risk(
+    request: RiskValidationRequest,
+    account_id: str = Header(..., alias="X-Account-ID"),
+) -> RiskValidationResponse:
 
     """Validate a trading intent against account level risk limits."""
-
-    try:
-        request = RiskValidationRequest.parse_obj(payload)
-    except ValidationError as exc:  # pragma: no cover - FastAPI handles validation
-        raise HTTPException(status_code=422, detail=exc.errors()) from exc
 
     if request.account_id != account_id:
         raise HTTPException(

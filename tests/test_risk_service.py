@@ -65,7 +65,11 @@ def test_validate_risk_all_admin_accounts(
     risk_app: AccountClient, account_id: str, instrument: str
 ) -> None:
     client, _ = risk_app
-    response = client.post("/risk/validate", json=_request_payload(account_id, instrument))
+    response = client.post(
+        "/risk/validate",
+        json=_request_payload(account_id, instrument),
+        headers={"X-Account-ID": account_id},
+    )
 
     assert response.status_code == 200
     body = response.json()
@@ -101,10 +105,28 @@ def test_get_risk_limits_returns_whitelists(risk_app: AccountClient) -> None:
 def test_missing_account_returns_404(risk_app: AccountClient) -> None:
     client, _ = risk_app
     missing_payload = _request_payload("shadow", "BTC-USD")
-    response = client.post("/risk/validate", json=missing_payload)
+    response = client.post(
+        "/risk/validate",
+        json=missing_payload,
+        headers={"X-Account-ID": "shadow"},
+    )
 
     assert response.status_code == 404
     assert response.json()["detail"] == "No risk limits configured for account 'shadow'."
 
     limits_response = client.get("/risk/limits", params={"account_id": "shadow"})
     assert limits_response.status_code == 404
+
+
+def test_validate_risk_rejects_mismatched_header(risk_app: AccountClient) -> None:
+    client, _ = risk_app
+    payload = _request_payload("company", "BTC-USD")
+
+    response = client.post(
+        "/risk/validate",
+        json=payload,
+        headers={"X-Account-ID": "director-1"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Account mismatch between header and payload."

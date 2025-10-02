@@ -139,7 +139,11 @@ def test_risk_engine_blocks_when_allocator_throttles(
         },
     }
 
-    response = client.post("/risk/validate", json=payload)
+    response = client.post(
+        "/risk/validate",
+        json=payload,
+        headers={"X-Account-ID": payload["account_id"]},
+    )
     assert response.status_code == 200
     body = response.json()
     assert body["pass"] is False

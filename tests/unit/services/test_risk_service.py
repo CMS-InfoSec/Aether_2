@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import Dict
 
 import pytest
+
+pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
 from risk_service import RiskEvaluationContext, app as risk_app
@@ -41,7 +43,11 @@ def _base_request() -> Dict[str, object]:
 
 def test_risk_validation_passes_under_fee_budget(risk_client: TestClient) -> None:
     payload = _base_request()
-    response = risk_client.post("/risk/validate", json=payload)
+    response = risk_client.post(
+        "/risk/validate",
+        json=payload,
+        headers={"X-Account-ID": payload["account_id"]},
+    )
     assert response.status_code == 200
     body = response.json()
     assert body["pass"] is True
@@ -51,7 +57,11 @@ def test_risk_validation_passes_under_fee_budget(risk_client: TestClient) -> Non
 def test_risk_validation_rejects_when_fee_budget_exhausted(risk_client: TestClient) -> None:
     payload = _base_request()
     payload["portfolio_state"]["fees_paid"] = 12_000.0
-    response = risk_client.post("/risk/validate", json=payload)
+    response = risk_client.post(
+        "/risk/validate",
+        json=payload,
+        headers={"X-Account-ID": payload["account_id"]},
+    )
     assert response.status_code == 200
     body = response.json()
     assert body["pass"] is False
@@ -61,7 +71,11 @@ def test_risk_validation_rejects_when_fee_budget_exhausted(risk_client: TestClie
 def test_risk_validation_enforces_schema(risk_client: TestClient) -> None:
     payload = _base_request()
     payload["intent"]["side"] = "hold"
-    response = risk_client.post("/risk/validate", json=payload)
+    response = risk_client.post(
+        "/risk/validate",
+        json=payload,
+        headers={"X-Account-ID": payload["account_id"]},
+    )
     assert response.status_code == 422
 
 
