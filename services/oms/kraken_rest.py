@@ -11,8 +11,8 @@ import random
 import time
 import urllib.parse
 
-from decimal import Decimal, InvalidOperation
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
+from uuid import uuid4
 
 
 import aiohttp
