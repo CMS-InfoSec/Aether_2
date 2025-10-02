@@ -1,3 +1,10 @@
 # Global system configuration for runtime toggles.
 enable_audit_mode: false
 auditor_accounts: [auditor]
+
+coingecko:
+  base_url: "https://api.coingecko.com/api/v3"
+  rate_limit_qps: 5
+  max_retries: 5
+  backoff_initial_ms: 200
+  timeout_sec: 30
