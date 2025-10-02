@@ -46,7 +46,8 @@ const ApiKeyForm: React.FC = () => {
   const [lastRotatedAt, setLastRotatedAt] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
-  const { readOnly } = useAuthClaims();
+  const { readOnly, accessToken, mfaContext, mfaVerified } = useAuthClaims();
+  const isAuthenticated = Boolean(accessToken);
   const accountOptions = useMemo(() => {
     if (typeof window !== "undefined") {
       const adminAccounts = (window as typeof window & {
@@ -70,6 +71,12 @@ const ApiKeyForm: React.FC = () => {
         return;
       }
 
+      if (!isAuthenticated || !mfaVerified) {
+        setStatusLoading(false);
+        setStatusError(null);
+        return;
+      }
+
       try {
         setStatusLoading(true);
         const response = await fetch(
@@ -79,6 +86,10 @@ const ApiKeyForm: React.FC = () => {
             headers: {
               Accept: "application/json",
               "X-Account-ID": accountId,
+              "X-MFA-Context": mfaContext,
+              ...(accessToken
+                ? { Authorization: `Bearer ${accessToken}` }
+                : {}),
             },
             signal,
           }
@@ -110,7 +121,7 @@ const ApiKeyForm: React.FC = () => {
         }
       }
     },
-    [accountId]
+    [accountId, accessToken, isAuthenticated, mfaContext, mfaVerified]
   );
 
   const refreshStatus = useCallback(async () => {
@@ -152,6 +163,16 @@ const ApiKeyForm: React.FC = () => {
       return;
     }
 
+    if (!isAuthenticated) {
+      setSubmitError("SSO login required before rotating credentials.");
+      return;
+    }
+
+    if (!mfaVerified) {
+      setSubmitError("Complete multi-factor authentication to rotate credentials.");
+      return;
+    }
+
     setIsSubmitting(true);
     setSubmitError(null);
     setSuccessMessage(null);
@@ -169,6 +190,8 @@ const ApiKeyForm: React.FC = () => {
           "Content-Type": "application/json",
           Accept: "application/json",
           "X-Account-ID": accountId,
+          "X-MFA-Context": mfaContext,
+          ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
         },
         body: JSON.stringify(payload),
       });
@@ -191,6 +214,28 @@ const ApiKeyForm: React.FC = () => {
       setIsSubmitting(false);
     }
   };
+
+  if (!isAuthenticated) {
+    return (
+      <div className="max-w-xl mx-auto bg-white shadow rounded-lg p-6">
+        <h2 className="text-2xl font-semibold text-gray-900 mb-4">Kraken API Credentials</h2>
+        <p className="text-sm text-gray-600">
+          Please sign in with your corporate single sign-on provider to manage Kraken API credentials.
+        </p>
+      </div>
+    );
+  }
+
+  if (!mfaVerified) {
+    return (
+      <div className="max-w-xl mx-auto bg-white shadow rounded-lg p-6">
+        <h2 className="text-2xl font-semibold text-gray-900 mb-4">Kraken API Credentials</h2>
+        <p className="text-sm text-gray-600">
+          Multi-factor authentication is required. Complete the MFA challenge to enable credential management.
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className="max-w-xl mx-auto bg-white shadow rounded-lg p-6">
