@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import sys
 import time
 import types
@@ -45,10 +46,20 @@ _websocket_exceptions.WebSocketException = _DummyWebSocketException
 
 sys.modules.setdefault("websockets", _websockets_stub)
 sys.modules.setdefault("websockets.exceptions", _websocket_exceptions)
-_fastapi_stub.FastAPI = _DummyFastAPI  # type: ignore[attr-defined]
-_fastapi_stub.Request = _DummyRequest  # type: ignore[attr-defined]
-_fastapi_stub.Response = _DummyResponse  # type: ignore[attr-defined]
-sys.modules.setdefault("fastapi", _fastapi_stub)
+
+def _module_available(name: str) -> bool:
+    try:
+        return importlib.util.find_spec(name) is not None
+    except ModuleNotFoundError:
+        return False
+
+
+if not _module_available("fastapi"):
+    _fastapi_stub.FastAPI = _DummyFastAPI  # type: ignore[attr-defined]
+    _fastapi_stub.Request = _DummyRequest  # type: ignore[attr-defined]
+    _fastapi_stub.Response = _DummyResponse  # type: ignore[attr-defined]
+    sys.modules.setdefault("fastapi", _fastapi_stub)
+
 _starlette_stub = types.ModuleType("starlette")
 _starlette_middleware_stub = types.ModuleType("starlette.middleware")
 _starlette_middleware_base_stub = types.ModuleType("starlette.middleware.base")
@@ -59,10 +70,11 @@ class _DummyBaseHTTPMiddleware:
         pass
 
 
-_starlette_middleware_base_stub.BaseHTTPMiddleware = _DummyBaseHTTPMiddleware  # type: ignore[attr-defined]
-sys.modules.setdefault("starlette", _starlette_stub)
-sys.modules.setdefault("starlette.middleware", _starlette_middleware_stub)
-sys.modules.setdefault("starlette.middleware.base", _starlette_middleware_base_stub)
+if not _module_available("starlette.middleware.base"):
+    _starlette_middleware_base_stub.BaseHTTPMiddleware = _DummyBaseHTTPMiddleware  # type: ignore[attr-defined]
+    sys.modules.setdefault("starlette", _starlette_stub)
+    sys.modules.setdefault("starlette.middleware", _starlette_middleware_stub)
+    sys.modules.setdefault("starlette.middleware.base", _starlette_middleware_base_stub)
 
 from services.oms.kraken_ws import KrakenWSClient, KrakenWSError
 
