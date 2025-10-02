@@ -5,9 +5,12 @@ import base64
 import json
 import logging
 import os
+import tempfile
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, ClassVar, Dict, Iterable, List, Optional
+from pathlib import Path
+from typing import Any, ClassVar, Dict, Iterable, List, Optional, Tuple
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -16,6 +19,10 @@ LOGGER = logging.getLogger(__name__)
 
 class EncryptionError(RuntimeError):
     """Raised when encryption or decryption fails."""
+
+
+class MasterKeyPersistenceError(RuntimeError):
+    """Raised when durable persistence of master keys fails."""
 
 
 def _b64encode(data: bytes) -> str:
@@ -39,6 +46,98 @@ class MasterKeyRecord:
     master_key_id: str
     rotated_at: datetime
     version: int
+
+
+class MasterKeyPersistence:
+    """Durable storage helper for local KMS master key material."""
+
+    def __init__(self, *, path: Optional[os.PathLike[str] | str] = None) -> None:
+        default_path = os.getenv("LOCAL_KMS_STATE_PATH")
+        if path is None and default_path is not None:
+            path = default_path
+        if path is None:
+            path = Path(tempfile.gettempdir()) / "aether-local-kms-master-keys.json"
+        self._path = Path(path)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def _read_store(self) -> Dict[str, List[Dict[str, Any]]]:
+        if not self._path.exists():
+            return {}
+        try:
+            with self._path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except FileNotFoundError:
+            return {}
+        except json.JSONDecodeError as exc:  # pragma: no cover - defensive guard
+            raise MasterKeyPersistenceError("Persisted master key store is corrupted") from exc
+        except OSError as exc:  # pragma: no cover - filesystem issues
+            raise MasterKeyPersistenceError("Unable to read persisted master keys") from exc
+        if not isinstance(payload, dict):  # pragma: no cover - defensive guard
+            raise MasterKeyPersistenceError("Unexpected master key store format")
+        result: Dict[str, List[Dict[str, Any]]] = {}
+        for key, value in payload.items():
+            if isinstance(key, str) and isinstance(value, list):
+                filtered = [item for item in value if isinstance(item, dict)]
+                result[key] = filtered
+        return result
+
+    def load(self, key_id: str) -> List[Tuple[MasterKeyRecord, bytes]]:
+        entries = self._read_store().get(key_id, [])
+        restored: List[Tuple[MasterKeyRecord, bytes]] = []
+        for entry in entries:
+            try:
+                master_key_id = str(entry["master_key_id"])
+                rotated_at = datetime.fromisoformat(str(entry["rotated_at"]))
+                version = int(entry["version"])
+                encoded_key = str(entry["master_key"])
+                master_key = _b64decode(encoded_key)
+            except Exception as exc:  # pragma: no cover - defensive guard
+                LOGGER.warning(
+                    "Skipping invalid master key persistence entry", extra={"reason": str(exc)}
+                )
+                continue
+            record = MasterKeyRecord(
+                master_key_id=master_key_id,
+                rotated_at=rotated_at,
+                version=version,
+            )
+            restored.append((record, master_key))
+        restored.sort(key=lambda item: item[0].version)
+        return restored
+
+    def _atomic_write(self, payload: Dict[str, List[Dict[str, Any]]]) -> None:
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=str(self._path.parent))
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, default=str, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, self._path)
+        except OSError as exc:  # pragma: no cover - filesystem issues
+            raise MasterKeyPersistenceError("Unable to persist master key record") from exc
+        finally:
+            with suppress(FileNotFoundError):
+                os.remove(tmp_path)
+
+    def persist(self, *, key_id: str, record: MasterKeyRecord, master_key: bytes) -> None:
+        store = self._read_store()
+        entries = store.setdefault(key_id, [])
+        encoded_key = _b64encode(master_key)
+        serialised = {
+            "master_key_id": record.master_key_id,
+            "rotated_at": record.rotated_at.isoformat(),
+            "version": record.version,
+            "master_key": encoded_key,
+        }
+        entries = [entry for entry in entries if entry.get("master_key_id") != record.master_key_id]
+        entries.append(serialised)
+        entries.sort(key=lambda entry: int(entry.get("version", 0)))
+        store[key_id] = entries
+        self._atomic_write(store)
 
 
 @dataclass
@@ -70,12 +169,17 @@ class LocalKMSEmulator:
         key_id: str | None = None,
         master_key: Optional[bytes] = None,
         rotation_interval: Optional[timedelta] = None,
+        persistence: Optional[MasterKeyPersistence] = None,
     ) -> None:
         self.key_id = key_id or os.getenv("LOCAL_KMS_KEY_ID", self.default_key_id)
         self._rotation_interval = rotation_interval or timedelta(days=90)
         self._master_keys: Dict[str, bytes] = {}
         self._master_key_history: List[MasterKeyRecord] = []
         self._current_version = 0
+        self._persistence = persistence or MasterKeyPersistence()
+        self._load_persisted_master_keys()
+        if self._master_keys:
+            return
         if master_key is None:
             env_value = os.getenv("LOCAL_KMS_MASTER_KEY")
             if env_value:
@@ -88,22 +192,39 @@ class LocalKMSEmulator:
         normalized_key = self._normalize_master_key(master_key)
         self._activate_master_key(normalized_key, datetime.now(timezone.utc))
 
+    def _load_persisted_master_keys(self) -> None:
+        try:
+            records = self._persistence.load(self.key_id)
+        except MasterKeyPersistenceError as exc:
+            LOGGER.error("Failed to load persisted master keys for %s", self.key_id)
+            raise
+        for record, master_key in records:
+            self._master_keys[record.master_key_id] = master_key
+            self._master_key_history.append(record)
+            if record.version > self._current_version:
+                self._current_version = record.version
+                self._current_master_key_id = record.master_key_id
+                self._last_rotated = record.rotated_at
+
     def _normalize_master_key(self, master_key: bytes) -> bytes:
         if len(master_key) not in (16, 24, 32):
             master_key = (master_key * (32 // len(master_key) + 1))[:32]
         return master_key
 
     def _activate_master_key(self, master_key: bytes, rotated_at: datetime) -> None:
-        self._current_version += 1
-        master_key_id = f"{self.key_id}:v{self._current_version}"
-        self._master_keys[master_key_id] = master_key
-        self._current_master_key_id = master_key_id
-        self._last_rotated = rotated_at
+        next_version = self._current_version + 1
+        master_key_id = f"{self.key_id}:v{next_version}"
         record = MasterKeyRecord(
             master_key_id=master_key_id,
             rotated_at=rotated_at,
-            version=self._current_version,
+            version=next_version,
         )
+        if self._persistence is not None:
+            self._persistence.persist(key_id=self.key_id, record=record, master_key=master_key)
+        self._current_version = next_version
+        self._master_keys[master_key_id] = master_key
+        self._current_master_key_id = master_key_id
+        self._last_rotated = rotated_at
         self._master_key_history.append(record)
 
     def _aesgcm(self, *, master_key_id: Optional[str] = None) -> AESGCM:
@@ -374,6 +495,8 @@ __all__ = [
     "DecryptedCredentials",
     "EncryptedSecretEnvelope",
     "EnvelopeEncryptor",
+    "MasterKeyPersistence",
+    "MasterKeyPersistenceError",
     "LocalKMSEmulator",
     "MasterKeyRecord",
     "SecretsMetadataStore",

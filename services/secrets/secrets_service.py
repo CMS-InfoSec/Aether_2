@@ -59,6 +59,7 @@ from services.secrets.secure_secrets import (
     EnvelopeEncryptor,
     EncryptedSecretEnvelope,
     LocalKMSEmulator,
+    MasterKeyPersistenceError,
     SecretsMetadataStore,
 )
 from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
@@ -110,6 +111,19 @@ async def _master_key_rotation_loop() -> None:
                         }
                     },
                 )
+        except MasterKeyPersistenceError as exc:
+            LOGGER.error("Master key rotation persistence failed: %s", exc)
+            kms = getattr(_encryptor, "_kms", None)
+            kms_key_id = getattr(kms, "key_id", "unknown")
+            SECRETS_LOGGER.error(
+                "master_key_rotation_failed",  # pragma: no cover - logging only
+                extra={
+                    "master_key_rotation_error": {
+                        "error": str(exc),
+                        "kms_key_id": kms_key_id,
+                    }
+                },
+            )
         except Exception:  # pragma: no cover - defensive guard for background loop
             LOGGER.exception("Background master key rotation loop failed")
         await asyncio.sleep(_MASTER_KEY_CHECK_INTERVAL.total_seconds())
