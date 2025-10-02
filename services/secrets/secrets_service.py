@@ -53,6 +53,8 @@ from services.common.security import (
     require_dual_director_confirmation,
     require_mfa_context,
 )
+from services.oms.kraken_rest import KrakenRESTClient, KrakenRESTError
+from services.oms.rate_limit_guard import RateLimitGuard
 from services.secrets.middleware import (
     ForwardedSchemeMiddleware,
     TRUSTED_HOSTS,
@@ -118,6 +120,9 @@ def _build_encryptor() -> EnvelopeEncryptor:
 
 _encryptor = _build_encryptor()
 _MASTER_KEY_CHECK_INTERVAL = timedelta(hours=6)
+
+_KRAKEN_VALIDATION_ENDPOINT = "/private/Balance"
+_KRAKEN_VALIDATION_RATE_LIMIT = RateLimitGuard()
 
 
 async def _master_key_rotation_loop() -> None:
@@ -341,13 +346,116 @@ async def handle_validation_error(request: Request, exc: RequestValidationError)
     )
 
 
-def validate_kraken_credentials(api_key: str, api_secret: str) -> bool:
-    """Stub for validating Kraken credentials via the GetBalance endpoint."""
+def _mask_identifier(value: str, *, prefix: str = "anon") -> str:
+    if not value:
+        return f"{prefix}:<empty>"
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return f"{prefix}:{digest[:8]}"
 
-    # TODO: Integrate with Kraken's REST API client to verify credentials.
-    # The stub intentionally returns ``True`` for now so rotation can proceed.
-    _ = (api_key, api_secret)  # Avoid unused variable warnings without logging secrets.
-    return True
+
+def _is_authentication_error(message: str) -> bool:
+    lowered = message.lower()
+    markers = (
+        "eapi:invalid key",
+        "eapi:invalid signature",
+        "eapi:invalid nonce",
+        "eapi:permission denied",
+        "egeneral:permission denied",
+        "eauth:",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+async def _validate_kraken_credentials_async(
+    api_key: str,
+    api_secret: str,
+    account_reference: str,
+) -> bool:
+    async def _credentials() -> Dict[str, Any]:
+        return {"api_key": api_key, "api_secret": api_secret}
+
+    client = KrakenRESTClient(credential_getter=_credentials)
+    validated = False
+    await _KRAKEN_VALIDATION_RATE_LIMIT.acquire(
+        account_reference,
+        _KRAKEN_VALIDATION_ENDPOINT,
+        transport="rest",
+        urgent=False,
+    )
+    try:
+        payload = await client.balance()
+        result = payload.get("result") if isinstance(payload, dict) else None
+        if not isinstance(result, dict):
+            raise KrakenRESTError("Kraken REST payload missing balance result")
+        validated = True
+        return True
+    finally:
+        await _KRAKEN_VALIDATION_RATE_LIMIT.release(
+            account_reference,
+            transport="rest",
+            successful=validated,
+        )
+        await client.close()
+
+
+def _run_validation(api_key: str, api_secret: str, account_reference: str) -> bool:
+    loop = asyncio.new_event_loop()
+    previous_loop: Optional[asyncio.AbstractEventLoop]
+    try:
+        try:
+            previous_loop = asyncio.get_event_loop()
+        except RuntimeError:
+            previous_loop = None
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(
+            _validate_kraken_credentials_async(api_key, api_secret, account_reference)
+        )
+    finally:
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+        asyncio.set_event_loop(previous_loop)
+
+
+def validate_kraken_credentials(
+    api_key: str,
+    api_secret: str,
+    *,
+    account_id: Optional[str] = None,
+) -> bool:
+    account_reference = account_id or _mask_identifier(api_key)
+    try:
+        return _run_validation(api_key, api_secret, account_reference)
+    except HTTPException:
+        raise
+    except KrakenRESTError as exc:
+        message = str(exc)
+        if _is_authentication_error(message):
+            LOGGER.warning(
+                "Kraken credential validation rejected for %s: %s",
+                account_reference,
+                message,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Kraken API rejected the provided credentials.",
+            ) from exc
+        LOGGER.error(
+            "Kraken credential validation failed for %s due to REST error: %s",
+            account_reference,
+            message,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Kraken API validation request failed.",
+        ) from exc
+    except Exception as exc:  # pragma: no cover - unexpected failure path
+        LOGGER.exception(
+            "Unexpected error validating Kraken credentials for %s", account_reference
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Unexpected error validating Kraken credentials.",
+        ) from exc
 
 
 _ACCOUNT_ID_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{2,63}$")
@@ -706,11 +814,11 @@ def rotate_secret(
     api_key = payload.api_key.get_secret_value()
     api_secret = payload.api_secret.get_secret_value()
 
-    if not validate_kraken_credentials(api_key, api_secret):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Unable to validate Kraken credentials",
-        )
+    validate_kraken_credentials(
+        api_key,
+        api_secret,
+        account_id=actor_account,
+    )
 
     rotation = _perform_secure_rotation(
         account_id=actor_account,
@@ -774,11 +882,11 @@ def rotate_kraken_secret(
     api_key = payload.api_key.get_secret_value()
     api_secret = payload.api_secret.get_secret_value()
 
-    if not validate_kraken_credentials(api_key, api_secret):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Unable to validate Kraken credentials",
-        )
+    validate_kraken_credentials(
+        api_key,
+        api_secret,
+        account_id=actor_account,
+    )
 
     rotation = _perform_secure_rotation(
         account_id=actor_account,
@@ -802,12 +910,7 @@ def rotate_kraken_secret(
         background_tasks=background_tasks,
     )
 
-    payload = {
-        "secret_name": rotation["secret_name"],
-        "last_rotated_at": rotation_ts.isoformat(),
-    }
-
-    response = JSONResponse(status_code=status.HTTP_200_OK, content=payload)
+    response = Response(status_code=status.HTTP_204_NO_CONTENT)
     response.headers[
         "X-OMS-Watcher"
     ] = "Kraken credentials rotated; OMS hot-reloads when secret annotations change."
@@ -839,11 +942,11 @@ def rotate_encrypted_secret(
     api_key = payload.api_key.get_secret_value()
     api_secret = payload.api_secret.get_secret_value()
 
-    if not validate_kraken_credentials(api_key, api_secret):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Unable to validate Kraken credentials",
-        )
+    validate_kraken_credentials(
+        api_key,
+        api_secret,
+        account_id=actor_account,
+    )
 
     rotation = _perform_secure_rotation(
         account_id=actor_account,
@@ -1126,11 +1229,11 @@ def test_kraken_secret(
 ) -> Response:
     api_key = payload.api_key.get_secret_value()
     api_secret = payload.api_secret.get_secret_value()
-    if not validate_kraken_credentials(api_key, api_secret):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Unable to validate Kraken credentials",
-        )
+    validate_kraken_credentials(
+        api_key,
+        api_secret,
+        account_id=payload.account_id,
+    )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

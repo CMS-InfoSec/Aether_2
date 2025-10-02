@@ -6,7 +6,7 @@ import time
 from dataclasses import asdict, is_dataclass
 from typing import Any, Dict, List, Optional, Union
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
 
 try:  # pragma: no cover - optional dependency
@@ -22,6 +22,9 @@ from metrics import (
     traced_span,
 )
 from services.common.security import ADMIN_ACCOUNTS
+from services.policy.trade_intensity_controller import (
+    controller as trade_intensity_controller,
+)
 
 
 class PolicyDecisionRequest(BaseModel):
@@ -74,6 +77,25 @@ class PolicyIntent(BaseModel):
         ..., description="Estimated cost expressed in basis points"
     )
     confidence: float = Field(..., description="Confidence score for the decision")
+
+
+class TradeIntensityResponse(BaseModel):
+    """Response schema for the trade intensity controller."""
+
+    account_id: str = Field(..., description="Account identifier associated with the query")
+    symbol: str = Field(..., description="Trading symbol for the intensity context")
+    multiplier: float = Field(..., description="Smoothed multiplier applied to position sizing")
+    raw_multiplier: float = Field(
+        ..., description="Raw multiplier prior to smoothing and clipping"
+    )
+    alpha: float = Field(..., description="EMA smoothing factor")
+    floor: float = Field(..., description="Lower bound on the multiplier")
+    ceiling: float = Field(..., description="Upper bound on the multiplier")
+    diagnostics: Dict[str, float] = Field(
+        default_factory=dict,
+        description="Component level adjustments that produced the multiplier",
+    )
+    last_updated: float = Field(..., description="Epoch timestamp of the last update")
 
 
 APP_VERSION = "2.0.0"
@@ -151,3 +173,57 @@ def decide_policy_intent(request: PolicyDecisionRequest) -> PolicyIntent:
     record_abstention_rate(request.account_id, request.symbol, abstain)
 
     return response
+
+
+@app.get("/policy/intensity", response_model=TradeIntensityResponse, status_code=status.HTTP_200_OK)
+def get_trade_intensity(
+    account_id: str = Query(..., description="Authorized account identifier"),
+    symbol: str = Query(..., description="Trading symbol to query"),
+    signal_confidence: float = Query(
+        0.5, ge=0.0, le=1.0, description="Model or strategy confidence in the signal"
+    ),
+    regime: str = Query("unknown", description="Detected market regime label"),
+    queue_depth: float = Query(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description="Execution backpressure score where 1 is fully saturated",
+    ),
+    win_rate: float = Query(
+        0.5,
+        ge=0.0,
+        le=1.0,
+        description="Recent win-rate of fills or strategy performance",
+    ),
+    drawdown: float = Query(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description="Normalized drawdown where 1 equals risk limits breached",
+    ),
+    fee_pressure: float = Query(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description="Fee pressure score capturing venue cost headwinds",
+    ),
+) -> TradeIntensityResponse:
+    """Return the current trade intensity multiplier and diagnostics."""
+
+    if account_id not in ADMIN_ACCOUNTS:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account must be an authorized admin.",
+        )
+
+    payload = trade_intensity_controller.evaluate(
+        account_id=account_id,
+        symbol=symbol,
+        signal_confidence=signal_confidence,
+        regime=regime,
+        queue_depth=queue_depth,
+        win_rate=win_rate,
+        drawdown=drawdown,
+        fee_pressure=fee_pressure,
+    )
+    return TradeIntensityResponse(**payload)

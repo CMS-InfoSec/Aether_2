@@ -14,6 +14,7 @@ import math
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from threading import Lock
 from typing import Any, DefaultDict, Dict, Iterable, List, Tuple
 
@@ -38,10 +39,10 @@ class ImpactFill:
     client_order_id: str
     symbol: str
     side: str
-    filled_qty: float
-    avg_price: float
-    pre_trade_mid: float
-    impact_bps: float
+    filled_qty: Decimal
+    avg_price: Decimal
+    pre_trade_mid: Decimal
+    impact_bps: Decimal
     recorded_at: datetime
 
 
@@ -63,10 +64,10 @@ class ImpactAnalyticsStore:
         client_order_id: str,
         symbol: str,
         side: str,
-        filled_qty: float,
-        avg_price: float,
-        pre_trade_mid: float,
-        impact_bps: float,
+        filled_qty: Decimal,
+        avg_price: Decimal,
+        pre_trade_mid: Decimal,
+        impact_bps: Decimal,
         recorded_at: datetime,
     ) -> None:
         fill = ImpactFill(
@@ -270,11 +271,22 @@ class ImpactAnalyticsStore:
 
     @staticmethod
     def _build_curve(
-        rows: Iterable[Tuple[float, float]],
+        rows: Iterable[Tuple[Decimal | float, Decimal | float]],
         *,
         bucket_count: int,
     ) -> List[Dict[str, float]]:
-        data = [row for row in rows if row[0] is not None and row[1] is not None]
+        def _to_decimal(value: Decimal | float | None) -> Decimal:
+            if value is None:
+                raise ValueError("Cannot convert None to Decimal")
+            if isinstance(value, Decimal):
+                return value
+            return Decimal(str(value))
+
+        data = [
+            (_to_decimal(row[0]), _to_decimal(row[1]))
+            for row in rows
+            if row[0] is not None and row[1] is not None
+        ]
         if not data:
             return []
 
@@ -287,9 +299,12 @@ class ImpactAnalyticsStore:
             chunk = ordered[index : index + chunk_size]
             if not chunk:
                 continue
-            avg_size = sum(abs(entry[0]) for entry in chunk) / len(chunk)
-            avg_impact = sum(entry[1] for entry in chunk) / len(chunk)
-            points.append({"size": avg_size, "impact_bps": avg_impact})
+            total_chunk = Decimal(len(chunk))
+            total_size = sum((abs(entry[0]) for entry in chunk), Decimal("0"))
+            total_impact = sum((entry[1] for entry in chunk), Decimal("0"))
+            avg_size = total_size / total_chunk
+            avg_impact = total_impact / total_chunk
+            points.append({"size": float(avg_size), "impact_bps": float(avg_impact)})
 
         return points
 

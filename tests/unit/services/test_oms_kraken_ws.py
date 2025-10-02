@@ -260,11 +260,14 @@ def test_sign_auth_caches_rest_token_until_expiry() -> None:
     asyncio.run(_run())
 
 
+
 def test_ensure_connected_uses_transport_factory() -> None:
+
     async def _creds() -> dict[str, str]:
         return {}
 
     client = KrakenWSClient(credential_getter=_creds)
+
 
     calls: list[tuple[str, dict[str, str]]] = []
     created_transport: list[object] = []
@@ -315,6 +318,7 @@ def test_ensure_connected_uses_transport_factory() -> None:
         await asyncio.sleep(0)
 
         assert len(calls) == 1
+
 
     asyncio.run(_run())
 

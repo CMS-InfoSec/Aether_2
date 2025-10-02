@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Dict, Iterable, List, Optional, Set, Tuple
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, ConfigDict
 
 from services.oms import reconcile as _oms_reconcile
 from services.oms.idempotency_store import _IdempotencyStore
@@ -68,6 +68,7 @@ def _log_extra(**extra: Any) -> Dict[str, Any]:
 
 
 class OMSPlaceRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
     account_id: str = Field(..., description="Account identifier for credential lookup")
     client_id: str = Field(..., description="Client supplied idempotency key")
     symbol: str = Field(..., description="Trading symbol (e.g. BTC/USD)")
@@ -86,6 +87,7 @@ class OMSPlaceRequest(BaseModel):
     flags: List[str] = Field(default_factory=list, description="Additional Kraken oflags")
     post_only: bool = Field(False, description="Convenience flag for post-only")
     reduce_only: bool = Field(False, description="Convenience flag for reduce-only")
+    shadow: bool = Field(False, description="True when the order should execute in shadow mode")
     take_profit: Optional[Decimal] = Field(
         default=None,
         gt=Decimal("0"),
@@ -2081,16 +2083,16 @@ class AccountContext:
 
         direction = Decimal("1") if normalized_side == "buy" else Decimal("-1")
         impact_ratio = (avg_price - mid_px) / mid_px
-        impact_bps = float((impact_ratio * direction * Decimal("10000")))
+        impact_bps = impact_ratio * direction * Decimal("10000")
 
         await self._impact_store.record_fill(
             account_id=self.account_id,
             client_order_id=record.client_id,
             symbol=record.symbol,
             side=record.side,
-            filled_qty=float(filled_qty),
-            avg_price=float(avg_price),
-            pre_trade_mid=float(mid_px),
+            filled_qty=filled_qty,
+            avg_price=avg_price,
+            pre_trade_mid=mid_px,
             impact_bps=impact_bps,
             recorded_at=datetime.now(timezone.utc),
         )
