@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import hmac
 
@@ -13,28 +14,83 @@ import json
 import logging
 from typing import Dict, Optional, Protocol, Set, runtime_checkable
 
-from argon2 import PasswordHasher, Type
-from argon2.exceptions import InvalidHash, VerifyMismatchError
 import pyotp
 
 from shared.correlation import get_correlation_id
 
 
 try:  # pragma: no cover - optional dependency in some test environments
-    from argon2 import PasswordHasher
-    from argon2.exceptions import VerificationError
+    from argon2 import PasswordHasher as _Argon2PasswordHasher, Type
+    from argon2.exceptions import InvalidHash, VerificationError, VerifyMismatchError
 except ImportError:  # pragma: no cover - fallback when argon2 is unavailable
-    PasswordHasher = None  # type: ignore[assignment]
+    class Type:  # type: ignore[override]
+        """Fallback stub mirroring the argon2 Type enum attributes used here."""
+
+        ID = "argon2id"
 
     class VerificationError(ValueError):
         """Minimal stand-in for argon2's verification errors."""
 
-    class _MissingPasswordHasher:
+    class InvalidHash(VerificationError):
+        """Raised when an argon2 hash cannot be parsed."""
+
+    class VerifyMismatchError(VerificationError):
+        """Raised when a password does not match the stored hash."""
+
+    class _FallbackPasswordHasher:
+        """Safe fallback used when argon2 is not installed."""
+
+        hash_prefix = "$pbkdf2-sha256$"
+
+        def __init__(self, *args: object, iterations: int = 390000, **kwargs: object) -> None:
+            self._iterations = iterations
+
         def hash(self, password: str) -> str:
-            raise RuntimeError("argon2-cffi must be installed to hash passwords")
+            salt = os.urandom(16)
+            derived = hashlib.pbkdf2_hmac(
+                "sha256", password.encode("utf-8"), salt, self._iterations
+            )
+            return "".join(
+                [
+                    self.hash_prefix,
+                    str(self._iterations),
+                    "$",
+                    base64.b64encode(salt).decode("ascii"),
+                    "$",
+                    base64.b64encode(derived).decode("ascii"),
+                ]
+            )
 
         def verify(self, hashed: str, password: str) -> bool:
-            raise RuntimeError("argon2-cffi must be installed to verify passwords")
+            if not hashed.startswith(self.hash_prefix):
+                raise InvalidHash("Unsupported password hash prefix")
+
+            try:
+                parts = hashed.split("$")
+                _, prefix_name, iterations_str, salt_b64, derived_b64 = parts
+            except ValueError as exc:
+                raise InvalidHash("Malformed password hash") from exc
+
+            if prefix_name != "pbkdf2-sha256":
+                raise InvalidHash("Unexpected password hash algorithm")
+
+            try:
+                iterations = int(iterations_str)
+            except ValueError as exc:
+                raise InvalidHash("Invalid iteration count in password hash") from exc
+
+            try:
+                salt = base64.b64decode(salt_b64.encode("ascii"))
+                expected = base64.b64decode(derived_b64.encode("ascii"))
+            except (ValueError, binascii.Error) as exc:
+                raise InvalidHash("Invalid base64 in stored password hash") from exc
+
+            computed = hashlib.pbkdf2_hmac(
+                "sha256", password.encode("utf-8"), salt, iterations
+            )
+            if not hmac.compare_digest(expected, computed):
+                raise VerifyMismatchError("Password does not match stored hash")
+            return True
 
         def needs_update(self, hashed: str) -> bool:
             return False
@@ -42,9 +98,11 @@ except ImportError:  # pragma: no cover - fallback when argon2 is unavailable
         def check_needs_rehash(self, hashed: str) -> bool:
             return False
 
-    _ARGON2_HASHER = _MissingPasswordHasher()
+    PasswordHasher = _FallbackPasswordHasher  # type: ignore[assignment]
+    _ARGON2_HASHER = PasswordHasher(type=getattr(Type, "ID", None))
 else:
-    _ARGON2_HASHER = PasswordHasher()
+    PasswordHasher = _Argon2PasswordHasher
+    _ARGON2_HASHER = PasswordHasher(type=Type.ID)
 
 try:  # pragma: no cover - prometheus is optional outside production
     from prometheus_client import Counter
@@ -61,9 +119,6 @@ except Exception:  # pragma: no cover - provide a no-op fallback
 
         def set(self, value: float) -> None:
             self._value = value
-
-from shared.correlation import get_correlation_id
-
 
 
 logger = logging.getLogger(__name__)
@@ -82,10 +137,6 @@ _LOGIN_SUCCESS_COUNTER = Counter(
     "auth_login_success_total",
     "Number of successful administrator logins.",
 )
-
-
-
-_ARGON2_HASHER = PasswordHasher(type=Type.ID)
 
 
 
@@ -364,23 +415,22 @@ class AuthService:
 
     def _verify_password(self, admin: AdminAccount, password: str) -> bool:
         stored_hash = admin.password_hash
-        # Prefer Argon2id verification for new credentials.
-        if stored_hash.startswith("$argon2"):
-            try:
-                if not _ARGON2_HASHER.verify(stored_hash, password):
-                    return False
-
-            except VerificationError:
-
-                return False
-            if hasattr(_ARGON2_HASHER, "check_needs_rehash"):
-                needs_update = _ARGON2_HASHER.check_needs_rehash(stored_hash)
-            else:
-                needs_update = _ARGON2_HASHER.needs_update(stored_hash)
-            if needs_update:
-                admin.password_hash = hash_password(password)
-                self._repository.add(admin)
-            return True
+        try:
+            if _ARGON2_HASHER.verify(stored_hash, password):
+                if hasattr(_ARGON2_HASHER, "check_needs_rehash"):
+                    needs_update = _ARGON2_HASHER.check_needs_rehash(stored_hash)
+                else:
+                    needs_update = _ARGON2_HASHER.needs_update(stored_hash)
+                if needs_update:
+                    admin.password_hash = hash_password(password)
+                    self._repository.add(admin)
+                return True
+        except VerifyMismatchError:
+            return False
+        except InvalidHash:
+            pass
+        except VerificationError:
+            return False
 
         # Backwards compatibility with legacy SHA-256 hashes.
         candidate = hashlib.sha256(password.encode()).hexdigest()
