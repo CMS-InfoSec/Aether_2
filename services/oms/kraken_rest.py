@@ -10,10 +10,12 @@ import random
 import time
 import urllib.parse
 from typing import Any, Awaitable, Callable, Dict, Optional
+from uuid import uuid4
 
 import aiohttp
 
 from services.oms.kraken_ws import OrderAck
+from metrics import get_request_id
 
 logger = logging.getLogger(__name__)
 
@@ -87,10 +89,12 @@ class KrakenRESTClient:
         encoded = urllib.parse.urlencode(body)
 
         signature = self._sign_request(path, nonce, encoded, credentials)
+        request_id = get_request_id() or str(uuid4())
         headers = {
             "API-Key": credentials.get("api_key", ""),
             "API-Sign": signature,
             "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+            "X-Request-ID": request_id,
         }
 
         url = f"{self._base_url}{path}"
