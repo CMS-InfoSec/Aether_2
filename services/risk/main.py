@@ -8,6 +8,7 @@ from services.common.security import require_admin_account
 from services.risk.engine import RiskEngine
 from services.risk.cvar_forecast import router as cvar_router
 from services.risk.nav_forecaster import router as nav_router
+from services.risk.pretrade_sanity import PRETRADE_SANITY, router as pretrade_router
 
 from metrics import (
     increment_trade_rejection,
@@ -23,6 +24,7 @@ setup_metrics(app, service_name="risk-service")
 
 app.include_router(cvar_router)
 app.include_router(nav_router)
+app.include_router(pretrade_router)
 
 
 @app.post("/risk/validate", response_model=RiskValidationResponse)
@@ -35,6 +37,14 @@ def validate_risk(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account mismatch between header and payload.",
+        )
+
+    sanity_decision = PRETRADE_SANITY.evaluate_validation_request(request)
+    if not sanity_decision.permitted:
+        return RiskValidationResponse(
+            valid=False,
+            reasons=sanity_decision.reasons,
+            fee=request.fee,
         )
 
     engine = RiskEngine(account_id=account_id)
