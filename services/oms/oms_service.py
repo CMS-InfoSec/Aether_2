@@ -38,6 +38,7 @@ from services.oms.warm_start import WarmStartCoordinator
 import websockets
 
 from metrics import (
+    increment_oms_auth_failures,
     increment_oms_child_orders_total,
     increment_oms_error_count,
     record_oms_latency,
@@ -1957,10 +1958,63 @@ warm_start = WarmStartCoordinator(lambda: manager)
 
 
 async def require_account_id(request: Request) -> str:
-    header = request.headers.get("X-Account-ID")
-    if not header:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing X-Account-ID header")
-    return header
+    raw_header = request.headers.get("X-Account-ID")
+    account_id = raw_header.strip() if raw_header else ""
+
+    if account_id:
+        return account_id
+
+    reason = "missing_account_id" if raw_header is None else "empty_account_id"
+    increment_oms_auth_failures(reason=reason)
+
+    logger.warning(
+        "Unauthorized OMS request missing X-Account-ID header",
+        extra={
+            "event": "oms.auth_failure",
+            "reason": reason,
+            "status_code": status.HTTP_401_UNAUTHORIZED,
+            "source_ip": _extract_source_ip(request),
+            "account_header": _redact_account_header(raw_header),
+            "path": request.url.path,
+        },
+    )
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Missing X-Account-ID header",
+    )
+
+
+def _extract_source_ip(request: Request) -> str:
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        first_hop = forwarded_for.split(",")[0].strip()
+        if first_hop:
+            return first_hop
+
+    client = request.client
+    if client and getattr(client, "host", None):
+        return str(client.host)
+
+    scope_client = request.scope.get("client") if hasattr(request, "scope") else None
+    if scope_client and scope_client[0]:
+        return str(scope_client[0])
+
+    return "unknown"
+
+
+def _redact_account_header(value: Optional[str]) -> str:
+    if value is None:
+        return "missing"
+
+    trimmed = value.strip()
+    if not trimmed:
+        return "missing"
+
+    if len(trimmed) <= 4:
+        return f"{trimmed[0]}***"
+
+    return f"{trimmed[:3]}***{trimmed[-2:]}"
 
 
 @app.on_event("shutdown")
@@ -2038,6 +2092,11 @@ async def get_rate_limit_status(
     header_account: str = Depends(require_account_id),
 ) -> Dict[str, Dict[str, Dict[str, float | int]]]:
     return await rate_limit_guard.status(header_account)
+
+
+@app.get("/oms/warm_start/status")
+async def get_warm_start_status(_: str = Depends(require_account_id)) -> Dict[str, int]:
+    return await warm_start.status()
 
 
 @app.get("/oms/warm_start/report")
