@@ -5,7 +5,8 @@ import contextlib
 import logging
 import os
 import sqlite3
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -37,19 +38,32 @@ class ReconcileLogStore:
             CREATE TABLE IF NOT EXISTS reconcile_log (
                 ts TIMESTAMP NOT NULL,
                 account_id TEXT NOT NULL,
-                mismatches INTEGER NOT NULL
+                mismatches_json TEXT NOT NULL
             )
             """
         )
+        columns = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(reconcile_log)")
+        }
+        if "mismatches_json" not in columns:
+            self._conn.execute("ALTER TABLE reconcile_log ADD COLUMN mismatches_json TEXT")
+            self._conn.execute(
+                "UPDATE reconcile_log SET mismatches_json = ? WHERE mismatches_json IS NULL",
+                (json.dumps({}, sort_keys=True),),
+            )
         self._conn.commit()
         self._lock = asyncio.Lock()
 
-    async def record(self, account_id: str, mismatches: int) -> None:
+    async def record(
+        self, account_id: str, mismatches: Dict[str, Sequence[str]]
+    ) -> None:
         timestamp = datetime.now(timezone.utc)
+        payload = json.dumps(mismatches, sort_keys=True)
         async with self._lock:
             self._conn.execute(
-                "INSERT INTO reconcile_log(ts, account_id, mismatches) VALUES(?, ?, ?)",
-                (timestamp, account_id, mismatches),
+                "INSERT INTO reconcile_log(ts, account_id, mismatches_json) VALUES(?, ?, ?)",
+                (timestamp, account_id, payload),
             )
             self._conn.commit()
 
@@ -57,16 +71,34 @@ class ReconcileLogStore:
 @dataclass
 class ReconcileStats:
     balances_checked: int = 0
-    orders_checked: int = 0
     mismatches_fixed: int = 0
+    alerts: int = 0
 
 
 @dataclass
 class AccountReconcileResult:
     balances_checked: int = 0
     orders_checked: int = 0
-    mismatches_fixed: int = 0
-    mismatches_remaining: int = 0
+    balances_fixed: List[str] = field(default_factory=list)
+    balances_remaining: List[str] = field(default_factory=list)
+    orders_fixed: List[str] = field(default_factory=list)
+    orders_remaining: List[str] = field(default_factory=list)
+
+    @property
+    def mismatches_fixed(self) -> int:
+        return len(self.balances_fixed) + len(self.orders_fixed)
+
+    @property
+    def mismatches_remaining(self) -> int:
+        return len(self.balances_remaining) + len(self.orders_remaining)
+
+    def log_payload(self) -> Dict[str, Sequence[str]]:
+        return {
+            "balances_fixed": list(self.balances_fixed),
+            "balances_remaining": list(self.balances_remaining),
+            "orders_fixed": list(self.orders_fixed),
+            "orders_remaining": list(self.orders_remaining),
+        }
 
 
 class OMSReconciler:
@@ -108,8 +140,8 @@ class OMSReconciler:
         async with self._stats_lock:
             return {
                 "balances_checked": self._stats.balances_checked,
-                "orders_checked": self._stats.orders_checked,
                 "mismatches_fixed": self._stats.mismatches_fixed,
+                "alerts": self._stats.alerts,
             }
 
     async def _run_loop(self) -> None:
@@ -132,7 +164,6 @@ class OMSReconciler:
             return
 
         total_balances = 0
-        total_orders = 0
         total_fixed = 0
 
         for account in accounts:
@@ -147,26 +178,24 @@ class OMSReconciler:
                 continue
 
             total_balances += result.balances_checked
-            total_orders += result.orders_checked
             total_fixed += result.mismatches_fixed
 
-            total_mismatches = result.mismatches_fixed + result.mismatches_remaining
-            await self._log_store.record(account.account_id, total_mismatches)
+            mismatch_payload = result.log_payload()
+            await self._log_store.record(account.account_id, mismatch_payload)
             logger.info(
                 "reconcile_log(%s, %s, mismatches=%s)",
                 datetime.now(timezone.utc).isoformat(),
                 account.account_id,
-                total_mismatches,
+                mismatch_payload,
             )
 
             await self._handle_persistent_mismatch(
                 account.account_id, result.mismatches_remaining
             )
 
-        if total_balances or total_orders or total_fixed:
+        if total_balances or total_fixed:
             async with self._stats_lock:
                 self._stats.balances_checked += total_balances
-                self._stats.orders_checked += total_orders
                 self._stats.mismatches_fixed += total_fixed
 
     async def _reconcile_account(self, account: "AccountContext") -> AccountReconcileResult:
@@ -186,8 +215,10 @@ class OMSReconciler:
         return AccountReconcileResult(
             balances_checked=balances_checked,
             orders_checked=orders_checked,
-            mismatches_fixed=balance_fixed + order_fixed,
-            mismatches_remaining=balance_remaining + order_remaining,
+            balances_fixed=balance_fixed,
+            balances_remaining=balance_remaining,
+            orders_fixed=order_fixed,
+            orders_remaining=order_remaining,
         )
 
     async def _fetch_balances(self, account: "AccountContext") -> Dict[str, Decimal]:
@@ -207,18 +238,24 @@ class OMSReconciler:
 
     async def _reconcile_balances(
         self, account: "AccountContext", remote_balances: Dict[str, Decimal]
-    ) -> Tuple[int, int]:
+    ) -> Tuple[List[str], List[str]]:
         if not remote_balances:
-            return 0, 0
+            return [], []
 
         local_balances = await account.get_local_balances()
         mismatches = _diff_balances(local_balances, remote_balances)
         if mismatches:
+            logger.info(
+                "Reconciler updating balances for account %s mismatches=%s",
+                account.account_id,
+                mismatches,
+            )
             await account.update_local_balances(remote_balances)
 
         updated_local = await account.get_local_balances()
         remaining = _diff_balances(updated_local, remote_balances)
-        return len(mismatches), len(remaining)
+        fixed_assets = [asset for asset in mismatches if asset not in remaining]
+        return fixed_assets, remaining
 
     async def _fetch_open_orders(
         self, account: "AccountContext"
@@ -258,9 +295,9 @@ class OMSReconciler:
         account: "AccountContext",
         orders: Iterable[Dict[str, object]],
         snapshot_authoritative: bool,
-    ) -> Tuple[int, int]:
+    ) -> Tuple[List[str], List[str]]:
         remote_states: List[OrderState] = []
-        mismatches_fixed = 0
+        mismatches_fixed: List[str] = []
 
         for order in orders:
             state = account._state_from_payload(
@@ -304,7 +341,7 @@ class OMSReconciler:
                     needs_update = True
 
             if needs_update:
-                mismatches_fixed += 1
+                mismatches_fixed.append(client_id)
                 await account._apply_stream_state(state)
                 logger.info(
                     "Reconciler corrected order %s on account %s (status=%s)",
@@ -323,7 +360,7 @@ class OMSReconciler:
                 record = await account.lookup(order_id)
                 if record is None:
                     continue
-                mismatches_fixed += 1
+                mismatches_fixed.append(order_id)
                 state = OrderState(
                     client_order_id=order_id,
                     exchange_order_id=record.result.exchange_order_id,
@@ -345,7 +382,7 @@ class OMSReconciler:
                 account.account_id,
             )
 
-        remaining = await _count_order_mismatches(
+        remaining = await _identify_order_mismatches(
             account, remote_states, remote_ids, snapshot_authoritative
         )
         return mismatches_fixed, remaining
@@ -354,14 +391,16 @@ class OMSReconciler:
         if remaining > 0:
             count = self._mismatch_counters.get(account_id, 0) + 1
             self._mismatch_counters[account_id] = count
-            if count > 2 and account_id not in self._alerted_accounts:
-                await self._publish_alert(account_id, remaining)
-                self._alerted_accounts.add(account_id)
+            if count > 3 and account_id not in self._alerted_accounts:
+                if await self._publish_alert(account_id, remaining):
+                    async with self._stats_lock:
+                        self._stats.alerts += 1
+                    self._alerted_accounts.add(account_id)
         else:
             self._mismatch_counters.pop(account_id, None)
             self._alerted_accounts.discard(account_id)
 
-    async def _publish_alert(self, account_id: str, mismatches: int) -> None:
+    async def _publish_alert(self, account_id: str, mismatches: int) -> bool:
         payload = {
             "account_id": account_id,
             "type": "oms_reconcile_mismatch",
@@ -373,10 +412,17 @@ class OMSReconciler:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 response = await client.post(url, json=payload)
                 response.raise_for_status()
+            logger.warning(
+                "Published persistent mismatch alert for account %s mismatches=%s",
+                account_id,
+                mismatches,
+            )
+            return True
         except httpx.HTTPError as exc:  # pragma: no cover - defensive logging
             logger.warning(
                 "Failed to publish reconcile alert for account %s: %s", account_id, exc
             )
+            return False
 
 
 def _normalize_status(value: Optional[str]) -> str:
@@ -408,13 +454,13 @@ def _diff_balances(
     return mismatches
 
 
-async def _count_order_mismatches(
+async def _identify_order_mismatches(
     account: "AccountContext",
     remote_states: Sequence[OrderState],
     remote_ids: Iterable[Optional[str]],
     snapshot_authoritative: bool,
-) -> int:
-    remaining = 0
+) -> List[str]:
+    remaining: List[str] = []
     remote_id_set = {order_id for order_id in remote_ids if order_id}
 
     for state in remote_states:
@@ -431,29 +477,29 @@ async def _count_order_mismatches(
         normalized_remote = _normalize_status(state.status)
 
         if record is None:
-            remaining += 1
+            remaining.append(client_id or state.exchange_order_id or "unknown")
             continue
 
         normalized_local = _normalize_status(record.result.status)
         if normalized_local != normalized_remote:
-            remaining += 1
+            remaining.append(client_id)
             continue
         if record.result.filled_qty != filled_remote:
-            remaining += 1
+            remaining.append(client_id)
             continue
         if (
             filled_remote > ZERO
             and avg_remote != ZERO
             and record.result.avg_price != avg_remote
         ):
-            remaining += 1
+            remaining.append(client_id)
             continue
 
     if snapshot_authoritative:
         local_open_ids = await _collect_open_local_orders(account)
         for order_id in local_open_ids:
             if order_id not in remote_id_set:
-                remaining += 1
+                remaining.append(order_id)
 
     return remaining
 
