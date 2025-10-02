@@ -96,6 +96,7 @@ def test_audit_chain_across_services(tmp_path, monkeypatch, capsys):
     encryption_key = base64.b64encode(b"0" * 32).decode()
     monkeypatch.setenv("SECRET_ENCRYPTION_KEY", encryption_key)
     monkeypatch.setenv("SECRETS_SERVICE_AUTH_TOKENS", "integration-token")
+    monkeypatch.setenv("KRAKEN_SECRETS_AUTH_TOKENS", "integration-token:ops.brigade")
 
     conn_mock, cursor_mock = _make_connection_mock()
     monkeypatch.setattr(audit_logger, "psycopg", MagicMock(connect=MagicMock(return_value=conn_mock)))
@@ -130,7 +131,7 @@ def test_audit_chain_across_services(tmp_path, monkeypatch, capsys):
                 "account_id": "admin-eu",
                 "api_key": "api-key-123",
                 "api_secret": "api-secret-xyz",
-                "actor": "sre.bob",
+                "actor": "ops.brigade",
             },
             headers={"Authorization": "Bearer integration-token"},
         )
