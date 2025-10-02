@@ -17,6 +17,8 @@ from argon2 import PasswordHasher, Type
 from argon2.exceptions import InvalidHash, VerifyMismatchError
 import pyotp
 
+from shared.correlation import get_correlation_id
+
 
 try:  # pragma: no cover - optional dependency in some test environments
     from argon2 import PasswordHasher
