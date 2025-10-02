@@ -11,20 +11,18 @@ from fastapi import FastAPI
 from audit_mode import configure_audit_mode
 from accounts.service import AccountsService
 from auth.routes import get_auth_service, router as auth_router
-
-from auth.service import AdminRepository, AuthService, SessionStore
+from auth.service import (
+    AdminRepositoryProtocol,
+    AuthService,
+    InMemoryAdminRepository,
+    InMemorySessionStore,
+    PostgresAdminRepository,
+    RedisSessionStore,
+    SessionStoreProtocol,
+)
 from metrics import setup_metrics
-
 from services.alert_manager import setup_alerting
 from services.alerts.alert_dedupe import router as alert_dedupe_router, setup_alert_dedupe
-
-from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
-from shared.correlation import CorrelationIdMiddleware
-
-
-
-
-from exposure_forecast import router as exposure_router
 from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
 from shared.correlation import CorrelationIdMiddleware
 from scaling_controller import (
@@ -32,6 +30,21 @@ from scaling_controller import (
     configure_scaling_controller,
     router as scaling_router,
 )
+
+
+logger = logging.getLogger(__name__)
+
+
+def _build_admin_repository_from_env() -> AdminRepositoryProtocol:
+    dsn_env_vars = (
+        "ADMIN_POSTGRES_DSN",
+        "ADMIN_DATABASE_DSN",
+        "ADMIN_DB_DSN",
+    )
+    dsn = next((os.getenv(var) for var in dsn_env_vars if os.getenv(var)), None)
+    if dsn:
+        return PostgresAdminRepository(dsn)
+    return InMemoryAdminRepository()
 
 
 def _build_session_store_from_env() -> SessionStoreProtocol:
@@ -45,12 +58,6 @@ def _build_session_store_from_env() -> SessionStoreProtocol:
         client = redis.Redis.from_url(redis_url)
         return RedisSessionStore(client, ttl_minutes=ttl_minutes)
     return InMemorySessionStore(ttl_minutes=ttl_minutes)
-
-from scaling_controller import (
-    build_scaling_controller_from_env,
-    configure_scaling_controller,
-    router as scaling_router,
-)
 
 
 def _maybe_include_router(app: FastAPI, module: str, attribute: str) -> None:

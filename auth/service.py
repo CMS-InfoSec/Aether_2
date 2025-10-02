@@ -13,7 +13,10 @@ import json
 import logging
 from typing import Dict, Optional, Protocol, Set, runtime_checkable
 
+from argon2 import PasswordHasher, Type
+from argon2.exceptions import InvalidHash, VerifyMismatchError
 import pyotp
+
 
 try:  # pragma: no cover - optional dependency in some test environments
     from argon2 import PasswordHasher
@@ -60,6 +63,7 @@ except Exception:  # pragma: no cover - provide a no-op fallback
 from shared.correlation import get_correlation_id
 
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -76,6 +80,11 @@ _LOGIN_SUCCESS_COUNTER = Counter(
     "auth_login_success_total",
     "Number of successful administrator logins.",
 )
+
+
+
+_ARGON2_HASHER = PasswordHasher(type=Type.ID)
+
 
 
 
@@ -358,7 +367,9 @@ class AuthService:
             try:
                 if not _ARGON2_HASHER.verify(stored_hash, password):
                     return False
+
             except VerificationError:
+
                 return False
             if hasattr(_ARGON2_HASHER, "check_needs_rehash"):
                 needs_update = _ARGON2_HASHER.check_needs_rehash(stored_hash)

@@ -54,8 +54,7 @@ STATE = _InitializationState()
 
 
 
-def _load_authorized_tokens_from_env() -> Dict[str, str]:
-    raw_tokens = os.getenv("KRAKEN_SECRETS_AUTH_TOKENS", "")
+def _parse_authorized_token_labels(raw_tokens: str) -> Dict[str, str]:
     tokens: Dict[str, str] = {}
     for entry in raw_tokens.split(","):
         entry = entry.strip()
@@ -68,9 +67,18 @@ def _load_authorized_tokens_from_env() -> Dict[str, str]:
         label = label.strip() or "system"
         tokens[token] = label
     if not tokens:
+        raise ValueError("at least one authorized token must be configured")
+    return tokens
+
+
+def _load_authorized_tokens_from_env() -> Dict[str, str]:
+    raw_tokens = os.getenv("KRAKEN_SECRETS_AUTH_TOKENS", "")
+    try:
+        tokens = _parse_authorized_token_labels(raw_tokens)
+    except ValueError as exc:  # pragma: no cover - configuration error path
         raise RuntimeError(
             "KRAKEN_SECRETS_AUTH_TOKENS environment variable must define at least one token"
-        )
+        ) from exc
     return tokens
 
 
@@ -83,18 +91,37 @@ class Settings(BaseModel):
     kraken_api_url: str = Field(
         default_factory=lambda: os.getenv("KRAKEN_API_URL", "https://api.kraken.com")
     )
-    authorized_tokens: Dict[str, str] = Field(
+    authorized_token_labels: Dict[str, str] = Field(
         default_factory=_load_authorized_tokens_from_env,
         alias="KRAKEN_SECRETS_AUTH_TOKENS",
     )
 
-    authorized_tokens: Tuple[str, ...] = Field(..., alias="SECRETS_SERVICE_AUTH_TOKENS")
+    authorized_token_ids: Tuple[str, ...] = Field(
+        ..., alias="SECRETS_SERVICE_AUTH_TOKENS"
+    )
 
 
     class Config:
         allow_population_by_field_name = True
 
-    @validator("authorized_tokens", pre=True)
+    @validator("authorized_token_labels", pre=True)
+    def _normalize_authorized_token_labels(  # type: ignore[override]
+        cls, value: Any
+    ) -> Dict[str, str]:
+        if isinstance(value, str):
+            return _parse_authorized_token_labels(value)
+        if isinstance(value, dict):
+            cleaned = {
+                str(token).strip(): str(label).strip() or "system"
+                for token, label in value.items()
+                if str(token).strip()
+            }
+            if not cleaned:
+                raise ValueError("at least one authorized token must be configured")
+            return cleaned
+        raise ValueError("authorized token labels must be provided as a string or mapping")
+
+    @validator("authorized_token_ids", pre=True)
     def _split_tokens(cls, value: Any) -> Tuple[str, ...]:  # type: ignore[override]
         if isinstance(value, str):
             tokens = [item.strip() for item in value.split(",") if item.strip()]
@@ -116,9 +143,11 @@ def load_settings() -> Settings:
     tokens = os.getenv("SECRETS_SERVICE_AUTH_TOKENS")
     if not tokens:
         raise RuntimeError("SECRETS_SERVICE_AUTH_TOKENS environment variable must be set")
+    token_labels = _load_authorized_tokens_from_env()
     return Settings(
         SECRET_ENCRYPTION_KEY=secret_key,
         SECRETS_SERVICE_AUTH_TOKENS=tokens,
+        authorized_token_labels=token_labels,
     )
 
 
@@ -462,8 +491,9 @@ def require_authorized_caller(authorization: Optional[str] = Header(default=None
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing or invalid authorization token",
         )
-    actor = SETTINGS.authorized_tokens.get(token)
-    if actor is None:
+    assert SETTINGS is not None  # for type-checkers
+    actor = SETTINGS.authorized_token_labels.get(token)
+    if actor is None or token not in SETTINGS.authorized_token_ids:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Caller is not authorized to access Kraken secrets",

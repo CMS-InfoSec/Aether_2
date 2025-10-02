@@ -1,0 +1,122 @@
+import base64
+import importlib
+import sys
+import types
+
+import pytest
+
+
+@pytest.fixture
+def secrets_service_module(monkeypatch):
+    # Ensure a clean import each time
+    sys.modules.pop("secrets_service", None)
+
+    dummy_httpx = types.ModuleType("httpx")
+    monkeypatch.setitem(sys.modules, "httpx", dummy_httpx)
+
+    dummy_client = types.ModuleType("kubernetes.client")
+
+    class _CoreV1Api:  # pragma: no cover - stubbed dependency
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+    dummy_client.CoreV1Api = _CoreV1Api
+    dummy_client.ApiException = Exception
+
+    dummy_config = types.ModuleType("kubernetes.config")
+
+    def _noop(*args, **kwargs) -> None:  # pragma: no cover - stubbed dependency
+        return None
+
+    dummy_config.load_incluster_config = _noop
+    dummy_config.load_kube_config = _noop
+
+    dummy_config_exception = types.ModuleType("kubernetes.config.config_exception")
+
+    class _ConfigException(Exception):
+        pass
+
+    dummy_config_exception.ConfigException = _ConfigException
+    dummy_config.config_exception = dummy_config_exception
+
+    dummy_kubernetes = types.ModuleType("kubernetes")
+    dummy_kubernetes.client = dummy_client
+    dummy_kubernetes.config = dummy_config
+
+    monkeypatch.setitem(sys.modules, "kubernetes", dummy_kubernetes)
+    monkeypatch.setitem(sys.modules, "kubernetes.client", dummy_client)
+    monkeypatch.setitem(sys.modules, "kubernetes.config", dummy_config)
+    monkeypatch.setitem(
+        sys.modules, "kubernetes.config.config_exception", dummy_config_exception
+    )
+
+    dummy_crypto = types.ModuleType("cryptography")
+    dummy_crypto_hazmat = types.ModuleType("cryptography.hazmat")
+    dummy_crypto_primitives = types.ModuleType("cryptography.hazmat.primitives")
+    dummy_crypto_ciphers = types.ModuleType(
+        "cryptography.hazmat.primitives.ciphers"
+    )
+    dummy_crypto_aead = types.ModuleType(
+        "cryptography.hazmat.primitives.ciphers.aead"
+    )
+
+    class _AESGCM:  # pragma: no cover - stubbed dependency
+        def __init__(self, key: bytes) -> None:
+            self._key = key
+
+        def encrypt(self, nonce: bytes, plaintext: bytes, associated_data: bytes) -> bytes:
+            return plaintext
+
+        def decrypt(self, nonce: bytes, payload: bytes, associated_data: bytes) -> bytes:
+            return payload
+
+    dummy_crypto_aead.AESGCM = _AESGCM
+    dummy_crypto_ciphers.aead = dummy_crypto_aead
+    dummy_crypto_primitives.ciphers = dummy_crypto_ciphers
+    dummy_crypto_hazmat.primitives = dummy_crypto_primitives
+    dummy_crypto.hazmat = dummy_crypto_hazmat
+
+    monkeypatch.setitem(sys.modules, "cryptography", dummy_crypto)
+    monkeypatch.setitem(sys.modules, "cryptography.hazmat", dummy_crypto_hazmat)
+    monkeypatch.setitem(
+        sys.modules, "cryptography.hazmat.primitives", dummy_crypto_primitives
+    )
+    monkeypatch.setitem(
+        sys.modules, "cryptography.hazmat.primitives.ciphers", dummy_crypto_ciphers
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "cryptography.hazmat.primitives.ciphers.aead",
+        dummy_crypto_aead,
+    )
+
+    module = importlib.import_module("secrets_service")
+    return module
+
+
+@pytest.fixture
+def configured_settings(monkeypatch, secrets_service_module):
+    encryption_key = base64.b64encode(b"x" * 32).decode("utf-8")
+    monkeypatch.setenv("SECRET_ENCRYPTION_KEY", encryption_key)
+    monkeypatch.setenv("SECRETS_SERVICE_AUTH_TOKENS", "token-1,token-2")
+    monkeypatch.setenv("KRAKEN_SECRETS_AUTH_TOKENS", "token-1:alpha,token-2:beta")
+
+    settings = secrets_service_module.load_settings()
+    monkeypatch.setattr(secrets_service_module, "SETTINGS", settings, raising=False)
+    return settings, secrets_service_module
+
+
+def test_require_authorized_caller_accepts_known_token(configured_settings):
+    settings, secrets_service = configured_settings
+    assert settings.authorized_token_ids == ("token-1", "token-2")
+    assert settings.authorized_token_labels["token-1"] == "alpha"
+
+    actor = secrets_service.require_authorized_caller("Bearer token-1")
+    assert actor == "alpha"
+
+
+def test_require_authorized_caller_rejects_unknown_token(configured_settings):
+    _, secrets_service = configured_settings
+    with pytest.raises(secrets_service.HTTPException) as excinfo:
+        secrets_service.require_authorized_caller("Bearer unknown")
+    assert excinfo.value.status_code == secrets_service.status.HTTP_403_FORBIDDEN
