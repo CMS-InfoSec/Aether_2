@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import inspect
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from functools import wraps
 from typing import Any, Callable, Iterable, Mapping, MutableMapping, Optional, Sequence, Tuple, TypeVar
+
+import hmac
 
 from fastapi import HTTPException, Request
 
@@ -75,15 +79,57 @@ def _decode_segment(segment: str) -> bytes:
 
 def _decode_jwt(token: str) -> Mapping[str, Any]:
     parts = token.split(".")
-    if len(parts) < 2:
+    if len(parts) != 3:
         raise BearerTokenError("Malformed bearer token")
-    header_segment, payload_segment = parts[0], parts[1]
-    _ = _decode_segment(header_segment)  # header currently unused but validates encoding.
+
+    header_segment, payload_segment, signature_segment = parts
+    header_raw = _decode_segment(header_segment)
     payload_raw = _decode_segment(payload_segment)
+
     try:
+        header: Mapping[str, Any] = json.loads(header_raw.decode("utf-8"))
         payload: Mapping[str, Any] = json.loads(payload_raw.decode("utf-8"))
     except Exception as exc:  # pragma: no cover - invalid tokens trigger auth failure.
         raise BearerTokenError("Malformed bearer token") from exc
+
+    alg = str(header.get("alg") or "").upper()
+    if alg != "HS256":
+        raise BearerTokenError("Unsupported JWT algorithm")
+
+    secret = os.getenv("AUTH_JWT_SECRET")
+    if not secret:
+        logger.error("AUTH_JWT_SECRET environment variable is not configured")
+        raise HTTPException(status_code=500, detail="Authorization service misconfigured")
+
+    signing_input = f"{header_segment}.{payload_segment}".encode("ascii")
+    expected_signature = base64.urlsafe_b64encode(
+        hmac.new(secret.encode("utf-8"), signing_input, hashlib.sha256).digest()
+    ).rstrip(b"=")
+
+    signature_bytes = signature_segment.encode("ascii")
+    if not hmac.compare_digest(expected_signature, signature_bytes):
+        raise BearerTokenError("Invalid bearer token signature")
+
+    now = datetime.now(timezone.utc).timestamp()
+
+    exp_claim = payload.get("exp")
+    if exp_claim is not None:
+        try:
+            exp = float(exp_claim)
+        except (TypeError, ValueError) as exc:
+            raise BearerTokenError("Invalid bearer token expiration") from exc
+        if now >= exp:
+            raise BearerTokenError("Bearer token expired")
+
+    nbf_claim = payload.get("nbf")
+    if nbf_claim is not None:
+        try:
+            nbf = float(nbf_claim)
+        except (TypeError, ValueError) as exc:
+            raise BearerTokenError("Invalid bearer token not-before claim") from exc
+        if now < nbf:
+            raise BearerTokenError("Bearer token not yet valid")
+
     return payload
 
 
