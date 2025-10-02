@@ -26,6 +26,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from reports.storage import ArtifactStorage, build_storage_from_env
+from shared.timezone import format_london_time
 from services.models.model_server import get_active_model
 
 try:  # pragma: no cover - psycopg is an optional dependency in tests
@@ -548,12 +549,18 @@ def _regime_detection(frame: pd.DataFrame) -> list[dict[str, Any]]:
     else:
         volatility = float(returns.std())
     regime = "high_volatility" if volatility > 0.02 else "normal"
+    start = ""
+    end = ""
+    if not timestamps.isna().all():
+        start = format_london_time(timestamps.min())
+        end = format_london_time(timestamps.max())
+
     return [
         {
             "regime": regime,
             "volatility": volatility,
-            "start": timestamps.min().isoformat() if not timestamps.isna().all() else "",
-            "end": timestamps.max().isoformat() if not timestamps.isna().all() else "",
+            "start": start,
+            "end": end,
         }
     ]
 

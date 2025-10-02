@@ -1,4 +1,5 @@
 import React, { FormEvent, useCallback, useEffect, useState } from "react";
+import { formatLondonTime } from "./timezone";
 import { useAuthClaims } from "./useAuthClaims";
 
 type SecretsStatusResponse = {
@@ -23,13 +24,8 @@ const formatTimestamp = (timestamp?: string | null) => {
     return "Never";
   }
 
-  const date = new Date(timestamp);
-
-  if (Number.isNaN(date.getTime())) {
-    return timestamp;
-  }
-
-  return date.toLocaleString();
+  const formatted = formatLondonTime(timestamp);
+  return formatted || "Never";
 };
 
 const ApiKeyManager: React.FC = () => {
