@@ -21,7 +21,7 @@ kind: HorizontalPodAutoscaler
 metadata:
   name: policy-service
 spec:
-  minReplicas: 3
+  minReplicas: 2
   maxReplicas: 8
 ---
 apiVersion: apps/v1
@@ -47,8 +47,8 @@ kind: HorizontalPodAutoscaler
 metadata:
   name: risk-service
 spec:
-  minReplicas: 4
-  maxReplicas: 12
+  minReplicas: 2
+  maxReplicas: 8
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -73,8 +73,8 @@ kind: HorizontalPodAutoscaler
 metadata:
   name: oms-service
 spec:
-  minReplicas: 3
-  maxReplicas: 9
+  minReplicas: 2
+  maxReplicas: 8
 ---
 apiVersion: apps/v1
 kind: Deployment
