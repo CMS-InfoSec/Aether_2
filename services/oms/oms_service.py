@@ -165,24 +165,47 @@ class ImpactCurveResponse(BaseModel):
     as_of: datetime
 
 
+@dataclass
+class _IdempotencyEntry:
+    future: asyncio.Future[OMSOrderStatusResponse]
+    timestamp: float = 0.0
+
+
 class _IdempotencyStore:
     """Cooperative idempotency cache used per-account."""
 
-    def __init__(self) -> None:
+    def __init__(self, ttl_seconds: float = 300.0) -> None:
         self._lock = asyncio.Lock()
-        self._entries: Dict[str, asyncio.Future[OMSOrderStatusResponse]] = {}
+        self._entries: Dict[str, _IdempotencyEntry] = {}
+        self._ttl_seconds = ttl_seconds
+
+    def _purge_expired(self) -> None:
+        if not self._entries:
+            return
+
+        now = time.monotonic()
+        expired = [
+            key
+            for key, entry in self._entries.items()
+            if entry.future.done() and now - entry.timestamp >= self._ttl_seconds
+        ]
+        for key in expired:
+            self._entries.pop(key, None)
 
     async def get_or_create(
         self, key: str, factory: Awaitable[OMSOrderStatusResponse]
     ) -> Tuple[OMSOrderStatusResponse, bool]:
         async with self._lock:
-            future = self._entries.get(key)
-            if future is None:
+            self._purge_expired()
+            entry = self._entries.get(key)
+            if entry is None:
                 loop = asyncio.get_event_loop()
                 future = loop.create_future()
-                self._entries[key] = future
+                entry = _IdempotencyEntry(future=future)
+                self._entries[key] = entry
                 create_future = True
             else:
+                future = entry.future
                 create_future = False
 
         if create_future:
@@ -190,8 +213,15 @@ class _IdempotencyStore:
                 result = await factory
             except Exception as exc:  # pragma: no cover - propagate to awaiting callers
                 future.set_exception(exc)
+                async with self._lock:
+                    self._entries.pop(key, None)
                 raise
             else:
+                completion_time = time.monotonic()
+                async with self._lock:
+                    entry = self._entries.get(key)
+                    if entry is not None:
+                        entry.timestamp = completion_time
                 future.set_result(result)
                 return result, False
 
