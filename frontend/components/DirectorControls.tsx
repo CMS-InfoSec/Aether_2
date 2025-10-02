@@ -27,6 +27,8 @@ interface KillSwitchResponse {
 
 type KillSwitchReason = "loss_cap_breach" | "spread_widening" | "latency_stall";
 
+type TradingPair = string;
+
 interface DirectorAction {
   id?: string;
   action: string;
@@ -36,10 +38,11 @@ interface DirectorAction {
   details?: string;
 }
 
-interface AssetOverridePayload {
-  asset: string;
-  reason: string;
-  action: "block" | "unblock";
+interface OverridePayload {
+  symbol: string;
+  enabled: boolean;
+  reason?: string;
+  actor?: string;
 }
 
 const KILL_SWITCH_REASONS: { label: string; value: KillSwitchReason }[] = [
@@ -177,16 +180,16 @@ const DirectorControls: React.FC = () => {
   const [firstApproval, setFirstApproval] = useState<string>("");
   const [secondApproval, setSecondApproval] = useState<string>("");
   const [initiatingAccount, setInitiatingAccount] = useState<string>("director-1");
-  const [killArmed, setKillArmed] = useState<boolean>(false);
   const [killLoading, setKillLoading] = useState<boolean>(false);
   const [killMessage, setKillMessage] = useState<string | null>(null);
   const [killError, setKillError] = useState<string | null>(null);
+  const [isKillModalOpen, setIsKillModalOpen] = useState<boolean>(false);
+  const [killConfirmationText, setKillConfirmationText] = useState<string>("");
 
-  const [overrideAsset, setOverrideAsset] = useState<string>("");
+  const [availablePairs, setAvailablePairs] = useState<TradingPair[]>([]);
+  const [overridePair, setOverridePair] = useState<TradingPair>("");
+  const [overrideEnabled, setOverrideEnabled] = useState<boolean>(false);
   const [overrideReason, setOverrideReason] = useState<string>("");
-  const [overrideAction, setOverrideAction] = useState<"block" | "unblock">(
-    "block"
-  );
   const [overrideActor, setOverrideActor] = useState<string>("");
   const [overrideLoading, setOverrideLoading] = useState<boolean>(false);
   const [overrideMessage, setOverrideMessage] = useState<string | null>(null);
@@ -268,6 +271,32 @@ const DirectorControls: React.FC = () => {
     []
   );
 
+  const loadTradingPairs = useCallback(
+    async (signal: AbortSignal) => {
+      try {
+        const response = await fetch("/universe/approved", {
+          method: "GET",
+          headers: { Accept: "application/json" },
+          signal,
+        });
+
+        if (!response.ok) {
+          throw new Error(`Failed to load trading pairs (${response.status})`);
+        }
+
+        const payload = (await response.json()) as { symbols?: TradingPair[] };
+        const symbols = Array.isArray(payload.symbols) ? payload.symbols : [];
+        setAvailablePairs(symbols);
+      } catch (error) {
+        if (signal.aborted) {
+          return;
+        }
+        console.error("Failed to fetch trading pairs", error);
+      }
+    },
+    []
+  );
+
   const refreshAuditTrail = useCallback(async () => {
     const controller = new AbortController();
     try {
@@ -301,14 +330,6 @@ const DirectorControls: React.FC = () => {
   }, [loadSafeModeStatus]);
 
   useEffect(() => {
-    if (killArmed) {
-      setKillArmed(false);
-      setKillMessage(null);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [killAccount, killReason, initiatingAccount, firstApproval, secondApproval]);
-
-  useEffect(() => {
     const controller = new AbortController();
 
     loadAuditTrail(controller.signal).catch((error) => {
@@ -321,6 +342,20 @@ const DirectorControls: React.FC = () => {
       controller.abort();
     };
   }, [loadAuditTrail]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+
+    loadTradingPairs(controller.signal).catch((error) => {
+      if (!controller.signal.aborted) {
+        console.error("Failed to initialize trading pairs", error);
+      }
+    });
+
+    return () => {
+      controller.abort();
+    };
+  }, [loadTradingPairs]);
 
   const handleSafeMode = async (action: "enter" | "exit") => {
     setSafeModeActionError(null);
@@ -346,9 +381,7 @@ const DirectorControls: React.FC = () => {
         headers: {
           "Content-Type": "application/json",
           Accept: "application/json",
-          ...(safeModeActor.trim()
-            ? { "X-Actor": safeModeActor.trim() }
-            : {}),
+          ...(safeModeActor.trim() ? { "X-Actor": safeModeActor.trim() } : {}),
         },
         body: JSON.stringify(payload),
       });
@@ -377,43 +410,39 @@ const DirectorControls: React.FC = () => {
     }
   };
 
-  const handleKillSwitch = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-
-    setKillError(null);
-    setKillMessage(null);
-
+  const validateKillSwitchForm = () => {
     const approvals = [firstApproval.trim(), secondApproval.trim()].filter(
       (value) => value.length > 0
     );
 
     if (approvals.length < 2) {
       setKillError("Two distinct director approvals are required.");
-      return;
+      return false;
     }
 
     if (approvals[0].toLowerCase() === approvals[1].toLowerCase()) {
       setKillError("Director approvals must belong to different directors.");
-      return;
-    }
-
-    if (!killArmed) {
-      setKillArmed(true);
-      setKillMessage(
-        "Kill switch armed. Re-submit to confirm and broadcast the shutdown."
-      );
-      return;
+      return false;
     }
 
     if (killAccount.trim().length === 0) {
       setKillError("Please specify an account identifier.");
-      return;
+      return false;
     }
 
     if (!initiatingAccount.trim()) {
       setKillError("Select an initiating administrator account.");
-      return;
+      return false;
     }
+
+    setKillError(null);
+    return true;
+  };
+
+  const handleKillSwitchRequest = async () => {
+    const approvals = [firstApproval.trim(), secondApproval.trim()].filter(
+      (value) => value.length > 0
+    );
 
     setKillLoading(true);
 
@@ -440,20 +469,29 @@ const DirectorControls: React.FC = () => {
       setKillMessage(
         `Kill switch engaged${
           payload.ts ? ` at ${formatTimestamp(payload.ts)}` : ""
-        }. All open orders cancelled and OMS halted.`
+        }${payload.reason_code ? ` • ${payload.reason_code}` : ""}`
       );
-      setKillArmed(false);
-      setFirstApproval("");
-      setSecondApproval("");
+      setKillConfirmationText("");
+      setIsKillModalOpen(false);
       await refreshAuditTrail();
+      await refreshSafeModeStatus();
     } catch (error) {
       console.error("Kill switch request failed", error);
-      setKillError(
-        "Unable to engage the kill switch. Please verify connectivity and try again."
-      );
+      setKillError("Unable to execute the kill switch. Please try again.");
     } finally {
       setKillLoading(false);
     }
+  };
+
+  const handleKillSwitch = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setKillMessage(null);
+
+    if (!validateKillSwitchForm()) {
+      return;
+    }
+
+    setIsKillModalOpen(true);
   };
 
   const handleOverride = async (event: FormEvent<HTMLFormElement>) => {
@@ -462,23 +500,24 @@ const DirectorControls: React.FC = () => {
     setOverrideError(null);
     setOverrideMessage(null);
 
-    if (overrideAsset.trim().length === 0) {
-      setOverrideError("Please provide an asset symbol.");
+    if (!overridePair.trim()) {
+      setOverrideError("Select a trading pair to override.");
       return;
     }
 
-    if (overrideReason.trim().length === 0) {
+    if (!overrideReason.trim()) {
       setOverrideError("Please provide a reason for the override decision.");
       return;
     }
 
-    const payload: AssetOverridePayload = {
-      asset: overrideAsset.trim().toUpperCase(),
-      reason: overrideReason.trim(),
-      action: overrideAction,
-    };
-
     setOverrideLoading(true);
+
+    const payload: OverridePayload = {
+      symbol: overridePair.trim().toUpperCase(),
+      enabled: overrideEnabled,
+      reason: overrideReason.trim(),
+      actor: overrideActor.trim() || undefined,
+    };
 
     try {
       const response = await fetch("/universe/override", {
@@ -487,12 +526,7 @@ const DirectorControls: React.FC = () => {
           "Content-Type": "application/json",
           Accept: "application/json",
         },
-        body: JSON.stringify({
-          symbol: payload.asset,
-          enabled: payload.action === "unblock",
-          reason: payload.reason,
-          actor: overrideActor.trim() || undefined,
-        }),
+        body: JSON.stringify(payload),
       });
 
       if (!response.ok) {
@@ -500,16 +534,15 @@ const DirectorControls: React.FC = () => {
       }
 
       setOverrideMessage(
-        overrideAction === "block"
-          ? `${payload.asset} has been blocked.`
-          : `${payload.asset} has been unblocked.`
+        `Override submitted: ${payload.symbol} ${
+          payload.enabled ? "enabled" : "disabled"
+        }.`
       );
-      setOverrideAsset("");
       setOverrideReason("");
       setOverrideActor("");
       await refreshAuditTrail();
     } catch (error) {
-      console.error("Override action failed", error);
+      console.error("Override submission failed", error);
       setOverrideError(
         "Unable to submit the override decision. Please try again later."
       );
@@ -519,216 +552,468 @@ const DirectorControls: React.FC = () => {
   };
 
   return (
-    <section className="director-controls">
-      <h2>Director Controls</h2>
+    <section className="max-w-6xl mx-auto px-4 py-8 space-y-8">
+      <header className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <h2 className="text-2xl font-semibold text-slate-900">
+            Director Controls
+          </h2>
+          <p className="text-sm text-slate-500">
+            Manage emergency actions, trading overrides, and review the latest
+            director activity.
+          </p>
+        </div>
+        <div className="rounded-lg border border-slate-200 px-4 py-2 text-sm text-slate-600">
+          <span className="font-medium text-slate-900">Safe Mode:</span>{" "}
+          {safeModeLoading ? "Checking…" : safeModeStatusLabel}
+        </div>
+      </header>
 
-      <div className="control-card">
-        <h3>Safe Mode</h3>
-        <p>
-          Current status: <strong>{safeModeStatusLabel}</strong>
-          {safeModeStatus?.since && (
-            <span>
-              {" "}
-              since {formatTimestamp(safeModeStatus.since)}
-            </span>
-          )}
-          {safeModeStatus?.reason && (
-            <span>
-              {" "}- Reason: <em>{safeModeStatus.reason}</em>
-            </span>
-          )}
-        </p>
-        {safeModeLoading && <p>Loading safe mode status…</p>}
-        {safeModeError && <p className="error">{safeModeError}</p>}
-        {!readOnly ? (
-          <>
-            <div className="form-grid">
-              <label htmlFor="safe-mode-reason">Reason</label>
-              <input
-                id="safe-mode-reason"
-                type="text"
-                value={safeModeReason}
-                onChange={(event) => setSafeModeReason(event.target.value)}
-                placeholder="Reason for entering safe mode"
-              />
-              <label htmlFor="safe-mode-actor">Actor (optional)</label>
-              <input
-                id="safe-mode-actor"
-                type="text"
-                value={safeModeActor}
-                onChange={(event) => setSafeModeActor(event.target.value)}
-                placeholder="Recorded actor"
-              />
+      <div className="grid gap-6 lg:grid-cols-2">
+        <div className="space-y-6">
+          <div className="rounded-lg bg-white p-6 shadow-sm ring-1 ring-slate-200">
+            <div className="flex items-start justify-between">
+              <h3 className="text-lg font-semibold text-slate-900">Safe Mode</h3>
+              {safeModeStatus?.active && (
+                <span className="rounded-full bg-amber-100 px-3 py-1 text-xs font-medium text-amber-800">
+                  Active
+                </span>
+              )}
             </div>
-            <div className="button-row">
+            <p className="mt-2 text-sm text-slate-600">
+              Current status: <strong>{safeModeStatusLabel}</strong>
+              {safeModeStatus?.since && (
+                <span className="ml-1 text-slate-500">
+                  since {formatTimestamp(safeModeStatus.since)}
+                </span>
+              )}
+              {safeModeStatus?.reason && (
+                <span className="ml-1 text-slate-500">
+                  • Reason: <em>{safeModeStatus.reason}</em>
+                </span>
+              )}
+            </p>
+            {safeModeLoading && (
+              <p className="mt-3 text-sm text-slate-500">
+                Loading safe mode status…
+              </p>
+            )}
+            {safeModeError && (
+              <p className="mt-3 text-sm text-rose-600">{safeModeError}</p>
+            )}
+            {!readOnly ? (
+              <div className="mt-4 space-y-4">
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <label className="text-sm font-medium text-slate-700" htmlFor="safe-mode-reason">
+                    Reason
+                  </label>
+                  <input
+                    id="safe-mode-reason"
+                    type="text"
+                    value={safeModeReason}
+                    onChange={(event) => setSafeModeReason(event.target.value)}
+                    placeholder="Reason for entering safe mode"
+                    className="sm:col-span-1 rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-900 shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  />
+                  <label className="text-sm font-medium text-slate-700" htmlFor="safe-mode-actor">
+                    Actor (optional)
+                  </label>
+                  <input
+                    id="safe-mode-actor"
+                    type="text"
+                    value={safeModeActor}
+                    onChange={(event) => setSafeModeActor(event.target.value)}
+                    placeholder="Recorded actor"
+                    className="sm:col-span-1 rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-900 shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  />
+                </div>
+                <div className="flex flex-col gap-3 sm:flex-row">
+                  <button
+                    type="button"
+                    onClick={() => handleSafeMode("enter")}
+                    disabled={safeModeActionLoading}
+                    className="inline-flex items-center justify-center rounded-md bg-amber-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-amber-500 disabled:cursor-not-allowed disabled:bg-amber-300"
+                  >
+                    Enter Safe Mode
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleSafeMode("exit")}
+                    disabled={safeModeActionLoading}
+                    className="inline-flex items-center justify-center rounded-md bg-emerald-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-emerald-500 disabled:cursor-not-allowed disabled:bg-emerald-300"
+                  >
+                    Exit Safe Mode
+                  </button>
+                </div>
+                {safeModeMessage && (
+                  <p className="text-sm text-emerald-600">{safeModeMessage}</p>
+                )}
+                {safeModeActionError && (
+                  <p className="text-sm text-rose-600">{safeModeActionError}</p>
+                )}
+              </div>
+            ) : (
+              <p className="mt-4 rounded-md bg-slate-50 p-3 text-sm text-slate-600">
+                Auditor access is read-only. Safe mode controls are hidden.
+              </p>
+            )}
+          </div>
+
+          <div className="rounded-lg bg-white p-6 shadow-sm ring-1 ring-slate-200">
+            <h3 className="text-lg font-semibold text-slate-900">Kill Switch</h3>
+            {!readOnly ? (
+              <>
+                <form onSubmit={handleKillSwitch} className="mt-4 space-y-4">
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    <div className="space-y-1">
+                      <label
+                        htmlFor="kill-account"
+                        className="text-sm font-medium text-slate-700"
+                      >
+                        Account
+                      </label>
+                      <input
+                        id="kill-account"
+                        type="text"
+                        value={killAccount}
+                        onChange={(event) => setKillAccount(event.target.value)}
+                        placeholder="Account identifier"
+                        className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-900 shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <label
+                        htmlFor="kill-reason"
+                        className="text-sm font-medium text-slate-700"
+                      >
+                        Reason
+                      </label>
+                      <select
+                        id="kill-reason"
+                        value={killReason}
+                        onChange={(event) =>
+                          setKillReason(event.target.value as KillSwitchReason)
+                        }
+                        className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-900 shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                      >
+                        {KILL_SWITCH_REASONS.map((reason) => (
+                          <option key={reason.value} value={reason.value}>
+                            {reason.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="space-y-1">
+                      <label
+                        htmlFor="first-approval"
+                        className="text-sm font-medium text-slate-700"
+                      >
+                        Director Approval #1
+                      </label>
+                      <input
+                        id="first-approval"
+                        type="text"
+                        value={firstApproval}
+                        onChange={(event) => setFirstApproval(event.target.value)}
+                        placeholder="director-1"
+                        className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-900 shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <label
+                        htmlFor="second-approval"
+                        className="text-sm font-medium text-slate-700"
+                      >
+                        Director Approval #2
+                      </label>
+                      <input
+                        id="second-approval"
+                        type="text"
+                        value={secondApproval}
+                        onChange={(event) => setSecondApproval(event.target.value)}
+                        placeholder="director-2"
+                        className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-900 shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <label
+                        htmlFor="initiating-account"
+                        className="text-sm font-medium text-slate-700"
+                      >
+                        Initiating Account
+                      </label>
+                      <input
+                        id="initiating-account"
+                        type="text"
+                        value={initiatingAccount}
+                        onChange={(event) =>
+                          setInitiatingAccount(event.target.value)
+                        }
+                        placeholder="director-1"
+                        className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-900 shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                      />
+                    </div>
+                  </div>
+                  <button
+                    type="submit"
+                    className="inline-flex w-full items-center justify-center rounded-md bg-rose-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-rose-500 disabled:cursor-not-allowed disabled:bg-rose-300"
+                    disabled={killLoading}
+                  >
+                    Engage Kill Switch
+                  </button>
+                </form>
+                {killMessage && (
+                  <p className="mt-3 text-sm text-amber-600">{killMessage}</p>
+                )}
+                {killError && (
+                  <p className="mt-3 text-sm text-rose-600">{killError}</p>
+                )}
+              </>
+            ) : (
+              <p className="mt-4 rounded-md bg-slate-50 p-3 text-sm text-slate-600">
+                Auditor access is read-only. Kill switch controls are hidden.
+              </p>
+            )}
+          </div>
+        </div>
+
+        <div className="space-y-6">
+          <div className="rounded-lg bg-white p-6 shadow-sm ring-1 ring-slate-200">
+            <h3 className="text-lg font-semibold text-slate-900">
+              Trading Pair Overrides
+            </h3>
+            <p className="mt-2 text-sm text-slate-600">
+              Temporarily enable or disable manual overrides for specific USD
+              trading pairs.
+            </p>
+            {!readOnly ? (
+              <>
+                <form onSubmit={handleOverride} className="mt-4 space-y-4">
+                  <div className="space-y-1">
+                    <label
+                      htmlFor="override-pair"
+                      className="text-sm font-medium text-slate-700"
+                    >
+                      Trading Pair
+                    </label>
+                    <select
+                      id="override-pair"
+                      value={overridePair}
+                      onChange={(event) => setOverridePair(event.target.value)}
+                      className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-900 shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    >
+                      <option value="">Select a trading pair…</option>
+                      {availablePairs.map((pair) => (
+                        <option key={pair} value={pair}>
+                          {pair}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="space-y-1">
+                    <span className="text-sm font-medium text-slate-700">
+                      Override Action
+                    </span>
+                    <div className="flex flex-col gap-2 sm:flex-row">
+                      <label className="flex items-center gap-2 text-sm text-slate-700">
+                        <input
+                          type="radio"
+                          name="override-enabled"
+                          value="disable"
+                          checked={!overrideEnabled}
+                          onChange={() => setOverrideEnabled(false)}
+                          className="h-4 w-4 border-slate-300 text-rose-600 focus:ring-rose-500"
+                        />
+                        Disable trading pair
+                      </label>
+                      <label className="flex items-center gap-2 text-sm text-slate-700">
+                        <input
+                          type="radio"
+                          name="override-enabled"
+                          value="enable"
+                          checked={overrideEnabled}
+                          onChange={() => setOverrideEnabled(true)}
+                          className="h-4 w-4 border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                        />
+                        Enable trading pair
+                      </label>
+                    </div>
+                  </div>
+                  <div className="space-y-1">
+                    <label
+                      htmlFor="override-reason"
+                      className="text-sm font-medium text-slate-700"
+                    >
+                      Reason
+                    </label>
+                    <input
+                      id="override-reason"
+                      type="text"
+                      value={overrideReason}
+                      onChange={(event) => setOverrideReason(event.target.value)}
+                      placeholder="Why this override is needed"
+                      className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-900 shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label
+                      htmlFor="override-actor"
+                      className="text-sm font-medium text-slate-700"
+                    >
+                      Actor (optional)
+                    </label>
+                    <input
+                      id="override-actor"
+                      type="text"
+                      value={overrideActor}
+                      onChange={(event) => setOverrideActor(event.target.value)}
+                      placeholder="ops_team"
+                      className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-900 shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    />
+                  </div>
+                  <button
+                    type="submit"
+                    disabled={overrideLoading}
+                    className="inline-flex w-full items-center justify-center rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-indigo-500 disabled:cursor-not-allowed disabled:bg-indigo-300"
+                  >
+                    Submit Override
+                  </button>
+                </form>
+                {overrideMessage && (
+                  <p className="mt-3 text-sm text-emerald-600">{overrideMessage}</p>
+                )}
+                {overrideError && (
+                  <p className="mt-3 text-sm text-rose-600">{overrideError}</p>
+                )}
+              </>
+            ) : (
+              <p className="mt-4 rounded-md bg-slate-50 p-3 text-sm text-slate-600">
+                Auditor access is read-only. Override controls are hidden.
+              </p>
+            )}
+          </div>
+
+          <div className="rounded-lg bg-white p-6 shadow-sm ring-1 ring-slate-200">
+            <div className="flex items-center justify-between">
+              <h3 className="text-lg font-semibold text-slate-900">
+                Recent Director Actions
+              </h3>
               <button
                 type="button"
-                onClick={() => handleSafeMode("enter")}
-                disabled={safeModeActionLoading}
+                onClick={refreshAuditTrail}
+                className="text-sm font-medium text-indigo-600 hover:text-indigo-500"
               >
-                Enter Safe Mode
+                Refresh
+              </button>
+            </div>
+            {auditLoading && (
+              <p className="mt-3 text-sm text-slate-500">
+                Loading director actions…
+              </p>
+            )}
+            {auditError && (
+              <p className="mt-3 text-sm text-rose-600">{auditError}</p>
+            )}
+            {!auditLoading && !auditError && auditTrail.length === 0 && (
+              <p className="mt-3 text-sm text-slate-600">
+                No director actions recorded.
+              </p>
+            )}
+            {!auditLoading && !auditError && auditTrail.length > 0 && (
+              <div className="mt-4 overflow-hidden rounded-lg border border-slate-200">
+                <table className="min-w-full divide-y divide-slate-200 text-sm">
+                  <thead className="bg-slate-50 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">
+                    <tr>
+                      <th className="px-4 py-2">Timestamp</th>
+                      <th className="px-4 py-2">Action</th>
+                      <th className="px-4 py-2">Actor</th>
+                      <th className="px-4 py-2">Entity</th>
+                      <th className="px-4 py-2">Details</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-200 bg-white">
+                    {auditTrail.map((entry, index) => (
+                      <tr key={entry.id ?? `${entry.action}-${index}`}>
+                        <td className="px-4 py-2 text-slate-700">
+                          {formatTimestamp(entry.timestamp)}
+                        </td>
+                        <td className="px-4 py-2 text-slate-700">{entry.action}</td>
+                        <td className="px-4 py-2 text-slate-700">
+                          {entry.actor || "Unknown"}
+                        </td>
+                        <td className="px-4 py-2 text-slate-700">{entry.entity}</td>
+                        <td className="px-4 py-2 text-slate-500">
+                          {entry.details ?? ""}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {isKillModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 px-4">
+          <div className="w-full max-w-lg rounded-lg bg-white p-6 shadow-xl">
+            <h4 className="text-lg font-semibold text-slate-900">Confirm Kill Switch</h4>
+            <p className="mt-2 text-sm text-slate-600">
+              You are about to broadcast a kill switch for account
+              <span className="font-semibold"> {killAccount.trim()}</span>. This
+              action will cancel all open orders and halt trading. Enter
+              <code className="mx-1 rounded bg-slate-100 px-1 py-0.5 text-xs text-slate-700">
+                CONFIRM
+              </code>{" "}
+              to proceed.
+            </p>
+            <div className="mt-4 space-y-4">
+              <div className="grid gap-2 rounded-md bg-slate-50 p-3 text-sm text-slate-600">
+                <div>
+                  <span className="font-medium text-slate-700">Reason:</span>{" "}
+                  {KILL_SWITCH_REASONS.find((item) => item.value === killReason)?.label}
+                </div>
+                <div>
+                  <span className="font-medium text-slate-700">Approvals:</span>{" "}
+                  {[firstApproval.trim(), secondApproval.trim()].join(", ")}
+                </div>
+                <div>
+                  <span className="font-medium text-slate-700">Initiating Account:</span>{" "}
+                  {initiatingAccount.trim()}
+                </div>
+              </div>
+              <input
+                type="text"
+                value={killConfirmationText}
+                onChange={(event) => setKillConfirmationText(event.target.value)}
+                placeholder="Type CONFIRM to continue"
+                className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-900 shadow-sm focus:border-rose-500 focus:outline-none focus:ring-2 focus:ring-rose-500"
+              />
+            </div>
+            <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:justify-end">
+              <button
+                type="button"
+                onClick={() => {
+                  setIsKillModalOpen(false);
+                  setKillConfirmationText("");
+                }}
+                className="inline-flex items-center justify-center rounded-md border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 shadow-sm transition hover:bg-slate-50"
+              >
+                Cancel
               </button>
               <button
                 type="button"
-                onClick={() => handleSafeMode("exit")}
-                disabled={safeModeActionLoading}
+                disabled={killConfirmationText.trim().toUpperCase() !== "CONFIRM" || killLoading}
+                onClick={handleKillSwitchRequest}
+                className="inline-flex items-center justify-center rounded-md bg-rose-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-rose-500 disabled:cursor-not-allowed disabled:bg-rose-300"
               >
-                Exit Safe Mode
+                Confirm Kill Switch
               </button>
             </div>
-            {safeModeMessage && <p className="success">{safeModeMessage}</p>}
-            {safeModeActionError && <p className="error">{safeModeActionError}</p>}
-          </>
-        ) : (
-          <p className="info">
-            Auditor access is read-only. Safe mode controls are hidden.
-          </p>
-        )}
-      </div>
-
-      <div className="control-card">
-        <h3>Kill Switch</h3>
-
-        {!readOnly ? (
-          <>
-            <form onSubmit={handleKillSwitch}>
-              <div className="form-grid">
-                <label htmlFor="kill-account">Account</label>
-                <input
-                  id="kill-account"
-                  type="text"
-                  value={killAccount}
-                  onChange={(event) => setKillAccount(event.target.value)}
-                  placeholder="Account identifier"
-                />
-                <label htmlFor="kill-reason">Reason</label>
-                <select
-                  id="kill-reason"
-                  value={killReason}
-                  onChange={(event) =>
-                    setKillReason(event.target.value as KillSwitchReason)
-                  }
-                >
-                  {KILL_SWITCH_REASONS.map((reason) => (
-                    <option key={reason.value} value={reason.value}>
-                      {reason.label}
-                    </option>
-                  ))}
-                </select>
-                <label htmlFor="first-approval">Director Approval #1</label>
-                <input
-                  id="first-approval"
-                  type="text"
-                  value={firstApproval}
-                  onChange={(event) => setFirstApproval(event.target.value)}
-                  placeholder="director-1"
-                />
-                <label htmlFor="second-approval">Director Approval #2</label>
-                <input
-                  id="second-approval"
-                  type="text"
-                  value={secondApproval}
-                  onChange={(event) => setSecondApproval(event.target.value)}
-                  placeholder="director-2"
-                />
-              </div>
-              <button type="submit" disabled={killLoading}>
-                {killArmed ? "Confirm Kill Switch" : "Engage Kill Switch"}
-              </button>
-            </form>
-            {killMessage && <p className="warning">{killMessage}</p>}
-            {killError && <p className="error">{killError}</p>}
-          </>
-        ) : (
-          <p className="info">
-            Auditor access is read-only. Kill switch controls are hidden.
-          </p>
-        )}
-
-      </div>
-
-      <div className="control-card">
-        <h3>Override Decisions</h3>
-
-        {!readOnly ? (
-          <>
-            <form onSubmit={handleOverride}>
-              <div className="form-grid">
-                <label htmlFor="override-asset">Asset</label>
-                <input
-                  id="override-asset"
-                  type="text"
-                  value={overrideAsset}
-                  onChange={(event) => setOverrideAsset(event.target.value)}
-                  placeholder="e.g. BTC-USD"
-                />
-                <label htmlFor="override-reason">Reason</label>
-                <input
-                  id="override-reason"
-                  type="text"
-                  value={overrideReason}
-                  onChange={(event) => setOverrideReason(event.target.value)}
-                  placeholder="Why this override is needed"
-                />
-                <label htmlFor="override-action">Action</label>
-                <select
-                  id="override-action"
-                  value={overrideAction}
-                  onChange={(event) =>
-                    setOverrideAction(event.target.value as "block" | "unblock")
-                  }
-                >
-                  <option value="block">Block Asset</option>
-                  <option value="unblock">Unblock Asset</option>
-                </select>
-              </div>
-              <button type="submit" disabled={overrideLoading}>
-                Submit Override
-              </button>
-            </form>
-            {overrideMessage && <p className="success">{overrideMessage}</p>}
-            {overrideError && <p className="error">{overrideError}</p>}
-          </>
-        ) : (
-          <p className="info">
-            Auditor access is read-only. Override controls are hidden.
-          </p>
-        )}
-
-      </div>
-
-      <div className="control-card">
-        <h3>Recent Director Actions</h3>
-        {auditLoading && <p>Loading director actions…</p>}
-        {auditError && <p className="error">{auditError}</p>}
-        {!auditLoading && !auditError && auditTrail.length === 0 && (
-          <p>No director actions recorded.</p>
-        )}
-        {!auditLoading && !auditError && auditTrail.length > 0 && (
-          <table className="audit-table">
-            <thead>
-              <tr>
-                <th>Timestamp</th>
-                <th>Action</th>
-                <th>Actor</th>
-                <th>Entity</th>
-                <th>Details</th>
-              </tr>
-            </thead>
-            <tbody>
-              {auditTrail.map((entry, index) => (
-                <tr key={entry.id ?? `${entry.action}-${index}`}>
-                  <td>{formatTimestamp(entry.timestamp)}</td>
-                  <td>{entry.action}</td>
-                  <td>{entry.actor || "Unknown"}</td>
-                  <td>{entry.entity}</td>
-                  <td>{entry.details ?? ""}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </div>
+          </div>
+        </div>
+      )}
     </section>
   );
 };
