@@ -150,22 +150,27 @@ def db_session(request: Request) -> Iterator[Session]:
 
     scopes = _normalize_account_scopes(getattr(request.state, "account_scopes", None))
     session_factory = _resolve_session_factory(request)
-    session = session_factory()
-    connection = session.connection()
-    applied_scopes = _set_account_scopes(connection, scopes)
+    session: Session | None = None
+    connection: Connection | None = None
+    applied_scopes = False
 
     try:
+        session = session_factory()
+        connection = session.connection()
+        applied_scopes = _set_account_scopes(connection, scopes)
+
         yield session
         if _session_in_transaction(session):
             session.commit()
     except Exception:
-        if _session_in_transaction(session):
+        if session is not None and _session_in_transaction(session):
             session.rollback()
         raise
     finally:
-        if applied_scopes:
+        if connection is not None and applied_scopes:
             _reset_account_scopes(connection)
-        session.close()
+        if session is not None:
+            session.close()
 
 
 __all__ = ["db_session"]
