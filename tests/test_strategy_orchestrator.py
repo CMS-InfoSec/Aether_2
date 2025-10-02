@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 from typing import Any, Dict
 from types import SimpleNamespace
 import sys
@@ -35,7 +36,7 @@ class _HTTPException(Exception):
 
 class _FastAPI:
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        pass
+        self._startup_handlers = []
 
     def post(self, *args: Any, **kwargs: Any):  # type: ignore[override]
         def decorator(func):
@@ -43,15 +44,34 @@ class _FastAPI:
 
         return decorator
 
+    def get(self, *args: Any, **kwargs: Any):  # type: ignore[override]
+        def decorator(func):
+            return func
+
+        return decorator
+
+    def on_event(self, event: str):
+        def decorator(func):
+            if event == "startup":
+                self._startup_handlers.append(func)
+            return func
+
+        return decorator
+
 
 sys.modules.setdefault(
     "fastapi",
-    SimpleNamespace(FastAPI=_FastAPI, HTTPException=_HTTPException),
+    SimpleNamespace(
+        FastAPI=_FastAPI,
+        HTTPException=_HTTPException,
+        status=SimpleNamespace(HTTP_503_SERVICE_UNAVAILABLE=503),
+    ),
 )
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
+from sqlalchemy.exc import OperationalError
 
 import strategy_orchestrator
 from services.common.schemas import (
@@ -167,3 +187,55 @@ async def test_route_trade_intent_forwards_account_header(
 
     assert response.valid is True
     assert captured["headers"] == {"X-Account-ID": request.account_id}
+
+
+@pytest.mark.asyncio
+async def test_startup_retry_recovers_after_transient_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = importlib.reload(strategy_orchestrator)
+
+    attempts = 0
+    real_create_all = module.Base.metadata.create_all
+
+    def flaky_create_all(*args: Any, **kwargs: Any) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise OperationalError("select 1", {}, Exception("db offline"))
+        return real_create_all(*args, **kwargs)
+
+    monkeypatch.setattr(module.Base.metadata, "create_all", flaky_create_all)
+
+    ensure_calls = 0
+
+    def ensure_stub(*args: Any, **kwargs: Any) -> None:
+        nonlocal ensure_calls
+        ensure_calls += 1
+
+    monkeypatch.setattr(module, "ensure_signal_tables", ensure_stub)
+
+    async def immediate_sleep(*_: Any) -> None:
+        return None
+
+    monkeypatch.setattr(module.asyncio, "sleep", immediate_sleep)
+
+    await module._initialise_with_retry(max_attempts=5, base_delay=0.0)
+
+    assert attempts == 3
+    assert ensure_calls == 1
+    assert module.REGISTRY is not None
+    assert module.SIGNAL_BUS is not None
+    assert module.INITIALIZATION_ERROR is None
+
+
+@pytest.mark.asyncio
+async def test_requests_return_503_until_initialised(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = importlib.reload(strategy_orchestrator)
+    module.REGISTRY = None
+    module.SIGNAL_BUS = None
+    module.INITIALIZATION_ERROR = RuntimeError("database unavailable")
+
+    with pytest.raises(module.HTTPException) as excinfo:
+        await module.strategy_status()
+
+    assert excinfo.value.status_code == 503
+    assert "database unavailable" in excinfo.value.detail
