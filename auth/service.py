@@ -13,10 +13,15 @@ import json
 import logging
 from typing import Dict, Optional, Protocol, Set, runtime_checkable
 
+from argon2 import PasswordHasher, Type
+from argon2.exceptions import InvalidHash, VerifyMismatchError
 import pyotp
 
 
 logger = logging.getLogger(__name__)
+
+
+_ARGON2_HASHER = PasswordHasher(type=Type.ID)
 
 
 
@@ -297,9 +302,9 @@ class AuthService:
         # Prefer Argon2id verification for new credentials.
         if stored_hash.startswith("$argon2"):
             try:
-                if not _ARGON2_HASHER.verify(password, stored_hash):
+                if not _ARGON2_HASHER.verify(stored_hash, password):
                     return False
-            except ValueError:
+            except (InvalidHash, VerifyMismatchError):
                 return False
             if _ARGON2_HASHER.needs_update(stored_hash):
                 admin.password_hash = hash_password(password)
