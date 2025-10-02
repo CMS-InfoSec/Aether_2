@@ -10,6 +10,7 @@ from accounts.service import AccountsService
 from auth.routes import get_auth_service, router as auth_router
 from auth.service import AdminRepository, AuthService, SessionStore
 from services.alert_manager import setup_alerting
+from services.alerts.alert_dedupe import router as alert_dedupe_router, setup_alert_dedupe
 from alert_prioritizer import router as alert_prioritizer_router
 from services.report_service import router as reports_router
 from multiformat_export import router as log_export_router
@@ -47,6 +48,7 @@ def create_app() -> FastAPI:
     app.include_router(reports_router)
     app.include_router(exposure_router)
     app.include_router(alert_prioritizer_router)
+    app.include_router(alert_dedupe_router)
 
     app.include_router(models_router)
 
@@ -81,6 +83,7 @@ def create_app() -> FastAPI:
 
     alertmanager_url = os.getenv("ALERTMANAGER_URL")
     setup_alerting(app, alertmanager_url=alertmanager_url)
+    setup_alert_dedupe(app, alertmanager_url=alertmanager_url)
 
     return app
 
