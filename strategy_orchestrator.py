@@ -21,7 +21,9 @@ from threading import RLock
 from typing import Any, Dict, Iterable, List, Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException, status
+
+from fastapi import Depends, FastAPI, HTTPException
+
 from pydantic import BaseModel, Field, PositiveFloat, constr
 from sqlalchemy import Boolean, Column, DateTime, Float, String, create_engine, func, select
 from sqlalchemy.engine import Engine
@@ -29,7 +31,9 @@ from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import NullPool
 
+from auth.service import InMemorySessionStore, RedisSessionStore, SessionStoreProtocol
 from services.common.schemas import RiskValidationRequest, RiskValidationResponse
+from services.common.security import require_admin_account
 from strategy_bus import StrategySignalBus, ensure_signal_tables
 
 LOGGER = logging.getLogger(__name__)
@@ -260,6 +264,19 @@ def _create_engine(url: str) -> Engine:
     return create_engine(url, **kwargs)
 
 
+def _build_session_store_from_env() -> SessionStoreProtocol:
+    ttl_minutes = int(os.getenv("SESSION_TTL_MINUTES", "60"))
+    redis_url = os.getenv("SESSION_REDIS_URL")
+    if redis_url:
+        try:  # pragma: no cover - optional dependency for Redis-backed sessions
+            import redis  # type: ignore[import-not-found]
+        except ImportError as exc:  # pragma: no cover - surfaced when redis is missing at runtime
+            raise RuntimeError("redis package is required when SESSION_REDIS_URL is set") from exc
+        client = redis.Redis.from_url(redis_url)
+        return RedisSessionStore(client, ttl_minutes=ttl_minutes)
+    return InMemorySessionStore(ttl_minutes=ttl_minutes)
+
+
 DATABASE_URL = _database_url()
 ENGINE = _create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
@@ -370,6 +387,8 @@ def _require_signal_bus() -> StrategySignalBus:
     return SIGNAL_BUS
 
 app = FastAPI(title="Strategy Orchestrator", version="0.1.0")
+SESSION_STORE = _build_session_store_from_env()
+app.state.session_store = SESSION_STORE
 
 
 @app.on_event("startup")
@@ -378,37 +397,57 @@ async def _startup_event() -> None:
 
 
 @app.post("/strategy/register", response_model=StrategyStatusResponse)
-async def register_strategy(payload: StrategyRegisterRequest) -> StrategyStatusResponse:
-    registry = _require_registry()
+
+async def register_strategy(
+    payload: StrategyRegisterRequest, actor: str = Depends(require_admin_account)
+) -> StrategyStatusResponse:
     try:
-        snapshot = registry.register(payload.name.lower(), payload.description, payload.max_nav_pct)
+        LOGGER.info("Registering strategy '%s' by %s", payload.name.lower(), actor)
+        snapshot = REGISTRY.register(payload.name.lower(), payload.description, payload.max_nav_pct)
+
     except StrategyAllocationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return StrategyStatusResponse(**snapshot.__dict__)
 
 
 @app.post("/strategy/toggle", response_model=StrategyStatusResponse)
-async def toggle_strategy(payload: StrategyToggleRequest) -> StrategyStatusResponse:
-    registry = _require_registry()
+
+async def toggle_strategy(
+    payload: StrategyToggleRequest, actor: str = Depends(require_admin_account)
+) -> StrategyStatusResponse:
     try:
-        snapshot = registry.toggle(payload.name.lower(), payload.enabled)
+        LOGGER.info(
+            "Toggling strategy '%s' to %s by %s", payload.name.lower(), payload.enabled, actor
+        )
+        snapshot = REGISTRY.toggle(payload.name.lower(), payload.enabled)
+
     except StrategyNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return StrategyStatusResponse(**snapshot.__dict__)
 
 
 @app.get("/strategy/status", response_model=List[StrategyStatusResponse])
-async def strategy_status() -> List[StrategyStatusResponse]:
-    registry = _require_registry()
-    snapshots = registry.status()
+
+async def strategy_status(actor: str = Depends(require_admin_account)) -> List[StrategyStatusResponse]:
+    LOGGER.info("Fetching strategy status for %s", actor)
+    snapshots = REGISTRY.status()
+
     return [StrategyStatusResponse(**snapshot.__dict__) for snapshot in snapshots]
 
 
 @app.post("/strategy/intent", response_model=RiskValidationResponse)
-async def route_intent(payload: StrategyIntentRequest) -> RiskValidationResponse:
-    registry = _require_registry()
+
+async def route_intent(
+    payload: StrategyIntentRequest, actor: str = Depends(require_admin_account)
+) -> RiskValidationResponse:
     try:
-        return await registry.route_trade_intent(payload.strategy_name.lower(), payload.request)
+        LOGGER.info(
+            "Routing intent for strategy '%s' submitted by %s",
+            payload.strategy_name.lower(),
+            actor,
+        )
+        return await REGISTRY.route_trade_intent(payload.strategy_name.lower(), payload.request)
+
     except StrategyNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except StrategyAllocationError as exc:
@@ -416,9 +455,11 @@ async def route_intent(payload: StrategyIntentRequest) -> RiskValidationResponse
 
 
 @app.get("/strategy/signals", response_model=List[StrategySignalResponse])
-async def strategy_signals() -> List[StrategySignalResponse]:
-    signal_bus = _require_signal_bus()
-    signals = signal_bus.list_signals()
+
+async def strategy_signals(actor: str = Depends(require_admin_account)) -> List[StrategySignalResponse]:
+    LOGGER.info("Listing strategy signals for %s", actor)
+    signals = SIGNAL_BUS.list_signals()
+
     return [
         StrategySignalResponse(
             name=signal.name,

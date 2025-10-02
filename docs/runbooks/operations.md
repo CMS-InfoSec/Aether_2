@@ -66,3 +66,13 @@ This runbook describes the day-2 operational workflows for the Aether risk platf
 - [ ] Export Loki query for `service=risk-api` covering the incident window.
 - [ ] Attach SBOM artifacts from the latest pipeline run to the incident ticket.
 - [ ] Summarize remediations and create follow-up tasks in Jira.
+
+## 6. Strategy orchestrator access controls
+- All calls to the strategy orchestrator FastAPI service (**`/strategy/*` endpoints**) require an
+  administrator session token supplied via the `Authorization: Bearer <token>` header. Requests
+  without this header are rejected with `401 Unauthorized`.
+- The orchestrator enforces that the authenticated operator belongs to the admin allow-list. If the
+  session resolves to a non-admin account, the request fails with `403 Forbidden`.
+- When coordinating incident mitigations, obtain an admin session from the authentication service
+  and re-use that token across CLI `curl` probes or workflow automations interacting with the
+  orchestrator.
