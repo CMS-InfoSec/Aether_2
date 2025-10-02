@@ -358,6 +358,11 @@ const DirectorControls: React.FC = () => {
   }, [loadTradingPairs]);
 
   const handleSafeMode = async (action: "enter" | "exit") => {
+    if (readOnly) {
+      setSafeModeActionError("Auditor access is read-only. Safe mode controls are disabled.");
+      setSafeModeMessage(null);
+      return;
+    }
     setSafeModeActionError(null);
     setSafeModeMessage(null);
 
@@ -440,6 +445,11 @@ const DirectorControls: React.FC = () => {
   };
 
   const handleKillSwitchRequest = async () => {
+    if (readOnly) {
+      setKillError("Auditor access is read-only. Kill switch controls are disabled.");
+      setKillMessage(null);
+      return;
+    }
     const approvals = [firstApproval.trim(), secondApproval.trim()].filter(
       (value) => value.length > 0
     );
@@ -485,6 +495,11 @@ const DirectorControls: React.FC = () => {
 
   const handleKillSwitch = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (readOnly) {
+      setKillError("Auditor access is read-only. Kill switch controls are disabled.");
+      setKillMessage(null);
+      return;
+    }
     setKillMessage(null);
 
     if (!validateKillSwitchForm()) {
@@ -496,6 +511,11 @@ const DirectorControls: React.FC = () => {
 
   const handleOverride = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (readOnly) {
+      setOverrideError("Auditor access is read-only. Override controls are disabled.");
+      setOverrideMessage(null);
+      return;
+    }
 
     setOverrideError(null);
     setOverrideMessage(null);
@@ -601,8 +621,8 @@ const DirectorControls: React.FC = () => {
             {safeModeError && (
               <p className="mt-3 text-sm text-rose-600">{safeModeError}</p>
             )}
-            {!readOnly ? (
-              <div className="mt-4 space-y-4">
+            <div className="mt-4 space-y-4" aria-disabled={readOnly}>
+              <fieldset disabled={readOnly} className="space-y-4">
                 <div className="grid gap-3 sm:grid-cols-2">
                   <label className="text-sm font-medium text-slate-700" htmlFor="safe-mode-reason">
                     Reason
@@ -631,7 +651,7 @@ const DirectorControls: React.FC = () => {
                   <button
                     type="button"
                     onClick={() => handleSafeMode("enter")}
-                    disabled={safeModeActionLoading}
+                    disabled={readOnly || safeModeActionLoading}
                     className="inline-flex items-center justify-center rounded-md bg-amber-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-amber-500 disabled:cursor-not-allowed disabled:bg-amber-300"
                   >
                     Enter Safe Mode
@@ -639,31 +659,32 @@ const DirectorControls: React.FC = () => {
                   <button
                     type="button"
                     onClick={() => handleSafeMode("exit")}
-                    disabled={safeModeActionLoading}
+                    disabled={readOnly || safeModeActionLoading}
                     className="inline-flex items-center justify-center rounded-md bg-emerald-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-emerald-500 disabled:cursor-not-allowed disabled:bg-emerald-300"
                   >
                     Exit Safe Mode
                   </button>
                 </div>
-                {safeModeMessage && (
-                  <p className="text-sm text-emerald-600">{safeModeMessage}</p>
-                )}
-                {safeModeActionError && (
-                  <p className="text-sm text-rose-600">{safeModeActionError}</p>
-                )}
-              </div>
-            ) : (
+              </fieldset>
+              {safeModeMessage && (
+                <p className="text-sm text-emerald-600">{safeModeMessage}</p>
+              )}
+              {safeModeActionError && (
+                <p className="text-sm text-rose-600">{safeModeActionError}</p>
+              )}
+            </div>
+            {readOnly && (
               <p className="mt-4 rounded-md bg-slate-50 p-3 text-sm text-slate-600">
-                Auditor access is read-only. Safe mode controls are hidden.
+                Auditor access is read-only. Safe mode controls are disabled.
               </p>
             )}
           </div>
 
           <div className="rounded-lg bg-white p-6 shadow-sm ring-1 ring-slate-200">
             <h3 className="text-lg font-semibold text-slate-900">Kill Switch</h3>
-            {!readOnly ? (
-              <>
-                <form onSubmit={handleKillSwitch} className="mt-4 space-y-4">
+            <>
+              <form onSubmit={handleKillSwitch} className="mt-4 space-y-4" aria-disabled={readOnly}>
+                <fieldset disabled={readOnly} className="space-y-4">
                   <div className="grid gap-4 sm:grid-cols-2">
                     <div className="space-y-1">
                       <label
@@ -757,23 +778,24 @@ const DirectorControls: React.FC = () => {
                   <button
                     type="submit"
                     className="inline-flex w-full items-center justify-center rounded-md bg-rose-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-rose-500 disabled:cursor-not-allowed disabled:bg-rose-300"
-                    disabled={killLoading}
+                    disabled={readOnly || killLoading}
                   >
                     Engage Kill Switch
                   </button>
-                </form>
-                {killMessage && (
-                  <p className="mt-3 text-sm text-amber-600">{killMessage}</p>
-                )}
-                {killError && (
-                  <p className="mt-3 text-sm text-rose-600">{killError}</p>
-                )}
-              </>
-            ) : (
-              <p className="mt-4 rounded-md bg-slate-50 p-3 text-sm text-slate-600">
-                Auditor access is read-only. Kill switch controls are hidden.
-              </p>
-            )}
+                </fieldset>
+              </form>
+              {killMessage && (
+                <p className="mt-3 text-sm text-amber-600">{killMessage}</p>
+              )}
+              {killError && (
+                <p className="mt-3 text-sm text-rose-600">{killError}</p>
+              )}
+              {readOnly && (
+                <p className="mt-4 rounded-md bg-slate-50 p-3 text-sm text-slate-600">
+                  Auditor access is read-only. Kill switch controls are disabled.
+                </p>
+              )}
+            </>
           </div>
         </div>
 
@@ -786,9 +808,9 @@ const DirectorControls: React.FC = () => {
               Temporarily enable or disable manual overrides for specific USD
               trading pairs.
             </p>
-            {!readOnly ? (
-              <>
-                <form onSubmit={handleOverride} className="mt-4 space-y-4">
+            <>
+              <form onSubmit={handleOverride} className="mt-4 space-y-4" aria-disabled={readOnly}>
+                <fieldset disabled={readOnly} className="space-y-4">
                   <div className="space-y-1">
                     <label
                       htmlFor="override-pair"
@@ -873,24 +895,25 @@ const DirectorControls: React.FC = () => {
                   </div>
                   <button
                     type="submit"
-                    disabled={overrideLoading}
+                    disabled={readOnly || overrideLoading}
                     className="inline-flex w-full items-center justify-center rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-indigo-500 disabled:cursor-not-allowed disabled:bg-indigo-300"
                   >
                     Submit Override
                   </button>
-                </form>
-                {overrideMessage && (
-                  <p className="mt-3 text-sm text-emerald-600">{overrideMessage}</p>
-                )}
-                {overrideError && (
-                  <p className="mt-3 text-sm text-rose-600">{overrideError}</p>
-                )}
-              </>
-            ) : (
-              <p className="mt-4 rounded-md bg-slate-50 p-3 text-sm text-slate-600">
-                Auditor access is read-only. Override controls are hidden.
-              </p>
-            )}
+                </fieldset>
+              </form>
+              {overrideMessage && (
+                <p className="mt-3 text-sm text-emerald-600">{overrideMessage}</p>
+              )}
+              {overrideError && (
+                <p className="mt-3 text-sm text-rose-600">{overrideError}</p>
+              )}
+              {readOnly && (
+                <p className="mt-4 rounded-md bg-slate-50 p-3 text-sm text-slate-600">
+                  Auditor access is read-only. Override controls are disabled.
+                </p>
+              )}
+            </>
           </div>
 
           <div className="rounded-lg bg-white p-6 shadow-sm ring-1 ring-slate-200">
