@@ -1,3 +1,4 @@
+
 """Integration tests covering router registration on the main FastAPI app."""
 
 from __future__ import annotations
@@ -9,10 +10,13 @@ import pytest
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
+
 import pack_exporter
 from app import create_app
+
 from policy_service import RegimeSnapshot, _reset_regime_state, regime_classifier
 from services.models.meta_learner import get_meta_learner, meta_governance_log
+
 
 
 class _FakeS3Client:
@@ -62,39 +66,49 @@ def test_create_app_registers_knowledge_routes(monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_create_app_registers_meta_routes(monkeypatch: pytest.MonkeyPatch) -> None:
+
     learner = get_meta_learner()
     learner.reset()
     meta_governance_log.reset()
     _reset_regime_state()
 
+
     now = dt.datetime.now(dt.timezone.utc)
+
     learner.record_performance(
         symbol="ETH-USD",
         regime="range",
         model="meanrev_model",
+
         score=0.8,
         ts=now - dt.timedelta(minutes=5),
+
     )
     learner.record_performance(
         symbol="ETH-USD",
         regime="range",
         model="trend_model",
+
         score=0.2,
         ts=now - dt.timedelta(minutes=2),
+
     )
 
     snapshot = RegimeSnapshot(
         symbol="ETH-USD",
         regime="range",
         volatility=0.01,
+
         trend_strength=0.3,
         feature_scale=1.0,
         size_scale=1.0,
         sample_count=50,
+
         updated_at=now,
     )
     with regime_classifier._lock:  # type: ignore[attr-defined]
         regime_classifier._snapshots["ETH-USD"] = snapshot  # type: ignore[attr-defined]
+
 
     app = create_app()
     client = TestClient(app)
@@ -110,3 +124,4 @@ def test_create_app_registers_meta_routes(monkeypatch: pytest.MonkeyPatch) -> No
     assert payload["symbol"] == "ETH-USD"
     assert payload["regime"] == "range"
     assert sum(payload["weights"].values()) > 0
+
