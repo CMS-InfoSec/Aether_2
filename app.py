@@ -49,6 +49,7 @@ def create_app() -> FastAPI:
     app.include_router(exposure_router)
     app.include_router(alert_prioritizer_router)
     app.include_router(alert_dedupe_router)
+    app.include_router(knowledge_router)
 
     app.include_router(models_router)
 
