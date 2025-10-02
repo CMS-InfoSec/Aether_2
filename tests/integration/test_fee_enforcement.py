@@ -25,6 +25,8 @@ def test_fee_enforcement_blocks_negative_edge(monkeypatch: pytest.MonkeyPatch) -
         set_pipeline_latency=lambda *args, **kwargs: None,
         setup_metrics=lambda *args, **kwargs: None,
         traced_span=lambda *args, **kwargs: contextlib.nullcontext(),
+        record_scaling_state=lambda *args, **kwargs: None,
+        observe_scaling_evaluation=lambda *args, **kwargs: None,
     )
     monkeypatch.setitem(sys.modules, "metrics", metrics_stub)
 

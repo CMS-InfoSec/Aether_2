@@ -109,6 +109,8 @@ def test_trading_pipeline_emits_fill_event(monkeypatch: pytest.MonkeyPatch) -> N
         record_oms_latency=lambda *args, **kwargs: None,
         record_ws_latency=lambda *args, **kwargs: None,
         record_oms_submit_ack=lambda *args, **kwargs: None,
+        record_scaling_state=lambda *args, **kwargs: None,
+        observe_scaling_evaluation=lambda *args, **kwargs: None,
     )
     sys.modules["metrics"] = metrics_stub
 

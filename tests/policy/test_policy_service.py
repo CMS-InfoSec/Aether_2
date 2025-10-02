@@ -19,6 +19,8 @@ if "metrics" not in sys.modules:
     metrics_stub.setup_metrics = _setup_metrics
     metrics_stub.record_abstention_rate = lambda *args, **kwargs: None
     metrics_stub.record_drift_score = lambda *args, **kwargs: None
+    metrics_stub.record_scaling_state = lambda *args, **kwargs: None
+    metrics_stub.observe_scaling_evaluation = lambda *args, **kwargs: None
     sys.modules["metrics"] = metrics_stub
 
 from services.common.schemas import ActionTemplate, ConfidenceMetrics, PolicyDecisionResponse

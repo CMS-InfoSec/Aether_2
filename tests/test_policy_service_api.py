@@ -17,6 +17,8 @@ if "metrics" not in sys.modules:
     metrics_stub.setup_metrics = lambda app: None
     metrics_stub.record_abstention_rate = lambda *args, **kwargs: None
     metrics_stub.record_drift_score = lambda *args, **kwargs: None
+    metrics_stub.record_scaling_state = lambda *args, **kwargs: None
+    metrics_stub.observe_scaling_evaluation = lambda *args, **kwargs: None
     sys.modules["metrics"] = metrics_stub
 
 import policy_service
