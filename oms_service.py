@@ -28,7 +28,9 @@ from services.oms.kraken_ws import (
     OrderAck,
     OrderState,
 )
-from services.risk.stablecoin_monitor import format_depeg_alert, get_global_monitor
+
+from services.oms.rate_limit_guard import RateLimitGuard, rate_limit_guard as shared_rate_limit_guard
+
 from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
 
 
@@ -296,9 +298,16 @@ class OrderRecord:
 class KrakenSession:
     """Manages Kraken websocket and REST transports for an account."""
 
-    def __init__(self, account_id: str, credential_provider: CredentialProvider) -> None:
+    def __init__(
+        self,
+        account_id: str,
+        credential_provider: CredentialProvider,
+        *,
+        rate_limit_guard: RateLimitGuard | None = None,
+    ) -> None:
         self.account_id = account_id
         self._credential_provider = credential_provider
+        self._rate_limit_guard: RateLimitGuard = rate_limit_guard or shared_rate_limit_guard
         self._rest_client = KrakenRESTClient(
             credential_getter=lambda: self._credential_provider.get(self.account_id)
         )
@@ -306,6 +315,8 @@ class KrakenSession:
             credential_getter=lambda: self._credential_provider.get(self.account_id),
             stream_update_cb=self._on_state,
             rest_client=self._rest_client,
+            rate_limit_guard=self._rate_limit_guard,
+            account_id=self.account_id,
         )
         self._ws_task: Optional[asyncio.Task[None]] = None
         self._ready = asyncio.Event()
@@ -340,13 +351,30 @@ class KrakenSession:
     async def place_order(self, payload: Dict[str, Any], context: OrderContext) -> Tuple[OrderAck, str]:
         await self.ensure_started()
         start = time.perf_counter()
+        await self._rate_limit_guard.acquire(
+            self.account_id,
+            "add_order",
+            transport="websocket",
+            urgent=False,
+        )
         try:
             ack = await self._ws_client.add_order(payload)
-            transport = "websocket"
         except (KrakenWSError, KrakenWSTimeout) as exc:
+            await self._rate_limit_guard.release(
+                self.account_id,
+                transport="websocket",
+                successful=False,
+            )
             increment_oms_error_count(self.account_id, context.symbol, "websocket")
             ack = await self._place_via_rest(payload)
             transport = "rest"
+        else:
+            await self._rate_limit_guard.release(
+                self.account_id,
+                transport="websocket",
+                successful=True,
+            )
+            transport = "websocket"
         latency_ms = (time.perf_counter() - start) * 1000.0
         record_oms_latency(self.account_id, context.symbol, transport, latency_ms)
         exchange_id = ack.exchange_order_id or context.client_id
@@ -366,13 +394,30 @@ class KrakenSession:
         await self.ensure_started()
         payload = {"order_id": order_id}
         start = time.perf_counter()
+        await self._rate_limit_guard.acquire(
+            self.account_id,
+            "cancel_order",
+            transport="websocket",
+            urgent=True,
+        )
         try:
             ack = await self._ws_client.cancel_order(payload)
-            transport = "websocket"
         except (KrakenWSError, KrakenWSTimeout):
+            await self._rate_limit_guard.release(
+                self.account_id,
+                transport="websocket",
+                successful=False,
+            )
             increment_oms_error_count(self.account_id, symbol or "unknown", "websocket")
             ack = await self._cancel_via_rest(payload)
             transport = "rest"
+        else:
+            await self._rate_limit_guard.release(
+                self.account_id,
+                transport="websocket",
+                successful=True,
+            )
+            transport = "websocket"
         latency_ms = (time.perf_counter() - start) * 1000.0
         record_oms_latency(self.account_id, symbol or "unknown", transport, latency_ms)
         exchange_id = ack.exchange_order_id or order_id
@@ -402,16 +447,52 @@ class KrakenSession:
         return None
 
     async def _place_via_rest(self, payload: Dict[str, Any]) -> OrderAck:
+        await self._rate_limit_guard.acquire(
+            self.account_id,
+            "add_order",
+            transport="rest",
+            urgent=False,
+        )
         try:
-            return await self._rest_client.add_order(payload)
+            result = await self._rest_client.add_order(payload)
         except KrakenRESTError as exc:
+            await self._rate_limit_guard.release(
+                self.account_id,
+                transport="rest",
+                successful=False,
+            )
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+        else:
+            await self._rate_limit_guard.release(
+                self.account_id,
+                transport="rest",
+                successful=True,
+            )
+            return result
 
     async def _cancel_via_rest(self, payload: Dict[str, Any]) -> OrderAck:
+        await self._rate_limit_guard.acquire(
+            self.account_id,
+            "cancel_order",
+            transport="rest",
+            urgent=True,
+        )
         try:
-            return await self._rest_client.cancel_order(payload)
+            result = await self._rest_client.cancel_order(payload)
         except KrakenRESTError as exc:
+            await self._rate_limit_guard.release(
+                self.account_id,
+                transport="rest",
+                successful=False,
+            )
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+        else:
+            await self._rate_limit_guard.release(
+                self.account_id,
+                transport="rest",
+                successful=True,
+            )
+            return result
 
     async def _on_state(self, state: OrderState) -> None:
         exchange_id = state.exchange_order_id or state.client_order_id

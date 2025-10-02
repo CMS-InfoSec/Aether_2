@@ -85,6 +85,13 @@ _oms_child_orders_total = Counter(
     registry=_REGISTRY,
 )
 
+_oms_stale_feed_total = Counter(
+    "oms_stale_feed_total",
+    "Number of OMS operations impacted by stale data feeds.",
+    ["service", "account", "symbol", "source", "action"],
+    registry=_REGISTRY,
+)
+
 _oms_latency_ms = Gauge(
     "oms_latency_ms",
     "Current latency of OMS interactions in milliseconds.",
@@ -203,6 +210,7 @@ _METRICS: Dict[str, Counter | Gauge | Histogram] = {
     "oms_errors_total": _oms_errors_total,
     "oms_auth_failures_total": _oms_auth_failures_total,
     "oms_child_orders_total": _oms_child_orders_total,
+    "oms_stale_feed_total": _oms_stale_feed_total,
     "oms_latency_ms": _oms_latency_ms,
     "pipeline_latency_ms": _pipeline_latency_ms,
     "policy_abstention_rate": _policy_abstention_rate,
@@ -462,12 +470,30 @@ def increment_oms_child_orders_total(
     transport: str,
     *,
     service: Optional[str] = None,
+    count: float = 1.0,
 ) -> None:
     _oms_child_orders_total.labels(
         service=_service_value(service),
         account=_normalised(account, "unknown"),
         symbol=_normalised(symbol, "unknown"),
         transport=_normalised(transport, "unknown"),
+    ).inc(count)
+
+
+def increment_oms_stale_feed(
+    account: str,
+    symbol: str,
+    *,
+    source: str,
+    action: str,
+    service: Optional[str] = None,
+) -> None:
+    _oms_stale_feed_total.labels(
+        service=_service_value(service),
+        account=_normalised(account, "unknown"),
+        symbol=_normalised(symbol, "unknown"),
+        source=_normalised(source, "unknown"),
+        action=_normalised(action, "unknown"),
     ).inc()
 
 
@@ -636,6 +662,7 @@ __all__ = [
     "increment_oms_error_count",
     "increment_oms_auth_failures",
     "increment_oms_child_orders_total",
+    "increment_oms_stale_feed",
     "set_oms_latency",
     "record_oms_latency",
     "set_pipeline_latency",

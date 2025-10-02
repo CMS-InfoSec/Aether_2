@@ -4,17 +4,21 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import itertools
 import json
 import logging
 import random
 import time
 import urllib.parse
+
 from decimal import Decimal, InvalidOperation
 from typing import Any, Awaitable, Callable, Dict, Optional
+
 
 import aiohttp
 
 from services.oms.kraken_ws import OrderAck
+from metrics import get_request_id
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +43,8 @@ class KrakenRESTClient:
         self._session = session
         self._base_url = base_url.rstrip("/")
         self._max_retries = max_retries
+        self._nonce_lock = asyncio.Lock()
+        self._nonce_counter = itertools.count(int(time.time() * 1000))
 
     async def _session_or_create(self) -> aiohttp.ClientSession:
         if self._session is None:
@@ -78,7 +84,7 @@ class KrakenRESTClient:
         payload: Dict[str, Any] = {"docalcs": bool(docalcs)}
         return await self._request("/private/OpenPositions", payload)
 
-    async def websocket_token(self) -> str:
+    async def websocket_token(self) -> Tuple[str, Optional[float]]:
         """Fetch a websocket authentication token for the current credentials."""
 
         payload = await self._request("/private/GetWebSocketsToken", {})
@@ -86,22 +92,33 @@ class KrakenRESTClient:
         token = result.get("token")
         if not token:
             raise KrakenRESTError("Kraken REST token response missing token")
-        return str(token)
+        expires = result.get("expires")
+        ttl: Optional[float]
+        if expires is None:
+            ttl = None
+        else:
+            try:
+                ttl = float(expires)
+            except (TypeError, ValueError):
+                ttl = None
+        return str(token), ttl
 
     async def _request(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         credentials = await self._credential_getter()
         session = await self._session_or_create()
 
-        nonce = str(int(time.time() * 1000))
+        nonce = await self._next_nonce()
         body = dict(payload)
         body["nonce"] = nonce
         encoded = urllib.parse.urlencode(body)
 
         signature = self._sign_request(path, nonce, encoded, credentials)
+        request_id = get_request_id() or str(uuid4())
         headers = {
             "API-Key": credentials.get("api_key", ""),
             "API-Sign": signature,
             "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+            "X-Request-ID": request_id,
         }
 
         url = f"{self._base_url}{path}"
@@ -135,6 +152,11 @@ class KrakenRESTClient:
                 continue
 
             return payload
+
+    async def _next_nonce(self) -> str:
+        async with self._nonce_lock:
+            nonce_value = next(self._nonce_counter)
+        return str(nonce_value)
 
     def _parse_response(self, payload: Dict[str, Any]) -> OrderAck:
         result = payload.get("result") or {}

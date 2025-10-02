@@ -42,9 +42,11 @@ from services.oms.warm_start import WarmStartCoordinator
 import websockets
 
 from metrics import (
+    get_request_id,
     increment_oms_auth_failures,
     increment_oms_child_orders_total,
     increment_oms_error_count,
+    increment_oms_stale_feed,
     record_oms_latency,
     setup_metrics,
 )
@@ -56,6 +58,13 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Kraken OMS Async Service")
 setup_metrics(app)
+
+
+def _log_extra(**extra: Any) -> Dict[str, Any]:
+    request_id = get_request_id()
+    if request_id:
+        extra.setdefault("request_id", request_id)
+    return extra
 
 
 class OMSPlaceRequest(BaseModel):
@@ -389,6 +398,16 @@ class _PublicOrderBookState:
         async with self._lock:
             return self._last_ts
 
+    async def is_stale(self, threshold_seconds: float) -> bool:
+        if threshold_seconds <= 0:
+            return False
+        async with self._lock:
+            last_ts = self._last_ts
+            ready = self._ready.is_set()
+        if not ready or last_ts is None:
+            return True
+        return (time.time() - last_ts) > threshold_seconds
+
 
 class KrakenOrderBookStore:
     def __init__(self, depth: int = 10) -> None:
@@ -678,6 +697,13 @@ class AccountContext:
         self._reconcile_task: Optional[asyncio.Task[None]] = None
         self._reconcile_interval = max(float(os.environ.get("OMS_RECONCILE_INTERVAL", "30")), 0.0)
         self._reconcile_lock = asyncio.Lock()
+        try:
+            self._feed_sla_seconds = max(
+                float(os.environ.get("OMS_FEED_SLA_SECONDS", "2.0")),
+                0.0,
+            )
+        except ValueError:
+            self._feed_sla_seconds = 2.0
 
 
     async def _throttle_ws(self, endpoint: str, *, urgent: bool = False) -> None:
@@ -1350,23 +1376,78 @@ class AccountContext:
             )
             book_symbol = _resolve_book_symbol(request.symbol, metadata)
             depth: Optional[Decimal] = None
+            book: _PublicOrderBookState | None = None
             try:
                 book = await order_book_store.ensure_book(book_symbol)
-                depth = await book.depth(request.side, levels=10)
             except Exception as exc:
                 logger.debug(
-                    "Unable to fetch order book depth for %s on account %s: %s",
+                    "Unable to fetch order book for %s on account %s: %s",
                     book_symbol,
                     self.account_id,
                     exc,
                 )
+            if book is not None:
+                try:
+                    if self._feed_sla_seconds > 0 and await book.is_stale(
+                        self._feed_sla_seconds
+                    ):
+                        last_update = await book.last_update()
+                        age = (
+                            max(time.time() - last_update, 0.0)
+                            if last_update is not None
+                            else None
+                        )
+                        increment_oms_stale_feed(
+                            self.account_id,
+                            request.symbol,
+                            source="public_order_book",
+                            action="rejected",
+                        )
+                        age_display = f"{age:.2f}s" if age is not None else "unknown"
+                        logger.warning(
+                            "Rejecting order for account %s symbol %s due to stale public order book (age=%s, threshold=%.2fs)",
+                            self.account_id,
+                            request.symbol,
+                            age_display,
+                            self._feed_sla_seconds,
+                        )
+                        raise HTTPException(
+                            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="Market data is stale; please retry",
+                        )
+                    depth = await book.depth(request.side, levels=10)
+                except HTTPException:
+                    raise
+                except Exception as exc:
+                    logger.debug(
+                        "Unable to fetch order book depth for %s on account %s: %s",
+                        book_symbol,
+                        self.account_id,
+                        exc,
+                    )
+
+            force_rest = False
+            if self._feed_sla_seconds > 0:
+                heartbeat_age = self.ws_client.heartbeat_age()
+                if heartbeat_age is not None and heartbeat_age > self._feed_sla_seconds:
+                    force_rest = True
+                    increment_oms_stale_feed(
+                        self.account_id,
+                        request.symbol,
+                        source="private_stream",
+                        action="rerouted",
+                    )
+                    logger.warning(
+                        "Private stream heartbeat stale for account %s symbol %s (age=%.2fs > %.2fs); forcing REST submission",
+                        self.account_id,
+                        request.symbol,
+                        heartbeat_age,
+                        self._feed_sla_seconds,
+                    )
 
             child_quantities = self._plan_child_quantities(request, qty, metadata, depth)
             if not child_quantities:
                 child_quantities = [qty]
-            increment_oms_child_orders_total(
-                self.account_id, request.symbol, len(child_quantities)
-            )
             if len(child_quantities) > 1:
                 logger.info(
                     "Slicing order for account %s symbol %s into %d child orders (depth=%s)",
@@ -1374,6 +1455,12 @@ class AccountContext:
                     request.symbol,
                     len(child_quantities),
                     depth,
+                    extra=_log_extra(
+                        account_id=self.account_id,
+                        symbol=request.symbol,
+                        child_orders=len(child_quantities),
+                        depth=float(depth) if depth is not None else None,
+                    ),
                 )
 
             child_results: List[OMSOrderStatusResponse] = []
@@ -1387,10 +1474,18 @@ class AccountContext:
             for index, child_qty in enumerate(child_quantities):
                 child_client_base = self._child_client_id(request.client_id, index)
                 payload = self._build_payload(
-                    request, child_qty, px, client_id=child_client_base
+                    request,
+                    child_qty,
+                    px,
+                    metadata,
+                    client_id=child_client_base,
                 )
                 ack, transport, client_id_used, _ = await self._submit_order_with_preference(
-                    payload, request.symbol, child_client_base
+                    payload,
+                    request.symbol,
+                    child_client_base,
+                    preferred_transport="rest" if force_rest else None,
+                    allow_fallback=not force_rest,
                 )
                 transports_used.add(transport)
                 child_result = self._order_result_from_ack(client_id_used, ack)
@@ -1408,6 +1503,13 @@ class AccountContext:
                 request.client_id, child_results, child_records
             )
             aggregate_transport = self._aggregate_transport(transports_used)
+
+            increment_oms_child_orders_total(
+                self.account_id,
+                request.symbol,
+                aggregate_transport,
+                count=len(child_quantities),
+            )
 
 
             async with self._orders_lock:
@@ -1557,8 +1659,25 @@ class AccountContext:
         request: OMSPlaceRequest,
         qty: Decimal,
         price: Optional[Decimal],
+        metadata: Dict[str, Any] | None = None,
+        *,
         client_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        pair_meta = _resolve_pair_metadata(request.symbol, metadata)
+        price_step = (
+            _PrecisionValidator._step(
+                pair_meta,
+                ["price_increment", "pair_decimals", "tick_size"],
+            )
+            if pair_meta
+            else None
+        )
+
+        def _snap_price(value: Optional[Decimal]) -> Optional[Decimal]:
+            if value is None or price_step is None:
+                return value
+            return _PrecisionValidator._snap(value, price_step)
+
         payload: Dict[str, Any] = {
             "clientOrderId": client_id or request.client_id,
             "pair": _normalize_symbol(request.symbol),
@@ -1567,8 +1686,9 @@ class AccountContext:
             "volume": str(qty),
         }
         payload["idempotencyKey"] = client_id or request.client_id
-        if price is not None:
-            payload["price"] = str(price)
+        snapped_price = _snap_price(price)
+        if snapped_price is not None:
+            payload["price"] = str(snapped_price)
 
         oflags = set(flag.lower() for flag in request.flags)
         if request.post_only:
@@ -1580,12 +1700,15 @@ class AccountContext:
 
         if request.tif:
             payload["timeInForce"] = request.tif.upper()
-        if request.take_profit is not None:
-            payload["takeProfit"] = str(request.take_profit)
-        if request.stop_loss is not None:
-            payload["stopLoss"] = str(request.stop_loss)
-        if request.trailing_offset is not None:
-            payload["trailingStopOffset"] = str(request.trailing_offset)
+        snapped_take_profit = _snap_price(request.take_profit)
+        if snapped_take_profit is not None:
+            payload["takeProfit"] = str(snapped_take_profit)
+        snapped_stop_loss = _snap_price(request.stop_loss)
+        if snapped_stop_loss is not None:
+            payload["stopLoss"] = str(snapped_stop_loss)
+        snapped_trailing_offset = _snap_price(request.trailing_offset)
+        if snapped_trailing_offset is not None:
+            payload["trailingStopOffset"] = str(snapped_trailing_offset)
 
         return payload
 
@@ -1721,6 +1844,9 @@ class AccountContext:
         payload: Dict[str, Any],
         symbol: str,
         base_client_id: str,
+        *,
+        preferred_transport: Optional[str] = None,
+        allow_fallback: bool = True,
     ) -> Tuple[OrderAck, str, str, float]:
         assert self.ws_client is not None
         assert self.rest_client is not None
@@ -1728,10 +1854,10 @@ class AccountContext:
         base_payload = dict(payload)
         base_payload.setdefault("idempotencyKey", base_client_id)
         self.routing.update_probe_template(base_payload)
-        preferred = self.routing.preferred_path
+        preferred = preferred_transport or self.routing.preferred_path
         transports = [preferred]
         fallback = "rest" if preferred == "websocket" else "websocket"
-        if fallback not in transports:
+        if allow_fallback and fallback not in transports:
             transports.append(fallback)
 
         ws_failed = False
@@ -1762,6 +1888,11 @@ class AccountContext:
                     self.account_id,
                     symbol,
                     exc,
+                    extra=_log_extra(
+                        account_id=self.account_id,
+                        symbol=symbol,
+                        transport="websocket",
+                    ),
                 )
                 ws_failed = True
                 last_ws_error = exc
@@ -1773,6 +1904,11 @@ class AccountContext:
                     self.account_id,
                     symbol,
                     rest_exc,
+                    extra=_log_extra(
+                        account_id=self.account_id,
+                        symbol=symbol,
+                        transport="rest",
+                    ),
                 )
                 last_rest_error = rest_exc
                 continue
@@ -1786,6 +1922,12 @@ class AccountContext:
                 symbol,
                 transport,
                 latency_ms,
+                extra=_log_extra(
+                    account_id=self.account_id,
+                    symbol=symbol,
+                    transport=transport,
+                    latency_ms=latency_ms,
+                ),
             )
             client_id_used = str(attempt_payload.get("clientOrderId", base_client_id))
             return ack, transport, client_id_used, latency_ms
@@ -1813,6 +1955,12 @@ class AccountContext:
                 self.account_id,
                 symbol,
                 latency_ms,
+                extra=_log_extra(
+                    account_id=self.account_id,
+                    symbol=symbol,
+                    transport="rest",
+                    latency_ms=latency_ms,
+                ),
             )
             client_id_used = str(rest_payload["clientOrderId"])
             return ack, "rest", client_id_used, latency_ms
@@ -1971,14 +2119,14 @@ async def require_account_id(request: Request) -> str:
 
     logger.warning(
         "Unauthorized OMS request missing X-Account-ID header",
-        extra={
-            "event": "oms.auth_failure",
-            "reason": reason,
-            "status_code": status.HTTP_401_UNAUTHORIZED,
-            "source_ip": _extract_source_ip(request),
-            "account_header": _redact_account_header(raw_header),
-            "path": request.url.path,
-        },
+        extra=_log_extra(
+            event="oms.auth_failure",
+            reason=reason,
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            source_ip=_extract_source_ip(request),
+            account_header=_redact_account_header(raw_header),
+            path=request.url.path,
+        ),
     )
 
     raise HTTPException(

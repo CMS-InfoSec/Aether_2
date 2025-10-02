@@ -2,12 +2,28 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 import types
 from decimal import Decimal
 
 import pytest
 
 _websockets_stub = types.ModuleType("websockets")
+
+_fastapi_stub = types.ModuleType("fastapi")
+
+
+class _DummyFastAPI:
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        pass
+
+
+class _DummyRequest:
+    pass
+
+
+class _DummyResponse:
+    pass
 
 
 class _DummyWebSocketProtocol:
@@ -30,6 +46,24 @@ _websocket_exceptions.WebSocketException = _DummyWebSocketException
 
 sys.modules.setdefault("websockets", _websockets_stub)
 sys.modules.setdefault("websockets.exceptions", _websocket_exceptions)
+_fastapi_stub.FastAPI = _DummyFastAPI  # type: ignore[attr-defined]
+_fastapi_stub.Request = _DummyRequest  # type: ignore[attr-defined]
+_fastapi_stub.Response = _DummyResponse  # type: ignore[attr-defined]
+sys.modules.setdefault("fastapi", _fastapi_stub)
+_starlette_stub = types.ModuleType("starlette")
+_starlette_middleware_stub = types.ModuleType("starlette.middleware")
+_starlette_middleware_base_stub = types.ModuleType("starlette.middleware.base")
+
+
+class _DummyBaseHTTPMiddleware:
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        pass
+
+
+_starlette_middleware_base_stub.BaseHTTPMiddleware = _DummyBaseHTTPMiddleware  # type: ignore[attr-defined]
+sys.modules.setdefault("starlette", _starlette_stub)
+sys.modules.setdefault("starlette.middleware", _starlette_middleware_stub)
+sys.modules.setdefault("starlette.middleware.base", _starlette_middleware_base_stub)
 
 _aiohttp_stub = types.ModuleType("aiohttp")
 
@@ -62,18 +96,34 @@ from services.oms.kraken_ws import KrakenWSClient, KrakenWSError
 
 
 class _StubRestClient:
-    def __init__(self, token: str = "rest-token") -> None:
+    def __init__(self, token: str = "rest-token", expires: float = 900.0) -> None:
         self.token = token
+        self.expires = expires
         self.calls = 0
 
-    async def websocket_token(self) -> str:
+    async def websocket_token(self) -> tuple[str, float]:
         self.calls += 1
-        return self.token
+        return self.token, self.expires
 
 
 class _FailingRestClient:
-    async def websocket_token(self) -> str:
+    async def websocket_token(self) -> tuple[str, float]:
         raise RuntimeError("boom")
+
+
+class _StubGuard:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, str]] = []
+
+    async def acquire(
+        self,
+        account_id: str,
+        endpoint: str,
+        *,
+        transport: str = "rest",
+        urgent: bool = False,
+    ) -> None:
+        self.calls.append((account_id, endpoint, transport))
 
 
 def test_sign_auth_prefers_existing_token() -> None:
@@ -124,6 +174,7 @@ def test_sign_auth_rest_failure_raises() -> None:
     asyncio.run(_run())
 
 
+
 def test_ack_from_payload_preserves_decimal_precision() -> None:
     async def _creds() -> dict[str, str]:
         return {}
@@ -168,3 +219,4 @@ def test_rest_parse_response_preserves_decimal_precision() -> None:
     assert isinstance(ack.avg_price, Decimal)
     assert ack.filled_qty == Decimal("0.000000123456789")
     assert ack.avg_price == Decimal("98765.432109876")
+
