@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import importlib
 import sys
@@ -111,12 +112,86 @@ def test_require_authorized_caller_accepts_known_token(configured_settings):
     assert settings.authorized_token_ids == ("token-1", "token-2")
     assert settings.authorized_token_labels["token-1"] == "alpha"
 
-    actor = secrets_service.require_authorized_caller("Bearer token-1")
+    actor = asyncio.run(secrets_service.require_authorized_caller("Bearer token-1"))
     assert actor == "alpha"
 
 
 def test_require_authorized_caller_rejects_unknown_token(configured_settings):
     _, secrets_service = configured_settings
     with pytest.raises(secrets_service.HTTPException) as excinfo:
-        secrets_service.require_authorized_caller("Bearer unknown")
+        asyncio.run(secrets_service.require_authorized_caller("Bearer unknown"))
     assert excinfo.value.status_code == secrets_service.status.HTTP_403_FORBIDDEN
+
+
+def test_require_authorized_caller_returns_503_when_settings_unavailable(
+    monkeypatch, secrets_service_module
+):
+    secrets_service = secrets_service_module
+
+    monkeypatch.delenv("SECRET_ENCRYPTION_KEY", raising=False)
+    monkeypatch.delenv("SECRETS_SERVICE_AUTH_TOKENS", raising=False)
+    monkeypatch.delenv("KRAKEN_SECRETS_AUTH_TOKENS", raising=False)
+
+    monkeypatch.setattr(secrets_service, "SETTINGS", None, raising=False)
+    monkeypatch.setattr(secrets_service, "CIPHER", None, raising=False)
+    monkeypatch.setattr(secrets_service, "secret_manager", None, raising=False)
+    secrets_service.STATE.initialization_error = None
+
+    call_count = {"value": 0}
+
+    async def fake_initialize(force: bool = False) -> None:
+        call_count["value"] += 1
+
+    monkeypatch.setattr(secrets_service, "initialize_dependencies", fake_initialize)
+
+    with pytest.raises(secrets_service.HTTPException) as excinfo:
+        asyncio.run(secrets_service.require_authorized_caller("Bearer token-1"))
+
+    assert excinfo.value.status_code == secrets_service.status.HTTP_503_SERVICE_UNAVAILABLE
+    assert call_count["value"] == 1
+
+
+def test_require_authorized_caller_returns_503_when_kubernetes_unavailable(
+    monkeypatch, secrets_service_module
+):
+    secrets_service = secrets_service_module
+
+    encryption_key = base64.b64encode(b"x" * 32).decode("utf-8")
+    monkeypatch.setenv("SECRET_ENCRYPTION_KEY", encryption_key)
+    monkeypatch.setenv("SECRETS_SERVICE_AUTH_TOKENS", "token-1")
+    monkeypatch.setenv("KRAKEN_SECRETS_AUTH_TOKENS", "token-1:alpha")
+
+    monkeypatch.setattr(secrets_service, "SETTINGS", None, raising=False)
+    monkeypatch.setattr(secrets_service, "CIPHER", None, raising=False)
+    monkeypatch.setattr(secrets_service, "secret_manager", None, raising=False)
+    secrets_service.STATE.initialization_error = None
+
+    async def immediate_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(secrets_service.asyncio, "sleep", immediate_sleep)
+
+    def fail_kubernetes_config() -> None:
+        raise secrets_service.ConfigException("kubernetes unavailable")
+
+    monkeypatch.setattr(
+        secrets_service, "load_kubernetes_config", fail_kubernetes_config
+    )
+
+    call_count = {"value": 0}
+    original_initialize = secrets_service.initialize_dependencies
+
+    async def wrapped_initialize(force: bool = False) -> None:
+        call_count["value"] += 1
+        await original_initialize(force=force)
+
+    monkeypatch.setattr(
+        secrets_service, "initialize_dependencies", wrapped_initialize
+    )
+
+    with pytest.raises(secrets_service.HTTPException) as excinfo:
+        asyncio.run(secrets_service.require_authorized_caller("Bearer token-1"))
+
+    assert excinfo.value.status_code == secrets_service.status.HTTP_503_SERVICE_UNAVAILABLE
+    assert call_count["value"] == 1
+    assert isinstance(secrets_service.STATE.initialization_error, Exception)
