@@ -88,6 +88,7 @@ class ReconcileLogStore:
 @dataclass
 class ReconcileStats:
     balances_checked: int = 0
+    orders_checked: int = 0
     mismatches_fixed: int = 0
     alerts: int = 0
 
@@ -157,6 +158,7 @@ class OMSReconciler:
         async with self._stats_lock:
             return {
                 "balances_checked": self._stats.balances_checked,
+                "orders_checked": self._stats.orders_checked,
                 "mismatches_fixed": self._stats.mismatches_fixed,
                 "alerts": self._stats.alerts,
             }
@@ -181,6 +183,7 @@ class OMSReconciler:
             return
 
         total_balances = 0
+        total_orders = 0
         total_fixed = 0
 
         for account in accounts:
@@ -195,6 +198,7 @@ class OMSReconciler:
                 continue
 
             total_balances += result.balances_checked
+            total_orders += result.orders_checked
             total_fixed += result.mismatches_fixed
 
             mismatch_payload = result.log_payload()
@@ -210,9 +214,10 @@ class OMSReconciler:
                 account.account_id, result.mismatches_remaining
             )
 
-        if total_balances or total_fixed:
+        if total_balances or total_orders or total_fixed:
             async with self._stats_lock:
                 self._stats.balances_checked += total_balances
+                self._stats.orders_checked += total_orders
                 self._stats.mismatches_fixed += total_fixed
 
     async def _reconcile_account(self, account: "AccountContext") -> AccountReconcileResult:
