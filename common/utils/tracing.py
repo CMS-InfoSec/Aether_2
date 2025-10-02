@@ -42,6 +42,16 @@ try:  # pragma: no cover - prometheus client may be optional
 except Exception:  # pragma: no cover
     Histogram = None  # type: ignore
 
+try:  # pragma: no cover - FastAPI/Starlette may be optional
+    from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+    from starlette.requests import Request
+    from starlette.responses import Response
+except Exception:  # pragma: no cover - ensure module import does not fail
+    BaseHTTPMiddleware = cast(Any, object)
+    RequestResponseEndpoint = Callable[..., Awaitable[Any]]  # type: ignore
+    Request = Any  # type: ignore
+    Response = Any  # type: ignore
+
 LOGGER = logging.getLogger(__name__)
 
 _SERVICE_NAME = "service"
@@ -224,6 +234,46 @@ def attach_correlation(
     return dict(payload)
 
 
+class CorrelationIdMiddleware(BaseHTTPMiddleware):
+    """FastAPI/Starlette middleware that manages correlation identifiers."""
+
+    def __init__(
+        self,
+        app: Any,
+        *,
+        header_name: str = "x-correlation-id",
+        response_header: Optional[str] = None,
+    ) -> None:
+        if BaseHTTPMiddleware is object:  # type: ignore[comparison-overlap]
+            raise RuntimeError(
+                "CorrelationIdMiddleware requires starlette.middleware.base.BaseHTTPMiddleware"
+            )
+        super().__init__(app)
+        self._header_name = header_name
+        self._response_header = response_header or header_name
+
+    async def dispatch(
+        self,
+        request: "Request",
+        call_next: "RequestResponseEndpoint",
+    ) -> "Response":  # pragma: no cover - exercised via FastAPI integration tests
+        incoming = None
+        if hasattr(request, "headers"):
+            try:
+                incoming = request.headers.get(self._header_name)
+            except Exception:  # pragma: no cover - defensive guard for exotic headers
+                incoming = None
+
+        with correlation_scope(incoming) as correlation_id:
+            if hasattr(request, "state"):
+                setattr(request.state, "correlation_id", correlation_id)
+
+            response = await call_next(request)
+            if hasattr(response, "headers"):
+                response.headers[self._response_header] = correlation_id
+            return response
+
+
 def _observe_stage_latency(stage: str, duration_seconds: float) -> None:
     if _STAGE_LATENCY_HISTOGRAM is None:
         return
@@ -377,6 +427,7 @@ def trace_request(func: Callable[..., R] | Callable[..., Awaitable[R]]) -> Calla
 
 
 __all__ = [
+    "CorrelationIdMiddleware",
     "attach_correlation",
     "correlation_scope",
     "current_correlation_id",

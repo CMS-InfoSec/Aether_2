@@ -6,6 +6,7 @@ from . import tracing as tracing
 from .audit_logger import hash_ip, log_audit, main, verify_audit_chain
 from .tracing import (
     attach_correlation,
+    CorrelationIdMiddleware,
     correlation_scope,
     current_correlation_id,
     fill_span,
@@ -14,11 +15,13 @@ from .tracing import (
     policy_span,
     risk_span,
     stage_span,
+    trace_request,
 )
 
 __all__ = [
     "audit_logger",
     "attach_correlation",
+    "CorrelationIdMiddleware",
     "correlation_scope",
     "current_correlation_id",
     "fill_span",
@@ -28,6 +31,7 @@ __all__ = [
     "oms_span",
     "policy_span",
     "risk_span",
+    "trace_request",
     "stage_span",
     "tracing",
     "verify_audit_chain",
