@@ -10,7 +10,7 @@ import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, Sequence
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, MutableMapping, Optional, Sequence
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -18,6 +18,7 @@ from psycopg2 import sql
 from psycopg2.extras import RealDictCursor
 
 from services.common.config import TimescaleSession, get_timescale_session
+from services.models.model_server import get_active_model
 
 LOGGER = logging.getLogger(__name__)
 
@@ -142,6 +143,26 @@ WHERE ts < %(cutoff)s
 """
 
 
+TRADE_CONTEXT_QUERY = """
+SELECT
+    COALESCE(f.fill_id::text, o.order_id::text) AS trade_id,
+    COALESCE(f.order_id::text, o.order_id::text) AS order_id,
+    COALESCE(f.account_id::text, o.account_id::text) AS account_id,
+    COALESCE(f.market::text, f.symbol::text, o.market::text, o.symbol::text) AS instrument,
+    COALESCE(f.fill_time, f.fill_ts, o.submitted_at) AS executed_at,
+    f.metadata AS fill_metadata,
+    o.metadata AS order_metadata
+FROM fills AS f
+LEFT JOIN orders AS o ON o.order_id = f.order_id
+WHERE
+    f.fill_id::text = %(trade_id)s
+    OR f.order_id::text = %(trade_id)s
+    OR o.order_id::text = %(trade_id)s
+ORDER BY COALESCE(f.fill_time, f.fill_ts, o.submitted_at) DESC
+LIMIT 1
+"""
+
+
 @dataclass(frozen=True)
 class TradeRecord:
     """Normalized trade lifecycle information."""
@@ -237,6 +258,10 @@ def _isoformat(value: datetime) -> str:
     else:
         value = value.astimezone(timezone.utc)
     return value.isoformat()
+
+
+class TradeContextError(RuntimeError):
+    """Raised when a trade cannot be explained due to missing context."""
 
 
 class DailyReportService:
@@ -345,7 +370,11 @@ class DailyReportService:
 
     def export_daily_report(self, report: DailyReport, *, fmt: str) -> tuple[bytes, str, str]:
         fmt_lower = fmt.lower()
-        if fmt_lower == "csv":
+        if fmt_lower == "json":
+            data = self._serialize_json(report)
+            filename = f"daily_report_{report.account_id}_{report.report_date.isoformat()}.json"
+            content_type = "application/json"
+        elif fmt_lower == "csv":
             data = self._serialize_csv(report)
             filename = f"daily_report_{report.account_id}_{report.report_date.isoformat()}.csv"
             content_type = "text/csv"
@@ -354,7 +383,7 @@ class DailyReportService:
             filename = f"daily_report_{report.account_id}_{report.report_date.isoformat()}.pdf"
             content_type = "application/pdf"
         else:
-            raise ValueError("Unsupported export format; choose 'csv' or 'pdf'")
+            raise ValueError("Unsupported export format; choose 'json', 'csv', or 'pdf'")
         return data, filename, content_type
 
     def persist_report(self, report: DailyReport, payload: Mapping[str, Any]) -> None:
@@ -373,6 +402,72 @@ class DailyReportService:
             cursor.execute(REPORTS_TABLE_DDL)
             cursor.execute(UPSERT_REPORT_SQL, params)
             cursor.execute(DELETE_EXPIRED_REPORTS_SQL, {"cutoff": cutoff})
+
+    def explain_trade(self, trade_id: str) -> Dict[str, Any]:
+        identifier = (trade_id or "").strip()
+        if not identifier:
+            raise ValueError("trade_id must be provided")
+
+        config = self._timescale(self._default_account_id)
+        with self._session(config) as cursor:
+            cursor.execute(TRADE_CONTEXT_QUERY, {"trade_id": identifier})
+            row = cursor.fetchone()
+
+        if row is None:
+            raise LookupError("Trade not found")
+
+        trade_row = dict(row)
+        account_id = str(trade_row.get("account_id") or "").strip()
+        if not account_id:
+            raise TradeContextError("Trade is missing account context")
+
+        instrument = str(trade_row.get("instrument") or "").strip()
+        if not instrument:
+            raise TradeContextError("Trade is missing instrument context")
+
+        features = _extract_feature_mapping(trade_row)
+
+        model = get_active_model(account_id, instrument)
+        try:
+            raw_importance = model.explain(features)
+        except Exception as exc:  # pragma: no cover - defensive safety net
+            LOGGER.exception(
+                "Model explanation failed",
+                extra={"trade_id": identifier, "account_id": account_id},
+            )
+            raise TradeContextError("Unable to generate feature importances") from exc
+
+        contributions = self._normalise_contributions(raw_importance)
+        ordered = sorted(contributions, key=lambda entry: abs(entry[1]), reverse=True)
+
+        executed_at: Optional[datetime] = None
+        executed_raw = trade_row.get("executed_at")
+        if executed_raw is not None:
+            executed_at = _ensure_datetime(executed_raw)
+
+        reason = _extract_reason(trade_row)
+        if not reason and ordered:
+            top_feature, top_value = ordered[0]
+            direction = "positive" if top_value >= 0 else "negative"
+            reason = (
+                f"Feature '{top_feature}' had a {direction} contribution of {top_value:.4f} "
+                "to the decision."
+            )
+
+        explanation = {
+            "trade_id": trade_row.get("trade_id") or identifier,
+            "account_id": account_id,
+            "instrument": instrument,
+            "executed_at": _isoformat(executed_at) if executed_at else None,
+            "model_used": _resolve_model_identifier(trade_row, model),
+            "regime": _extract_regime_label(trade_row),
+            "reason": reason or "No explicit model reasoning recorded",
+            "feature_importances": [
+                {"feature": name, "importance": value} for name, value in ordered[:10]
+            ],
+            "feature_count": len(ordered),
+        }
+        return explanation
 
     # ------------------------------------------------------------------
     # Helpers
@@ -409,6 +504,11 @@ class DailyReportService:
             return 0.0
         weighted = sum(abs(fill.quantity) * fill.slippage_bps for fill in fills)
         return weighted / total_size
+
+    @staticmethod
+    def _serialize_json(report: DailyReport) -> bytes:
+        payload = report.to_dict()
+        return json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
     @staticmethod
     def _serialize_csv(report: DailyReport) -> bytes:
@@ -482,6 +582,32 @@ class DailyReportService:
                 f"Fill {fill.order_id} {fill.quantity} @ {fill.price} fee {fill.fee}bps {fill.slippage_bps:.4f}"
             )
         return _pdf_from_lines(lines)
+
+    @staticmethod
+    def _normalise_contributions(raw: Any) -> List[tuple[str, float]]:
+        if isinstance(raw, Mapping):
+            pairs = []
+            for name, value in raw.items():
+                try:
+                    pairs.append((str(name), float(value)))
+                except (TypeError, ValueError) as exc:
+                    raise TradeContextError(
+                        f"Feature importance for '{name}' is not numeric"
+                    ) from exc
+            return pairs
+
+        if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, bytearray)):
+            pairs = []
+            for idx, value in enumerate(raw):
+                try:
+                    pairs.append((f"feature_{idx}", float(value)))
+                except (TypeError, ValueError) as exc:
+                    raise TradeContextError(
+                        f"Feature importance at position {idx} is not numeric"
+                    ) from exc
+            return pairs
+
+        raise TradeContextError("Model explanation returned unsupported format")
 
 
 def _as_float(value: Any) -> float:
@@ -558,6 +684,136 @@ def _pdf_from_lines(lines: Iterable[str]) -> bytes:
     return buffer.getvalue()
 
 
+def _normalise_feature_payload(raw: Any) -> MutableMapping[str, float]:
+    if isinstance(raw, Mapping):
+        normalised: MutableMapping[str, float] = {}
+        for key, value in raw.items():
+            try:
+                normalised[str(key)] = float(value)
+            except (TypeError, ValueError) as exc:
+                raise TradeContextError(f"Feature '{key}' is not numeric") from exc
+        if normalised:
+            return normalised
+
+    if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, bytearray)):
+        normalised = {}
+        for idx, value in enumerate(raw):
+            try:
+                normalised[f"feature_{idx}"] = float(value)
+            except (TypeError, ValueError) as exc:
+                raise TradeContextError(
+                    f"Feature at position {idx} is not numeric"
+                ) from exc
+        if normalised:
+            return normalised
+
+    return {}
+
+
+def _extract_feature_mapping(trade_row: Mapping[str, Any]) -> MutableMapping[str, float]:
+    candidates = ("features", "feature_vector", "feature_values")
+    for key in candidates:
+        if key in trade_row:
+            mapping = _normalise_feature_payload(trade_row[key])
+            if mapping:
+                return mapping
+
+    metadata_candidates = (
+        trade_row.get("order_metadata"),
+        trade_row.get("fill_metadata"),
+        trade_row.get("metadata"),
+    )
+    for container in metadata_candidates:
+        if isinstance(container, Mapping):
+            for key in candidates:
+                if key in container:
+                    mapping = _normalise_feature_payload(container[key])
+                    if mapping:
+                        return mapping
+
+    raise TradeContextError("Trade is missing feature metadata")
+
+
+def _extract_model_version(trade_row: Mapping[str, Any]) -> Optional[str]:
+    model_version = trade_row.get("model_version")
+    if isinstance(model_version, str) and model_version:
+        return model_version
+
+    metadata_candidates = (
+        trade_row.get("order_metadata"),
+        trade_row.get("fill_metadata"),
+        trade_row.get("metadata"),
+    )
+    for container in metadata_candidates:
+        if isinstance(container, Mapping):
+            candidate = container.get("model_version")
+            if isinstance(candidate, str) and candidate:
+                return candidate
+    return None
+
+
+def _extract_regime_label(trade_row: Mapping[str, Any]) -> str:
+    search_space: Iterable[Any] = (
+        trade_row.get("regime"),
+        trade_row.get("state"),
+        trade_row.get("order_metadata"),
+        trade_row.get("fill_metadata"),
+        trade_row.get("metadata"),
+    )
+
+    for candidate in search_space:
+        if isinstance(candidate, Mapping):
+            regime = candidate.get("regime")
+            if isinstance(regime, str) and regime:
+                return regime
+            state = candidate.get("state")
+            if isinstance(state, Mapping):
+                nested = state.get("regime")
+                if isinstance(nested, str) and nested:
+                    return nested
+        elif isinstance(candidate, str) and candidate:
+            return candidate
+
+    return "unknown"
+
+
+def _resolve_model_identifier(trade_row: Mapping[str, Any], model: Any) -> str:
+    version = _extract_model_version(trade_row)
+    if version:
+        return version
+
+    for attr in ("name", "model_name", "version"):
+        value = getattr(model, attr, None)
+        if isinstance(value, str) and value:
+            return value
+
+    return type(model).__name__
+
+
+def _extract_reason(trade_row: Mapping[str, Any]) -> Optional[str]:
+    direct_candidates: Iterable[Any] = (
+        trade_row.get("reason"),
+        trade_row.get("decision_reason"),
+    )
+    for candidate in direct_candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+
+    metadata_candidates = (
+        trade_row.get("order_metadata"),
+        trade_row.get("fill_metadata"),
+        trade_row.get("metadata"),
+    )
+    for container in metadata_candidates:
+        if isinstance(container, Mapping):
+            for key in ("reason", "decision_reason", "model_reason"):
+                value = container.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+
+    return None
+
+
 router = APIRouter(prefix="/reports", tags=["reports"])
 
 
@@ -596,7 +852,7 @@ async def get_daily_report(
 
 @router.post("/export")
 async def export_daily_report(
-    format: str = Query(..., regex="^(?i)(pdf|csv)$"),
+    format: str = Query(..., regex="^(?i)(pdf|csv|json)$"),
     account_id: str | None = Query(default=None),
     report_date: date | None = Query(default=None),
 ) -> StreamingResponse:
@@ -620,9 +876,26 @@ async def export_daily_report(
     )
 
 
+@router.get("/explain")
+async def explain_trade(trade_id: str = Query(..., description="Unique trade or order identifier")) -> Dict[str, Any]:
+    service = get_daily_report_service()
+    try:
+        return service.explain_trade(trade_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except TradeContextError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:  # pragma: no cover - unexpected error surface
+        LOGGER.exception("Failed to generate explanation for trade %s", trade_id)
+        raise HTTPException(status_code=500, detail="Unable to generate explanation") from exc
+
+
 __all__ = [
     "DailyReport",
     "DailyReportService",
+    "TradeContextError",
     "router",
     "get_daily_report_service",
 ]
