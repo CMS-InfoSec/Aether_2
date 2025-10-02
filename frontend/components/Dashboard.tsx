@@ -1,4 +1,5 @@
 import React, { FormEvent, useEffect, useMemo, useState } from "react";
+import { useAuthClaims } from "./useAuthClaims";
 
 interface ExposureBreakdown {
   asset: string;
@@ -201,6 +202,7 @@ const Dashboard: React.FC = () => {
   const [rotationMessage, setRotationMessage] = useState<string | null>(null);
   const [rotationError, setRotationError] = useState<string | null>(null);
   const [rotationSubmitting, setRotationSubmitting] = useState(false);
+  const { readOnly } = useAuthClaims();
 
   useEffect(() => {
     let isMounted = true;
@@ -751,50 +753,56 @@ const Dashboard: React.FC = () => {
                 </dl>
               </div>
 
-              <form onSubmit={handleRotateSecrets} className="space-y-3">
-                <div className="text-xs uppercase tracking-wide text-slate-500">
-                  Rotate Kraken API Keys
+              {!readOnly ? (
+                <form onSubmit={handleRotateSecrets} className="space-y-3">
+                  <div className="text-xs uppercase tracking-wide text-slate-500">
+                    Rotate Kraken API Keys
+                  </div>
+                  <label className="block text-xs text-slate-400">
+                    API Key
+                    <input
+                      type="text"
+                      value={apiKey}
+                      onChange={(event) => setApiKey(event.target.value)}
+                      className="mt-1 w-full rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-white outline-none focus:border-emerald-500"
+                      placeholder="Enter new API key"
+                      autoComplete="off"
+                    />
+                  </label>
+                  <label className="block text-xs text-slate-400">
+                    API Secret
+                    <input
+                      type="password"
+                      value={apiSecret}
+                      onChange={(event) => setApiSecret(event.target.value)}
+                      className="mt-1 w-full rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-white outline-none focus:border-emerald-500"
+                      placeholder="Enter new API secret"
+                      autoComplete="off"
+                    />
+                  </label>
+                  <button
+                    type="submit"
+                    disabled={rotationSubmitting}
+                    className="w-full rounded-md bg-emerald-500 px-3 py-2 text-sm font-semibold text-slate-950 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-slate-800 disabled:text-slate-400"
+                  >
+                    {rotationSubmitting ? "Rotating..." : "Rotate Credentials"}
+                  </button>
+                  {rotationError && (
+                    <div className="rounded-md border border-rose-500/40 bg-rose-950/40 px-3 py-2 text-xs text-rose-200">
+                      {rotationError}
+                    </div>
+                  )}
+                  {rotationMessage && (
+                    <div className="rounded-md border border-emerald-500/40 bg-emerald-950/30 px-3 py-2 text-xs text-emerald-200">
+                      {rotationMessage}
+                    </div>
+                  )}
+                </form>
+              ) : (
+                <div className="rounded-md border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-300">
+                  Auditor access is read-only. Credential rotation is disabled.
                 </div>
-                <label className="block text-xs text-slate-400">
-                  API Key
-                  <input
-                    type="text"
-                    value={apiKey}
-                    onChange={(event) => setApiKey(event.target.value)}
-                    className="mt-1 w-full rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-white outline-none focus:border-emerald-500"
-                    placeholder="Enter new API key"
-                    autoComplete="off"
-                  />
-                </label>
-                <label className="block text-xs text-slate-400">
-                  API Secret
-                  <input
-                    type="password"
-                    value={apiSecret}
-                    onChange={(event) => setApiSecret(event.target.value)}
-                    className="mt-1 w-full rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-white outline-none focus:border-emerald-500"
-                    placeholder="Enter new API secret"
-                    autoComplete="off"
-                  />
-                </label>
-                <button
-                  type="submit"
-                  disabled={rotationSubmitting}
-                  className="w-full rounded-md bg-emerald-500 px-3 py-2 text-sm font-semibold text-slate-950 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-slate-800 disabled:text-slate-400"
-                >
-                  {rotationSubmitting ? "Rotating..." : "Rotate Credentials"}
-                </button>
-                {rotationError && (
-                  <div className="rounded-md border border-rose-500/40 bg-rose-950/40 px-3 py-2 text-xs text-rose-200">
-                    {rotationError}
-                  </div>
-                )}
-                {rotationMessage && (
-                  <div className="rounded-md border border-emerald-500/40 bg-emerald-950/30 px-3 py-2 text-xs text-emerald-200">
-                    {rotationMessage}
-                  </div>
-                )}
-              </form>
+              )}
             </div>
           </div>
         </section>

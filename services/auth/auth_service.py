@@ -259,12 +259,12 @@ class AuthService:
         base_permissions = {
             "view_reports",
             "view_logs",
-            "view_trades",
+            "view_metrics",
         }
         if role == "auditor":
             return base_permissions
         if role == "admin":
-            return base_permissions | {"place_orders", "modify_configs"}
+            return base_permissions | {"view_trades", "place_orders", "modify_configs"}
         return set()
 
     def _encode_jwt(self, payload: Dict[str, Any]) -> str:

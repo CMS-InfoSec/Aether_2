@@ -5,6 +5,7 @@ import React, {
   useMemo,
   useState,
 } from "react";
+import { useAuthClaims } from "./useAuthClaims";
 
 interface SafeModeStatusResponse {
   active: boolean;
@@ -96,6 +97,7 @@ const DirectorControls: React.FC = () => {
   const [auditTrail, setAuditTrail] = useState<DirectorAction[]>([]);
   const [auditLoading, setAuditLoading] = useState<boolean>(true);
   const [auditError, setAuditError] = useState<string | null>(null);
+  const { readOnly } = useAuthClaims();
 
   const safeModeStatusLabel = useMemo(() => {
     if (!safeModeStatus) {
@@ -417,133 +419,157 @@ const DirectorControls: React.FC = () => {
         </p>
         {safeModeLoading && <p>Loading safe mode status…</p>}
         {safeModeError && <p className="error">{safeModeError}</p>}
-        <div className="form-grid">
-          <label htmlFor="safe-mode-reason">Reason</label>
-          <input
-            id="safe-mode-reason"
-            type="text"
-            value={safeModeReason}
-            onChange={(event) => setSafeModeReason(event.target.value)}
-            placeholder="Reason for entering safe mode"
-          />
-          <label htmlFor="safe-mode-actor">Actor (optional)</label>
-          <input
-            id="safe-mode-actor"
-            type="text"
-            value={safeModeActor}
-            onChange={(event) => setSafeModeActor(event.target.value)}
-            placeholder="Recorded actor"
-          />
-        </div>
-        <div className="button-row">
-          <button
-            type="button"
-            onClick={() => handleSafeMode("enter")}
-            disabled={safeModeActionLoading}
-          >
-            Enter Safe Mode
-          </button>
-          <button
-            type="button"
-            onClick={() => handleSafeMode("exit")}
-            disabled={safeModeActionLoading}
-          >
-            Exit Safe Mode
-          </button>
-        </div>
-        {safeModeMessage && <p className="success">{safeModeMessage}</p>}
-        {safeModeActionError && <p className="error">{safeModeActionError}</p>}
+        {!readOnly ? (
+          <>
+            <div className="form-grid">
+              <label htmlFor="safe-mode-reason">Reason</label>
+              <input
+                id="safe-mode-reason"
+                type="text"
+                value={safeModeReason}
+                onChange={(event) => setSafeModeReason(event.target.value)}
+                placeholder="Reason for entering safe mode"
+              />
+              <label htmlFor="safe-mode-actor">Actor (optional)</label>
+              <input
+                id="safe-mode-actor"
+                type="text"
+                value={safeModeActor}
+                onChange={(event) => setSafeModeActor(event.target.value)}
+                placeholder="Recorded actor"
+              />
+            </div>
+            <div className="button-row">
+              <button
+                type="button"
+                onClick={() => handleSafeMode("enter")}
+                disabled={safeModeActionLoading}
+              >
+                Enter Safe Mode
+              </button>
+              <button
+                type="button"
+                onClick={() => handleSafeMode("exit")}
+                disabled={safeModeActionLoading}
+              >
+                Exit Safe Mode
+              </button>
+            </div>
+            {safeModeMessage && <p className="success">{safeModeMessage}</p>}
+            {safeModeActionError && <p className="error">{safeModeActionError}</p>}
+          </>
+        ) : (
+          <p className="info">
+            Auditor access is read-only. Safe mode controls are hidden.
+          </p>
+        )}
       </div>
 
       <div className="control-card">
         <h3>Kill Switch</h3>
-        <form onSubmit={handleKillSwitch}>
-          <div className="form-grid">
-            <label htmlFor="kill-account">Account</label>
-            <input
-              id="kill-account"
-              type="text"
-              value={killAccount}
-              onChange={(event) => setKillAccount(event.target.value)}
-              placeholder="Account identifier"
-            />
-            <label htmlFor="kill-reason">Reason</label>
-            <select
-              id="kill-reason"
-              value={killReason}
-              onChange={(event) =>
-                setKillReason(event.target.value as KillSwitchReason)
-              }
-            >
-              {KILL_SWITCH_REASONS.map((reason) => (
-                <option key={reason.value} value={reason.value}>
-                  {reason.label}
-                </option>
-              ))}
-            </select>
-            <label htmlFor="first-approval">Director Approval #1</label>
-            <input
-              id="first-approval"
-              type="text"
-              value={firstApproval}
-              onChange={(event) => setFirstApproval(event.target.value)}
-              placeholder="director-1"
-            />
-            <label htmlFor="second-approval">Director Approval #2</label>
-            <input
-              id="second-approval"
-              type="text"
-              value={secondApproval}
-              onChange={(event) => setSecondApproval(event.target.value)}
-              placeholder="director-2"
-            />
-          </div>
-          <button type="submit" disabled={killLoading}>
-            {killArmed ? "Confirm Kill Switch" : "Engage Kill Switch"}
-          </button>
-        </form>
-        {killMessage && <p className="warning">{killMessage}</p>}
-        {killError && <p className="error">{killError}</p>}
+        {!readOnly ? (
+          <>
+            <form onSubmit={handleKillSwitch}>
+              <div className="form-grid">
+                <label htmlFor="kill-account">Account</label>
+                <input
+                  id="kill-account"
+                  type="text"
+                  value={killAccount}
+                  onChange={(event) => setKillAccount(event.target.value)}
+                  placeholder="Account identifier"
+                />
+                <label htmlFor="kill-reason">Reason</label>
+                <select
+                  id="kill-reason"
+                  value={killReason}
+                  onChange={(event) =>
+                    setKillReason(event.target.value as KillSwitchReason)
+                  }
+                >
+                  {KILL_SWITCH_REASONS.map((reason) => (
+                    <option key={reason.value} value={reason.value}>
+                      {reason.label}
+                    </option>
+                  ))}
+                </select>
+                <label htmlFor="first-approval">Director Approval #1</label>
+                <input
+                  id="first-approval"
+                  type="text"
+                  value={firstApproval}
+                  onChange={(event) => setFirstApproval(event.target.value)}
+                  placeholder="director-1"
+                />
+                <label htmlFor="second-approval">Director Approval #2</label>
+                <input
+                  id="second-approval"
+                  type="text"
+                  value={secondApproval}
+                  onChange={(event) => setSecondApproval(event.target.value)}
+                  placeholder="director-2"
+                />
+              </div>
+              <button type="submit" disabled={killLoading}>
+                {killArmed ? "Confirm Kill Switch" : "Engage Kill Switch"}
+              </button>
+            </form>
+            {killMessage && <p className="warning">{killMessage}</p>}
+            {killError && <p className="error">{killError}</p>}
+          </>
+        ) : (
+          <p className="info">
+            Auditor access is read-only. Kill switch controls are hidden.
+          </p>
+        )}
       </div>
 
       <div className="control-card">
         <h3>Override Decisions</h3>
-        <form onSubmit={handleOverride}>
-          <div className="form-grid">
-            <label htmlFor="override-asset">Asset</label>
-            <input
-              id="override-asset"
-              type="text"
-              value={overrideAsset}
-              onChange={(event) => setOverrideAsset(event.target.value)}
-              placeholder="e.g. BTC-USD"
-            />
-            <label htmlFor="override-reason">Reason</label>
-            <input
-              id="override-reason"
-              type="text"
-              value={overrideReason}
-              onChange={(event) => setOverrideReason(event.target.value)}
-              placeholder="Why this override is needed"
-            />
-            <label htmlFor="override-action">Action</label>
-            <select
-              id="override-action"
-              value={overrideAction}
-              onChange={(event) =>
-                setOverrideAction(event.target.value as "block" | "unblock")
-              }
-            >
-              <option value="block">Block Asset</option>
-              <option value="unblock">Unblock Asset</option>
-            </select>
-          </div>
-          <button type="submit" disabled={overrideLoading}>
-            Submit Override
-          </button>
-        </form>
-        {overrideMessage && <p className="success">{overrideMessage}</p>}
-        {overrideError && <p className="error">{overrideError}</p>}
+        {!readOnly ? (
+          <>
+            <form onSubmit={handleOverride}>
+              <div className="form-grid">
+                <label htmlFor="override-asset">Asset</label>
+                <input
+                  id="override-asset"
+                  type="text"
+                  value={overrideAsset}
+                  onChange={(event) => setOverrideAsset(event.target.value)}
+                  placeholder="e.g. BTC-USD"
+                />
+                <label htmlFor="override-reason">Reason</label>
+                <input
+                  id="override-reason"
+                  type="text"
+                  value={overrideReason}
+                  onChange={(event) => setOverrideReason(event.target.value)}
+                  placeholder="Why this override is needed"
+                />
+                <label htmlFor="override-action">Action</label>
+                <select
+                  id="override-action"
+                  value={overrideAction}
+                  onChange={(event) =>
+                    setOverrideAction(event.target.value as "block" | "unblock")
+                  }
+                >
+                  <option value="block">Block Asset</option>
+                  <option value="unblock">Unblock Asset</option>
+                </select>
+              </div>
+              <button type="submit" disabled={overrideLoading}>
+                Submit Override
+              </button>
+            </form>
+            {overrideMessage && <p className="success">{overrideMessage}</p>}
+            {overrideError && <p className="error">{overrideError}</p>}
+          </>
+        ) : (
+          <p className="info">
+            Auditor access is read-only. Override controls are hidden.
+          </p>
+        )}
       </div>
 
       <div className="control-card">
