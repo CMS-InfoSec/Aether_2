@@ -1,9 +1,12 @@
+
 from __future__ import annotations
+
 
 import pytest
 
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
+
 
 from app import create_app
 import pack_exporter
@@ -42,3 +45,4 @@ def test_meta_router_available() -> None:
     assert body["regime"] in {"range", "trend", "high_vol"}
     weights = body["weights"]
     assert set(weights.keys()) >= {"trend_model", "meanrev_model", "vol_breakout"}
+
