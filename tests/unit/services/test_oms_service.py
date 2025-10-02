@@ -83,7 +83,7 @@ def oms_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
 
 
 def _auth_headers(account_id: str) -> Dict[str, str]:
-    token, _ = create_jwt(subject=account_id, ttl_seconds=3600)
+    token, _ = create_jwt(subject=account_id, role="admin", ttl_seconds=3600)
     return {"Authorization": f"Bearer {token}"}
 
 
