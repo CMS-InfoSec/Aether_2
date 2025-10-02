@@ -155,10 +155,25 @@ class PrioritizedIntentQueue(asyncio.Queue[QueueItem]):
         excess = len(items) - self._maxsize
         if excess <= 0:
             return []
+
+        non_critical_items = [
+            entry for entry in items if not entry.hedge and not entry.safe_mode
+        ]
+        if not non_critical_items:
+            # Queue is saturated with hedges/safe-mode intents. Reject the newcomer to
+            # avoid dropping any critical work.
+            return [new_item]
+
         sorted_items = sorted(
-            items,
+            non_critical_items,
             key=lambda entry: entry.drop_key(prefer_new=entry is new_item),
         )
+
+        if len(sorted_items) < excess:
+            # Not enough non-critical intents can be dropped to fit the newcomer. Keep
+            # the existing critical work and reject the incoming item instead.
+            return [new_item]
+
         return sorted_items[:excess]
 
 
