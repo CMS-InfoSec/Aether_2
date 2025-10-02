@@ -192,6 +192,8 @@ class ArtifactStorage:
         checksum_object_key = f"{canonical_key}.sha256"
         created_at = datetime.now(timezone.utc)
 
+        target_descriptor: str
+
         if not self._s3_bucket:
             target_path = self.base_path / canonical_key
             target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -200,6 +202,7 @@ class ArtifactStorage:
             checksum_path.write_bytes(
                 self._checksum_payload(canonical_key, checksum)
             )
+            target_descriptor = str(target_path)
             LOGGER.info(
                 "Stored artifact for account %s at %s (checksum=%s)",
                 account_id,
@@ -225,6 +228,7 @@ class ArtifactStorage:
                 Body=self._checksum_payload(canonical_key, checksum),
                 ContentType="text/plain",
             )
+            target_descriptor = f"s3://{self._s3_bucket}/{s3_key}"
             LOGGER.info(
                 "Stored artifact for account %s in bucket %s at %s (checksum=%s)",
                 account_id,
@@ -268,7 +272,9 @@ class ArtifactStorage:
                 except Exception:  # pragma: no cover - defensive logging
                     LOGGER.debug("Session commit failed; continuing", exc_info=True)
         except Exception:  # pragma: no cover - logging for production visibility
-            LOGGER.exception("Failed to write audit log entry for %s", target_path)
+            LOGGER.exception(
+                "Failed to write audit log entry for %s", target_descriptor
+            )
             raise
 
         return StoredArtifact(
