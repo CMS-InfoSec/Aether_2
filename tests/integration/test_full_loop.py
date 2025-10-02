@@ -7,6 +7,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
@@ -192,20 +193,22 @@ def test_full_loop_across_accounts(
     policy_service.ENABLE_SHADOW_EXECUTION = False
 
     async def fake_fetch_effective_fee(
-        account_id: str, symbol: str, liquidity: str, notional: float
-    ) -> float:
+        account_id: str, symbol: str, liquidity: str, notional: float | Decimal
+    ) -> Decimal:
+        notional_decimal = notional if isinstance(notional, Decimal) else Decimal(str(notional))
+        notional_str = f"{notional_decimal.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP)}"
         response = fees_client.get(
             "/fees/effective",
             params={
                 "pair": symbol,
                 "liquidity": liquidity,
-                "notional": f"{max(notional, 0.0):.8f}",
+                "notional": notional_str,
             },
             headers={"X-Account-ID": account_id},
         )
         response.raise_for_status()
         payload = response.json()
-        return float(payload["bps"])
+        return Decimal(str(payload["bps"]))
 
     monkeypatch.setattr(policy_service, "_fetch_effective_fee", fake_fetch_effective_fee)
 
