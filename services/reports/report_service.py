@@ -898,10 +898,40 @@ async def explain_trade(
         raise HTTPException(status_code=500, detail="Unable to generate explanation") from exc
 
 
+def compute_daily_return_pct(account_id: Optional[str] = None) -> Optional[float]:
+    """Return the daily net return percentage for *account_id*.
+
+    The helper uses :class:`DailyReportService` to build the latest daily report
+    and derives the net return as ``(realized + unrealized - fees) / nav``. A
+    ``None`` result indicates that the computation could not be completed (for
+    example due to missing NAV data or connectivity issues).
+    """
+
+    service = get_daily_report_service()
+    try:
+        report = service.build_daily_report(account_id=account_id)
+    except ValueError:
+        return None
+    except Exception:  # pragma: no cover - surfaced when backend storage fails
+        LOGGER.exception(
+            "Failed to build daily report for return calculation",
+            extra={"account_id": account_id},
+        )
+        return None
+
+    nav = float(report.nav or 0.0)
+    if nav <= 0.0:
+        return None
+
+    net_pnl = float(report.realized_pnl) + float(report.unrealized_pnl) - float(report.fees)
+    return (net_pnl / nav) * 100.0
+
+
 __all__ = [
     "DailyReport",
     "DailyReportService",
     "TradeContextError",
     "router",
     "get_daily_report_service",
+    "compute_daily_return_pct",
 ]
