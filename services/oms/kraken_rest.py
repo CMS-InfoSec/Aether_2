@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import itertools
 import json
 import logging
 import random
@@ -38,6 +39,8 @@ class KrakenRESTClient:
         self._session = session
         self._base_url = base_url.rstrip("/")
         self._max_retries = max_retries
+        self._nonce_lock = asyncio.Lock()
+        self._nonce_counter = itertools.count(int(time.time() * 1000))
 
     async def _session_or_create(self) -> aiohttp.ClientSession:
         if self._session is None:
@@ -91,7 +94,7 @@ class KrakenRESTClient:
         credentials = await self._credential_getter()
         session = await self._session_or_create()
 
-        nonce = str(int(time.time() * 1000))
+        nonce = await self._next_nonce()
         body = dict(payload)
         body["nonce"] = nonce
         encoded = urllib.parse.urlencode(body)
@@ -134,6 +137,11 @@ class KrakenRESTClient:
                 continue
 
             return payload
+
+    async def _next_nonce(self) -> str:
+        async with self._nonce_lock:
+            nonce_value = next(self._nonce_counter)
+        return str(nonce_value)
 
     def _parse_response(self, payload: Dict[str, Any]) -> OrderAck:
         result = payload.get("result") or {}
