@@ -250,6 +250,7 @@ def _install_prometheus_stub() -> None:
     prom.Summary = _Metric
     prom.Histogram = _Metric
     prom.CollectorRegistry = SimpleNamespace
+    prom.REGISTRY = SimpleNamespace()
     prom.CONTENT_TYPE_LATEST = "text/plain"
     prom.generate_latest = lambda registry: b""
     sys.modules["prometheus_client"] = prom
