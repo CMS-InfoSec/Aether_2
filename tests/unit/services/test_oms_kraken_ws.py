@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.util
 import sys
 import time
@@ -90,7 +91,7 @@ class _DummyClientError(Exception):
 def _module_available(name: str) -> bool:
     try:
         return importlib.util.find_spec(name) is not None
-    except ModuleNotFoundError:
+    except (ModuleNotFoundError, ValueError):
         return False
 
 
@@ -195,6 +196,32 @@ def test_sign_auth_rest_failure_raises() -> None:
     async def _run() -> None:
         with pytest.raises(KrakenWSError):
             await client._sign_auth()
+
+    asyncio.run(_run())
+
+
+def test_handle_payload_heartbeat_updates_timestamp(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _creds() -> dict[str, str]:
+        return {}
+
+    client = KrakenWSClient(credential_getter=_creds)
+    heartbeat_time = 12345.678
+
+    async def _run() -> None:
+        receiver_task = asyncio.create_task(asyncio.sleep(0.1))
+        client._receiver_task = receiver_task
+        monkeypatch.setattr("services.oms.kraken_ws.time.time", lambda: heartbeat_time)
+
+        await client._handle_payload({"channel": "heartbeat"})
+
+        assert client._last_private_heartbeat == heartbeat_time
+        assert client._receiver_task is receiver_task
+        assert not receiver_task.done()
+        assert client.heartbeat_age() == 0.0
+
+        receiver_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await receiver_task
 
     asyncio.run(_run())
 
