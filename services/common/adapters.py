@@ -67,6 +67,18 @@ class KafkaNATSAdapter:
             return
         cls._event_store.pop(account_id, None)
 
+    @classmethod
+    def flush_events(cls) -> Dict[str, int]:
+        """Flush buffered publish events and return per-account counts."""
+
+        counts = {account: len(events) for account, events in cls._event_store.items()}
+        for account, count in counts.items():
+            logger.info(
+                "Flushing Kafka/NATS buffer", extra={"account_id": account, "event_count": count}
+            )
+        cls._event_store.clear()
+        return counts
+
 
 @dataclass
 class TimescaleAdapter:
@@ -199,6 +211,62 @@ class TimescaleAdapter:
             ],
 
         }
+
+    @classmethod
+    def flush_event_buffers(cls) -> Dict[str, Dict[str, int]]:
+        """Flush in-memory telemetry/event buffers and return a summary."""
+
+        summary: Dict[str, Dict[str, int]] = {}
+
+        def _merge(account: str, bucket: str, count: int) -> None:
+            if count <= 0:
+                return
+            account_summary = summary.setdefault(account, {})
+            account_summary[bucket] = account_summary.get(bucket, 0) + count
+
+        for account, buckets in cls._events.items():
+            for channel, events in buckets.items():
+                _merge(account, f"events_{channel}", len(events))
+                events.clear()
+
+        for account, entries in cls._telemetry.items():
+            _merge(account, "telemetry", len(entries))
+            entries.clear()
+
+        for account, entries in cls._credential_events.items():
+            _merge(account, "credential_events", len(entries))
+            entries.clear()
+
+        for account, entries in cls._credential_rotations.items():
+            _merge(account, "credential_rotations", len(entries))
+            entries.clear()
+
+        for account, entries in cls._kill_events.items():
+            _merge(account, "kill_events", len(entries))
+            entries.clear()
+
+        for account, entries in cls._cvar_results.items():
+            _merge(account, "cvar_results", len(entries))
+            entries.clear()
+
+        for account, entries in cls._nav_forecasts.items():
+            _merge(account, "nav_forecasts", len(entries))
+            entries.clear()
+
+        for account, entries in cls._rolling_volume.items():
+            bucket_total = sum(len(records) for records in entries.values())
+            _merge(account, "rolling_volume", bucket_total)
+            for records in entries.values():
+                records.clear()
+
+        if summary:
+            for account, buckets in summary.items():
+                logger.info(
+                    "Flushing Timescale adapter buffers",
+                    extra={"account_id": account, "buckets": buckets},
+                )
+
+        return summary
 
     # ------------------------------------------------------------------
     # Timescale-inspired risk state helpers

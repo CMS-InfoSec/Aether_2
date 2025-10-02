@@ -28,16 +28,46 @@ from services.oms.kraken_ws import (
     OrderAck,
     OrderState,
 )
+from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
 
 
 logger = logging.getLogger(__name__)
 
+
+SHUTDOWN_TIMEOUT = float(os.getenv("OMS_SHUTDOWN_TIMEOUT", os.getenv("SERVICE_SHUTDOWN_TIMEOUT", "75.0")))
 
 app = FastAPI(title="Kraken OMS Service")
 setup_metrics(app, service_name="oms-service")
 
 
 _OMS_ACTIVITY_LOG: List[Dict[str, Any]] = []
+
+shutdown_manager = setup_graceful_shutdown(
+    app,
+    service_name="oms-service",
+    allowed_paths={"/", "/docs", "/openapi.json"},
+    shutdown_timeout=SHUTDOWN_TIMEOUT,
+    logger_instance=logger,
+)
+
+
+def _flush_oms_event_buffers() -> None:
+    """Flush OMS event buffers (Kafka and activity logs)."""
+
+    flush_logging_handlers("", __name__)
+    kafka_counts = KafkaNATSAdapter.flush_events()
+    if kafka_counts:
+        logger.info("Flushed Kafka/NATS buffers", extra={"event_counts": kafka_counts})
+    activity_count = len(_OMS_ACTIVITY_LOG)
+    if activity_count:
+        logger.info(
+            "Persisting OMS activity log prior to shutdown",
+            extra={"entries": activity_count},
+        )
+        _OMS_ACTIVITY_LOG.clear()
+
+
+shutdown_manager.register_flush_callback(_flush_oms_event_buffers)
 
 
 def _format_decimal(value: float) -> str:
@@ -460,6 +490,14 @@ class OMSService:
                 self._sessions[account_id] = session
             return session
 
+    async def drain(self) -> None:
+        async with self._lock:
+            sessions = list(self._sessions.values())
+            self._sessions.clear()
+        for session in sessions:
+            with contextlib.suppress(Exception):
+                await session.close()
+
     async def place_order(self, request: PlaceOrderRequest) -> PlaceOrderResponse:
         session = await self._session(request.account_id)
         payload = self._build_payload(request)
@@ -592,6 +630,11 @@ class OMSService:
 
 
 oms_service = OMSService()
+
+
+@app.on_event("shutdown")
+async def _drain_sessions() -> None:
+    await oms_service.drain()
 
 
 @app.post("/oms/place", response_model=PlaceOrderResponse)

@@ -32,6 +32,7 @@ from services.policy.adaptive_horizon import get_horizon
 from exchange_adapter import get_exchange_adapter, get_exchange_adapters_status
 from metrics import record_abstention_rate, record_drift_score, setup_metrics
 from services.common.security import ADMIN_ACCOUNTS
+from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
 
 
 FEES_SERVICE_URL = os.getenv("FEES_SERVICE_URL", "http://fees-service")
@@ -64,9 +65,19 @@ KRAKEN_PRECISION: Dict[str, Dict[str, float]] = {
 logger = logging.getLogger(__name__)
 
 
+SHUTDOWN_TIMEOUT = float(os.getenv("POLICY_SHUTDOWN_TIMEOUT", os.getenv("SERVICE_SHUTDOWN_TIMEOUT", "60.0")))
+
 app = FastAPI(title="Policy Service", version="2.0.0")
 setup_metrics(app, service_name="policy-service")
 EXCHANGE_ADAPTER = get_exchange_adapter(DEFAULT_EXCHANGE)
+
+shutdown_manager = setup_graceful_shutdown(
+    app,
+    service_name="policy-service",
+    allowed_paths={"/", "/docs", "/openapi.json"},
+    shutdown_timeout=SHUTDOWN_TIMEOUT,
+    logger_instance=logger,
+)
 
 
 if TYPE_CHECKING:  # pragma: no cover - type checking only
@@ -225,6 +236,21 @@ class RegimeClassifier:
 
 
 regime_classifier = RegimeClassifier()
+
+
+def _flush_policy_event_buffers() -> None:
+    """Flush buffered policy events/loggers prior to shutdown."""
+
+    flush_logging_handlers("", __name__)
+    snapshot_count = len(regime_classifier._snapshots)  # noqa: SLF001 - intentional diagnostic access
+    if snapshot_count:
+        logger.info(
+            "Draining cached regime snapshots before shutdown",
+            extra={"snapshot_count": snapshot_count},
+        )
+
+
+shutdown_manager.register_flush_callback(_flush_policy_event_buffers)
 
 
 def _default_state() -> PolicyState:
