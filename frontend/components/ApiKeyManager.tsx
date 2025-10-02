@@ -50,16 +50,25 @@ const ApiKeyManager: React.FC = () => {
     "idle"
   );
   const [confirmationInput, setConfirmationInput] = useState("");
-  const { readOnly } = useAuthClaims();
+  const { readOnly, accessToken, mfaContext, mfaVerified } = useAuthClaims();
+  const isAuthenticated = Boolean(accessToken);
 
   const loadStatus = useCallback(
     async (signal: AbortSignal) => {
       try {
         setStatusLoading(true);
+        if (!isAuthenticated || !mfaVerified) {
+          setStatusLoading(false);
+          setStatusError(null);
+          return;
+        }
+
         const response = await fetch("/secrets/status", {
           method: "GET",
           headers: {
             Accept: "application/json",
+            "X-MFA-Context": mfaContext,
+            ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
           },
           signal,
         });
@@ -86,7 +95,7 @@ const ApiKeyManager: React.FC = () => {
         }
       }
     },
-    []
+    [accessToken, isAuthenticated, mfaContext, mfaVerified]
   );
 
   const refreshStatus = useCallback(async () => {
@@ -102,10 +111,18 @@ const ApiKeyManager: React.FC = () => {
     async (signal: AbortSignal) => {
       try {
         setAuditLoading(true);
+        if (!isAuthenticated || !mfaVerified) {
+          setAuditLoading(false);
+          setAuditError(null);
+          return;
+        }
+
         const response = await fetch("/secrets/audit", {
           method: "GET",
           headers: {
             Accept: "application/json",
+            "X-MFA-Context": mfaContext,
+            ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
           },
           signal,
         });
@@ -130,7 +147,7 @@ const ApiKeyManager: React.FC = () => {
         }
       }
     },
-    []
+    [accessToken, isAuthenticated, mfaContext, mfaVerified]
   );
 
   const refreshAudit = useCallback(async () => {
@@ -186,6 +203,16 @@ const ApiKeyManager: React.FC = () => {
       return;
     }
 
+    if (!isAuthenticated) {
+      setSubmitError("SSO login required before rotating credentials.");
+      return;
+    }
+
+    if (!mfaVerified) {
+      setSubmitError("Complete multi-factor authentication to rotate credentials.");
+      return;
+    }
+
     setIsSubmitting(true);
     const payload: RotateSecretsPayload = {
       api_key: apiKey.trim(),
@@ -198,6 +225,8 @@ const ApiKeyManager: React.FC = () => {
         headers: {
           "Content-Type": "application/json",
           Accept: "application/json",
+          "X-MFA-Context": mfaContext,
+          ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
         },
         body: JSON.stringify(payload),
       });
@@ -230,6 +259,28 @@ const ApiKeyManager: React.FC = () => {
       setIsSubmitting(false);
     }
   };
+
+  if (!isAuthenticated) {
+    return (
+      <div className="max-w-xl mx-auto bg-white shadow rounded-lg p-6">
+        <h2 className="text-2xl font-semibold text-gray-900 mb-4">Kraken API Key Manager</h2>
+        <p className="text-sm text-gray-600">
+          Please sign in with your corporate SSO account to manage Kraken API keys.
+        </p>
+      </div>
+    );
+  }
+
+  if (!mfaVerified) {
+    return (
+      <div className="max-w-xl mx-auto bg-white shadow rounded-lg p-6">
+        <h2 className="text-2xl font-semibold text-gray-900 mb-4">Kraken API Key Manager</h2>
+        <p className="text-sm text-gray-600">
+          Multi-factor authentication is required to rotate Kraken API credentials. Complete the MFA challenge to continue.
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className="max-w-xl mx-auto bg-white shadow rounded-lg p-6">

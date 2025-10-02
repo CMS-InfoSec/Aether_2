@@ -9,7 +9,16 @@ from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -49,6 +58,7 @@ from services.secrets.middleware import (
 from services.secrets.secure_secrets import (
     EnvelopeEncryptor,
     EncryptedSecretEnvelope,
+    LocalKMSEmulator,
     SecretsMetadataStore,
 )
 from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
@@ -78,7 +88,10 @@ _audit_store = AuditLogStore()
 _audit_logger = TimescaleAuditLogger(_audit_store)
 _auditor = SensitiveActionRecorder(_audit_logger)
 
-_encryptor = EnvelopeEncryptor()
+_MASTER_KEY_ROTATION_INTERVAL = timedelta(days=90)
+_encryptor = EnvelopeEncryptor(
+    LocalKMSEmulator(rotation_interval=_MASTER_KEY_ROTATION_INTERVAL)
+)
 _MASTER_KEY_CHECK_INTERVAL = timedelta(hours=6)
 
 
@@ -143,8 +156,17 @@ def _log_secret_rotation(*, account_id: str, actor: str, rotated_at: datetime) -
     SECRETS_LOGGER.info("credential_rotation", extra={"secret_rotation": payload})
 
 
-def _post_rotation_hooks(*, account_id: str, actor: str, rotated_at: datetime) -> None:
-    _trigger_hot_reload(account_id)
+def _post_rotation_hooks(
+    *,
+    account_id: str,
+    actor: str,
+    rotated_at: datetime,
+    background_tasks: BackgroundTasks | None = None,
+) -> None:
+    if background_tasks is not None:
+        background_tasks.add_task(_trigger_hot_reload, account_id)
+    else:
+        _trigger_hot_reload(account_id)
     _log_secret_rotation(account_id=account_id, actor=actor, rotated_at=rotated_at)
 
 
@@ -633,6 +655,7 @@ def rotate_secret(
     actor_account: str = Depends(require_admin_account),
     _: str = Depends(require_mfa_context),
     director_approvals: Tuple[str, str] = Depends(require_dual_director_confirmation),
+    background_tasks: BackgroundTasks,
     api: CoreV1Api = Depends(get_core_v1_api),
 ) -> Response:
     if payload.account_id != actor_account:
@@ -665,7 +688,12 @@ def rotate_secret(
         rotation_ts = rotated_at
     else:
         rotation_ts = datetime.now(timezone.utc)
-    _post_rotation_hooks(account_id=actor_account, actor=actor_account, rotated_at=rotation_ts)
+    _post_rotation_hooks(
+        account_id=actor_account,
+        actor=actor_account,
+        rotated_at=rotation_ts,
+        background_tasks=background_tasks,
+    )
 
     response_payload = SecretRotationResponse(
         account_id=actor_account,
@@ -694,6 +722,7 @@ def rotate_kraken_secret(
     actor_account: str = Depends(require_admin_account),
     _: str = Depends(require_mfa_context),
     director_approvals: Tuple[str, str] = Depends(require_dual_director_confirmation),
+    background_tasks: BackgroundTasks,
     api: CoreV1Api = Depends(get_core_v1_api),
 ) -> Response:
     if payload.account_id != actor_account:
@@ -726,7 +755,12 @@ def rotate_kraken_secret(
         rotation_ts = rotated_at
     else:
         rotation_ts = datetime.now(timezone.utc)
-    _post_rotation_hooks(account_id=actor_account, actor=actor_account, rotated_at=rotation_ts)
+    _post_rotation_hooks(
+        account_id=actor_account,
+        actor=actor_account,
+        rotated_at=rotation_ts,
+        background_tasks=background_tasks,
+    )
 
     payload = {
         "secret_name": rotation["secret_name"],
@@ -752,6 +786,7 @@ def rotate_encrypted_secret(
     actor_account: str = Depends(require_admin_account),
     _: str = Depends(require_mfa_context),
     director_approvals: Tuple[str, str] = Depends(require_dual_director_confirmation),
+    background_tasks: BackgroundTasks,
     api: CoreV1Api = Depends(get_core_v1_api),
 ) -> Response:
     if payload.account_id != actor_account:
@@ -784,7 +819,12 @@ def rotate_encrypted_secret(
         rotation_ts = rotated_at
     else:
         rotation_ts = datetime.now(timezone.utc)
-    _post_rotation_hooks(account_id=actor_account, actor=actor_account, rotated_at=rotation_ts)
+    _post_rotation_hooks(
+        account_id=actor_account,
+        actor=actor_account,
+        rotated_at=rotation_ts,
+        background_tasks=background_tasks,
+    )
 
     response = EncryptedRotationResponse(
         secret_name=rotation["secret_name"],
@@ -813,6 +853,7 @@ def force_rotate_kraken_secret(
     request: Request,
     actor_account: str = Depends(require_admin_account),
     _: str = Depends(require_mfa_context),
+    background_tasks: BackgroundTasks,
     api: CoreV1Api = Depends(get_core_v1_api),
 ) -> Response:
     if payload.account_id != actor_account:
@@ -851,7 +892,12 @@ def force_rotate_kraken_secret(
         annotations=updated_annotations,
     )
 
-    _post_rotation_hooks(account_id=actor_account, actor=actor_account, rotated_at=now)
+    _post_rotation_hooks(
+        account_id=actor_account,
+        actor=actor_account,
+        rotated_at=now,
+        background_tasks=background_tasks,
+    )
 
     before_for_audit = _serialize_metadata_for_audit(metadata)
     after_for_audit = {
