@@ -215,6 +215,27 @@ class RateLimitGuard:
             snapshot[account] = entry
         return snapshot
 
+    async def wait_for_idle(self, timeout: Optional[float] = None) -> bool:
+        """Wait until no callers are queued behind the rate limit guard."""
+
+        deadline = None if timeout is None else time.monotonic() + max(timeout, 0.0)
+        poll_interval = max(self._sleep_floor, 0.05)
+
+        while True:
+            async with self._waiter_lock:
+                pending = sum(self._waiter_counts.values())
+
+            if pending == 0:
+                return True
+
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                await asyncio.sleep(min(poll_interval, remaining))
+            else:
+                await asyncio.sleep(poll_interval)
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
