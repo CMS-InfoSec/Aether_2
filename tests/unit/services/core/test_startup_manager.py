@@ -1,10 +1,49 @@
+from __future__ import annotations
+
+import asyncio
 import importlib.util
 import json
+import sys
+import types
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict
+from types import SimpleNamespace
+from typing import Mapping
 
 import pytest
+import sqlalchemy as sa
+
+if "fastapi" not in sys.modules:  # pragma: no cover - lightweight stub for unit tests
+    fastapi_stub = types.ModuleType("fastapi")
+
+    class _HTTPException(Exception):
+        def __init__(self, status_code: int, detail: str | None = None) -> None:
+            super().__init__(detail or "")
+            self.status_code = status_code
+            self.detail = detail
+
+    class _APIRouter:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self.routes = []
+
+        def get(self, *args: object, **kwargs: object):
+            def decorator(func):
+                self.routes.append(func)
+                return func
+
+            return decorator
+
+    class _FastAPI:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self.state = SimpleNamespace()
+
+        def include_router(self, router: _APIRouter) -> None:  # type: ignore[name-defined]
+            self.router = router
+
+    fastapi_stub.FastAPI = _FastAPI  # type: ignore[attr-defined]
+    fastapi_stub.APIRouter = _APIRouter  # type: ignore[attr-defined]
+    fastapi_stub.HTTPException = _HTTPException  # type: ignore[attr-defined]
+    sys.modules["fastapi"] = fastapi_stub
 
 _MODULE_PATH = Path(__file__).resolve().parents[4] / "services" / "core" / "startup_manager.py"
 _SPEC = importlib.util.spec_from_file_location("_startup_manager", _MODULE_PATH)
@@ -15,100 +54,121 @@ _SPEC.loader.exec_module(_MODULE)
 
 StartupManager = _MODULE.StartupManager
 StartupMode = _MODULE.StartupMode
+SQLStartupStateStore = _MODULE.SQLStartupStateStore
 
 
-@pytest.fixture
-def anyio_backend() -> str:
-    return "asyncio"
+def _create_engine() -> sa.engine.Engine:
+    return sa.create_engine("sqlite:///:memory:", future=True)
 
 
-@pytest.mark.anyio
-async def test_cold_start_loads_state_and_persists(tmp_path):
+def test_cold_start_bootstraps_exchange_state_and_persists() -> None:
+    asyncio.run(_exercise_cold_start())
+
+
+async def _exercise_cold_start() -> None:
+    engine = _create_engine()
+    store = SQLStartupStateStore(engine)
+
     balance_calls: list[str] = []
+    order_calls: list[str] = []
     position_calls: list[str] = []
-    replay_offsets: list[Dict[str, int]] = []
+    replay_payloads: list[Mapping[str, int]] = []
+    reconcile_calls: list[str] = []
 
     async def balance_loader() -> None:
-        balance_calls.append("balance")
+        balance_calls.append("balances")
+
+    async def order_loader() -> None:
+        order_calls.append("orders")
 
     async def position_loader() -> None:
-        position_calls.append("position")
+        position_calls.append("positions")
 
-    async def replay_handler(offsets: Dict[str, int]) -> None:
-        replay_offsets.append(dict(offsets))
+    async def replay_handler(offsets: Mapping[str, int]) -> Mapping[str, int]:
+        replay_payloads.append(dict(offsets))
+        return {"events:0": 5}
 
-    offset_file = tmp_path / "offset.log"
-    offset_file.write_text(json.dumps({"partitions": {"0": {"offset": 7}}}), encoding="utf-8")
-    state_file = tmp_path / "startup_state.json"
+    async def reconcile_runner() -> None:
+        reconcile_calls.append("reconcile")
 
     manager = StartupManager(
         balance_loader=balance_loader,
+        order_loader=order_loader,
         position_loader=position_loader,
         kafka_replay_handler=replay_handler,
-        offset_log_path=offset_file,
-        startup_state_path=state_file,
+        reconcile_runner=reconcile_runner,
+        state_store=store,
+        snapshot_probe=lambda: False,
         clock=lambda: datetime(2024, 1, 1, tzinfo=timezone.utc),
     )
 
     mode = await manager.start()
 
     assert mode is StartupMode.COLD
-    assert balance_calls == ["balance"]
-    assert position_calls == ["position"]
-    assert replay_offsets == [{"offset:0": 7}]
+    assert balance_calls == ["balances"]
+    assert order_calls == ["orders"]
+    assert position_calls == ["positions"]
+    assert replay_payloads == [{}]
+    assert reconcile_calls == ["reconcile"]
 
     status = await manager.status()
-    assert status == {"mode": "cold", "synced": True, "offset": 7}
+    assert status["mode"] == "cold"
+    assert status["synced"] is True
+    assert status["offsets"]["last_offset"] == 5
+    assert status["offsets"]["sources"] == {"events:0": 5}
 
-    persisted = json.loads(state_file.read_text(encoding="utf-8"))
-    assert persisted["mode"] == "cold"
-    assert persisted["last_offset"] == 7
-    assert persisted["ts"] == datetime(2024, 1, 1, tzinfo=timezone.utc).isoformat()
+    persisted = await store.read_state()
+    assert persisted["startup_mode"] == "cold"
+    assert persisted["last_offset"] == 5
+    assert persisted["offsets"] == {"events:0": 5}
 
 
-@pytest.mark.anyio
-async def test_warm_restart_replays_and_reconciles(tmp_path):
-    state_file = tmp_path / "startup_state.json"
-    state_file.write_text(
-        json.dumps({"mode": "cold", "last_offset": 2, "ts": "2023-01-01T00:00:00Z"}),
-        encoding="utf-8",
+def test_warm_restart_replays_from_offsets_and_reconciles() -> None:
+    asyncio.run(_exercise_warm_restart())
+
+
+async def _exercise_warm_restart() -> None:
+    engine = _create_engine()
+    store = SQLStartupStateStore(engine)
+
+    await store.write_state(
+        startup_mode="cold",
+        last_offset=3,
+        offsets={"events:0": 3, "events:1": 4},
+        updated_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
     )
 
-    offset_dir = tmp_path / "offsets"
-    offset_dir.mkdir()
-    (offset_dir / "replay.json").write_text(
-        json.dumps({"partitions": {"0": {"offset": 3}, "1": {"offset": 5}}}),
-        encoding="utf-8",
-    )
-
-    replay_calls: list[Dict[str, int]] = []
-    async def replay_handler(offsets: Dict[str, int]) -> None:
-        replay_calls.append(dict(offsets))
-
+    replay_payloads: list[Mapping[str, int]] = []
     reconcile_calls: list[str] = []
+
+    async def replay_handler(offsets: Mapping[str, int]) -> Mapping[str, int]:
+        replay_payloads.append(dict(offsets))
+        return {"events:0": 4, "events:1": 6}
+
     async def reconcile_runner() -> None:
         reconcile_calls.append("ran")
 
     manager = StartupManager(
         reconcile_runner=reconcile_runner,
         kafka_replay_handler=replay_handler,
-        offset_log_path=offset_dir,
-        startup_state_path=state_file,
+        state_store=store,
+        snapshot_probe=lambda: True,
         clock=lambda: datetime(2024, 1, 2, tzinfo=timezone.utc),
     )
 
     mode = await manager.start()
 
     assert mode is StartupMode.WARM
+    assert replay_payloads and replay_payloads[0]["events:1"] == 4
     assert reconcile_calls == ["ran"]
-    assert replay_calls and replay_calls[0]["replay:1"] == 5
 
     status = await manager.status()
     assert status["mode"] == "warm"
     assert status["synced"] is True
-    assert status["offset"] == 5
+    assert status["offsets"]["last_offset"] == 6
+    assert status["offsets"]["sources"] == {"events:0": 4, "events:1": 6}
 
-    persisted = json.loads(state_file.read_text(encoding="utf-8"))
-    assert persisted["mode"] == "warm"
-    assert persisted["last_offset"] == 5
-    assert persisted["ts"] == datetime(2024, 1, 2, tzinfo=timezone.utc).isoformat()
+    persisted = await store.read_state()
+    assert persisted["startup_mode"] == "warm"
+    assert persisted["last_offset"] == 6
+    assert persisted["offsets"] == {"events:0": 4, "events:1": 6}

@@ -6,10 +6,24 @@ import json
 import logging
 from datetime import datetime, timezone
 from enum import Enum
-from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, Mapping, MutableMapping, Optional
+from typing import Any, Awaitable, Callable, Dict, Mapping, MutableMapping, Optional, Protocol
 
 from fastapi import APIRouter, FastAPI, HTTPException
+
+try:  # pragma: no cover - optional dependency during documentation builds
+    import sqlalchemy as sa
+    from sqlalchemy import select
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.exc import SQLAlchemyError
+    from sqlalchemy.orm import Session, sessionmaker
+except Exception:  # pragma: no cover - fall back for environments without sqlalchemy
+    sa = None  # type: ignore[assignment]
+    select = None  # type: ignore[assignment]
+    Engine = Any  # type: ignore[assignment]
+    SQLAlchemyError = Exception  # type: ignore[assignment]
+    Session = Any  # type: ignore[assignment]
+    sessionmaker = None  # type: ignore[assignment]
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -21,6 +35,185 @@ class StartupMode(str, Enum):
     WARM = "warm"
 
 
+class StartupStateStore(Protocol):
+    """Persistence contract for recording startup progress."""
+
+    async def read_state(self) -> Optional[Dict[str, Any]]:
+        """Return the most recently persisted startup state."""
+
+    async def write_state(
+        self,
+        *,
+        startup_mode: str,
+        last_offset: Optional[int],
+        offsets: Mapping[str, int],
+        updated_at: datetime,
+    ) -> None:
+        """Persist the latest startup state snapshot."""
+
+    async def has_snapshot(self) -> bool:
+        """Return ``True`` if a previous startup snapshot exists."""
+
+
+class SQLStartupStateStore:
+    """Persist startup metadata inside the ``startup_state`` table."""
+
+    def __init__(self, engine: Engine, *, table_name: str = "startup_state") -> None:
+        if sa is None or select is None or sessionmaker is None:
+            raise RuntimeError("sqlalchemy is required to use SQLStartupStateStore")
+
+        self._engine = engine
+        self._Session = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+        metadata = sa.MetaData()
+        self._table = sa.Table(
+            table_name,
+            metadata,
+            sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
+            sa.Column("startup_mode", sa.String(16), nullable=False),
+            sa.Column("last_offset", sa.Integer, nullable=True),
+            sa.Column("offsets", sa.String, nullable=True),
+            sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+        )
+        metadata.create_all(engine, checkfirst=True)
+        self._memory_state: Optional[Dict[str, Any]] = None
+        self._use_memory_only = False
+        try:
+            session = self._Session()
+            close = getattr(session, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            self._use_memory_only = True
+
+    async def read_state(self) -> Optional[Dict[str, Any]]:
+        return await asyncio.to_thread(self._read_state)
+
+    def _read_state(self) -> Optional[Dict[str, Any]]:
+        if self._use_memory_only:
+            return self._memory_state
+
+        try:
+            session = self._Session()  # type: Session
+            try:
+                stmt = select(self._table).order_by(self._table.c.updated_at.desc()).limit(1)
+                row = session.execute(stmt).mappings().first()
+            finally:
+                close = getattr(session, "close", None)
+                if callable(close):
+                    close()
+        except Exception:  # pragma: no cover - defensive logging
+            LOGGER.warning("Failed to load startup state from database", exc_info=True)
+            self._use_memory_only = True
+            return self._memory_state
+
+        if row is None:
+            return self._memory_state
+
+        offsets_payload: Dict[str, int] = {}
+        raw_offsets = row.get("offsets")
+        if isinstance(raw_offsets, str) and raw_offsets.strip():
+            try:
+                decoded = json.loads(raw_offsets)
+            except json.JSONDecodeError:
+                decoded = {}
+            if isinstance(decoded, Mapping):
+                for key, value in decoded.items():
+                    try:
+                        offsets_payload[str(key)] = int(value)
+                    except (TypeError, ValueError):
+                        continue
+
+        record = {
+            "startup_mode": row.get("startup_mode"),
+            "last_offset": row.get("last_offset"),
+            "offsets": offsets_payload,
+            "updated_at": row.get("updated_at"),
+        }
+        self._memory_state = record
+        return record
+
+    async def write_state(
+        self,
+        *,
+        startup_mode: str,
+        last_offset: Optional[int],
+        offsets: Mapping[str, int],
+        updated_at: datetime,
+    ) -> None:
+        await asyncio.to_thread(
+            self._write_state,
+            startup_mode,
+            last_offset,
+            offsets,
+            updated_at,
+        )
+
+    def _write_state(
+        self,
+        startup_mode: str,
+        last_offset: Optional[int],
+        offsets: Mapping[str, int],
+        updated_at: datetime,
+    ) -> None:
+        normalized_offsets = {str(k): int(v) for k, v in offsets.items()}
+        payload = {
+            "startup_mode": startup_mode,
+            "last_offset": last_offset,
+            "offsets": json.dumps(normalized_offsets, sort_keys=True),
+            "updated_at": updated_at,
+        }
+
+        self._memory_state = {
+            "startup_mode": startup_mode,
+            "last_offset": last_offset,
+            "offsets": normalized_offsets,
+            "updated_at": updated_at,
+        }
+
+        if self._use_memory_only:
+            return
+
+        try:
+            session = self._Session()  # type: Session
+            try:
+                existing_id = session.execute(select(self._table.c.id)).scalar_one_or_none()
+                if existing_id is None:
+                    session.execute(self._table.insert().values(**payload))
+                else:
+                    session.execute(self._table.update().where(self._table.c.id == existing_id).values(**payload))
+                commit = getattr(session, "commit", None)
+                if callable(commit):
+                    commit()
+            finally:
+                close = getattr(session, "close", None)
+                if callable(close):
+                    close()
+        except Exception:  # pragma: no cover - defensive logging
+            LOGGER.warning("Failed to persist startup state to database", exc_info=True)
+            self._use_memory_only = True
+
+    async def has_snapshot(self) -> bool:
+        return await asyncio.to_thread(self._has_snapshot)
+
+    def _has_snapshot(self) -> bool:
+        if self._use_memory_only:
+            return self._memory_state is not None
+        try:
+            session = self._Session()  # type: Session
+            try:
+                stmt = select(sa.func.count()).select_from(self._table)
+                count = session.execute(stmt).scalar()
+                return bool(count)
+            finally:
+                close = getattr(session, "close", None)
+                if callable(close):
+                    close()
+        except Exception:  # pragma: no cover - defensive logging
+            LOGGER.warning("Failed to check startup state snapshot", exc_info=True)
+            self._use_memory_only = True
+            return self._memory_state is not None
+
+
 class StartupManager:
     """Coordinate restoration of state for the trading control plane."""
 
@@ -28,21 +221,23 @@ class StartupManager:
         self,
         *,
         balance_loader: Callable[[], Awaitable[Any]] | Callable[[], Any] | None = None,
+        order_loader: Callable[[], Awaitable[Any]] | Callable[[], Any] | None = None,
         position_loader: Callable[[], Awaitable[Any]] | Callable[[], Any] | None = None,
         reconcile_runner: Callable[[], Awaitable[Any]] | Callable[[], Any] | None = None,
-        kafka_replay_handler: Callable[[Mapping[str, int]], Awaitable[int | None]]
-        | Callable[[Mapping[str, int]], int | None]
+        kafka_replay_handler: Callable[[Mapping[str, int]], Awaitable[Any]]
+        | Callable[[Mapping[str, int]], Any]
         | None = None,
-        offset_log_path: str | Path | None = None,
-        startup_state_path: str | Path | None = None,
+        state_store: StartupStateStore | None = None,
+        snapshot_probe: Callable[[], Awaitable[bool]] | Callable[[], bool] | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._balance_loader = self._wrap_loader(balance_loader)
+        self._order_loader = self._wrap_loader(order_loader)
         self._position_loader = self._wrap_loader(position_loader)
         self._reconcile_runner = self._wrap_loader(reconcile_runner)
         self._kafka_replay_handler = kafka_replay_handler
-        self._offset_log_path = Path(offset_log_path) if offset_log_path else None
-        self._startup_state_path = Path(startup_state_path) if startup_state_path else None
+        self._state_store = state_store
+        self._snapshot_probe = self._wrap_loader(snapshot_probe)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
         self._mode: Optional[StartupMode] = None
@@ -54,11 +249,7 @@ class StartupManager:
         self._status_lock = asyncio.Lock()
         self._run_lock = asyncio.Lock()
 
-        self._persisted_state: Optional[Dict[str, Any]] = self._read_startup_state()
-        if self._persisted_state is not None:
-            persisted_offset = self._persisted_state.get("last_offset")
-            if isinstance(persisted_offset, int):
-                self._last_offset = persisted_offset
+        self._persisted_state: Optional[Dict[str, Any]] = None
 
     async def start(self, mode: StartupMode | str | None = None) -> StartupMode:
         """Execute the bootstrap workflow using *mode* or auto-detect if omitted."""
@@ -74,10 +265,8 @@ class StartupManager:
             try:
                 if mode_value is StartupMode.COLD:
                     await self._run_cold_start()
-                    await self._replay_from_offsets()
-                else:
-                    await self._replay_from_offsets()
-                    await self._run_warm_start()
+                await self._replay_from_offsets()
+                await self._run_reconcile()
             except Exception as exc:  # pragma: no cover - defensive logging
                 LOGGER.exception("Startup manager failed during %s start", mode_value.value)
                 async with self._status_lock:
@@ -101,250 +290,184 @@ class StartupManager:
             LOGGER.debug("No persisted startup state found; defaulting to cold start")
             return StartupMode.COLD
 
+        if self._snapshot_probe is not None:
+            probe_result = await self._invoke_loader(self._snapshot_probe, "snapshot_probe")
+            if not bool(probe_result):
+                LOGGER.debug("Snapshot probe reported missing snapshot; defaulting to cold start")
+                return StartupMode.COLD
+        elif self._state_store is not None:
+            has_snapshot = await self._state_store.has_snapshot()
+            if not has_snapshot:
+                LOGGER.debug("Startup store empty; defaulting to cold start")
+                return StartupMode.COLD
+
         LOGGER.debug("Persisted startup state detected; defaulting to warm restart")
         return StartupMode.WARM
 
     async def status(self) -> Dict[str, Any]:
         """Return the most recent startup status snapshot."""
 
+        if self._persisted_state is None:
+            await self._load_startup_state()
+
         async with self._status_lock:
-            mode = self._mode.value if self._mode else None
-            offset = self._last_offset
-            if mode is None and self._persisted_state:
-                persisted_mode = self._persisted_state.get("mode")
-                if isinstance(persisted_mode, str):
-                    mode = persisted_mode
-                if offset is None:
-                    persisted_offset = self._persisted_state.get("last_offset")
-                    if isinstance(persisted_offset, int):
-                        offset = persisted_offset
-            return {
-                "mode": mode,
-                "synced": self._synced,
-                "offset": offset,
-            }
+            persisted = self._persisted_state or {}
+            mode = self._mode.value if self._mode else persisted.get("mode")
+            last_offset = self._last_offset
+            offsets_snapshot = dict(self._offset_sources)
+            synced = self._synced
+
+        if not offsets_snapshot:
+            stored_offsets = persisted.get("offsets")
+            offsets_snapshot = self._normalize_offsets(stored_offsets)
+
+        if last_offset is None:
+            stored_last = self._coerce_int(persisted.get("last_offset"))
+            last_offset = stored_last if stored_last is not None else (
+                max(offsets_snapshot.values()) if offsets_snapshot else None
+            )
+
+        return {
+            "mode": mode,
+            "synced": synced,
+            "offsets": {
+                "last_offset": last_offset,
+                "sources": offsets_snapshot,
+            },
+        }
 
     async def _run_cold_start(self) -> None:
         await self._invoke_loader(self._balance_loader, "balances")
+        await self._invoke_loader(self._order_loader, "open_orders")
         await self._invoke_loader(self._position_loader, "positions")
 
-    async def _run_warm_start(self) -> None:
-        if self._reconcile_runner is None:
-            LOGGER.info("Warm start requested but no reconcile runner configured")
-            return
+    async def _run_reconcile(self) -> None:
         await self._invoke_loader(self._reconcile_runner, "reconcile")
 
     async def _load_startup_state(self) -> Optional[Dict[str, Any]]:
-        if self._startup_state_path is None:
+        if self._state_store is None:
             async with self._status_lock:
                 self._persisted_state = None
             return None
 
-        state = await asyncio.to_thread(self._read_startup_state)
+        state = await self._state_store.read_state()
+        normalized: Optional[Dict[str, Any]] = None
+        if state is not None:
+            offsets = self._normalize_offsets(state.get("offsets"))
+            last_offset = self._coerce_int(state.get("last_offset"))
+            normalized = {
+                "mode": state.get("mode") or state.get("startup_mode"),
+                "last_offset": last_offset,
+                "offsets": offsets,
+                "updated_at": state.get("updated_at"),
+            }
         async with self._status_lock:
-            self._persisted_state = state
-            if state and self._mode is None:
-                persisted_offset = state.get("last_offset")
-                if isinstance(persisted_offset, int):
-                    self._last_offset = persisted_offset
-        return state
+            self._persisted_state = normalized
+            if normalized is not None and self._mode is None:
+                if normalized.get("last_offset") is not None:
+                    self._last_offset = normalized["last_offset"]
+                if normalized.get("offsets"):
+                    self._offset_sources = dict(normalized["offsets"])
+        return normalized
 
     async def _persist_state(self, mode: StartupMode) -> None:
-        if self._startup_state_path is None:
+        if self._state_store is None:
             return
 
         ts = self._clock()
         if isinstance(ts, datetime) and ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
 
-        payload = {
-            "mode": mode.value,
-            "last_offset": self._last_offset,
-            "ts": ts.isoformat() if isinstance(ts, datetime) else str(ts),
-        }
+        offsets_snapshot: Dict[str, int]
+        async with self._status_lock:
+            offsets_snapshot = dict(self._offset_sources)
+            last_offset = self._last_offset
 
         try:
-            await asyncio.to_thread(self._write_startup_state, payload)
+            await self._state_store.write_state(
+                startup_mode=mode.value,
+                last_offset=last_offset,
+                offsets=offsets_snapshot,
+                updated_at=ts,
+            )
         except Exception as exc:  # pragma: no cover - IO failures should not crash startup
             LOGGER.warning("Unable to persist startup state: %s", exc)
-        async with self._status_lock:
-            self._persisted_state = payload
+        else:
+            async with self._status_lock:
+                self._persisted_state = {
+                    "mode": mode.value,
+                    "last_offset": last_offset,
+                    "offsets": offsets_snapshot,
+                    "updated_at": ts,
+                }
 
     async def _replay_from_offsets(self) -> None:
-        offsets = await self._load_offset_logs()
-        if offsets:
-            await self._dispatch_replay(offsets)
-            self._last_offset = max(offsets.values()) if offsets else None
-            self._offset_sources = offsets
-        else:
-            self._last_offset = None
-            self._offset_sources.clear()
+        async with self._status_lock:
+            offsets = dict(self._offset_sources)
+            last_offset = self._last_offset
+            persisted = self._persisted_state
 
-    def _read_startup_state(self) -> Optional[Dict[str, Any]]:
-        path = self._startup_state_path
-        if path is None or not path.exists():
-            return None
+        if not offsets and persisted is not None:
+            offsets = self._normalize_offsets(persisted.get("offsets"))
 
-        try:
-            raw = path.read_text(encoding="utf-8").strip()
-        except OSError as exc:  # pragma: no cover - defensive IO guard
-            LOGGER.warning("Unable to read startup state from %s: %s", path, exc)
-            return None
+        if last_offset is None and persisted is not None:
+            last_offset = self._coerce_int(persisted.get("last_offset"))
 
-        if not raw:
-            return None
+        new_last = await self._dispatch_replay(offsets, last_offset)
 
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            LOGGER.warning("Invalid startup state payload in %s: %s", path, exc)
-            return None
+        if new_last is None and offsets:
+            new_last = max(offsets.values()) if offsets else None
 
-        if not isinstance(payload, dict):
-            LOGGER.debug("Ignoring startup state from %s because payload is not an object", path)
-            return None
+        async with self._status_lock:
+            if offsets:
+                self._offset_sources = dict(offsets)
+            else:
+                self._offset_sources.clear()
+            self._last_offset = new_last
 
-        mode: Optional[str]
-        raw_mode = payload.get("mode")
-        if isinstance(raw_mode, str):
-            mode = raw_mode
-        elif raw_mode is None:
-            mode = None
-        else:
-            mode = str(raw_mode)
-
-        if mode is not None:
-            try:
-                StartupMode(mode)
-            except ValueError:
-                LOGGER.debug("Encountered unsupported startup mode %s in %s", mode, path)
-                mode = None
-
-        last_offset = self._coerce_int(payload.get("last_offset"))
-        ts = payload.get("ts")
-        if ts is not None and not isinstance(ts, str):
-            ts = str(ts)
-
-        return {"mode": mode, "last_offset": last_offset, "ts": ts}
-
-    def _write_startup_state(self, payload: Mapping[str, Any]) -> None:
-        path = self._startup_state_path
-        if path is None:
-            return
-
-        if not path.parent.exists():
-            path.parent.mkdir(parents=True, exist_ok=True)
-
-        text = json.dumps(payload, sort_keys=True)
-        path.write_text(text, encoding="utf-8")
-
-    async def _dispatch_replay(self, offsets: Mapping[str, int]) -> None:
-        if self._kafka_replay_handler is None:
+    async def _dispatch_replay(
+        self, offsets: MutableMapping[str, int], last_offset: Optional[int]
+    ) -> Optional[int]:
+        handler = self._kafka_replay_handler
+        if handler is None:
             LOGGER.info("Kafka replay handler not configured; skipping replay")
-            return
+            return last_offset
+
+        payload = dict(offsets)
+        if last_offset is not None:
+            payload.setdefault("__last_offset__", last_offset)
 
         try:
-            result = self._kafka_replay_handler(offsets)
+            result = handler(payload)
             if inspect.isawaitable(result):
-                await result
+                result = await result
         except Exception as exc:  # pragma: no cover - defensive logging
             LOGGER.warning("Kafka replay handler failed: %s", exc)
+            return last_offset
 
-    async def _load_offset_logs(self) -> Dict[str, int]:
-        if self._offset_log_path is None:
-            return {}
-        return await asyncio.to_thread(self._read_offset_logs)
+        if isinstance(result, Mapping):
+            updated = self._normalize_offsets(result)
+            if updated:
+                offsets.update(updated)
+                return max(updated.values())
+            return last_offset
 
-    def _read_offset_logs(self) -> Dict[str, int]:
-        path = self._offset_log_path
-        assert path is not None
-        if not path.exists():
-            return {}
-
-        files: list[Path] = []
-        if path.is_dir():
-            for pattern in ("*.json", "*.log", "*"):
-                files.extend(candidate for candidate in path.glob(pattern) if candidate.is_file())
-            # Deduplicate while preserving order
-            seen: set[Path] = set()
-            unique: list[Path] = []
-            for candidate in files:
-                if candidate in seen:
-                    continue
-                seen.add(candidate)
-                unique.append(candidate)
-            files = unique
-        else:
-            files = [path]
-
-        offsets: Dict[str, int] = {}
-        for file_path in files:
-            try:
-                raw_text = file_path.read_text().strip()
-            except OSError as exc:  # pragma: no cover - IO failure
-                LOGGER.warning("Unable to read offset log %s: %s", file_path, exc)
-                continue
-
-            if not raw_text:
-                continue
-
-            parsed: Any
-            try:
-                parsed = json.loads(raw_text)
-            except json.JSONDecodeError:
-                value = self._coerce_int(raw_text)
-                if value is not None:
-                    self._record_offset(offsets, file_path.stem, value)
-                else:
-                    LOGGER.debug("Skipping malformed offset log %s", file_path)
-                continue
-
-            extracted = self._extract_offsets(file_path.stem, parsed)
-            for key, offset in extracted.items():
-                self._record_offset(offsets, key, offset)
-
-        return offsets
-
-    def _extract_offsets(self, prefix: str, payload: Any) -> Dict[str, int]:
-        if isinstance(payload, dict):
-            partitions = payload.get("partitions")
-            if isinstance(partitions, dict):
-                return {
-                    f"{prefix}:{partition}": value
-                    for partition, entry in partitions.items()
-                    if (value := self._coerce_entry(entry)) is not None
-                }
-            value = self._coerce_entry(payload)
-            return {prefix: value} if value is not None else {}
-
-        if isinstance(payload, list):
-            collected: Dict[str, int] = {}
-            for index, entry in enumerate(payload):
-                value = self._coerce_entry(entry)
-                if value is not None:
-                    collected[f"{prefix}:{index}"] = value
-            return collected
-
-        value = self._coerce_entry(payload)
-        return {prefix: value} if value is not None else {}
-
-    def _record_offset(self, offsets: MutableMapping[str, int], key: str, offset: int) -> None:
-        current = offsets.get(key)
-        if current is None or offset > current:
-            offsets[key] = offset
+        coerced = self._coerce_int(result)
+        return coerced if coerced is not None else last_offset
 
     async def _invoke_loader(
         self,
         loader: Callable[[], Awaitable[Any]] | None,
         label: str,
-    ) -> None:
+    ) -> Any:
         if loader is None:
             LOGGER.debug("No %s loader configured", label)
-            return
+            return None
         try:
             result = loader()
             if inspect.isawaitable(result):
-                await result
+                return await result
+            return result
         except Exception:  # pragma: no cover - defensive logging
             LOGGER.exception("Startup %s loader failed", label)
             raise
@@ -375,19 +498,16 @@ class StartupManager:
         except ValueError as exc:  # pragma: no cover - defensive
             raise ValueError(f"Unsupported startup mode: {mode}") from exc
 
-    def _coerce_entry(self, entry: Any) -> Optional[int]:
-        if isinstance(entry, dict):
-            for key in ("next_offset", "offset", "last_offset"):
-                if key not in entry:
-                    continue
-                value = self._coerce_int(entry[key])
-                if value is None:
-                    continue
-                if key == "last_offset":
-                    return value + 1
-                return value
-            return None
-        return self._coerce_int(entry)
+    def _normalize_offsets(self, mapping: Any) -> Dict[str, int]:
+        if not isinstance(mapping, Mapping):
+            return {}
+        normalized: Dict[str, int] = {}
+        for key, value in mapping.items():
+            coerced = self._coerce_int(value)
+            if coerced is None:
+                continue
+            normalized[str(key)] = coerced
+        return normalized
 
     def _coerce_int(self, value: Any) -> Optional[int]:
         if value is None:
@@ -429,4 +549,10 @@ def register(app: FastAPI, manager: StartupManager) -> StartupManager:
     return manager
 
 
-__all__ = ["StartupManager", "StartupMode", "register", "router"]
+__all__ = [
+    "SQLStartupStateStore",
+    "StartupManager",
+    "StartupMode",
+    "register",
+    "router",
+]
