@@ -7,10 +7,14 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict
 
 from services.common.adapters import TimescaleAdapter
+from services.common.security import (
+    AuthenticatedPrincipal,
+    require_authenticated_principal,
+)
 from shared.audit import AuditLogEntry, AuditLogStore
 
 
@@ -214,18 +218,10 @@ def ensure_audit_mode_enabled(config: AuditModeConfig = Depends(get_audit_mode_c
 
 
 def require_auditor_identity(
+    principal: AuthenticatedPrincipal = Depends(require_authenticated_principal),
     config: AuditModeConfig = Depends(get_audit_mode_config),
-    x_role: str = Header(..., alias="X-Role"),
-    x_account_id: str = Header(..., alias="X-Account-ID"),
 ) -> AuditorPrincipal:
-    role = x_role.strip().lower()
-    if role != "auditor":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Auditor role required for audit endpoints.",
-        )
-
-    account = x_account_id.strip().lower()
+    account = principal.normalized_account
     allowed = {acct.strip().lower() for acct in config.auditor_accounts}
     if account not in allowed:
         raise HTTPException(

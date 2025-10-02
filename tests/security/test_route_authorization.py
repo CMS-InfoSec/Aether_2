@@ -96,7 +96,7 @@ def test_export_logs_rejects_non_auditors(export_client: TestClient) -> None:
     response = export_client.get(
         "/logs/export",
         params={"date": "2024-01-01", "format": "json"},
-        headers={"X-Role": "engineer", "X-Account-ID": "analyst"},
+        headers={"X-Account-ID": "analyst"},
     )
     assert response.status_code == 403
 
@@ -152,7 +152,7 @@ def test_export_compliance_pack_rejects_non_auditors(compliance_client: TestClie
     response = compliance_client.get(
         "/compliance/export",
         params={"date": "2024-01-01", "format": "sec"},
-        headers={"X-Role": "engineer", "X-Account-ID": "auditor-1"},
+        headers={"X-Account-ID": "auditor-1"},
     )
     assert response.status_code == 403
 
