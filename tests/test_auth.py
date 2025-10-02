@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 import logging
 import sys
 from pathlib import Path
@@ -14,8 +15,10 @@ if spec and spec.loader:
     spec.loader.exec_module(module)
     sys.modules["secrets"] = module
 
+
 import pyotp
 import pytest
+
 
 from auth import service as auth_service_module
 
@@ -58,6 +61,7 @@ def test_login_enforces_mfa_and_ip_allow_list():
     sessions = SessionStore()
     service = AuthService(repository, sessions)
 
+
     secret = pyotp.random_base32()
     admin = AdminAccount(
         admin_id="admin-1",
@@ -69,17 +73,20 @@ def test_login_enforces_mfa_and_ip_allow_list():
     repository.add(admin)
 
     # Missing or invalid MFA should fail
+
     mfa_failure_before = _metric_value(
         auth_service_module._LOGIN_FAILURE_COUNTER, {"reason": "mfa_required"}
     )
     mfa_denied_before = _metric_value(auth_service_module._MFA_DENIED_COUNTER)
     with pytest.raises(PermissionError) as exc:
+
         service.login(
             email=admin.email,
             password="P@ssw0rd",
             mfa_code="000000",
             ip_address="203.0.113.10",
         )
+
     assert str(exc.value) == "mfa_required"
     assert (
         _metric_value(
@@ -95,6 +102,7 @@ def test_login_enforces_mfa_and_ip_allow_list():
     # Valid MFA and IP allow-list should succeed
     valid_code = pyotp.TOTP(secret).now()
     success_before = _metric_value(auth_service_module._LOGIN_SUCCESS_COUNTER)
+
     session = service.login(
         email=admin.email,
         password="P@ssw0rd",
@@ -103,6 +111,7 @@ def test_login_enforces_mfa_and_ip_allow_list():
     )
     assert session.admin_id == admin.admin_id
     assert session.token
+
     assert (
         _metric_value(auth_service_module._LOGIN_SUCCESS_COUNTER)
         == success_before + 1
@@ -215,3 +224,4 @@ def test_auth_service_failure_branches_emit_structured_logs_and_metrics(caplog):
         ip_address="203.0.113.10",
         admin_id_expected=True,
     )
+
