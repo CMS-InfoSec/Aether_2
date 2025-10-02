@@ -30,6 +30,7 @@ DEFAULT_SERVICES_DIR = Path("deploy/k8s/base/aether-services")
 DEFAULT_MODELS_DIR = Path("ml/models")
 DEFAULT_JSON_OUTPUT = Path("release_manifest_current.json")
 DEFAULT_MARKDOWN_OUTPUT = Path("release_manifest_current.md")
+DEFAULT_HASH_OUTPUT = Path("release_manifest_current.sha256")
 
 
 Base = declarative_base()
@@ -335,6 +336,7 @@ def write_manifest_artifacts(
     manifest: Manifest,
     json_path: Path = DEFAULT_JSON_OUTPUT,
     markdown_path: Path = DEFAULT_MARKDOWN_OUTPUT,
+    hash_path: Path = DEFAULT_HASH_OUTPUT,
 ) -> None:
     try:
         json_path.write_text(manifest_to_json(manifest))
@@ -342,6 +344,10 @@ def write_manifest_artifacts(
         pass
     try:
         markdown_path.write_text(manifest_to_markdown(manifest))
+    except OSError:  # pragma: no cover - filesystem failure
+        pass
+    try:
+        hash_path.write_text(f"{manifest.manifest_hash}\n")
     except OSError:  # pragma: no cover - filesystem failure
         pass
 
@@ -459,7 +465,12 @@ def create_command(args: argparse.Namespace) -> int:
             raise SystemExit(f"Manifest '{manifest.manifest_id}' already exists")
         manifest = save_manifest(session, manifest)
 
-    write_manifest_artifacts(manifest, Path(args.output_json), Path(args.output_markdown))
+    write_manifest_artifacts(
+        manifest,
+        Path(args.output_json),
+        Path(args.output_markdown),
+        Path(args.output_hash),
+    )
     print(manifest_to_json(manifest))
     return 0
 
@@ -521,6 +532,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-markdown",
         default=str(DEFAULT_MARKDOWN_OUTPUT),
         help="Path to write the Markdown manifest",
+    )
+    create_parser.add_argument(
+        "--output-hash",
+        default=str(DEFAULT_HASH_OUTPUT),
+        help="Path to write the manifest hash",
     )
     create_parser.set_defaults(func=create_command)
 
