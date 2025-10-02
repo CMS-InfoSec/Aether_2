@@ -12,6 +12,8 @@ Features provided by the mock:
 * Behaviour toggles for probabilistic partial fills, rejections and cancels.
 * Latency simulation for both synchronous (WS) and asynchronous (REST) paths.
 * Random latency spikes and WebSocket failure simulation.
+* Runtime behaviour modes (``normal``, ``delayed``, ``failing``, ``crash``)
+  that allow tests to exercise orchestration logic under adverse conditions.
 * Random as well as scheduled error injection to exercise retry paths.
 * Pytest fixtures that expose the mock in a convenient form for integration
   tests.
@@ -51,6 +53,10 @@ class MockKrakenRandomError(MockKrakenError):
     """Raised when a probabilistic failure is triggered."""
 
 
+class MockKrakenCrashed(MockKrakenError):
+    """Raised when the mock exchange is configured to crash."""
+
+
 # ---------------------------------------------------------------------------
 # Configuration containers
 # ---------------------------------------------------------------------------
@@ -82,6 +88,7 @@ class MockKrakenConfig:
     rejection_rate: float = 0.0
     cancel_rate: float = 0.0
     seed: Optional[int] = 11
+    mode: str = "normal"
 
 
 @dataclass(slots=True)
@@ -161,16 +168,33 @@ class MockKrakenExchange:
         self._fill_schedules: Dict[str, Deque[List[float]]] = {}
         self._rejection_reasons: Deque[str] = deque()
         self._cancel_reasons: Deque[str] = deque()
+        self._default_partial_fill_probability = self.config.partial_fill_probability
         self._partial_fill_probability = self.config.partial_fill_probability
+        self._default_rejection_rate = self.config.rejection_rate
         self._rejection_rate = self.config.rejection_rate
+        self._default_cancel_rate = self.config.cancel_rate
         self._cancel_rate = self.config.cancel_rate
+        self._default_latency_range = tuple(self.config.latency)
+        self._latency_range = tuple(self.config.latency)
+        self._default_random_latency_chance = self.config.random_latency_chance
         self._random_latency_chance = self.config.random_latency_chance
-        self._random_latency = self.config.random_latency
+        self._default_random_latency = tuple(self.config.random_latency)
+        self._random_latency = tuple(self.config.random_latency)
+        self._default_error_rate = self.config.error_rate
+        self._error_rate = self.config.error_rate
+        self._mode = "normal"
+        self._crashed = False
         self._ws_sessions: set["MockKrakenWSSession"] = set()
+        self._apply_mode(self.config.mode)
 
     # ------------------------------------------------------------------
     # Configuration helpers
     # ------------------------------------------------------------------
+    def set_mode(self, mode: str) -> None:
+        """Switch the exchange into one of the predefined behaviour modes."""
+
+        self._apply_mode(mode)
+
     def schedule_fill_sequence(self, sequence: Iterable[float], *, pair: Optional[str] = None) -> None:
         """Enqueue a specific fill sequence for the next order.
 
@@ -206,22 +230,31 @@ class MockKrakenExchange:
         cancel_rate: Optional[float] = None,
         random_latency_chance: Optional[float] = None,
         random_latency: Optional[Tuple[float, float]] = None,
+        error_rate: Optional[float] = None,
     ) -> None:
         """Adjust runtime behaviour knobs without recreating the exchange."""
 
         if partial_fill_probability is not None:
             self._partial_fill_probability = max(0.0, min(1.0, float(partial_fill_probability)))
+            self._default_partial_fill_probability = self._partial_fill_probability
         if rejection_rate is not None:
             self._rejection_rate = max(0.0, min(1.0, float(rejection_rate)))
+            self._default_rejection_rate = self._rejection_rate
         if cancel_rate is not None:
             self._cancel_rate = max(0.0, min(1.0, float(cancel_rate)))
+            self._default_cancel_rate = self._cancel_rate
         if random_latency_chance is not None:
             self._random_latency_chance = max(0.0, min(1.0, float(random_latency_chance)))
+            self._default_random_latency_chance = self._random_latency_chance
         if random_latency is not None:
             low, high = random_latency
             if high < low:
                 low, high = high, low
             self._random_latency = (float(low), float(high))
+            self._default_random_latency = self._random_latency
+        if error_rate is not None:
+            self._error_rate = max(0.0, min(1.0, float(error_rate)))
+            self._default_error_rate = self._error_rate
 
     def simulate_ws_failure(self) -> int:
         """Force-close every active WebSocket session and return the count."""
@@ -232,6 +265,52 @@ class MockKrakenExchange:
             closed += 1
         self._ws_sessions.clear()
         return closed
+
+    # ------------------------------------------------------------------
+    # Behaviour modes
+    # ------------------------------------------------------------------
+    def _apply_mode(self, mode: str) -> None:
+        normalised = str(mode or "normal").lower()
+        base_latency = tuple(self._default_latency_range)
+        base_random_latency = tuple(self._default_random_latency)
+        base_random_chance = float(self._default_random_latency_chance)
+        base_error_rate = float(self._default_error_rate)
+
+        self._latency_range = base_latency
+        self._random_latency = base_random_latency
+        self._random_latency_chance = base_random_chance
+        self._error_rate = base_error_rate
+        self._partial_fill_probability = self._default_partial_fill_probability
+        self._rejection_rate = self._default_rejection_rate
+        self._cancel_rate = self._default_cancel_rate
+        self._mode = normalised
+        self._crashed = False
+
+        if normalised == "normal":
+            return
+        if normalised == "delayed":
+            low, high = self._latency_range
+            low = max(low, 0.25)
+            high = max(high, 0.75)
+            if high < low:
+                low, high = high, low
+            self._latency_range = (low, high)
+            jitter_low, jitter_high = self._random_latency
+            jitter_low = max(jitter_low, 0.05)
+            jitter_high = max(jitter_high, 0.25)
+            if jitter_high < jitter_low:
+                jitter_low, jitter_high = jitter_high, jitter_low
+            self._random_latency = (jitter_low, jitter_high)
+            self._random_latency_chance = max(self._random_latency_chance, 0.75)
+            return
+        if normalised == "failing":
+            self._error_rate = max(self._error_rate, 0.75)
+            self._rejection_rate = max(self._rejection_rate, 0.5)
+            return
+        if normalised == "crash":
+            self._crashed = True
+            return
+        raise ValueError(f"Unknown mock Kraken mode: {mode!r}")
 
     def reset(self) -> None:
         """Restore balances and clear orders/trades."""
@@ -248,11 +327,23 @@ class MockKrakenExchange:
         self._fill_schedules.clear()
         self._rejection_reasons.clear()
         self._cancel_reasons.clear()
+        self._default_latency_range = tuple(self.config.latency)
+        self._default_partial_fill_probability = self.config.partial_fill_probability
         self._partial_fill_probability = self.config.partial_fill_probability
+        self._default_rejection_rate = self.config.rejection_rate
         self._rejection_rate = self.config.rejection_rate
+        self._default_cancel_rate = self.config.cancel_rate
         self._cancel_rate = self.config.cancel_rate
-        self._random_latency_chance = self.config.random_latency_chance
-        self._random_latency = self.config.random_latency
+        self._default_random_latency_chance = self.config.random_latency_chance
+        self._latency_range = tuple(self._default_latency_range)
+        self._random_latency_chance = self._default_random_latency_chance
+        self._default_random_latency = tuple(self.config.random_latency)
+        self._random_latency = tuple(self._default_random_latency)
+        self._default_error_rate = self.config.error_rate
+        self._error_rate = self._default_error_rate
+        self._mode = "normal"
+        self._crashed = False
+        self._apply_mode(self.config.mode)
         self.simulate_ws_failure()
 
     # ------------------------------------------------------------------
@@ -481,7 +572,7 @@ class MockKrakenExchange:
             await asyncio.sleep(delay)
 
     def _latency_value(self) -> float:
-        low, high = self.config.latency
+        low, high = self._latency_range
         if high < low:
             low, high = high, low
         base = 0.0
@@ -495,10 +586,12 @@ class MockKrakenExchange:
         return max(0.0, base)
 
     def _maybe_raise(self, method: str) -> None:
+        if self._crashed:
+            raise MockKrakenCrashed("Mock Kraken exchange is in crash mode")
         queue = self._error_queues.get(method)
         if queue:
             raise queue.popleft()
-        if self.config.error_rate and self._random.random() < self.config.error_rate:
+        if self._error_rate and self._random.random() < self._error_rate:
             raise MockKrakenRandomError(f"Random failure injected for {method}")
 
     def _pop_rejection_reason(self) -> Optional[str]:
@@ -634,6 +727,9 @@ class MockKrakenControls:
         self._exchange.configure_behaviour(
             random_latency_chance=chance, random_latency=(low, high)
         )
+
+    def set_mode(self, mode: str) -> None:
+        self._exchange.set_mode(mode)
 
     def reject_next_order(self, reason: str = "EOrder:Rejected") -> None:
         self._exchange.schedule_rejection(reason)
