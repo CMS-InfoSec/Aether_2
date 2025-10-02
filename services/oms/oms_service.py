@@ -41,6 +41,7 @@ from services.oms.warm_start import WarmStartCoordinator
 import websockets
 
 from metrics import (
+    increment_oms_auth_failures,
     increment_oms_child_orders_total,
     increment_oms_error_count,
     record_oms_latency,
@@ -1987,70 +1988,66 @@ manager = OMSManager()
 warm_start = WarmStartCoordinator(lambda: manager)
 
 
-def _decode_segment(segment: str) -> bytes:
-    padding = "=" * (-len(segment) % 4)
-    return base64.urlsafe_b64decode(segment + padding)
+
+async def require_account_id(request: Request) -> str:
+    raw_header = request.headers.get("X-Account-ID")
+    account_id = raw_header.strip() if raw_header else ""
+
+    if account_id:
+        return account_id
+
+    reason = "missing_account_id" if raw_header is None else "empty_account_id"
+    increment_oms_auth_failures(reason=reason)
+
+    logger.warning(
+        "Unauthorized OMS request missing X-Account-ID header",
+        extra={
+            "event": "oms.auth_failure",
+            "reason": reason,
+            "status_code": status.HTTP_401_UNAUTHORIZED,
+            "source_ip": _extract_source_ip(request),
+            "account_header": _redact_account_header(raw_header),
+            "path": request.url.path,
+        },
+    )
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Missing X-Account-ID header",
+    )
 
 
-def _verify_authorization_token(token: str) -> Dict[str, Any]:
-    try:
-        header_segment, payload_segment, signature_segment = token.split(".")
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authorization token format",
-        ) from exc
+def _extract_source_ip(request: Request) -> str:
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        first_hop = forwarded_for.split(",")[0].strip()
+        if first_hop:
+            return first_hop
 
-    secret = os.getenv("AUTH_JWT_SECRET", "change-me").encode("utf-8")
-    signing_input = f"{header_segment}.{payload_segment}".encode("ascii")
-    expected_signature = hmac.new(secret, signing_input, hashlib.sha256).digest()
+    client = request.client
+    if client and getattr(client, "host", None):
+        return str(client.host)
 
-    try:
-        provided_signature = _decode_segment(signature_segment)
-    except Exception as exc:  # pragma: no cover - defensive guard
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authorization token signature",
-        ) from exc
+    scope_client = request.scope.get("client") if hasattr(request, "scope") else None
+    if scope_client and scope_client[0]:
+        return str(scope_client[0])
 
-    if not hmac.compare_digest(expected_signature, provided_signature):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token signature")
-
-    try:
-        payload_bytes = _decode_segment(payload_segment)
-    except Exception as exc:  # pragma: no cover - defensive guard
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid token payload") from exc
-
-    try:
-        payload: Dict[str, Any] = json.loads(payload_bytes)
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Malformed token payload") from exc
-
-    exp = payload.get("exp")
-    if exp is not None and int(exp) < int(time.time()):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired")
-
-    return payload
+    return "unknown"
 
 
-async def require_authorized_account(request: Request) -> str:
-    authorization = request.headers.get("Authorization")
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token")
+def _redact_account_header(value: Optional[str]) -> str:
+    if value is None:
+        return "missing"
 
-    token = authorization.split(" ", 1)[1].strip()
-    if not token:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authorization token missing")
+    trimmed = value.strip()
+    if not trimmed:
+        return "missing"
 
-    payload = _verify_authorization_token(token)
+    if len(trimmed) <= 4:
+        return f"{trimmed[0]}***"
 
-    account_id = payload.get("account") or payload.get("sub")
-    if not isinstance(account_id, str) or not account_id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Token missing account claim")
+    return f"{trimmed[:3]}***{trimmed[-2:]}"
 
-    request.state.account_id = account_id
-    request.state.token_claims = payload
-    return account_id
 
 
 @app.on_event("shutdown")
@@ -2128,6 +2125,11 @@ async def get_rate_limit_status(
     header_account: str = Depends(require_authorized_account),
 ) -> Dict[str, Dict[str, Dict[str, float | int]]]:
     return await rate_limit_guard.status(header_account)
+
+
+@app.get("/oms/warm_start/status")
+async def get_warm_start_status(_: str = Depends(require_account_id)) -> Dict[str, int]:
+    return await warm_start.status()
 
 
 @app.get("/oms/warm_start/report")
