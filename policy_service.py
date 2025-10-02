@@ -59,6 +59,10 @@ DEFAULT_MODEL_SHARPES: Dict[str, float] = {
     "vol_breakout": 1.1,
 }
 
+FOUR_DP = Decimal("0.0001")
+EIGHT_DP = Decimal("0.00000001")
+ZERO_DECIMAL = Decimal("0")
+
 _ATR_CACHE: Dict[str, float] = {}
 
 KRAKEN_PRECISION: Dict[str, Dict[str, float]] = {
@@ -293,6 +297,33 @@ def _snap(value: float, step: float) -> float:
 
 
 
+def _to_decimal(value: float | Decimal | None, *, default: Decimal = ZERO_DECIMAL) -> Decimal:
+    if value is None:
+        return default
+    if isinstance(value, Decimal):
+        return value
+    try:
+        return Decimal(str(value))
+    except (TypeError, ValueError, ArithmeticError):
+        return default
+
+
+def _quantize_decimal(value: Decimal, exponent: Decimal = FOUR_DP) -> Decimal:
+    return value.quantize(exponent, rounding=ROUND_HALF_UP)
+
+
+def _clamp_decimal(
+    value: Decimal,
+    lower: Decimal = ZERO_DECIMAL,
+    upper: Decimal = Decimal("1"),
+) -> Decimal:
+    if value < lower:
+        return lower
+    if value > upper:
+        return upper
+    return value
+
+
 def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
     return max(lower, min(upper, value))
 
@@ -346,50 +377,53 @@ def _normalize_weights(weights: Dict[str, float]) -> Dict[str, float]:
 
 
 def _blend_confidence(intents: Dict[str, "Intent"], weights: Dict[str, float]) -> ConfidenceMetrics:
-    model_conf = 0.0
-    state_conf = 0.0
-    exec_conf = 0.0
-    overall = 0.0
+    model_conf = ZERO_DECIMAL
+    state_conf = ZERO_DECIMAL
+    exec_conf = ZERO_DECIMAL
+    overall = ZERO_DECIMAL
 
     for key, intent in intents.items():
-        weight = weights.get(key, 0.0)
-        if weight <= 0:
+        weight = _to_decimal(weights.get(key, 0.0))
+        if weight <= ZERO_DECIMAL:
             continue
         confidence = intent.confidence
-        model_conf += confidence.model_confidence * weight
-        state_conf += confidence.state_confidence * weight
-        exec_conf += confidence.execution_confidence * weight
-        overall += (confidence.overall_confidence or 0.0) * weight
+        model_conf += _to_decimal(confidence.model_confidence) * weight
+        state_conf += _to_decimal(confidence.state_confidence) * weight
+        exec_conf += _to_decimal(confidence.execution_confidence) * weight
+        overall += _to_decimal(confidence.overall_confidence, default=ZERO_DECIMAL) * weight
 
     blended = ConfidenceMetrics(
-        model_confidence=round(_clamp(model_conf), 4),
-        state_confidence=round(_clamp(state_conf), 4),
-        execution_confidence=round(_clamp(exec_conf), 4),
-        overall_confidence=round(_clamp(overall), 4),
+        model_confidence=float(_quantize_decimal(_clamp_decimal(model_conf))),
+        state_confidence=float(_quantize_decimal(_clamp_decimal(state_conf))),
+        execution_confidence=float(_quantize_decimal(_clamp_decimal(exec_conf))),
+        overall_confidence=float(_quantize_decimal(_clamp_decimal(overall))),
     )
     return blended
 
 
-def _blend_template_confidences(intents: Dict[str, "Intent"], weights: Dict[str, float]) -> Dict[str, float]:
-    confidence_totals: Dict[str, float] = defaultdict(float)
-    weight_totals: Dict[str, float] = defaultdict(float)
+def _blend_template_confidences(
+    intents: Dict[str, "Intent"], weights: Dict[str, float]
+) -> Dict[str, Decimal]:
+    confidence_totals: Dict[str, Decimal] = defaultdict(lambda: ZERO_DECIMAL)
+    weight_totals: Dict[str, Decimal] = defaultdict(lambda: ZERO_DECIMAL)
 
     for key, intent in intents.items():
-        weight = weights.get(key, 0.0)
-        if weight <= 0:
+        weight = _to_decimal(weights.get(key, 0.0))
+        if weight <= ZERO_DECIMAL:
             continue
         for template in intent.action_templates or []:
             template_key = template.name.lower()
-            confidence_totals[template_key] += template.confidence * weight
+            confidence_totals[template_key] += _to_decimal(template.confidence) * weight
             weight_totals[template_key] += weight
 
-    blended: Dict[str, float] = {}
+    blended: Dict[str, Decimal] = {}
     for template_key, total_conf in confidence_totals.items():
-        weight = weight_totals.get(template_key, 0.0)
-        if weight <= 0:
-            blended[template_key] = 0.0
+        weight = weight_totals.get(template_key, ZERO_DECIMAL)
+        if weight > ZERO_DECIMAL:
+            average = total_conf / weight
         else:
-            blended[template_key] = round(_clamp(total_conf / weight), 4)
+            average = total_conf
+        blended[template_key] = _quantize_decimal(_clamp_decimal(average))
     return blended
 
 
@@ -479,15 +513,21 @@ def _resolve_risk_band(
 
 
 
-async def _fetch_effective_fee(account_id: str, symbol: str, liquidity: str, notional: float) -> float:
+async def _fetch_effective_fee(
+    account_id: str, symbol: str, liquidity: str, notional: Decimal | float
+) -> Decimal:
     liquidity_normalized = liquidity.lower() if liquidity else "maker"
     if liquidity_normalized not in {"maker", "taker"}:
         liquidity_normalized = "maker"
 
+    notional_decimal = _to_decimal(notional)
+    if notional_decimal < ZERO_DECIMAL:
+        notional_decimal = ZERO_DECIMAL
+
     params = {
         "pair": symbol,
         "liquidity": liquidity_normalized,
-        "notional": f"{max(notional, 0.0):.8f}",
+        "notional": f"{_quantize_decimal(notional_decimal, EIGHT_DP)}",
     }
     headers = {"X-Account-ID": account_id}
     timeout = httpx.Timeout(FEES_REQUEST_TIMEOUT)
@@ -515,7 +555,7 @@ async def _fetch_effective_fee(account_id: str, symbol: str, liquidity: str, not
         )
 
     try:
-        return float(payload["bps"])
+        return _to_decimal(payload["bps"])
     except (KeyError, TypeError, ValueError) as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -652,14 +692,18 @@ async def decide_policy(
         )
         return fallback_decision.response
 
-    notional = float(Decimal(str(snapped_price)) * Decimal(str(snapped_qty)))
-    maker_fee_bps = await _fetch_effective_fee(request.account_id, request.instrument, "maker", notional)
-    taker_fee_bps = await _fetch_effective_fee(request.account_id, request.instrument, "taker", notional)
+    notional = _to_decimal(snapped_price) * _to_decimal(snapped_qty)
+    maker_fee_bps = _to_decimal(
+        await _fetch_effective_fee(request.account_id, request.instrument, "maker", notional)
+    )
+    taker_fee_bps = _to_decimal(
+        await _fetch_effective_fee(request.account_id, request.instrument, "taker", notional)
+    )
 
     effective_fee = FeeBreakdown(
         currency=request.fee.currency,
-        maker=round(maker_fee_bps, 4),
-        taker=round(taker_fee_bps, 4),
+        maker=float(_quantize_decimal(maker_fee_bps)),
+        taker=float(_quantize_decimal(taker_fee_bps)),
         maker_detail=request.fee.maker_detail,
         taker_detail=request.fee.taker_detail,
     )
@@ -679,36 +723,44 @@ async def decide_policy(
             ),
         )
 
-    expected_edge = 0.0
+    expected_edge = ZERO_DECIMAL
     for variant, intent in intents.items():
-        expected_edge += weights.get(variant, 0.0) * float(intent.edge_bps or 0.0)
+        weight = _to_decimal(weights.get(variant, 0.0))
+        if weight <= ZERO_DECIMAL:
+            continue
+        expected_edge += weight * _to_decimal(intent.edge_bps, default=ZERO_DECIMAL)
 
-    slippage_bps = float(request.slippage_bps or 0.0)
-    maker_edge = round(expected_edge - (effective_fee.maker + slippage_bps), 4)
-    taker_edge = round(expected_edge - (effective_fee.taker + slippage_bps), 4)
+    slippage_bps = _to_decimal(request.slippage_bps, default=ZERO_DECIMAL)
+    maker_edge = _quantize_decimal(expected_edge - (maker_fee_bps + slippage_bps))
+    taker_edge = _quantize_decimal(expected_edge - (taker_fee_bps + slippage_bps))
 
     template_confidences = _blend_template_confidences(intents, weights)
-    maker_confidence = _clamp(template_confidences.get("maker", confidence.execution_confidence))
-    taker_confidence = _clamp(
-        template_confidences.get("taker", confidence.execution_confidence * 0.95)
+    maker_confidence = template_confidences.get(
+        "maker", _to_decimal(confidence.execution_confidence)
     )
+    taker_default = _to_decimal(confidence.execution_confidence) * Decimal("0.95")
+    taker_confidence = template_confidences.get("taker", taker_default)
+    maker_confidence = _quantize_decimal(_clamp_decimal(maker_confidence))
+    taker_confidence = _quantize_decimal(_clamp_decimal(taker_confidence))
 
     action_templates = [
         ActionTemplate(
             name="maker",
             venue_type="maker",
-            edge_bps=maker_edge,
-            fee_bps=round(effective_fee.maker, 4),
-            confidence=round(maker_confidence, 4),
+            edge_bps=float(maker_edge),
+            fee_bps=float(_quantize_decimal(maker_fee_bps)),
+            confidence=float(maker_confidence),
         ),
         ActionTemplate(
             name="taker",
             venue_type="taker",
-            edge_bps=taker_edge,
-            fee_bps=round(effective_fee.taker, 4),
-            confidence=round(taker_confidence, 4),
+            edge_bps=float(taker_edge),
+            fee_bps=float(_quantize_decimal(taker_fee_bps)),
+            confidence=float(taker_confidence),
         ),
     ]
+
+    edge_by_action = {"maker": maker_edge, "taker": taker_edge}
 
     vote_totals: Dict[str, float] = defaultdict(float)
     for variant, intent in intents.items():
@@ -738,7 +790,14 @@ async def decide_policy(
     if selected_template is None and action_templates:
         selected_template = max(action_templates, key=lambda template: template.edge_bps)
 
-    fee_adjusted_edge = selected_template.edge_bps if selected_template else 0.0
+    if winning_action in edge_by_action:
+        fee_adjusted_edge = edge_by_action[winning_action]
+    elif selected_template is not None:
+        fee_adjusted_edge = _quantize_decimal(
+            _to_decimal(selected_template.edge_bps),
+        )
+    else:
+        fee_adjusted_edge = ZERO_DECIMAL
     approval_score = sum(
         weights.get(variant, 0.0) for variant, intent in intents.items() if intent.approved
     )
@@ -765,7 +824,7 @@ async def decide_policy(
     selected_action = winning_action if winning_action in {"maker", "taker"} else "abstain"
     if not approved:
 
-        if fee_adjusted_edge <= 0:
+        if fee_adjusted_edge <= ZERO_DECIMAL:
             reason = "Fee-adjusted edge non-positive"
         elif entropy > 0.3:
             reason = "High ensemble entropy"
@@ -779,7 +838,7 @@ async def decide_policy(
             reason = "Fee-adjusted edge non-positive"
 
         selected_action = "abstain"
-        fee_adjusted_edge = min(fee_adjusted_edge, 0.0)
+        fee_adjusted_edge = min(fee_adjusted_edge, ZERO_DECIMAL)
     else:
         selected_action = selected_template.name if selected_template else selected_action
 
@@ -798,8 +857,8 @@ async def decide_policy(
         approved=approved,
         reason=reason,
         effective_fee=effective_fee,
-        expected_edge_bps=round(expected_edge, 4),
-        fee_adjusted_edge_bps=round(fee_adjusted_edge, 4),
+        expected_edge_bps=float(_quantize_decimal(expected_edge)),
+        fee_adjusted_edge_bps=float(_quantize_decimal(fee_adjusted_edge)),
         selected_action=selected_action,
         action_templates=action_templates,
         confidence=confidence,

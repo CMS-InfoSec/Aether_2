@@ -49,13 +49,16 @@ def _intent() -> Intent:
 
 
 def test_policy_service_decision(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
-    async def _fake_fee(account_id: str, symbol: str, liquidity: str, notional: float) -> float:
+    async def _fake_fee(
+        account_id: str, symbol: str, liquidity: str, notional: float | Decimal
+    ) -> Decimal:
         assert account_id == "company"
         assert symbol == "BTC-USD"
         assert liquidity in {"maker", "taker"}
-        expected_notional = float(Decimal("30120.5") * Decimal("0.1235"))
-        assert notional == pytest.approx(expected_notional)
-        return 4.5
+        dec_notional = notional if isinstance(notional, Decimal) else Decimal(str(notional))
+        expected_notional = Decimal("30120.5") * Decimal("0.1235")
+        assert dec_notional == expected_notional
+        return Decimal("4.5")
 
     monkeypatch.setattr(policy_service, "_fetch_effective_fee", _fake_fee)
     monkeypatch.setattr(policy_service, "predict_intent", lambda **_: _intent())

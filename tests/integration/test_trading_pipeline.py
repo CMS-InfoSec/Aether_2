@@ -5,6 +5,7 @@ import sys
 import types
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
 
 import pytest
 from fastapi import FastAPI, HTTPException, Request
@@ -177,14 +178,18 @@ def test_trading_pipeline_emits_fill_event(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(policy_module, "predict_intent", lambda **_: intent_stub)
     policy_module.ENABLE_SHADOW_EXECUTION = False
 
-    async def fake_fetch_effective_fee(account_id: str, symbol: str, liquidity: str, notional: float) -> float:
+    async def fake_fetch_effective_fee(
+        account_id: str, symbol: str, liquidity: str, notional: float | Decimal
+    ) -> Decimal:
+        notional_decimal = notional if isinstance(notional, Decimal) else Decimal(str(notional))
+        notional_str = f"{notional_decimal.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP)}"
         response = fees_client.get(
             "/fees/effective",
-            params={"pair": symbol, "liquidity": liquidity, "notional": f"{max(notional, 0.0):.8f}"},
+            params={"pair": symbol, "liquidity": liquidity, "notional": notional_str},
             headers={"X-Account-ID": account_id},
         )
         response.raise_for_status()
-        return float(response.json()["bps"])
+        return Decimal(str(response.json()["bps"]))
 
     async def fake_submit_execution(request, response, *, shadow: bool, actor: str | None = None) -> None:
         if shadow:

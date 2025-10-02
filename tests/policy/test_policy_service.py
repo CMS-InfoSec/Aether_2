@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import types
 from dataclasses import dataclass
+from decimal import Decimal
 from uuid import uuid4
 
 import pytest
@@ -83,8 +84,10 @@ def test_decide_policy_accepts_dataclass_intent(monkeypatch: pytest.MonkeyPatch,
         approved=True,
     )
 
-    async def _fake_fee(account_id: str, symbol: str, liquidity: str, notional: float) -> float:
-        return {"maker": 4.0, "taker": 7.0}[liquidity]
+    async def _fake_fee(
+        account_id: str, symbol: str, liquidity: str, notional: float | Decimal
+    ) -> Decimal:
+        return {"maker": Decimal("4.0"), "taker": Decimal("7.0")}[liquidity]
 
     monkeypatch.setattr(policy_service, "_fetch_effective_fee", _fake_fee)
     monkeypatch.setattr(policy_service, "predict_intent", lambda **_: intent)
