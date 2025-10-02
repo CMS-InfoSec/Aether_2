@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
 
 from common.schemas.contracts import FillEvent
@@ -28,6 +28,7 @@ from services.oms.kraken_ws import (
     OrderAck,
     OrderState,
 )
+from services.risk.stablecoin_monitor import format_depeg_alert, get_global_monitor
 from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
 
 
@@ -84,6 +85,34 @@ def oms_log(order_id: Optional[str], account_id: str, status: str, ts: datetime 
     entry = {"order_id": order_id, "account_id": account_id, "status": status, "ts": timestamp}
     _OMS_ACTIVITY_LOG.append(entry)
     logger.info("oms_log", extra={"order_id": order_id, "account_id": account_id, "status": status, "ts": timestamp.isoformat()})
+
+
+def _enforce_stablecoin_guard() -> None:
+    monitor = get_global_monitor()
+    statuses = monitor.active_depegs()
+    if not statuses:
+        return
+
+    detail = format_depeg_alert(statuses, monitor.config.depeg_threshold_bps)
+    logger.error(
+        "Stablecoin depeg guard triggered; refusing OMS order",
+        extra={
+            "threshold_bps": monitor.config.depeg_threshold_bps,
+            "stablecoin_status": [
+                {
+                    "symbol": status.symbol,
+                    "deviation_bps": round(status.deviation_bps, 3),
+                    "price": round(status.price, 6),
+                    "feed": status.feed,
+                }
+                for status in statuses
+            ],
+        },
+    )
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=detail,
+    )
 
 
 class PlaceOrderRequest(BaseModel):
@@ -499,6 +528,7 @@ class OMSService:
                 await session.close()
 
     async def place_order(self, request: PlaceOrderRequest) -> PlaceOrderResponse:
+        _enforce_stablecoin_guard()
         session = await self._session(request.account_id)
         payload = self._build_payload(request)
         context = OrderContext(
