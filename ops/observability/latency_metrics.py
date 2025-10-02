@@ -83,9 +83,9 @@ class LatencyMetrics:
     """Collect latency metrics for trading services."""
 
     _HISTOGRAM_SPECS = {
-        "policy_latency": 200.0,
-        "risk_latency": 200.0,
-        "oms_latency": 500.0,
+        "policy_latency_ms": 200.0,
+        "risk_latency_ms": 200.0,
+        "oms_latency_ms": 500.0,
     }
 
     _BUCKETS = (5, 10, 25, 50, 100, 200, 300, 500, 750, 1000, float("inf"))

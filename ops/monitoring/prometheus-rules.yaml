@@ -62,3 +62,44 @@ spec:
             summary: Consecutive canary promotions exceeding 30 minute alert threshold
             runbook: docs/runbooks/model_rollback.md
             slo_reference: docs/slo.md#model-canary-promotion
+    - name: trade-latency.slo
+      rules:
+        - alert: policy_latency_p95_slo_breach
+          expr: |
+            histogram_quantile(0.95,
+              sum(rate(policy_latency_ms_bucket[5m])) by (le, symbol, account_id)
+            ) > 200
+          for: 10m
+          labels:
+            severity: warning
+            slo_target: "p95<=200ms"
+          annotations:
+            summary: Policy evaluation latency p95 above 200 ms for {{ $labels.symbol }}/{{ $labels.account_id }}
+            runbook: docs/runbooks/policy_latency.md
+            slo_reference: docs/slo.md#policy-latency
+        - alert: risk_latency_p95_slo_breach
+          expr: |
+            histogram_quantile(0.95,
+              sum(rate(risk_latency_ms_bucket[5m])) by (le, symbol, account_id)
+            ) > 200
+          for: 10m
+          labels:
+            severity: warning
+            slo_target: "p95<=200ms"
+          annotations:
+            summary: Risk validation latency p95 above 200 ms for {{ $labels.symbol }}/{{ $labels.account_id }}
+            runbook: docs/runbooks/risk_latency.md
+            slo_reference: docs/slo.md#risk-latency
+        - alert: oms_latency_p95_slo_breach
+          expr: |
+            histogram_quantile(0.95,
+              sum(rate(oms_latency_ms_bucket[5m])) by (le, symbol, account_id)
+            ) > 500
+          for: 10m
+          labels:
+            severity: critical
+            slo_target: "p95<=500ms"
+          annotations:
+            summary: OMS submission latency p95 above 500 ms for {{ $labels.symbol }}/{{ $labels.account_id }}
+            runbook: docs/runbooks/oms_latency.md
+            slo_reference: docs/slo.md#oms-latency

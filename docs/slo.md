@@ -6,16 +6,30 @@ This document defines the quantitative availability and responsiveness expectati
 
 | Capability | SLI Definition | SLO Target | Prometheus Alert |
 | --- | --- | --- | --- |
-| OMS Latency | 99th percentile order acknowledgement latency (`oms_order_latency_seconds{quantile="0.99"}`) | ≤ 0.150 s over rolling 5 minutes | `oms_latency_slo_breach` fires when > 0.120 s for 2/3 evaluations |
+| Policy Latency | 95th percentile policy evaluation latency (`histogram_quantile(0.95, policy_latency_ms_bucket)`) | ≤ 200 ms over rolling 5 minutes | `policy_latency_p95_slo_breach` fires when > 200 ms for 2/3 evaluations |
+| Risk Latency | 95th percentile risk validation latency (`histogram_quantile(0.95, risk_latency_ms_bucket)`) | ≤ 200 ms over rolling 5 minutes | `risk_latency_p95_slo_breach` fires when > 200 ms for 2/3 evaluations |
+| OMS Latency | 95th percentile OMS submission latency (`histogram_quantile(0.95, oms_latency_ms_bucket)`) | ≤ 500 ms over rolling 5 minutes | `oms_latency_p95_slo_breach` fires when > 500 ms for 2/3 evaluations |
 | WebSocket Ingest Latency | 99th percentile delta propagation latency (`ws_delivery_latency_seconds{quantile="0.99"}`) | ≤ 0.300 s over rolling 5 minutes | `ws_latency_slo_breach` fires when > 0.250 s for 3/5 evaluations |
 | Kill-Switch Response | Time from activation command to OMS halt (`kill_switch_response_seconds`) | ≤ 60 s per activation | `kill_switch_slo_warning` fires when > 45 s for a single evaluation |
 | Model Canary Promotion | Completion time of canary to production promotion (`model_canary_promotion_duration_minutes`) | ≤ 45 minutes for 95% of promotions in 30-day window | `model_canary_promotion_slow` fires when 3 consecutive promotions exceed 30 minutes |
 
+## Policy Latency
+- **Measurement**: Prometheus histogram `policy_latency_ms` tagged by `symbol` and `account_id` tracks end-to-end policy evaluation time.
+- **Target**: Keep the rolling 5-minute p95 ≤ 200 ms to prevent backlog in the decisioning pipeline.
+- **Alerting**: `policy_latency_p95_slo_breach` triggers when p95 latency breaches 200 ms for two of the last three evaluations.
+- **Runbooks**: Use [`docs/runbooks/policy_latency.md`](runbooks/policy_latency.md) for triage steps.
+
+## Risk Latency
+- **Measurement**: Histogram `risk_latency_ms` captures validation latency per order candidate across risk controls.
+- **Target**: Maintain rolling 5-minute p95 ≤ 200 ms to ensure OMS submissions are not blocked.
+- **Alerting**: `risk_latency_p95_slo_breach` fires when p95 latency is above 200 ms for two of the last three intervals.
+- **Runbooks**: Follow [`docs/runbooks/risk_latency.md`](runbooks/risk_latency.md).
+
 ## OMS Latency
-- **Measurement**: Derived from OMS acknowledgement telemetry emitted per order, aggregated into Prometheus histogram `oms_order_latency_seconds`.
-- **Target**: Keep the 99th percentile ≤ 150 ms to satisfy trading partner SLAs.
-- **Alerting**: Prometheus rule `oms_latency_slo_breach` fires when the rolling 5-minute p99 exceeds 120 ms for two out of the last three intervals, giving buffer before the SLO is violated.
-- **Runbooks**: See [`docs/runbooks/exchange_outage.md`](runbooks/exchange_outage.md) and [`docs/runbooks/kill_switch_activation.md`](runbooks/kill_switch_activation.md) for remediation guidance.
+- **Measurement**: Histogram `oms_latency_ms` records submission latency to external venues, keyed by symbol and account.
+- **Target**: Hold the rolling 5-minute p95 ≤ 500 ms to absorb market spikes without missing fills.
+- **Alerting**: `oms_latency_p95_slo_breach` fires when the rolling p95 is above 500 ms for two of the last three evaluations.
+- **Runbooks**: See [`docs/runbooks/oms_latency.md`](runbooks/oms_latency.md) and [`docs/runbooks/kill_switch_activation.md`](runbooks/kill_switch_activation.md) for remediation guidance.
 
 ## WebSocket Ingest Latency
 - **Measurement**: Calculated from Kafka offset commit to WebSocket emit delta, exported via `ws_delivery_latency_seconds` histogram.
