@@ -95,6 +95,7 @@ def test_audit_chain_across_services(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("OVERRIDE_DATABASE_URL", f"sqlite:///{tmp_path / 'override.db'}")
     encryption_key = base64.b64encode(b"0" * 32).decode()
     monkeypatch.setenv("SECRET_ENCRYPTION_KEY", encryption_key)
+    monkeypatch.setenv("SECRETS_SERVICE_AUTH_TOKENS", "integration-token")
 
     conn_mock, cursor_mock = _make_connection_mock()
     monkeypatch.setattr(audit_logger, "psycopg", MagicMock(connect=MagicMock(return_value=conn_mock)))
@@ -131,6 +132,7 @@ def test_audit_chain_across_services(tmp_path, monkeypatch, capsys):
                 "api_secret": "api-secret-xyz",
                 "actor": "sre.bob",
             },
+            headers={"Authorization": "Bearer integration-token"},
         )
         assert response.status_code == 201
 

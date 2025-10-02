@@ -13,7 +13,16 @@ spec:
     - Egress
   ingress:
     - from:
-        - podSelector: {}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              networking.aether.io/trusted: "true"
   egress:
     - to:
         - podSelector: {}

@@ -26,6 +26,7 @@ dependencies = [
     "email-validator>=2.1",
     "prometheus-client>=0.20",
     "networkx>=3.2",
+    "passlib[argon2]>=1.7.4",
 ]
 
 [project.optional-dependencies]

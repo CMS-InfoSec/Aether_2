@@ -13,12 +13,13 @@ from datetime import date, datetime, timedelta, timezone
 from statistics import mean
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, MutableMapping, Optional, Sequence
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from psycopg2 import sql
 from psycopg2.extras import RealDictCursor
 
 from reports.storage import ArtifactStorage, StoredArtifact, TimescaleSession as StorageSession, build_storage_from_env
 from services.common.config import TimescaleSession, get_timescale_session
+from services.common.security import require_admin_account
 
 
 DAILY_ACCOUNT_PNL_QUERY = """
@@ -366,7 +367,10 @@ def get_report_service() -> ReportService:
 
 
 @router.get("/xai")
-async def recent_xai(account_id: Optional[str] = Query(default=None)) -> Dict[str, Any]:
+async def recent_xai(
+    account_id: Optional[str] = Query(default=None),
+    _: str = Depends(require_admin_account),
+) -> Dict[str, Any]:
     """Return aggregated SHAP explanations for recent trades."""
 
     service = get_report_service()

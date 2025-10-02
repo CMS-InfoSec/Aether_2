@@ -14,6 +14,7 @@ import contextlib
 import inspect
 import logging
 import os
+from time import perf_counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, TypeVar
@@ -21,6 +22,8 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Typ
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
+
+from metrics import observe_scaling_evaluation, record_scaling_state, traced_span
 
 try:  # pragma: no cover - optional dependency in CI
     from kubernetes import client, config
@@ -109,13 +112,18 @@ class OmsDeploymentScaler:
             return self._replica_cache
         loop = asyncio.get_running_loop()
         try:
-            deployment = await loop.run_in_executor(
-                None,
-                lambda: self._apps_v1.read_namespaced_deployment(
-                    name=self.deployment,
-                    namespace=self.namespace,
-                ),
-            )
+            with traced_span(
+                "scaling.kubernetes.get_replicas",
+                namespace=self.namespace,
+                deployment=self.deployment,
+            ):
+                deployment = await loop.run_in_executor(
+                    None,
+                    lambda: self._apps_v1.read_namespaced_deployment(
+                        name=self.deployment,
+                        namespace=self.namespace,
+                    ),
+                )
         except Exception as exc:  # pragma: no cover - depends on kubernetes client behaviour
             logger.warning("Failed to read deployment %s/%s replicas: %s", self.namespace, self.deployment, exc)
             return self._replica_cache
@@ -138,14 +146,20 @@ class OmsDeploymentScaler:
         loop = asyncio.get_running_loop()
         body = {"spec": {"replicas": replicas}}
         try:
-            await loop.run_in_executor(
-                None,
-                lambda: self._apps_v1.patch_namespaced_deployment_scale(
-                    name=self.deployment,
-                    namespace=self.namespace,
-                    body=body,
-                ),
-            )
+            with traced_span(
+                "scaling.kubernetes.scale_deployment",
+                namespace=self.namespace,
+                deployment=self.deployment,
+                replicas=replicas,
+            ):
+                await loop.run_in_executor(
+                    None,
+                    lambda: self._apps_v1.patch_namespaced_deployment_scale(
+                        name=self.deployment,
+                        namespace=self.namespace,
+                        body=body,
+                    ),
+                )
             logger.info("Scaled deployment %s/%s to %s replicas", self.namespace, self.deployment, replicas)
         except Exception as exc:  # pragma: no cover - depends on client
             logger.warning(
@@ -191,13 +205,19 @@ class LinodeGPUManager:
         json_payload: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         url = f"{self.base_url}{path}"
-        async with httpx.AsyncClient(timeout=self.timeout) as client_session:
-            response = await client_session.request(
-                method,
-                url,
-                headers=self._headers(),
-                json=json_payload,
-            )
+        with traced_span(
+            "scaling.linode.request",
+            method=method,
+            url=url,
+            cluster_id=self.cluster_id,
+        ):
+            async with httpx.AsyncClient(timeout=self.timeout) as client_session:
+                response = await client_session.request(
+                    method,
+                    url,
+                    headers=self._headers(),
+                    json=json_payload,
+                )
             response.raise_for_status()
             try:
                 return response.json()
@@ -325,6 +345,9 @@ class ScalingController:
         oms_scaler: OmsDeploymentScaler,
         gpu_manager: LinodeGPUManager | NullGPUManager,
         oms_scale_threshold: float = 500.0,
+        oms_downscale_threshold: float | None = None,
+        downscale_stabilization: timedelta = timedelta(minutes=15),
+        min_oms_replicas: int = 1,
         check_interval: float = 60.0,
         gpu_idle_timeout: timedelta = timedelta(hours=1),
     ) -> None:
@@ -334,6 +357,11 @@ class ScalingController:
         self._oms_scaler = oms_scaler
         self._gpu_manager = gpu_manager
         self._threshold = max(oms_scale_threshold, 0.0)
+        if oms_downscale_threshold is None:
+            oms_downscale_threshold = self._threshold * 0.5
+        self._downscale_threshold = max(float(oms_downscale_threshold), 0.0)
+        self._downscale_stabilization = max(downscale_stabilization, timedelta())
+        self._min_replicas = max(int(min_oms_replicas), 0)
         self._check_interval = max(check_interval, 5.0)
         self._gpu_idle_timeout = max(gpu_idle_timeout, timedelta(minutes=5))
 
@@ -341,6 +369,7 @@ class ScalingController:
         self._task: Optional[asyncio.Task[None]] = None
         self._lock = asyncio.Lock()
         self._last_gpu_activity: datetime | None = None
+        self._low_throughput_since: datetime | None = None
 
     async def start(self) -> None:
         if self._task is None or self._task.done():
@@ -362,59 +391,90 @@ class ScalingController:
             await asyncio.sleep(self._check_interval)
 
     async def evaluate_once(self) -> None:
-        async with self._lock:
-            now = _now()
-            throughput = await _resolve(self._throughput_getter())
-            policy_load = await _resolve(self._policy_load_getter())
-            pending_jobs_raw = await _resolve(self._pending_job_getter())
-            try:
-                pending_jobs = max(int(pending_jobs_raw), 0)
-            except (TypeError, ValueError):
-                pending_jobs = 0
+        start_time = perf_counter()
+        duration: float | None = None
+        try:
+            with traced_span("scaling.evaluate_once") as span:
+                async with self._lock:
+                    now = _now()
+                    throughput = await _resolve(self._throughput_getter())
+                    policy_load = await _resolve(self._policy_load_getter())
+                    pending_jobs_raw = await _resolve(self._pending_job_getter())
+                    try:
+                        pending_jobs = max(int(pending_jobs_raw), 0)
+                    except (TypeError, ValueError):
+                        pending_jobs = 0
 
-            logger.debug(
-                "Scaling evaluation: throughput=%.2f orders/min, policy_load=%.2f, pending_jobs=%s",
-                throughput,
-                policy_load,
-                pending_jobs,
-            )
+                    logger.debug(
+                        "Scaling evaluation: throughput=%.2f orders/min, policy_load=%.2f, pending_jobs=%s",
+                        throughput,
+                        policy_load,
+                        pending_jobs,
+                    )
 
-            replicas = await self._oms_scaler.get_replicas()
-            if throughput > self._threshold:
-                desired = replicas + 1
-                logger.info(
-                    "OMS throughput %.2f orders/min above threshold %.2f, scaling replicas %s -> %s",
-                    throughput,
-                    self._threshold,
-                    replicas,
-                    desired,
-                )
-                await self._oms_scaler.scale_to(desired)
-                replicas = desired
 
-            gpu_nodes = list(await self._gpu_manager.list_gpu_nodes())
-            if pending_jobs > 0:
-                if not gpu_nodes:
-                    logger.info("Training jobs pending; provisioning GPU node pool")
-                    gpu_nodes = list(await self._gpu_manager.provision_gpu_pool())
-                self._last_gpu_activity = now
-            else:
-                if gpu_nodes and self._last_gpu_activity is not None:
-                    idle_duration = now - self._last_gpu_activity
-                    if idle_duration >= self._gpu_idle_timeout:
+                    if span:
+                        span.set_attribute("scaling.throughput_orders_per_minute", float(throughput))
+                        span.set_attribute("scaling.pending_jobs", pending_jobs)
+                        if isinstance(policy_load, (int, float)):
+                            span.set_attribute("scaling.policy_load", float(policy_load))
+
+                    replicas = await self._oms_scaler.get_replicas()
+                    if span:
+                        span.set_attribute("scaling.oms_replicas_before", replicas)
+
+                    if throughput > self._threshold:
+                        desired = replicas + 1
+
                         logger.info(
-                            "GPU node pool idle for %s, deprovisioning", idle_duration,
+                            "OMS throughput %.2f orders/min above threshold %.2f, scaling replicas %s -> %s",
+                            throughput,
+                            self._threshold,
+                            replicas,
+                            desired,
                         )
-                        await self._gpu_manager.deprovision_gpu_pool()
-                        gpu_nodes = list(await self._gpu_manager.list_gpu_nodes())
-                        self._last_gpu_activity = None
+                        await self._oms_scaler.scale_to(desired)
+                        replicas = desired
 
-            self._state = _ScalingState(
-                oms_replicas=replicas,
-                gpu_nodes=len(gpu_nodes),
-                pending_jobs=pending_jobs,
-                last_policy_load=float(policy_load) if isinstance(policy_load, (int, float)) else None,
-            )
+                    gpu_nodes = list(await self._gpu_manager.list_gpu_nodes())
+                    if pending_jobs > 0:
+                        if not gpu_nodes:
+                            logger.info("Training jobs pending; provisioning GPU node pool")
+                            gpu_nodes = list(await self._gpu_manager.provision_gpu_pool())
+                        self._last_gpu_activity = now
+                    else:
+                        if gpu_nodes and self._last_gpu_activity is not None:
+                            idle_duration = now - self._last_gpu_activity
+                            if idle_duration >= self._gpu_idle_timeout:
+                                logger.info(
+                                    "GPU node pool idle for %s, deprovisioning", idle_duration,
+                                )
+                                await self._gpu_manager.deprovision_gpu_pool()
+                                gpu_nodes = list(await self._gpu_manager.list_gpu_nodes())
+                                self._last_gpu_activity = None
+
+                    self._state = _ScalingState(
+                        oms_replicas=replicas,
+                        gpu_nodes=len(gpu_nodes),
+                        pending_jobs=pending_jobs,
+                        last_policy_load=float(policy_load) if isinstance(policy_load, (int, float)) else None,
+                    )
+
+                    record_scaling_state(
+                        oms_replicas=self._state.oms_replicas,
+                        gpu_nodes=self._state.gpu_nodes,
+                        pending_jobs=self._state.pending_jobs,
+                    )
+
+                    if span:
+                        span.set_attribute("scaling.oms_replicas_after", self._state.oms_replicas)
+                        span.set_attribute("scaling.gpu_nodes", self._state.gpu_nodes)
+
+                duration = perf_counter() - start_time
+                if span:
+                    span.set_attribute("scaling.evaluation_duration_seconds", duration)
+        finally:
+            observe_scaling_evaluation(duration if duration is not None else perf_counter() - start_time)
 
     @property
     def status(self) -> ScalingStatus:
@@ -522,7 +582,10 @@ def build_scaling_controller_from_env() -> ScalingController:
 
     namespace = os.getenv("OMS_DEPLOYMENT_NAMESPACE", "aether")
     deployment_name = os.getenv("OMS_DEPLOYMENT_NAME", "oms-service")
-    fallback_replicas = int(os.getenv("OMS_REPLICA_FALLBACK", "1"))
+    try:
+        fallback_replicas = int(os.getenv("OMS_REPLICA_FALLBACK", "1"))
+    except ValueError:
+        fallback_replicas = 1
     oms_scaler = OmsDeploymentScaler(
         namespace=namespace,
         deployment=deployment_name,
@@ -547,9 +610,31 @@ def build_scaling_controller_from_env() -> ScalingController:
         gpu_manager = NullGPUManager(default_count=linode_node_count)
         logger.info("Linode credentials missing; using simulated GPU manager")
 
-    oms_threshold = float(os.getenv("OMS_THROUGHPUT_THRESHOLD", "500"))
-    check_interval = float(os.getenv("SCALING_CHECK_INTERVAL", "60"))
-    gpu_idle_seconds = float(os.getenv("GPU_IDLE_TIMEOUT", str(60 * 60)))
+    try:
+        oms_threshold = float(os.getenv("OMS_THROUGHPUT_THRESHOLD", "500"))
+    except ValueError:
+        oms_threshold = 500.0
+    downscale_threshold_env = os.getenv("OMS_DOWNSCALE_THRESHOLD")
+    try:
+        downscale_threshold = float(downscale_threshold_env) if downscale_threshold_env is not None else None
+    except ValueError:
+        downscale_threshold = None
+    try:
+        downscale_stabilization_seconds = float(os.getenv("OMS_DOWNSCALE_STABILIZATION_SECONDS", str(15 * 60)))
+    except ValueError:
+        downscale_stabilization_seconds = float(15 * 60)
+    try:
+        min_replicas = int(os.getenv("OMS_MIN_REPLICAS", str(max(fallback_replicas, 1))))
+    except ValueError:
+        min_replicas = max(fallback_replicas, 1)
+    try:
+        check_interval = float(os.getenv("SCALING_CHECK_INTERVAL", "60"))
+    except ValueError:
+        check_interval = 60.0
+    try:
+        gpu_idle_seconds = float(os.getenv("GPU_IDLE_TIMEOUT", str(60 * 60)))
+    except ValueError:
+        gpu_idle_seconds = float(60 * 60)
 
     controller = ScalingController(
         throughput_getter=throughput_getter,
@@ -558,6 +643,9 @@ def build_scaling_controller_from_env() -> ScalingController:
         oms_scaler=oms_scaler,
         gpu_manager=gpu_manager,
         oms_scale_threshold=oms_threshold,
+        oms_downscale_threshold=downscale_threshold,
+        downscale_stabilization=timedelta(seconds=downscale_stabilization_seconds),
+        min_oms_replicas=min_replicas,
         check_interval=check_interval,
         gpu_idle_timeout=timedelta(seconds=gpu_idle_seconds),
     )

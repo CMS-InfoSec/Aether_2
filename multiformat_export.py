@@ -12,12 +12,14 @@ from typing import Any, Dict, List, Mapping
 
 import markdown2
 import pandas as pd
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import LETTER
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+from audit_mode import AuditorPrincipal, require_auditor_identity
 
 try:  # pragma: no cover - boto3 is optional in some environments.
     import boto3
@@ -448,6 +450,7 @@ def export_logs(
         pattern="^(json|csv|pdf|md)$",
         description="Desired response format",
     ),
+    _: AuditorPrincipal = Depends(require_auditor_identity),
 ) -> Response:
     """Trigger a multi-format export and return the requested artifact."""
 

@@ -9,7 +9,9 @@ Use this checklist during weekly reviews to verify operational readiness and doc
 
 ## Monitoring & Alerting
 - [ ] Check Prometheus alerts `oms_latency_slo_breach`, `ws_latency_slo_breach`, `kill_switch_slo_warning`, and `model_canary_promotion_slow` fired within test windows or have recent successful test annotations.
+- [ ] Confirm Prometheus alerts `scaling_controller_evaluations_stalled` and `scaling_gpu_pool_idle` are green or acknowledged after recent test fires.
 - [ ] Ensure Grafana dashboards display the correct SLI panels for OMS latency, WebSocket latency, kill-switch response, and model canary duration.
+- [ ] Verify the "Trading Latency Percentiles" dashboard shows the **Infra Scaling State** and **Scaling Evaluation Duration** panels with recent data.
 - [ ] Verify synthetic checks simulate order placement and WebSocket subscription at least once per day.
 
 ## Automation & Tooling

@@ -17,6 +17,7 @@ Provide a standardized procedure for rotating the AES encryption key that protec
    umask 077
    openssl rand -base64 32 > "$KEY_FILE"
    ```
+
    > **Note:** Setting a restrictive `umask` ensures the file is readable only by the
    > current operator.
 2. Copy the value stored in `$KEY_FILE` into a password manager entry for audit
@@ -82,6 +83,7 @@ Provide a standardized procedure for rotating the AES encryption key that protec
      --from-literal=SECRET_ENCRYPTION_KEY="$SECRET_ENCRYPTION_KEY" \
      --dry-run=client -o yaml \
    | kubectl --context aether-production apply -f -
+
    kubectl --context aether-production rollout restart deployment/secrets-service
    kubectl --context aether-production rollout status deployment/secrets-service
    unset SECRET_ENCRYPTION_KEY
@@ -89,6 +91,10 @@ Provide a standardized procedure for rotating the AES encryption key that protec
    unset KEY_FILE
    ```
 2. Confirm production logs and metrics (error rate, latency) remain healthy for 30 minutes.
+3. Unset the exported variable from your shell:
+   ```bash
+   unset SECRET_ENCRYPTION_KEY
+   ```
 
 ## Post-Rotation Validation
 - Run the integration suite focused on encryption/decryption (`pytest tests/integration/test_audit_chain.py -k encryption`).
@@ -96,7 +102,7 @@ Provide a standardized procedure for rotating the AES encryption key that protec
 - Update the rotation record in the secrets ledger with timestamp, operator, and key fingerprint (hash the base64 value using SHA-256).
 
 ## Rollback Plan
-- If issues occur, reapply the previous manifest from Git history and restart the deployment.
+- If issues occur, retrieve the previous key from the password manager entry and reapply it using the `kubectl create secret … | kubectl apply -f -` workflow above.
 - Notify stakeholders via #security-ops and #platform-alerts channels.
 - Conduct a post-incident review to determine root cause before attempting rotation again.
 

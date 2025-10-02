@@ -13,12 +13,17 @@ Outline remediation actions when automated secret rotations fail or leave servic
 2. Inspect Vault audit logs for denied access or version conflicts.
 3. Confirm whether downstream services are failing auth using `kubectl describe pod` and checking crash loops.
 4. Verify the last successful secret version in the registry to determine rollback candidates.
+5. If the Kraken Secrets API returns HTTP 503 with detail `Kraken secrets service configuration is unavailable`, inspect service logs for initialization errors (Kubernetes config or encryption key issues).
 
 ## Containment and Response Steps
 1. **Disable automatic retries**: Pause the rotation workflow by setting `argo suspend secret-rotation` to avoid thrashing.
 2. **Rollback to last good secret**: Retrieve previous secret version via `vault kv get -version=<N-1> secret/data/<path>` and reapply using `kubectl apply -f <secret-file>`.
 3. **Regenerate credentials if compromised**: Coordinate with the provider (exchange, database) to issue new credentials and update Vault entries.
-4. **Re-enable rotation**: Once stable, resume automation with `argo resume secret-rotation` and monitor the next run manually.
+4. **Recover service configuration** (when 503 observed):
+   - Confirm the Kubernetes configuration path/credentials referenced by the service are valid.
+   - Validate the `SECRET_ENCRYPTION_KEY` environment variable is set and base64 encoded to 16/24/32 bytes.
+   - After fixing configuration issues, restart the deployment so the startup retries can succeed.
+5. **Re-enable rotation**: Once stable, resume automation with `argo resume secret-rotation` and monitor the next run manually.
 
 ## Recovery Validation
 - `secret_rotation_last_success_seconds` metric drops below 3,600 seconds following a successful run.

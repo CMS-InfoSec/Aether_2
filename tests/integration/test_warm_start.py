@@ -194,6 +194,8 @@ if "metrics" not in sys.modules:
     metrics_stub.record_ws_latency = _noop
     metrics_stub.record_oms_submit_ack = _noop
     metrics_stub.record_drift_score = _noop
+    metrics_stub.record_scaling_state = _noop
+    metrics_stub.observe_scaling_evaluation = _noop
     sys.modules["metrics"] = metrics_stub
 
 from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
