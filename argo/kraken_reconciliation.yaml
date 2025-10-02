@@ -1,0 +1,50 @@
+apiVersion: argoproj.io/v1alpha1
+kind: CronWorkflow
+metadata:
+  name: kraken-statement-reconciliation
+  labels:
+    workflows.argoproj.io/controller-instanceid: ops-automation
+  annotations:
+    slo.aether.dev/reference: docs/slo.md
+spec:
+  schedule: "30 4 * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  workflowSpec:
+    entrypoint: reconcile
+    templates:
+      - name: reconcile
+        container:
+          image: ghcr.io/aether/ops-runtime:latest
+          command: ["python", "-m", "services.reports.kraken_reconciliation_job"]
+          env:
+            - name: RECONCILE_ACCOUNTS
+              valueFrom:
+                configMapKeyRef:
+                  name: trading-accounts
+                  key: kraken_accounts
+            - name: KRAKEN_STATEMENT_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: kraken-statement-config
+                  key: base_url
+            - name: KRAKEN_STATEMENT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: kraken-statement-credentials
+                  key: api_key
+            - name: KRAKEN_STATEMENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: kraken-statement-credentials
+                  key: api_secret
+            - name: ALERTMANAGER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: alertmanager
+                  key: url
+            - name: KRAKEN_RECONCILE_TOLERANCE
+              value: "5.0"
+          envFrom:
+            - secretRef:
+                name: timescale-credentials
