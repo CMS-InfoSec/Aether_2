@@ -17,36 +17,69 @@ from argon2 import PasswordHasher, Type
 from argon2.exceptions import InvalidHash, VerifyMismatchError
 import pyotp
 
-from prometheus_client import CollectorRegistry, Counter
+
+try:  # pragma: no cover - optional dependency in some test environments
+    from argon2 import PasswordHasher
+    from argon2.exceptions import VerificationError
+except ImportError:  # pragma: no cover - fallback when argon2 is unavailable
+    PasswordHasher = None  # type: ignore[assignment]
+
+    class VerificationError(ValueError):
+        """Minimal stand-in for argon2's verification errors."""
+
+    class _MissingPasswordHasher:
+        def hash(self, password: str) -> str:
+            raise RuntimeError("argon2-cffi must be installed to hash passwords")
+
+        def verify(self, hashed: str, password: str) -> bool:
+            raise RuntimeError("argon2-cffi must be installed to verify passwords")
+
+        def needs_update(self, hashed: str) -> bool:
+            return False
+
+        def check_needs_rehash(self, hashed: str) -> bool:
+            return False
+
+    _ARGON2_HASHER = _MissingPasswordHasher()
+else:
+    _ARGON2_HASHER = PasswordHasher()
+
+try:  # pragma: no cover - prometheus is optional outside production
+    from prometheus_client import Counter
+except Exception:  # pragma: no cover - provide a no-op fallback
+    class Counter:  # type: ignore[override]
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self._value = 0.0
+
+        def labels(self, **kwargs: object) -> "Counter":
+            return self
+
+        def inc(self, value: float = 1.0) -> None:
+            self._value = getattr(self, "_value", 0.0) + value
+
+        def set(self, value: float) -> None:
+            self._value = value
 
 from shared.correlation import get_correlation_id
 
-try:  # pragma: no cover - prefer the real Argon2 implementation when available
-    from passlib.hash import argon2 as _ARGON2_HASHER
-except Exception:  # pragma: no cover - fall back to a minimal stub for tests
-
-    class _StubArgon2Hasher:
-        """Minimal Argon2 interface used for unit tests when passlib is absent."""
-
-        _PREFIX = "$argon2$stub$"
-
-        def hash(self, password: str) -> str:
-            digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
-            return f"{self._PREFIX}{digest}"
-
-        def verify(self, password: str, stored_hash: str) -> bool:
-            if not stored_hash.startswith(self._PREFIX):
-                raise ValueError("invalid argon2 hash")
-            candidate = self.hash(password)
-            return hmac.compare_digest(candidate, stored_hash)
-
-        def needs_update(self, stored_hash: str) -> bool:
-            return not stored_hash.startswith(self._PREFIX)
-
-    _ARGON2_HASHER = _StubArgon2Hasher()
 
 
 logger = logging.getLogger(__name__)
+
+
+_LOGIN_FAILURE_COUNTER = Counter(
+    "auth_login_failures_total",
+    "Number of failed administrator authentication attempts.",
+    ["reason"],
+)
+_MFA_DENIED_COUNTER = Counter(
+    "auth_mfa_denied_total",
+    "Number of administrator logins denied due to MFA.",
+)
+_LOGIN_SUCCESS_COUNTER = Counter(
+    "auth_login_success_total",
+    "Number of successful administrator logins.",
+)
 
 
 
@@ -334,9 +367,15 @@ class AuthService:
             try:
                 if not _ARGON2_HASHER.verify(stored_hash, password):
                     return False
-            except (InvalidHash, VerifyMismatchError):
+
+            except VerificationError:
+
                 return False
-            if _ARGON2_HASHER.needs_update(stored_hash):
+            if hasattr(_ARGON2_HASHER, "check_needs_rehash"):
+                needs_update = _ARGON2_HASHER.check_needs_rehash(stored_hash)
+            else:
+                needs_update = _ARGON2_HASHER.needs_update(stored_hash)
+            if needs_update:
                 admin.password_hash = hash_password(password)
             return True
 

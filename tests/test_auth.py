@@ -119,6 +119,32 @@ def test_login_enforces_mfa_and_ip_allow_list():
     )
 
 
+def test_login_succeeds_with_argon2_hashed_password():
+    repository = AdminRepository()
+    sessions = SessionStore()
+    service = AuthService(repository, sessions)
+
+    secret = pyotp.random_base32()
+    password = "Sup3rSecret!"
+    admin = AdminAccount(
+        admin_id="admin-argon",
+        email="argon@example.com",
+        password_hash=hash_password(password),
+        mfa_secret=secret,
+    )
+    repository.add(admin)
+
+    session = service.login(
+        email=admin.email,
+        password=password,
+        mfa_code=pyotp.TOTP(secret).now(),
+        ip_address=None,
+    )
+
+    assert session.admin_id == admin.admin_id
+    assert session.token
+
+
 def test_auth_service_failure_branches_emit_structured_logs_and_metrics(caplog):
     repository = AdminRepository()
     sessions = SessionStore()
