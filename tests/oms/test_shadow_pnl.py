@@ -1,8 +1,6 @@
 from decimal import Decimal
 
-import pytest
-
-from services.oms.oms_service import _ShadowPnLTracker
+from services.oms.shadow_oms import _ShadowPnLTracker
 
 
 def test_shadow_pnl_tracker_records_real_and_shadow_fills() -> None:
@@ -43,16 +41,52 @@ def test_shadow_pnl_tracker_records_real_and_shadow_fills() -> None:
     real = snapshot["real"]
     shadow = snapshot["shadow"]
 
-    assert real["realized_pnl"] == pytest.approx(400.0)
-    assert real["positions"]["BTC-USD"]["quantity"] == pytest.approx(0.6)
-    assert real["positions"]["BTC-USD"]["avg_price"] == pytest.approx(20000.0)
+    assert Decimal(real["realized_pnl"]) == Decimal("400")
+    assert Decimal(real["positions"]["BTC-USD"]["quantity"]) == Decimal("0.6")
+    assert Decimal(real["positions"]["BTC-USD"]["avg_price"]) == Decimal("20000")
 
-    assert shadow["realized_pnl"] == pytest.approx(250.0)
-    assert shadow["positions"]["BTC-USD"]["quantity"] == pytest.approx(0.25)
-    assert shadow["positions"]["BTC-USD"]["avg_price"] == pytest.approx(20500.0)
+    assert Decimal(shadow["realized_pnl"]) == Decimal("250")
+    assert Decimal(shadow["positions"]["BTC-USD"]["quantity"]) == Decimal("0.25")
+    assert Decimal(shadow["positions"]["BTC-USD"]["avg_price"]) == Decimal("20500")
 
     assert len(real["fills"]) == 2
     assert len(shadow["fills"]) == 2
     assert shadow["fills"][0]["side"] == "buy"
 
-    assert snapshot["delta"]["realized_pnl"] == pytest.approx(-150.0)
+    assert Decimal(snapshot["delta"]["realized_pnl"]) == Decimal("-150")
+
+
+def test_shadow_pnl_tracker_preserves_high_precision() -> None:
+    tracker = _ShadowPnLTracker()
+
+    qty = Decimal("0.00000051")
+    price = Decimal("27123.12345678")
+    fee = Decimal("0.00000000012")
+    slippage = Decimal("0.0123456789")
+
+    tracker.record_fill(
+        symbol="BTC-USD",
+        side="buy",
+        quantity=qty,
+        price=price,
+        shadow=False,
+        fee=fee,
+        slippage_bps=slippage,
+    )
+
+    snapshot = tracker.snapshot()
+    real = snapshot["real"]
+
+    assert Decimal(real["realized_pnl"]) == Decimal("0")
+    assert Decimal(real["fees"]) == fee
+    assert Decimal(real["slippage"]) == slippage
+
+    position = real["positions"]["BTC-USD"]
+    assert Decimal(position["quantity"]) == qty
+    assert Decimal(position["avg_price"]) == price
+
+    recorded_fill = real["fills"][0]
+    assert Decimal(recorded_fill["quantity"]) == qty
+    assert Decimal(recorded_fill["price"]) == price
+    assert Decimal(recorded_fill["fee"]) == fee
+    assert Decimal(recorded_fill["slippage_bps"]) == slippage
