@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import logging
 import os
-from typing import Callable, Dict, Mapping, MutableMapping, Sequence
+from typing import Callable, Dict, Mapping, MutableMapping, Sequence, Tuple
 
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -51,11 +51,21 @@ except Exception:  # pragma: no cover - executed when mlflow is missing.
     MlflowClient = None  # type: ignore
 
 
+CANARY_STAGE = "canary"
+PRODUCTION_STAGE = "Production"
+ARCHIVED_STAGE = "Archived"
+
+
 class FeatureDriftScore(BaseModel):
     """Container returned to API consumers for a single feature."""
 
     psi: float = Field(..., description="Population stability index score")
+    psi_alert: bool = Field(..., description="Whether PSI breached its threshold")
     ks: float = Field(..., description="Kolmogorov-Smirnov statistic")
+    ks_alert: bool = Field(..., description="Whether KS statistic breached its threshold")
+    severity: float = Field(
+        ..., description="Max-normalised drift severity across monitored statistics"
+    )
     alert: bool = Field(..., description="Whether the feature breached thresholds")
     checked_at: datetime = Field(..., description="Timestamp of the last evaluation")
 
@@ -141,7 +151,7 @@ class CanaryDeploymentManager:
         client = self._client()
         if client is not None:  # pragma: no branch - simple branch.
             try:
-                latest_prod = client.get_latest_versions(self.model_name, stages=["Production"])
+                latest_prod = client.get_latest_versions(self.model_name, stages=[PRODUCTION_STAGE])
                 if latest_prod:
                     self._previous_production = latest_prod[0].version
             except Exception as exc:  # pragma: no cover - requires mlflow backend.
@@ -150,7 +160,7 @@ class CanaryDeploymentManager:
                 client.transition_model_version_stage(
                     name=self.model_name,
                     version=model_version,
-                    stage="Canary",
+                    stage=CANARY_STAGE,
                     archive_existing_versions=False,
                 )
             except Exception as exc:  # pragma: no cover - requires mlflow backend.
@@ -168,6 +178,7 @@ class CanaryDeploymentManager:
         self,
         *,
         drift_alerts: Sequence[str],
+        degraded_metrics: Mapping[str, float] | None,
         has_metrics: bool,
         trade_metrics: Mapping[str, float] | None = None,
     ) -> None:
@@ -180,6 +191,15 @@ class CanaryDeploymentManager:
             LOGGER.info(
                 "Drift detected while canary version %s active. Triggering rollback.",
                 self._active_version,
+            )
+            self._rollback()
+            return
+
+        if degraded_metrics:
+            LOGGER.info(
+                "Performance degradation observed for canary %s: %s. Triggering rollback.",
+                self._active_version,
+                ", ".join(f"{metric}={value:.4f}" for metric, value in degraded_metrics.items()),
             )
             self._rollback()
             return
@@ -207,14 +227,14 @@ class CanaryDeploymentManager:
                 client.transition_model_version_stage(
                     name=self.model_name,
                     version=self._active_version,
-                    stage="Production",
+                    stage=PRODUCTION_STAGE,
                     archive_existing_versions=False,
                 )
                 if self._previous_production and self._previous_production != self._active_version:
                     client.transition_model_version_stage(
                         name=self.model_name,
                         version=self._previous_production,
-                        stage="Archived",
+                        stage=ARCHIVED_STAGE,
                         archive_existing_versions=False,
                     )
                     LOGGER.info(
@@ -248,13 +268,13 @@ class CanaryDeploymentManager:
                     client.transition_model_version_stage(
                         name=self.model_name,
                         version=self._previous_production,
-                        stage="Production",
+                        stage=PRODUCTION_STAGE,
                         archive_existing_versions=False,
                     )
                 client.transition_model_version_stage(
                     name=self.model_name,
                     version=self._active_version,
-                    stage="Archived",
+                    stage=ARCHIVED_STAGE,
                     archive_existing_versions=False,
                 )
             except Exception as exc:  # pragma: no cover - requires mlflow backend.
@@ -295,6 +315,7 @@ class DriftMonitoringService:
         canary_promote_after_trades: int = 50,
         tracking_uri: str | None = None,
         registry_uri: str | None = None,
+        performance_thresholds: Mapping[str, Tuple[float | None, float | None]] | None = None,
     ) -> None:
         self.psi_threshold = psi_threshold
         self.ks_threshold = ks_threshold
@@ -304,6 +325,9 @@ class DriftMonitoringService:
         self._last_checked: datetime | None = None
         self._retrain_requested = False
         self._last_retrain_at: datetime | None = None
+        self._performance_thresholds: Dict[str, Tuple[float | None, float | None]] = (
+            dict(performance_thresholds) if performance_thresholds else {}
+        )
         self._canary_manager = (
             CanaryDeploymentManager(
                 model_name=canary_model_name,
@@ -342,7 +366,10 @@ class DriftMonitoringService:
         self._metrics = {
             report.feature: FeatureDriftScore(
                 psi=report.population_stability_index,
+                psi_alert=report.psi_alert,
                 ks=report.kolmogorov_smirnov,
+                ks_alert=report.ks_alert,
+                severity=report.severity,
                 alert=report.alert,
                 checked_at=evaluated_at,
             )
@@ -356,9 +383,11 @@ class DriftMonitoringService:
         return reports
 
     def _trigger_retrain(self, alerts: Sequence[DriftReport]) -> None:
+        max_severity = max((report.severity for report in alerts), default=0.0)
         LOGGER.warning(
-            "Feature drift detected for %s. Initiating retrain pipeline.",
+            "Feature drift detected for %s (max severity %.2f). Initiating retrain pipeline.",
             ", ".join(report.feature for report in alerts),
+            max_severity,
         )
         self._retrain_requested = True
         self._last_retrain_at = datetime.now(timezone.utc)
@@ -394,8 +423,10 @@ class DriftMonitoringService:
 
         alerts = [feature for feature, metric in self._metrics.items() if metric.alert]
         has_metrics = bool(self._metrics)
+        degraded_metrics = self._detect_performance_degradation(trade_metrics)
         self._canary_manager.observe_trade(
             drift_alerts=alerts,
+            degraded_metrics=degraded_metrics if degraded_metrics else None,
             has_metrics=has_metrics,
             trade_metrics=trade_metrics,
         )
@@ -408,6 +439,25 @@ class DriftMonitoringService:
             last_retrain_at=_ensure_datetime(self._last_retrain_at),
             canary=self._canary_manager.status() if self._canary_manager else None,
         )
+
+    def _detect_performance_degradation(
+        self, trade_metrics: Mapping[str, float] | None
+    ) -> Dict[str, float]:
+        if not trade_metrics or not self._performance_thresholds:
+            return {}
+
+        degraded: Dict[str, float] = {}
+        for metric, value in trade_metrics.items():
+            bounds = self._performance_thresholds.get(metric)
+            if bounds is None:
+                continue
+            lower, upper = bounds
+            if lower is not None and value < lower:
+                degraded[metric] = value
+                continue
+            if upper is not None and value > upper:
+                degraded[metric] = value
+        return degraded
 
 
 # ---------------------------------------------------------------------------

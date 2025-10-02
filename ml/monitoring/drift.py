@@ -19,14 +19,20 @@ class DriftReport:
     feature: str
     population_stability_index: float
     kolmogorov_smirnov: float
+    psi_alert: bool
+    ks_alert: bool
     alert: bool
+    severity: float
 
     def to_dict(self) -> Dict[str, float | str | bool]:
         return {
             "feature": self.feature,
             "population_stability_index": self.population_stability_index,
             "kolmogorov_smirnov": self.kolmogorov_smirnov,
+            "psi_alert": self.psi_alert,
+            "ks_alert": self.ks_alert,
             "alert": self.alert,
+            "severity": self.severity,
         }
 
 
@@ -51,7 +57,12 @@ def evaluate_feature_drift(
 ) -> DriftReport:
     psi_value = population_stability_index(baseline, production)
     ks_stat, _ = ks_2samp(baseline, production)
-    alert = psi_value > psi_threshold or ks_stat > ks_threshold
+    psi_alert = psi_value > psi_threshold
+    ks_alert = ks_stat > ks_threshold
+    alert = psi_alert or ks_alert
+    psi_ratio = (psi_value / psi_threshold) if psi_threshold > 0 else float("inf")
+    ks_ratio = (ks_stat / ks_threshold) if ks_threshold > 0 else float("inf")
+    severity = max(psi_ratio if psi_alert else 0.0, ks_ratio if ks_alert else 0.0)
     LOGGER.debug(
         "Feature %s drift metrics: PSI=%.4f KS=%.4f", feature, psi_value, ks_stat
     )
@@ -59,7 +70,10 @@ def evaluate_feature_drift(
         feature=feature,
         population_stability_index=psi_value,
         kolmogorov_smirnov=float(ks_stat),
+        psi_alert=psi_alert,
+        ks_alert=ks_alert,
         alert=alert,
+        severity=severity,
     )
 
 
