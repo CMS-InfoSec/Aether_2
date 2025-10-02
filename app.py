@@ -59,8 +59,10 @@ def create_app() -> FastAPI:
     app.include_router(knowledge_router)
     app.include_router(meta_router)
     app.include_router(models_router)
+    app.include_router(meta_router)
 
     app.include_router(log_export_router)
+    app.include_router(knowledge_router)
 
     app.include_router(compliance_router)
 
