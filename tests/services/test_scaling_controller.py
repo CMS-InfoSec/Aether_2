@@ -157,7 +157,6 @@ class FakeGpuManager:
         self.nodes = []
 
 
-
 class SequenceGetter:
     def __init__(self, values: Iterable[Any]) -> None:
         self._values = iter(values)
@@ -340,4 +339,3 @@ def test_http_json_field_getter_returns_default_on_cast_error(monkeypatch: pytes
     )
 
     assert asyncio.run(getter()) == 99.0
-
