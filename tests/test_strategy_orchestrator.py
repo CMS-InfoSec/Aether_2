@@ -44,9 +44,13 @@ class _FastAPI:
         return decorator
 
 
+def _depends(*args: Any, **kwargs: Any) -> Any:
+    return None
+
+
 sys.modules.setdefault(
     "fastapi",
-    SimpleNamespace(FastAPI=_FastAPI, HTTPException=_HTTPException),
+    SimpleNamespace(FastAPI=_FastAPI, HTTPException=_HTTPException, Depends=_depends),
 )
 
 from sqlalchemy import create_engine

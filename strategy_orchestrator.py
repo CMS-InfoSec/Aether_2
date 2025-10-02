@@ -20,7 +20,7 @@ from threading import RLock
 from typing import Any, Dict, Iterable, List
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field, PositiveFloat, constr
 from sqlalchemy import Boolean, Column, DateTime, Float, String, create_engine, func, select
 from sqlalchemy.engine import Engine
@@ -28,6 +28,7 @@ from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import NullPool
 
 from services.common.schemas import RiskValidationRequest, RiskValidationResponse
+from services.common.security import require_admin_account
 from strategy_bus import StrategySignalBus, ensure_signal_tables
 
 LOGGER = logging.getLogger(__name__)
@@ -288,8 +289,11 @@ app = FastAPI(title="Strategy Orchestrator", version="0.1.0")
 
 
 @app.post("/strategy/register", response_model=StrategyStatusResponse)
-async def register_strategy(payload: StrategyRegisterRequest) -> StrategyStatusResponse:
+async def register_strategy(
+    payload: StrategyRegisterRequest, actor: str = Depends(require_admin_account)
+) -> StrategyStatusResponse:
     try:
+        LOGGER.info("Registering strategy '%s' by %s", payload.name.lower(), actor)
         snapshot = REGISTRY.register(payload.name.lower(), payload.description, payload.max_nav_pct)
     except StrategyAllocationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -297,8 +301,13 @@ async def register_strategy(payload: StrategyRegisterRequest) -> StrategyStatusR
 
 
 @app.post("/strategy/toggle", response_model=StrategyStatusResponse)
-async def toggle_strategy(payload: StrategyToggleRequest) -> StrategyStatusResponse:
+async def toggle_strategy(
+    payload: StrategyToggleRequest, actor: str = Depends(require_admin_account)
+) -> StrategyStatusResponse:
     try:
+        LOGGER.info(
+            "Toggling strategy '%s' to %s by %s", payload.name.lower(), payload.enabled, actor
+        )
         snapshot = REGISTRY.toggle(payload.name.lower(), payload.enabled)
     except StrategyNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -306,14 +315,22 @@ async def toggle_strategy(payload: StrategyToggleRequest) -> StrategyStatusRespo
 
 
 @app.get("/strategy/status", response_model=List[StrategyStatusResponse])
-async def strategy_status() -> List[StrategyStatusResponse]:
+async def strategy_status(actor: str = Depends(require_admin_account)) -> List[StrategyStatusResponse]:
+    LOGGER.info("Fetching strategy status for %s", actor)
     snapshots = REGISTRY.status()
     return [StrategyStatusResponse(**snapshot.__dict__) for snapshot in snapshots]
 
 
 @app.post("/strategy/intent", response_model=RiskValidationResponse)
-async def route_intent(payload: StrategyIntentRequest) -> RiskValidationResponse:
+async def route_intent(
+    payload: StrategyIntentRequest, actor: str = Depends(require_admin_account)
+) -> RiskValidationResponse:
     try:
+        LOGGER.info(
+            "Routing intent for strategy '%s' submitted by %s",
+            payload.strategy_name.lower(),
+            actor,
+        )
         return await REGISTRY.route_trade_intent(payload.strategy_name.lower(), payload.request)
     except StrategyNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -322,7 +339,8 @@ async def route_intent(payload: StrategyIntentRequest) -> RiskValidationResponse
 
 
 @app.get("/strategy/signals", response_model=List[StrategySignalResponse])
-async def strategy_signals() -> List[StrategySignalResponse]:
+async def strategy_signals(actor: str = Depends(require_admin_account)) -> List[StrategySignalResponse]:
+    LOGGER.info("Listing strategy signals for %s", actor)
     signals = SIGNAL_BUS.list_signals()
     return [
         StrategySignalResponse(
