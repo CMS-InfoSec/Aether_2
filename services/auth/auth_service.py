@@ -7,7 +7,13 @@ initial identity verification and then enforces a time-based one-time
 password (TOTP) challenge.  Successful MFA verification results in a
 short-lived JWT (15 minutes) tagged with the caller's role and an
 accompanying refresh token which can be traded in for new access tokens
-when the old one expires.
+when the old one expires.  Two roles are currently supported:
+
+* ``admin`` – the default privileged identity capable of executing
+  state-changing workflows such as order placement or configuration
+  updates.
+* ``auditor`` – a read-only persona that can inspect reports, metrics and
+  logs but is intentionally barred from performing any mutating actions.
 
 The service exposes a handful of endpoints:
 
@@ -240,7 +246,11 @@ class AuthService:
         self._refresh_tokens[refresh_token] = _RefreshTokenState(
             user_id=payload["sub"], role=resolved_role, expires_at=refresh_expires
         )
-        return TokenPair(access_token=access_token, refresh_token=refresh_token, expires_in=self.settings.access_token_ttl_seconds)
+        return TokenPair(
+            access_token=access_token,
+            refresh_token=refresh_token,
+            expires_in=self.settings.access_token_ttl_seconds,
+        )
 
     def _resolve_role(self, user_info: Dict[str, Any]) -> str:
         candidate = (
@@ -249,6 +259,12 @@ class AuthService:
             or user_info.get("sub")
             or ""
         )
+        explicit_role = user_info.get("role")
+        if isinstance(explicit_role, str):
+            normalized_role = explicit_role.strip().lower()
+            if normalized_role in {"admin", "auditor"}:
+                return normalized_role
+
         normalized = str(candidate).strip().lower()
         if normalized and normalized in self._auditor_accounts:
             return "auditor"
@@ -256,15 +272,19 @@ class AuthService:
 
     @staticmethod
     def _permissions_for_role(role: str) -> set[str]:
-        base_permissions = {
+        read_only_permissions = {
             "view_reports",
             "view_logs",
             "view_metrics",
         }
         if role == "auditor":
-            return base_permissions
+            return read_only_permissions
         if role == "admin":
-            return base_permissions | {"view_trades", "place_orders", "modify_configs"}
+            return read_only_permissions | {
+                "view_trades",
+                "place_orders",
+                "modify_configs",
+            }
         return set()
 
     def _encode_jwt(self, payload: Dict[str, Any]) -> str:
@@ -302,6 +322,10 @@ class AuthService:
         role = payload.get("role")
         if role not in {"admin", "auditor"}:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unsupported role")
+        # Enforce server-side role semantics regardless of what the caller provided.
+        permissions = self._permissions_for_role(role)
+        payload["permissions"] = sorted(permissions)
+        payload["read_only"] = role == "auditor"
         return payload
 
     def verify_totp_and_issue_tokens(self, session_id: str, totp_code: str) -> TokenPair:
