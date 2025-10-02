@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, ClassVar, Dict, Iterable, List, Mapping, Optional
 
+from common.utils.tracing import attach_correlation, current_correlation_id
 from shared.k8s import KrakenSecretStore
 from services.secrets.secure_secrets import (
     EncryptedSecretEnvelope,
@@ -44,11 +45,20 @@ class KafkaNATSAdapter:
         self._event_store.setdefault(self.account_id, [])
 
     def publish(self, topic: str, payload: Dict[str, Any]) -> None:
-        record = {"topic": topic, "payload": payload, "timestamp": datetime.now(timezone.utc)}
+        enriched = attach_correlation(payload)
+        record = {
+            "topic": topic,
+            "payload": enriched,
+            "timestamp": datetime.now(timezone.utc),
+            "correlation_id": enriched.get("correlation_id") or current_correlation_id(),
+        }
         self._event_store[self.account_id].append(record)
 
-    def history(self) -> List[Dict[str, Any]]:
-        return list(self._event_store.get(self.account_id, []))
+    def history(self, correlation_id: str | None = None) -> List[Dict[str, Any]]:
+        records = list(self._event_store.get(self.account_id, []))
+        if correlation_id:
+            return [record for record in records if record.get("correlation_id") == correlation_id]
+        return records
 
     @classmethod
     def reset(cls, account_id: str | None = None) -> None:
