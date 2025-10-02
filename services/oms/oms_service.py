@@ -792,14 +792,17 @@ class AccountContext:
                     exc,
                 )
                 raise
+            if self.rest_client is None:
+                self.rest_client = KrakenRESTClient(credential_getter=self.credentials.get_credentials)
             if self.ws_client is None:
                 self.ws_client = KrakenWSClient(
                     credential_getter=self.credentials.get_credentials,
                     stream_update_cb=self._apply_stream_state,
+                    rest_client=self.rest_client,
                 )
                 self._stream_task = asyncio.create_task(self.ws_client.stream_handler())
-            if self.rest_client is None:
-                self.rest_client = KrakenRESTClient(credential_getter=self.credentials.get_credentials)
+            else:
+                self.ws_client.set_rest_client(self.rest_client)
 
             await self.ws_client.ensure_connected()
             await self.ws_client.subscribe_private(["openOrders", "ownTrades"])

@@ -5,9 +5,8 @@ import contextlib
 import json
 import logging
 import random
-import time
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional
 
 import websockets
 from websockets import WebSocketClientProtocol
@@ -90,6 +89,10 @@ class _WebsocketTransport:
         await self._protocol.close()
 
 
+if TYPE_CHECKING:
+    from services.oms.kraken_rest import KrakenRESTClient
+
+
 class KrakenWSClient:
     """High level async client for Kraken WebSocket v2 private API."""
 
@@ -100,6 +103,7 @@ class KrakenWSClient:
         url: str = KRAKEN_WS_URL,
         transport_factory: Optional[Callable[[str], Awaitable[_WebsocketTransport]]] = None,
         stream_update_cb: Optional[Callable[[OrderState], Awaitable[None]]] = None,
+        rest_client: Optional["KrakenRESTClient"] = None,
         request_timeout: float = 5.0,
     ) -> None:
         self._credential_getter = credential_getter
@@ -107,6 +111,7 @@ class KrakenWSClient:
         self._transport_factory = transport_factory or self._default_transport
         self._stream_update_cb = stream_update_cb
         self._request_timeout = request_timeout
+        self._rest_client = rest_client
 
         self._transport: Optional[_WebsocketTransport] = None
         self._receiver_task: Optional[asyncio.Task[None]] = None
@@ -122,6 +127,11 @@ class KrakenWSClient:
     async def _default_transport(self, url: str) -> _WebsocketTransport:
         protocol = await websockets.connect(url, ping_interval=None)
         return _WebsocketTransport(protocol)
+
+    def set_rest_client(self, rest_client: "KrakenRESTClient") -> None:
+        """Attach a REST client used for obtaining websocket tokens."""
+
+        self._rest_client = rest_client
 
     async def ensure_connected(self) -> None:
         async with self._lock:
@@ -414,11 +424,23 @@ class KrakenWSClient:
     async def _sign_auth(self) -> str:
         credentials = await self._credential_getter()
         token = credentials.get("ws_token")
+        if token:
+            return str(token)
+
+        rest_client = self._rest_client
+        if rest_client is None:
+            raise KrakenWSError("ws_token missing and REST client unavailable")
+
+        try:
+            token = await rest_client.websocket_token()
+        except Exception as exc:
+            logger.error("Failed to obtain Kraken websocket token: %s", exc)
+            raise KrakenWSError("failed to obtain websocket token") from exc
+
         if not token:
-            api_key = credentials.get("api_key")
-            secret = credentials.get("api_secret")
-            token = f"nonce-{int(time.time() * 1000)}-{api_key}-{secret}"  # placeholder when token not supplied
-        return token
+            raise KrakenWSError("Kraken REST token response missing token")
+
+        return str(token)
 
     def _ack_from_payload(self, payload: Dict[str, Any]) -> OrderAck:
         status = payload.get("status") or payload.get("result", {}).get("status")

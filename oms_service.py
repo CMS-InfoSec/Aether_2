@@ -270,12 +270,13 @@ class KrakenSession:
     def __init__(self, account_id: str, credential_provider: CredentialProvider) -> None:
         self.account_id = account_id
         self._credential_provider = credential_provider
+        self._rest_client = KrakenRESTClient(
+            credential_getter=lambda: self._credential_provider.get(self.account_id)
+        )
         self._ws_client = KrakenWSClient(
             credential_getter=lambda: self._credential_provider.get(self.account_id),
             stream_update_cb=self._on_state,
-        )
-        self._rest_client = KrakenRESTClient(
-            credential_getter=lambda: self._credential_provider.get(self.account_id)
+            rest_client=self._rest_client,
         )
         self._ws_task: Optional[asyncio.Task[None]] = None
         self._ready = asyncio.Event()
