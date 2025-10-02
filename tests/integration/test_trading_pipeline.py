@@ -186,7 +186,7 @@ def test_trading_pipeline_emits_fill_event(monkeypatch: pytest.MonkeyPatch) -> N
         response.raise_for_status()
         return float(response.json()["bps"])
 
-    async def fake_submit_execution(request, response, *, shadow: bool) -> None:
+    async def fake_submit_execution(request, response, *, shadow: bool, actor: str | None = None) -> None:
         if shadow:
             return
         precision = policy_module._resolve_precision(request.instrument)
