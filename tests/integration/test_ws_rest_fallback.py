@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import types
+from decimal import Decimal
 from typing import Any, Dict
 
 import pytest
@@ -52,18 +53,19 @@ def _install_cryptography_stub(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _ack_from_exchange_response(payload: Dict[str, Any]) -> OrderAck:
     fills = payload.get("fills") or []
-    filled_qty = sum(float(fill.get("volume", 0.0)) for fill in fills)
+    filled_qty = sum(Decimal(str(fill.get("volume", 0.0))) for fill in fills)
     avg_price = None
-    if filled_qty > 0:
+    if filled_qty > Decimal("0"):
         total_notional = sum(
-            float(fill.get("price", 0.0)) * float(fill.get("volume", 0.0))
+            Decimal(str(fill.get("price", 0.0))) * Decimal(str(fill.get("volume", 0.0)))
             for fill in fills
         )
-        avg_price = total_notional / filled_qty if filled_qty else None
+        avg_price = (total_notional / filled_qty) if filled_qty else None
+    filled_value = filled_qty if filled_qty != Decimal("0") else None
     return OrderAck(
         exchange_order_id=str(payload.get("txid")) if payload.get("txid") else None,
         status=str(payload.get("status") or "ok"),
-        filled_qty=filled_qty or None,
+        filled_qty=filled_value,
         avg_price=avg_price,
         errors=None,
     )

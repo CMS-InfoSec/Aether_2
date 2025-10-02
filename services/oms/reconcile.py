@@ -403,8 +403,8 @@ class OMSReconciler:
                     client_order_id=order_id,
                     exchange_order_id=record.result.exchange_order_id,
                     status="closed",
-                    filled_qty=float(record.result.filled_qty),
-                    avg_price=float(record.result.avg_price),
+                    filled_qty=record.result.filled_qty,
+                    avg_price=record.result.avg_price,
                     errors=None,
                     transport="reconcile",
                 )
@@ -469,9 +469,11 @@ def _normalize_status(value: Optional[str]) -> str:
     return value.strip().lower()
 
 
-def _to_decimal(value: Optional[float]) -> Decimal:
+def _to_decimal(value: Optional[Decimal | float | int | str]) -> Decimal:
     if value is None:
         return ZERO
+    if isinstance(value, Decimal):
+        return value
     return Decimal(str(value))
 
 
