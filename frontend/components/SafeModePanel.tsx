@@ -1,4 +1,5 @@
 import React, { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { useAuthClaims } from "./useAuthClaims";
 
 type SafeModeStatusResponse = {
   active: boolean;
@@ -50,6 +51,7 @@ const SafeModePanel: React.FC = () => {
   const [actionLoading, setActionLoading] = useState(false);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const { readOnly } = useAuthClaims();
 
   const currentStatusLabel = useMemo(() => {
     if (!status) {
@@ -279,76 +281,93 @@ const SafeModePanel: React.FC = () => {
         </div>
       </div>
 
-      <form
-        onSubmit={handleEnterSafeMode}
-        className="grid gap-4 md:grid-cols-2"
-        aria-label="Safe mode controls"
-      >
-        <div className="md:col-span-2 grid gap-4 sm:grid-cols-2">
-          <label className="flex flex-col text-sm font-medium text-gray-700">
-            Reason
-            <input
-              type="text"
-              value={reason}
-              onChange={(event) => setReason(event.target.value)}
-              placeholder="Describe the issue triggering safe mode"
-              className="mt-1 rounded-md border border-gray-300 px-3 py-2 shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-              required
-              disabled={actionLoading}
-            />
-          </label>
-          <label className="flex flex-col text-sm font-medium text-gray-700">
-            Actor (optional)
-            <input
-              type="text"
-              value={actor}
-              onChange={(event) => setActor(event.target.value)}
-              placeholder="ops-oncall"
-              className="mt-1 rounded-md border border-gray-300 px-3 py-2 shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-              disabled={actionLoading}
-            />
-          </label>
-        </div>
+      {!readOnly ? (
+        <>
+          <form
+            onSubmit={handleEnterSafeMode}
+            className="grid gap-4 md:grid-cols-2"
+            aria-label="Safe mode controls"
+          >
+            <div className="md:col-span-2 grid gap-4 sm:grid-cols-2">
+              <label className="flex flex-col text-sm font-medium text-gray-700">
+                Reason
+                <input
+                  type="text"
+                  value={reason}
+                  onChange={(event) => setReason(event.target.value)}
+                  placeholder="Describe the issue triggering safe mode"
+                  className="mt-1 rounded-md border border-gray-300 px-3 py-2 shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                  required
+                  disabled={actionLoading}
+                />
+              </label>
+              <label className="flex flex-col text-sm font-medium text-gray-700">
+                Actor (optional)
+                <input
+                  type="text"
+                  value={actor}
+                  onChange={(event) => setActor(event.target.value)}
+                  placeholder="ops-oncall"
+                  className="mt-1 rounded-md border border-gray-300 px-3 py-2 shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                  disabled={actionLoading}
+                />
+              </label>
+            </div>
 
-        <div className="flex flex-col gap-3 md:col-span-2 md:flex-row">
-          <button
-            type="submit"
-            className="inline-flex items-center justify-center rounded-md bg-red-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2 disabled:cursor-not-allowed disabled:bg-red-400"
-            disabled={actionLoading}
-          >
-            {actionLoading ? "Processing..." : "Enter Safe Mode"}
-          </button>
-          <button
-            type="button"
-            onClick={handleExitSafeMode}
-            className="inline-flex items-center justify-center rounded-md bg-green-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2 disabled:cursor-not-allowed disabled:bg-green-400"
-            disabled={actionLoading}
-          >
-            {actionLoading ? "Processing..." : "Exit Safe Mode"}
-          </button>
+            <div className="flex flex-col gap-3 md:col-span-2 md:flex-row">
+              <button
+                type="submit"
+                className="inline-flex items-center justify-center rounded-md bg-red-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2 disabled:cursor-not-allowed disabled:bg-red-400"
+                disabled={actionLoading}
+              >
+                {actionLoading ? "Processing..." : "Enter Safe Mode"}
+              </button>
+              <button
+                type="button"
+                onClick={handleExitSafeMode}
+                className="inline-flex items-center justify-center rounded-md bg-green-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2 disabled:cursor-not-allowed disabled:bg-green-400"
+                disabled={actionLoading}
+              >
+                {actionLoading ? "Processing..." : "Exit Safe Mode"}
+              </button>
+              <button
+                type="button"
+                onClick={refreshAll}
+                className="inline-flex items-center justify-center rounded-md border border-gray-300 px-4 py-2 text-sm font-semibold text-gray-700 shadow-sm hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 disabled:cursor-not-allowed"
+                disabled={actionLoading}
+              >
+                Refresh
+              </button>
+            </div>
+          </form>
+
+          <div className="space-y-3">
+            {actionMessage && (
+              <div className="rounded-md bg-green-50 p-3 text-sm text-green-800">
+                {actionMessage}
+              </div>
+            )}
+            {actionError && (
+              <div className="rounded-md bg-red-50 p-3 text-sm text-red-700">
+                {actionError}
+              </div>
+            )}
+          </div>
+        </>
+      ) : (
+        <div className="space-y-3 md:col-span-2">
+          <div className="rounded-md border border-gray-200 bg-gray-50 p-3 text-sm text-gray-600">
+            Auditor access is read-only. Safe mode controls are hidden.
+          </div>
           <button
             type="button"
             onClick={refreshAll}
-            className="inline-flex items-center justify-center rounded-md border border-gray-300 px-4 py-2 text-sm font-semibold text-gray-700 shadow-sm hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 disabled:cursor-not-allowed"
-            disabled={actionLoading}
+            className="inline-flex items-center justify-center rounded-md border border-gray-300 px-4 py-2 text-sm font-semibold text-gray-700 shadow-sm hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2"
           >
             Refresh
           </button>
         </div>
-      </form>
-
-      <div className="space-y-3">
-        {actionMessage && (
-          <div className="rounded-md bg-green-50 p-3 text-sm text-green-800">
-            {actionMessage}
-          </div>
-        )}
-        {actionError && (
-          <div className="rounded-md bg-red-50 p-3 text-sm text-red-700">
-            {actionError}
-          </div>
-        )}
-      </div>
+      )}
 
       <div className="grid gap-4 md:grid-cols-2">
         <div className="space-y-2">

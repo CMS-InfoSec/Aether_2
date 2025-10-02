@@ -1,4 +1,5 @@
 import React, { FormEvent, useCallback, useEffect, useState } from "react";
+import { useAuthClaims } from "./useAuthClaims";
 
 type SecretsStatusResponse = {
   last_rotated_at?: string | null;
@@ -49,6 +50,7 @@ const ApiKeyManager: React.FC = () => {
     "idle"
   );
   const [confirmationInput, setConfirmationInput] = useState("");
+  const { readOnly } = useAuthClaims();
 
   const loadStatus = useCallback(
     async (signal: AbortSignal) => {
@@ -256,93 +258,99 @@ const ApiKeyManager: React.FC = () => {
         )}
       </div>
 
-      <form onSubmit={handleSubmit} className="space-y-4">
-        <div>
-          <label htmlFor="apiKey" className="block text-sm font-medium text-gray-700 mb-1">
-            API Key
-          </label>
-          <input
-            id="apiKey"
-            name="apiKey"
-            type="text"
-            value={apiKey}
-            onChange={(event) => setApiKey(event.target.value)}
-            className="w-full rounded-md border border-gray-300 px-3 py-2 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-200"
-            placeholder="Enter your Kraken API key"
-            required
-            autoComplete="off"
-          />
-        </div>
-
-        <div>
-          <label htmlFor="apiSecret" className="block text-sm font-medium text-gray-700 mb-1">
-            API Secret
-          </label>
-          <input
-            id="apiSecret"
-            name="apiSecret"
-            type="password"
-            value={apiSecret}
-            onChange={(event) => setApiSecret(event.target.value)}
-            className="w-full rounded-md border border-gray-300 px-3 py-2 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-200"
-            placeholder="Enter your Kraken API secret"
-            required
-            autoComplete="new-password"
-          />
-        </div>
-
-        {confirmationStage === "confirm" && (
-          <div className="rounded-md border border-yellow-300 bg-yellow-50 p-4">
-            <p className="text-sm text-yellow-800 mb-2">
-              Rotating the Kraken API credentials will immediately revoke access for the current key pair. Please confirm that
-              you intend to proceed by typing <span className="font-semibold">ROTATE</span> below.
-            </p>
+      {!readOnly ? (
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <label htmlFor="apiKey" className="block text-sm font-medium text-gray-700 mb-1">
+              API Key
+            </label>
             <input
+              id="apiKey"
+              name="apiKey"
               type="text"
-              value={confirmationInput}
-              onChange={(event) => setConfirmationInput(event.target.value)}
-              className="w-full rounded-md border border-yellow-300 px-3 py-2 focus:border-yellow-500 focus:outline-none focus:ring-2 focus:ring-yellow-200"
-              placeholder="Type ROTATE to confirm"
+              value={apiKey}
+              onChange={(event) => setApiKey(event.target.value)}
+              className="w-full rounded-md border border-gray-300 px-3 py-2 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-200"
+              placeholder="Enter your Kraken API key"
+              required
               autoComplete="off"
             />
-            <div className="mt-3 flex items-center justify-between">
-              <button
-                type="button"
-                className="text-sm font-medium text-gray-600 hover:text-gray-800"
-                onClick={() => {
-                  setConfirmationStage("idle");
-                  setConfirmationInput("");
-                }}
-              >
-                Cancel rotation
-              </button>
-              <p className="text-xs text-gray-500">Confirmation required before submission</p>
+          </div>
+
+          <div>
+            <label htmlFor="apiSecret" className="block text-sm font-medium text-gray-700 mb-1">
+              API Secret
+            </label>
+            <input
+              id="apiSecret"
+              name="apiSecret"
+              type="password"
+              value={apiSecret}
+              onChange={(event) => setApiSecret(event.target.value)}
+              className="w-full rounded-md border border-gray-300 px-3 py-2 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-200"
+              placeholder="Enter your Kraken API secret"
+              required
+              autoComplete="new-password"
+            />
+          </div>
+
+          {confirmationStage === "confirm" && (
+            <div className="rounded-md border border-yellow-300 bg-yellow-50 p-4">
+              <p className="text-sm text-yellow-800 mb-2">
+                Rotating the Kraken API credentials will immediately revoke access for the current key pair. Please confirm that
+                you intend to proceed by typing <span className="font-semibold">ROTATE</span> below.
+              </p>
+              <input
+                type="text"
+                value={confirmationInput}
+                onChange={(event) => setConfirmationInput(event.target.value)}
+                className="w-full rounded-md border border-yellow-300 px-3 py-2 focus:border-yellow-500 focus:outline-none focus:ring-2 focus:ring-yellow-200"
+                placeholder="Type ROTATE to confirm"
+                autoComplete="off"
+              />
+              <div className="mt-3 flex items-center justify-between">
+                <button
+                  type="button"
+                  className="text-sm font-medium text-gray-600 hover:text-gray-800"
+                  onClick={() => {
+                    setConfirmationStage("idle");
+                    setConfirmationInput("");
+                  }}
+                >
+                  Cancel rotation
+                </button>
+                <p className="text-xs text-gray-500">Confirmation required before submission</p>
+              </div>
             </div>
-          </div>
-        )}
+          )}
 
-        {submitError && (
-          <div className="rounded-md bg-red-50 p-3 text-sm text-red-700" role="alert">
-            {submitError}
-          </div>
-        )}
+          {submitError && (
+            <div className="rounded-md bg-red-50 p-3 text-sm text-red-700" role="alert">
+              {submitError}
+            </div>
+          )}
 
-        {successMessage && (
-          <div className="rounded-md bg-green-50 p-3 text-sm text-green-700" role="status" aria-live="polite">
-            {successMessage}
-          </div>
-        )}
+          {successMessage && (
+            <div className="rounded-md bg-green-50 p-3 text-sm text-green-700" role="status" aria-live="polite">
+              {successMessage}
+            </div>
+          )}
 
-        <div className="flex justify-end">
-          <button
-            type="submit"
-            disabled={isSubmitting}
-            className="inline-flex items-center rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-75"
-          >
-            {isSubmitting ? "Rotating…" : confirmationStage === "confirm" ? "Confirm Rotation" : "Rotate Keys"}
-          </button>
+          <div className="flex justify-end">
+            <button
+              type="submit"
+              disabled={isSubmitting}
+              className="inline-flex items-center rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-75"
+            >
+              {isSubmitting ? "Rotating…" : confirmationStage === "confirm" ? "Confirm Rotation" : "Rotate Keys"}
+            </button>
+          </div>
+        </form>
+      ) : (
+        <div className="rounded-md border border-gray-200 bg-gray-50 p-4 text-sm text-gray-600">
+          Auditor access is read-only. Credential rotation is disabled.
         </div>
-      </form>
+      )}
 
       <div className="mt-8">
         <h3 className="text-lg font-semibold text-gray-900 mb-3">Rotation History</h3>

@@ -1,4 +1,5 @@
 import React, { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { useAuthClaims } from "./useAuthClaims";
 
 type KrakenStatusResponse = {
   rotated_at?: string | null;
@@ -45,6 +46,7 @@ const ApiKeyForm: React.FC = () => {
   const [lastRotatedAt, setLastRotatedAt] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const { readOnly } = useAuthClaims();
   const accountOptions = useMemo(() => {
     if (typeof window !== "undefined") {
       const adminAccounts = (window as typeof window & {
@@ -213,114 +215,120 @@ const ApiKeyForm: React.FC = () => {
         )}
       </div>
 
-      <form onSubmit={handleSubmit} className="space-y-4">
-        <div>
-          <label
-            htmlFor="accountId"
-            className="block text-sm font-medium text-gray-700 mb-1"
-          >
-            Account
-          </label>
-          <select
-            id="accountId"
-            name="accountId"
-            value={accountId}
-            onChange={(event) => {
-              const newAccountId = event.target.value;
-              setAccountId(newAccountId);
-              setSubmitError(null);
-              setSuccessMessage(null);
-              setStatusError(null);
-              if (!newAccountId) {
-                setStatusLoading(false);
-                setLastRotatedAt(null);
-              } else {
-                setStatusLoading(true);
-              }
-            }}
-            className="w-full rounded-md border border-gray-300 bg-white px-3 py-2 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-200"
-            required
-          >
-            <option value="" disabled>
-              Select an account
-            </option>
-            {accountOptions.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
+      {!readOnly ? (
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <label
+              htmlFor="accountId"
+              className="block text-sm font-medium text-gray-700 mb-1"
+            >
+              Account
+            </label>
+            <select
+              id="accountId"
+              name="accountId"
+              value={accountId}
+              onChange={(event) => {
+                const newAccountId = event.target.value;
+                setAccountId(newAccountId);
+                setSubmitError(null);
+                setSuccessMessage(null);
+                setStatusError(null);
+                if (!newAccountId) {
+                  setStatusLoading(false);
+                  setLastRotatedAt(null);
+                } else {
+                  setStatusLoading(true);
+                }
+              }}
+              className="w-full rounded-md border border-gray-300 bg-white px-3 py-2 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-200"
+              required
+            >
+              <option value="" disabled>
+                Select an account
               </option>
-            ))}
-          </select>
-        </div>
-
-        <div>
-          <label
-            htmlFor="apiKey"
-            className="block text-sm font-medium text-gray-700 mb-1"
-          >
-            API Key
-          </label>
-          <input
-            id="apiKey"
-            name="apiKey"
-            type="text"
-            value={apiKey}
-            onChange={(event) => setApiKey(event.target.value)}
-            className="w-full rounded-md border border-gray-300 px-3 py-2 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-200"
-            placeholder="Enter your Kraken API key"
-            required
-            autoComplete="off"
-          />
-        </div>
-
-        <div>
-          <label
-            htmlFor="apiSecret"
-            className="block text-sm font-medium text-gray-700 mb-1"
-          >
-            API Secret
-          </label>
-          <input
-            id="apiSecret"
-            name="apiSecret"
-            type="password"
-            value={apiSecret}
-            onChange={(event) => setApiSecret(event.target.value)}
-            className="w-full rounded-md border border-gray-300 px-3 py-2 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-200"
-            placeholder="Enter your Kraken API secret"
-            required
-            autoComplete="new-password"
-          />
-        </div>
-
-        {submitError && (
-          <div
-            className="rounded-md bg-red-50 p-3 text-sm text-red-700"
-            role="alert"
-          >
-            {submitError}
+              {accountOptions.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
           </div>
-        )}
 
-        {successMessage && (
-          <div
-            className="rounded-md bg-green-50 p-3 text-sm text-green-700"
-            role="status"
-            aria-live="polite"
-          >
-            {successMessage}
+          <div>
+            <label
+              htmlFor="apiKey"
+              className="block text-sm font-medium text-gray-700 mb-1"
+            >
+              API Key
+            </label>
+            <input
+              id="apiKey"
+              name="apiKey"
+              type="text"
+              value={apiKey}
+              onChange={(event) => setApiKey(event.target.value)}
+              className="w-full rounded-md border border-gray-300 px-3 py-2 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-200"
+              placeholder="Enter your Kraken API key"
+              required
+              autoComplete="off"
+            />
           </div>
-        )}
 
-        <div className="flex justify-end">
-          <button
-            type="submit"
-            disabled={isSubmitting}
-            className="inline-flex items-center rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-75"
-          >
-            {isSubmitting ? "Saving…" : "Save Credentials"}
-          </button>
+          <div>
+            <label
+              htmlFor="apiSecret"
+              className="block text-sm font-medium text-gray-700 mb-1"
+            >
+              API Secret
+            </label>
+            <input
+              id="apiSecret"
+              name="apiSecret"
+              type="password"
+              value={apiSecret}
+              onChange={(event) => setApiSecret(event.target.value)}
+              className="w-full rounded-md border border-gray-300 px-3 py-2 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-200"
+              placeholder="Enter your Kraken API secret"
+              required
+              autoComplete="new-password"
+            />
+          </div>
+
+          {submitError && (
+            <div
+              className="rounded-md bg-red-50 p-3 text-sm text-red-700"
+              role="alert"
+            >
+              {submitError}
+            </div>
+          )}
+
+          {successMessage && (
+            <div
+              className="rounded-md bg-green-50 p-3 text-sm text-green-700"
+              role="status"
+              aria-live="polite"
+            >
+              {successMessage}
+            </div>
+          )}
+
+          <div className="flex justify-end">
+            <button
+              type="submit"
+              disabled={isSubmitting}
+              className="inline-flex items-center rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-75"
+            >
+              {isSubmitting ? "Saving…" : "Save Credentials"}
+            </button>
+          </div>
+        </form>
+      ) : (
+        <div className="rounded-md border border-gray-200 bg-gray-50 p-4 text-sm text-gray-600">
+          Auditor access is read-only. Updating Kraken credentials is disabled.
         </div>
-      </form>
+      )}
     </div>
   );
 };
