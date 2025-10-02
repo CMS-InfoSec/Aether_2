@@ -424,7 +424,10 @@ def test_full_pipeline_records_audit_metrics_and_safe_mode(
         "instrument": "BTC-USD",
         "side": "buy",
         "quantity": 0.2,
-        "price": 30000.0,
+        # The mock Kraken server only fills buy limits that cross the reference ask
+        # (base 30_000 plus half the 20 bps spread = 30_010).  Use a higher price so
+        # the order executes and produces a fill for the assertions below.
+        "price": 30050.0,
         "features": [0.12, 0.18, 0.22],
     }
 
