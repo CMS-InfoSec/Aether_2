@@ -1478,7 +1478,11 @@ class AccountContext:
             for index, child_qty in enumerate(child_quantities):
                 child_client_base = self._child_client_id(request.client_id, index)
                 payload = self._build_payload(
-                    request, child_qty, px, client_id=child_client_base
+                    request,
+                    child_qty,
+                    px,
+                    metadata,
+                    client_id=child_client_base,
                 )
                 ack, transport, client_id_used, _ = await self._submit_order_with_preference(
                     payload,
@@ -1652,8 +1656,25 @@ class AccountContext:
         request: OMSPlaceRequest,
         qty: Decimal,
         price: Optional[Decimal],
+        metadata: Dict[str, Any] | None = None,
+        *,
         client_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        pair_meta = _resolve_pair_metadata(request.symbol, metadata)
+        price_step = (
+            _PrecisionValidator._step(
+                pair_meta,
+                ["price_increment", "pair_decimals", "tick_size"],
+            )
+            if pair_meta
+            else None
+        )
+
+        def _snap_price(value: Optional[Decimal]) -> Optional[Decimal]:
+            if value is None or price_step is None:
+                return value
+            return _PrecisionValidator._snap(value, price_step)
+
         payload: Dict[str, Any] = {
             "clientOrderId": client_id or request.client_id,
             "pair": _normalize_symbol(request.symbol),
@@ -1662,8 +1683,9 @@ class AccountContext:
             "volume": str(qty),
         }
         payload["idempotencyKey"] = client_id or request.client_id
-        if price is not None:
-            payload["price"] = str(price)
+        snapped_price = _snap_price(price)
+        if snapped_price is not None:
+            payload["price"] = str(snapped_price)
 
         oflags = set(flag.lower() for flag in request.flags)
         if request.post_only:
@@ -1675,12 +1697,15 @@ class AccountContext:
 
         if request.tif:
             payload["timeInForce"] = request.tif.upper()
-        if request.take_profit is not None:
-            payload["takeProfit"] = str(request.take_profit)
-        if request.stop_loss is not None:
-            payload["stopLoss"] = str(request.stop_loss)
-        if request.trailing_offset is not None:
-            payload["trailingStopOffset"] = str(request.trailing_offset)
+        snapped_take_profit = _snap_price(request.take_profit)
+        if snapped_take_profit is not None:
+            payload["takeProfit"] = str(snapped_take_profit)
+        snapped_stop_loss = _snap_price(request.stop_loss)
+        if snapped_stop_loss is not None:
+            payload["stopLoss"] = str(snapped_stop_loss)
+        snapped_trailing_offset = _snap_price(request.trailing_offset)
+        if snapped_trailing_offset is not None:
+            payload["trailingStopOffset"] = str(snapped_trailing_offset)
 
         return payload
 
