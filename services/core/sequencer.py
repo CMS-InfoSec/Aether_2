@@ -17,10 +17,13 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from common.schemas.contracts import FillEvent, IntentEvent, OrderEvent, RiskDecisionEvent
+from common.utils import tracing
 from services.common.adapters import KafkaNATSAdapter
 from services.common.config import TimescaleSession, get_timescale_session
 
 LOGGER = logging.getLogger(__name__)
+
+tracing.init_tracing("core-trading-sequencer")
 
 
 class RiskServiceClient(Protocol):
@@ -151,7 +154,6 @@ class TradingSequencer:
 
         started_at = datetime.now(timezone.utc)
         start_perf = time.perf_counter()
-        correlation_id = str(uuid.uuid4())
         adapter = self._kafka_factory(account_id=event.account_id)
 
         decision_payload: Optional[Dict[str, Any]] = None
@@ -162,118 +164,172 @@ class TradingSequencer:
         error: Optional[str] = None
         completed_at = started_at
         latency_ms = 0.0
-
-        await self._publish(adapter, "intent", event.account_id, _with_correlation(event.model_dump(), correlation_id))
-
-        try:
-            decision_payload = _to_dict(
-                await self._risk_service.validate_intent(event, correlation_id=correlation_id)
+        correlation_source: Optional[Any] = None
+        if isinstance(event.intent, Mapping):
+            correlation_source = (
+                event.intent.get("correlation_id")
+                or event.intent.get("corr_id")
+                or event.intent.get("correlation")
             )
-            decision_event = RiskDecisionEvent(
-                account_id=event.account_id,
-                symbol=event.symbol,
-                decision=decision_payload,
-                ts=datetime.now(timezone.utc),
-            )
-            await self._publish(
-                adapter,
-                "decision",
-                event.account_id,
-                _with_correlation(decision_event.model_dump(mode="json"), correlation_id),
-            )
+        correlation_hint = (
+            str(correlation_source).strip() if correlation_source is not None else None
+        )
 
-            approved = bool(
-                decision_payload.get("approved")
-                or decision_payload.get("valid")
-                or decision_payload.get("status") == "approved"
-            )
+        with tracing.correlation_scope(correlation_hint) as correlation_id:
+            if isinstance(event.intent, Mapping):
+                intent_payload: Dict[str, Any] = dict(event.intent)
+                intent_payload["correlation_id"] = correlation_id
+                event.intent = intent_payload  # type: ignore[assignment]
 
-            if not approved:
-                status = "rejected"
-            else:
-                order_payload = _to_dict(
-                    await self._oms.place_order(event, decision_payload, correlation_id=correlation_id)
-                )
-                order_event = OrderEvent(
-                    account_id=event.account_id,
-                    symbol=event.symbol,
-                    order_id=str(
-                        order_payload.get("order_id")
-                        or order_payload.get("client_order_id")
-                        or order_payload.get("id")
-                        or uuid.uuid4()
-                    ),
-                    status=str(order_payload.get("status") or "submitted"),
-                    ts=datetime.now(timezone.utc),
-                )
-                order_dump = order_event.model_dump(mode="json")
-                order_dump["details"] = dict(order_payload)
-                await self._publish(
-                    adapter,
-                    "order",
-                    event.account_id,
-                    _with_correlation(order_dump, correlation_id),
-                )
+            intent_dump = event.model_dump(mode="json")
+            tracing.attach_correlation(intent_dump, mutate=True)
 
-                async for raw_fill in self._oms.stream_fills(order_payload, correlation_id=correlation_id):
-                    fill_payload = _to_dict(raw_fill)
-                    fill_event = self._build_fill_event(event, fill_payload)
-                    fill_dump = fill_event.model_dump(mode="json")
-                    fill_dump["details"] = fill_payload
+            with tracing.policy_span(intent=intent_dump.get("intent", {})):
+                await self._publish(adapter, "intent", event.account_id, intent_dump)
+
+            try:
+                with tracing.risk_span(intent=intent_dump.get("intent", {})):
+                    decision_payload = tracing.attach_correlation(
+                        _to_dict(
+                            await self._risk_service.validate_intent(
+                                event, correlation_id=correlation_id
+                            )
+                        )
+                    )
+                    decision_event = RiskDecisionEvent(
+                        account_id=event.account_id,
+                        symbol=event.symbol,
+                        decision=decision_payload,
+                        ts=datetime.now(timezone.utc),
+                    )
+                    decision_dump = decision_event.model_dump(mode="json")
+                    tracing.attach_correlation(decision_dump, mutate=True)
                     await self._publish(
                         adapter,
-                        "fill",
+                        "decision",
                         event.account_id,
-                        _with_correlation(fill_dump, correlation_id),
+                        decision_dump,
                     )
 
-                    await self._risk_service.handle_fill(fill_event, correlation_id=correlation_id)
-                    destinations = ["risk"]
-                    if self._pnl_tracker is not None:
-                        await self._pnl_tracker.handle_fill(fill_event, correlation_id=correlation_id)
-                        destinations.append("pnl")
+                approved = bool(
+                    decision_payload.get("approved")
+                    or decision_payload.get("valid")
+                    or decision_payload.get("status") == "approved"
+                )
 
-                    update_payload = {
-                        "account_id": event.account_id,
-                        "symbol": event.symbol,
-                        "order_id": order_event.order_id,
-                        "destinations": destinations,
-                        "ts": datetime.now(timezone.utc).isoformat(),
-                    }
-                    await self._publish(
-                        adapter,
-                        "update",
-                        event.account_id,
-                        _with_correlation(update_payload, correlation_id),
-                    )
-                    fills.append(fill_dump)
+                if not approved:
+                    status = "rejected"
+                else:
+                    with tracing.oms_span(intent=intent_dump.get("intent", {})):
+                        order_payload = tracing.attach_correlation(
+                            _to_dict(
+                                await self._oms.place_order(
+                                    event, decision_payload, correlation_id=correlation_id
+                                )
+                            )
+                        )
+                        order_event = OrderEvent(
+                            account_id=event.account_id,
+                            symbol=event.symbol,
+                            order_id=str(
+                                order_payload.get("order_id")
+                                or order_payload.get("client_order_id")
+                                or order_payload.get("id")
+                                or uuid.uuid4()
+                            ),
+                            status=str(order_payload.get("status") or "submitted"),
+                            ts=datetime.now(timezone.utc),
+                        )
+                        order_dump = order_event.model_dump(mode="json")
+                        order_dump["details"] = dict(order_payload)
+                        tracing.attach_correlation(order_dump, mutate=True)
+                        await self._publish(
+                            adapter,
+                            "order",
+                            event.account_id,
+                            order_dump,
+                        )
 
-                status = "filled" if fills else order_event.status
-        except Exception as exc:
-            error = str(exc)
-            status = "error"
-            await self._publish(
-                adapter,
-                "error",
-                event.account_id,
-                {
+                        async for raw_fill in self._oms.stream_fills(
+                            order_payload, correlation_id=correlation_id
+                        ):
+                            fill_payload = _to_dict(raw_fill)
+                            fill_identifier = (
+                                fill_payload.get("fill_id")
+                                or fill_payload.get("id")
+                                or fill_payload.get("execution_id")
+                            )
+                            with tracing.fill_span(
+                                intent=intent_dump.get("intent", {}),
+                                fill_id=str(fill_identifier or uuid.uuid4()),
+                            ):
+                                fill_event = self._build_fill_event(event, fill_payload)
+                                fill_dump = fill_event.model_dump(mode="json")
+                                fill_dump["details"] = fill_payload
+                                tracing.attach_correlation(fill_dump, mutate=True)
+                                await self._publish(
+                                    adapter,
+                                    "fill",
+                                    event.account_id,
+                                    fill_dump,
+                                )
+
+                                await self._risk_service.handle_fill(
+                                    fill_event, correlation_id=correlation_id
+                                )
+                                destinations = ["risk"]
+                                if self._pnl_tracker is not None:
+                                    await self._pnl_tracker.handle_fill(
+                                        fill_event, correlation_id=correlation_id
+                                    )
+                                    destinations.append("pnl")
+
+                                update_payload = {
+                                    "account_id": event.account_id,
+                                    "symbol": event.symbol,
+                                    "order_id": order_event.order_id,
+                                    "destinations": destinations,
+                                    "ts": datetime.now(timezone.utc).isoformat(),
+                                }
+                                tracing.attach_correlation(update_payload, mutate=True)
+                                await self._publish(
+                                    adapter,
+                                    "update",
+                                    event.account_id,
+                                    update_payload,
+                                )
+                                fills.append(dict(fill_dump))
+
+                    status = "filled" if fills else order_event.status
+            except Exception as exc:
+                error = str(exc)
+                status = "error"
+                error_payload = {
                     "account_id": event.account_id,
                     "symbol": event.symbol,
-                    "correlation_id": correlation_id,
-                    "ts": datetime.now(timezone.utc).isoformat(),
                     "error": error,
-                },
-            )
-            raise
-        finally:
-            completed_at = datetime.now(timezone.utc)
-            latency_ms = (time.perf_counter() - start_perf) * 1000.0
-            recorder = await self._latency_recorder(event.account_id)
-            await recorder.record(
-                endpoint=f"trade_roundtrip.{event.symbol}",
-                latency_ms=latency_ms,
-                ts=completed_at,
-            )
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                }
+                tracing.attach_correlation(error_payload, mutate=True)
+                await self._publish(
+                    adapter,
+                    "error",
+                    event.account_id,
+                    error_payload,
+                )
+                raise
+            finally:
+                completed_at = datetime.now(timezone.utc)
+                latency_ms = (time.perf_counter() - start_perf) * 1000.0
+                recorder = await self._latency_recorder(event.account_id)
+                await recorder.record(
+                    endpoint=f"trade_roundtrip.{event.symbol}",
+                    latency_ms=latency_ms,
+                    ts=completed_at,
+                )
+
+        intent_result = event.model_dump(mode="json")
+        tracing.attach_correlation(intent_result, mutate=True)
 
         return SequencerResult(
             correlation_id=correlation_id,
@@ -283,7 +339,7 @@ class TradingSequencer:
             started_at=started_at,
             completed_at=completed_at,
             latency_ms=latency_ms,
-            intent=event.model_dump(mode="json"),
+            intent=intent_result,
             decision=decision_payload,
             order=order_payload,
             fills=fills,
@@ -308,6 +364,7 @@ class TradingSequencer:
         topic = f"sequencer.{stage}"
         enriched = dict(payload)
         enriched.setdefault("account_id", account_id)
+        tracing.attach_correlation(enriched, mutate=True)
         await asyncio.to_thread(adapter.publish, topic, enriched)
 
     def _build_fill_event(
@@ -338,14 +395,6 @@ class TradingSequencer:
             liquidity=liquidity,
             ts=ts,
         )
-
-
-def _with_correlation(payload: Mapping[str, Any], correlation_id: str) -> Dict[str, Any]:
-    enriched = dict(payload)
-    enriched["correlation_id"] = correlation_id
-    return enriched
-
-
 def _coerce_float(payload: Mapping[str, Any], keys: Iterable[str], *, default: float) -> float:
     for key in keys:
         value = payload.get(key)

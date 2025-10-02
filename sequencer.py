@@ -17,6 +17,7 @@ from fastapi import FastAPI, HTTPException, status
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
 
+from common.utils import tracing
 from services.common.adapters import KafkaNATSAdapter
 from override_service import OverrideDecision, OverrideRecord, latest_override
 
@@ -33,6 +34,8 @@ from metrics import (
 
 
 LOGGER = logging.getLogger("sequencer")
+
+tracing.init_tracing("sequencer-service")
 
 
 DEFAULT_POLICY_TIMEOUT = float(os.getenv("SEQUENCER_POLICY_TIMEOUT", "2.0"))
@@ -194,7 +197,8 @@ class AuditPublisher:
 
     async def publish(self, topic_suffix: str, payload: Mapping[str, Any]) -> None:
         topic = f"{self._topic_prefix}.{topic_suffix}" if topic_suffix else self._topic_prefix
-        encoded = jsonable_encoder(payload)
+        enriched = tracing.attach_correlation(payload)
+        encoded = jsonable_encoder(enriched)
         await asyncio.to_thread(self._adapter.publish, topic, encoded)  # type: ignore[arg-type]
 
     async def publish_event(
@@ -216,6 +220,7 @@ class AuditPublisher:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "data": data,
         }
+        payload = tracing.attach_correlation(payload)
         await self.publish(f"{stage}.{phase}", payload)
 
 
@@ -252,7 +257,16 @@ class SequencerPipeline:
             publisher=publisher,
         )
 
-        payload: Dict[str, Any] = {"intent": jsonable_encoder(intent)}
+        intent_payload = jsonable_encoder(intent)
+        correlation_source = (
+            intent_payload.get("correlation_id")
+            or intent_payload.get("corr_id")
+            or intent_payload.get("correlation")
+        )
+        correlation_hint = (
+            str(correlation_source).strip() if correlation_source is not None else None
+        )
+
         stage_artifacts: Dict[str, Any] = {}
         stage_latencies: Dict[str, float] = {}
         executed: List[Tuple[Stage, StageResult]] = []
@@ -264,107 +278,131 @@ class SequencerPipeline:
         fill_event: Optional[Dict[str, Any]] = None
         total_latency: float = 0.0
 
-        await publisher.publish_event(
-            "pipeline",
-            "start",
-            run_id=run_id,
-            intent_id=intent_id,
-            account_id=normalized_account,
-            data={"intent": payload["intent"]},
-        )
+        with tracing.correlation_scope(correlation_hint) as correlation_id:
+            tracing.attach_correlation(intent_payload, mutate=True)
+            payload: Dict[str, Any] = {"intent": intent_payload}
+            tracing.attach_correlation(payload, mutate=True)
 
-        try:
-            with traced_span(
-                "sequencer.pipeline",
+            await publisher.publish_event(
+                "pipeline",
+                "start",
                 run_id=run_id,
-                account_id=normalized_account,
                 intent_id=intent_id,
-            ):
-                for stage in self._stages:
-                    await publisher.publish_event(
-                        stage.name,
-                        "start",
-                        run_id=run_id,
-                        intent_id=intent_id,
-                        account_id=normalized_account,
-                        data={"payload": payload},
-                    )
-                    stage_start = time.perf_counter()
-                    with traced_span(
-                        f"sequencer.stage.{stage.name}",
-                        stage=stage.name,
-                        run_id=run_id,
-                        account_id=normalized_account,
-                        intent_id=intent_id,
+                account_id=normalized_account,
+                data={"intent": intent_payload},
+            )
+
+            try:
+                with traced_span(
+                    "sequencer.pipeline",
+                    run_id=run_id,
+                    account_id=normalized_account,
+                    intent_id=intent_id,
+                ):
+                    for stage in self._stages:
+                        await publisher.publish_event(
+                            stage.name,
+                            "start",
+                            run_id=run_id,
+                            intent_id=intent_id,
+                            account_id=normalized_account,
+                            data={"payload": payload},
+                        )
+                        stage_start = time.perf_counter()
+                        with tracing.stage_span(
+                            stage.name,
+                            intent=payload.get("intent", {}),
+                            correlation_id=correlation_id,
+                            span_name=f"sequencer.{stage.name}",
+                        ):
+                            with traced_span(
+                                f"sequencer.stage.{stage.name}",
+                                stage=stage.name,
+                                run_id=run_id,
+                                account_id=normalized_account,
+                                intent_id=intent_id,
+                            ):
+                                result = await stage.execute(payload, ctx)
+                        stage_latency = (time.perf_counter() - stage_start) * 1000.0
+                        stage_latencies[stage.name] = stage_latency
+                        if stage.name == "policy":
+                            observe_policy_inference_latency(stage_latency)
+                        elif stage.name == "risk":
+                            observe_risk_validation_latency(stage_latency)
+                        elif stage.name == "oms":
+                            artifact = result.artifact if isinstance(result.artifact, dict) else {}
+                            transport = str(artifact.get("transport") or "sequencer")
+                            observe_oms_submit_latency(stage_latency, transport=transport)
+                        payload = tracing.attach_correlation(result.payload, mutate=True)
+                        stage_artifact = tracing.attach_correlation(result.artifact, mutate=True)
+                        stage_artifacts[stage.name] = stage_artifact
+                        executed.append((stage, result))
+                        await publisher.publish_event(
+                            stage.name,
+                            "complete",
+                            run_id=run_id,
+                            intent_id=intent_id,
+                            account_id=normalized_account,
+                            data=stage_artifact,
+                        )
+
+                    with tracing.fill_span(
+                        intent=payload.get("intent", {}),
+                        correlation_id=correlation_id,
+                        span_name="sequencer.fill",
                     ):
-                        result = await stage.execute(payload, ctx)
-                    stage_latency = (time.perf_counter() - stage_start) * 1000.0
-                    stage_latencies[stage.name] = stage_latency
-                    if stage.name == "policy":
-                        observe_policy_inference_latency(stage_latency)
-                    elif stage.name == "risk":
-                        observe_risk_validation_latency(stage_latency)
-                    elif stage.name == "oms":
-                        artifact = result.artifact if isinstance(result.artifact, dict) else {}
-                        transport = str(artifact.get("transport") or "sequencer")
-                        observe_oms_submit_latency(stage_latency, transport=transport)
-                    payload = result.payload
-                    stage_artifacts[stage.name] = result.artifact
-                    executed.append((stage, result))
+                        fill_event = tracing.attach_correlation(
+                            await self._emit_fill_event(ctx, payload, stage_artifacts)
+                        )
+                    total_latency_snapshot = (time.perf_counter() - pipeline_start) * 1000.0
+                    completion_payload = tracing.attach_correlation(
+                        {"fill_event": fill_event, "latency_ms": total_latency_snapshot}
+                    )
                     await publisher.publish_event(
-                        stage.name,
+                        "pipeline",
                         "complete",
                         run_id=run_id,
                         intent_id=intent_id,
                         account_id=normalized_account,
-                        data=result.artifact,
+                        data=completion_payload,
                     )
-
-                fill_event = await self._emit_fill_event(ctx, payload, stage_artifacts)
-                total_latency_snapshot = (time.perf_counter() - pipeline_start) * 1000.0
+            except StageError as exc:
+                status_value = "failed"
+                error_message = f"{exc.stage}: {exc.message}"
+                increment_rejected_intents(exc.stage, exc.message)
+                error_payload = tracing.attach_correlation({"error": exc.message})
                 await publisher.publish_event(
-                    "pipeline",
-                    "complete",
+                    exc.stage,
+                    "failed",
                     run_id=run_id,
                     intent_id=intent_id,
                     account_id=normalized_account,
-                    data={"fill_event": fill_event, "latency_ms": total_latency_snapshot},
+                    data=error_payload,
                 )
-        except StageError as exc:
-            status_value = "failed"
-            error_message = f"{exc.stage}: {exc.message}"
-            increment_rejected_intents(exc.stage, exc.message)
-            await publisher.publish_event(
-                exc.stage,
-                "failed",
-                run_id=run_id,
-                intent_id=intent_id,
-                account_id=normalized_account,
-                data={"error": exc.message},
-            )
-            await publisher.publish_event(
-                "pipeline",
-                "failed",
-                run_id=run_id,
-                intent_id=intent_id,
-                account_id=normalized_account,
-                data={"error": exc.message},
-            )
-            await self._rollback(executed, ctx)
-            raise
-        except Exception as exc:  # pragma: no cover - defensive guard
-            status_value = "failed"
-            error_message = f"unexpected: {exc}"
-            await publisher.publish_event(
-                "pipeline",
-                "failed",
-                run_id=run_id,
-                intent_id=intent_id,
-                account_id=normalized_account,
-                data={"error": error_message},
-            )
-            await self._rollback(executed, ctx)
-            raise StageFailedError("pipeline", error_message) from exc
+                await publisher.publish_event(
+                    "pipeline",
+                    "failed",
+                    run_id=run_id,
+                    intent_id=intent_id,
+                    account_id=normalized_account,
+                    data=error_payload,
+                )
+                await self._rollback(executed, ctx)
+                raise
+            except Exception as exc:  # pragma: no cover - defensive guard
+                status_value = "failed"
+                error_message = f"unexpected: {exc}"
+                error_payload = tracing.attach_correlation({"error": error_message})
+                await publisher.publish_event(
+                    "pipeline",
+                    "failed",
+                    run_id=run_id,
+                    intent_id=intent_id,
+                    account_id=normalized_account,
+                    data=error_payload,
+                )
+                await self._rollback(executed, ctx)
+                raise StageFailedError("pipeline", error_message) from exc
         finally:
             completed_at = datetime.now(timezone.utc)
             total_latency = (time.perf_counter() - pipeline_start) * 1000.0
@@ -434,6 +472,7 @@ class SequencerPipeline:
             "stage_artifacts": stage_artifacts,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+        tracing.attach_correlation(event, mutate=True)
         await asyncio.wait_for(
             ctx.publisher.publish_event(
                 "fill",
