@@ -10,11 +10,13 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.feature_extraction import DictVectorizer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder
+
+from services.common.security import require_admin_account
 
 _DEFAULT_ALERTMANAGER_URL = os.getenv("ALERTMANAGER_URL", "http://alertmanager:9093")
 _ALERT_ENDPOINT = "/api/v2/alerts"
@@ -283,7 +285,7 @@ _service = AlertPrioritizerService()
 
 
 @router.get("/alerts/prioritized")
-async def prioritized_alerts() -> List[Dict[str, Any]]:
+async def prioritized_alerts(_: str = Depends(require_admin_account)) -> List[Dict[str, Any]]:
     """Return alerts prioritised by the ML classifier."""
 
     return await _service.get_prioritized_alerts()
@@ -295,4 +297,3 @@ async def shutdown_prioritizer() -> None:
 
 
 __all__ = ["router", "AlertPrioritizerService"]
-

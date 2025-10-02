@@ -11,8 +11,10 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
+
+from audit_mode import AuditorPrincipal, require_auditor_identity
 
 try:  # pragma: no cover - optional dependency during unit tests.
     import boto3
@@ -560,6 +562,7 @@ def _cached_exporter() -> CompliancePackExporter:
 def export_compliance_pack(
     export_format: str = Query("sec", alias="format"),
     export_date: dt.date = Query(..., alias="date"),
+    _: AuditorPrincipal = Depends(require_auditor_identity),
 ) -> Response:
     try:
         exporter = _cached_exporter()
