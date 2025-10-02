@@ -410,6 +410,9 @@ def load_history(
     engine = _get_engine()
     _ensure_runs_table(engine)
 
+    if vs_currency.strip().lower() != "usd":
+        raise ValueError("Only USD quote currency is supported")
+
     if resume:
         try:
             run_uuid = UUID(resume)

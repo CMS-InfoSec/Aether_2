@@ -221,29 +221,28 @@ def _normalize_market(market: str) -> Optional[str]:
     if not market:
         return None
 
-    token = market.strip().upper().replace("/", "-")
+    token = market.strip().upper()
     if not token:
         return None
 
-    base: Optional[str] = None
-    quote: Optional[str] = None
-
-    if "-" in token:
-        base_part, _, quote_part = token.partition("-")
-        base = base_part
-        quote = quote_part
-    elif token.endswith("USD"):
-        base = token[:-3]
-        quote = "USD"
-    else:
-        base = token
-        quote = "USD"
-
-    if not base or not quote:
+    compact = token.replace("/", "").replace("-", "")
+    if not compact:
         return None
 
-    base = _normalize_asset_symbol(base, is_quote=False)
-    quote = _normalize_asset_symbol(quote, is_quote=True)
+    base_token: Optional[str] = None
+    quote_token: Optional[str] = None
+
+    for alias in sorted(KRAKEN_QUOTE_ALIASES.keys(), key=len, reverse=True):
+        if compact.endswith(alias):
+            base_token = compact[: -len(alias)]
+            quote_token = alias
+            break
+
+    if not base_token or not quote_token:
+        return None
+
+    base = _normalize_asset_symbol(base_token, is_quote=False)
+    quote = _normalize_asset_symbol(quote_token, is_quote=True)
 
     if not base or quote != "USD":
         return None
@@ -317,6 +316,8 @@ def _evaluate_universe(session: Session) -> List[str]:
 
         market_cap = float(cap_feature.value or 0.0)
         vol_feature = vols.get(canonical_pair)
+        if vol_feature is None and pair != canonical_pair:
+            vol_feature = vols.get(pair)
         volatility = float(vol_feature.value) if vol_feature and vol_feature.value is not None else 0.0
         kraken_volume = volumes.get(canonical_pair, 0.0)
 
