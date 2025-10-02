@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -28,6 +29,8 @@ from services.common.schemas import (
 )
 from services.policy.adaptive_horizon import get_horizon
 
+from ml.policy.fallback_policy import FallbackDecision, FallbackPolicy
+
 
 from exchange_adapter import get_exchange_adapter, get_exchange_adapters_status
 from metrics import record_abstention_rate, record_drift_score, setup_metrics
@@ -44,6 +47,8 @@ ENABLE_SHADOW_EXECUTION = os.getenv("ENABLE_SHADOW_EXECUTION", "true").lower() i
 }
 SHADOW_CLIENT_SUFFIX = os.getenv("SHADOW_CLIENT_SUFFIX", "-shadow")
 DEFAULT_EXCHANGE = os.getenv("PRIMARY_EXCHANGE", "kraken")
+MODEL_HEALTH_URL = os.getenv("MODEL_HEALTH_URL", "http://model-service/health/model")
+MODEL_HEALTH_TIMEOUT = float(os.getenv("MODEL_HEALTH_TIMEOUT", "0.75"))
 
 MODEL_VARIANTS: List[str] = ["trend_model", "meanrev_model", "vol_breakout"]
 DEFAULT_MODEL_SHARPES: Dict[str, float] = {
@@ -225,6 +230,12 @@ class RegimeClassifier:
 
 
 regime_classifier = RegimeClassifier()
+fallback_policy = FallbackPolicy(
+    top_symbols=["BTC-USD", "ETH-USD", "SOL-USD", "USDT-USD"],
+    size_fraction=float(os.getenv("FALLBACK_SIZE_FRACTION", "0.35")),
+    momentum_threshold=float(os.getenv("FALLBACK_MOMENTUM_THRESHOLD", "0.6")),
+    max_risk_band_bps=float(os.getenv("FALLBACK_MAX_RISK_BPS", "25")),
+)
 
 
 def _default_state() -> PolicyState:
@@ -257,6 +268,29 @@ def _snap(value: float, step: float) -> float:
 
 def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
     return max(lower, min(upper, value))
+
+
+async def _model_health_ok() -> bool:
+    if not MODEL_HEALTH_URL:
+        return True
+
+    timeout = httpx.Timeout(MODEL_HEALTH_TIMEOUT)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        try:
+            response = await client.get(MODEL_HEALTH_URL)
+            response.raise_for_status()
+        except httpx.HTTPError:
+            return False
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+
+    if isinstance(payload, dict):
+        status_value = str(payload.get("status") or payload.get("state") or "").lower()
+        return status_value == "ok"
+    return False
 
 
 def _model_sharpe_weights() -> Dict[str, float]:
@@ -539,16 +573,44 @@ async def decide_policy(request: PolicyDecisionRequest) -> PolicyDecisionRespons
     raw_weights = _model_sharpe_weights()
     weights = _normalize_weights(raw_weights)
 
+    fallback_reason: str | None = None
+    if not await _model_health_ok():
+        fallback_reason = "model_health_check_failed"
+
     intents: Dict[str, "Intent"] = {}
-    for variant in MODEL_VARIANTS:
-        intents[variant] = predict_intent(
-            account_id=request.account_id,
-            symbol=request.instrument,
-            features=features,
+    if fallback_reason is None:
+        for variant in MODEL_VARIANTS:
+            try:
+                intents[variant] = predict_intent(
+                    account_id=request.account_id,
+                    symbol=request.instrument,
+                    features=features,
+                    book_snapshot=book_snapshot,
+                    model_variant=variant,
+                    horizon=horizon_seconds,
+                )
+            except Exception as exc:  # pragma: no cover - protective fallback path
+                logger.exception(
+                    "Model inference failed for order %s on variant %s: %s",
+                    request.order_id,
+                    variant,
+                    exc,
+                )
+                fallback_reason = f"model_inference_error:{variant}"
+                break
+
+    if fallback_reason is not None:
+        activation_start = time.monotonic()
+        fallback_decision: FallbackDecision = fallback_policy.evaluate(
+            request=request,
             book_snapshot=book_snapshot,
-            model_variant=variant,
-            horizon=horizon_seconds,
+            reason=fallback_reason,
         )
+        duration = time.monotonic() - activation_start
+        fallback_policy.log_activation(reason=fallback_reason, duration=duration)
+
+        await _dispatch_shadow_orders(fallback_decision.request, fallback_decision.response)
+        return fallback_decision.response
 
     notional = float(Decimal(str(snapped_price)) * Decimal(str(snapped_qty)))
     maker_fee_bps = await _fetch_effective_fee(request.account_id, request.instrument, "maker", notional)
