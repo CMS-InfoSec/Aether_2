@@ -275,7 +275,17 @@ class _PrecisionValidator:
         if not metadata:
             return qty, price
 
-        pair_meta = metadata.get(symbol) if isinstance(metadata, dict) else None
+        pair_meta: Optional[Dict[str, Any]] = None
+        if isinstance(metadata, dict):
+            if cls._looks_like_pair_metadata(metadata):
+                pair_meta = metadata
+            else:
+                candidate = metadata.get(symbol)
+                if isinstance(candidate, dict):
+                    pair_meta = candidate
+                else:
+                    pair_meta = _resolve_pair_metadata(symbol, metadata)
+
         if not isinstance(pair_meta, dict):
             return qty, price
 
@@ -313,6 +323,20 @@ class _PrecisionValidator:
             except Exception:  # pragma: no cover - defensive
                 continue
         return None
+
+    @staticmethod
+    def _looks_like_pair_metadata(metadata: Dict[str, Any]) -> bool:
+        indicator_keys = {
+            "lot_step",
+            "lot_decimals",
+            "step_size",
+            "ordermin",
+            "min_qty",
+            "price_increment",
+            "pair_decimals",
+            "tick_size",
+        }
+        return any(key in metadata for key in indicator_keys)
 
     @classmethod
     def _step(cls, metadata: Dict[str, Any], keys: List[str]) -> Optional[Decimal]:

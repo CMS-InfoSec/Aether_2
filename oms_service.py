@@ -725,12 +725,13 @@ class OMSService:
 
         pair_meta: Optional[Dict[str, Any]] = None
         if metadata:
+            pair_meta = _resolve_pair_metadata(request.symbol, metadata)
             try:
                 snapped_qty, snapped_limit = _PrecisionValidator.validate(
                     request.symbol,
                     request.qty,
                     request.limit_px,
-                    metadata,
+                    pair_meta or metadata,
                 )
             except HTTPException:
                 raise
@@ -740,7 +741,6 @@ class OMSService:
                 )
                 snapped_qty = request.qty
                 snapped_limit = request.limit_px
-            pair_meta = _resolve_pair_metadata(request.symbol, metadata)
 
         price_step: Optional[Decimal] = None
         if pair_meta:
