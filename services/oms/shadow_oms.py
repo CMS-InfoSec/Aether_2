@@ -16,9 +16,15 @@ from decimal import Decimal
 from threading import Lock
 from typing import Any, Dict, Iterable, List, Optional
 
-import pandas as pd
+try:  # pragma: no cover - optional dependency during unit tests
+    from backtest_engine import Backtester, FeeSchedule, OrderIntent, Policy
+except ImportError:  # pragma: no cover - fallback to satisfy type checkers
+    Backtester = None  # type: ignore[assignment]
+    FeeSchedule = None  # type: ignore[assignment]
+    OrderIntent = None  # type: ignore[assignment]
 
-from backtest_engine import Backtester, FeeSchedule, OrderIntent, Policy
+    class Policy:  # type: ignore[no-redef]
+        pass
 
 
 class _SingleOrderPolicy(Policy):
@@ -44,11 +50,30 @@ class _SingleOrderPolicy(Policy):
 class _FillSnapshot:
     symbol: str
     side: str
-    quantity: float
-    price: float
+    quantity: Decimal
+    price: Decimal
     timestamp: datetime
-    fee: float = 0.0
-    slippage_bps: float = 0.0
+    fee: Decimal = Decimal("0")
+    slippage_bps: Decimal = Decimal("0")
+
+
+def _to_decimal(value: Decimal | float | int | str | None) -> Decimal:
+    if isinstance(value, Decimal):
+        return value
+    if value is None:
+        return Decimal("0")
+    if isinstance(value, (int, float)):
+        return Decimal(str(value))
+    return Decimal(value)
+
+
+def _decimal_to_str(value: Decimal) -> str:
+    if value == 0:
+        return "0"
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
 
 
 class _ShadowPnLTracker:
@@ -60,16 +85,16 @@ class _ShadowPnLTracker:
             False: {
                 "fills": [],
                 "positions": {},
-                "realized_pnl": 0.0,
-                "fees": 0.0,
-                "slippage": 0.0,
+                "realized_pnl": Decimal("0"),
+                "fees": Decimal("0"),
+                "slippage": Decimal("0"),
             },
             True: {
                 "fills": [],
                 "positions": {},
-                "realized_pnl": 0.0,
-                "fees": 0.0,
-                "slippage": 0.0,
+                "realized_pnl": Decimal("0"),
+                "fees": Decimal("0"),
+                "slippage": Decimal("0"),
             },
         }
 
@@ -82,20 +107,20 @@ class _ShadowPnLTracker:
         price: Decimal | float,
         shadow: bool,
         timestamp: Optional[datetime] = None,
-        fee: float = 0.0,
-        slippage_bps: float = 0.0,
+        fee: Decimal | float = Decimal("0"),
+        slippage_bps: Decimal | float = Decimal("0"),
     ) -> None:
         ts = timestamp or datetime.now(timezone.utc)
-        qty = float(quantity)
-        px = float(price)
+        qty = _to_decimal(quantity)
+        px = _to_decimal(price)
         snapshot = _FillSnapshot(
             symbol=symbol,
             side=side.lower(),
             quantity=qty,
             price=px,
             timestamp=ts,
-            fee=float(fee or 0.0),
-            slippage_bps=float(slippage_bps or 0.0),
+            fee=_to_decimal(fee or Decimal("0")),
+            slippage_bps=_to_decimal(slippage_bps or Decimal("0")),
         )
 
         with self._lock:
@@ -108,30 +133,36 @@ class _ShadowPnLTracker:
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
-            real = self._format_bucket(False)
-            shadow = self._format_bucket(True)
-        delta = {
-            "realized_pnl": shadow["realized_pnl"] - real["realized_pnl"],
-            "fees": shadow["fees"] - real["fees"],
-            "slippage": shadow["slippage"] - real["slippage"],
-        }
-        return {"real": real, "shadow": shadow, "delta": delta}
+            real_bucket = self._format_bucket(False)
+            shadow_bucket = self._format_bucket(True)
+            real_values = self._buckets[False]
+            shadow_values = self._buckets[True]
+            delta = {
+                "realized_pnl": _decimal_to_str(
+                    shadow_values["realized_pnl"] - real_values["realized_pnl"]
+                ),
+                "fees": _decimal_to_str(shadow_values["fees"] - real_values["fees"]),
+                "slippage": _decimal_to_str(
+                    shadow_values["slippage"] - real_values["slippage"]
+                ),
+            }
+        return {"real": real_bucket, "shadow": shadow_bucket, "delta": delta}
 
     def reset(self) -> None:
         with self._lock:
             for bucket in self._buckets.values():
                 bucket["fills"].clear()
                 bucket["positions"].clear()
-                bucket["realized_pnl"] = 0.0
-                bucket["fees"] = 0.0
-                bucket["slippage"] = 0.0
+                bucket["realized_pnl"] = Decimal("0")
+                bucket["fees"] = Decimal("0")
+                bucket["slippage"] = Decimal("0")
 
     def _format_bucket(self, shadow: bool) -> Dict[str, Any]:
         bucket = self._buckets[shadow]
         positions = {
             symbol: {
-                "quantity": position["quantity"],
-                "avg_price": position["avg_price"],
+                "quantity": _decimal_to_str(position["quantity"]),
+                "avg_price": _decimal_to_str(position["avg_price"]),
             }
             for symbol, position in bucket["positions"].items()
         }
@@ -139,54 +170,63 @@ class _ShadowPnLTracker:
             {
                 "symbol": fill.symbol,
                 "side": fill.side,
-                "quantity": fill.quantity,
-                "price": fill.price,
+                "quantity": _decimal_to_str(fill.quantity),
+                "price": _decimal_to_str(fill.price),
                 "timestamp": fill.timestamp.isoformat(),
-                "fee": fill.fee,
-                "slippage_bps": fill.slippage_bps,
+                "fee": _decimal_to_str(fill.fee),
+                "slippage_bps": _decimal_to_str(fill.slippage_bps),
             }
             for fill in bucket["fills"]
         ]
         return {
-            "realized_pnl": bucket["realized_pnl"],
-            "fees": bucket["fees"],
-            "slippage": bucket["slippage"],
+            "realized_pnl": _decimal_to_str(bucket["realized_pnl"]),
+            "fees": _decimal_to_str(bucket["fees"]),
+            "slippage": _decimal_to_str(bucket["slippage"]),
             "positions": positions,
             "fills": fills,
         }
 
-    def _apply_to_positions(self, positions: Dict[str, Dict[str, float]], fill: _FillSnapshot) -> float:
-        book = positions.setdefault(fill.symbol, {"quantity": 0.0, "avg_price": 0.0})
+    def _apply_to_positions(
+        self, positions: Dict[str, Dict[str, Decimal]], fill: _FillSnapshot
+    ) -> Decimal:
+        zero = Decimal("0")
+        book = positions.setdefault(
+            fill.symbol, {"quantity": zero, "avg_price": zero}
+        )
         qty = fill.quantity
         price = fill.price
-        realized = 0.0
+        realized = Decimal("0")
 
         if fill.side == "buy":
-            if book["quantity"] < 0:
+            if book["quantity"] < zero:
                 close_qty = min(qty, -book["quantity"])
-                realized += (book["avg_price"] - price) * close_qty
-                book["quantity"] += close_qty
-                qty -= close_qty
-                if book["quantity"] == 0:
-                    book["avg_price"] = 0.0
-            if qty > 0:
-                total_cost = max(book["quantity"], 0.0) * book["avg_price"] + price * qty
+                if close_qty > zero:
+                    realized += (book["avg_price"] - price) * close_qty
+                    book["quantity"] += close_qty
+                    qty -= close_qty
+                    if book["quantity"] == zero:
+                        book["avg_price"] = zero
+            if qty > zero:
+                existing_qty = book["quantity"] if book["quantity"] > zero else zero
+                total_cost = existing_qty * book["avg_price"] + price * qty
                 book["quantity"] += qty
-                if book["quantity"] > 0:
+                if book["quantity"] > zero:
                     book["avg_price"] = total_cost / book["quantity"]
         else:
-            if book["quantity"] > 0:
+            if book["quantity"] > zero:
                 close_qty = min(qty, book["quantity"])
-                realized += (price - book["avg_price"]) * close_qty
-                book["quantity"] -= close_qty
-                qty -= close_qty
-                if book["quantity"] <= 0:
-                    book["avg_price"] = 0.0
-            if qty > 0:
-                total_proceeds = abs(min(book["quantity"], 0.0)) * book["avg_price"] + price * qty
+                if close_qty > zero:
+                    realized += (price - book["avg_price"]) * close_qty
+                    book["quantity"] -= close_qty
+                    qty -= close_qty
+                    if book["quantity"] <= zero:
+                        book["avg_price"] = zero
+            if qty > zero:
+                existing_qty = (-book["quantity"] if book["quantity"] < zero else zero)
+                total_proceeds = existing_qty * book["avg_price"] + price * qty
                 book["quantity"] -= qty
-                if book["quantity"] < 0:
-                    book["avg_price"] = total_proceeds / abs(book["quantity"])
+                if book["quantity"] < zero:
+                    book["avg_price"] = total_proceeds / (-book["quantity"])
 
         return realized
 
@@ -217,8 +257,8 @@ class ShadowOMS:
         quantity: Decimal | float,
         price: Decimal | float,
         timestamp: Optional[datetime] = None,
-        fee: float = 0.0,
-        slippage_bps: float = 0.0,
+        fee: Decimal | float = Decimal("0"),
+        slippage_bps: Decimal | float = Decimal("0"),
     ) -> None:
         tracker = self._get_tracker(account_id)
         tracker.record_fill(
@@ -261,8 +301,8 @@ class ShadowOMS:
                 record = {
                     "account_id": account_id,
                     "symbol": symbol,
-                    "qty": fill.quantity,
-                    "price": fill.price,
+                    "qty": _decimal_to_str(fill.quantity),
+                    "price": _decimal_to_str(fill.price),
                     "ts": fill.timestamp.isoformat(),
                 }
                 store.append(record)
@@ -296,11 +336,17 @@ class ShadowOMS:
         price: Decimal | float,
         timestamp: Optional[datetime],
     ) -> List[_FillSnapshot]:
-        qty = float(quantity)
-        if qty <= 0:
+        qty_decimal = _to_decimal(quantity)
+        if qty_decimal <= 0:
             return []
-        px = float(price)
+        px_decimal = _to_decimal(price)
+        if Backtester is None or FeeSchedule is None or OrderIntent is None:
+            raise RuntimeError("Backtest engine dependencies are unavailable")
+        qty = float(qty_decimal)
+        px = float(px_decimal)
         ts = timestamp or datetime.now(timezone.utc)
+        import pandas as pd  # type: ignore
+
         order_intent = OrderIntent(
             side=side.lower(),
             quantity=qty,
@@ -349,11 +395,11 @@ class ShadowOMS:
                 _FillSnapshot(
                     symbol=symbol,
                     side=fill.side,
-                    quantity=float(fill.quantity),
-                    price=float(fill.price),
+                    quantity=_to_decimal(fill.quantity),
+                    price=_to_decimal(fill.price),
                     timestamp=timestamp_value,
-                    fee=float(fill.fee),
-                    slippage_bps=float(fill.slippage_bps),
+                    fee=_to_decimal(fill.fee),
+                    slippage_bps=_to_decimal(fill.slippage_bps),
                 )
             )
         return fills
