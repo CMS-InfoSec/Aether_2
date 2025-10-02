@@ -6,11 +6,24 @@ import csv
 import io
 import os
 from datetime import datetime
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.middleware.base import BaseHTTPMiddleware
+
+try:  # pragma: no cover - shared middleware may be unavailable in minimal environments
+    from shared.authz_middleware import (  # type: ignore
+        BearerTokenError,
+        _coerce_account_scopes as _shared_coerce_account_scopes,
+        _decode_jwt as _shared_decode_jwt,
+        _extract_bearer_token as _shared_extract_bearer_token,
+    )
+except Exception:  # pragma: no cover - fall back to header based scopes when helpers missing
+    BearerTokenError = HTTPException  # type: ignore[assignment]
+    _shared_coerce_account_scopes = None  # type: ignore[assignment]
+    _shared_decode_jwt = None  # type: ignore[assignment]
+    _shared_extract_bearer_token = None  # type: ignore[assignment]
 
 try:  # pragma: no cover - psycopg is optional in certain environments
     import psycopg
@@ -32,12 +45,25 @@ class AccountScopeMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):  # type: ignore[override]
         header_value = request.headers.get(self._header_name, "")
-        scopes = {
-            scope.strip()
-            for scope in header_value.split(",")
-            if scope and scope.strip()
-        }
+        scopes = _normalize_account_scopes(header_value.split(","))
+
+        # Fall back to decoding the bearer token when explicit scope headers are missing.
+        if not scopes and _shared_extract_bearer_token and _shared_decode_jwt:
+            try:
+                token = _shared_extract_bearer_token(request)
+                payload = _shared_decode_jwt(token)
+            except BearerTokenError:  # pragma: no cover - unauthenticated requests handled downstream
+                payload = None
+            except HTTPException:
+                raise
+            else:
+                if payload and _shared_coerce_account_scopes:
+                    token_scopes = _shared_coerce_account_scopes(payload.get("account_scopes"))
+                    scopes = _normalize_account_scopes(token_scopes)
+
         request.state.account_scopes = scopes
+        request.scope["account_scopes"] = scopes
+        setattr(request, "account_scopes", scopes)
         return await call_next(request)
 
 
@@ -71,6 +97,7 @@ def _parse_datetime(value: str | None) -> datetime | None:
 
 
 def _query_records(
+    request: Request,
     table: str,
     account_id: str,
     *,
@@ -96,11 +123,7 @@ def _query_records(
         query += " ORDER BY 1 DESC"
 
     query += " LIMIT %(limit)s OFFSET %(offset)s"
-
-    with _connect() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(query, params)
-            rows = cursor.fetchall()
+    rows = _execute_scoped_query(_scopes_from_request(request), query, params)
     return list(rows)
 
 
@@ -125,7 +148,7 @@ async def requires_account_scope(
     request: Request,
     account_id: str = Query(..., description="Account identifier"),
 ) -> str:
-    scopes = getattr(request.state, "account_scopes", set())
+    scopes = set(getattr(request.state, "account_scopes", ()))
     if "*" in scopes or account_id in scopes:
         return account_id
     raise HTTPException(status_code=403, detail="Account scope is not authorised")
@@ -178,6 +201,7 @@ async def get_positions(
     format: str | None = Query(None, regex="^(json|csv)$"),
 ):
     rows = _query_records(
+        request,
         "portfolio_positions",
         account_id,
         time_column="as_of",
@@ -209,6 +233,7 @@ async def get_pnl(
     start = _parse_datetime(from_ts)
     end = _parse_datetime(to_ts)
     rows = _query_records(
+        request,
         "portfolio_pnl_curve",
         account_id,
         time_column="bucket",
@@ -240,6 +265,7 @@ async def get_orders(
     start = _parse_datetime(from_ts)
     end = _parse_datetime(to_ts)
     rows = _query_records(
+        request,
         "portfolio_orders",
         account_id,
         time_column="created_at",
@@ -271,6 +297,7 @@ async def get_fills(
     start = _parse_datetime(from_ts)
     end = _parse_datetime(to_ts)
     rows = _query_records(
+        request,
         "portfolio_fills",
         account_id,
         time_column="fill_time",
@@ -287,4 +314,93 @@ async def get_fills(
         limit=limit,
         offset=offset,
     )
+
+
+def _normalize_account_scopes(scopes: Iterable[str] | None) -> tuple[str, ...]:
+    """Return a normalised tuple of scope identifiers."""
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    if scopes is None:
+        return tuple()
+
+    for raw in scopes:
+        if raw is None:
+            continue
+        candidate = str(raw).strip()
+        if not candidate or candidate in seen:
+            continue
+        normalized.append(candidate)
+        seen.add(candidate)
+
+    return tuple(normalized)
+
+
+def _scopes_from_request(request: Request) -> tuple[str, ...]:
+    scopes = getattr(request.state, "account_scopes", ())
+    normalized = _normalize_account_scopes(scopes)
+    if not normalized:
+        raise HTTPException(status_code=403, detail="Request is missing account scopes")
+    return normalized
+
+
+def _set_account_scopes(cursor: Any, scopes: Sequence[str]) -> None:
+    joined = ",".join(scopes)
+    cursor.execute(
+        "SELECT set_config('app.account_scopes', %(scopes)s, true)",
+        {"scopes": joined},
+    )
+
+
+def _execute_scoped_query(
+    account_scopes: Sequence[str],
+    query: str,
+    params: Mapping[str, Any],
+) -> list[Mapping[str, Any]]:
+    normalized = _normalize_account_scopes(account_scopes)
+    if not normalized:
+        raise ValueError("account_scopes must not be empty")
+
+    with _connect() as conn:
+        with conn.cursor() as cursor:
+            _set_account_scopes(cursor, normalized)
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+    return list(rows)
+
+
+def query_positions(
+    *, account_scopes: Sequence[str], limit: int = 500
+) -> list[Mapping[str, Any]]:
+    """Return recent position rows scoped by *account_scopes*."""
+
+    query = "SELECT * FROM positions ORDER BY as_of DESC LIMIT %(limit)s"
+    return _execute_scoped_query(account_scopes, query, {"limit": limit})
+
+
+def query_pnl_curves(
+    *, account_scopes: Sequence[str], limit: int = 500
+) -> list[Mapping[str, Any]]:
+    """Return recent PnL curve rows scoped by *account_scopes*."""
+
+    query = "SELECT * FROM pnl_curves ORDER BY curve_ts DESC LIMIT %(limit)s"
+    return _execute_scoped_query(account_scopes, query, {"limit": limit})
+
+
+def query_orders(
+    *, account_scopes: Sequence[str], limit: int = 500
+) -> list[Mapping[str, Any]]:
+    """Return recent order rows scoped by *account_scopes*."""
+
+    query = "SELECT * FROM orders ORDER BY submitted_at DESC LIMIT %(limit)s"
+    return _execute_scoped_query(account_scopes, query, {"limit": limit})
+
+
+def query_fills(
+    *, account_scopes: Sequence[str], limit: int = 500
+) -> list[Mapping[str, Any]]:
+    """Return recent fill rows scoped by *account_scopes*."""
+
+    query = "SELECT * FROM fills ORDER BY fill_time DESC LIMIT %(limit)s"
+    return _execute_scoped_query(account_scopes, query, {"limit": limit})
 
