@@ -305,7 +305,7 @@ class MockKrakenExchange:
             self._random_latency = (jitter_low, jitter_high)
             self._random_latency_chance = max(self._random_latency_chance, 0.75)
             return
-        if normalised == "failing":
+        if normalised in {"failing", "error"}:
             self._error_rate = max(self._error_rate, 0.75)
             self._rejection_rate = max(self._rejection_rate, 0.5)
             return
