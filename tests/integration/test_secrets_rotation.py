@@ -129,6 +129,15 @@ def test_rotate_secret_triggers_oms_reload(monkeypatch: pytest.MonkeyPatch, capl
     assert snapshot["api_key"] == initial_key
 
     secrets_service.app.dependency_overrides[secrets_service.get_core_v1_api] = lambda: _FakeCoreV1Api()
+    secrets_service.app.dependency_overrides[secrets_service.require_admin_account] = (
+        lambda: account_id
+    )
+    secrets_service.app.dependency_overrides[secrets_service.require_mfa_context] = (
+        lambda: "verified"
+    )
+    secrets_service.app.dependency_overrides[
+        secrets_service.require_dual_director_confirmation
+    ] = lambda: ("director-a", "director-b")
     monkeypatch.setattr(oms_main, "KrakenWSClient", _RecordingKrakenWSClient)
 
     try:
@@ -184,5 +193,14 @@ def test_rotate_secret_triggers_oms_reload(monkeypatch: pytest.MonkeyPatch, capl
         assert recorded.get("api_secret") == new_secret
     finally:
         secrets_service.app.dependency_overrides.pop(secrets_service.get_core_v1_api, None)
+        secrets_service.app.dependency_overrides.pop(
+            secrets_service.require_admin_account, None
+        )
+        secrets_service.app.dependency_overrides.pop(
+            secrets_service.require_mfa_context, None
+        )
+        secrets_service.app.dependency_overrides.pop(
+            secrets_service.require_dual_director_confirmation, None
+        )
         KrakenCredentialWatcher.reset_instances()
 

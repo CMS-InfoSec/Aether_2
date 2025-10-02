@@ -6,13 +6,29 @@ fastapi = pytest.importorskip("fastapi")
 from fastapi import status  # noqa: E402  # pragma: no cover
 from fastapi.testclient import TestClient  # noqa: E402  # pragma: no cover
 
-from services.secrets import middleware  # noqa: E402  # pragma: no cover
+from services.secrets import middleware, secrets_service  # noqa: E402  # pragma: no cover
 from services.secrets.secrets_service import app  # noqa: E402
 
 
 @pytest.fixture(name="client")
 def client_fixture() -> TestClient:
-    return TestClient(app)
+    secrets_service.app.dependency_overrides[secrets_service.require_admin_account] = (
+        lambda: "company"
+    )
+    secrets_service.app.dependency_overrides[secrets_service.require_mfa_context] = (
+        lambda: "verified"
+    )
+    client = TestClient(app)
+    try:
+        yield client
+    finally:
+        client.close()
+        secrets_service.app.dependency_overrides.pop(
+            secrets_service.require_admin_account, None
+        )
+        secrets_service.app.dependency_overrides.pop(
+            secrets_service.require_mfa_context, None
+        )
 
 
 def test_forwarded_proto_allows_secure_requests(client: TestClient) -> None:
