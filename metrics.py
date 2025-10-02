@@ -462,13 +462,14 @@ def increment_oms_child_orders_total(
     transport: str,
     *,
     service: Optional[str] = None,
+    count: float = 1.0,
 ) -> None:
     _oms_child_orders_total.labels(
         service=_service_value(service),
         account=_normalised(account, "unknown"),
         symbol=_normalised(symbol, "unknown"),
         transport=_normalised(transport, "unknown"),
-    ).inc()
+    ).inc(count)
 
 
 def set_oms_latency(

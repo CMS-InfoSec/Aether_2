@@ -1365,9 +1365,6 @@ class AccountContext:
             child_quantities = self._plan_child_quantities(request, qty, metadata, depth)
             if not child_quantities:
                 child_quantities = [qty]
-            increment_oms_child_orders_total(
-                self.account_id, request.symbol, len(child_quantities)
-            )
             if len(child_quantities) > 1:
                 logger.info(
                     "Slicing order for account %s symbol %s into %d child orders (depth=%s)",
@@ -1409,6 +1406,13 @@ class AccountContext:
                 request.client_id, child_results, child_records
             )
             aggregate_transport = self._aggregate_transport(transports_used)
+
+            increment_oms_child_orders_total(
+                self.account_id,
+                request.symbol,
+                aggregate_transport,
+                count=len(child_quantities),
+            )
 
 
             async with self._orders_lock:
