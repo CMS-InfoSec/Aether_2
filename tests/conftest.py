@@ -356,6 +356,51 @@ if _class_validators is not None:
     _class_validators.root_validator = _compat_root_validator  # type: ignore[assignment]
 
 
+def _precision_fixture_payload() -> Dict[str, Dict[str, str]]:
+    def _entry(base: str, tick: float, lot: float) -> Dict[str, str]:
+        return {
+            "wsname": f"{base}/USD",
+            "tick_size": str(tick),
+            "lot_step": str(lot),
+        }
+
+    return {
+        "BTCUSD": _entry("BTC", 0.1, 0.0001),
+        "ETHUSD": _entry("ETH", 0.05, 0.001),
+        "SOLUSD": _entry("SOL", 0.01, 0.1),
+        "USDTUSD": _entry("USDT", 0.001, 1.0),
+        "ADAUSD": _entry("ADA", 0.0001, 0.1),
+        "TSTUSD": _entry("TST", 1e-08, 1e-08),
+    }
+
+
+@pytest.fixture(autouse=True)
+def _seed_precision_cache(monkeypatch: pytest.MonkeyPatch):
+    try:
+        from services.common import precision as precision_module
+    except Exception:  # pragma: no cover - precision module not available
+        yield
+        return
+
+    payload = _precision_fixture_payload()
+    provider = precision_module.PrecisionMetadataProvider(
+        fetcher=lambda: payload,
+        refresh_interval=0.0,
+    )
+    provider.refresh(force=True)
+    monkeypatch.setattr(precision_module, "precision_provider", provider)
+
+    policy_module = sys.modules.get("policy_service")
+    if policy_module is not None:
+        monkeypatch.setattr(policy_module, "precision_provider", provider, raising=False)
+
+    position_sizer_module = sys.modules.get("services.risk.position_sizer")
+    if position_sizer_module is not None:
+        monkeypatch.setattr(position_sizer_module, "precision_provider", provider, raising=False)
+
+    yield provider
+
+
 @pytest.fixture(autouse=True)
 def _configure_security_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
     try:  # FastAPI is optional in some test environments

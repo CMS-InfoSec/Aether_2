@@ -4,19 +4,53 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
 
+import pytest
+
 import safe_mode
 from tests.fixtures.backends import MemoryRedis
 
 
+class _StubOrderControls:
+    def __init__(self) -> None:
+        self.open_orders: list[str] = []
+        self.cancelled_orders: list[str] = []
+        self.hedging_only = False
+        self.only_hedging = False
+
+    def cancel_open_orders(self) -> None:
+        self.cancelled_orders.extend(self.open_orders)
+        self.open_orders.clear()
+
+    def restrict_to_hedging(self, *, reason: str | None = None, actor: str | None = None) -> None:
+        self.hedging_only = True
+        self.only_hedging = True
+
+    def lift_restrictions(self, *, reason: str | None = None, actor: str | None = None) -> None:
+        self.hedging_only = False
+        self.only_hedging = False
+
+    def reset(self) -> None:
+        self.open_orders.clear()
+        self.cancelled_orders.clear()
+        self.hedging_only = False
+        self.only_hedging = False
+
+
 @pytest.fixture(autouse=True)
-def reset_state() -> None:
+def reset_state(monkeypatch: pytest.MonkeyPatch) -> None:
     backend = MemoryRedis()
-    safe_mode.controller._state_store = safe_mode.SafeModeStateStore(redis_client=backend)
-    safe_mode.controller.reset()
+    stub_controls = _StubOrderControls()
+    controller = safe_mode.SafeModeController(
+        order_controls=stub_controls,
+        state_store=safe_mode.SafeModeStateStore(redis_client=backend),
+    )
+    original_controller = safe_mode.controller
+    monkeypatch.setattr(safe_mode, "controller", controller)
     safe_mode.clear_safe_mode_log()
     yield
-    safe_mode.controller.reset()
+    controller.reset()
     safe_mode.clear_safe_mode_log()
+    monkeypatch.setattr(safe_mode, "controller", original_controller)
 
 
 def test_enter_safe_mode_enforces_controls() -> None:

@@ -100,7 +100,7 @@ class Sequencer:
 @pytest.mark.slow
 def test_trading_pipeline_emits_fill_event(monkeypatch: pytest.MonkeyPatch) -> None:
     metrics_stub = types.SimpleNamespace(
-        setup_metrics=lambda app: None,
+        setup_metrics=lambda *args, **kwargs: None,
         record_abstention_rate=lambda *args, **kwargs: None,
         record_drift_score=lambda *args, **kwargs: None,
         increment_trade_rejection=lambda *args, **kwargs: None,
@@ -112,6 +112,7 @@ def test_trading_pipeline_emits_fill_event(monkeypatch: pytest.MonkeyPatch) -> N
         record_oms_submit_ack=lambda *args, **kwargs: None,
         record_scaling_state=lambda *args, **kwargs: None,
         observe_scaling_evaluation=lambda *args, **kwargs: None,
+        get_request_id=lambda: None,
     )
     sys.modules["metrics"] = metrics_stub
 

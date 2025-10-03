@@ -167,6 +167,7 @@ metrics_stub.record_oms_latency = _noop
 metrics_stub.setup_metrics = _noop
 metrics_stub.record_scaling_state = _noop
 metrics_stub.observe_scaling_evaluation = _noop
+metrics_stub.get_request_id = lambda: None
 metrics_stub._REGISTRY = object()
 sys.modules['metrics'] = metrics_stub
 

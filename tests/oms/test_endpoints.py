@@ -308,6 +308,9 @@ def test_place_order_allows_admin_accounts(client: TestClient, account_id: str) 
         "accepted": True,
         "routed_venue": "kraken",
         "fee": payload["fee"],
+        "exchange_order_id": "SIM-123",
+        "kraken_status": "ok",
+        "errors": None,
     }
 
 
@@ -346,7 +349,7 @@ def test_place_order_rejected_ack_sets_accepted_false(
                     status="rejected",
                     filled_qty=None,
                     avg_price=None,
-                    errors=None,
+                    errors=["EOrder:post only"]
                 )
 
             async def fetch_open_orders_snapshot(self) -> list[Dict[str, Any]]:
@@ -365,7 +368,7 @@ def test_place_order_rejected_ack_sets_accepted_false(
                     status="rejected",
                     filled_qty=None,
                     avg_price=None,
-                    errors=None,
+                    errors=["EOrder:post only"]
                 )
 
             async def open_orders(self) -> Dict[str, Any]:
@@ -410,6 +413,9 @@ def test_place_order_rejected_ack_sets_accepted_false(
         "accepted": False,
         "routed_venue": "kraken",
         "fee": payload["fee"],
+        "exchange_order_id": "SIM-REJECT",
+        "kraken_status": "rejected",
+        "errors": ["EOrder:post only"],
     }
 
 
@@ -624,4 +630,146 @@ def test_place_order_returns_424_when_metadata_missing(
         "detail": "Market metadata unavailable; unable to quantize order safely."
     }
     assert call_state == {"get": 2, "refresh": 1}
+
+
+def test_cancel_order_records_events(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    published: list[Dict[str, Any]] = []
+    recorded_events: list[Dict[str, Any]] = []
+
+    class _KafkaStub:
+        def __init__(self, account_id: str, **_: Any) -> None:
+            self.account_id = account_id
+
+        def publish(self, *, topic: str, payload: Dict[str, Any]) -> None:
+            published.append(
+                {"account_id": self.account_id, "topic": topic, "payload": payload}
+            )
+
+    class _TimescaleStub:
+        def __init__(self, account_id: str, **_: Any) -> None:
+            self.account_id = account_id
+
+        def record_event(self, event_type: str, payload: Dict[str, Any]) -> None:
+            recorded_events.append(
+                {
+                    "account_id": self.account_id,
+                    "event_type": event_type,
+                    "payload": payload,
+                }
+            )
+
+    monkeypatch.setattr(main, "KafkaNATSAdapter", _KafkaStub)
+    monkeypatch.setattr(main, "TimescaleAdapter", _TimescaleStub)
+
+    payload = {"account_id": "admin-alpha", "client_id": "ord-cancel", "txid": "SIM-321"}
+
+    response = client.post("/oms/cancel", json=payload, headers={"X-Account-ID": "admin-alpha"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["exchange_order_id"] == "SIM-321"
+    assert body["status"].lower() in {"canceled", "cancelled"}
+
+    assert published, "expected Kafka cancel event"
+    assert recorded_events, "expected Timescale cancel event"
+
+    kafka_event = published[0]
+    timescale_event = recorded_events[0]
+
+    assert kafka_event["topic"] == "oms.cancels"
+    assert kafka_event["account_id"] == "admin-alpha"
+    assert timescale_event["event_type"] == "oms.cancel"
+    assert timescale_event["account_id"] == "admin-alpha"
+
+    assert kafka_event["payload"] == timescale_event["payload"]
+
+    payload_body = kafka_event["payload"]
+    assert payload_body["order_id"] == "ord-cancel"
+    assert payload_body["txid"] == "SIM-321"
+    assert payload_body["requested_txid"] == "SIM-321"
+    assert payload_body["status"].lower() in {"canceled", "cancelled"}
+    assert payload_body["transport"] in {"websocket", "rest"}
+
+    timestamp = payload_body["timestamp"]
+    assert isinstance(timestamp, str)
+    datetime.fromisoformat(timestamp)
+
+
+def test_cancel_order_rejection_records_events(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    published: list[Dict[str, Any]] = []
+    recorded_events: list[Dict[str, Any]] = []
+    rejections: list[Tuple[str, str, Any]] = []
+
+    class _KafkaStub:
+        def __init__(self, account_id: str, **_: Any) -> None:
+            self.account_id = account_id
+
+        def publish(self, *, topic: str, payload: Dict[str, Any]) -> None:
+            published.append(
+                {"account_id": self.account_id, "topic": topic, "payload": payload}
+            )
+
+    class _TimescaleStub:
+        def __init__(self, account_id: str, **_: Any) -> None:
+            self.account_id = account_id
+
+        def record_event(self, event_type: str, payload: Dict[str, Any]) -> None:
+            recorded_events.append(
+                {
+                    "account_id": self.account_id,
+                    "event_type": event_type,
+                    "payload": payload,
+                }
+            )
+
+    async def _mock_cancel_order(*_: Any, **__: Any) -> Tuple[OrderAck, str]:
+        return (
+            OrderAck(
+                exchange_order_id=None,
+                status="error",
+                filled_qty=None,
+                avg_price=None,
+                errors=["Rejected"],
+            ),
+            "websocket",
+        )
+
+    def _record_rejection(account_id: str, symbol: str, *, service: Any = None) -> None:
+        rejections.append((account_id, symbol, service))
+
+    monkeypatch.setattr(main, "KafkaNATSAdapter", _KafkaStub)
+    monkeypatch.setattr(main, "TimescaleAdapter", _TimescaleStub)
+    monkeypatch.setattr(main, "_cancel_order", _mock_cancel_order)
+    monkeypatch.setattr(main, "increment_trade_rejection", _record_rejection)
+
+    payload = {"account_id": "admin-alpha", "client_id": "ord-cancel", "txid": "SIM-999"}
+
+    response = client.post("/oms/cancel", json=payload, headers={"X-Account-ID": "admin-alpha"})
+
+    assert response.status_code == status.HTTP_502_BAD_GATEWAY
+    assert published, "expected Kafka cancel event on rejection"
+    assert recorded_events, "expected Timescale cancel event on rejection"
+
+    kafka_event = published[0]
+    timescale_event = recorded_events[0]
+
+    assert kafka_event["topic"] == "oms.cancels"
+    assert kafka_event["account_id"] == "admin-alpha"
+    assert timescale_event["event_type"] == "oms.cancel"
+    assert timescale_event["account_id"] == "admin-alpha"
+    assert kafka_event["payload"] == timescale_event["payload"]
+
+    payload_body = kafka_event["payload"]
+    assert payload_body["order_id"] == "ord-cancel"
+    assert payload_body["txid"] == "SIM-999"
+    assert payload_body["status"] == "error"
+    assert payload_body["errors"] == ["Rejected"]
+    assert payload_body["transport"] == "websocket"
+    datetime.fromisoformat(payload_body["timestamp"])
+
+    assert rejections == [("admin-alpha", "unknown", None)]
 

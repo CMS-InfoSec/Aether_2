@@ -55,6 +55,8 @@ from services.oms.rate_limit_guard import rate_limit_guard
 from services.oms.shadow_oms import shadow_oms
 from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
 
+from services.oms.circuit_breaker_store import CircuitBreakerStateStore, CircuitBreakerPersistedState
+
 try:  # pragma: no cover - optional dependency during tests
     import websockets
     from websockets import WebSocketClientProtocol
@@ -254,6 +256,7 @@ async def _await_background_tasks(timeout: float) -> None:
 @app.on_event("startup")
 async def _on_startup_initialize_metadata() -> None:
     await market_metadata_cache.start()
+    CircuitBreaker.reload_from_store()
 
 
 @app.on_event("shutdown")
@@ -264,29 +267,62 @@ async def _on_shutdown_complete() -> None:
 
 
 class CircuitBreaker:
-    _halts: Dict[str, Dict[str, float | str]] = {}
+    _halts: Dict[str, Dict[str, object]] = {}
+    _store: CircuitBreakerStateStore | None = None
+
+    @classmethod
+    def use_store(cls, store: CircuitBreakerStateStore | None) -> None:
+        cls._store = store
+
+    @classmethod
+    def reload_from_store(cls) -> None:
+        if cls._store is None:
+            return
+        persisted = cls._store.load_all()
+        cls._halts.clear()
+        now = time.time()
+        for instrument, state in persisted.items():
+            expires_at = state.expires_at
+            if expires_at is not None and expires_at <= now:
+                cls._store.delete(instrument)
+                continue
+            cls._halts[instrument] = {"reason": state.reason, "expires": expires_at}
 
     @classmethod
     def halt(cls, instrument: str, reason: str, ttl_seconds: float | None = None) -> None:
-        expires = float("inf") if ttl_seconds is None else time.time() + ttl_seconds
+        expires = None if ttl_seconds is None else time.time() + ttl_seconds
         cls._halts[instrument] = {"reason": reason, "expires": expires}
+        if cls._store is not None:
+            cls._store.save(
+                CircuitBreakerPersistedState(
+                    instrument=instrument,
+                    reason=reason,
+                    expires_at=expires,
+                )
+            )
 
     @classmethod
     def resume(cls, instrument: str) -> None:
         cls._halts.pop(instrument, None)
+        if cls._store is not None:
+            cls._store.delete(instrument)
 
     @classmethod
     def reset(cls) -> None:
         cls._halts.clear()
+        if cls._store is not None:
+            cls._store.clear()
 
     @classmethod
     def is_halted(cls, instrument: str) -> bool:
         data = cls._halts.get(instrument)
         if not data:
             return False
-        expires = data.get("expires", float("inf"))
-        if expires != float("inf") and expires < time.time():
+        expires = data.get("expires")
+        if isinstance(expires, (int, float)) and expires < time.time():
             cls._halts.pop(instrument, None)
+            if cls._store is not None:
+                cls._store.delete(instrument)
             return False
         return True
 
@@ -294,6 +330,17 @@ class CircuitBreaker:
     def reason(cls, instrument: str) -> str | None:
         data = cls._halts.get(instrument)
         return None if not data else str(data.get("reason"))
+
+
+try:  # pragma: no cover - default store wiring best-effort for production deployments
+    _DEFAULT_CIRCUIT_BREAKER_STORE = CircuitBreakerStateStore()
+except RuntimeError as exc:  # pragma: no cover - redis optional in test environments
+    logger.warning(
+        "Circuit breaker persistence disabled: %s", exc,
+    )
+    _DEFAULT_CIRCUIT_BREAKER_STORE = None
+
+CircuitBreaker.use_store(_DEFAULT_CIRCUIT_BREAKER_STORE)
 
 
 _BASE_ALIASES: Dict[str, str] = {
@@ -1402,7 +1449,14 @@ async def place_order(
 
     accepted = (not status_value) or status_value in _SUCCESS_STATUSES
     venue = "kraken"
-    return OrderPlacementResponse(accepted=accepted, routed_venue=venue, fee=request.fee)
+    return OrderPlacementResponse(
+        accepted=accepted,
+        routed_venue=venue,
+        fee=request.fee,
+        exchange_order_id=ack.exchange_order_id,
+        kraken_status=ack_payload.get("status"),
+        errors=ack_payload.get("errors"),
+    )
 
 
 @app.post("/oms/cancel", response_model=CancelOrderResponse)
@@ -1422,6 +1476,9 @@ async def cancel_order(
             detail="exchange_order_id is required for Kraken cancellations.",
         )
 
+    kafka = KafkaNATSAdapter(account_id=request.account_id)
+    timescale = TimescaleAdapter(account_id=request.account_id)
+
     async with _acquire_kraken_clients(request.account_id) as clients:
         credentials = await clients.credential_getter()
         try:
@@ -1432,13 +1489,59 @@ async def cancel_order(
                 detail=str(exc),
             ) from exc
 
-        ack, _ = await _cancel_order(
+        ack, transport = await _cancel_order(
             clients.ws_client,
             clients.rest_client,
             {"txid": request.exchange_order_id},
         )
 
-    return _cancel_ack_payload(ack, fallback_txid=request.exchange_order_id)
+    event_payload: Dict[str, Any] = {
+        "account_id": request.account_id,
+        "order_id": request.client_id,
+        "requested_txid": request.exchange_order_id,
+        "txid": ack.exchange_order_id or request.exchange_order_id,
+        "status": (ack.status or "").strip() or "canceled",
+        "transport": transport,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    if ack.filled_qty is not None:
+        event_payload["filled_qty"] = float(ack.filled_qty)
+    if ack.avg_price is not None:
+        event_payload["avg_price"] = float(ack.avg_price)
+    if ack.errors:
+        errors = [str(error) for error in ack.errors if str(error)]
+        if errors:
+            event_payload["errors"] = errors
+
+    try:
+        response = _cancel_ack_payload(ack, fallback_txid=request.exchange_order_id)
+    except HTTPException:
+        timescale.record_event("oms.cancel", event_payload)
+        kafka.publish(topic="oms.cancels", payload=event_payload)
+        increment_trade_rejection(request.account_id, "unknown")
+        raise
+
+    event_payload.update(
+        {
+            "txid": response.exchange_order_id,
+            "status": response.status,
+        }
+    )
+    if response.filled_qty is not None:
+        event_payload["filled_qty"] = response.filled_qty
+    elif "filled_qty" in event_payload and response.filled_qty is None:
+        event_payload.pop("filled_qty")
+    if response.avg_price is not None:
+        event_payload["avg_price"] = response.avg_price
+    elif "avg_price" in event_payload and response.avg_price is None:
+        event_payload.pop("avg_price")
+    event_payload.pop("errors", None)
+
+    timescale.record_event("oms.cancel", event_payload)
+    kafka.publish(topic="oms.cancels", payload=event_payload)
+
+    return response
 
 
 @app.get(

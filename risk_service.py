@@ -551,10 +551,6 @@ class RiskEvaluationContext(BaseModel):
     def intended_notional(self) -> float:
         return float(self.request.intent.notional)
 
-    class Config:
-        arbitrary_types_allowed = True
-
-
 class AccountUsage(BaseModel):
     account_id: str
     realized_daily_loss: Decimal = Field(..., ge=DECIMAL_ZERO)
@@ -1109,7 +1105,9 @@ async def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
             details={"fees": state.fees_paid, "limit": limits.fee_budget},
         )
 
-    nav_cap_for_trade = limits.max_nav_pct_per_trade * state.net_asset_value
+    nav_value = float(state.net_asset_value)
+    nav_pct_limit = float(limits.max_nav_pct_per_trade)
+    nav_cap_for_trade = nav_pct_limit * nav_value
 
     scaled_notional_cap = None
     target_vol = getattr(limits, "target_volatility", None)

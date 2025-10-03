@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+
 import hashlib
 import tempfile
+
 import json
 import logging
 
@@ -15,12 +17,15 @@ import sqlite3
 import threading
 from copy import deepcopy
 from dataclasses import dataclass, field
+
 from pathlib import Path
 from weakref import WeakSet
 
 
+
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, ClassVar, Dict, Iterable, List, Mapping, Optional, Tuple
+from weakref import WeakSet
 
 
 from common.utils.tracing import attach_correlation, current_correlation_id
@@ -31,6 +36,7 @@ from services.secrets.secure_secrets import (
 )
 
 from services.common.config import (
+
     TimescaleSession,
     get_feast_client,
     get_redis_client,
@@ -39,6 +45,19 @@ from services.common.config import (
     get_timescale_session,
 )
 from services.universe.repository import UniverseRepository
+
+try:  # pragma: no cover - psycopg may be unavailable in minimal environments
+    import psycopg
+    from psycopg.rows import dict_row
+except Exception:  # pragma: no cover - allow unit tests without psycopg dependency
+    psycopg = None  # type: ignore[assignment]
+    dict_row = None  # type: ignore[assignment]
+
+if psycopg is not None:  # pragma: no cover - executed when psycopg available
+    PsycopgError = psycopg.Error
+else:  # pragma: no cover - fallback for type checkers when psycopg missing
+    class PsycopgError(Exception):
+        pass
 
 try:
     from feast import FeatureStore
@@ -62,16 +81,6 @@ def _mask_secret(value: str) -> str:
     return f"{value[:2]}{'*' * (len(value) - 4)}{value[-2:]}"
 
 
-_DB_ROOT = Path(tempfile.gettempdir()) / "aether_timescale"
-
-
-def _ensure_db_root() -> None:
-    try:
-        _DB_ROOT.mkdir(parents=True, exist_ok=True)
-    except Exception:  # pragma: no cover - directory creation failures should not crash tests
-        logging.getLogger(__name__).exception("Failed to ensure Timescale adapter DB directory")
-
-
 def _sanitize_identifier(raw: str) -> str:
     value = raw.strip().lower().replace("-", "_")
     sanitized = "".join(ch for ch in value if ch.isalnum() or ch == "_")
@@ -80,15 +89,6 @@ def _sanitize_identifier(raw: str) -> str:
     if sanitized[0].isdigit():
         sanitized = f"acct_{sanitized}"
     return sanitized
-
-
-def _database_path(*, dsn: str, schema: str) -> Path:
-    _ensure_db_root()
-    key = f"{dsn}|{schema}"
-    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()
-    return _DB_ROOT / f"{digest}.db"
-
-
 def _isoformat(ts: datetime) -> str:
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
@@ -96,6 +96,10 @@ def _isoformat(ts: datetime) -> str:
 
 
 def _deserialize_timestamp(raw: str) -> datetime:
+    if isinstance(raw, datetime):
+        if raw.tzinfo is None:
+            return raw.replace(tzinfo=timezone.utc)
+        return raw.astimezone(timezone.utc)
     try:
         return datetime.fromisoformat(raw)
     except ValueError:  # pragma: no cover - defensive guard for malformed data
@@ -116,6 +120,8 @@ def _json_dumps(payload: Mapping[str, Any]) -> str:
 
 
 def _json_loads(raw: str) -> Dict[str, Any]:
+    if isinstance(raw, Mapping):
+        return dict(raw)
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
@@ -125,16 +131,20 @@ def _json_loads(raw: str) -> Dict[str, Any]:
     return {"value": data}
 
 
+def _require_psycopg() -> None:
+    if psycopg is None:  # pragma: no cover - executed only when psycopg is absent
+        raise RuntimeError(
+            "psycopg is required for Timescale persistence but is not installed in this environment."
+        )
+
+
 @dataclass
 class _TimescaleConnectionState:
-    connection: sqlite3.Connection
+    connection: "psycopg.Connection[Any]"
     lock: threading.RLock
     tables: Dict[str, str]
-    pending_counts: Dict[str, int] = field(default_factory=dict)
-    dirty: bool = False
-    dsn: str = ""
-    schema: str = ""
-    path: Path | None = None
+    dsn: str
+    schema: str
 
 
 class PublishError(RuntimeError):
@@ -156,82 +166,89 @@ def _as_base_url(endpoint: str) -> str:
 
 
 class _TimescaleStore:
-    """Lightweight persistence layer backed by sqlite for Timescale-like data."""
+    """Lightweight persistence layer backed by TimescaleDB/PostgreSQL."""
 
     _lock: ClassVar[threading.Lock] = threading.Lock()
     _connections: ClassVar[Dict[str, _TimescaleConnectionState]] = {}
     _TABLE_DEFINITIONS: ClassVar[Dict[str, str]] = {
-        "acks": """
-            CREATE TABLE IF NOT EXISTS {table} (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                recorded_at TEXT NOT NULL,
-                payload TEXT NOT NULL
-            )
-        """.strip(),
-        "fills": """
-            CREATE TABLE IF NOT EXISTS {table} (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                recorded_at TEXT NOT NULL,
-                payload TEXT NOT NULL
-            )
-        """.strip(),
-        "shadow_fills": """
-            CREATE TABLE IF NOT EXISTS {table} (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                recorded_at TEXT NOT NULL,
-                payload TEXT NOT NULL
-            )
-        """.strip(),
-        "events": """
-            CREATE TABLE IF NOT EXISTS {table} (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_type TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                recorded_at TEXT NOT NULL
-            )
-        """.strip(),
-        "telemetry": """
-            CREATE TABLE IF NOT EXISTS {table} (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                order_id TEXT,
-                payload TEXT NOT NULL,
-                recorded_at TEXT NOT NULL
-            )
-        """.strip(),
-        "audit_logs": """
-            CREATE TABLE IF NOT EXISTS {table} (
-                id TEXT PRIMARY KEY,
-                payload TEXT NOT NULL,
-                recorded_at TEXT NOT NULL
-            )
-        """.strip(),
-        "credential_events": """
-            CREATE TABLE IF NOT EXISTS {table} (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                secret_name TEXT,
-                metadata TEXT NOT NULL,
-                recorded_at TEXT NOT NULL
-            )
-        """.strip(),
-        "credential_rotations": """
-            CREATE TABLE IF NOT EXISTS {table} (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                secret_name TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                rotated_at TEXT NOT NULL,
-                kms_key_id TEXT
-            )
-        """.strip(),
+    "acks": """
+        CREATE TABLE IF NOT EXISTS {table} (
+            id BIGSERIAL PRIMARY KEY,
+            recorded_at TIMESTAMPTZ NOT NULL,
+            payload JSONB NOT NULL
+        )
+    """.strip(),
+    "fills": """
+        CREATE TABLE IF NOT EXISTS {table} (
+            id BIGSERIAL PRIMARY KEY,
+            recorded_at TIMESTAMPTZ NOT NULL,
+            payload JSONB NOT NULL
+        )
+    """.strip(),
+    "shadow_fills": """
+        CREATE TABLE IF NOT EXISTS {table} (
+            id BIGSERIAL PRIMARY KEY,
+            recorded_at TIMESTAMPTZ NOT NULL,
+            payload JSONB NOT NULL
+        )
+    """.strip(),
+    "events": """
+        CREATE TABLE IF NOT EXISTS {table} (
+            id BIGSERIAL PRIMARY KEY,
+            event_type TEXT NOT NULL,
+            payload JSONB NOT NULL,
+            recorded_at TIMESTAMPTZ NOT NULL
+        )
+    """.strip(),
+    "telemetry": """
+        CREATE TABLE IF NOT EXISTS {table} (
+            id BIGSERIAL PRIMARY KEY,
+            order_id TEXT,
+            payload JSONB NOT NULL,
+            recorded_at TIMESTAMPTZ NOT NULL
+        )
+    """.strip(),
+    "audit_logs": """
+        CREATE TABLE IF NOT EXISTS {table} (
+            id TEXT PRIMARY KEY,
+            payload JSONB NOT NULL,
+            recorded_at TIMESTAMPTZ NOT NULL
+        )
+    """.strip(),
+    "credential_events": """
+        CREATE TABLE IF NOT EXISTS {table} (
+            id BIGSERIAL PRIMARY KEY,
+            event TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            secret_name TEXT,
+            metadata JSONB NOT NULL,
+            recorded_at TIMESTAMPTZ NOT NULL
+        )
+    """.strip(),
+    "credential_rotations": """
+        CREATE TABLE IF NOT EXISTS {table} (
+            id BIGSERIAL PRIMARY KEY,
+            secret_name TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL,
+            rotated_at TIMESTAMPTZ NOT NULL,
+            kms_key_id TEXT
+        )
+    """.strip(),
         "risk_configs": """
-            CREATE TABLE IF NOT EXISTS {table} (
-                account_id TEXT PRIMARY KEY,
-                config TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-        """.strip(),
+        CREATE TABLE IF NOT EXISTS {table} (
+            account_id TEXT PRIMARY KEY,
+            config JSONB NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL
+        )
+    """.strip(),
     }
+    _HYPER_TABLES: ClassVar[Tuple[str, ...]] = (
+        "acks",
+        "fills",
+        "shadow_fills",
+        "events",
+        "telemetry",
+    )
 
     def __init__(
         self,
@@ -262,43 +279,61 @@ class _TimescaleStore:
             return state
 
     def _create_connection_state(self, session: "TimescaleSession") -> _TimescaleConnectionState:
-        path = _database_path(dsn=session.dsn, schema=session.account_schema)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(
-            path,
-            detect_types=sqlite3.PARSE_DECLTYPES,
-            check_same_thread=False,
-        )
-        connection.row_factory = sqlite3.Row
-        try:
-            connection.execute("PRAGMA journal_mode=WAL")
-        except sqlite3.DatabaseError:
-            logger.debug("journal_mode WAL unsupported on this sqlite build")
-        prefix = _sanitize_identifier(session.account_schema or self.account_id)
-        tables = {name: f'"{prefix}_{name}"' for name in self._TABLE_DEFINITIONS}
+        _require_psycopg()
+        schema = session.account_schema or f"acct_{self.account_id}"
+        normalized_schema = _sanitize_identifier(schema)
+        connection = self._open_connection(session.dsn, normalized_schema)
+        tables = {
+            name: f'"{normalized_schema}"."{name}"' for name in self._TABLE_DEFINITIONS
+        }
         state = _TimescaleConnectionState(
             connection=connection,
             lock=threading.RLock(),
             tables=tables,
             dsn=session.dsn,
-            schema=session.account_schema,
-            path=path,
+            schema=normalized_schema,
         )
         self._initialize_schema(state)
         return state
 
+    @staticmethod
+    def _open_connection(
+        dsn: str, schema: str
+    ) -> "psycopg.Connection[Any]":  # pragma: no cover - requires psycopg
+        connection = psycopg.connect(dsn)
+        connection.autocommit = True
+        if dict_row is not None:
+            connection.row_factory = dict_row
+        with connection.cursor() as cursor:
+            cursor.execute("SET TIME ZONE 'UTC'")
+            cursor.execute(f'SET search_path TO "{schema}", public')
+        return connection
+
     def _initialize_schema(self, state: _TimescaleConnectionState) -> None:
         with state.lock:
-            for name, ddl in self._TABLE_DEFINITIONS.items():
-                table = state.tables[name]
-                state.connection.execute(ddl.format(table=table))
-            state.connection.commit()
-            state.pending_counts.clear()
-            state.dirty = False
+            conn = state.connection
+            with conn.cursor() as cursor:
+                cursor.execute(f'CREATE SCHEMA IF NOT EXISTS "{state.schema}"')
+                try:
+                    cursor.execute("CREATE EXTENSION IF NOT EXISTS timescaledb")
+                except Exception:  # pragma: no cover - extension may require elevated privileges
+                    logger.debug("Unable to ensure timescaledb extension is installed", exc_info=True)
+                for name, ddl in self._TABLE_DEFINITIONS.items():
+                    table = state.tables[name]
+                    cursor.execute(ddl.format(table=table))
+                for name in self._HYPER_TABLES:
+                    qualified = f"{state.schema}.{name}"
+                    try:
+                        cursor.execute(
+                            "SELECT create_hypertable(%s, 'recorded_at', if_not_exists => TRUE, migrate_data => TRUE)",
+                            (qualified,),
+                        )
+                    except Exception:  # pragma: no cover - tolerate missing extension
+                        logger.debug("create_hypertable call failed", exc_info=True)
 
     def _with_retry(
         self,
-        operation: Callable[[sqlite3.Connection], Any],
+        operation: Callable[["psycopg.Connection[Any]"], Any],
         *,
         state: _TimescaleConnectionState | None = None,
     ) -> Any:
@@ -307,87 +342,85 @@ class _TimescaleStore:
         for attempt in range(1, self._max_retries + 1):
             try:
                 with active_state.lock:
-                    return operation(active_state.connection)
-            except sqlite3.OperationalError as exc:
+                    connection = active_state.connection
+                    if getattr(connection, "closed", False):
+                        connection = self._open_connection(active_state.dsn, active_state.schema)
+                        active_state.connection = connection
+                    return operation(connection)
+            except (PsycopgError, AttributeError) as exc:
                 if attempt == self._max_retries:
                     raise RuntimeError("Timescale storage operation failed") from exc
                 time.sleep(delay)
                 delay *= 2
 
-    def _mark_pending(
+    def _execute(
         self,
-        bucket: str,
+        connection: "psycopg.Connection[Any]",
+        sql: str,
+        params: Tuple[Any, ...] | None = None,
         *,
-        count: int = 1,
-        state: _TimescaleConnectionState | None = None,
-    ) -> None:
-        active_state = state or self._state
-        current = active_state.pending_counts.get(bucket, 0)
-        active_state.pending_counts[bucket] = current + count
-        active_state.dirty = True
+        fetch: str | None = None,
+    ) -> Any:
+        with connection.cursor() as cursor:
+            cursor.execute(sql, params)
+            if fetch == "all":
+                return cursor.fetchall()
+            if fetch == "one":
+                return cursor.fetchone()
+            return None
 
     # ------------------------------------------------------------------
     # Insert helpers
     # ------------------------------------------------------------------
     def record_ack(self, payload: Mapping[str, Any]) -> None:
-        recorded_at = _isoformat(datetime.now(timezone.utc))
+        recorded_at = datetime.now(timezone.utc)
         table = self._state.tables["acks"]
-        self._with_retry(
-            lambda conn: conn.execute(
-                f"INSERT INTO {table} (recorded_at, payload) VALUES (?, ?)",
-                (recorded_at, _json_dumps(dict(payload))),
-            )
-        )
-        self._mark_pending("acks")
+        payload_json = _json_dumps(dict(payload))
+        sql = f"INSERT INTO {table} (recorded_at, payload) VALUES (%s, %s::jsonb)"
+        self._with_retry(lambda conn: self._execute(conn, sql, (recorded_at, payload_json)))
 
     def record_fill(self, payload: Mapping[str, Any], *, shadow: bool = False) -> None:
-        recorded_at = _isoformat(datetime.now(timezone.utc))
+        recorded_at = datetime.now(timezone.utc)
         table_key = "shadow_fills" if shadow else "fills"
         table = self._state.tables[table_key]
-        self._with_retry(
-            lambda conn: conn.execute(
-                f"INSERT INTO {table} (recorded_at, payload) VALUES (?, ?)",
-                (recorded_at, _json_dumps(dict(payload))),
-            )
-        )
-        self._mark_pending(table_key)
+        payload_json = _json_dumps(dict(payload))
+        sql = f"INSERT INTO {table} (recorded_at, payload) VALUES (%s, %s::jsonb)"
+        self._with_retry(lambda conn: self._execute(conn, sql, (recorded_at, payload_json)))
 
     def record_event(self, event_type: str, payload: Mapping[str, Any]) -> None:
-        timestamp = _isoformat(datetime.now(timezone.utc))
+        timestamp = datetime.now(timezone.utc)
         table = self._state.tables["events"]
-        self._with_retry(
-            lambda conn: conn.execute(
-                f"INSERT INTO {table} (event_type, payload, recorded_at) VALUES (?, ?, ?)",
-                (event_type, _json_dumps(dict(payload)), timestamp),
-            )
+        payload_json = _json_dumps(dict(payload))
+        sql = (
+            f"INSERT INTO {table} (event_type, payload, recorded_at) VALUES (%s, %s::jsonb, %s)"
         )
-        self._mark_pending("events")
+        self._with_retry(
+            lambda conn: self._execute(conn, sql, (event_type, payload_json, timestamp))
+        )
 
     def record_audit_log(self, record: Mapping[str, Any]) -> None:
         stored = dict(record)
         entry_id = stored.setdefault("id", str(uuid.uuid4()))
-        created_at = _isoformat(
-            stored.setdefault("created_at", datetime.now(timezone.utc))
-        )
+        created_at = stored.setdefault("created_at", datetime.now(timezone.utc))
         table = self._state.tables["audit_logs"]
-        self._with_retry(
-            lambda conn: conn.execute(
-                f"INSERT OR REPLACE INTO {table} (id, payload, recorded_at) VALUES (?, ?, ?)",
-                (str(entry_id), _json_dumps(stored), created_at),
-            )
+        payload_json = _json_dumps(stored)
+        sql = (
+            f"INSERT INTO {table} (id, payload, recorded_at) VALUES (%s, %s::jsonb, %s)"
+            " ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload,"
+            " recorded_at = EXCLUDED.recorded_at"
         )
-        self._mark_pending("audit_logs")
+        self._with_retry(
+            lambda conn: self._execute(conn, sql, (str(entry_id), payload_json, created_at))
+        )
 
     def record_decision(self, order_id: str, payload: Mapping[str, Any]) -> None:
         table = self._state.tables["telemetry"]
-        recorded_at = _isoformat(datetime.now(timezone.utc))
+        recorded_at = datetime.now(timezone.utc)
+        payload_json = _json_dumps(dict(payload))
+        sql = f"INSERT INTO {table} (order_id, payload, recorded_at) VALUES (%s, %s::jsonb, %s)"
         self._with_retry(
-            lambda conn: conn.execute(
-                f"INSERT INTO {table} (order_id, payload, recorded_at) VALUES (?, ?, ?)",
-                (order_id, _json_dumps(dict(payload)), recorded_at),
-            )
+            lambda conn: self._execute(conn, sql, (order_id, payload_json, recorded_at))
         )
-        self._mark_pending("telemetry")
 
     def record_credential_event(
         self,
@@ -399,20 +432,18 @@ class _TimescaleStore:
         recorded_at: datetime,
     ) -> None:
         table = self._state.tables["credential_events"]
+        metadata_json = _json_dumps(dict(metadata))
+        sql = (
+            f"INSERT INTO {table} (event, event_type, secret_name, metadata, recorded_at)"
+            " VALUES (%s, %s, %s, %s::jsonb, %s)"
+        )
         self._with_retry(
-            lambda conn: conn.execute(
-                f"INSERT INTO {table} (event, event_type, secret_name, metadata, recorded_at)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (
-                    event,
-                    event_type,
-                    secret_name,
-                    _json_dumps(dict(metadata)),
-                    _isoformat(recorded_at),
-                ),
+            lambda conn: self._execute(
+                conn,
+                sql,
+                (event, event_type, secret_name, metadata_json, recorded_at),
             )
         )
-        self._mark_pending("credential_events")
 
     def upsert_credential_rotation(
         self,
@@ -430,34 +461,31 @@ class _TimescaleStore:
         if kms_key_id is not None:
             metadata["kms_key_id"] = kms_key_id
         table = self._state.tables["credential_rotations"]
-        self._with_retry(
-            lambda conn: conn.execute(
-                f"INSERT INTO {table} (secret_name, created_at, rotated_at, kms_key_id)"
-                " VALUES (?, ?, ?, ?)",
-                (
-                    secret_name,
-                    _isoformat(created_at),
-                    _isoformat(rotated_at),
-                    kms_key_id,
-                ),
-            )
+        sql = (
+            f"INSERT INTO {table} (secret_name, created_at, rotated_at, kms_key_id)"
+            " VALUES (%s, %s, %s, %s)"
         )
-        self._mark_pending("credential_rotations")
+        self._with_retry(
+            lambda conn: self._execute(conn, sql, (secret_name, created_at, rotated_at, kms_key_id))
+        )
         return metadata
 
     def upsert_risk_config(self, config: Mapping[str, Any]) -> None:
         table = self._state.tables["risk_configs"]
         payload = _json_dumps(dict(config))
-        updated_at = _isoformat(datetime.now(timezone.utc))
+        updated_at = datetime.now(timezone.utc)
+        sql = (
+            f"INSERT INTO {table} (account_id, config, updated_at) VALUES (%s, %s::jsonb, %s)"
+            " ON CONFLICT(account_id) DO UPDATE SET config=EXCLUDED.config,"
+            " updated_at=EXCLUDED.updated_at"
+        )
         self._with_retry(
-            lambda conn: conn.execute(
-                f"INSERT INTO {table} (account_id, config, updated_at) VALUES (?, ?, ?)"
-                " ON CONFLICT(account_id) DO UPDATE SET config=excluded.config,"
-                " updated_at=excluded.updated_at",
+            lambda conn: self._execute(
+                conn,
+                sql,
                 (self.account_id, payload, updated_at),
             )
         )
-        self._mark_pending("risk_configs")
 
     # ------------------------------------------------------------------
     # Query helpers
@@ -465,10 +493,13 @@ class _TimescaleStore:
     def fetch_events(self) -> Dict[str, List[Dict[str, Any]]]:
         state = self._state
 
-        def _rows(table_key: str, columns: str) -> List[sqlite3.Row]:
+        def _rows(table_key: str, columns: str) -> List[Mapping[str, Any]]:
             table = state.tables[table_key]
             sql = f"SELECT {columns} FROM {table} ORDER BY id ASC"
-            return self._with_retry(lambda conn: conn.execute(sql).fetchall(), state=state)
+            rows = self._with_retry(
+                lambda conn: self._execute(conn, sql, fetch="all"), state=state
+            )
+            return list(rows or [])
 
         acks = [
             {
@@ -506,9 +537,9 @@ class _TimescaleStore:
             created_at = metadata.get("created_at")
             rotated_at = metadata.get("rotated_at")
             if created_at is not None:
-                metadata["created_at"] = _deserialize_timestamp(str(created_at))
+                metadata["created_at"] = _deserialize_timestamp(created_at)
             if rotated_at is not None:
-                metadata["rotated_at"] = _deserialize_timestamp(str(rotated_at))
+                metadata["rotated_at"] = _deserialize_timestamp(rotated_at)
             metadata["timestamp"] = _deserialize_timestamp(row["recorded_at"])
             rotation_events.append(metadata)
 
@@ -522,11 +553,8 @@ class _TimescaleStore:
 
     def fetch_telemetry(self) -> List[Dict[str, Any]]:
         table = self._state.tables["telemetry"]
-        rows = self._with_retry(
-            lambda conn: conn.execute(
-                f"SELECT order_id, payload, recorded_at FROM {table} ORDER BY id ASC"
-            ).fetchall()
-        )
+        sql = f"SELECT order_id, payload, recorded_at FROM {table} ORDER BY id DESC LIMIT 250"
+        rows = self._with_retry(lambda conn: self._execute(conn, sql, fetch="all"))
         return [
             {
                 "order_id": row["order_id"],
@@ -538,11 +566,8 @@ class _TimescaleStore:
 
     def fetch_audit_logs(self) -> List[Dict[str, Any]]:
         table = self._state.tables["audit_logs"]
-        rows = self._with_retry(
-            lambda conn: conn.execute(
-                f"SELECT id, payload, recorded_at FROM {table} ORDER BY recorded_at ASC"
-            ).fetchall()
-        )
+        sql = f"SELECT id, payload, recorded_at FROM {table} ORDER BY recorded_at ASC"
+        rows = self._with_retry(lambda conn: self._execute(conn, sql, fetch="all"))
         results: List[Dict[str, Any]] = []
         for row in rows:
             payload = _json_loads(row["payload"])
@@ -551,18 +576,20 @@ class _TimescaleStore:
             results.append(payload)
         return results
 
-    def _fetch_credential_events(self, event: str | None = None) -> List[sqlite3.Row]:
+    def _fetch_credential_events(self, event: str | None = None) -> List[Mapping[str, Any]]:
         table = self._state.tables["credential_events"]
         if event is None:
             sql = f"SELECT event, event_type, secret_name, metadata, recorded_at FROM {table} ORDER BY id ASC"
-            return self._with_retry(lambda conn: conn.execute(sql).fetchall())
+            rows = self._with_retry(lambda conn: self._execute(conn, sql, fetch="all"))
+            return list(rows or [])
         sql = (
             f"SELECT event, event_type, secret_name, metadata, recorded_at FROM {table}"
-            " WHERE event = ? ORDER BY id ASC"
+            " WHERE event = %s ORDER BY id ASC"
         )
-        return self._with_retry(
-            lambda conn: conn.execute(sql, (event,)).fetchall()
+        rows = self._with_retry(
+            lambda conn: self._execute(conn, sql, (event,), fetch="all")
         )
+        return list(rows or [])
 
     def fetch_credential_events(self) -> List[Dict[str, Any]]:
         rows = self._fetch_credential_events(None)
@@ -572,9 +599,9 @@ class _TimescaleStore:
             created_at = metadata.get("created_at")
             rotated_at = metadata.get("rotated_at")
             if created_at is not None:
-                metadata["created_at"] = _deserialize_timestamp(str(created_at))
+                metadata["created_at"] = _deserialize_timestamp(created_at)
             if rotated_at is not None:
-                metadata["rotated_at"] = _deserialize_timestamp(str(rotated_at))
+                metadata["rotated_at"] = _deserialize_timestamp(rotated_at)
             results.append(
                 {
                     "event": row["event"],
@@ -588,12 +615,11 @@ class _TimescaleStore:
 
     def fetch_rotation_status(self) -> Dict[str, Any] | None:
         table = self._state.tables["credential_rotations"]
-        row = self._with_retry(
-            lambda conn: conn.execute(
-                f"SELECT secret_name, created_at, rotated_at, kms_key_id"
-                f" FROM {table} ORDER BY rotated_at DESC LIMIT 1"
-            ).fetchone()
+        sql = (
+            f"SELECT secret_name, created_at, rotated_at, kms_key_id"
+            f" FROM {table} ORDER BY rotated_at DESC LIMIT 1"
         )
+        row = self._with_retry(lambda conn: self._execute(conn, sql, fetch="one"))
         if row is None:
             return None
         payload: Dict[str, Any] = {
@@ -607,11 +633,9 @@ class _TimescaleStore:
 
     def fetch_risk_config(self, default: Mapping[str, Any]) -> Dict[str, Any]:
         table = self._state.tables["risk_configs"]
+        sql = f"SELECT config FROM {table} WHERE account_id = %s"
         row = self._with_retry(
-            lambda conn: conn.execute(
-                f"SELECT config FROM {table} WHERE account_id = ?",
-                (self.account_id,),
-            ).fetchone()
+            lambda conn: self._execute(conn, sql, (self.account_id,), fetch="one")
         )
         if row is None:
             self.upsert_risk_config(default)
@@ -625,33 +649,19 @@ class _TimescaleStore:
     def clear_rotation_state(self) -> None:
         rotation_table = self._state.tables["credential_rotations"]
         events_table = self._state.tables["credential_events"]
-        self._with_retry(lambda conn: conn.execute(f"DELETE FROM {rotation_table}"))
+        self._with_retry(lambda conn: self._execute(conn, f"DELETE FROM {rotation_table}"))
         self._with_retry(
-            lambda conn: conn.execute(
-                f"DELETE FROM {events_table} WHERE event = ?",
+            lambda conn: self._execute(
+                conn,
+                f"DELETE FROM {events_table} WHERE event = %s",
                 ("rotation",),
             )
         )
-        self._state.pending_counts.pop("credential_rotations", None)
-        self._state.pending_counts.pop("credential_events", None)
-        self._state.dirty = True
 
     @classmethod
     async def flush_all(cls) -> Dict[str, Dict[str, int]]:
         await asyncio.sleep(0)
-        summary: Dict[str, Dict[str, int]] = {}
-        with cls._lock:
-            items = list(cls._connections.items())
-        for account_id, state in items:
-            with state.lock:
-                if not state.dirty:
-                    continue
-                state.connection.commit()
-                if state.pending_counts:
-                    summary[account_id] = dict(state.pending_counts)
-                state.pending_counts.clear()
-                state.dirty = False
-        return summary
+        return {}
 
     @classmethod
     def clear_all_rotation_state(cls, account_id: str | None = None) -> None:
@@ -663,15 +673,12 @@ class _TimescaleStore:
             with state.lock:
                 rotation_table = state.tables["credential_rotations"]
                 events_table = state.tables["credential_events"]
-                state.connection.execute(f"DELETE FROM {rotation_table}")
-                state.connection.execute(
-                    f"DELETE FROM {events_table} WHERE event = ?",
+                cls._execute_static(state, f"DELETE FROM {rotation_table}")
+                cls._execute_static(
+                    state,
+                    f"DELETE FROM {events_table} WHERE event = %s",
                     ("rotation",),
                 )
-                state.connection.commit()
-                state.pending_counts.pop("credential_rotations", None)
-                state.pending_counts.pop("credential_events", None)
-                state.dirty = False
             return
 
         with cls._lock:
@@ -680,15 +687,12 @@ class _TimescaleStore:
             with state.lock:
                 rotation_table = state.tables["credential_rotations"]
                 events_table = state.tables["credential_events"]
-                state.connection.execute(f"DELETE FROM {rotation_table}")
-                state.connection.execute(
-                    f"DELETE FROM {events_table} WHERE event = ?",
+                cls._execute_static(state, f"DELETE FROM {rotation_table}")
+                cls._execute_static(
+                    state,
+                    f"DELETE FROM {events_table} WHERE event = %s",
                     ("rotation",),
                 )
-                state.connection.commit()
-                state.pending_counts.pop("credential_rotations", None)
-                state.pending_counts.pop("credential_events", None)
-                state.dirty = False
 
     @classmethod
     def reset_account(cls, account_id: str) -> None:
@@ -698,18 +702,11 @@ class _TimescaleStore:
             return
         with state.lock:
             for table in state.tables.values():
-                state.connection.execute(f"DELETE FROM {table}")
-            state.connection.commit()
-            state.pending_counts.clear()
-            state.dirty = False
+                cls._execute_static(state, f"DELETE FROM {table}")
         try:
             state.connection.close()
-        finally:
-            if state.path and state.path.exists():
-                try:
-                    state.path.unlink()
-                except FileNotFoundError:
-                    pass
+        except Exception:  # pragma: no cover - ensure cleanup continues
+            logger.debug("Error while closing Timescale connection", exc_info=True)
 
     @classmethod
     def reset_all(cls) -> None:
@@ -719,18 +716,22 @@ class _TimescaleStore:
         for account_id, state in states:
             with state.lock:
                 for table in state.tables.values():
-                    state.connection.execute(f"DELETE FROM {table}")
-                state.connection.commit()
-                state.pending_counts.clear()
-                state.dirty = False
+                    cls._execute_static(state, f"DELETE FROM {table}")
             try:
                 state.connection.close()
-            finally:
-                if state.path and state.path.exists():
-                    try:
-                        state.path.unlink()
-                    except FileNotFoundError:
-                        pass
+            except Exception:  # pragma: no cover - connection might already be closed
+                logger.debug("Error while closing Timescale connection", exc_info=True)
+
+    @classmethod
+    def _execute_static(
+        cls, state: _TimescaleConnectionState, sql: str, params: Tuple[Any, ...] | None = None
+    ) -> None:
+        connection = state.connection
+        if getattr(connection, "closed", False):
+            connection = cls._open_connection(state.dsn, state.schema)
+            state.connection = connection
+        with connection.cursor() as cursor:
+            cursor.execute(sql, params)
 
 @dataclass(eq=False)
 class KafkaNATSAdapter:

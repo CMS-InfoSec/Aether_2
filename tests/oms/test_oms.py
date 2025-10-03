@@ -141,8 +141,18 @@ def test_oms_place_authorized_accounts(client: TestClient) -> None:
         response = client.post("/oms/place", json=payload, headers={"X-Account-ID": account})
         assert response.status_code == 200
         data = response.json()
-        assert set(data.keys()) == {"accepted", "routed_venue", "fee"}
+        assert set(data.keys()) == {
+            "accepted",
+            "routed_venue",
+            "fee",
+            "exchange_order_id",
+            "kraken_status",
+            "errors",
+        }
         assert data["fee"] == payload["fee"]
+        assert data["exchange_order_id"] == "SIM-123"
+        assert data["kraken_status"] == "ok"
+        assert data["errors"] is None
 
 
 def test_oms_place_rejects_non_admin_account(client: TestClient) -> None:
