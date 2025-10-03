@@ -242,6 +242,57 @@ backendServices:
     pdb:
       enabled: true
       maxUnavailable: 1
+  override:
+    enabled: true
+    nameOverride: override-service
+    image:
+      repository: ghcr.io/aether/override-service
+      tag: latest
+    replicaCount: 2
+    containerPort: 8000
+    env:
+      - name: OVERRIDE_DATABASE_URL
+        valueFrom:
+          secretKeyRef:
+            name: override-service-database
+            key: dsn
+      - name: OVERRIDE_DB_SSLMODE
+        valueFrom:
+          secretKeyRef:
+            name: override-service-database
+            key: sslmode
+    usesKrakenSecrets: false
+    extraVolumeMounts: []
+    extraVolumes: []
+    service:
+      port: 80
+      targetPort: http
+    ingress:
+      enabled: true
+      host: override.aether.example.com
+      tlsSecret: override-service-tls
+      annotations: {}
+    resources:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+      limits:
+        cpu: 400m
+        memory: 512Mi
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 4
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 60
+    pdb:
+      enabled: true
+      maxUnavailable: 1
   policy:
     enabled: true
     nameOverride: policy-service

@@ -6,7 +6,8 @@ import logging
 import os
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Iterable, List, Optional
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional
 
 from fastapi import Depends, FastAPI, Header, Query, Request, status
 from pydantic import BaseModel, Field
@@ -14,7 +15,26 @@ from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, s
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
-from services.common.security import require_admin_account
+try:  # pragma: no cover - support alternative namespace packages
+    from services.common.security import require_admin_account
+except ModuleNotFoundError:  # pragma: no cover - fallback when installed under package namespace
+    import importlib.util
+    import sys
+
+    try:
+        from aether.services.common.security import require_admin_account
+    except ModuleNotFoundError:  # pragma: no cover - direct file import when running from source tree
+        ROOT = Path(__file__).resolve().parent
+        spec = importlib.util.spec_from_file_location(
+            "override_service._security",
+            ROOT / "services" / "common" / "security.py",
+        )
+        if spec is None or spec.loader is None:  # pragma: no cover - defensive
+            raise
+        security_module = importlib.util.module_from_spec(spec)
+        sys.modules.setdefault("override_service._security", security_module)
+        spec.loader.exec_module(security_module)
+        require_admin_account = getattr(security_module, "require_admin_account")
 
 try:  # pragma: no cover - import guarded for optional dependency
     from common.utils.audit_logger import hash_ip, log_audit
@@ -27,6 +47,13 @@ except Exception:  # pragma: no cover - degrade gracefully if audit logger unava
 
 LOGGER = logging.getLogger("override_service")
 
+_DATABASE_URL_ENV = "OVERRIDE_DATABASE_URL"
+_SSL_MODE_ENV = "OVERRIDE_DB_SSLMODE"
+_POOL_SIZE_ENV = "OVERRIDE_DB_POOL_SIZE"
+_MAX_OVERFLOW_ENV = "OVERRIDE_DB_MAX_OVERFLOW"
+_POOL_TIMEOUT_ENV = "OVERRIDE_DB_POOL_TIMEOUT"
+_POOL_RECYCLE_ENV = "OVERRIDE_DB_POOL_RECYCLE"
+
 
 Base = declarative_base()
 
@@ -36,14 +63,48 @@ class OverrideDecision(str, Enum):
     REJECT = "reject"
 
 
-def _database_url() -> str:
-    return os.getenv("OVERRIDE_DATABASE_URL", "sqlite:///./override.db")
+def _require_database_url() -> str:
+    """Return the configured Postgres/Timescale database URL."""
+
+    raw_url = os.getenv(_DATABASE_URL_ENV)
+    if not raw_url:
+        raise RuntimeError(
+            "OVERRIDE_DATABASE_URL must be set and point to the shared TimescaleDB cluster."
+        )
+
+    normalized = raw_url.lower()
+    if normalized.startswith("postgres://"):
+        raw_url = "postgresql://" + raw_url.split("://", 1)[1]
+        normalized = raw_url.lower()
+
+    allowed_prefixes = (
+        "postgresql://",
+        "postgresql+psycopg://",
+        "postgresql+psycopg2://",
+    )
+    if not normalized.startswith(allowed_prefixes):
+        raise RuntimeError(
+            "OVERRIDE_DATABASE_URL must use a PostgreSQL-compatible driver (e.g. postgresql://)."
+        )
+
+    return raw_url
 
 
 def _engine() -> Engine:
-    url = _database_url()
-    connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
-    return create_engine(url, future=True, connect_args=connect_args)
+    url = _require_database_url()
+    connect_args: Dict[str, object] = {
+        "sslmode": os.getenv(_SSL_MODE_ENV, "require"),
+    }
+    engine_kwargs: Dict[str, object] = {
+        "future": True,
+        "pool_pre_ping": True,
+        "pool_size": int(os.getenv(_POOL_SIZE_ENV, "10")),
+        "max_overflow": int(os.getenv(_MAX_OVERFLOW_ENV, "5")),
+        "pool_timeout": int(os.getenv(_POOL_TIMEOUT_ENV, "30")),
+        "pool_recycle": int(os.getenv(_POOL_RECYCLE_ENV, "1800")),
+        "connect_args": connect_args,
+    }
+    return create_engine(url, **engine_kwargs)
 
 
 ENGINE = _engine()
@@ -60,9 +121,6 @@ class OverrideLogEntry(Base):
     decision = Column(String, nullable=False)
     reason = Column(Text, nullable=False)
     ts = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), index=True)
-
-
-Base.metadata.create_all(bind=ENGINE)
 
 
 def get_session() -> Iterable[Session]:
