@@ -6,11 +6,12 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, ConfigDict, model_validator
-from sqlalchemy import Column, DateTime, Float, Integer, String, create_engine, text
+from sqlalchemy import Column, DateTime, Integer, Numeric, String, create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
@@ -50,6 +51,71 @@ ENGINE: Engine = create_engine(_DB_URL, **_engine_options(_DB_URL))
 SessionLocal = sessionmaker(bind=ENGINE, expire_on_commit=False, autoflush=False, future=True)
 
 
+_ZERO = Decimal("0")
+
+
+def _env_int(key: str, default: int) -> int:
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    try:
+        value = int(str(raw))
+    except (TypeError, ValueError):
+        LOGGER.warning("Invalid integer value for %s: %s", key, raw)
+        return default
+    return max(value, 0)
+
+
+def _decimal_quantizer(scale: int) -> Decimal:
+    if scale <= 0:
+        return Decimal("1")
+    return Decimal("1").scaleb(-scale)
+
+
+_PCT_SCALE = _env_int("ALLOCATOR_PCT_SCALE", 6)
+_NAV_SCALE = _env_int("ALLOCATOR_NAV_SCALE", 2)
+
+_PCT_QUANT = _decimal_quantizer(_PCT_SCALE)
+_NAV_QUANT = _decimal_quantizer(_NAV_SCALE)
+
+_EPSILON = Decimal("1e-9")
+
+
+def _quantize(value: Decimal, quant: Decimal) -> Decimal:
+    return value.quantize(quant, rounding=ROUND_HALF_EVEN)
+
+
+def _to_decimal(value: object, default: Decimal = _ZERO) -> Decimal:
+    if isinstance(value, Decimal):
+        return value
+    if value in (None, ""):
+        return default
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return default
+
+
+def _quantize_pct(value: Decimal) -> Decimal:
+    return _quantize(value, _PCT_QUANT)
+
+
+def _quantize_nav(value: Decimal) -> Decimal:
+    return _quantize(value, _NAV_QUANT)
+
+
+def _env_decimal(key: str, default: Decimal, quant: Decimal) -> Decimal:
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    try:
+        value = Decimal(str(raw))
+    except (InvalidOperation, ValueError):
+        LOGGER.warning("Invalid decimal value for %s: %s", key, raw)
+        return default
+    return _quantize(value, quant)
+
+
 class CapitalAllocation(Base):
     """Historical record of allocation decisions for an account."""
 
@@ -57,7 +123,7 @@ class CapitalAllocation(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     account_id = Column(String, nullable=False, index=True)
-    pct = Column(Float, nullable=False)
+    pct = Column(Numeric(18, _PCT_SCALE), nullable=False)
     ts = Column(DateTime(timezone=True), nullable=False, index=True)
 
 
@@ -67,46 +133,48 @@ Base.metadata.create_all(bind=ENGINE)
 @dataclass(slots=True)
 class AccountNavSnapshot:
     account_id: str
-    nav: float
-    drawdown: float
-    drawdown_limit: Optional[float]
+    nav: Decimal
+    drawdown: Decimal
+    drawdown_limit: Optional[Decimal]
     timestamp: Optional[datetime]
 
 
 @dataclass(slots=True)
 class AllocationDecision:
     account_id: str
-    nav: float
-    drawdown_ratio: float
-    drawdown_limit: float
-    requested_pct: float
-    final_pct: float
+    nav: Decimal
+    drawdown_ratio: Decimal
+    drawdown_limit: Decimal
+    requested_pct: Decimal
+    final_pct: Decimal
     throttled: bool
 
 
 class AllocationRequest(BaseModel):
-    allocations: Dict[str, float] = Field(
+    allocations: Dict[str, Decimal] = Field(
         default_factory=dict,
         description="Requested allocation percentages keyed by account identifier.",
     )
+
+    model_config = ConfigDict(json_schema_extra={"example": {"allocations": {"alpha": "0.25"}}})
 
     @model_validator(mode="after")
     def validate_totals(cls, model: "AllocationRequest") -> "AllocationRequest":
         if not model.allocations:
             raise ValueError("allocations payload cannot be empty")
-        total = sum(float(value) for value in model.allocations.values())
-        if total <= 0:
+        total = sum((Decimal(value) for value in model.allocations.values()), _ZERO)
+        if total <= _ZERO:
             raise ValueError("allocation percentages must sum to a positive value")
         return model
 
 
 class AllocatedAccount(BaseModel):
     account_id: str
-    nav: float = Field(0.0, ge=0.0)
-    allocation_pct: float = Field(0.0, ge=0.0)
-    allocated_nav: float = Field(0.0, ge=0.0)
-    drawdown_ratio: float = Field(0.0, ge=0.0)
-    drawdown_limit: float = Field(0.0, ge=0.0)
+    nav: Decimal = Field(_ZERO, ge=_ZERO)
+    allocation_pct: Decimal = Field(_ZERO, ge=_ZERO)
+    allocated_nav: Decimal = Field(_ZERO, ge=_ZERO)
+    drawdown_ratio: Decimal = Field(_ZERO, ge=_ZERO)
+    drawdown_limit: Decimal = Field(_ZERO, ge=_ZERO)
     throttled: bool = False
 
     model_config = ConfigDict(extra="ignore")
@@ -114,22 +182,11 @@ class AllocatedAccount(BaseModel):
 
 class AllocationResponse(BaseModel):
     timestamp: datetime
-    total_nav: float
-    requested_total_pct: float
-    allocated_total_pct: float
-    unallocated_pct: float
+    total_nav: Decimal
+    requested_total_pct: Decimal
+    allocated_total_pct: Decimal
+    unallocated_pct: Decimal
     accounts: List[AllocatedAccount]
-
-
-def _env_float(key: str, default: float) -> float:
-    raw = os.getenv(key)
-    if raw is None:
-        return default
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        LOGGER.warning("Invalid float value for %s: %s", key, raw)
-        return default
 
 
 def _parse_timestamp(value: object) -> Optional[datetime]:
@@ -167,21 +224,23 @@ def _load_latest_navs(session: Session) -> Dict[str, AccountNavSnapshot]:
 
     snapshots: Dict[str, AccountNavSnapshot] = {}
     try:
-        results = session.execute(query)
+        results = session.execute(query).mappings()
     except SQLAlchemyError as exc:
         LOGGER.error("Failed to query pnl_curves: %s", exc)
         raise HTTPException(status_code=503, detail="Unable to load NAV snapshots") from exc
 
     for row in results:
         account_id = str(row["account_id"])
-        nav = float(row["nav"] or 0.0)
-        drawdown = float(row["drawdown"] or 0.0)
+        nav = _quantize_nav(_to_decimal(row["nav"], _ZERO))
+        drawdown = _quantize_nav(_to_decimal(row["drawdown"], _ZERO))
         drawdown_limit = row["drawdown_limit"]
-        limit_value = float(drawdown_limit) if drawdown_limit not in (None, "") else None
+        limit_value = None
+        if drawdown_limit not in (None, ""):
+            limit_value = _quantize_nav(_to_decimal(drawdown_limit, _ZERO))
         snapshots[account_id] = AccountNavSnapshot(
             account_id=account_id,
-            nav=max(nav, 0.0),
-            drawdown=max(drawdown, 0.0),
+            nav=max(nav, _ZERO),
+            drawdown=max(drawdown, _ZERO),
             drawdown_limit=limit_value,
             timestamp=_parse_timestamp(row["event_ts"]),
         )
@@ -201,55 +260,81 @@ def _latest_allocation_snapshot(session: Session) -> Dict[str, float]:
         ON ca.account_id = latest.account_id AND ca.ts = latest.latest_ts
         """
     )
-    allocations: Dict[str, float] = {}
+    allocations: Dict[str, Decimal] = {}
     try:
-        for row in session.execute(query):
-            allocations[str(row["account_id"])] = float(row["pct"] or 0.0)
+        for row in session.execute(query).mappings():
+            allocations[str(row["account_id"])] = _quantize_pct(
+                _to_decimal(row["pct"], _ZERO)
+            )
     except SQLAlchemyError as exc:
         LOGGER.error("Failed to query capital allocation history: %s", exc)
         raise HTTPException(status_code=503, detail="Unable to load allocation history") from exc
     return allocations
 
 
-def _effective_drawdown_limit(snapshot: AccountNavSnapshot, default_ratio: float) -> Optional[float]:
-    if snapshot.drawdown_limit and snapshot.drawdown_limit > 0:
+def _effective_drawdown_limit(
+    snapshot: AccountNavSnapshot, default_ratio: Decimal
+) -> Optional[Decimal]:
+    ratio = _quantize_pct(default_ratio)
+    if snapshot.drawdown_limit is not None and snapshot.drawdown_limit > _ZERO:
         return snapshot.drawdown_limit
-    if snapshot.nav > 0 and default_ratio > 0:
-        return snapshot.nav * default_ratio
+    if snapshot.nav > _ZERO and ratio > _ZERO:
+        return _quantize_nav(snapshot.nav * ratio)
     return None
 
 
 def _apply_allocation_rules(
     navs: Mapping[str, AccountNavSnapshot],
-    requested: Mapping[str, float],
-) -> Tuple[Dict[str, AllocationDecision], float, float]:
-    threshold = _env_float("ALLOCATOR_DRAWDOWN_THRESHOLD", 0.85)
-    throttle_floor = _env_float("ALLOCATOR_MIN_THROTTLE_PCT", 0.0)
-    default_limit_ratio = _env_float("ALLOCATOR_DEFAULT_DRAWDOWN_LIMIT_PCT", 0.10)
+    requested: Mapping[str, Decimal],
+) -> Tuple[Dict[str, AllocationDecision], Decimal, Decimal]:
+    threshold = _env_decimal(
+        "ALLOCATOR_DRAWDOWN_THRESHOLD",
+        _quantize_pct(Decimal("0.85")),
+        _PCT_QUANT,
+    )
+    throttle_floor = _env_decimal(
+        "ALLOCATOR_MIN_THROTTLE_PCT",
+        _quantize_pct(Decimal("0.0")),
+        _PCT_QUANT,
+    )
+    default_limit_ratio = _env_decimal(
+        "ALLOCATOR_DEFAULT_DRAWDOWN_LIMIT_PCT",
+        _quantize_pct(Decimal("0.10")),
+        _PCT_QUANT,
+    )
 
-    if threshold <= 0:
-        threshold = 0.85
-    if throttle_floor < 0:
-        throttle_floor = 0.0
+    if threshold <= _ZERO:
+        threshold = _quantize_pct(Decimal("0.85"))
+    if throttle_floor < _ZERO:
+        throttle_floor = _quantize_pct(Decimal("0"))
 
     decisions: Dict[str, AllocationDecision] = {}
     accounts: Iterable[str] = set(navs.keys()) | set(requested.keys())
-    freed_total = 0.0
-    requested_total = 0.0
+    freed_total = _ZERO
+    requested_total = _ZERO
 
     for account_id in accounts:
         snapshot = navs.get(
             account_id,
-            AccountNavSnapshot(account_id=account_id, nav=0.0, drawdown=0.0, drawdown_limit=None, timestamp=None),
+            AccountNavSnapshot(
+                account_id=account_id,
+                nav=_ZERO,
+                drawdown=_ZERO,
+                drawdown_limit=None,
+                timestamp=None,
+            ),
         )
-        desired = float(requested.get(account_id, 0.0) or 0.0)
-        desired = max(desired, 0.0)
+        desired = requested.get(account_id, _ZERO) or _ZERO
+        desired = max(_quantize_pct(desired), _ZERO)
         requested_total += desired
 
         limit_value = _effective_drawdown_limit(snapshot, default_limit_ratio)
-        drawdown = max(snapshot.drawdown, 0.0)
-        ratio = drawdown / limit_value if limit_value and limit_value > 0 else 0.0
-        throttled = bool(snapshot.nav > 0 and ratio >= threshold)
+        drawdown = max(snapshot.drawdown, _ZERO)
+        if limit_value is not None and limit_value > _ZERO:
+            ratio = _quantize_pct(drawdown / limit_value)
+        else:
+            ratio = _ZERO
+        throttled = bool(snapshot.nav > _ZERO and ratio >= threshold)
 
         final_pct = desired
         if throttled and desired > throttle_floor:
@@ -258,66 +343,82 @@ def _apply_allocation_rules(
 
         decisions[account_id] = AllocationDecision(
             account_id=account_id,
-            nav=max(snapshot.nav, 0.0),
+            nav=max(snapshot.nav, _ZERO),
             drawdown_ratio=ratio,
-            drawdown_limit=float(limit_value) if limit_value else 0.0,
+            drawdown_limit=limit_value if limit_value else _ZERO,
             requested_pct=desired,
             final_pct=final_pct,
             throttled=throttled,
         )
 
     eligible: List[AllocationDecision] = [entry for entry in decisions.values() if not entry.throttled]
-    if freed_total > 0 and eligible:
+    if freed_total > _ZERO and eligible:
         weight = sum(entry.nav for entry in eligible)
-        if weight <= 0:
-            redistribution = freed_total / len(eligible)
+        if weight <= _ZERO:
+            redistribution = freed_total / Decimal(len(eligible))
             for entry in eligible:
-                entry.final_pct += redistribution
+                entry.final_pct = _quantize_pct(entry.final_pct + redistribution)
         else:
             for entry in eligible:
                 share = freed_total * (entry.nav / weight)
-                entry.final_pct += share
+                entry.final_pct = _quantize_pct(entry.final_pct + share)
 
     allocated_total = sum(entry.final_pct for entry in decisions.values())
     if (
-        requested_total > 0
-        and allocated_total > 0
-        and freed_total <= 1e-9
+        requested_total > _ZERO
+        and allocated_total > _ZERO
+        and freed_total <= _EPSILON
     ):
         scale = requested_total / allocated_total
         for entry in decisions.values():
-            entry.final_pct *= scale
+            entry.final_pct = _quantize_pct(entry.final_pct * scale)
         allocated_total = requested_total
 
-    unallocated = max(requested_total - allocated_total, 0.0)
+    unallocated = requested_total - allocated_total
+    if unallocated < _ZERO:
+        unallocated = _ZERO
+    unallocated = _quantize_pct(unallocated)
     return decisions, requested_total, unallocated
 
 
-def _build_response(decisions: Mapping[str, AllocationDecision], requested_total: float, unallocated_pct: float) -> AllocationResponse:
+def _build_response(
+    decisions: Mapping[str, AllocationDecision],
+    requested_total: Decimal,
+    unallocated_pct: Decimal,
+) -> AllocationResponse:
     timestamp = datetime.now(timezone.utc)
-    total_nav = sum(entry.nav for entry in decisions.values())
+    total_nav = _quantize_nav(sum(entry.nav for entry in decisions.values()))
     accounts: List[AllocatedAccount] = []
-    allocated_total = 0.0
-    allocation_base = total_nav if total_nav > 0 else 1.0
-    for entry in sorted(decisions.values(), key=lambda item: item.account_id):
-        allocated_total += entry.final_pct
+    allocated_total = _ZERO
+    allocation_base = total_nav if total_nav > _ZERO else Decimal("1")
+    sorted_decisions = sorted(decisions.values(), key=lambda item: item.account_id)
+    allocated_nav_sum = _ZERO
+    for index, entry in enumerate(sorted_decisions, start=1):
+        final_pct = _quantize_pct(entry.final_pct)
+        allocated_total += final_pct
+        if index == len(sorted_decisions):
+            allocated_nav = _quantize_nav(total_nav - allocated_nav_sum)
+        else:
+            allocated_nav = _quantize_nav(final_pct * allocation_base)
+            allocated_nav_sum += allocated_nav
         accounts.append(
             AllocatedAccount(
                 account_id=entry.account_id,
                 nav=entry.nav,
-                allocation_pct=entry.final_pct,
-                allocated_nav=entry.final_pct * allocation_base,
+                allocation_pct=final_pct,
+                allocated_nav=allocated_nav,
                 drawdown_ratio=entry.drawdown_ratio,
                 drawdown_limit=entry.drawdown_limit,
                 throttled=entry.throttled,
             )
         )
 
+    allocated_total = _quantize_pct(allocated_total)
     return AllocationResponse(
         timestamp=timestamp,
         total_nav=total_nav,
-        requested_total_pct=requested_total,
-        allocated_total_pct=allocated_total,
+        requested_total_pct=_quantize_pct(requested_total),
+        allocated_total_pct=_quantize_pct(allocated_total),
         unallocated_pct=unallocated_pct,
         accounts=accounts,
     )
