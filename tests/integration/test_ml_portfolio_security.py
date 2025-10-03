@@ -2,14 +2,36 @@
 
 from __future__ import annotations
 
+import importlib
+import importlib.util
+import os
+import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import pytest
 
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+services_init = ROOT / "services" / "__init__.py"
+spec = importlib.util.spec_from_file_location(
+    "services", services_init, submodule_search_locations=[str(services_init.parent)]
+)
+if spec is None or spec.loader is None:  # pragma: no cover - defensive guard
+    raise ImportError("Unable to load local services package for tests")
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+sys.modules["services"] = module
+
+os.environ.setdefault("AUTH_JWT_SECRET", "test-secret")
+os.environ.setdefault("AUTH_DATABASE_URL", "sqlite:///./test-auth-service.db")
+
 pytest.importorskip("fastapi", reason="fastapi is required for API integration tests")
 
 from fastapi.testclient import TestClient
+from auth_service import create_jwt
 
 
 def _issue_training_request(client: TestClient) -> Dict[str, Any]:
@@ -147,12 +169,6 @@ def test_training_bootstrap_populates_all_backends(monkeypatch: pytest.MonkeyPat
 @pytest.mark.integration
 def test_portfolio_positions_enforce_account_scopes(monkeypatch: pytest.MonkeyPatch) -> None:
     """JWT account scopes should gate access to portfolio positions."""
-
-    import os
-
-    from auth_service import create_jwt
-
-    os.environ.setdefault("AUTH_JWT_SECRET", "test-secret")
 
     try:
         import portfolio_service

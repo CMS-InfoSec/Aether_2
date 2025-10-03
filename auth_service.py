@@ -60,10 +60,11 @@ from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, HttpUrl
-from sqlalchemy import Boolean, Column, DateTime, String, create_engine
+from sqlalchemy import Boolean, Column, DateTime, MetaData, String, create_engine
+from sqlalchemy.engine import Engine
+from sqlalchemy.engine.url import make_url
 from sqlalchemy.orm import Session as OrmSession
 from sqlalchemy.orm import declarative_base, sessionmaker
-from sqlalchemy.pool import StaticPool
 
 from services.auth.jwt_tokens import create_jwt
 
@@ -89,19 +90,45 @@ JWT_SECRET = _require_env("AUTH_JWT_SECRET")
 # ---------------------------------------------------------------------------
 
 
+def _load_database_url() -> str:
+    url = _require_env("AUTH_DATABASE_URL")
+    if url == "sqlite:///./auth_sessions.db":
+        raise RuntimeError(
+            "AUTH_DATABASE_URL must point at the shared Postgres/Timescale cluster instead of the"
+            " legacy SQLite default"
+        )
+    return url
+
+
 def _engine_options(url: str) -> Dict[str, Any]:
-    options: Dict[str, Any] = {"future": True}
-    if url.startswith("sqlite://"):
-        options.setdefault("connect_args", {"check_same_thread": False})
-        if url.endswith(":memory:"):
-            options["poolclass"] = StaticPool
+    options: Dict[str, Any] = {"future": True, "pool_pre_ping": True}
+    sa_url = make_url(url)
+    if sa_url.get_backend_name().startswith("postgresql"):
+        options.update(
+            pool_size=int(os.getenv("AUTH_DATABASE_POOL_SIZE", "10")),
+            max_overflow=int(os.getenv("AUTH_DATABASE_MAX_OVERFLOW", "20")),
+            pool_timeout=int(os.getenv("AUTH_DATABASE_POOL_TIMEOUT_SECONDS", "30")),
+            pool_recycle=int(os.getenv("AUTH_DATABASE_POOL_RECYCLE_SECONDS", "300")),
+        )
+        sslmode = os.getenv("AUTH_DATABASE_SSLMODE", "require")
+        if sslmode and "sslmode" not in sa_url.query:
+            options["connect_args"] = {"sslmode": sslmode}
     return options
 
 
-DATABASE_URL = os.getenv("AUTH_DATABASE_URL", "sqlite:///./auth_sessions.db")
-ENGINE = create_engine(DATABASE_URL, **_engine_options(DATABASE_URL))
+def _metadata(url: str) -> MetaData:
+    sa_url = make_url(url)
+    if sa_url.get_backend_name().startswith("postgresql"):
+        schema = os.getenv("AUTH_DATABASE_SCHEMA", "auth")
+        if schema:
+            return MetaData(schema=schema)
+    return MetaData()
+
+
+DATABASE_URL = _load_database_url()
+ENGINE: Engine = create_engine(DATABASE_URL, **_engine_options(DATABASE_URL))
+Base = declarative_base(metadata=_metadata(DATABASE_URL))
 SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
-Base = declarative_base()
 
 
 class AuthSession(Base):

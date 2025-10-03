@@ -26,6 +26,8 @@ if str(ROOT) not in sys.path:
 _DEFAULT_MASTER_KEY = base64.b64encode(b"\x00" * 32).decode("ascii")
 os.environ.setdefault("SECRET_ENCRYPTION_KEY", _DEFAULT_MASTER_KEY)
 os.environ.setdefault("LOCAL_KMS_MASTER_KEY", _DEFAULT_MASTER_KEY)
+os.environ.setdefault("AUTH_JWT_SECRET", "unit-test-secret")
+os.environ.setdefault("AUTH_DATABASE_URL", "sqlite:////tmp/aether-auth-test.db")
 
 
 pytest_plugins = [
