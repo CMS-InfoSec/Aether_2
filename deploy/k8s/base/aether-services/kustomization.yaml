@@ -2,38 +2,46 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
-  - deployment-config.yaml
+
+  - deployment-auth.yaml
+
   - deployment-policy.yaml
   - deployment-risk.yaml
   - deployment-oms.yaml
   - deployment-fees.yaml
   - deployment-secrets.yaml
   - deployment-universe.yaml
-  - service-config.yaml
+
+  - service-auth.yaml
+
   - service-policy.yaml
   - service-risk.yaml
   - service-oms.yaml
   - service-fees.yaml
   - service-secrets.yaml
   - service-universe.yaml
+  - hpa-auth.yaml
   - hpa-policy.yaml
   - hpa-risk.yaml
   - hpa-oms.yaml
   - hpa-fees.yaml
   - hpa-secrets.yaml
   - hpa-universe.yaml
+  - networkpolicy-auth.yaml
   - networkpolicy-policy.yaml
   - networkpolicy-risk.yaml
   - networkpolicy-oms.yaml
   - networkpolicy-fees.yaml
   - networkpolicy-secrets.yaml
   - networkpolicy-universe.yaml
+  - ingress-auth.yaml
   - ingress-policy.yaml
   - ingress-risk.yaml
   - ingress-oms.yaml
   - ingress-fees.yaml
   - ingress-secrets.yaml
   - ingress-universe.yaml
+  - pdb-auth.yaml
   - pdb-policy.yaml
   - pdb-risk.yaml
   - pdb-oms.yaml

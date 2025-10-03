@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import itertools
 import importlib
+import importlib.util
 import json
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -82,9 +85,10 @@ def _decode_jwt_payload(token: str) -> dict[str, object]:
     return json.loads(decoded)
 
 
-def test_auth_service_requires_jwt_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_auth_service_requires_jwt_secret(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Importing the service without a configured secret should fail fast."""
 
+    monkeypatch.setenv("AUTH_DATABASE_URL", f"sqlite:///{tmp_path/'auth.db'}")
     monkeypatch.delenv("AUTH_JWT_SECRET", raising=False)
     _install_dependency_stubs(monkeypatch)
     _clear_auth_service_module()
@@ -95,11 +99,29 @@ def test_auth_service_requires_jwt_secret(monkeypatch: pytest.MonkeyPatch) -> No
     _clear_auth_service_module()
 
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+services_init = ROOT / "services" / "__init__.py"
+_services_spec = importlib.util.spec_from_file_location(
+    "services", services_init, submodule_search_locations=[str(services_init.parent)]
+)
+if _services_spec and _services_spec.loader:
+    _services_module = importlib.util.module_from_spec(_services_spec)
+    _services_spec.loader.exec_module(_services_module)
+    sys.modules["services"] = _services_module
+
+
 @pytest.fixture
-def auth_service(monkeypatch: pytest.MonkeyPatch):
+def auth_service(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory):
     """Load the auth_service module with a deterministic secret."""
 
-    def loader(secret: str = "test-secret"):
+    def loader(secret: str = "test-secret", database_url: str | None = None):
+        db_path = database_url
+        if db_path is None:
+            directory = tmp_path_factory.mktemp("auth-db")
+            db_path = f"sqlite:///{directory/'auth.db'}"
+        monkeypatch.setenv("AUTH_DATABASE_URL", db_path)
         monkeypatch.setenv("AUTH_JWT_SECRET", secret)
         _install_dependency_stubs(monkeypatch)
         _clear_auth_service_module()
@@ -174,3 +196,93 @@ def test_authenticate_emits_role_specific_token(
     claims = _decode_jwt_payload(response.access_token)
     assert claims["role"] == "auditor"
     assert claims["sub"] == "user@example.com"
+
+
+def test_auth_service_requires_database_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The service should fail fast if the shared database URL is missing or default."""
+
+    monkeypatch.delenv("AUTH_DATABASE_URL", raising=False)
+    monkeypatch.setenv("AUTH_JWT_SECRET", "test-secret")
+    _install_dependency_stubs(monkeypatch)
+    _clear_auth_service_module()
+
+    with pytest.raises(RuntimeError):
+        importlib.import_module("auth_service")
+
+    _clear_auth_service_module()
+    monkeypatch.setenv("AUTH_DATABASE_URL", "sqlite:///./auth_sessions.db")
+
+    with pytest.raises(RuntimeError):
+        importlib.import_module("auth_service")
+
+    _clear_auth_service_module()
+
+
+def test_sessions_shared_across_replicas(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory) -> None:
+    """Multiple replicas should persist sessions to the same database."""
+
+    db_path = tmp_path_factory.mktemp("auth-multi") / "sessions.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setenv("AUTH_DATABASE_URL", database_url)
+    monkeypatch.setenv("AUTH_JWT_SECRET", "shared-secret")
+    _install_dependency_stubs(monkeypatch)
+
+    _clear_auth_service_module()
+    replica_a = importlib.import_module("auth_service")
+    repo_a = replica_a.SessionRepository(replica_a.SessionLocal)
+    counter = itertools.count()
+
+    def deterministic_token(_: int = 32) -> str:
+        return f"token-{next(counter)}"
+
+    monkeypatch.setattr(replica_a.secrets, "token_urlsafe", deterministic_token, raising=False)
+    session_a = repo_a.create(user_id="shared@example.com", mfa_verified=True)
+
+    _clear_auth_service_module()
+    replica_b = importlib.import_module("auth_service")
+    monkeypatch.setattr(replica_b.secrets, "token_urlsafe", deterministic_token, raising=False)
+
+    with replica_b.SessionLocal() as session:
+        stored = session.get(replica_b.AuthSession, session_a.session_token)
+        assert stored is not None
+        assert stored.user_id == "shared@example.com"
+        assert stored.mfa_verified is True
+
+    repo_b = replica_b.SessionRepository(replica_b.SessionLocal)
+    session_b = repo_b.create(user_id="secondary@example.com", mfa_verified=False)
+
+    with replica_a.SessionLocal() as session:
+        fetched = session.get(replica_a.AuthSession, session_b.session_token)
+        assert fetched is not None
+        assert fetched.user_id == "secondary@example.com"
+        assert fetched.mfa_verified is False
+
+
+def test_session_tokens_survive_restart(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory) -> None:
+    """Session tokens should remain valid across pod restarts."""
+
+    db_path = tmp_path_factory.mktemp("auth-restart") / "sessions.db"
+    monkeypatch.setenv("AUTH_DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("AUTH_JWT_SECRET", "restart-secret")
+    _install_dependency_stubs(monkeypatch)
+
+    _clear_auth_service_module()
+    module = importlib.import_module("auth_service")
+    repo = module.SessionRepository(module.SessionLocal)
+    counter = itertools.count()
+
+    def deterministic_token(_: int = 32) -> str:
+        return f"token-{next(counter)}"
+
+    monkeypatch.setattr(module.secrets, "token_urlsafe", deterministic_token, raising=False)
+    record = repo.create(user_id="restart@example.com", mfa_verified=True)
+
+    _clear_auth_service_module()
+    restarted = importlib.import_module("auth_service")
+    monkeypatch.setattr(restarted.secrets, "token_urlsafe", deterministic_token, raising=False)
+
+    with restarted.SessionLocal() as session:
+        persisted = session.get(restarted.AuthSession, record.session_token)
+        assert persisted is not None
+        assert persisted.user_id == "restart@example.com"
+        assert persisted.mfa_verified is True

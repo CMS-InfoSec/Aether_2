@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-service
+  labels:
+    app: auth-service
+    app.kubernetes.io/name: auth-service
+    app.kubernetes.io/component: api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: auth-service
+  template:
+    metadata:
+      labels:
+        app: auth-service
+        app.kubernetes.io/name: auth-service
+        app.kubernetes.io/component: api
+    spec:
+      serviceAccountName: api-services
+      containers:
+        - name: auth-service
+          image: ghcr.io/aether/auth-service:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+              name: http
+          envFrom:
+            - secretRef:
+                name: auth-service-config
+          env:
+            - name: AUTH_DATABASE_SCHEMA
+              value: auth
+            - name: AUTH_DATABASE_POOL_SIZE
+              value: "10"
+            - name: AUTH_DATABASE_MAX_OVERFLOW
+              value: "20"
+            - name: AUTH_DATABASE_POOL_TIMEOUT_SECONDS
+              value: "30"
+            - name: AUTH_DATABASE_POOL_RECYCLE_SECONDS
+              value: "300"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 2000
+        seccompProfile:
+          type: RuntimeDefault
