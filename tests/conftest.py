@@ -134,6 +134,7 @@ def _install_sqlalchemy_stub() -> None:
     sa.BigInteger = _Type
     sa.DateTime = _Type
     sa.Numeric = _Type
+    sa.Text = _Type
     sa.JSON = _Type
     sa.JSONB = _Type
     sa.MetaData = MetaData
@@ -142,6 +143,7 @@ def _install_sqlalchemy_stub() -> None:
     sa.select = _select
     sa.insert = _insert
     sa.create_engine = _create_engine
+    sa.text = lambda *args, **kwargs: None
     sa.engine_from_config = _engine_from_config
 
     sys.modules["sqlalchemy"] = sa
@@ -186,6 +188,7 @@ def _install_sqlalchemy_stub() -> None:
         return SimpleNamespace(mapper=lambda *a, **k: None)
 
     orm.declarative_base = declarative_base
+    orm.DeclarativeBase = DeclarativeBase
     orm.registry = _registry
     sys.modules["sqlalchemy.orm"] = orm
 
@@ -295,7 +298,14 @@ def _install_prometheus_stub() -> None:
     sys.modules["prometheus_client"] = prom
 
 
-_install_sqlalchemy_stub()
+try:  # prefer real SQLAlchemy when available for integration-style tests
+    import sqlalchemy as _sa  # type: ignore[import-untyped]
+except Exception:  # pragma: no cover - fallback to stub when import fails
+    _install_sqlalchemy_stub()
+else:
+    if not hasattr(_sa, "select") or not hasattr(_sa, "text"):
+        _install_sqlalchemy_stub()
+    del _sa
 _install_prometheus_stub()
 
 try:  # pragma: no cover - defensive in case pydantic is absent

@@ -7,7 +7,7 @@ import sys
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 import time
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple
 
@@ -515,11 +515,31 @@ def _extract_trades(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     return trades
 
 
-def _snap(value: float, step: float) -> float:
+def _snap(
+    value: float,
+    step: float,
+    *,
+    side: str,
+    floor_quantity: bool = False,
+) -> float:
     if step <= 0:
         return value
-    quant = Decimal(str(step))
-    snapped = (Decimal(str(value)) / quant).to_integral_value(rounding=ROUND_HALF_UP) * quant
+
+    try:
+        quant = Decimal(str(step))
+        decimal_value = Decimal(str(value))
+    except Exception:
+        return value
+
+    rounding = ROUND_FLOOR
+    if not floor_quantity and side.upper() == "SELL":
+        rounding = ROUND_CEILING
+
+    snapped = decimal_value.quantize(quant, rounding=rounding)
+
+    if floor_quantity and snapped > decimal_value:
+        snapped -= quant
+
     return float(snapped)
 
 
@@ -556,8 +576,10 @@ async def place_order(
         )
 
     metadata = MARKET_METADATA.get(request.instrument, {"tick": 0.01, "lot": 0.0001})
-    snapped_price = _snap(request.price, metadata["tick"])
-    snapped_quantity = _snap(request.quantity, metadata["lot"])
+    snapped_price = _snap(request.price, metadata["tick"], side=request.side)
+    snapped_quantity = _snap(
+        request.quantity, metadata["lot"], side=request.side, floor_quantity=True
+    )
 
     if snapped_price <= 0 or snapped_quantity <= 0:
         raise HTTPException(
@@ -580,9 +602,17 @@ async def place_order(
     if request.time_in_force:
         order_payload["timeInForce"] = request.time_in_force
     if request.take_profit:
-        order_payload["takeProfit"] = request.take_profit
+        order_payload["takeProfit"] = _snap(
+            request.take_profit,
+            metadata["tick"],
+            side=request.side,
+        )
     if request.stop_loss:
-        order_payload["stopLoss"] = request.stop_loss
+        order_payload["stopLoss"] = _snap(
+            request.stop_loss,
+            metadata["tick"],
+            side=request.side,
+        )
 
     kafka.publish(
         topic="oms.orders",
@@ -666,6 +696,7 @@ async def place_order(
     kafka.publish(topic="oms.acks", payload=ack_payload)
 
     status_value = str(ack_payload.get("status", "")).lower()
+    accepted = not status_value or status_value in _SUCCESS_STATUSES
 
     if status_value and status_value not in _SUCCESS_STATUSES:
         increment_trade_rejection(account_id, request.instrument)
