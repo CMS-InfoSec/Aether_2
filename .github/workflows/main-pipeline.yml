@@ -160,8 +160,7 @@ jobs:
         env:
           COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
-        run: |
-          cosign attest --key env://COSIGN_PRIVATE_KEY --predicate "sbom-${{ matrix.build.name }}.spdx.json" --type spdx "${{ steps.image_meta.outputs.sha_tag }}"
+        run: cosign attest --key env://COSIGN_PRIVATE_KEY --predicate "sbom-${{ matrix.build.name }}.spdx.json" --type spdx "${{ steps.image_meta.outputs.sha_tag }}"
 
   argocd-sync:
     name: Trigger ArgoCD Sync
