@@ -6,14 +6,16 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict
+from collections.abc import Iterable as IterableCollection, Mapping as MappingCollection
+from typing import Any, Dict, Iterable, Mapping
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
 
 from config_sandbox import _current_config, _deep_merge, _run_backtest
 from services.common.config import get_timescale_session
+from services.common.security import require_admin_account
 from shared.correlation import CorrelationIdMiddleware
 
 try:  # pragma: no cover - psycopg optional in some environments
@@ -56,6 +58,10 @@ class GovernanceSimulationRequest(BaseModel):
     config_changes: Dict[str, Any] = Field(
         default_factory=dict,
         description="Partial configuration overrides proposed for approval",
+    )
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Optional metadata describing the simulation request context.",
     )
 
 
@@ -128,8 +134,60 @@ def _record_simulation(run_id: str, changes: Dict[str, Any], metrics: Dict[str, 
         raise HTTPException(status_code=500, detail="Failed to persist simulation run")
 
 
+def _flatten_account_candidates(value: Any) -> Iterable[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        candidate = value.strip()
+        return [candidate] if candidate else []
+    if isinstance(value, MappingCollection):
+        nested: list[str] = []
+        for key in ("account_id", "account", "id", "slug", "name"):
+            if key in value:
+                nested.extend(_flatten_account_candidates(value[key]))
+        if not nested:
+            for nested_value in value.values():
+                nested.extend(_flatten_account_candidates(nested_value))
+        return nested
+    if isinstance(value, IterableCollection) and not isinstance(value, (bytes, bytearray)):
+        results: list[str] = []
+        for item in value:
+            results.extend(_flatten_account_candidates(item))
+        return results
+    candidate = str(value).strip()
+    return [candidate] if candidate else []
+
+
+def _enforce_metadata_actor(metadata: Mapping[str, Any], actor: str) -> None:
+    if not metadata:
+        return
+
+    normalized_actor = actor.strip().lower()
+    if not normalized_actor:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authenticated session is missing an account identifier.",
+        )
+
+    candidate_keys = ("account_id", "account", "actor", "requested_by", "initiator")
+    for key in candidate_keys:
+        if key not in metadata:
+            continue
+        for value in _flatten_account_candidates(metadata[key]):
+            if value and value.strip().lower() != normalized_actor:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Metadata account does not match authenticated session.",
+                )
+
+
 @app.post("/governance/simulate", response_model=GovernanceSimulationResponse)
-def simulate_governance_change(payload: GovernanceSimulationRequest) -> GovernanceSimulationResponse:
+def simulate_governance_change(
+    payload: GovernanceSimulationRequest,
+    actor: str = Depends(require_admin_account),
+) -> GovernanceSimulationResponse:
+    _enforce_metadata_actor(payload.metadata, actor)
+
     baseline_config = _current_config()
     candidate_config = _deep_merge(baseline_config, payload.config_changes)
 
