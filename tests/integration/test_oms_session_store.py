@@ -7,6 +7,8 @@ import types
 from pathlib import Path
 from typing import Any, Dict
 
+from auth.service import InMemorySessionStore
+
 
 if "aiohttp" not in sys.modules:
 
@@ -65,6 +67,19 @@ def _issue_session_token(account_id: str) -> str:
         raise RuntimeError("OMS session store is not configured")
     session = store.create(account_id)
     return session.token
+
+
+def test_memory_session_store_initialises(monkeypatch) -> None:
+    monkeypatch.setenv("SESSION_REDIS_URL", "memory://local")
+
+    import services.oms.main as main_module
+
+    reloaded = importlib.reload(main_module)
+
+    assert isinstance(reloaded.app.state.session_store, InMemorySessionStore)
+
+    monkeypatch.setenv("SESSION_REDIS_URL", "memory://oms-test")
+    importlib.reload(main_module)
 
 
 def test_valid_session_token_allows_access(monkeypatch) -> None:
