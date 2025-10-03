@@ -666,8 +666,9 @@ async def place_order(
     kafka.publish(topic="oms.acks", payload=ack_payload)
 
     status_value = str(ack_payload.get("status", "")).lower()
+    accepted = status_value in _SUCCESS_STATUSES
 
-    if status_value and status_value not in _SUCCESS_STATUSES:
+    if status_value and not accepted:
         increment_trade_rejection(account_id, request.instrument)
 
     trades_snapshot = {"trades": trades}

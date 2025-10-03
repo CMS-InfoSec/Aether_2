@@ -40,6 +40,7 @@ if "aiohttp" not in sys.modules:
     sys.modules["aiohttp"] = aiohttp_stub
 
 from services.common import security
+import services.oms.main as oms_main
 from services.oms.main import app, KrakenClientBundle
 from services.oms.kraken_ws import OrderAck
 from shared.k8s import KrakenSecretStore
@@ -169,6 +170,92 @@ def test_place_order_rejects_non_admin(client: TestClient) -> None:
     response = client.post("/oms/place", json=payload, headers={"X-Account-ID": "trade"})
 
     assert response.status_code == 403
+
+
+def test_place_order_rejected_ack_sets_accepted_false(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    @asynccontextmanager
+    async def _factory(account_id: str):
+        async def _credentials() -> Dict[str, Any]:
+            return {
+                "api_key": f"test-key-{account_id}",
+                "api_secret": "secret",
+                "metadata": {"rotated_at": datetime.now(timezone.utc).isoformat()},
+            }
+
+        class _StubWS:
+            async def add_order(self, payload: Dict[str, Any]) -> OrderAck:
+                return OrderAck(
+                    exchange_order_id="SIM-REJECT",
+                    status="rejected",
+                    filled_qty=None,
+                    avg_price=None,
+                    errors=None,
+                )
+
+            async def fetch_open_orders_snapshot(self) -> list[Dict[str, Any]]:
+                return []
+
+            async def fetch_own_trades_snapshot(self) -> list[Dict[str, Any]]:
+                return []
+
+            async def close(self) -> None:
+                return None
+
+        class _StubREST:
+            async def add_order(self, payload: Dict[str, Any]) -> OrderAck:
+                return OrderAck(
+                    exchange_order_id="SIM-REJECT",
+                    status="rejected",
+                    filled_qty=None,
+                    avg_price=None,
+                    errors=None,
+                )
+
+            async def open_orders(self) -> Dict[str, Any]:
+                return {"result": {"open": []}}
+
+            async def own_trades(self) -> Dict[str, Any]:
+                return {"result": {"trades": {}}}
+
+            async def close(self) -> None:
+                return None
+
+        ws_client = _StubWS()
+        rest_client = _StubREST()
+        try:
+            yield KrakenClientBundle(
+                credential_getter=_credentials,
+                ws_client=ws_client,  # type: ignore[arg-type]
+                rest_client=rest_client,  # type: ignore[arg-type]
+            )
+        finally:
+            await ws_client.close()
+            await rest_client.close()
+
+    monkeypatch.setattr(app.state, "kraken_client_factory", _factory)
+    monkeypatch.setattr(oms_main, "_ensure_ack_success", lambda ack, transport: None)
+
+    payload = {
+        "account_id": "admin-alpha",
+        "order_id": "ord-123",
+        "instrument": "BTC-USD",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 101.5,
+        "fee": {"currency": "USD", "maker": 0.1, "taker": 0.2},
+    }
+
+    response = client.post("/oms/place", json=payload, headers={"X-Account-ID": "admin-alpha"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body == {
+        "accepted": False,
+        "routed_venue": "kraken",
+        "fee": payload["fee"],
+    }
 
 
 def test_place_order_mismatched_account(client: TestClient) -> None:
