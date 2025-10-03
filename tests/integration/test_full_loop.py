@@ -22,6 +22,7 @@ from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
 from services.oms.warm_start import WarmStartCoordinator
 from services.common.schemas import PolicyDecisionResponse
 from tests import factories
+from tests.fixtures.backends import MemoryRedis
 from tests.fixtures.mock_kraken import MockKrakenServer
 
 
@@ -123,9 +124,10 @@ def test_full_loop_across_accounts(
 
     metrics_module.init_metrics("sequencer")
 
+    backend = MemoryRedis()
+    safe_mode.controller._state_store = safe_mode.SafeModeStateStore(redis_client=backend)  # type: ignore[attr-defined]
     safe_mode.controller.reset()
     safe_mode.clear_safe_mode_log()
-    safe_mode.controller._state_store = safe_mode.SafeModeStateStore(tmp_path / "safe_mode_state.json")  # type: ignore[attr-defined]
 
     # ------------------------------------------------------------------
     # Configure audit logging to use deterministic local artefacts.

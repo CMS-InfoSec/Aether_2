@@ -9,6 +9,7 @@ pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
 import safe_mode
+from tests.fixtures.backends import MemoryRedis
 
 
 class DummyTradingEngine:
@@ -41,6 +42,8 @@ class DummyTradingEngine:
 @pytest.mark.integration
 def test_safe_mode_blocks_intents_but_allows_hedging_orders() -> None:
     controller = safe_mode.controller
+    backend = MemoryRedis()
+    controller._state_store = safe_mode.SafeModeStateStore(redis_client=backend)
     controller.reset()
     safe_mode.clear_safe_mode_log()
 
