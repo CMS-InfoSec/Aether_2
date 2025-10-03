@@ -196,7 +196,9 @@ backendServices:
       tag: latest
     replicaCount: 2
     containerPort: 8000
-    env: []
+    env:
+      - name: SESSION_REDIS_URL
+        value: redis://redis:6379/0
     usesKrakenSecrets: true
     extraVolumeMounts: []
     extraVolumes: []

@@ -29,6 +29,7 @@ os.environ.setdefault("LOCAL_KMS_MASTER_KEY", _DEFAULT_MASTER_KEY)
 
 os.environ.setdefault("AUTH_JWT_SECRET", "unit-test-secret")
 os.environ.setdefault("AUTH_DATABASE_URL", "sqlite:////tmp/aether-auth-test.db")
+os.environ.setdefault("SESSION_REDIS_URL", "memory://oms-test")
 
 
 
