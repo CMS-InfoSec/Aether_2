@@ -3,29 +3,24 @@ from __future__ import annotations
 
 import asyncio
 import base64
-
 import hashlib
-import tempfile
-
 import json
 import logging
-
 import os
-
-import uuid
 import sqlite3
+import tempfile
 import threading
+import time
+import uuid
 from copy import deepcopy
 from dataclasses import dataclass, field
-
-from pathlib import Path
-from weakref import WeakSet
-
-
-
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable, ClassVar, Dict, Iterable, List, Mapping, Optional, Tuple
+from urllib.parse import urlparse
 from weakref import WeakSet
+
+import httpx
 
 
 from common.utils.tracing import attach_correlation, current_correlation_id
