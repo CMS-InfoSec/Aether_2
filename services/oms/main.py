@@ -522,20 +522,25 @@ def _snap(
     side: str,
     floor_quantity: bool = False,
 ) -> float:
-    if step <= 0:
-        return value
-
     try:
         quant = Decimal(str(step))
         decimal_value = Decimal(str(value))
     except Exception:
         return value
 
+    if quant <= 0:
+        return value
+
     rounding = ROUND_FLOOR
     if not floor_quantity and side.upper() == "SELL":
         rounding = ROUND_CEILING
 
-    snapped = decimal_value.quantize(quant, rounding=rounding)
+    try:
+        snapped_ratio = (decimal_value / quant).to_integral_value(rounding=rounding)
+    except Exception:
+        return value
+
+    snapped = snapped_ratio * quant
 
     if floor_quantity and snapped > decimal_value:
         snapped -= quant
