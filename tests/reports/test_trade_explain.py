@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from typing import Dict
 
-from fastapi.testclient import TestClient
 import pytest
+from fastapi.testclient import TestClient
 
 
 pytest.importorskip("pandas", exc_type=ImportError)
 
 import report_service
+from services.common.security import require_admin_account
 
 
 class StubModel:
@@ -18,6 +19,19 @@ class StubModel:
     def explain(self, features: Dict[str, float]) -> Dict[str, float]:
         # ignore provided features and return the predetermined attributions
         return self._shap_values
+
+
+def test_trade_explain_requires_authentication(monkeypatch) -> None:
+    monkeypatch.setattr(
+        report_service,
+        "_load_trade_record",
+        lambda trade_id: {"fill_id": trade_id, "account_id": "alpha", "instrument": "BTC-USD"},
+    )
+
+    client = TestClient(report_service.app)
+    response = client.get("/reports/trade_explain", params={"trade_id": "fill-unauth"})
+
+    assert response.status_code == 401
 
 
 def test_trade_explain_returns_sorted_top_features(monkeypatch) -> None:
@@ -51,7 +65,11 @@ def test_trade_explain_returns_sorted_top_features(monkeypatch) -> None:
     monkeypatch.setattr(report_service, "get_active_model", lambda account_id, instrument: StubModel(shap_values))
 
     client = TestClient(report_service.app)
-    response = client.get("/reports/trade_explain", params={"trade_id": "fill-123"})
+    client.app.dependency_overrides[require_admin_account] = lambda: "alpha"
+    try:
+        response = client.get("/reports/trade_explain", params={"trade_id": "fill-123"})
+    finally:
+        client.app.dependency_overrides.pop(require_admin_account, None)
     assert response.status_code == 200
 
     payload = response.json()
@@ -77,12 +95,32 @@ def test_trade_explain_returns_sorted_top_features(monkeypatch) -> None:
     ]
 
 
+def test_trade_explain_rejects_mismatched_account(monkeypatch) -> None:
+    trade_record = {"fill_id": "fill-403", "account_id": "beta", "instrument": "ETH-USD", "features": {}}
+
+    monkeypatch.setattr(report_service, "_load_trade_record", lambda trade_id: trade_record)
+
+    client = TestClient(report_service.app)
+    client.app.dependency_overrides[require_admin_account] = lambda: "alpha"
+    try:
+        response = client.get("/reports/trade_explain", params={"trade_id": "fill-403"})
+    finally:
+        client.app.dependency_overrides.pop(require_admin_account, None)
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Authenticated account is not authorized for the requested account."
+
+
 def test_trade_explain_missing_features_returns_422(monkeypatch) -> None:
     trade_record = {"fill_id": "fill-404", "account_id": "beta", "instrument": "ETH-USD"}
 
     monkeypatch.setattr(report_service, "_load_trade_record", lambda trade_id: trade_record)
 
     client = TestClient(report_service.app)
-    response = client.get("/reports/trade_explain", params={"trade_id": "fill-404"})
+    client.app.dependency_overrides[require_admin_account] = lambda: "beta"
+    try:
+        response = client.get("/reports/trade_explain", params={"trade_id": "fill-404"})
+    finally:
+        client.app.dependency_overrides.pop(require_admin_account, None)
     assert response.status_code == 422
     assert response.json()["detail"] == "Trade is missing feature metadata"

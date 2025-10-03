@@ -27,7 +27,6 @@ from sqlalchemy import JSON, Column, DateTime, Float, Integer, String, Text, cre
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
-from sqlalchemy.pool import StaticPool
 
 from common.schemas.contracts import IntentEvent
 from services.common.adapters import KafkaNATSAdapter
@@ -42,19 +41,33 @@ except Exception:  # pragma: no cover - degrade gracefully when LightGBM missing
 LOGGER = logging.getLogger("watchdog")
 
 
-DATABASE_URL = os.getenv("WATCHDOG_DATABASE_URL", "sqlite:///./watchdog.db")
+DATABASE_URL_ENV_VAR = "WATCHDOG_DATABASE_URL"
 
 
-def _engine_options(url: str) -> Dict[str, Any]:
-    options: Dict[str, Any] = {"future": True}
-    if url.startswith("sqlite://"):
-        options.setdefault("connect_args", {"check_same_thread": False})
-        if url.endswith(":memory:"):
-            options["poolclass"] = StaticPool
-    return options
+def _database_url() -> str:
+    url = os.getenv(DATABASE_URL_ENV_VAR) or os.getenv("TIMESCALE_DSN")
+    if not url:
+        raise RuntimeError(
+            "WATCHDOG_DATABASE_URL or TIMESCALE_DSN must be set to a PostgreSQL/Timescale DSN"
+        )
+
+    normalized = url.strip()
+    if normalized.startswith("postgresql://"):
+        normalized = normalized.replace("postgresql://", "postgresql+psycopg://", 1)
+    elif normalized.startswith("postgresql+psycopg://") or normalized.startswith("postgresql+psycopg2://"):
+        pass
+    else:
+        raise RuntimeError(
+            "Watchdog requires a PostgreSQL/Timescale DSN via WATCHDOG_DATABASE_URL or TIMESCALE_DSN"
+        )
+
+    return normalized
 
 
-ENGINE: Engine = create_engine(DATABASE_URL, **_engine_options(DATABASE_URL))
+DATABASE_URL = _database_url()
+
+
+ENGINE: Engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
 Base = declarative_base()
 

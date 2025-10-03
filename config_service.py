@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import os
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Generator, Iterable, List, Optional, Set, Tuple
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
@@ -14,6 +17,27 @@ from pydantic import BaseModel, Field
 from sqlalchemy import JSON, Column, DateTime, Integer, String, UniqueConstraint, create_engine, func, select
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
+
+ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+try:  # pragma: no cover - support alternative namespace packages
+    from services.common.security import require_admin_account
+except ModuleNotFoundError:  # pragma: no cover - fallback when installed under package namespace
+    try:
+        from aether.services.common.security import require_admin_account
+    except ModuleNotFoundError:  # pragma: no cover - direct file import when running from source tree
+        spec = importlib.util.spec_from_file_location(
+            "config_service._security",
+            ROOT / "services" / "common" / "security.py",
+        )
+        if spec is None or spec.loader is None:  # pragma: no cover - defensive
+            raise
+        security_module = importlib.util.module_from_spec(spec)
+        sys.modules.setdefault("config_service._security", security_module)
+        spec.loader.exec_module(security_module)
+        require_admin_account = getattr(security_module, "require_admin_account")
 
 try:  # pragma: no cover - optional audit dependency
     from common.utils.audit_logger import hash_ip, log_audit
@@ -29,28 +53,72 @@ except Exception:  # pragma: no cover - degrade gracefully
 # ---------------------------------------------------------------------------
 
 
-DEFAULT_DATABASE_URL = "sqlite+pysqlite:////tmp/config.db"
+LOGGER = logging.getLogger("config_service")
+_SQLITE_FALLBACK_FLAG = "CONFIG_ALLOW_SQLITE_FOR_TESTS"
+
+
+def _require_database_url() -> str:
+    """Return the configured database URL ensuring it targets Postgres."""
+
+    raw_url = os.getenv("CONFIG_DATABASE_URL")
+    if not raw_url:
+        raise RuntimeError(
+            "CONFIG_DATABASE_URL environment variable is required for the config service."
+        )
+
+    normalized = raw_url.lower()
+    allowed_prefixes = ("postgresql://", "postgresql+psycopg://", "postgresql+psycopg2://")
+    if normalized.startswith("postgres://"):
+        raw_url = "postgresql://" + raw_url.split("://", 1)[1]
+        normalized = raw_url.lower()
+
+    if normalized.startswith(allowed_prefixes):
+        return raw_url
+
+    if os.getenv(_SQLITE_FALLBACK_FLAG) == "1":
+        LOGGER.warning(
+            "Non-Postgres CONFIG_DATABASE_URL '%s' permitted because %s=1.",
+            raw_url,
+            _SQLITE_FALLBACK_FLAG,
+        )
+        return raw_url
+
+    raise RuntimeError(
+        "CONFIG_DATABASE_URL must point to a PostgreSQL/TimescaleDB instance; "
+        f"received '{raw_url}'. Set {_SQLITE_FALLBACK_FLAG}=1 to allow alternative URLs in tests."
+    )
 
 
 def _create_engine(database_url: str):
     connect_args: Dict[str, Any] = {}
-    engine_kwargs: Dict[str, Any] = {"future": True}
-    if database_url.startswith("sqlite"):  # pragma: no cover - defensive branch
+    engine_kwargs: Dict[str, Any] = {
+        "future": True,
+        "pool_pre_ping": True,
+    }
+
+    if database_url.startswith("sqlite"):
         connect_args["check_same_thread"] = False
         engine_kwargs["connect_args"] = connect_args
         if ":memory:" in database_url:
             engine_kwargs["poolclass"] = StaticPool
+    else:
+        connect_args["sslmode"] = os.getenv("CONFIG_DB_SSLMODE", "require")
+        engine_kwargs["connect_args"] = connect_args
+        engine_kwargs.update(
+            pool_size=int(os.getenv("CONFIG_DB_POOL_SIZE", "10")),
+            max_overflow=int(os.getenv("CONFIG_DB_MAX_OVERFLOW", "5")),
+            pool_timeout=int(os.getenv("CONFIG_DB_POOL_TIMEOUT", "30")),
+            pool_recycle=int(os.getenv("CONFIG_DB_POOL_RECYCLE", "1800")),
+        )
+
     return create_engine(database_url, **engine_kwargs)
 
 
-DATABASE_URL = os.getenv("CONFIG_DATABASE_URL", DEFAULT_DATABASE_URL)
+DATABASE_URL = _require_database_url()
 engine = _create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
 
 Base = declarative_base()
-
-
-LOGGER = logging.getLogger("config_service")
 
 
 class ConfigVersion(Base):
@@ -249,6 +317,7 @@ def _commit_version(
 @app.get("/config/current", response_model=Dict[str, ConfigEntry])
 def get_current_config(
     account_id: str = Query("global", description="Account identifier"),
+    _admin_account: str = Depends(require_admin_account),
     session: Session = Depends(get_session),
 ) -> Dict[str, ConfigEntry]:
     stmt = (
@@ -269,6 +338,7 @@ def update_config(
     payload: ConfigUpdateRequest,
     request: Request,
     account_id: str = Query("global", description="Account identifier"),
+    admin_account: str = Depends(require_admin_account),
     session: Session = Depends(get_session),
 ):
     key = payload.key
@@ -286,7 +356,7 @@ def update_config(
             created_at = datetime.now(timezone.utc)
             _pending_guarded[pending_identifier] = PendingGuardedChange(
                 value=payload.value,
-                author=payload.author,
+                author=admin_account,
                 created_at=created_at,
             )
             response = ConfigUpdateResponse(
@@ -294,7 +364,7 @@ def update_config(
                 account_id=account_id,
                 key=key,
                 value=payload.value,
-                approvers=[payload.author],
+                approvers=[admin_account],
                 version=None,
                 ts=None,
                 required_approvals=required_approvals,
@@ -307,12 +377,12 @@ def update_config(
                         "key": key,
                         "value": payload.value,
                         "status": "pending",
-                        "requested_by": payload.author,
+                        "requested_by": admin_account,
                         "requested_at": created_at.isoformat(),
                         "required_approvals": required_approvals,
                     }
                     log_audit(
-                        actor=payload.author,
+                        actor=admin_account,
                         action="config.change.requested",
                         entity=entity,
                         before=before_snapshot,
@@ -325,7 +395,7 @@ def update_config(
                     )
             return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=response.model_dump())
 
-        if pending.author == payload.author:
+        if pending.author == admin_account:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="second_author_required")
         if pending.value != payload.value:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="value_mismatch")
@@ -335,7 +405,7 @@ def update_config(
             account_id=account_id,
             key=key,
             value=payload.value,
-            approvers=[pending.author, payload.author],
+            approvers=[pending.author, admin_account],
         )
         _pending_guarded.pop(pending_identifier, None)
         response = ConfigUpdateResponse(
@@ -352,7 +422,7 @@ def update_config(
         if log_audit is not None:
             try:
                 log_audit(
-                    actor=payload.author,
+                    actor=admin_account,
                     action="config.change.approved",
                     entity=entity,
                     before=before_snapshot,
@@ -369,7 +439,7 @@ def update_config(
         account_id=account_id,
         key=key,
         value=payload.value,
-        approvers=[payload.author],
+        approvers=[admin_account],
     )
     response = ConfigUpdateResponse(
         status="applied",
@@ -385,7 +455,7 @@ def update_config(
     if log_audit is not None:
         try:
             log_audit(
-                actor=payload.author,
+                actor=admin_account,
                 action="config.change.applied",
                 entity=entity,
                 before=before_snapshot,

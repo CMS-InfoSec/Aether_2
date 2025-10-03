@@ -91,6 +91,7 @@ def test_audit_chain_across_services(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("AUDIT_CHAIN_LOG", str(chain_log))
     monkeypatch.setenv("AUDIT_CHAIN_STATE", str(chain_state))
 
+    monkeypatch.setenv("CONFIG_ALLOW_SQLITE_FOR_TESTS", "1")
     monkeypatch.setenv("CONFIG_DATABASE_URL", f"sqlite:///{tmp_path / 'config.db'}")
     monkeypatch.setenv("OVERRIDE_DATABASE_URL", f"sqlite:///{tmp_path / 'override.db'}")
     encryption_key = base64.b64encode(b"0" * 32).decode()
