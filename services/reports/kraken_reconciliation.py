@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -31,6 +32,7 @@ except ModuleNotFoundError:  # pragma: no cover - used when FastAPI is not insta
         labels: Dict[str, str] = field(default_factory=dict)
 
 from services.common.config import TimescaleSession, get_timescale_session
+from services.secrets.signing import sign_kraken_request
 
 try:  # pragma: no cover - optional dependency for unit tests
     from services.reports.report_service import (
@@ -244,10 +246,14 @@ class KrakenStatementDownloader:
         if self._owns_session and hasattr(self._session, "close"):
             self._session.close()
 
-    def _headers(self) -> Dict[str, str]:
+    def _headers(self, path: str, params: Dict[str, Any]) -> Dict[str, str]:
         headers = {"User-Agent": "AetherKrakenReconciler/1.0"}
         if self._api_key and self._api_secret:
-            headers.update({"API-Key": self._api_key, "API-Secret": self._api_secret})
+            nonce = str(int(time.time() * 1000))
+            params["nonce"] = nonce
+            _, signature = sign_kraken_request(path, params, self._api_secret)
+            headers["API-Key"] = self._api_key
+            headers["API-Sign"] = signature
         elif self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
         return headers
@@ -258,22 +264,34 @@ class KrakenStatementDownloader:
             "start": start.isoformat(),
             "end": end.isoformat(),
         }
-        headers = self._headers()
-
         csv_url = f"{self._base_url}{self._csv_path}"
         json_url = f"{self._base_url}{self._json_path}"
+        csv_params = dict(params)
+        csv_params["format"] = "csv"
+        csv_headers = self._headers(self._csv_path, csv_params)
+        json_params = dict(params)
+        json_params["format"] = "json"
+        json_headers = self._headers(self._json_path, json_params)
+
         LOGGER.info(
             "Fetching Kraken statement",
-            extra={"account_id": account_id, "csv_url": csv_url, "json_url": json_url},
+            extra={
+                "account_id": account_id,
+                "csv_url": csv_url,
+                "json_url": json_url,
+                "credential_mode": (
+                    "hmac"
+                    if self._api_key and self._api_secret
+                    else "token" if self._api_key else "public"
+                ),
+            },
         )
 
-        csv_response = self._session.get(csv_url, params={**params, "format": "csv"}, headers=headers)
+        csv_response = self._session.get(csv_url, params=csv_params, headers=csv_headers)
         csv_response.raise_for_status()
         fills = self._parse_csv(csv_response.text)
 
-        json_response = self._session.get(
-            json_url, params={**params, "format": "json"}, headers=headers
-        )
+        json_response = self._session.get(json_url, params=json_params, headers=json_headers)
         json_response.raise_for_status()
         payload = self._parse_json(json_response.text)
 
