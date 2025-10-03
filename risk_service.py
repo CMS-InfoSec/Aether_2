@@ -21,7 +21,7 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optio
 
 import httpx
 
-from fastapi import Depends, FastAPI, HTTPException, Header, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 
 from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, model_validator
 from sqlalchemy import Column, DateTime, Float, Integer, Numeric, String, create_engine, select
@@ -648,7 +648,7 @@ battle_mode_controller = BattleModeController(
 @app.post("/risk/validate", response_model=RiskValidationResponse)
 async def validate_risk(
     request: RiskValidationRequest,
-    account_id: str = Header(..., alias="X-Account-ID"),
+    account_id: str = Depends(require_admin_account),
 ) -> RiskValidationResponse:
 
     """Validate a trading intent against account level risk limits."""
@@ -656,7 +656,7 @@ async def validate_risk(
     if request.account_id != account_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Account mismatch between header and payload.",
+            detail="Account mismatch between authenticated session and payload.",
         )
 
     logger.info("Received risk validation request for account %s", account_id)

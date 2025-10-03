@@ -20,7 +20,7 @@ except Exception:  # pragma: no cover - services module may be unavailable in so
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
-    sys.path.append(str(ROOT))
+    sys.path.insert(0, str(ROOT))
 
 
 _DEFAULT_MASTER_KEY = base64.b64encode(b"\x00" * 32).decode("ascii")

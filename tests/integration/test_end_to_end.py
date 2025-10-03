@@ -12,6 +12,8 @@ from typing import Any, AsyncIterator, Dict, Iterable, List
 
 import pytest
 
+pytest.importorskip("services.common.security")
+
 pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
@@ -38,6 +40,7 @@ from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditL
 from shared.correlation import CorrelationContext
 from services.fees.fee_service import app as fees_app
 from tests import factories
+from tests.helpers.authentication import override_admin_auth
 from tests.fixtures.mock_kraken import MockKrakenServer
 
 
@@ -75,15 +78,22 @@ class HttpRiskServiceClient:
             intent=trade_intent,
             portfolio_state=portfolio_state,
         )
-        response = await asyncio.to_thread(
-            self._client.post,
-            "/risk/validate",
-            json=request_model.model_dump(by_alias=True, mode="json"),
-            headers={
+        with override_admin_auth(
+            self._client.app,
+            self._risk.require_admin_account,
+            intent.account_id,
+        ) as headers:
+            request_headers = {
+                **headers,
                 "X-Account-ID": intent.account_id,
                 "X-Correlation-ID": correlation_id,
-            },
-        )
+            }
+            response = await asyncio.to_thread(
+                self._client.post,
+                "/risk/validate",
+                json=request_model.model_dump(by_alias=True, mode="json"),
+                headers=request_headers,
+            )
         response.raise_for_status()
         data: Dict[str, Any] = response.json()
         self.validations.append({"request": request_model, "response": data, "correlation_id": correlation_id})
@@ -335,12 +345,17 @@ def test_full_pipeline_records_audit_metrics_and_safe_mode(
             intent=trade_intent,
             portfolio_state=portfolio_state,
         )
-        response = await asyncio.to_thread(
-            risk_client.post,
-            "/risk/validate",
-            json=request_model.model_dump(by_alias=True, mode="json"),
-            headers={"X-Account-ID": intent["account_id"]},
-        )
+        with override_admin_auth(
+            risk_client.app,
+            risk_service.require_admin_account,
+            intent["account_id"],
+        ) as headers:
+            response = await asyncio.to_thread(
+                risk_client.post,
+                "/risk/validate",
+                json=request_model.model_dump(by_alias=True, mode="json"),
+                headers={**headers, "X-Account-ID": intent["account_id"]},
+            )
         response.raise_for_status()
         decision = response.json()
         artifact: Dict[str, Any] = dict(decision)
@@ -794,12 +809,17 @@ def test_policy_risk_oms_flow_emits_hashed_audit_and_metrics(
             intent=trade_intent,
             portfolio_state=portfolio_state,
         )
-        response = await asyncio.to_thread(
-            risk_client.post,
-            "/risk/validate",
-            json=request_model.model_dump(by_alias=True, mode="json"),
-            headers={"X-Account-ID": intent["account_id"]},
-        )
+        with override_admin_auth(
+            risk_client.app,
+            risk_service.require_admin_account,
+            intent["account_id"],
+        ) as headers:
+            response = await asyncio.to_thread(
+                risk_client.post,
+                "/risk/validate",
+                json=request_model.model_dump(by_alias=True, mode="json"),
+                headers={**headers, "X-Account-ID": intent["account_id"]},
+            )
         response.raise_for_status()
         decision: Dict[str, Any] = response.json()
         artifact = dict(decision)

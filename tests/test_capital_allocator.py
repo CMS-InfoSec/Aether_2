@@ -7,9 +7,12 @@ from datetime import datetime, timezone
 
 import pytest
 
+pytest.importorskip("services.common.security")
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 from sqlalchemy import text
+
+from tests.helpers.authentication import override_admin_auth
 
 
 def _reload_allocator(monkeypatch: pytest.MonkeyPatch, db_url: str) -> object:
@@ -271,11 +274,14 @@ def test_risk_engine_blocks_when_allocator_throttles(
         },
     }
 
-    response = client.post(
-        "/risk/validate",
-        json=payload,
-        headers={"X-Account-ID": payload["account_id"]},
-    )
+    with override_admin_auth(
+        client.app, module.require_admin_account, payload["account_id"]
+    ) as headers:
+        response = client.post(
+            "/risk/validate",
+            json=payload,
+            headers={**headers, "X-Account-ID": payload["account_id"]},
+        )
     assert response.status_code == 200
     body = response.json()
     assert body["pass"] is False
