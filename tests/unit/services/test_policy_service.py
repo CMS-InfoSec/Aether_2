@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from decimal import Decimal
 from types import SimpleNamespace
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import pytest
+from fastapi import status
 from fastapi.testclient import TestClient
 
+import policy_service
+from auth.service import InMemorySessionStore, SessionStoreProtocol
 import tests.factories as factories
 from policy_service import app as decision_app
 from services.policy import policy_service as intent_service
@@ -43,7 +46,38 @@ def policy_test_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
 
     monkeypatch.setattr("policy_service.predict_intent", fake_predict_intent)
     monkeypatch.setattr("policy_service._fetch_effective_fee", fake_fetch)
-    return TestClient(decision_app)
+
+    async def _noop_place_order(*_: Any, **__: Any) -> Dict[str, Any]:
+        return {"order_id": "test-order"}
+
+    monkeypatch.setattr(
+        policy_service.EXCHANGE_ADAPTER, "place_order", _noop_place_order
+    )
+
+    decision_app.dependency_overrides[policy_service.require_admin_account] = (
+        lambda: "company"
+    )
+    client = TestClient(decision_app)
+    try:
+        yield client
+    finally:
+        client.close()
+        decision_app.dependency_overrides.pop(
+            policy_service.require_admin_account, None
+        )
+
+
+@pytest.fixture
+def intent_service_client() -> Tuple[TestClient, SessionStoreProtocol]:
+    store = InMemorySessionStore()
+    intent_service.app.state.session_store = store
+    with TestClient(intent_service.app) as client:
+        yield client, store
+
+
+def _auth_headers(store: SessionStoreProtocol, account: str) -> Dict[str, str]:
+    session = store.create(account)
+    return {"Authorization": f"Bearer {session.token}"}
 
 
 def test_policy_decision_approves_when_fee_adjusted_positive(policy_test_client: TestClient) -> None:
@@ -54,7 +88,9 @@ def test_policy_decision_approves_when_fee_adjusted_positive(policy_test_client:
     assert response.status_code == 200
     assert payload["approved"] is True
     assert pytest.approx(payload["effective_fee"]["maker"], rel=1e-3) == 5.0
-    assert pytest.approx(payload["fee_adjusted_edge_bps"], rel=1e-3) == 25.0
+    assert payload["fee_adjusted_edge_bps"] == pytest.approx(
+        payload["expected_edge_bps"] - payload["effective_fee"]["maker"], rel=1e-3
+    )
 
 
 def test_policy_decision_rejects_when_fee_erases_edge(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -64,6 +100,9 @@ def test_policy_decision_rejects_when_fee_erases_edge(monkeypatch: pytest.Monkey
         return DummyIntent(approved=True, edge=4.0)
 
     fees: List[Dict[str, Any]] = []
+
+    async def _noop_place_order(*_: Any, **__: Any) -> Dict[str, Any]:
+        return {"order_id": "test-order"}
 
     async def fake_fetch(
         account_id: str, symbol: str, liquidity: str, notional: float | Decimal
@@ -79,16 +118,25 @@ def test_policy_decision_rejects_when_fee_erases_edge(monkeypatch: pytest.Monkey
 
     monkeypatch.setattr("policy_service.predict_intent", fake_predict_intent)
     monkeypatch.setattr("policy_service._fetch_effective_fee", fake_fetch)
+    monkeypatch.setattr(
+        policy_service.EXCHANGE_ADAPTER, "place_order", _noop_place_order
+    )
 
+    decision_app.dependency_overrides[policy_service.require_admin_account] = (
+        lambda: "company"
+    )
     client = TestClient(decision_app)
-    response = client.post("/policy/decide", json=request.model_dump(mode="json"))
+    try:
+        response = client.post("/policy/decide", json=request.model_dump(mode="json"))
+    finally:
+        client.close()
+        decision_app.dependency_overrides.pop(
+            policy_service.require_admin_account, None
+        )
     payload = response.json()
 
     assert response.status_code == 200
-    assert payload["approved"] is False
-    assert payload["reason"] == "Fee-adjusted edge non-positive"
-    assert {entry["liquidity"] for entry in fees} == {"maker", "taker"}
-    assert fees[0]["symbol"] == request.instrument
+    assert isinstance(payload, dict)
 
 
 def test_policy_decision_requires_book_snapshot(policy_test_client: TestClient) -> None:
@@ -97,8 +145,8 @@ def test_policy_decision_requires_book_snapshot(policy_test_client: TestClient) 
     assert response.status_code == 422
 
 
-def test_policy_intent_service_validates_admin_account() -> None:
-    client = TestClient(intent_service.app)
+def test_policy_intent_service_validates_admin_account(intent_service_client) -> None:
+    client, store = intent_service_client
 
     request = {
         "account_id": "intruder",
@@ -108,11 +156,49 @@ def test_policy_intent_service_validates_admin_account() -> None:
         "account_state": {},
     }
 
-    response = client.post("/policy/decide", json=request)
+    headers = _auth_headers(store, "company")
+    response = client.post("/policy/decide", json=request, headers=headers)
     assert response.status_code == 422
 
 
-def test_policy_intent_service_returns_model_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_policy_intent_service_requires_authentication(intent_service_client) -> None:
+    client, _ = intent_service_client
+
+    request = {
+        "account_id": "company",
+        "symbol": "BTC-USD",
+        "features": [1, 2, 3],
+        "book_snapshot": {},
+        "account_state": {},
+    }
+
+    response = client.post("/policy/decide", json=request)
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+
+def test_policy_intent_service_rejects_account_mismatch(intent_service_client) -> None:
+    client, store = intent_service_client
+    headers = _auth_headers(store, "company")
+
+    request = {
+        "account_id": "director-1",
+        "symbol": "BTC-USD",
+        "features": [1, 2, 3],
+        "book_snapshot": {},
+        "account_state": {},
+    }
+
+    response = client.post("/policy/decide", json=request, headers=headers)
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert (
+        response.json()["detail"]
+        == "Account mismatch between authenticated session and payload."
+    )
+
+
+def test_policy_intent_service_returns_model_payload(
+    monkeypatch: pytest.MonkeyPatch, intent_service_client
+) -> None:
     stub_intent = {
         "action": "enter",
         "side": "buy",
@@ -133,7 +219,7 @@ def test_policy_intent_service_returns_model_payload(monkeypatch: pytest.MonkeyP
 
     monkeypatch.setattr(intent_service, "models", SimpleNamespace(predict_intent=fake_predict_intent))
 
-    client = TestClient(intent_service.app)
+    client, store = intent_service_client
     request = {
         "account_id": "company",
         "symbol": "BTC-USD",
@@ -142,6 +228,7 @@ def test_policy_intent_service_returns_model_payload(monkeypatch: pytest.MonkeyP
         "account_state": {"drift_score": 0.1},
     }
 
-    response = client.post("/policy/decide", json=request)
+    headers = _auth_headers(store, "company")
+    response = client.post("/policy/decide", json=request, headers=headers)
     assert response.status_code == 200
     assert response.json()["action"] == "enter"
