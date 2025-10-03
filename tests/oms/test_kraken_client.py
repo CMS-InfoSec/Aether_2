@@ -10,10 +10,11 @@ from typing import Any, Dict, List
 
 import pytest
 
-from services.common.adapters import TimescaleAdapter
+from services.common.adapters import KrakenSecretManager, TimescaleAdapter
 from services.oms.kraken_client import (
     KrakenCredentialExpired,
     KrakenWSClient,
+    SECRET_MAX_AGE,
     _LoopbackSession,
 )
 from services.oms.oms_kraken import ANNOTATION_ROTATED_AT, KrakenCredentialWatcher
@@ -24,6 +25,18 @@ def setup_function() -> None:
     KrakenSecretStore.reset()
     TimescaleAdapter.reset()
     KrakenCredentialWatcher.reset_instances()
+
+
+def _file_secret_payload(key: str, secret: str, rotated_at: datetime) -> Dict[str, Any]:
+    iso = rotated_at.isoformat()
+    return {
+        "key": key,
+        "secret": secret,
+        "metadata": {
+            "rotated_at": iso,
+            "annotations": {ANNOTATION_ROTATED_AT: iso},
+        },
+    }
 
 
 def test_ws_client_rejects_expired_credentials() -> None:
@@ -83,7 +96,15 @@ def test_ws_client_loads_credentials() -> None:
 
 def test_client_reloads_credentials_on_secret_change(tmp_path: Path) -> None:
     secret_file = tmp_path / "kraken.json"
-    secret_file.write_text(json.dumps({"key": "key-1", "secret": "sec-1"}))
+    secret_file.write_text(
+        json.dumps(
+            _file_secret_payload(
+                "key-1",
+                "sec-1",
+                datetime.now(timezone.utc) - timedelta(minutes=1),
+            )
+        )
+    )
 
     watcher = KrakenCredentialWatcher(
         "company",
@@ -104,7 +125,15 @@ def test_client_reloads_credentials_on_secret_change(tmp_path: Path) -> None:
         client.add_order({"clientOrderId": "A"})
         assert session_credentials[-1]["api_key"] == "key-1"
 
-        secret_file.write_text(json.dumps({"key": "key-2", "secret": "sec-2"}))
+        secret_file.write_text(
+            json.dumps(
+                _file_secret_payload(
+                    "key-2",
+                    "sec-2",
+                    datetime.now(timezone.utc),
+                )
+            )
+        )
         watcher.trigger_refresh()
         assert watcher.wait_for_version(1, timeout=2.0)
 
@@ -181,9 +210,35 @@ def test_kubernetes_watch_triggers_refresh() -> None:
         watcher.close()
 
 
+def test_ws_client_detects_expired_persisted_secret() -> None:
+    store = KubernetesSecretClient()
+    store.write_credentials("company", api_key="key-123", api_secret="secret-456")
+
+    namespace_store = store._store.setdefault(store.namespace, {})
+    record = namespace_store.setdefault(store.secret_name("company"), {})
+    expired_iso = (datetime.now(timezone.utc) - SECRET_MAX_AGE - timedelta(days=1)).isoformat()
+    record["rotated_at"] = expired_iso
+
+    manager = KrakenSecretManager("company", secret_store=store)
+    credentials = manager.get_credentials()
+
+    client = KrakenWSClient("company", credentials=credentials)
+
+    with pytest.raises(KrakenCredentialExpired):
+        client.add_order({"clientOrderId": "EXPIRED-PERSISTED"})
+
+
 def test_client_continues_order_flow_during_rotation(tmp_path: Path) -> None:
     secret_file = tmp_path / "kraken.json"
-    secret_file.write_text(json.dumps({"key": "init", "secret": "first"}))
+    secret_file.write_text(
+        json.dumps(
+            _file_secret_payload(
+                "init",
+                "first",
+                datetime.now(timezone.utc) - timedelta(minutes=5),
+            )
+        )
+    )
 
     watcher = KrakenCredentialWatcher(
         "company",
@@ -211,7 +266,15 @@ def test_client_continues_order_flow_during_rotation(tmp_path: Path) -> None:
         assert response["status"] == "ok"
         assert sessions[-1].credentials["api_key"] == "init"
 
-        secret_file.write_text(json.dumps({"key": "rotated", "secret": "second"}))
+        secret_file.write_text(
+            json.dumps(
+                _file_secret_payload(
+                    "rotated",
+                    "second",
+                    datetime.now(timezone.utc),
+                )
+            )
+        )
         watcher.trigger_refresh()
         assert watcher.wait_for_version(1, timeout=2.0)
 
