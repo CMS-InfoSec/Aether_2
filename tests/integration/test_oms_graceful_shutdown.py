@@ -1,9 +1,12 @@
 import asyncio
+import asyncio
 import importlib
 import os
 import signal
 import threading
 import time
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any, Dict
 
 import pytest
@@ -23,6 +26,7 @@ def test_sigterm_drains_inflight_requests(monkeypatch: pytest.MonkeyPatch) -> No
     oms_main = importlib.reload(importlib.import_module("services.oms.main"))
 
     from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
+    from services.oms.kraken_ws import OrderAck
 
     KafkaNATSAdapter.reset()
     TimescaleAdapter.flush_event_buffers()
@@ -79,24 +83,67 @@ def test_sigterm_drains_inflight_requests(monkeypatch: pytest.MonkeyPatch) -> No
 
     monkeypatch.setattr(graceful_shutdown.sys, "exit", _fake_exit)
 
-    class _SlowKrakenClient:
-        def __init__(self, account_id: str) -> None:
-            self.account_id = account_id
+    @asynccontextmanager
+    async def _slow_factory(account_id: str):
+        async def _credentials() -> Dict[str, Any]:
+            return {
+                "api_key": f"slow-{account_id}",
+                "api_secret": "secret",
+                "metadata": {"rotated_at": datetime.now(timezone.utc).isoformat()},
+            }
 
-        def add_order(self, payload: Dict[str, Any], timeout: float = 1.0) -> Dict[str, Any]:
-            time.sleep(0.35)
-            return {"status": "ok", "txid": "SIM-123"}
+        class _SlowWS:
+            async def add_order(self, payload: Dict[str, Any]) -> OrderAck:
+                await asyncio.sleep(0.35)
+                return OrderAck(
+                    exchange_order_id="SIM-123",
+                    status="ok",
+                    filled_qty=None,
+                    avg_price=None,
+                    errors=None,
+                )
 
-        def open_orders(self) -> Dict[str, Any]:
-            return {"open": []}
+            async def fetch_open_orders_snapshot(self) -> list[Dict[str, Any]]:
+                return []
 
-        def own_trades(self, txid: str | None = None) -> Dict[str, Any]:
-            return {"trades": []}
+            async def fetch_own_trades_snapshot(self) -> list[Dict[str, Any]]:
+                return []
 
-        def close(self) -> None:
-            return None
+            async def close(self) -> None:
+                return None
 
-    monkeypatch.setattr(oms_main, "KrakenWSClient", _SlowKrakenClient)
+        class _StubREST:
+            async def add_order(self, payload: Dict[str, Any]) -> OrderAck:
+                return OrderAck(
+                    exchange_order_id="SIM-REST",
+                    status="ok",
+                    filled_qty=None,
+                    avg_price=None,
+                    errors=None,
+                )
+
+            async def open_orders(self) -> Dict[str, Any]:
+                return {"result": {"open": []}}
+
+            async def own_trades(self) -> Dict[str, Any]:
+                return {"result": {"trades": {}}}
+
+            async def close(self) -> None:
+                return None
+
+        ws_client = _SlowWS()
+        rest_client = _StubREST()
+        try:
+            yield oms_main.KrakenClientBundle(  # type: ignore[attr-defined]
+                credential_getter=_credentials,
+                ws_client=ws_client,  # type: ignore[arg-type]
+                rest_client=rest_client,  # type: ignore[arg-type]
+            )
+        finally:
+            await ws_client.close()
+            await rest_client.close()
+
+    monkeypatch.setattr(oms_main.app.state, "kraken_client_factory", _slow_factory)
 
     request_payload = {
         "order_id": "OID-123",
