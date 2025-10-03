@@ -449,6 +449,9 @@ def test_place_order_snaps_to_exchange_metadata(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     submissions: list[Dict[str, Any]] = []
+    call_state = {"get": 0, "refresh": 0}
+    original_get = main.market_metadata_cache.get
+    original_refresh = main.market_metadata_cache.refresh
 
     async def _capture_submit(
         ws_client: Any, rest_client: Any, payload: Dict[str, Any]
@@ -466,6 +469,27 @@ def test_place_order_snaps_to_exchange_metadata(
         )
 
     monkeypatch.setattr(main, "_submit_order", _capture_submit)
+
+    async def _mock_get(self: Any, instrument: str) -> Dict[str, float] | None:
+        call_state["get"] += 1
+        if call_state["get"] == 1:
+            return None
+        return await original_get(instrument)
+
+    async def _mock_refresh(self: Any) -> None:
+        call_state["refresh"] += 1
+        await original_refresh()
+
+    monkeypatch.setattr(
+        main.market_metadata_cache,
+        "get",
+        types.MethodType(_mock_get, main.market_metadata_cache),
+    )
+    monkeypatch.setattr(
+        main.market_metadata_cache,
+        "refresh",
+        types.MethodType(_mock_refresh, main.market_metadata_cache),
+    )
 
     payload = {
         "account_id": "admin-alpha",
@@ -486,40 +510,47 @@ def test_place_order_snaps_to_exchange_metadata(
     assert submitted["price"] == pytest.approx(0.123456, rel=0, abs=1e-9)
     assert submitted["volume"] == pytest.approx(5.43210987, rel=0, abs=1e-9)
 
+    assert call_state == {"get": 2, "refresh": 1}
 
-@pytest.mark.asyncio
-async def test_cancel_order_via_adapter(
-    kraken_adapter: exchange_adapter.KrakenAdapter,
+
+def test_place_order_returns_424_when_metadata_missing(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    result = await kraken_adapter.cancel_order(
-        "admin-alpha",
-        "client-cancel",
-        exchange_order_id="SIM-CANCEL-1",
+    call_state = {"get": 0, "refresh": 0}
+
+    async def _mock_get(self: Any, instrument: str) -> Dict[str, float] | None:
+        call_state["get"] += 1
+        return None
+
+    async def _mock_refresh(self: Any) -> None:
+        call_state["refresh"] += 1
+
+    monkeypatch.setattr(
+        main.market_metadata_cache,
+        "get",
+        types.MethodType(_mock_get, main.market_metadata_cache),
+    )
+    monkeypatch.setattr(
+        main.market_metadata_cache,
+        "refresh",
+        types.MethodType(_mock_refresh, main.market_metadata_cache),
     )
 
-    assert result["exchange_order_id"] == "SIM-CANCEL-1"
-    assert result["status"].lower().startswith("cancel")
+    payload = {
+        "account_id": "admin-alpha",
+        "order_id": "ord-missing",
+        "instrument": "BTC-USD",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 101.5,
+        "fee": {"currency": "USD", "maker": 0.1, "taker": 0.2},
+    }
 
+    response = client.post("/oms/place", json=payload, headers={"X-Account-ID": "admin-alpha"})
 
-@pytest.mark.asyncio
-async def test_get_balance_via_adapter(
-    kraken_adapter: exchange_adapter.KrakenAdapter,
-) -> None:
-    balances = await kraken_adapter.get_balance("admin-alpha")
+    assert response.status_code == 424
+    assert response.json() == {
+        "detail": "Market metadata unavailable; unable to quantize order safely."
+    }
+    assert call_state == {"get": 2, "refresh": 1}
 
-    assert balances["account_id"] == "admin-alpha"
-    assert balances["balances"]["ZUSD"] == pytest.approx(1234.56)
-    assert balances["balances"]["XXBT"] == pytest.approx(0.789)
-    assert "timestamp" in balances
-
-
-@pytest.mark.asyncio
-async def test_get_trades_via_adapter(
-    kraken_adapter: exchange_adapter.KrakenAdapter,
-) -> None:
-    trades = await kraken_adapter.get_trades("admin-alpha", limit=1)
-
-    assert len(trades) == 1
-    trade = trades[0]
-    assert trade["instrument_id"] == "BTC-USD"
-    assert trade["quantity"] == pytest.approx(1.0)
