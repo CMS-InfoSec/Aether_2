@@ -440,24 +440,26 @@ class DailyReportService:
             fees_row = self._fetch_one(cursor, FEES_SUMMARY_QUERY, params) or {}
 
         open_nav = _as_float(open_row.get("nav", 0.0))
-        close_nav = _as_float(close_row.get("nav", 0.0))
+        nav_now = _as_float(close_row.get("nav", 0.0))
         realized = _as_float(pnl_row.get("realized_pnl", 0.0))
         unrealized = _as_float(pnl_row.get("unrealized_pnl", 0.0))
         fees = _as_float(fees_row.get("fees", 0.0))
 
         daily_return_pct = 0.0
         if open_nav:
-            daily_return_pct = ((close_nav - open_nav) / open_nav) * 100.0
+            daily_return_pct = ((nav_now - open_nav) / open_nav) * 100.0
 
         summary = {
             "account_id": target_account,
             "date": summary_date.isoformat(),
             "daily_return_pct": daily_return_pct,
-            "open_nav": open_nav,
-            "close_nav": close_nav,
-            "realized_pnl_usd": realized,
-            "unrealized_pnl_usd": unrealized,
-            "fees_usd": fees,
+            "nav_open": open_nav,
+            "nav_now": nav_now,
+            "components": {
+                "realized_pnl_usd": realized,
+                "unrealized_pnl_usd": unrealized,
+                "fees_usd": fees,
+            },
         }
 
         try:
@@ -465,7 +467,7 @@ class DailyReportService:
                 account_id=target_account,
                 nav_date=summary_date,
                 open_nav=open_nav,
-                close_nav=close_nav,
+                close_nav=nav_now,
                 daily_return_pct=daily_return_pct,
             )
         except Exception:  # pragma: no cover - best effort persistence

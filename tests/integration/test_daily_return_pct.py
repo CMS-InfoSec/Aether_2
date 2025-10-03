@@ -229,11 +229,11 @@ def test_daily_return_pct_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     assert payload["account_id"] == "alpha"
     assert payload["date"] == report_date.isoformat()
     assert payload["daily_return_pct"] == pytest.approx(expected_return)
-    assert payload["open_nav"] == pytest.approx(nav_rows[0]["nav"])
-    assert payload["close_nav"] == pytest.approx(nav_rows[1]["nav"])
-    assert payload["realized_pnl_usd"] == pytest.approx(480.0)
-    assert payload["unrealized_pnl_usd"] == pytest.approx(215.0)
-    assert payload["fees_usd"] == pytest.approx(7.5)
+    assert payload["nav_open"] == pytest.approx(nav_rows[0]["nav"])
+    assert payload["nav_now"] == pytest.approx(nav_rows[1]["nav"])
+    assert payload["components"]["realized_pnl_usd"] == pytest.approx(480.0)
+    assert payload["components"]["unrealized_pnl_usd"] == pytest.approx(215.0)
+    assert payload["components"]["fees_usd"] == pytest.approx(7.5)
 
     assert service.persisted_nav is not None
     assert service.persisted_nav["account_id"] == "alpha"
