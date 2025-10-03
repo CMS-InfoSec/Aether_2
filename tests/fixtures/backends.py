@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from threading import Lock
 from typing import Any, Dict, List, Optional
 
 import pytest
@@ -57,6 +58,26 @@ class FakeRedis:
         current = int(self._values.get(key, 0)) + amount
         self._values[key] = current
         return current
+
+
+class MemoryRedis:
+    """Thread-safe in-memory Redis replacement for synchronous code paths."""
+
+    def __init__(self) -> None:
+        self._values: Dict[str, str] = {}
+        self._lock = Lock()
+
+    def get(self, key: str) -> Optional[str]:
+        with self._lock:
+            return self._values.get(key)
+
+    def set(self, key: str, value: str) -> None:
+        with self._lock:
+            self._values[key] = value
+
+    def delete(self, key: str) -> None:
+        with self._lock:
+            self._values.pop(key, None)
 
 
 class FakeKafkaProducer:

@@ -5,10 +5,10 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 from threading import Lock
 import logging
-from typing import Dict, List, Optional, Union
+import os
+from typing import Any, Dict, List, Optional
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Request, status
 
@@ -120,41 +120,65 @@ class SafeModePersistedState:
 
 
 class SafeModeStateStore:
-    """Persist safe mode state to disk for crash recovery."""
+    """Persist safe mode state using a shared Redis key for crash recovery."""
 
-    def __init__(self, path: Optional[Union[str, Path]] = None) -> None:
-        self._path = Path(path) if path is not None else Path("safe_mode_state.json")
+    _DEFAULT_KEY = "safe-mode:state"
+
+    def __init__(self, redis_client: Optional[Any] = None, *, key: str = _DEFAULT_KEY) -> None:
         self._lock = Lock()
+        self._key = key
+        self._redis = redis_client or self._create_default_client()
+
+    @staticmethod
+    def _create_default_client() -> Any:
+        redis_url = os.getenv("SAFE_MODE_REDIS_URL", "redis://localhost:6379/0")
+        try:  # pragma: no cover - optional dependency path
+            import redis  # type: ignore[import-not-found]
+        except Exception as exc:  # pragma: no cover - defensive fallback when Redis is unavailable
+            raise RuntimeError("redis package is required for SafeModeStateStore") from exc
+        return redis.Redis.from_url(redis_url, decode_responses=True)
 
     def load(self) -> SafeModePersistedState:
         with self._lock:
-            if not self._path.exists():
-                return SafeModePersistedState(active=False, reason=None, timestamp=None)
             try:
-                payload = json.loads(self._path.read_text())
-            except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+                raw_state = self._redis.get(self._key)
+            except Exception as exc:  # pragma: no cover - best effort resilience if Redis is unavailable
+                LOGGER.warning("Failed to load safe mode state from Redis: %s", exc)
                 return SafeModePersistedState(active=False, reason=None, timestamp=None)
+
+            if raw_state is None:
+                return SafeModePersistedState(active=False, reason=None, timestamp=None)
+
+            if isinstance(raw_state, bytes):
+                try:
+                    raw_state = raw_state.decode("utf-8")
+                except UnicodeDecodeError:
+                    return SafeModePersistedState(active=False, reason=None, timestamp=None)
+
+            try:
+                payload = json.loads(raw_state)
+            except (TypeError, json.JSONDecodeError):
+                return SafeModePersistedState(active=False, reason=None, timestamp=None)
+
             if not isinstance(payload, dict):
                 return SafeModePersistedState(active=False, reason=None, timestamp=None)
+
             return SafeModePersistedState.from_dict(payload)
 
     def save(self, state: SafeModePersistedState) -> None:
+        serialized = json.dumps(state.to_dict())
         with self._lock:
             try:
-                if self._path.parent and not self._path.parent.exists():
-                    self._path.parent.mkdir(parents=True, exist_ok=True)
-                self._path.write_text(json.dumps(state.to_dict()))
-            except OSError:
-                return
+                self._redis.set(self._key, serialized)
+            except Exception as exc:  # pragma: no cover - best effort resilience if Redis is unavailable
+                LOGGER.warning("Failed to persist safe mode state to Redis: %s", exc)
 
     def clear(self) -> None:
         with self._lock:
             try:
-                self._path.unlink()
-            except FileNotFoundError:
-                return
-            except OSError:
-                return
+                self._redis.delete(self._key)
+            except Exception as exc:  # pragma: no cover - best effort resilience if Redis is unavailable
+                LOGGER.warning("Failed to clear safe mode state in Redis: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +235,8 @@ class OrderControls:
         self.open_orders: List[str] = []
         self.cancelled_orders: List[str] = []
         self.hedging_only: bool = False
+        # ``only_hedging`` is kept for backwards compatibility with legacy callers.
+        self.only_hedging: bool = False
 
     def cancel_open_orders(self) -> None:
         self.cancelled_orders.extend(self.open_orders)
@@ -218,14 +244,17 @@ class OrderControls:
 
     def restrict_to_hedging(self) -> None:
         self.hedging_only = True
+        self.only_hedging = True
 
     def lift_restrictions(self) -> None:
         self.hedging_only = False
+        self.only_hedging = False
 
     def reset(self) -> None:
         self.open_orders.clear()
         self.cancelled_orders.clear()
         self.hedging_only = False
+        self.only_hedging = False
 
 
 class IntentGuard:
@@ -362,7 +391,13 @@ class SafeModeController:
                 since=ts,
                 actor=actor,
             )
-
+            self._state_store.save(
+                SafeModePersistedState(
+                    active=True,
+                    reason=normalized_reason,
+                    timestamp=ts,
+                )
+            )
             entered = True
 
 

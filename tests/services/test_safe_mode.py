@@ -5,10 +5,13 @@ pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
 import safe_mode
+from tests.fixtures.backends import MemoryRedis
 
 
 @pytest.fixture(autouse=True)
 def reset_state() -> None:
+    backend = MemoryRedis()
+    safe_mode.controller._state_store = safe_mode.SafeModeStateStore(redis_client=backend)
     safe_mode.controller.reset()
     safe_mode.clear_safe_mode_log()
     yield
@@ -113,3 +116,19 @@ def test_safe_mode_endpoints_enforce_authentication() -> None:
 
     unauthenticated_exit = client.post("/safe_mode/exit")
     assert unauthenticated_exit.status_code == 401
+
+
+def test_safe_mode_state_survives_controller_restart() -> None:
+    backend = MemoryRedis()
+    store = safe_mode.SafeModeStateStore(redis_client=backend)
+
+    primary = safe_mode.SafeModeController(state_store=store)
+    primary.enter(reason="ops_drill", actor="company")
+
+    restarted = safe_mode.SafeModeController(state_store=safe_mode.SafeModeStateStore(redis_client=backend))
+
+    status = restarted.status()
+    assert status.active is True
+    assert status.reason == "ops_drill"
+    assert restarted.intent_guard.allow_new_intents is False
+    assert restarted.order_controls.hedging_only is True
