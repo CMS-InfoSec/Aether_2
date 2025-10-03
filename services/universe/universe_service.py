@@ -239,7 +239,8 @@ def _normalize_market(market: str) -> Optional[str]:
             break
 
     if not base_token or not quote_token:
-        return None
+        base = _normalize_asset_symbol(compact, is_quote=False)
+        return f"{base}-USD" if base else None
 
     base = _normalize_asset_symbol(base_token, is_quote=False)
     quote = _normalize_asset_symbol(quote_token, is_quote=True)

@@ -1,3 +1,4 @@
+import pytest
 from fastapi.testclient import TestClient
 
 from services.common.adapters import RedisFeastAdapter
@@ -10,6 +11,7 @@ from services.universe import main as universe_main
 from services.universe.main import app
 
 from services.universe.repository import UniverseRepository
+from tests.universe.conftest import UniverseTimescaleFixture
 
 
 class NoopFeastStore:
@@ -38,6 +40,7 @@ client = TestClient(app)
 
 
 @pytest.fixture(autouse=True)
+
 def reset_state(monkeypatch: pytest.MonkeyPatch) -> None:
     UniverseRepository.reset()
     RedisFeastAdapter._features.clear()
@@ -66,6 +69,7 @@ def reset_state(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_universe_approved_authorized_accounts():
+
     for account in ADMIN_ACCOUNTS:
         _prime_adapter_cache(account)
         adapter = RedisFeastAdapter(
