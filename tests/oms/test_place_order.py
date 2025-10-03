@@ -26,6 +26,12 @@ def reset_state() -> None:
     main.CircuitBreaker.reset()
 
 
+@pytest.fixture(autouse=True)
+def disable_shadow_fills(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(main.shadow_oms, "generate_shadow_fills", lambda *_, **__: [])
+    monkeypatch.setattr(main.shadow_oms, "record_real_fill", lambda *_, **__: None)
+
+
 def _seed_credentials(account_id: str) -> None:
     store = KrakenSecretStore()
     store.write_credentials(account_id, api_key="test-key", api_secret="test-secret")
@@ -82,6 +88,7 @@ def test_precision_snapping(client: TestClient, monkeypatch: pytest.MonkeyPatch)
 
     response = client.post("/oms/place", json=payload, headers={"X-Account-ID": "company"})
     assert response.status_code == 200
+    assert response.json()["accepted"] is True
 
     assert records, "Kraken client was not invoked"
     snapped_payload = records[0].requests[0]
@@ -162,3 +169,43 @@ def test_rest_fallback_when_ws_stalls(client: TestClient, monkeypatch: pytest.Mo
     assert events["acks"][0]["transport"] == "rest"
     history = KafkaNATSAdapter(account_id="company").history()
     assert any(entry["payload"].get("transport") == "rest" for entry in history if entry["topic"] == "oms.acks")
+
+
+def test_rejected_orders_surface_errors(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class RejectingClient:
+        def __init__(self, **_: Any) -> None:
+            pass
+
+        def add_order(self, payload: Dict[str, Any], timeout: float | None = None) -> Dict[str, Any]:
+            return {
+                "status": "rejected",
+                "error": ["EOrder:Insufficient funds"],
+                "transport": "websocket",
+            }
+
+        def open_orders(self) -> Dict[str, Any]:
+            return {"open": []}
+
+        def own_trades(self, txid: str | None = None) -> Dict[str, Any]:
+            return {"trades": []}
+
+        def close(self) -> None:  # pragma: no cover - interface shim
+            return None
+
+    monkeypatch.setattr(main, "KrakenWSClient", RejectingClient)
+
+    payload = {
+        "account_id": "company",
+        "order_id": "reject-1",
+        "instrument": "BTC-USD",
+        "side": "BUY",
+        "quantity": 0.1,
+        "price": 20000,
+        "fee": {"currency": "USD", "maker": 0.1, "taker": 0.2},
+    }
+
+    response = client.post("/oms/place", json=payload, headers={"X-Account-ID": "company"})
+    assert response.status_code == 400
+    assert "Insufficient funds" in response.json()["detail"]

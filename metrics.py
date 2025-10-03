@@ -531,6 +531,25 @@ def record_oms_latency(
     observe_oms_submit_latency(latency_ms, transport=transport, service=service)
 
 
+def record_ws_latency(
+    account: str,
+    symbol: str,
+    latency_ms: float,
+    *,
+    transport: str = "websocket",
+    service: Optional[str] = None,
+) -> None:
+    """Record latency observations for Kraken acknowledgements by transport."""
+
+    set_oms_latency(
+        latency_ms,
+        account=account,
+        symbol=symbol,
+        transport=transport,
+        service=service,
+    )
+
+
 def set_pipeline_latency(latency_ms: float, *, service: Optional[str] = None) -> None:
     _pipeline_latency_ms.labels(service=_service_value(service)).set(latency_ms)
 
@@ -560,6 +579,29 @@ def observe_oms_submit_latency(
     _oms_submit_latency.labels(
         service=_service_value(service), transport=_normalised(transport, "unknown")
     ).observe(latency_ms)
+
+
+def record_oms_submit_ack(
+    account: str,
+    symbol: str,
+    latency_ms: float,
+    *,
+    transport: str | None = None,
+    service: Optional[str] = None,
+) -> None:
+    """Record metrics for OMS submission acknowledgements."""
+
+    resolved_transport = transport or "unknown"
+    set_oms_latency(
+        latency_ms,
+        account=account,
+        symbol=symbol,
+        transport=resolved_transport,
+        service=service,
+    )
+    observe_oms_submit_latency(
+        latency_ms, transport=resolved_transport, service=service
+    )
 
 
 def record_abstention_rate(

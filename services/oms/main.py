@@ -265,8 +265,16 @@ def place_order(
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
 
     ack_latency_ms = (time.perf_counter() - start_time) * 1000.0
-    record_ws_latency(account_id, request.instrument, ack_latency_ms)
-    record_oms_submit_ack(account_id, request.instrument, ack_latency_ms)
+    transport = str(ack.get("transport", "websocket") or "websocket")
+    record_ws_latency(
+        account_id, request.instrument, ack_latency_ms, transport=transport
+    )
+    record_oms_submit_ack(
+        account_id,
+        request.instrument,
+        ack_latency_ms,
+        transport=transport,
+    )
 
     open_snapshot = client.open_orders()
     trades_snapshot = client.own_trades(txid=ack.get("txid"))
@@ -288,8 +296,41 @@ def place_order(
     kafka.publish(topic="oms.acks", payload=ack_payload)
 
     status_value = str(ack_payload.get("status", "")).lower()
-    if status_value and status_value not in {"ok", "accepted", "open"}:
+    accepted = status_value in {"ok", "accepted", "open"}
+    if status_value and not accepted:
         increment_trade_rejection(account_id, request.instrument)
+
+    if not accepted:
+        error_messages: List[str] = []
+        for key in ("error", "errors", "errorMessage", "error_message", "reason", "message"):
+            value = ack.get(key) or ack_payload.get(key)
+            if not value:
+                continue
+            if isinstance(value, str):
+                text = value.strip()
+                if text:
+                    error_messages.append(text)
+            elif isinstance(value, (list, tuple, set)):
+                for item in value:
+                    if not item:
+                        continue
+                    text = str(item).strip()
+                    if text:
+                        error_messages.append(text)
+            else:
+                text = str(value).strip()
+                if text:
+                    error_messages.append(text)
+
+        reason = "; ".join(dict.fromkeys(error_messages))
+        if not reason:
+            reason = "Order rejected by Kraken"
+            if status_value:
+                reason += f" (status: {status_value})"
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=reason,
+        )
 
     for trade in trades_snapshot.get("trades", []):
         fill_payload = {
@@ -335,7 +376,7 @@ def place_order(
         timescale.record_shadow_fill(shadow_fill)
 
     venue = "kraken"
-    return OrderPlacementResponse(accepted=True, routed_venue=venue, fee=request.fee)
+    return OrderPlacementResponse(accepted=accepted, routed_venue=venue, fee=request.fee)
 
 
 @app.get("/oms/shadow_pnl")
