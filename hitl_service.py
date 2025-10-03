@@ -16,8 +16,8 @@ Endpoints
 ``POST /hitl/approve``
     Record a director's decision and update the trade's lifecycle state.
 
-The implementation stores state in a lightweight SQLite database by default and
-uses asynchronous tasks to expire pending reviews when they time out.
+The queue persists in a managed PostgreSQL/Timescale database shared by all HITL
+replicas and asynchronous tasks enforce the approval SLA.
 """
 
 from __future__ import annotations
@@ -36,7 +36,6 @@ from pydantic import BaseModel, Field, PositiveFloat
 from sqlalchemy import Column, DateTime, String, Text, create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
-from sqlalchemy.pool import StaticPool
 
 
 logger = logging.getLogger(__name__)
@@ -63,23 +62,33 @@ class HitlQueueEntry(Base):
     ts = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
 
-_DEFAULT_DB_URL = "sqlite:///./hitl.db"
+DATABASE_URL_ENV = "HITL_DATABASE_URL"
 
 
 def _database_url() -> str:
-    url = os.getenv("HITL_DATABASE_URL") or os.getenv("TIMESCALE_DSN") or _DEFAULT_DB_URL
-    if url.startswith("postgresql://"):
-        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
-    return url
+    url = os.getenv(DATABASE_URL_ENV) or os.getenv("TIMESCALE_DSN")
+    if not url:
+        raise RuntimeError(
+            "HITL service requires a PostgreSQL/Timescale DSN via "
+            f"{DATABASE_URL_ENV} or TIMESCALE_DSN",
+        )
+
+    normalized = url.strip()
+    if normalized.startswith("postgresql://"):
+        normalized = normalized.replace("postgresql://", "postgresql+psycopg://", 1)
+    elif normalized.startswith("postgresql+psycopg://") or normalized.startswith("postgresql+psycopg2://"):
+        pass
+    else:
+        raise RuntimeError(
+            "HITL service requires a PostgreSQL/Timescale DSN via "
+            f"{DATABASE_URL_ENV} or TIMESCALE_DSN",
+        )
+
+    return normalized
 
 
-def _engine_options(url: str) -> Dict[str, Any]:
-    options: Dict[str, Any] = {"future": True}
-    if url.startswith("sqlite://"):
-        options.setdefault("connect_args", {"check_same_thread": False})
-        if url in {"sqlite:///:memory:", "sqlite://"} or url.endswith(":memory:"):
-            options["poolclass"] = StaticPool
-    return options
+def _engine_options(_url: str) -> Dict[str, Any]:
+    return {"future": True, "pool_pre_ping": True}
 
 
 _DB_URL = _database_url()
