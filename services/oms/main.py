@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import logging
 import os
 import sys
@@ -14,6 +15,14 @@ import time
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from fastapi import Depends, FastAPI, HTTPException, status
+
+from auth.service import (
+    InMemorySessionStore,
+    RedisSessionStore,
+    SessionStoreProtocol,
+)
+
+from services.common import security
 
 from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
 from services.common.schemas import OrderPlacementRequest, OrderPlacementResponse
@@ -50,6 +59,53 @@ from metrics import (
     setup_metrics,
 )
 
+
+def _build_session_store_from_env() -> SessionStoreProtocol:
+    ttl_minutes = int(os.getenv("SESSION_TTL_MINUTES", "60"))
+    redis_url = os.getenv("SESSION_REDIS_URL")
+    if redis_url:
+        try:  # pragma: no cover - optional dependency for redis-backed sessions
+            import redis  # type: ignore[import-not-found]
+        except ImportError as exc:  # pragma: no cover - surfaced when redis missing
+            raise RuntimeError("redis package is required when SESSION_REDIS_URL is set") from exc
+        client = redis.Redis.from_url(redis_url)
+        return RedisSessionStore(client, ttl_minutes=ttl_minutes)
+    return InMemorySessionStore(ttl_minutes=ttl_minutes)
+
+
+def _attach_auth_service(store: SessionStoreProtocol) -> object | None:
+    existing = getattr(app.state, "auth_service", None)
+    if existing is not None:
+        return existing
+
+    spec = os.getenv("OMS_AUTH_SERVICE_CLIENT")
+    if not spec:
+        return None
+
+    module_name, _, attr_name = spec.partition(":")
+    attr_name = attr_name or "auth_service"
+    try:
+        module = importlib.import_module(module_name)
+    except Exception:
+        logger.debug("Unable to import auth service client module '%s'", module_name)
+        return None
+
+    try:
+        client = getattr(module, attr_name)
+    except AttributeError:
+        logger.debug(
+            "Auth service client module '%s' is missing attribute '%s'", module_name, attr_name
+        )
+        return None
+
+    setattr(app.state, "auth_service", client)
+    if hasattr(client, "_sessions"):
+        try:
+            setattr(client, "_sessions", store)
+        except Exception:
+            logger.debug("Auth service client does not allow overriding session store")
+    return client
+
 SHUTDOWN_TIMEOUT = float(
     os.getenv("OMS_SHUTDOWN_TIMEOUT", os.getenv("SERVICE_SHUTDOWN_TIMEOUT", "60.0"))
 )
@@ -59,6 +115,13 @@ setup_metrics(app)
 
 
 logger = logging.getLogger(__name__)
+
+SESSION_STORE = _build_session_store_from_env()
+app.state.session_store = SESSION_STORE
+
+_AUTH_SERVICE = _attach_auth_service(SESSION_STORE)
+if _AUTH_SERVICE is None:
+    security.set_default_session_store(SESSION_STORE)
 
 
 async def _production_transport_factory(
