@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import (
     JSON,
@@ -33,6 +33,8 @@ from sqlalchemy import (
     create_engine,
 )
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
+
+from services.common.security import require_admin_account
 
 try:  # pragma: no cover - optional dependency in minimal environments.
     import mlflow
@@ -194,6 +196,7 @@ class TrainingJobState:
     metrics: MutableMapping[str, float] = field(default_factory=dict)
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     finished_at: Optional[datetime] = None
+    actor: Optional[str] = None
 
 
 _JOB_REGISTRY: Dict[str, TrainingJobState] = {}
@@ -759,7 +762,10 @@ app = FastAPI(title="Aether Training Service", version="1.0.0")
 
 
 @app.post("/ml/train/start", response_model=TrainingStartResponse, status_code=status.HTTP_202_ACCEPTED)
-async def start_training(request: TrainingRequest) -> TrainingStartResponse:
+async def start_training(
+    request: TrainingRequest,
+    actor: str = Depends(require_admin_account),
+) -> TrainingStartResponse:
     normalized_symbols: List[str] = []
     invalid_symbols: List[str] = []
 
@@ -780,7 +786,12 @@ async def start_training(request: TrainingRequest) -> TrainingStartResponse:
 
     run_id = str(uuid4())
     correlation_id = str(uuid4())
-    state = TrainingJobState(run_id=run_id, run_name=request.run_name, correlation_id=correlation_id)
+    state = TrainingJobState(
+        run_id=run_id,
+        run_name=request.run_name,
+        correlation_id=correlation_id,
+        actor=actor,
+    )
     await _register_job(state)
 
     with session_scope() as session:
@@ -804,13 +815,20 @@ async def start_training(request: TrainingRequest) -> TrainingStartResponse:
     logger.info(
         "Queued training run %s",
         run_id,
-        extra={"correlation_id": correlation_id, "model": request.model},
+        extra={
+            "correlation_id": correlation_id,
+            "model": request.model,
+            "requested_by": actor,
+        },
     )
     return TrainingStartResponse(run_id=run_id, correlation_id=correlation_id, status="queued")
 
 
 @app.post("/ml/train/promote", response_model=PromotionResponse)
-async def promote_model(request: PromoteRequest) -> PromotionResponse:
+async def promote_model(
+    request: PromoteRequest,
+    actor: str = Depends(require_admin_account),
+) -> PromotionResponse:
     correlation_id = str(uuid4())
     with session_scope() as session:
         record = session.get(TrainingRunRecord, request.model_run_id)
@@ -850,7 +868,7 @@ async def promote_model(request: PromoteRequest) -> PromotionResponse:
             logger.error(
                 "Failed to transition model version: %s",
                 exc,
-                extra={"correlation_id": correlation_id},
+                extra={"correlation_id": correlation_id, "requested_by": actor},
             )
             raise HTTPException(status_code=500, detail="MLflow promotion failed") from exc
 
@@ -864,6 +882,7 @@ async def promote_model(request: PromoteRequest) -> PromotionResponse:
                 details={
                     "metrics": metrics,
                     "stage": request.stage,
+                    "requested_by": actor,
                 },
             )
         )
@@ -872,7 +891,7 @@ async def promote_model(request: PromoteRequest) -> PromotionResponse:
         "Promoted run %s to %s",
         request.model_run_id,
         request.stage,
-        extra={"correlation_id": correlation_id},
+        extra={"correlation_id": correlation_id, "requested_by": actor},
     )
     return PromotionResponse(
         run_id=request.model_run_id,
@@ -883,10 +902,18 @@ async def promote_model(request: PromoteRequest) -> PromotionResponse:
 
 
 @app.get("/ml/train/status", response_model=StatusResponse)
-async def get_status(run_id: str = Query(..., description="Training run identifier")) -> StatusResponse:
+async def get_status(
+    run_id: str = Query(..., description="Training run identifier"),
+    actor: str = Depends(require_admin_account),
+) -> StatusResponse:
     state = await _get_job_state(run_id)
     if state:
         metrics = dict(state.metrics)
+        logger.info(
+            "Status queried for in-flight run %s",
+            run_id,
+            extra={"requested_by": actor},
+        )
         return StatusResponse(
             run_id=run_id,
             status=state.status,
@@ -903,6 +930,11 @@ async def get_status(run_id: str = Query(..., description="Training run identifi
         if record is None:
             raise HTTPException(status_code=404, detail="Training run not found")
         metrics = record.metrics or {}
+        logger.info(
+            "Status queried for run %s",
+            run_id,
+            extra={"requested_by": actor},
+        )
         return StatusResponse(
             run_id=run_id,
             status=record.status,
