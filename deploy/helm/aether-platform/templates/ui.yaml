@@ -1,0 +1,158 @@
+{{- $global := .Values.global -}}
+{{- $ui := .Values.ui -}}
+{{- if $ui.enabled }}
+{{- $name := default "aether-2-ui" $ui.nameOverride -}}
+{{- $labels := dict "name" $name "Release" $.Release -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "aether-platform.labels" $labels | nindent 4 }}
+    app: {{ $name }}
+spec:
+  replicas: {{ $ui.replicaCount | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "aether-platform.selectorLabels" (dict "name" $name) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "aether-platform.selectorLabels" (dict "name" $name) | nindent 8 }}
+        {{- include "aether-platform.labels" $labels | nindent 8 }}
+      {{- if and $global.krakenSecrets.enabled $ui.usesKrakenSecrets }}
+      annotations:
+        {{ $global.krakenSecrets.annotationKey }}: {{ $global.krakenSecrets.checksum | quote }}
+      {{- end }}
+    spec:
+      securityContext:
+        {{- toYaml $global.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ $name }}
+          image: {{ include "aether-platform.image" $ui.image }}
+          imagePullPolicy: {{ $global.imagePullPolicy }}
+          ports:
+            - containerPort: {{ $ui.containerPort | default 8080 }}
+              name: http
+          {{- $hasKraken := and $global.krakenSecrets.enabled $ui.usesKrakenSecrets }}
+          {{- $extraEnv := $ui.env | default (list) -}}
+          {{- $envEnabled := or $hasKraken (gt (len $extraEnv) 0) -}}
+          {{- if $envEnabled }}
+          env:
+            {{- if $hasKraken }}
+            - name: KRAKEN_SECRETS_BASE
+              value: {{ $global.krakenSecrets.basePath | quote }}
+            - name: AETHER_COMPANY_KRAKEN_SECRET_PATH
+              value: {{ printf "%s/company/credentials.json" $global.krakenSecrets.basePath | quote }}
+            - name: AETHER_DIRECTOR_1_KRAKEN_SECRET_PATH
+              value: {{ printf "%s/director-1/credentials.json" $global.krakenSecrets.basePath | quote }}
+            - name: AETHER_DIRECTOR_2_KRAKEN_SECRET_PATH
+              value: {{ printf "%s/director-2/credentials.json" $global.krakenSecrets.basePath | quote }}
+            {{- end }}
+            {{- range $extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          {{- $readiness := $global.probes.readiness -}}
+          readinessProbe:
+            {{- toYaml $readiness | nindent 12 }}
+          {{- $liveness := $global.probes.liveness -}}
+          livenessProbe:
+            {{- toYaml $liveness | nindent 12 }}
+          {{- with $ui.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml $global.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if $hasKraken }}
+            - name: kraken-credentials
+              mountPath: {{ $global.krakenSecrets.basePath | quote }}
+              readOnly: true
+            {{- end }}
+            {{- range $ui.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if $hasKraken }}
+        - name: kraken-credentials
+          projected:
+            defaultMode: 0440
+            sources:
+              - secret:
+                  name: {{ $global.krakenSecrets.secretRefs.company }}
+                  items:
+                    - key: credentials.json
+                      path: company/credentials.json
+                  optional: true
+              - secret:
+                  name: {{ $global.krakenSecrets.secretRefs.director1 }}
+                  items:
+                    - key: credentials.json
+                      path: director-1/credentials.json
+                  optional: true
+              - secret:
+                  name: {{ $global.krakenSecrets.secretRefs.director2 }}
+                  items:
+                    - key: credentials.json
+                      path: director-2/credentials.json
+                  optional: true
+        {{- end }}
+        {{- range $ui.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "aether-platform.labels" $labels | nindent 4 }}
+    app: {{ $name }}
+spec:
+  selector:
+    {{- include "aether-platform.selectorLabels" (dict "name" $name) | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ $ui.service.port | default 80 }}
+      targetPort: {{ $ui.service.targetPort | default "http" }}
+  type: ClusterIP
+{{- if $ui.ingress.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "aether-platform.labels" $labels | nindent 4 }}
+    app: {{ $name }}
+  annotations:
+    cert-manager.io/cluster-issuer: {{ $global.tls.issuer | quote }}
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+    {{- with $ui.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ $global.ingressClassName }}
+  tls:
+    - hosts:
+        - {{ $ui.ingress.host }}
+      secretName: {{ $ui.ingress.tlsSecret }}
+  rules:
+    - host: {{ $ui.ingress.host }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $name }}
+                port:
+                  number: {{ $ui.service.port | default 80 }}
+{{- end }}
+{{- end }}

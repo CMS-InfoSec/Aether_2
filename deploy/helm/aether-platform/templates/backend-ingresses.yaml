@@ -1,0 +1,38 @@
+{{- $global := .Values.global -}}
+{{- range $svcName, $svc := .Values.backendServices }}
+{{- if and $svc.enabled $svc.ingress.enabled }}
+{{- $name := default (printf "%s-service" $svcName) $svc.nameOverride -}}
+{{- $labels := dict "name" $name "Release" $.Release -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "aether-platform.labels" $labels | nindent 4 }}
+    app: {{ $name }}
+  annotations:
+    cert-manager.io/cluster-issuer: {{ $global.tls.issuer | quote }}
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+    {{- with $svc.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ $global.ingressClassName }}
+  tls:
+    - hosts:
+        - {{ $svc.ingress.host }}
+      secretName: {{ $svc.ingress.tlsSecret }}
+  rules:
+    - host: {{ $svc.ingress.host }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $name }}
+                port:
+                  number: {{ $svc.service.port | default 80 }}
+---
+{{- end }}
+{{- end }}

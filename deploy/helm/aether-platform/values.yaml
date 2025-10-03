@@ -1,0 +1,395 @@
+global:
+  imagePullPolicy: IfNotPresent
+  ingressClassName: nginx
+  tls:
+    issuer: letsencrypt-production
+  krakenSecrets:
+    enabled: true
+    basePath: /var/run/secrets/kraken
+    annotationKey: checksum/kraken-secrets
+    checksum: ""
+    secretRefs:
+      company: kraken-keys-company
+      director1: kraken-keys-director-1
+      director2: kraken-keys-director-2
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 2000
+    seccompProfile:
+      type: RuntimeDefault
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+    readOnlyRootFilesystem: true
+  probes:
+    liveness:
+      httpGet:
+        path: /metrics
+        port: http
+      initialDelaySeconds: 30
+      periodSeconds: 20
+      timeoutSeconds: 5
+      failureThreshold: 3
+    readiness:
+      httpGet:
+        path: /metrics
+        port: http
+      initialDelaySeconds: 20
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 3
+  networkPolicy:
+    enabled: true
+    allowFromIngress:
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: ingress-nginx
+    allowFromTrustedNamespaces:
+      matchLabels:
+        networking.aether.io/trusted: "true"
+    allowDnsNamespace:
+      matchLabels:
+        kubernetes.io/metadata.name: kube-system
+    allowDnsPodSelector:
+      matchLabels:
+        k8s-app: kube-dns
+    destinations:
+      kraken:
+        description: Kraken exchange endpoints
+        cidrs:
+          - 104.16.0.0/13
+          - 104.24.0.0/14
+          - 172.64.0.0/13
+          - 131.0.72.0/22
+        ports:
+          - 443
+      coingecko:
+        description: CoinGecko API endpoints
+        cidrs:
+          - 104.16.0.0/13
+          - 104.24.0.0/14
+          - 172.64.0.0/13
+          - 131.0.72.0/22
+        ports:
+          - 443
+      linodeObjectStorage:
+        description: Linode Object Storage endpoints
+        cidrs:
+          - 50.116.0.0/16
+          - 97.107.128.0/17
+          - 172.104.0.0/13
+        ports:
+          - 443
+backendServices:
+  fees:
+    enabled: true
+    nameOverride: fees-service
+    image:
+      repository: ghcr.io/aether/fees-service
+      tag: latest
+    replicaCount: 2
+    containerPort: 8000
+    env: []
+    usesKrakenSecrets: true
+    extraVolumeMounts: []
+    extraVolumes: []
+    service:
+      port: 80
+      targetPort: http
+    ingress:
+      enabled: true
+      host: fees.aether.example.com
+      tlsSecret: fees-service-tls
+      annotations: {}
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 6
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 60
+    pdb:
+      enabled: true
+      maxUnavailable: 1
+  oms:
+    enabled: true
+    nameOverride: oms-service
+    image:
+      repository: ghcr.io/aether/oms-service
+      tag: latest
+    replicaCount: 2
+    containerPort: 8000
+    env: []
+    usesKrakenSecrets: true
+    extraVolumeMounts: []
+    extraVolumes: []
+    service:
+      port: 80
+      targetPort: http
+    ingress:
+      enabled: true
+      host: oms.aether.example.com
+      tlsSecret: oms-service-tls
+      annotations: {}
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 8
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 70
+        - type: Resource
+          resource:
+            name: memory
+            target:
+              type: Utilization
+              averageUtilization: 75
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 60
+        scaleDown:
+          stabilizationWindowSeconds: 60
+    pdb:
+      enabled: true
+      maxUnavailable: 1
+  policy:
+    enabled: true
+    nameOverride: policy-service
+    image:
+      repository: ghcr.io/aether/policy-service
+      tag: latest
+    replicaCount: 2
+    containerPort: 8000
+    env: []
+    usesKrakenSecrets: true
+    extraVolumeMounts: []
+    extraVolumes: []
+    service:
+      port: 80
+      targetPort: http
+    ingress:
+      enabled: true
+      host: policy.aether.example.com
+      tlsSecret: policy-service-tls
+      annotations: {}
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 8
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 70
+        - type: Resource
+          resource:
+            name: memory
+            target:
+              type: Utilization
+              averageUtilization: 75
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 60
+        scaleDown:
+          stabilizationWindowSeconds: 60
+    pdb:
+      enabled: true
+      maxUnavailable: 1
+  risk:
+    enabled: true
+    nameOverride: risk-service
+    image:
+      repository: ghcr.io/aether/risk-service
+      tag: latest
+    replicaCount: 2
+    containerPort: 8000
+    env: []
+    usesKrakenSecrets: true
+    extraVolumeMounts: []
+    extraVolumes: []
+    service:
+      port: 80
+      targetPort: http
+    ingress:
+      enabled: true
+      host: risk.aether.example.com
+      tlsSecret: risk-service-tls
+      annotations: {}
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 8
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 70
+        - type: Resource
+          resource:
+            name: memory
+            target:
+              type: Utilization
+              averageUtilization: 75
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 60
+        scaleDown:
+          stabilizationWindowSeconds: 60
+    pdb:
+      enabled: true
+      maxUnavailable: 1
+  secrets:
+    enabled: true
+    nameOverride: secrets-service
+    image:
+      repository: ghcr.io/aether/secrets-service
+      tag: latest
+    replicaCount: 2
+    containerPort: 8000
+    env:
+      - name: SECRET_ENCRYPTION_KEY
+        valueFrom:
+          secretKeyRef:
+            name: secrets-service-config
+            key: SECRET_ENCRYPTION_KEY
+    usesKrakenSecrets: true
+    extraVolumeMounts: []
+    extraVolumes: []
+    service:
+      port: 80
+      targetPort: http
+    ingress:
+      enabled: true
+      host: secrets.aether.example.com
+      tlsSecret: secrets-service-tls
+      annotations: {}
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 6
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 60
+    pdb:
+      enabled: true
+      maxUnavailable: 1
+  universe:
+    enabled: true
+    nameOverride: universe-service
+    image:
+      repository: ghcr.io/aether/universe-service
+      tag: latest
+    replicaCount: 2
+    containerPort: 8000
+    env: []
+    usesKrakenSecrets: true
+    extraVolumeMounts: []
+    extraVolumes: []
+    service:
+      port: 80
+      targetPort: http
+    ingress:
+      enabled: true
+      host: universe.aether.example.com
+      tlsSecret: universe-service-tls
+      annotations: {}
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 6
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 60
+    pdb:
+      enabled: true
+      maxUnavailable: 1
+ui:
+  enabled: true
+  nameOverride: aether-2-ui
+  replicaCount: 2
+  image:
+    repository: ghcr.io/aether/aether-2-ui
+    tag: latest
+  containerPort: 8080
+  env: []
+  service:
+    port: 80
+    targetPort: http
+  ingress:
+    enabled: true
+    host: ui.aether.example.com
+    tlsSecret: aether-2-ui-tls
+    annotations: {}
+  resources: {}
+  usesKrakenSecrets: false
+  extraVolumeMounts: []
+  extraVolumes: []

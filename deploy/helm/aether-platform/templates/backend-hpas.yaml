@@ -1,0 +1,27 @@
+{{- range $svcName, $svc := .Values.backendServices }}
+{{- if and $svc.enabled $svc.hpa.enabled }}
+{{- $name := default (printf "%s-service" $svcName) $svc.nameOverride -}}
+{{- $labels := dict "name" $name "Release" $.Release -}}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "aether-platform.labels" $labels | nindent 4 }}
+    app: {{ $name }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ $name }}
+  minReplicas: {{ $svc.hpa.minReplicas | default 1 }}
+  maxReplicas: {{ $svc.hpa.maxReplicas | default 1 }}
+  metrics:
+    {{- toYaml $svc.hpa.metrics | nindent 4 }}
+  {{- with $svc.hpa.behavior }}
+  behavior:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+---
+{{- end }}
+{{- end }}

@@ -1,0 +1,23 @@
+{{- range $svcName, $svc := .Values.backendServices }}
+{{- if and $svc.enabled $svc.pdb.enabled }}
+{{- $name := default (printf "%s-service" $svcName) $svc.nameOverride -}}
+{{- $labels := dict "name" $name "Release" $.Release -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "aether-platform.labels" $labels | nindent 4 }}
+    app: {{ $name }}
+spec:
+  {{- if $svc.pdb.maxUnavailable }}
+  maxUnavailable: {{ $svc.pdb.maxUnavailable }}
+  {{- else if $svc.pdb.minAvailable }}
+  minAvailable: {{ $svc.pdb.minAvailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "aether-platform.selectorLabels" (dict "name" $name) | nindent 6 }}
+---
+{{- end }}
+{{- end }}

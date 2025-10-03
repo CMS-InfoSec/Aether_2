@@ -17,6 +17,8 @@ spec:
             template: evaluate-and-log
         - - name: canary-deploy
             template: canary-deploy
+        - - name: deploy-platform
+            template: deploy-platform
     - name: fetch-data
       container:
         image: '{{workflow.parameters.feature_image}}'
@@ -105,6 +107,19 @@ spec:
         envFrom:
           - secretRef:
               name: registry-credentials
+    - name: deploy-platform
+      container:
+        image: '{{workflow.parameters.ops_image}}'
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            set -euo pipefail
+            helm upgrade --install \
+              '{{workflow.parameters.platform_release_name}}' \
+              '{{workflow.parameters.umbrella_chart_path}}' \
+              --namespace '{{workflow.parameters.target_namespace}}' \
+              --create-namespace \
+              --wait --atomic
   volumes:
     - name: feast-repo
       persistentVolumeClaim:
@@ -114,3 +129,9 @@ spec:
       - name: feature_image
       - name: training_image
       - name: ops_image
+      - name: umbrella_chart_path
+        value: deploy/helm/aether-platform
+      - name: platform_release_name
+        value: aether-platform
+      - name: target_namespace
+        value: aether
