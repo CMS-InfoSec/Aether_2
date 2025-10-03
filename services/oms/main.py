@@ -305,8 +305,30 @@ def _instrument_from_pair(metadata: Dict[str, Any]) -> Optional[str]:
     return f"{base}-USD"
 
 
-def _parse_asset_pairs(payload: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
-    parsed: Dict[str, Dict[str, float]] = {}
+MetadataEntry = Dict[str, float | str]
+MarketMetadataDict = Dict[str, MetadataEntry]
+
+
+def _native_pair_identifier(entry: Dict[str, Any], instrument: str) -> str:
+    candidate = entry.get("wsname")
+    if isinstance(candidate, str) and candidate.strip():
+        return candidate.strip()
+
+    candidate = entry.get("altname")
+    if isinstance(candidate, str) and candidate.strip():
+        altname = candidate.strip()
+        if "/" in altname:
+            return altname
+        if altname.endswith("USD") and len(altname) > 3:
+            return f"{altname[:-3]}/USD"
+        return altname
+
+    fallback = instrument.replace("-", "/") if instrument else instrument
+    return fallback
+
+
+def _parse_asset_pairs(payload: Dict[str, Any]) -> MarketMetadataDict:
+    parsed: MarketMetadataDict = {}
     for entry in payload.values():
         if not isinstance(entry, dict):
             continue
@@ -320,6 +342,7 @@ def _parse_asset_pairs(payload: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
         parsed[_normalize_instrument(instrument)] = {
             "tick": float(tick),
             "lot": float(lot),
+            "native_pair": _native_pair_identifier(entry, instrument),
         }
     return parsed
 
@@ -340,7 +363,7 @@ async def _fetch_asset_pairs() -> Dict[str, Any]:
 
 class MarketMetadataCache:
     def __init__(self, refresh_interval: float) -> None:
-        self._data: Dict[str, Dict[str, float]] = {}
+        self._data: MarketMetadataDict = {}
         self._lock = asyncio.Lock()
         self._refresh_interval = max(refresh_interval, 0.0)
         self._task: Optional[asyncio.Task[None]] = None
@@ -372,13 +395,13 @@ class MarketMetadataCache:
         global MARKET_METADATA
         MARKET_METADATA = {symbol: dict(values) for symbol, values in parsed.items()}
 
-    async def get(self, instrument: str) -> Optional[Dict[str, float]]:
+    async def get(self, instrument: str) -> Optional[MetadataEntry]:
         key = _normalize_instrument(instrument)
         async with self._lock:
             entry = self._data.get(key)
             return dict(entry) if entry else None
 
-    async def snapshot(self) -> Dict[str, Dict[str, float]]:
+    async def snapshot(self) -> MarketMetadataDict:
         async with self._lock:
             return {symbol: dict(values) for symbol, values in self._data.items()}
 
@@ -403,7 +426,7 @@ def _metadata_refresh_interval() -> float:
 market_metadata_cache = MarketMetadataCache(_metadata_refresh_interval())
 app.state.market_metadata_cache = market_metadata_cache
 
-MARKET_METADATA: Dict[str, Dict[str, float]] = {}
+MARKET_METADATA: MarketMetadataDict = {}
 
 
 _SUCCESS_STATUSES = {"ok", "accepted", "open"}
@@ -1037,6 +1060,11 @@ async def place_order(
 
     tick_size = metadata.get("tick") if metadata else None
     lot_size = metadata.get("lot") if metadata else None
+    native_pair = None
+    if metadata:
+        pair_value = metadata.get("native_pair")
+        if isinstance(pair_value, str) and pair_value.strip():
+            native_pair = pair_value.strip()
 
     if not tick_size or not lot_size:
         raise HTTPException(
@@ -1061,7 +1089,7 @@ async def place_order(
 
     order_payload = {
         "clientOrderId": request.order_id,
-        "pair": request.instrument.replace("-", "/"),
+        "pair": native_pair or request.instrument.replace("-", "/"),
         "type": "buy" if request.side == "BUY" else "sell",
         "ordertype": "limit",
         "price": snapped_price,
