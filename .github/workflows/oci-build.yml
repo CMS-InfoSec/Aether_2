@@ -6,7 +6,7 @@ on:
     branches:
       - main
     paths:
-      - 'services/**'
+      - 'deploy/docker/**'
       - '.github/workflows/oci-build.yml'
 
 env:
@@ -16,10 +16,10 @@ jobs:
   kaniko:
     name: Kaniko Build
     runs-on: ubuntu-latest
-    if: ${{ hashFiles('services/order-gateway/Dockerfile') != '' && hashFiles('services/pricing-service/Dockerfile') != '' }}
+    if: ${{ hashFiles('deploy/docker/kraken-ws-ingest/Dockerfile') != '' && hashFiles('deploy/docker/risk-api/Dockerfile') != '' }}
     steps:
       - uses: actions/checkout@v4
-      - name: Build Order Gateway image
+      - name: Build Kraken WS Ingest image
         uses: addnab/docker-run-action@v3
         with:
           image: gcr.io/kaniko-project/executor:v1.18.0
@@ -29,11 +29,12 @@ jobs:
             -v /kaniko/.docker:/kaniko/.docker
           run: >-
             /kaniko/executor
-            --context /workspace/services/order-gateway
-            --destination ${REGISTRY}/order-gateway:${{ github.sha }}
+            --context /workspace
+            --dockerfile /workspace/deploy/docker/kraken-ws-ingest/Dockerfile
+            --destination ${REGISTRY}/kraken-ws-ingest:${{ github.sha }}
             --snapshotMode time
             --single-snapshot
-      - name: Build Pricing Service image
+      - name: Build Risk API image
         uses: addnab/docker-run-action@v3
         with:
           image: gcr.io/kaniko-project/executor:v1.18.0
@@ -43,8 +44,9 @@ jobs:
             -v /kaniko/.docker:/kaniko/.docker
           run: >-
             /kaniko/executor
-            --context /workspace/services/pricing-service
-            --destination ${REGISTRY}/pricing-service:${{ github.sha }}
+            --context /workspace
+            --dockerfile /workspace/deploy/docker/risk-api/Dockerfile
+            --destination ${REGISTRY}/risk-api:${{ github.sha }}
             --snapshotMode time
             --single-snapshot
   buildah:
@@ -56,16 +58,16 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Buildah
         run: sudo apt-get update && sudo apt-get install -y buildah
-      - name: Build Order Gateway image
+      - name: Build Kraken WS Ingest image
         run: |
-          buildah bud --layers -f services/order-gateway/Dockerfile -t ${REGISTRY}/order-gateway:${{ github.sha }} services/order-gateway
-      - name: Build Pricing Service image
+          buildah bud --layers -f deploy/docker/kraken-ws-ingest/Dockerfile -t ${REGISTRY}/kraken-ws-ingest:${{ github.sha }} .
+      - name: Build Risk API image
         run: |
-          buildah bud --layers -f services/pricing-service/Dockerfile -t ${REGISTRY}/pricing-service:${{ github.sha }} services/pricing-service
+          buildah bud --layers -f deploy/docker/risk-api/Dockerfile -t ${REGISTRY}/risk-api:${{ github.sha }} .
       - name: Push images
         env:
           CR_PAT: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "${CR_PAT}" | buildah login --username ${{ github.actor }} --password-stdin ghcr.io
-          buildah push ${REGISTRY}/order-gateway:${{ github.sha }}
-          buildah push ${REGISTRY}/pricing-service:${{ github.sha }}
+          buildah push ${REGISTRY}/kraken-ws-ingest:${{ github.sha }}
+          buildah push ${REGISTRY}/risk-api:${{ github.sha }}
