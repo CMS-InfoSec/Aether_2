@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from services.common.adapters import TimescaleAdapter
+from services.common.adapters import RedisFeastAdapter, TimescaleAdapter
 from services.common.schemas import (
     FeeBreakdown,
     PolicyDecisionPayload,
@@ -19,44 +19,44 @@ from services.common.schemas import (
 )
 from services.risk.engine import RiskEngine
 
-from services.universe.repository import MarketSnapshot, UniverseRepository
+class StubUniverseRepository:
+    def __init__(self) -> None:
+        self._approved: list[str] = []
+        self._fees: dict[str, dict[str, float | str]] = {}
+
+    def configure(
+        self,
+        approved: list[str],
+        fees: dict[str, dict[str, float | str]],
+    ) -> None:
+        self._approved = list(approved)
+        self._fees = {symbol: dict(payload) for symbol, payload in fees.items()}
+
+    def approved_universe(self) -> list[str]:
+        return list(self._approved)
+
+    def fee_override(self, instrument: str) -> dict[str, float | str] | None:
+        override = self._fees.get(instrument) or self._fees.get("default")
+        return dict(override) if override else None
+
+
+STUB_UNIVERSE = StubUniverseRepository()
 
 
 @pytest.fixture(autouse=True)
 def reset_state() -> Generator[None, None, None]:
     TimescaleAdapter.reset()
-    original_snapshots = list(UniverseRepository._market_snapshots.values())  # type: ignore[attr-defined]
-    UniverseRepository.seed_market_snapshots(
-        [
-            MarketSnapshot(
-                base_asset="BTC",
-                quote_asset="USD",
-                market_cap=1.0e9,
-                global_volume_24h=5.0e8,
-                kraken_volume_24h=2.5e8,
-                volatility_30d=0.5,
-            ),
-            MarketSnapshot(
-                base_asset="ETH",
-                quote_asset="USD",
-                market_cap=1.6e9,
-                global_volume_24h=3.0e8,
-                kraken_volume_24h=1.6e8,
-                volatility_30d=0.45,
-            ),
-            MarketSnapshot(
-                base_asset="SOL",
-                quote_asset="USD",
-                market_cap=1.1e9,
-                global_volume_24h=2.6e8,
-                kraken_volume_24h=1.3e8,
-                volatility_30d=0.5,
-            ),
-        ]
+    STUB_UNIVERSE.configure(
+        ["BTC-USD", "ETH-USD", "SOL-USD"],
+        {
+            "BTC-USD": {"currency": "USD", "maker": 0.1, "taker": 0.2},
+            "ETH-USD": {"currency": "USD", "maker": 0.12, "taker": 0.24},
+            "SOL-USD": {"currency": "USD", "maker": 0.15, "taker": 0.3},
+            "default": {"currency": "USD", "maker": 0.1, "taker": 0.2},
+        },
     )
     yield
     TimescaleAdapter.reset()
-    UniverseRepository.seed_market_snapshots(original_snapshots)
 
 
 
@@ -121,9 +121,14 @@ def make_request(**overrides: Any) -> RiskValidationRequest:
     return RiskValidationRequest(**request_payload)
 
 
+def make_engine(account_id: str) -> RiskEngine:
+    universe = RedisFeastAdapter(account_id=account_id, repository=STUB_UNIVERSE)
+    return RiskEngine(account_id=account_id, universe_source=universe)
+
+
 def test_engine_accepts_trade_within_limits() -> None:
     account = "company"
-    engine = RiskEngine(account_id=account)
+    engine = make_engine(account)
     request = make_request(account_id=account)
 
     response = engine.validate(request)
@@ -142,7 +147,7 @@ def test_engine_accepts_trade_within_limits() -> None:
 
 def test_engine_rejects_non_whitelisted_instrument() -> None:
     account = "company"
-    engine = RiskEngine(account_id=account)
+    engine = make_engine(account)
     request = make_request(account_id=account, instrument="DOGE-USD")
 
     response = engine.validate(request)
@@ -158,7 +163,7 @@ def test_engine_rejects_non_whitelisted_instrument() -> None:
 
 def test_engine_flags_var_breach_and_records_event() -> None:
     account = "company"
-    engine = RiskEngine(account_id=account)
+    engine = make_engine(account)
     request = make_request(account_id=account, var_95=500_000.0)
 
     response = engine.validate(request)
@@ -179,7 +184,7 @@ def test_engine_honors_kill_switch_and_short_circuits() -> None:
     original_config = adapter.load_risk_config()
     try:
         TimescaleAdapter._risk_configs[account]["kill_switch"] = True  # type: ignore[attr-defined]
-        engine = RiskEngine(account_id=account)
+        engine = make_engine(account)
         request = make_request(account_id=account)
 
         response = engine.validate(request)
@@ -195,7 +200,7 @@ def test_engine_honors_kill_switch_and_short_circuits() -> None:
 
 def test_engine_records_events_without_exception() -> None:
     account = "company"
-    engine = RiskEngine(account_id=account)
+    engine = make_engine(account)
     request = make_request(account_id=account, instrument="DOGE-USD")
 
     response = engine.validate(request)

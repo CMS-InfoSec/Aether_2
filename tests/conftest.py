@@ -136,6 +136,7 @@ def _install_sqlalchemy_stub() -> None:
     sa.Numeric = _Type
     sa.JSON = _Type
     sa.JSONB = _Type
+    sa.Text = _Type
     sa.MetaData = MetaData
     sa.Table = Table
     sa.func = SimpleNamespace(count=lambda *a, **k: 0)

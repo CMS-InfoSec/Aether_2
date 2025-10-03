@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import importlib
+import importlib
 import sys
 
 import pytest
 from fastapi.testclient import TestClient
 
+from services.universe import universe_service
+
 
 pytest.importorskip("sqlalchemy")
+
+if not hasattr(universe_service.ENGINE, "url"):
+    pytest.skip("sqlalchemy runtime support is required for universe service startup tests", allow_module_level=True)
 
 
 def _reload_universe_service():
