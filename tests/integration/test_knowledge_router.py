@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from auth.service import InMemoryAdminRepository
 
 from app import create_app
+from auth.service import InMemorySessionStore
 import pack_exporter
 from services.common.security import require_admin_account
 
@@ -42,7 +43,9 @@ def test_knowledge_router_is_registered(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(pack_exporter, "_s3_client", lambda config: _StubS3Client())
     monkeypatch.setenv("KNOWLEDGE_PACK_URL_TTL", "600")
 
+
     app = create_app(admin_repository=InMemoryAdminRepository())
+
     with TestClient(app) as client:
         client.app.dependency_overrides[require_admin_account] = lambda: "company"
         response = client.get("/knowledge/export/latest")

@@ -43,6 +43,8 @@ spec:
               value: /var/run/secrets/kraken/director-1/credentials.json
             - name: AETHER_DIRECTOR_2_KRAKEN_SECRET_PATH
               value: /var/run/secrets/kraken/director-2/credentials.json
+            - name: SESSION_REDIS_URL
+              value: redis://redis:6379/0
           readinessProbe:
             httpGet:
               path: /metrics
