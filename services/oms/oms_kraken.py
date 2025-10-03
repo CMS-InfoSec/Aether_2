@@ -136,6 +136,26 @@ def _extract_rotated_at(metadata: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _ensure_rotation_metadata(metadata: Dict[str, Any], *, source: str) -> str:
+    """Ensure rotation metadata is present and normalized."""
+
+    if not isinstance(metadata, dict):
+        raise RuntimeError(f"{source} missing rotation metadata block")
+
+    rotated_at = _extract_rotated_at(metadata)
+    if rotated_at is None:
+        raise RuntimeError(
+            f"{source} missing rotation metadata; unable to determine credential freshness"
+        )
+
+    annotations = metadata.get("annotations") if isinstance(metadata.get("annotations"), dict) else {}
+    annotations = dict(annotations)
+    annotations.setdefault(ANNOTATION_ROTATED_AT, rotated_at)
+    metadata["annotations"] = annotations
+    metadata["rotated_at"] = rotated_at
+    return rotated_at
+
+
 @dataclass
 class _CredentialSnapshot:
     version: int
@@ -405,6 +425,10 @@ class KrakenCredentialWatcher:
         payload = self._manager.get_credentials()
         payload.setdefault("metadata", {})
         payload["metadata"] = _sanitize_metadata(dict(payload["metadata"]))
+        _ensure_rotation_metadata(
+            payload["metadata"],
+            source=f"Kraken credentials for account '{self.account_id}'",
+        )
         return payload
 
     def _load_from_file(self, path: Path) -> Dict[str, Any]:
@@ -413,16 +437,20 @@ class KrakenCredentialWatcher:
         secret = data.get("api_secret") or data.get("secret")
         if not key or not secret:
             raise ValueError(f"Credential file at {path} missing key/secret")
-        rotated_at = datetime.now(timezone.utc).isoformat()
-        metadata = _sanitize_metadata({
-            "secret_path": str(path),
-            "material_present": True,
-            "api_key": key,
-            "api_secret": secret,
-            "rotated_at": rotated_at,
-        })
-        metadata["rotated_at"] = rotated_at
-        return {"api_key": key, "api_secret": secret, "metadata": metadata}
+        raw_metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+        metadata = dict(raw_metadata)
+        metadata.setdefault("secret_path", str(path))
+        metadata["material_present"] = True
+        metadata["api_key"] = key
+        metadata["api_secret"] = secret
+        rotated_at = _ensure_rotation_metadata(
+            metadata,
+            source=f"Credential file at {path}",
+        )
+        sanitized = _sanitize_metadata(metadata)
+        sanitized["annotations"] = dict(metadata.get("annotations", {}))
+        sanitized["rotated_at"] = rotated_at
+        return {"api_key": key, "api_secret": secret, "metadata": sanitized}
 
 
 __all__ = ["KrakenCredentialWatcher"]

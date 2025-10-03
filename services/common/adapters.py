@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, ClassVar, Dict, Iterable, List, Mapping, Optional
 
 from common.utils.tracing import attach_correlation, current_correlation_id
-from shared.k8s import KrakenSecretStore
+from shared.k8s import ANNOTATION_ROTATED_AT as K8S_ROTATED_AT, KrakenSecretStore
 from services.secrets.secure_secrets import (
     EncryptedSecretEnvelope,
     EnvelopeEncryptor,
@@ -803,6 +803,18 @@ class RedisFeastAdapter:
         )
 
 
+def _extract_secret_rotated_at(metadata: Mapping[str, Any]) -> Optional[str]:
+    rotated = metadata.get("rotated_at") or metadata.get("last_rotated_at")
+    if rotated:
+        return str(rotated)
+    annotations = metadata.get("annotations")
+    if isinstance(annotations, Mapping):
+        value = annotations.get(K8S_ROTATED_AT)
+        if value:
+            return str(value)
+    return None
+
+
 @dataclass
 class KrakenSecretManager:
     account_id: str
@@ -911,6 +923,12 @@ class KrakenSecretManager:
         metadata.setdefault("namespace", self.namespace)
         metadata["material_present"] = True
 
+        rotated_at = _extract_secret_rotated_at(metadata)
+        if rotated_at is None:
+            raise RuntimeError(
+                "Kraken credentials metadata missing rotation timestamp; cannot determine freshness."
+            )
+
         sanitized_metadata = deepcopy(metadata)
         for sensitive_field in (
             "api_key",
@@ -922,6 +940,14 @@ class KrakenSecretManager:
                 sanitized_metadata[sensitive_field] = "***"
         sanitized_metadata.setdefault("api_key", "***")
         sanitized_metadata.setdefault("api_secret", "***")
+        annotations = sanitized_metadata.get("annotations")
+        if isinstance(annotations, Mapping):
+            annotations = dict(annotations)
+        else:
+            annotations = {}
+        annotations.setdefault(K8S_ROTATED_AT, rotated_at)
+        sanitized_metadata["annotations"] = annotations
+        sanitized_metadata["rotated_at"] = rotated_at
 
         self.timescale.record_credential_access(
             secret_name=self.secret_name,
