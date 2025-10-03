@@ -188,6 +188,67 @@ backendServices:
     pdb:
       enabled: true
       maxUnavailable: 1
+  volatility:
+    enabled: true
+    nameOverride: volatility-service
+    image:
+      repository: ghcr.io/aether/volatility-service
+      tag: latest
+    replicaCount: 2
+    containerPort: 8000
+    env:
+      - name: ANALYTICS_DATABASE_URL
+        valueFrom:
+          secretKeyRef:
+            name: volatility-service-database
+            key: dsn
+      - name: ANALYTICS_DB_SSLMODE
+        value: require
+      - name: ANALYTICS_DB_POOL_SIZE
+        value: "20"
+      - name: ANALYTICS_DB_MAX_OVERFLOW
+        value: "10"
+      - name: ANALYTICS_DB_POOL_TIMEOUT
+        value: "30"
+      - name: ANALYTICS_DB_POOL_RECYCLE
+        value: "1800"
+    usesKrakenSecrets: false
+    extraVolumeMounts: []
+    extraVolumes: []
+    service:
+      port: 80
+      targetPort: http
+    ingress:
+      enabled: true
+      host: volatility.aether.example.com
+      tlsSecret: volatility-service-tls
+      annotations: {}
+    resources:
+      requests:
+        cpu: 150m
+        memory: 384Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 5
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 65
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 60
+        scaleDown:
+          stabilizationWindowSeconds: 120
+    pdb:
+      enabled: true
+      maxUnavailable: 1
   oms:
     enabled: true
     nameOverride: oms-service
