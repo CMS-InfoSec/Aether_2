@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, InvalidOperation
 
 import time
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple
