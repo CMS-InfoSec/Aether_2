@@ -29,7 +29,7 @@ def test_sigterm_drains_inflight_requests(monkeypatch: pytest.MonkeyPatch) -> No
     from services.oms.kraken_ws import OrderAck
 
     KafkaNATSAdapter.reset()
-    TimescaleAdapter.flush_event_buffers()
+    asyncio.run(TimescaleAdapter.flush_event_buffers())
     oms_main.shadow_oms.reset()
 
     flush_counts: Dict[str, int] = {"kafka": 0, "timescale": 0}
@@ -48,11 +48,11 @@ def test_sigterm_drains_inflight_requests(monkeypatch: pytest.MonkeyPatch) -> No
 
     original_timescale_flush = TimescaleAdapter.flush_event_buffers.__func__  # type: ignore[attr-defined]
 
-    def _tracked_timescale_flush(
+    async def _tracked_timescale_flush(
         cls: type[TimescaleAdapter],
     ) -> Dict[str, Dict[str, int]]:
         flush_counts["timescale"] += 1
-        return original_timescale_flush(cls)
+        return await original_timescale_flush(cls)
 
     monkeypatch.setattr(
         TimescaleAdapter,

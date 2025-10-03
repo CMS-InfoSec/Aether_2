@@ -59,7 +59,7 @@ def _setup_account_config() -> None:
             },
         }
     )
-    TimescaleAdapter._risk_configs[ACCOUNT_ID] = config
+    timescale.save_risk_config(config)
 
 
 def _seed_universe() -> None:
@@ -138,8 +138,7 @@ def _build_allocator():
 
 @pytest.fixture(autouse=True)
 def _setup_environment():
-    TimescaleAdapter._risk_configs.pop(ACCOUNT_ID, None)
-    TimescaleAdapter._instrument_exposures[ACCOUNT_ID] = {}
+    TimescaleAdapter.reset(account_id=ACCOUNT_ID)
     RedisFeastAdapter._online_feature_store.pop(ACCOUNT_ID, None)
     _setup_account_config()
     _seed_universe()
@@ -173,7 +172,9 @@ def test_compute_targets_enforces_caps():
 def test_adjust_intent_scales_down_when_concentration_exceeded():
     allocator = _build_allocator()
     # Existing BTC exposure representing 20% of NAV.
-    TimescaleAdapter._instrument_exposures[ACCOUNT_ID] = {"BTC-USD": 200_000.0}
+    TimescaleAdapter(account_id=ACCOUNT_ID).record_instrument_exposure(
+        "BTC-USD", 200_000.0
+    )
     intent = PolicyIntent(symbol="BTC-USD", side="BUY", notional=200_000.0, expected_edge_bps=18.0)
 
     adjustment = allocator.adjust_intent_for_diversification(intent)
@@ -187,11 +188,10 @@ def test_adjust_intent_scales_down_when_concentration_exceeded():
 def test_rebalance_plan_respects_fees_and_threshold():
     allocator = _build_allocator()
     # Current exposures in USD notionals.
-    TimescaleAdapter._instrument_exposures[ACCOUNT_ID] = {
-        "BTC-USD": 350_000.0,
-        "ETH-USD": 320_000.0,
-        "SOL-USD": 280_000.0,
-    }
+    timescale = TimescaleAdapter(account_id=ACCOUNT_ID)
+    timescale.record_instrument_exposure("BTC-USD", 350_000.0)
+    timescale.record_instrument_exposure("ETH-USD", 320_000.0)
+    timescale.record_instrument_exposure("SOL-USD", 280_000.0)
 
     plan = allocator.generate_rebalance_plan()
 

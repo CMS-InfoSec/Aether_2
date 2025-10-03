@@ -11,7 +11,7 @@ from services.oms.sim_broker import SimBroker
 @pytest.fixture(autouse=True)
 def _reset_adapters() -> None:
     KafkaNATSAdapter.reset()
-    TimescaleAdapter._events.clear()  # type: ignore[attr-defined]
+    TimescaleAdapter.reset()
 
 
 def test_market_order_immediate_fill() -> None:
@@ -41,8 +41,8 @@ def test_market_order_immediate_fill() -> None:
     assert fill_events, "expected a fill event to be published"
     assert fill_events[-1]["payload"]["simulated"] is True
 
-    fills = broker._timescale._events["ACC-DEFAULT"]["fills"]  # type: ignore[attr-defined]
-    assert fills[-1]["payload"]["simulated"] is True
+    fills = broker._timescale.events()["fills"]
+    assert fills[-1]["simulated"] is True
 
 
 def test_limit_order_partial_fill() -> None:
