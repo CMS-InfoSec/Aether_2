@@ -7,6 +7,7 @@ from .backpressure import (
     backpressure_controller,
 )
 from .sequencer import SequencerResult, TradingSequencer
+from .sim_mode import router as sim_mode_router
 from .startup_manager import (
     StartupManager,
     StartupMode,
@@ -25,6 +26,7 @@ __all__ = [
 
     "SequencerResult",
     "TradingSequencer",
+    "sim_mode_router",
     "StartupManager",
     "StartupMode",
     "CacheWarmer",

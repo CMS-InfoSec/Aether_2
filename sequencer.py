@@ -11,7 +11,7 @@ import logging
 import os
 import time
 import uuid
-from typing import Any, Awaitable, Callable, Deque, Dict, List, Mapping, MutableMapping, Optional, Tuple
+from typing import Any, Awaitable, Callable, Deque, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 from fastapi import FastAPI, HTTPException, status
 from fastapi.encoders import jsonable_encoder
@@ -21,12 +21,16 @@ import httpx
 from auth.session_client import AdminSessionManager, get_default_session_manager
 from common.utils import tracing
 from services.common.adapters import KafkaNATSAdapter
+
 from services.common.schemas import (
     FeeBreakdown,
     PolicyDecisionRequest,
     PolicyDecisionResponse,
 )
+
 from override_service import OverrideDecision, OverrideRecord, latest_override
+
+import httpx
 
 from metrics import (
     increment_rejected_intents,
@@ -51,11 +55,17 @@ DEFAULT_RISK_TIMEOUT = float(os.getenv("SEQUENCER_RISK_TIMEOUT", "2.0"))
 DEFAULT_OMS_TIMEOUT = float(os.getenv("SEQUENCER_OMS_TIMEOUT", "2.5"))
 DEFAULT_PUBLISH_TIMEOUT = float(os.getenv("SEQUENCER_PUBLISH_TIMEOUT", "1.0"))
 
+
 POLICY_SERVICE_URL = os.getenv("POLICY_SERVICE_URL", "http://policy-service").strip()
 POLICY_DECISION_ENDPOINT = os.getenv("POLICY_DECISION_ENDPOINT", "/policy/decide").strip()
 
+
 RECENT_RUN_CAPACITY = int(os.getenv("SEQUENCER_HISTORY_SIZE", "200"))
 TOPIC_PREFIX = os.getenv("SEQUENCER_TOPIC_PREFIX", "sequencer")
+DEFAULT_EXCHANGE = os.getenv("PRIMARY_EXCHANGE", "kraken")
+
+
+EXCHANGE_ADAPTER = get_exchange_adapter(DEFAULT_EXCHANGE)
 
 
 def _join_url(base_url: str, endpoint: str) -> str:
@@ -216,10 +226,11 @@ class SequencerStatusResponse(BaseModel):
 class StageError(Exception):
     """Base class for stage execution errors."""
 
-    def __init__(self, stage: str, message: str) -> None:
+    def __init__(self, stage: str, message: str, *, details: Optional[Mapping[str, Any]] = None) -> None:
         super().__init__(message)
         self.stage = stage
         self.message = message
+        self.details = dict(details) if details is not None else None
 
 
 class StageTimeoutError(StageError):
@@ -272,6 +283,8 @@ class Stage:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+            if isinstance(exc, StageError):
+                raise
             raise StageFailedError(self.name, f"Stage '{self.name}' failed: {exc}") from exc
 
         if not isinstance(result, StageResult):
@@ -515,7 +528,10 @@ class SequencerPipeline:
                 status_value = "failed"
                 error_message = f"{exc.stage}: {exc.message}"
                 increment_rejected_intents(exc.stage, exc.message)
-                error_payload = tracing.attach_correlation({"error": exc.message})
+                error_payload: Dict[str, Any] = {"error": exc.message}
+                if getattr(exc, "details", None):
+                    error_payload["details"] = exc.details
+                error_payload = tracing.attach_correlation(error_payload)
                 await publisher.publish_event(
                     exc.stage,
                     "failed",
@@ -639,6 +655,7 @@ def _safe_float(value: Any) -> float:
         return 0.0
 
 
+
 def _build_policy_request(intent: Mapping[str, Any], ctx: PipelineContext) -> PolicyDecisionRequest:
     if not intent:
         raise StageFailedError("policy", "Intent payload is missing for policy evaluation")
@@ -684,6 +701,7 @@ def _build_policy_request(intent: Mapping[str, Any], ctx: PipelineContext) -> Po
     return PolicyDecisionRequest(**request_kwargs)
 
 
+
 async def policy_handler(payload: Dict[str, Any], ctx: PipelineContext) -> StageResult:
     intent = payload.get("intent", {})
     try:
@@ -727,19 +745,103 @@ async def risk_handler(payload: Dict[str, Any], ctx: PipelineContext) -> StageRe
         raise StageFailedError("risk", message)
 
     intent = payload.get("intent", {})
-    quantity = _safe_float(intent.get("quantity") or intent.get("qty"))
-    price = _safe_float(intent.get("price") or intent.get("limit_px"))
-    notional = abs(quantity * price)
-    assessment = {
-        "valid": True,
-        "reasons": [],
-        "assessed_at": datetime.now(timezone.utc).isoformat(),
-        "projected_notional": notional,
-        "net_exposure": quantity,
+    request_payload: Dict[str, Any] = {
+        "account_id": ctx.account_id,
+        "intent": intent,
+        "policy_decision": decision,
     }
-    new_payload = dict(payload)
-    new_payload["risk_validation"] = assessment
-    return StageResult(payload=new_payload, artifact=assessment)
+    if "portfolio_state" in payload:
+        request_payload["portfolio_state"] = payload["portfolio_state"]
+    if "risk_context" in payload:
+        request_payload["context"] = payload["risk_context"]
+
+    url = f"{RISK_SERVICE_URL.rstrip('/')}/risk/validate"
+    headers = {"X-Account-ID": ctx.account_id}
+
+    max_attempts = max(1, RISK_SERVICE_MAX_RETRIES + 1)
+    backoff = max(0.0, RISK_SERVICE_BACKOFF_SECONDS)
+    attempts = 0
+    last_error: Optional[Exception] = None
+
+    while attempts < max_attempts:
+        attempts += 1
+        try:
+            async with httpx.AsyncClient(timeout=RISK_SERVICE_TIMEOUT) as client:
+                response = await client.post(url, json=request_payload, headers=headers)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code
+            if 500 <= status_code < 600 and attempts < max_attempts:
+                last_error = exc
+                if backoff:
+                    await asyncio.sleep(backoff)
+                    backoff *= 2
+                continue
+
+            try:
+                error_detail = exc.response.json()
+            except ValueError:
+                error_detail = exc.response.text
+
+            raise StageFailedError(
+                "risk",
+                f"Risk validation request failed with status {status_code}",
+                details={
+                    "status_code": status_code,
+                    "response": error_detail,
+                },
+            ) from exc
+        except (httpx.TimeoutException, httpx.RequestError) as exc:
+            last_error = exc
+            if attempts >= max_attempts:
+                raise StageFailedError(
+                    "risk",
+                    f"Risk validation failed after {attempts} attempts: {exc.__class__.__name__}: {exc}",
+                    details={"attempts": attempts, "error": str(exc)},
+                ) from exc
+            if backoff:
+                await asyncio.sleep(backoff)
+                backoff *= 2
+            continue
+
+        try:
+            validation_payload = response.json()
+        except ValueError as exc:
+            raise StageFailedError(
+                "risk",
+                "Risk validation returned invalid JSON",
+                details={"response": response.text},
+            ) from exc
+
+        if not isinstance(validation_payload, Mapping):
+            raise StageFailedError(
+                "risk",
+                "Risk validation returned unexpected payload",
+                details={"response": validation_payload},
+            )
+
+        reasons = [str(reason) for reason in validation_payload.get("reasons") or []]
+        is_valid = bool(validation_payload.get("valid"))
+        if not is_valid:
+            message = "Risk validation rejected intent"
+            if reasons:
+                message += ": " + "; ".join(reasons)
+            raise StageFailedError(
+                "risk",
+                message,
+                details={"reasons": reasons, "response": validation_payload},
+            )
+
+        new_payload = dict(payload)
+        new_payload["risk_validation"] = dict(validation_payload)
+        return StageResult(payload=new_payload, artifact=dict(validation_payload))
+
+    assert last_error is not None  # pragma: no cover - defensive guard
+    raise StageFailedError(
+        "risk",
+        "Risk validation failed due to repeated errors",
+        details={"attempts": attempts, "error": str(last_error)},
+    )
 
 
 async def risk_rollback(result: StageResult, ctx: PipelineContext) -> None:
@@ -793,30 +895,125 @@ async def oms_handler(payload: Dict[str, Any], ctx: PipelineContext) -> StageRes
         raise StageFailedError("oms", "Risk validation failed")
 
     intent = payload.get("intent", {})
-    client_order_id = intent.get("order_id") or str(uuid.uuid4())
-    filled_qty = _safe_float(intent.get("quantity") or intent.get("qty") or 0.0)
-    avg_price = _safe_float(intent.get("price") or intent.get("limit_px") or 0.0)
-    oms_result = {
-        "accepted": True,
-        "routed_venue": intent.get("venue") or "default",
+    account_id = str(intent.get("account_id") or ctx.account_id or "").strip()
+    if not account_id:
+        raise StageFailedError("oms", "Intent is missing account_id for order submission")
+
+    client_order_id = (
+        str(intent.get("order_id") or intent.get("client_id") or ctx.intent_id or uuid.uuid4())
+    )
+
+    order_payload, shadow = _build_order_payload(intent, account_id, client_order_id)
+
+    if not EXCHANGE_ADAPTER.supports("place_order"):
+        raise StageFailedError(
+            "oms",
+            f"Exchange adapter '{EXCHANGE_ADAPTER.name}' does not support order placement",
+        )
+
+    try:
+        adapter_response = await EXCHANGE_ADAPTER.place_order(
+            account_id,
+            order_payload,
+            shadow=shadow,
+        )
+    except Exception as exc:  # pragma: no cover - defensive guard
+        LOGGER.exception("OMS submission failed for order %s", client_order_id)
+        raise StageFailedError("oms", f"Failed to submit order: {exc}") from exc
+
+    ack = _as_dict(adapter_response)
+    accepted = bool(ack.get("accepted"))
+    errors = _normalize_strings(ack.get("errors") or ack.get("rejection_reasons"))
+    fills = _normalize_fills(ack.get("fills") or ack.get("executions"))
+    filled_qty = _safe_float(ack.get("filled_qty"))
+    if filled_qty <= 0.0 and fills:
+        filled_qty = sum(_safe_float(_extract_quantity(fill)) for fill in fills)
+    if filled_qty <= 0.0:
+        filled_qty = _safe_float(intent.get("quantity") or intent.get("qty"))
+
+    avg_price = _safe_float(ack.get("avg_price"))
+    if avg_price <= 0.0:
+        notional = sum(
+            _safe_float(fill.get("price")) * _safe_float(_extract_quantity(fill))
+            for fill in fills
+        )
+        if filled_qty > 0.0 and notional > 0.0:
+            avg_price = notional / filled_qty
+        else:
+            avg_price = _safe_float(intent.get("price") or intent.get("limit_px"))
+
+    oms_result: Dict[str, Any] = {
+        "accepted": accepted,
+        "account_id": account_id,
+        "routed_venue": ack.get("routed_venue") or intent.get("venue"),
         "client_order_id": client_order_id,
+        "exchange_order_id": ack.get("exchange_order_id") or ack.get("txid"),
         "filled_qty": filled_qty,
         "avg_price": avg_price,
+        "fills": fills,
+        "rejection_reasons": errors,
+        "transport": ack.get("transport") or "exchange_adapter",
         "completed_at": datetime.now(timezone.utc).isoformat(),
     }
+    if "fee" in ack and ack["fee"] is not None:
+        oms_result["fee"] = ack["fee"]
+    if ack.get("kraken_status"):
+        oms_result["kraken_status"] = ack.get("kraken_status")
+
     new_payload = dict(payload)
     new_payload["oms_result"] = oms_result
+
+    if not accepted:
+        detail = ", ".join(errors)
+        if not detail:
+            status_text = ack.get("kraken_status") or ack.get("status")
+            if status_text:
+                detail = str(status_text)
+        if not detail:
+            detail = "Order rejected by OMS"
+        raise StageFailedError("oms", detail)
+
     return StageResult(payload=new_payload, artifact=oms_result)
 
 
 async def oms_rollback(result: StageResult, ctx: PipelineContext) -> None:
+    artifact = result.artifact if isinstance(result.artifact, dict) else {}
+    event_payload = dict(artifact)
+    cancel_result: Optional[Mapping[str, Any]] = None
+    cancel_error: Optional[str] = None
+
+    accepted = bool(artifact.get("accepted"))
+    client_order_id = str(
+        artifact.get("client_order_id") or artifact.get("order_id") or ctx.intent_id
+    )
+    exchange_order_id = artifact.get("exchange_order_id")
+    rollback_account = str(artifact.get("account_id") or ctx.account_id)
+
+    if accepted and EXCHANGE_ADAPTER.supports("cancel_order"):
+        try:
+            cancel_result = await EXCHANGE_ADAPTER.cancel_order(
+                rollback_account,
+                client_order_id,
+                exchange_order_id=str(exchange_order_id) if exchange_order_id else None,
+            )
+        except Exception as exc:  # pragma: no cover - best-effort cancellation
+            LOGGER.warning(
+                "OMS rollback cancellation failed for order %s: %s", client_order_id, exc
+            )
+            cancel_error = str(exc)
+
+    if cancel_result is not None:
+        event_payload["cancel_result"] = _as_dict(cancel_result)
+    if cancel_error is not None:
+        event_payload["cancel_error"] = cancel_error
+
     await ctx.publisher.publish_event(
         "oms",
         "rollback",
         run_id=ctx.run_id,
         intent_id=ctx.intent_id,
         account_id=ctx.account_id,
-        data=result.artifact,
+        data=event_payload,
     )
 
 

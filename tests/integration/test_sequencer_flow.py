@@ -8,7 +8,9 @@ import pytest
 
 pytest.importorskip("fastapi")
 
+
 from sequencer import StageFailedError, pipeline
+
 from services.common.adapters import KafkaNATSAdapter
 from services.common.schemas import PolicyDecisionRequest, PolicyDecisionResponse
 from tests.factories import policy_decision_response
@@ -37,9 +39,11 @@ async def test_sequencer_flow_emits_complete_audit_trail(monkeypatch: pytest.Mon
     # ``latest_override`` consults a SQLite store; stub it out so we remain in-memory.
     monkeypatch.setattr("override_service.latest_override", lambda intent_id: None)
 
+
     decision = policy_decision_response()
     policy_stub = _StubPolicyClient([decision])
     monkeypatch.setattr("sequencer.policy_client", policy_stub)
+
 
     intent: Dict[str, Any] = {
         "account_id": "AlphaDesk",

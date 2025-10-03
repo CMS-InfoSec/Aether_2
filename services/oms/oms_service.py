@@ -750,6 +750,13 @@ class AccountContext:
             self._feed_sla_seconds = 2.0
 
 
+    async def _is_simulation_active(self) -> bool:
+        if sim_mode_state.active:
+            return True
+        status = await self._sim_mode_repo.get_status_async()
+        return status.active
+
+
     async def _throttle_ws(self, endpoint: str, *, urgent: bool = False) -> None:
         await self.rate_limits.acquire(
             self.account_id,
@@ -1404,7 +1411,11 @@ class AccountContext:
             return None
 
     async def place_order(self, request: OMSPlaceRequest) -> OMSPlaceResponse:
-        await self.start()
+        sim_active = await self._is_simulation_active()
+        if sim_active:
+            await self.credentials.start()
+        else:
+            await self.start()
 
         async def _simulate() -> OMSOrderStatusResponse:
             metadata = await self.credentials.get_metadata()
@@ -1471,8 +1482,7 @@ class AccountContext:
                 request.limit_px,
                 metadata,
             )
-            sim_status = await self._sim_mode_repo.get_status_async()
-            if sim_status.active:
+            if sim_active:
                 return await self._execute_simulated_order(request, qty, px)
 
             assert self.ws_client is not None
@@ -1641,11 +1651,11 @@ class AccountContext:
 
 
         cache_key = f"place:{request.client_id}"
-        factory = _simulate() if sim_mode_state.active else _execute()
+        factory = _simulate() if sim_active else _execute()
         result, reused = await self.idempotency.get_or_create(cache_key, factory)
         async with self._orders_lock:
             record = self._orders.get(request.client_id)
-        default_transport = "simulation" if sim_mode_state.active else "websocket"
+        default_transport = "simulation" if sim_active else "websocket"
         transport = record.transport if record else default_transport
         if record is not None:
             await self._record_trade_impact(record)
@@ -1661,7 +1671,11 @@ class AccountContext:
         )
 
     async def cancel_order(self, request: OMSCancelRequest) -> OMSOrderStatusResponse:
-        await self.start()
+        sim_active = await self._is_simulation_active()
+        if sim_active:
+            await self.credentials.start()
+        else:
+            await self.start()
 
         async def _execute_cancel() -> OMSOrderStatusResponse:
             async with self._orders_lock:
@@ -1690,6 +1704,12 @@ class AccountContext:
                     sim_record = self._snapshot_to_record(snapshot)
                     await self._store_sim_record(sim_record)
                     return self._snapshot_to_response(snapshot)
+
+            if sim_active:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Unknown simulated order for cancellation",
+                )
 
             assert self.ws_client is not None
             assert self.rest_client is not None
