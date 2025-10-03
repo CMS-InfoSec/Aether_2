@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib
 import sys
 from typing import Iterator, Tuple
 
@@ -11,23 +10,20 @@ import pytest
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
+from tests.helpers.override_service import bootstrap_override_service
+
 
 @pytest.fixture
 def override_client(tmp_path, monkeypatch) -> Iterator[Tuple[object, TestClient]]:
     """Provide a freshly-initialized override service TestClient for each test."""
 
-    db_path = tmp_path / "override.db"
-    monkeypatch.setenv("OVERRIDE_DATABASE_URL", f"sqlite:///{db_path}")
-
-    sys.modules.pop("override_service", None)
-    module = importlib.import_module("override_service")
-    module.Base.metadata.drop_all(bind=module.ENGINE)
-    module.Base.metadata.create_all(bind=module.ENGINE)
+    module = bootstrap_override_service(tmp_path, monkeypatch, reset=True)
 
     with TestClient(module.app) as client:
         yield module, client
 
     module.app.dependency_overrides.clear()
+    module.ENGINE.dispose()
     sys.modules.pop("override_service", None)
 
 

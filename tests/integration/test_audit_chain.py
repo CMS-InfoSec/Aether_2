@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from unittest.mock import MagicMock
 
 from common.utils import audit_logger
+from tests.helpers.override_service import bootstrap_override_service
 
 
 class _FakeApiException(Exception):
@@ -69,8 +70,11 @@ def test_audit_chain_across_services(tmp_path, monkeypatch, capsys):
     rest_module = ModuleType("kubernetes.client.rest")
     config_module = ModuleType("kubernetes.config")
     config_exc_module = ModuleType("kubernetes.config.config_exception")
+    signing_module = ModuleType("services.secrets.signing")
+    signing_module.sign_kraken_request = lambda path, payload, secret: (payload, "signature")  # type: ignore[assignment]
 
     client_module.CoreV1Api = lambda: fake_core  # type: ignore[attr-defined]
+    client_module.ApiException = _FakeApiException  # type: ignore[attr-defined]
     rest_module.ApiException = _FakeApiException  # type: ignore[attr-defined]
     config_module.load_incluster_config = lambda: None  # type: ignore[attr-defined]
     config_module.load_kube_config = lambda: None  # type: ignore[attr-defined]
@@ -84,6 +88,7 @@ def test_audit_chain_across_services(tmp_path, monkeypatch, capsys):
     monkeypatch.setitem(sys.modules, "kubernetes.client.rest", rest_module)
     monkeypatch.setitem(sys.modules, "kubernetes.config", config_module)
     monkeypatch.setitem(sys.modules, "kubernetes.config.config_exception", config_exc_module)
+    monkeypatch.setitem(sys.modules, "services.secrets.signing", signing_module)
 
     chain_log = tmp_path / "chain.log"
     chain_state = tmp_path / "chain_state.json"
@@ -93,7 +98,7 @@ def test_audit_chain_across_services(tmp_path, monkeypatch, capsys):
 
     monkeypatch.setenv("CONFIG_ALLOW_SQLITE_FOR_TESTS", "1")
     monkeypatch.setenv("CONFIG_DATABASE_URL", f"sqlite:///{tmp_path / 'config.db'}")
-    monkeypatch.setenv("OVERRIDE_DATABASE_URL", f"sqlite:///{tmp_path / 'override.db'}")
+    override_service = bootstrap_override_service(tmp_path, monkeypatch, reset=True)
     encryption_key = base64.b64encode(b"0" * 32).decode()
     monkeypatch.setenv("SECRET_ENCRYPTION_KEY", encryption_key)
     monkeypatch.setenv("SECRETS_SERVICE_AUTH_TOKENS", "integration-token")
@@ -102,29 +107,40 @@ def test_audit_chain_across_services(tmp_path, monkeypatch, capsys):
     conn_mock, cursor_mock = _make_connection_mock()
     monkeypatch.setattr(audit_logger, "psycopg", MagicMock(connect=MagicMock(return_value=conn_mock)))
 
-    for module_name in ("config_service", "override_service", "secrets_service"):
+    for module_name in ("config_service", "secrets_service"):
         sys.modules.pop(module_name, None)
 
     config_service = importlib.import_module("config_service")
-    override_service = importlib.import_module("override_service")
     secrets_service = importlib.import_module("secrets_service")
 
     config_service.reset_state()
-    override_service.Base.metadata.drop_all(bind=override_service.ENGINE)
-    override_service.Base.metadata.create_all(bind=override_service.ENGINE)
+    settings = secrets_service.load_settings()
+    secrets_service.SETTINGS = settings
+    secrets_service.CIPHER = secrets_service.SecretCipher(  # type: ignore[attr-defined]
+        secrets_service._decode_encryption_key(settings.encryption_key_b64)  # type: ignore[attr-defined]
+    )
     secrets_service.secret_manager = secrets_service.KrakenSecretManager(
-        secrets_service.SETTINGS.kubernetes_namespace
+        settings.kubernetes_namespace, cipher=secrets_service.CIPHER
     )
     secrets_service.secret_manager._client = fake_core  # type: ignore[attr-defined]
+    
+    async def _fake_balance(*_args, **_kwargs):  # type: ignore[unused-argument]
+        return {"error": []}
 
+    monkeypatch.setattr(secrets_service, "kraken_get_balance", _fake_balance)
+
+    config_service.app.dependency_overrides[config_service.require_admin_account] = lambda: "company"
     with TestClient(config_service.app) as config_client:
         response = config_client.post(
             "/config/update",
             params={"account_id": "global"},
             json={"key": "feature.enabled", "value": {"enabled": True}, "author": "alice"},
+            headers={"X-Account-ID": "company"},
         )
         assert response.status_code == 200
+    config_service.app.dependency_overrides.pop(config_service.require_admin_account, None)
 
+    secrets_service.app.dependency_overrides[secrets_service.require_authorized_caller] = lambda: "ops.brigade"
     with TestClient(secrets_service.app) as secrets_client:
         response = secrets_client.post(
             "/secrets/kraken",
@@ -137,6 +153,7 @@ def test_audit_chain_across_services(tmp_path, monkeypatch, capsys):
             headers={"Authorization": "Bearer integration-token"},
         )
         assert response.status_code == 201
+    secrets_service.app.dependency_overrides.pop(secrets_service.require_authorized_caller, None)
 
     with TestClient(override_service.app) as override_client:
         response = override_client.post(
@@ -164,7 +181,7 @@ def test_audit_chain_across_services(tmp_path, monkeypatch, capsys):
 
     prev_entry_hash = audit_logger._GENESIS_HASH  # pylint: disable=protected-access
     for entry in entries:
-        expected_prev_hash = hashlib.sha256(prev_entry_hash.encode("utf-8")).hexdigest()
+        expected_prev_hash = prev_entry_hash
         assert entry["prev_hash"] == expected_prev_hash
         canonical = audit_logger._canonical_payload(entry)  # pylint: disable=protected-access
         serialized = audit_logger._canonical_serialized(canonical)  # pylint: disable=protected-access
