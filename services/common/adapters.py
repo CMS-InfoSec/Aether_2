@@ -13,10 +13,12 @@ import uuid
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
+import threading
 
 
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, ClassVar, Dict, Iterable, List, Mapping, Optional, Tuple
+from weakref import WeakSet
 
 
 from common.utils.tracing import attach_correlation, current_correlation_id
@@ -26,8 +28,14 @@ from services.secrets.secure_secrets import (
     EnvelopeEncryptor,
 )
 
-from services.common.config import get_feast_client, get_redis_client
-main
+from services.common.config import (
+    get_feast_client,
+    get_redis_client,
+    get_kafka_producer,
+    get_nats_producer,
+    get_timescale_session,
+)
+import tempfile
 from services.universe.repository import UniverseRepository
 
 try:
