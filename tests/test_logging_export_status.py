@@ -7,13 +7,18 @@ import pytest
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
+from auth.service import InMemoryAdminRepository
+
 from app import create_app
+from auth.service import InMemorySessionStore
 from logging_export import ExportResult
 
 
 @pytest.fixture()
 def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
-    app = create_app()
+
+    app = create_app(admin_repository=InMemoryAdminRepository())
+
     with TestClient(app) as test_client:
         yield test_client
 

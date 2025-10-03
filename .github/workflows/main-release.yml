@@ -44,51 +44,41 @@ jobs:
     name: Build and Push Container Image
     runs-on: ubuntu-latest
     needs: lint-and-test
-    container:
-      image: gcr.io/kaniko-project/executor:latest
     env:
-      DOCKER_CONFIG: /kaniko/.docker/
+      IMAGE_DESTINATION: ghcr.io/${{ github.repository_owner }}/aether-app
     outputs:
-      image_ref: ${{ steps.publish.outputs.image_ref }}
-      image_digest: ${{ steps.publish.outputs.digest }}
+      image_ref: ${{ steps.image-metadata.outputs.image_ref }}
+      image_digest: ${{ steps.image-metadata.outputs.digest }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Configure registry auth
-        env:
-          GHCR_USERNAME: ${{ github.actor }}
-          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
-        run: |
-          if [ -z "$GHCR_TOKEN" ]; then
-            echo "GHCR_TOKEN secret must be provided" >&2
-            exit 1
-          fi
-          mkdir -p "$DOCKER_CONFIG"
-          AUTH_TOKEN=$(printf "%s:%s" "$GHCR_USERNAME" "$GHCR_TOKEN" | base64 | tr -d '\n')
-          cat <<JSON > "$DOCKER_CONFIG/config.json"
-          {
-            "auths": {
-              "ghcr.io": {
-                "auth": "${AUTH_TOKEN}"
-              }
-            }
-          }
-          JSON
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
 
       - name: Build and push image
         id: publish
+        uses: int128/kaniko-action@v1
+        with:
+          push: true
+          context: .
+          file: deploy/docker/kraken-ws-ingest/Dockerfile
+          tags: |
+            ${{ env.IMAGE_DESTINATION }}:${{ github.sha }}
+            ${{ env.IMAGE_DESTINATION }}:latest
+
+      - name: Capture image metadata
+        id: image-metadata
         env:
-          IMAGE_DESTINATION: ghcr.io/${{ github.repository_owner }}/aether-app
+          IMAGE_DESTINATION: ${{ env.IMAGE_DESTINATION }}
+          IMAGE_DIGEST: ${{ steps.publish.outputs.digest }}
         run: |
-          /kaniko/executor \
-            --context "$GITHUB_WORKSPACE" \
-            --dockerfile deploy/docker/kraken-ws-ingest/Dockerfile \
-            --destination "${IMAGE_DESTINATION}:${GITHUB_SHA}" \
-            --destination "${IMAGE_DESTINATION}:latest" \
-            --digest-file image-digest.txt
           echo "image_ref=${IMAGE_DESTINATION}" >> "$GITHUB_OUTPUT"
-          echo "digest=$(cat image-digest.txt)" >> "$GITHUB_OUTPUT"
+          echo "digest=${IMAGE_DIGEST}" >> "$GITHUB_OUTPUT"
 
   security-and-sign:
     name: Security Scan, SBOM, and Signing

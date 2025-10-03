@@ -35,6 +35,17 @@ spec:
             - containerPort: 8000
               name: http
           env:
+            - name: COMPLIANCE_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: compliance-service-database
+                  key: dsn
+            - name: COMPLIANCE_DB_SSLMODE
+              valueFrom:
+                secretKeyRef:
+                  name: compliance-service-database
+                  key: sslmode
+                  optional: true
             - name: KRAKEN_SECRETS_BASE
               value: /var/run/secrets/kraken
             - name: AETHER_COMPANY_KRAKEN_SECRET_PATH
@@ -43,6 +54,17 @@ spec:
               value: /var/run/secrets/kraken/director-1/credentials.json
             - name: AETHER_DIRECTOR_2_KRAKEN_SECRET_PATH
               value: /var/run/secrets/kraken/director-2/credentials.json
+            - name: RISK_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: risk-service-database
+                  key: dsn
+            - name: RISK_DB_SSLMODE
+              valueFrom:
+                secretKeyRef:
+                  name: risk-service-database
+                  key: sslmode
+                  optional: true
           readinessProbe:
             httpGet:
               path: /metrics

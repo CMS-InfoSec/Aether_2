@@ -13,37 +13,41 @@ on:
 jobs:
   kaniko-build:
     runs-on: ubuntu-latest
-    container:
-      image: gcr.io/kaniko-project/executor:latest
-    env:
-      DOCKER_CONFIG: /kaniko/.docker/
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Configure Registry Auth
+      - name: Log in to GHCR
+        env:
+          GHCR_AUTH: ${{ secrets.GHCR_AUTH }}
         run: |
-          mkdir -p $DOCKER_CONFIG
-          cat <<'EOC' > $DOCKER_CONFIG/config.json
-          {
-            "auths": {
-              "ghcr.io": {
-                "auth": "${{ secrets.GHCR_AUTH }}"
-              }
-            }
-          }
-          EOC
+          if [ -z "$GHCR_AUTH" ]; then
+            echo "GHCR_AUTH secret must be provided" >&2
+            exit 1
+          fi
+          AUTH_DECODED=$(echo "$GHCR_AUTH" | base64 --decode)
+          USERNAME=${AUTH_DECODED%%:*}
+          PASSWORD=${AUTH_DECODED#*:}
+          if [ -z "$USERNAME" ] || [ -z "$PASSWORD" ] || [ "$USERNAME" = "$AUTH_DECODED" ]; then
+            echo "GHCR_AUTH must be a base64-encoded 'username:token' string" >&2
+            exit 1
+          fi
+          echo "$PASSWORD" | docker login ghcr.io --username "$USERNAME" --password-stdin
       - name: Build Risk API Image
-        run: |
-          /kaniko/executor \
-            --context $GITHUB_WORKSPACE \
-            --dockerfile deploy/docker/risk-api/Dockerfile \
-            --destination ghcr.io/aether/risk-api:${{ github.sha }}
+        uses: int128/kaniko-action@v1
+        with:
+          push: true
+          context: .
+          file: deploy/docker/risk-api/Dockerfile
+          tags: |
+            ghcr.io/aether/risk-api:${{ github.sha }}
       - name: Build Ingestor Image
-        run: |
-          /kaniko/executor \
-            --context $GITHUB_WORKSPACE \
-            --dockerfile deploy/docker/risk-ingestor/Dockerfile \
-            --destination ghcr.io/aether/risk-ingestor:${{ github.sha }}
+        uses: int128/kaniko-action@v1
+        with:
+          push: true
+          context: .
+          file: deploy/docker/risk-ingestor/Dockerfile
+          tags: |
+            ghcr.io/aether/risk-ingestor:${{ github.sha }}
 
   buildah-sbom:
     runs-on: ubuntu-latest

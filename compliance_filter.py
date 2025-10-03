@@ -7,7 +7,7 @@ import os
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from typing import Generator, Iterable, List, Optional
+from typing import Any, Generator, Iterable, List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
@@ -45,36 +45,105 @@ class ComplianceAsset(Base):
         }
 
 
-DEFAULT_DATABASE_URL = "sqlite:///./risk.db"
+_SQLITE_TEST_FLAG = "COMPLIANCE_ALLOW_SQLITE_FOR_TESTS"
+_DB_ENV_VARS = (
+    "COMPLIANCE_DATABASE_URL",
+    "RISK_DATABASE_URL",
+    "TIMESCALE_DSN",
+    "DATABASE_URL",
+)
 
 
 def _database_url() -> str:
-    url = (
-        os.getenv("COMPLIANCE_DATABASE_URL")
-        or os.getenv("RISK_DATABASE_URL")
-        or os.getenv("TIMESCALE_DSN")
-        or os.getenv("DATABASE_URL")
-        or DEFAULT_DATABASE_URL
+    """Return the configured compliance database URL, failing fast when absent."""
+
+    url: Optional[str] = None
+    for var in _DB_ENV_VARS:
+        candidate = os.getenv(var)
+        if candidate and candidate.strip():
+            url = candidate.strip()
+            break
+
+    if not url:
+        raise RuntimeError(
+            "COMPLIANCE_DATABASE_URL (or RISK_DATABASE_URL/TIMESCALE_DSN/DATABASE_URL) must "
+            "be set to a managed PostgreSQL/TimescaleDSN."
+        )
+
+    normalized = url.lower()
+    allowed_prefixes = ("postgresql+psycopg://", "postgresql+psycopg2://")
+    if normalized.startswith(allowed_prefixes):
+        return url
+
+    conversions = {
+        "postgres://": "postgresql+psycopg://",
+        "postgresql://": "postgresql+psycopg://",
+        "timescale://": "postgresql+psycopg://",
+        "timescaledb://": "postgresql+psycopg://",
+        "timescale+psycopg://": "postgresql+psycopg://",
+        "timescale+psycopg2://": "postgresql+psycopg2://",
+    }
+    for prefix, replacement in conversions.items():
+        if normalized.startswith(prefix):
+            url = replacement + url.split("://", 1)[1]
+            normalized = url.lower()
+            break
+
+    if normalized.startswith(allowed_prefixes):
+        return url
+
+    if normalized.startswith("sqlite://") and os.getenv(_SQLITE_TEST_FLAG) == "1":
+        logger.warning(
+            "Using SQLite compliance database URL '%s' because %s=1 is set."
+            " This should only be enabled for local testing.",
+            url,
+            _SQLITE_TEST_FLAG,
+        )
+        return url
+
+    raise RuntimeError(
+        "COMPLIANCE database URL must point to PostgreSQL/TimescaleDB; received "
+        f"'{url}'."
     )
-    if url.startswith("postgresql://"):
-        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
-    return url
 
 
 def _engine_options(url: str) -> dict[str, object]:
-    options: dict[str, object] = {"future": True}
+    options: dict[str, object] = {"future": True, "pool_pre_ping": True}
+    connect_args: dict[str, Any] = {}
+
     if url.startswith("sqlite://"):
-        options.setdefault("connect_args", {"check_same_thread": False})
+        connect_args.setdefault("check_same_thread", False)
+        options["connect_args"] = connect_args
         if url.endswith(":memory:"):
             options["poolclass"] = StaticPool
+        return options
+
+    connect_args["sslmode"] = os.getenv("COMPLIANCE_DB_SSLMODE", "require")
+    options["connect_args"] = connect_args
+    options.update(
+        pool_size=int(os.getenv("COMPLIANCE_DB_POOL_SIZE", "10")),
+        max_overflow=int(os.getenv("COMPLIANCE_DB_MAX_OVERFLOW", "5")),
+        pool_timeout=int(os.getenv("COMPLIANCE_DB_POOL_TIMEOUT", "30")),
+        pool_recycle=int(os.getenv("COMPLIANCE_DB_POOL_RECYCLE", "1800")),
+    )
     return options
+
+
+def run_compliance_migrations(engine: Engine) -> None:
+    """Ensure the compliance asset schema exists on the configured database."""
+
+    Base.metadata.create_all(
+        bind=engine,
+        tables=[ComplianceAsset.__table__],
+        checkfirst=True,
+    )
 
 
 _DB_URL = _database_url()
 ENGINE: Engine = create_engine(_DB_URL, **_engine_options(_DB_URL))
 SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
 
-Base.metadata.create_all(bind=ENGINE)
+run_compliance_migrations(ENGINE)
 
 
 ALLOWED_STATUSES = {"allowed", "restricted", "watch"}
@@ -248,6 +317,7 @@ class ComplianceUpdateRequest(BaseModel):
 
 
 app = FastAPI(title="Compliance Filter")
+app.state.db_sessionmaker = SessionLocal
 
 
 @app.get("/compliance/list", response_model=List[ComplianceAssetModel])
@@ -275,5 +345,6 @@ __all__ = [
     "ComplianceFilter",
     "compliance_filter",
     "COMPLIANCE_REASON",
+    "run_compliance_migrations",
 ]
 

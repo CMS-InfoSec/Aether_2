@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from services.common.schemas import ActionTemplate, ConfidenceMetrics, PolicyDecisionResponse
 from tests import factories
 from tests.helpers.authentication import override_admin_auth
+from tests.helpers.risk import risk_service_instance
 
 
 @dataclass
@@ -107,7 +108,9 @@ class Sequencer:
 
 @pytest.mark.integration
 @pytest.mark.slow
-def test_trading_pipeline_emits_fill_event(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_trading_pipeline_emits_fill_event(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
     metrics_stub = types.SimpleNamespace(
         setup_metrics=lambda *args, **kwargs: None,
         record_abstention_rate=lambda *args, **kwargs: None,
@@ -126,7 +129,6 @@ def test_trading_pipeline_emits_fill_event(monkeypatch: pytest.MonkeyPatch) -> N
     sys.modules["metrics"] = metrics_stub
 
     monkeypatch.setenv("ENABLE_SHADOW_EXECUTION", "false")
-    monkeypatch.setenv("RISK_DATABASE_URL", "sqlite:///:memory:")
 
     fees_app = FastAPI()
 
@@ -162,114 +164,117 @@ def test_trading_pipeline_emits_fill_event(monkeypatch: pytest.MonkeyPatch) -> N
     oms_client = TestClient(oms_app)
 
     sys.modules.pop("policy_service", None)
-    sys.modules.pop("risk_service", None)
     policy_module = importlib.import_module("policy_service")
-    risk_module = importlib.import_module("risk_service")
 
-    confidence = ConfidenceMetrics(
-        model_confidence=0.9,
-        state_confidence=0.88,
-        execution_confidence=0.86,
-        overall_confidence=0.9,
-    )
-    intent_stub = policy_module.Intent(
-        edge_bps=38.0,
-        confidence=confidence,
-        take_profit_bps=45.0,
-        stop_loss_bps=20.0,
-        selected_action="maker",
-        action_templates=[
-            ActionTemplate(name="maker", venue_type="maker", edge_bps=38.0, fee_bps=0.0, confidence=0.86),
-            ActionTemplate(name="taker", venue_type="taker", edge_bps=18.0, fee_bps=0.0, confidence=0.8),
-        ],
-        approved=True,
-        reason=None,
-    )
-    monkeypatch.setattr(policy_module, "predict_intent", lambda **_: intent_stub)
-    policy_module.ENABLE_SHADOW_EXECUTION = False
-
-    async def fake_fetch_effective_fee(
-        account_id: str, symbol: str, liquidity: str, notional: float | Decimal
-    ) -> Decimal:
-        notional_decimal = notional if isinstance(notional, Decimal) else Decimal(str(notional))
-        notional_str = f"{notional_decimal.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP)}"
-        response = fees_client.get(
-            "/fees/effective",
-            params={"pair": symbol, "liquidity": liquidity, "notional": notional_str},
-            headers={"X-Account-ID": account_id},
+    with risk_service_instance(tmp_path, monkeypatch) as risk_module:
+        confidence = ConfidenceMetrics(
+            model_confidence=0.9,
+            state_confidence=0.88,
+            execution_confidence=0.86,
+            overall_confidence=0.9,
         )
-        response.raise_for_status()
-        return Decimal(str(response.json()["bps"]))
-
-    async def fake_submit_execution(request, response, *, shadow: bool, actor: str | None = None) -> None:
-        if shadow:
-            return
-        precision = policy_module._resolve_precision(request.instrument)
-        snapped_price = policy_module._snap(request.price, precision["tick"])
-        snapped_qty = policy_module._snap(request.quantity, precision["lot"])
-        order_type = "limit" if response.selected_action.lower() == "maker" else "market"
-        client_id = request.order_id
-        payload = {
-            "client_id": client_id,
-            "symbol": request.instrument,
-            "side": request.side.lower(),
-            "qty": snapped_qty,
-            "order_type": order_type,
-        }
-        if order_type == "limit":
-            payload["limit_px"] = snapped_price
-        response_obj = oms_client.post(
-            "/oms/place",
-            json=payload,
-            headers={"X-Account-ID": request.account_id},
+        intent_stub = policy_module.Intent(
+            edge_bps=38.0,
+            confidence=confidence,
+            take_profit_bps=45.0,
+            stop_loss_bps=20.0,
+            selected_action="maker",
+            action_templates=[
+                ActionTemplate(
+                    name="maker", venue_type="maker", edge_bps=38.0, fee_bps=0.0, confidence=0.86
+                ),
+                ActionTemplate(
+                    name="taker", venue_type="taker", edge_bps=18.0, fee_bps=0.0, confidence=0.8
+                ),
+            ],
+            approved=True,
+            reason=None,
         )
-        response_obj.raise_for_status()
+        monkeypatch.setattr(policy_module, "predict_intent", lambda **_: intent_stub)
+        policy_module.ENABLE_SHADOW_EXECUTION = False
 
-    monkeypatch.setattr(policy_module, "_fetch_effective_fee", fake_fetch_effective_fee)
-    monkeypatch.setattr(policy_module, "_submit_execution", fake_submit_execution)
+        async def fake_fetch_effective_fee(
+            account_id: str, symbol: str, liquidity: str, notional: float | Decimal
+        ) -> Decimal:
+            notional_decimal = notional if isinstance(notional, Decimal) else Decimal(str(notional))
+            notional_str = f"{notional_decimal.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP)}"
+            response = fees_client.get(
+                "/fees/effective",
+                params={"pair": symbol, "liquidity": liquidity, "notional": notional_str},
+                headers={"X-Account-ID": account_id},
+            )
+            response.raise_for_status()
+            return Decimal(str(response.json()["bps"]))
 
-    history = [
-        {"high": 30200.0 + idx, "low": 29800.0 + idx, "close": 30000.0 + idx}
-        for idx in range(30)
-    ]
-    risk_module.set_stub_price_history("BTC-USD", history)
-    risk_module.set_stub_account_returns("company", [50.0, -20.0, 10.0, -5.0] * 70)
-    timestamp = datetime.now(timezone.utc).isoformat()
-    risk_module.set_stub_fills([
-        {"account_id": "company", "timestamp": timestamp, "pnl": 0.0, "fee": 0.0}
-    ])
-    risk_module.set_stub_market_telemetry(
-        "BTC-USD", {"spread_bps": 4.0, "latency_seconds": 0.6, "exchange_outage": 0}
-    )
+        async def fake_submit_execution(
+            request, response, *, shadow: bool, actor: str | None = None
+        ) -> None:
+            if shadow:
+                return
+            precision = policy_module._resolve_precision(request.instrument)
+            snapped_price = policy_module._snap(request.price, precision["tick"])
+            snapped_qty = policy_module._snap(request.quantity, precision["lot"])
+            order_type = "limit" if response.selected_action.lower() == "maker" else "market"
+            client_id = request.order_id
+            payload = {
+                "client_id": client_id,
+                "symbol": request.instrument,
+                "side": request.side.lower(),
+                "qty": snapped_qty,
+                "order_type": order_type,
+            }
+            if order_type == "limit":
+                payload["limit_px"] = snapped_price
+            response_obj = oms_client.post(
+                "/oms/place",
+                json=payload,
+                headers={"X-Account-ID": request.account_id},
+            )
+            response_obj.raise_for_status()
 
-    with TestClient(policy_module.app) as policy_client, TestClient(risk_module.app) as risk_client:
-        sequencer = Sequencer(
-            policy_client=policy_client,
-            risk_client=risk_client,
-            risk_module=risk_module,
+        monkeypatch.setattr(policy_module, "_fetch_effective_fee", fake_fetch_effective_fee)
+        monkeypatch.setattr(policy_module, "_submit_execution", fake_submit_execution)
+
+        history = [
+            {"high": 30200.0 + idx, "low": 29800.0 + idx, "close": 30000.0 + idx}
+            for idx in range(30)
+        ]
+        risk_module.set_stub_price_history("BTC-USD", history)
+        risk_module.set_stub_account_returns("company", [50.0, -20.0, 10.0, -5.0] * 70)
+        timestamp = datetime.now(timezone.utc).isoformat()
+        risk_module.set_stub_fills(
+            [{"account_id": "company", "timestamp": timestamp, "pnl": 0.0, "fee": 0.0}]
         )
-        intent = DummyIntent(
-            account_id="company",
-            instrument="BTC-USD",
-            side="buy",
-            quantity=0.75,
-            price=30120.0,
-            features=[0.4, -0.1, 2.3],
+        risk_module.set_stub_market_telemetry(
+            "BTC-USD", {"spread_bps": 4.0, "latency_seconds": 0.6, "exchange_outage": 0}
         )
-        result = sequencer.submit_intent(intent)
 
-    risk_module.ENGINE.dispose()
+        with TestClient(policy_module.app) as policy_client, TestClient(risk_module.app) as risk_client:
+            sequencer = Sequencer(
+                policy_client=policy_client,
+                risk_client=risk_client,
+                risk_module=risk_module,
+            )
+            intent = DummyIntent(
+                account_id="company",
+                instrument="BTC-USD",
+                side="buy",
+                quantity=0.75,
+                price=30120.0,
+                features=[0.4, -0.1, 2.3],
+            )
+            result = sequencer.submit_intent(intent)
 
-    policy_response = result["policy_response"]
-    risk_response = result["risk_response"]
+        policy_response = result["policy_response"]
+        risk_response = result["risk_response"]
 
-    assert policy_response.approved is True
-    assert policy_response.selected_action == "maker"
-    assert policy_response.effective_fee.maker == pytest.approx(4.2)
-    assert policy_response.effective_fee.taker == pytest.approx(7.9)
+        assert policy_response.approved is True
+        assert policy_response.selected_action == "maker"
+        assert policy_response.effective_fee.maker == pytest.approx(4.2)
+        assert policy_response.effective_fee.taker == pytest.approx(7.9)
 
-    assert risk_response.pass_ is True
-    assert not risk_response.reasons
+        assert risk_response.pass_ is True
+        assert not risk_response.reasons
 
     assert len(fill_events) == 1
     fill = fill_events[0]

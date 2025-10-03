@@ -16,34 +16,55 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import JSON, Column, DateTime, Integer, String, create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
-from sqlalchemy.pool import StaticPool
 
 from services.alert_manager import RiskEvent, get_alert_manager_instance
 from services.common.adapters import TimescaleAdapter
+from services.common.security import require_admin_account
 
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
-DATABASE_URL = os.getenv("ANOMALY_DATABASE_URL", "sqlite:///./anomaly.db")
+_DATABASE_URL_ENV_VAR = "ANOMALY_DATABASE_URL"
 
 
-def _engine_options(url: str) -> Dict[str, Any]:
-    options: Dict[str, Any] = {"future": True}
-    if url.startswith("sqlite://"):
-        options.setdefault("connect_args", {"check_same_thread": False})
-        if url.endswith(":memory:"):
-            options["poolclass"] = StaticPool
-    return options
+def _database_url() -> str:
+    """Return the configured PostgreSQL/Timescale connection string."""
+
+    url = os.getenv(_DATABASE_URL_ENV_VAR) or os.getenv("TIMESCALE_DSN")
+    if not url:
+        raise RuntimeError(
+            "ANOMALY_DATABASE_URL or TIMESCALE_DSN must be set to a PostgreSQL/Timescale DSN"
+        )
+
+    normalized = url.strip()
+    if normalized.startswith("postgres://"):
+        normalized = "postgresql://" + normalized.split("://", 1)[1]
+
+    if normalized.startswith("postgresql://"):
+        normalized = normalized.replace("postgresql://", "postgresql+psycopg://", 1)
+    elif normalized.startswith("postgresql+psycopg://") or normalized.startswith(
+        "postgresql+psycopg2://"
+    ):
+        pass
+    else:
+        raise RuntimeError(
+            "Anomaly service requires a PostgreSQL/Timescale DSN via ANOMALY_DATABASE_URL or TIMESCALE_DSN"
+        )
+
+    return normalized
 
 
-ENGINE: Engine = create_engine(DATABASE_URL, **_engine_options(DATABASE_URL))
+DATABASE_URL = _database_url()
+
+
+ENGINE: Engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
 Base = declarative_base()
 
@@ -58,9 +79,6 @@ class AnomalyLog(Base):
     anomaly_type = Column(String, nullable=False)
     details_json = Column(JSON, nullable=False, default=dict)
     ts = Column(DateTime(timezone=True), nullable=False, index=True)
-
-
-Base.metadata.create_all(bind=ENGINE)
 
 
 class ScanRequest(BaseModel):
@@ -90,6 +108,26 @@ class StatusResponse(BaseModel):
     account_id: str
     blocked: bool
     incidents: List[Incident]
+
+
+def _normalize_account(value: str) -> str:
+    return value.strip().lower()
+
+
+def _ensure_account_access(requested: str, authenticated: str) -> str:
+    normalized_request = _normalize_account(requested)
+    normalized_auth = _normalize_account(authenticated)
+    if not normalized_request:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Account identifier must not be empty.",
+        )
+    if normalized_request != normalized_auth:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authenticated account does not match requested account.",
+        )
+    return normalized_request
 
 
 @dataclass
@@ -452,7 +490,7 @@ class ResponseFactory:
         self.repository = repository or IncidentRepository()
 
     def scan(self, request: ScanRequest) -> ScanResponse:
-        account_id = request.account_id.strip().lower()
+        account_id = _normalize_account(request.account_id)
         if not account_id:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -477,7 +515,7 @@ class ResponseFactory:
         return ScanResponse(incidents=incidents, blocked=blocked_state)
 
     def status(self, account_id: str) -> StatusResponse:
-        normalized = account_id.strip().lower()
+        normalized = _normalize_account(account_id)
         if not normalized:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -524,14 +562,23 @@ _coordinator = ResponseFactory()
 
 
 @app.get("/anomaly/status", response_model=StatusResponse)
-def get_status(account_id: str = Query(..., min_length=1)) -> StatusResponse:
+def get_status(
+    account_id: str = Query(..., min_length=1),
+    caller_account: str = Depends(require_admin_account),
+) -> StatusResponse:
     """Return current anomaly status for the requested account."""
 
-    return _coordinator.status(account_id)
+    normalized = _ensure_account_access(account_id, caller_account)
+    return _coordinator.status(normalized)
 
 
 @app.post("/anomaly/scan", response_model=ScanResponse)
-def post_scan(request: ScanRequest) -> ScanResponse:
+def post_scan(
+    request: ScanRequest,
+    caller_account: str = Depends(require_admin_account),
+) -> ScanResponse:
     """Run anomaly detection for the specified account."""
 
-    return _coordinator.scan(request)
+    normalized = _ensure_account_access(request.account_id, caller_account)
+    normalized_request = request.model_copy(update={"account_id": normalized})
+    return _coordinator.scan(normalized_request)
