@@ -3,6 +3,8 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 
 from app import create_app
+from auth.service import InMemorySessionStore
+from services.common.security import require_admin_account
 from services.models import model_zoo
 
 
@@ -11,7 +13,9 @@ def setup_function() -> None:
 
 
 def _client() -> TestClient:
-    return TestClient(create_app())
+    application = create_app(session_store=InMemorySessionStore())
+    application.dependency_overrides[require_admin_account] = lambda: "company"
+    return TestClient(application)
 
 
 def test_list_models_returns_inventory() -> None:
