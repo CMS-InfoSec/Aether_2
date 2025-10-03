@@ -17,11 +17,12 @@ from fastapi.testclient import TestClient
 
 if "metrics" not in sys.modules:
     metrics_stub = types.ModuleType("metrics")
-    metrics_stub.setup_metrics = lambda app: None
+    metrics_stub.setup_metrics = lambda *args, **kwargs: None
     metrics_stub.record_abstention_rate = lambda *args, **kwargs: None
     metrics_stub.record_drift_score = lambda *args, **kwargs: None
     metrics_stub.record_scaling_state = lambda *args, **kwargs: None
     metrics_stub.observe_scaling_evaluation = lambda *args, **kwargs: None
+    metrics_stub.get_request_id = lambda: "test-request"
     sys.modules["metrics"] = metrics_stub
 
 import policy_service
@@ -47,6 +48,14 @@ def _client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
 
     monkeypatch.setattr(policy_service.EXCHANGE_ADAPTER, "place_order", _noop_place_order)
     monkeypatch.setattr(policy_service.EXCHANGE_ADAPTER, "supports", lambda op: True)
+    monkeypatch.setattr(
+        "shared.graceful_shutdown.install_sigterm_handler", lambda manager: None
+    )
+    shutdown_manager = getattr(policy_service, "shutdown_manager", None)
+    if shutdown_manager is not None:
+        shutdown_manager._draining = False  # type: ignore[attr-defined]
+        shutdown_manager._drain_started_at = None  # type: ignore[attr-defined]
+        shutdown_manager._inflight = 0  # type: ignore[attr-defined]
     policy_service.app.dependency_overrides[policy_service.require_admin_account] = lambda: "company"
     with TestClient(policy_service.app) as client:
         yield client
@@ -97,6 +106,82 @@ def _coerce_decimal(value: float | Decimal) -> Decimal:
     if isinstance(value, Decimal):
         return value
     return Decimal(str(value))
+
+
+def _decision_request_payload(account_id: str = "company") -> dict:
+    return {
+        "account_id": account_id,
+        "order_id": "abc-123",
+        "instrument": "BTC-USD",
+        "side": "BUY",
+        "quantity": 0.1234567,
+        "price": 30120.4567,
+        "fee": {"currency": "USD", "maker": 4.0, "taker": 6.0},
+        "features": [0.4, -0.1, 2.8],
+        "book_snapshot": {
+            "mid_price": 30125.4,
+            "spread_bps": 2.4,
+            "imbalance": 0.05,
+        },
+    }
+
+
+def test_policy_decide_accepts_case_insensitive_account(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    override_key = policy_service.require_admin_account
+    original_override = client.app.dependency_overrides.get(override_key)
+    client.app.dependency_overrides[override_key] = lambda: "COMPANY"
+
+    async def _healthy() -> bool:
+        return True
+
+    monkeypatch.setattr(policy_service, "_model_health_ok", _healthy)
+    monkeypatch.setattr(policy_service, "_enforce_stablecoin_guard", lambda: None)
+
+    async def _noop_dispatch(*_: object, **__: object) -> None:
+        return None
+
+    monkeypatch.setattr(policy_service, "_dispatch_shadow_orders", _noop_dispatch)
+    monkeypatch.setattr(
+        policy_service,
+        "predict_intent",
+        lambda **_: _intent(edge_bps=22.0, approved=True, selected="maker"),
+    )
+
+    async def _fake_fee(
+        account_id: str, symbol: str, liquidity: str, notional: float | Decimal
+    ) -> Decimal:
+        return Decimal("5.0")
+
+    monkeypatch.setattr(policy_service, "_fetch_effective_fee", _fake_fee)
+
+    try:
+        payload = _decision_request_payload("company")
+        response = client.post("/policy/decide", json=payload)
+        assert response.status_code == status.HTTP_200_OK
+    finally:
+        if original_override is not None:
+            client.app.dependency_overrides[override_key] = original_override
+        else:
+            client.app.dependency_overrides.pop(override_key, None)
+
+
+def test_policy_decide_rejects_account_mismatch(client: TestClient) -> None:
+    override_key = policy_service.require_admin_account
+    original_override = client.app.dependency_overrides.get(override_key)
+    client.app.dependency_overrides[override_key] = lambda: "director-1"
+
+    try:
+        payload = _decision_request_payload("company")
+        response = client.post("/policy/decide", json=payload)
+        assert response.status_code == status.HTTP_403_FORBIDDEN, response.text
+        assert response.json()["detail"] == "Account mismatch between header and payload."
+    finally:
+        if original_override is not None:
+            client.app.dependency_overrides[override_key] = original_override
+        else:
+            client.app.dependency_overrides.pop(override_key, None)
 
 def test_policy_decide_approves_when_edge_beats_costs(
     monkeypatch: pytest.MonkeyPatch, client: TestClient

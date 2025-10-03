@@ -633,11 +633,25 @@ async def decide_policy(
     request: PolicyDecisionRequest,
     caller_account: str = Depends(require_admin_account),
 ) -> PolicyDecisionResponse:
+    request_account = request.account_id.strip()
+    account_id = caller_account.strip()
+    caller_normalized = account_id.lower()
+    if request_account.strip().lower() != caller_normalized:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account mismatch between header and payload.",
+        )
+
+    if hasattr(request, "model_copy"):
+        request = request.model_copy(update={"account_id": account_id})
+    else:
+        request.account_id = account_id  # type: ignore[attr-defined]
+
     logger.info(
         "Policy decision requested by %s for order %s on account %s",
-        caller_account,
+        account_id,
         request.order_id,
-        request.account_id,
+        request_account,
     )
     precision = _resolve_precision(request.instrument)
     snapped_price = _snap(request.price, precision["tick"])
@@ -692,7 +706,7 @@ async def decide_policy(
         for variant in MODEL_VARIANTS:
             try:
                 intents[variant] = predict_intent(
-                    account_id=request.account_id,
+                    account_id=account_id,
                     symbol=request.instrument,
                     features=features,
                     book_snapshot=book_snapshot,
@@ -722,16 +736,16 @@ async def decide_policy(
         await _dispatch_shadow_orders(
             fallback_decision.request,
             fallback_decision.response,
-            actor=caller_account,
+            actor=account_id,
         )
         return fallback_decision.response
 
     notional = _to_decimal(snapped_price) * _to_decimal(snapped_qty)
     maker_fee_bps = _to_decimal(
-        await _fetch_effective_fee(request.account_id, request.instrument, "maker", notional)
+        await _fetch_effective_fee(account_id, request.instrument, "maker", notional)
     )
     taker_fee_bps = _to_decimal(
-        await _fetch_effective_fee(request.account_id, request.instrument, "taker", notional)
+        await _fetch_effective_fee(account_id, request.instrument, "taker", notional)
     )
 
     effective_fee = FeeBreakdown(
@@ -883,9 +897,9 @@ async def decide_policy(
     except (TypeError, ValueError):
         drift_value = 0.0
 
-    record_drift_score(request.account_id, request.instrument, drift_value)
+    record_drift_score(account_id, request.instrument, drift_value)
     abstain_metric = 0.0 if approved and selected_action != "abstain" else 1.0
-    record_abstention_rate(request.account_id, request.instrument, abstain_metric)
+    record_abstention_rate(account_id, request.instrument, abstain_metric)
 
     response = PolicyDecisionResponse(
         approved=approved,
@@ -903,7 +917,7 @@ async def decide_policy(
         stop_loss_bps=round(float(stop_loss), 4),
     )
 
-    await _dispatch_shadow_orders(request, response, actor=caller_account)
+    await _dispatch_shadow_orders(request, response, actor=account_id)
 
     return response
 
