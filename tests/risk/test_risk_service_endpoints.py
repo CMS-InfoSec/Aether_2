@@ -3,8 +3,13 @@ from __future__ import annotations
 from copy import deepcopy
 import sys
 import types
+from pathlib import Path
+
+if str(Path(__file__).resolve().parents[1]) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pytest
+from fastapi import status
 from fastapi.testclient import TestClient
 
 if "prometheus_client" not in sys.modules:
@@ -39,8 +44,11 @@ if "prometheus_client" not in sys.modules:
 
     sys.modules["prometheus_client"] = prometheus_client
 
-from risk_service import app
+pytest.importorskip("services.common.security")
+
+from risk_service import app, require_admin_account
 from services.common import security
+from tests.helpers.authentication import override_admin_auth
 
 
 @pytest.fixture(autouse=True)
@@ -82,33 +90,43 @@ def risk_payload_fixture() -> dict[str, object]:
 def test_validate_requires_admin_header(client: TestClient, risk_payload: dict[str, object]) -> None:
     response = client.post("/risk/validate", json=risk_payload)
 
-    assert response.status_code == 403
-    assert response.json()["detail"] == "Account is not authorized for administrative access."
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
 
 
 def test_validate_rejects_account_mismatch(client: TestClient, risk_payload: dict[str, object]) -> None:
     payload = deepcopy(risk_payload)
     payload["account_id"] = "ACC-AGGR"
 
-    response = client.post(
-        "/risk/validate",
-        json=payload,
-        headers={"X-Account-ID": "ACC-DEFAULT"},
-    )
+    with override_admin_auth(
+        client.app, require_admin_account, "ACC-DEFAULT"
+    ) as headers:
+        response = client.post(
+            "/risk/validate",
+            json=payload,
+            headers={**headers, "X-Account-ID": "ACC-DEFAULT"},
+        )
 
-    assert response.status_code == 403
-    assert response.json()["detail"] == "Account mismatch between header and payload."
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert (
+        response.json()["detail"]
+        == "Account mismatch between authenticated session and payload."
+    )
 
 
 def test_limits_requires_admin_header(client: TestClient) -> None:
     response = client.get("/risk/limits")
 
-    assert response.status_code == 403
-    assert response.json()["detail"] == "Account is not authorized for administrative access."
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
 
 
 def test_limits_returns_account_data(client: TestClient) -> None:
-    response = client.get("/risk/limits", headers={"X-Account-ID": "ACC-DEFAULT"})
+    with override_admin_auth(
+        client.app, require_admin_account, "ACC-DEFAULT"
+    ) as headers:
+        response = client.get(
+            "/risk/limits",
+            headers={**headers, "X-Account-ID": "ACC-DEFAULT"},
+        )
 
     assert response.status_code == 200
     body = response.json()

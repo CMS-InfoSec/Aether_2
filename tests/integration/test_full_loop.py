@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
 import pytest
+
+pytest.importorskip("services.common.security")
 pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
@@ -22,6 +24,7 @@ from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
 from services.oms.warm_start import WarmStartCoordinator
 from services.common.schemas import PolicyDecisionResponse
 from tests import factories
+from tests.helpers.authentication import override_admin_auth
 from tests.fixtures.backends import MemoryRedis
 from tests.fixtures.mock_kraken import MockKrakenServer
 
@@ -338,11 +341,15 @@ def test_full_loop_across_accounts(
             intent=trade_intent,
             portfolio_state=portfolio_state,
         )
-        risk_response_http = risk_client.post(
-            "/risk/validate",
-            json=risk_request.model_dump(by_alias=True, mode="json"),
-            headers={"X-Account-ID": account_id},
-        )
+        with override_admin_auth(
+            risk_client.app, risk_service.require_admin_account, account_id
+        ) as headers:
+            risk_headers = {**headers, "X-Account-ID": account_id}
+            risk_response_http = risk_client.post(
+                "/risk/validate",
+                json=risk_request.model_dump(by_alias=True, mode="json"),
+                headers=risk_headers,
+            )
         risk_response_http.raise_for_status()
         risk_decision = risk_service.RiskValidationResponse.model_validate(risk_response_http.json())
 

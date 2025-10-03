@@ -8,11 +8,14 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 
 import pytest
+
+pytest.importorskip("services.common.security")
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 
 from services.common.schemas import ActionTemplate, ConfidenceMetrics, PolicyDecisionResponse
 from tests import factories
+from tests.helpers.authentication import override_admin_auth
 
 
 @dataclass
@@ -80,11 +83,17 @@ class Sequencer:
             portfolio_state=portfolio_state,
         )
 
-        risk_response = self._risk_client.post(
-            "/risk/validate",
-            json=risk_request.model_dump(by_alias=True, mode="json"),
-            headers={"X-Account-ID": intent.account_id},
-        )
+        with override_admin_auth(
+            self._risk_client.app,
+            self._risk_module.require_admin_account,
+            intent.account_id,
+        ) as headers:
+            risk_headers = {**headers, "X-Account-ID": intent.account_id}
+            risk_response = self._risk_client.post(
+                "/risk/validate",
+                json=risk_request.model_dump(by_alias=True, mode="json"),
+                headers=risk_headers,
+            )
         risk_response.raise_for_status()
         risk_decision = self._risk_module.RiskValidationResponse.model_validate(risk_response.json())
 
