@@ -12,6 +12,11 @@ from typing import Dict
 
 import pytest
 
+try:
+    from services.oms import order_ack_cache as _order_ack_cache
+except Exception:  # pragma: no cover - services module may be unavailable in some suites
+    _order_ack_cache = None  # type: ignore[assignment]
+
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -27,6 +32,18 @@ pytest_plugins = [
     "tests.fixtures.backends",
     "tests.fixtures.mock_kraken",
 ]
+
+
+@pytest.fixture(autouse=True)
+def _clear_ack_cache() -> None:
+    if _order_ack_cache is None:
+        yield
+        return
+    _order_ack_cache.get_order_ack_cache.cache_clear()
+    try:
+        yield
+    finally:
+        _order_ack_cache.get_order_ack_cache.cache_clear()
 
 if "pyotp" not in sys.modules:
     pyotp_stub = ModuleType("pyotp")

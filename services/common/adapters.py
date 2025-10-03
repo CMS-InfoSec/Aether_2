@@ -4,15 +4,19 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import tempfile
 import json
 import logging
 
 import os
 
 import uuid
+import sqlite3
+import threading
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
+from weakref import WeakSet
 
 
 from datetime import datetime, timedelta, timezone
@@ -26,8 +30,14 @@ from services.secrets.secure_secrets import (
     EnvelopeEncryptor,
 )
 
-from services.common.config import get_feast_client, get_redis_client
-main
+from services.common.config import (
+    TimescaleSession,
+    get_feast_client,
+    get_redis_client,
+    get_kafka_producer,
+    get_nats_producer,
+    get_timescale_session,
+)
 from services.universe.repository import UniverseRepository
 
 try:
