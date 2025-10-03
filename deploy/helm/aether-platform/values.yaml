@@ -88,6 +88,65 @@ global:
         ports:
           - 443
 backendServices:
+  behavior:
+    enabled: true
+    nameOverride: behavior-service
+    image:
+      repository: ghcr.io/aether/behavior-service
+      tag: latest
+    replicaCount: 2
+    containerPort: 8000
+    env:
+      - name: BEHAVIOR_DATABASE_URL
+        valueFrom:
+          secretKeyRef:
+            name: behavior-service-database
+            key: dsn
+      - name: BEHAVIOR_DB_SSLMODE
+        value: require
+    usesKrakenSecrets: false
+    extraVolumeMounts: []
+    extraVolumes: []
+    service:
+      port: 80
+      targetPort: http
+    ingress:
+      enabled: true
+      host: behavior.aether.example.com
+      tlsSecret: behavior-service-tls
+      annotations: {}
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 6
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 65
+        - type: Resource
+          resource:
+            name: memory
+            target:
+              type: Utilization
+              averageUtilization: 70
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 60
+        scaleDown:
+          stabilizationWindowSeconds: 60
+    pdb:
+      enabled: true
+      maxUnavailable: 1
   fees:
     enabled: true
     nameOverride: fees-service
