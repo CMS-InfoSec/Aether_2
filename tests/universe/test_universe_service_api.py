@@ -28,6 +28,10 @@ from services.universe.universe_service import (
 )
 
 
+if not hasattr(universe_service.Base.metadata, "drop_all"):
+    pytest.skip("sqlalchemy runtime support is required for universe service integration tests", allow_module_level=True)
+
+
 @pytest.fixture
 def session(tmp_path, monkeypatch) -> Session:
     db_path = tmp_path / "universe_test.db"

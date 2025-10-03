@@ -8,6 +8,7 @@ from services.common.security import ADMIN_ACCOUNTS
 from services.universe.main import app
 
 from services.universe.repository import UniverseRepository
+from tests.universe.conftest import UniverseTimescaleFixture
 
 
 
@@ -17,14 +18,31 @@ def client_fixture() -> TestClient:
 
 
 @pytest.fixture(autouse=True)
-def reset_universe_repository() -> None:
+def configure_repository(universe_timescale: UniverseTimescaleFixture) -> None:
     UniverseRepository.reset()
+    universe_timescale.rebind()
+    universe_timescale.clear()
     yield
     UniverseRepository.reset()
+    universe_timescale.rebind()
+    universe_timescale.clear()
 
 
 @pytest.mark.parametrize("account_id", sorted(ADMIN_ACCOUNTS))
-def test_get_universe_allows_admin_accounts(client: TestClient, account_id: str) -> None:
+def test_get_universe_allows_admin_accounts(
+    client: TestClient, account_id: str, universe_timescale: UniverseTimescaleFixture
+) -> None:
+    universe_timescale.add_snapshot(
+        base_asset="BTC",
+        quote_asset="USD",
+        market_cap=1.2e12,
+        global_volume_24h=5.0e10,
+        kraken_volume_24h=2.5e10,
+        volatility_30d=0.45,
+    )
+    universe_timescale.add_fee_override(
+        "BTC-USD", currency="USD", maker=0.1, taker=0.2
+    )
 
     adapter = RedisFeastAdapter(account_id=account_id)
     expected_instruments = adapter.approved_instruments()
@@ -63,10 +81,10 @@ def test_get_universe_rejects_non_admin(client: TestClient) -> None:
 
 @pytest.mark.parametrize("account_id", sorted(ADMIN_ACCOUNTS))
 def test_universe_endpoint_uses_fallback_when_timescale_empty(
-    client: TestClient, account_id: str
+    client: TestClient, account_id: str, universe_timescale: UniverseTimescaleFixture
 ) -> None:
 
-    UniverseRepository.seed_market_snapshots([])
+    universe_timescale.clear()
 
     response = client.get(
         "/universe/approved",

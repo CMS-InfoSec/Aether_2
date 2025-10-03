@@ -12,10 +12,33 @@ from services.risk.diversification_allocator import (
     PolicyIntent,
     init_diversification_storage,
 )
-from services.universe.repository import MarketSnapshot, UniverseRepository
 
 
 ACCOUNT_ID = "company"
+
+
+class StubUniverseRepository:
+    def __init__(self) -> None:
+        self._approved: list[str] = []
+        self._fees: dict[str, dict[str, float | str]] = {}
+
+    def configure(
+        self,
+        instruments: list[str],
+        fees: dict[str, dict[str, float | str]],
+    ) -> None:
+        self._approved = list(instruments)
+        self._fees = {symbol: dict(payload) for symbol, payload in fees.items()}
+
+    def approved_universe(self) -> list[str]:
+        return list(self._approved)
+
+    def fee_override(self, instrument: str) -> dict[str, float | str] | None:
+        override = self._fees.get(instrument) or self._fees.get("default")
+        return dict(override) if override else None
+
+
+STUB_UNIVERSE_REPOSITORY = StubUniverseRepository()
 
 
 def _setup_account_config() -> None:
@@ -63,49 +86,15 @@ def _setup_account_config() -> None:
 
 
 def _seed_universe() -> None:
-    snapshots = [
-        MarketSnapshot(
-            base_asset="BTC",
-            quote_asset="USD",
-            market_cap=1.5e12,
-            global_volume_24h=5e10,
-            kraken_volume_24h=2e10,
-            volatility_30d=0.5,
-        ),
-        MarketSnapshot(
-            base_asset="ETH",
-            quote_asset="USD",
-            market_cap=8e11,
-            global_volume_24h=3e10,
-            kraken_volume_24h=1.5e10,
-            volatility_30d=0.45,
-        ),
-        MarketSnapshot(
-            base_asset="SOL",
-            quote_asset="USD",
-            market_cap=1.2e11,
-            global_volume_24h=7e9,
-            kraken_volume_24h=4e9,
-            volatility_30d=0.42,
-        ),
-        MarketSnapshot(
-            base_asset="ADA",
-            quote_asset="USD",
-            market_cap=9e10,
-            global_volume_24h=6e9,
-            kraken_volume_24h=3e9,
-            volatility_30d=0.41,
-        ),
-    ]
-    UniverseRepository.seed_market_snapshots(snapshots)
-    UniverseRepository.seed_fee_overrides(
+    STUB_UNIVERSE_REPOSITORY.configure(
+        ["BTC-USD", "ETH-USD", "SOL-USD", "ADA-USD"],
         {
             "BTC-USD": {"currency": "USD", "maker": 0.1, "taker": 0.15},
             "ETH-USD": {"currency": "USD", "maker": 0.35, "taker": 0.6},
             "SOL-USD": {"currency": "USD", "maker": 0.12, "taker": 0.2},
             "ADA-USD": {"currency": "USD", "maker": 0.12, "taker": 0.2},
             "default": {"currency": "USD", "maker": 0.1, "taker": 0.2},
-        }
+        },
     )
 
 
@@ -126,7 +115,7 @@ def _build_allocator():
     init_diversification_storage(engine)
     session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True)
     timescale = TimescaleAdapter(account_id=ACCOUNT_ID)
-    universe = RedisFeastAdapter(account_id=ACCOUNT_ID)
+    universe = RedisFeastAdapter(account_id=ACCOUNT_ID, repository=STUB_UNIVERSE_REPOSITORY)
     return DiversificationAllocator(
         ACCOUNT_ID,
         timescale=timescale,
