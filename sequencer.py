@@ -450,23 +450,90 @@ class SequencerPipeline:
         stage_artifacts: Mapping[str, Any],
     ) -> Dict[str, Any]:
         intent = payload.get("intent", {})
-        oms_result = stage_artifacts.get("oms", {})
-        quantity = _safe_float(intent.get("quantity") or intent.get("qty") or 0.0)
-        price = _safe_float(
-            intent.get("price")
-            or intent.get("limit_px")
-            or (intent.get("mid_price") if isinstance(intent.get("mid_price"), (int, float)) else 0.0)
+        oms_result_raw = stage_artifacts.get("oms", {})
+        if isinstance(oms_result_raw, Mapping):
+            oms_result = dict(oms_result_raw)
+        else:
+            oms_result = {}
+
+        def _first_non_none(*values: Any) -> Any:
+            for value in values:
+                if value is not None:
+                    return value
+            return None
+
+        def _string_value(value: Any) -> Optional[str]:
+            if value is None:
+                return None
+            if isinstance(value, str):
+                stripped = value.strip()
+                return stripped or None
+            return str(value)
+
+        def _normalize_status(raw_status: Any) -> str:
+            errors = oms_result.get("errors") or oms_result.get("error")
+            if errors:
+                return "rejected"
+            accepted = bool(oms_result.get("accepted", True))
+            status_text = _string_value(raw_status)
+            normalized = status_text.lower() if status_text else ""
+            if not normalized:
+                return "open" if accepted else "rejected"
+            if normalized in {"ok", "accepted"}:
+                return "open" if accepted else "rejected"
+            if normalized in {"partially_filled", "partial_fill", "partially-filled"}:
+                return "partial"
+            if normalized in {"closed", "filled", "done", "complete", "completed"}:
+                return "filled"
+            if normalized in {"canceled", "cancelled"}:
+                return "canceled"
+            return normalized
+
+        filled_qty = _safe_float(
+            _first_non_none(
+                oms_result.get("filled_qty"),
+                oms_result.get("filled"),
+                oms_result.get("vol_exec"),
+            )
         )
-        filled_qty = _safe_float(oms_result.get("filled_qty", quantity))
-        avg_price = _safe_float(oms_result.get("avg_price", price))
+        avg_price = _safe_float(
+            _first_non_none(
+                oms_result.get("avg_price"),
+                oms_result.get("average_price"),
+            )
+        )
+        exchange_order_id = _string_value(
+            _first_non_none(
+                oms_result.get("exchange_order_id"),
+                oms_result.get("txid"),
+                oms_result.get("ordertxid"),
+            )
+        )
+        client_order_id = _string_value(
+            _first_non_none(
+                oms_result.get("client_order_id"),
+                oms_result.get("clientOrderId"),
+                oms_result.get("order_id"),
+                intent.get("order_id"),
+            )
+        )
+        status_value = _normalize_status(
+            _first_non_none(
+                oms_result.get("status"),
+                oms_result.get("order_status"),
+                oms_result.get("state"),
+            )
+        )
         event = {
             "event_type": "FillEvent",
             "run_id": ctx.run_id,
             "account_id": ctx.account_id,
             "intent_id": ctx.intent_id,
-            "order_id": intent.get("order_id"),
+            "order_id": exchange_order_id or client_order_id,
+            "client_order_id": client_order_id,
+            "exchange_order_id": exchange_order_id,
             "instrument": intent.get("instrument"),
-            "status": "filled" if oms_result.get("accepted", True) else "rejected",
+            "status": status_value,
             "filled_qty": filled_qty,
             "avg_price": avg_price,
             "stage_artifacts": stage_artifacts,
@@ -592,12 +659,17 @@ async def oms_handler(payload: Dict[str, Any], ctx: PipelineContext) -> StageRes
 
     intent = payload.get("intent", {})
     client_order_id = intent.get("order_id") or str(uuid.uuid4())
+    exchange_order_id = intent.get("exchange_order_id") or f"SIM-{uuid.uuid4().hex[:12]}"
     filled_qty = _safe_float(intent.get("quantity") or intent.get("qty") or 0.0)
     avg_price = _safe_float(intent.get("price") or intent.get("limit_px") or 0.0)
+    status = "filled" if filled_qty > 0 else "open"
     oms_result = {
         "accepted": True,
         "routed_venue": intent.get("venue") or "default",
         "client_order_id": client_order_id,
+        "exchange_order_id": exchange_order_id,
+        "txid": exchange_order_id,
+        "status": status,
         "filled_qty": filled_qty,
         "avg_price": avg_price,
         "completed_at": datetime.now(timezone.utc).isoformat(),

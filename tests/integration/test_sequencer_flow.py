@@ -44,6 +44,9 @@ async def test_sequencer_flow_emits_complete_audit_trail(monkeypatch: pytest.Mon
     assert set(result.stage_artifacts) == {"policy", "risk", "override", "oms"}
     assert result.fill_event["event_type"] == "FillEvent"
     assert result.fill_event["run_id"] == result.run_id
+    assert result.fill_event["client_order_id"] == intent["order_id"]
+    assert result.fill_event["order_id"] == result.fill_event["exchange_order_id"]
+    assert result.fill_event["status"] == "filled"
 
     # ------------------------------------------------------------------
     # Audit log emitted the lifecycle (start/complete) for every stage.

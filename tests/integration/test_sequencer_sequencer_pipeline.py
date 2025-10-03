@@ -326,6 +326,9 @@ async def _run_sequencer_pipeline_integration(
         artifact = {
             "accepted": True,
             "client_order_id": intent["order_id"],
+            "exchange_order_id": response["order"]["order_id"],
+            "txid": response["order"]["order_id"],
+            "status": response["order"]["status"],
             "filled_qty": filled_qty,
             "avg_price": avg_price,
             "fills": fills,
@@ -379,7 +382,10 @@ async def _run_sequencer_pipeline_integration(
     assert oms_artifact["accepted"] is True
     assert oms_artifact["filled_qty"] == pytest.approx(0.6)
     assert oms_artifact["avg_price"] == pytest.approx(30_010.0, rel=0.01)
-    assert result.fill_event["status"] == "filled"
+    assert result.fill_event["client_order_id"] == intent["order_id"]
+    assert result.fill_event["exchange_order_id"] == oms_artifact["exchange_order_id"]
+    assert result.fill_event["order_id"] == oms_artifact["exchange_order_id"]
+    assert result.fill_event["status"] == oms_artifact["status"]
     assert result.fill_event["filled_qty"] == pytest.approx(oms_artifact["filled_qty"])
 
     trades = await kraken_mock_server.get_trades(account="company", pair="BTC/USD")
