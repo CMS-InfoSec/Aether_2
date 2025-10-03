@@ -35,13 +35,13 @@ jobs:
         run: |
           /kaniko/executor \
             --context $GITHUB_WORKSPACE \
-            --dockerfile services/risk-api/Dockerfile \
+            --dockerfile deploy/docker/risk-api/Dockerfile \
             --destination ghcr.io/aether/risk-api:${{ github.sha }}
       - name: Build Ingestor Image
         run: |
           /kaniko/executor \
             --context $GITHUB_WORKSPACE \
-            --dockerfile services/risk-ingestor/Dockerfile \
+            --dockerfile deploy/docker/risk-ingestor/Dockerfile \
             --destination ghcr.io/aether/risk-ingestor:${{ github.sha }}
 
   buildah-sbom:
@@ -57,10 +57,10 @@ jobs:
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
       - name: Build Risk API with Buildah
         run: |
-          buildah bud -f services/risk-api/Dockerfile -t ghcr.io/aether/risk-api:${{ github.sha }} .
+          buildah bud -f deploy/docker/risk-api/Dockerfile -t ghcr.io/aether/risk-api:${{ github.sha }} .
       - name: Build Ingestor with Buildah
         run: |
-          buildah bud -f services/risk-ingestor/Dockerfile -t ghcr.io/aether/risk-ingestor:${{ github.sha }} .
+          buildah bud -f deploy/docker/risk-ingestor/Dockerfile -t ghcr.io/aether/risk-ingestor:${{ github.sha }} .
       - name: Generate SBOMs
         run: |
           syft ghcr.io/aether/risk-api:${{ github.sha }} -o json > sbom-risk-api.json
