@@ -1,6 +1,7 @@
 import importlib
 import importlib.util
 import sys
+from decimal import Decimal
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -32,9 +33,22 @@ def test_capital_allocator_rebalance_and_status(tmp_path, monkeypatch: pytest.Mo
                 CREATE TABLE IF NOT EXISTS pnl_curves (
                     account_id TEXT,
                     nav REAL,
+                    net_asset_value REAL,
+                    equity REAL,
+                    ending_balance REAL,
+                    balance REAL,
                     drawdown REAL,
+                    realized_drawdown REAL,
+                    drawdown_value REAL,
+                    max_drawdown REAL,
                     drawdown_limit REAL,
-                    curve_ts TEXT
+                    max_drawdown_limit REAL,
+                    drawdown_cap REAL,
+                    drawdown_threshold REAL,
+                    curve_ts TEXT,
+                    valuation_ts TEXT,
+                    ts TEXT,
+                    created_at TEXT
                 )
                 """
             )
@@ -67,12 +81,12 @@ def test_capital_allocator_rebalance_and_status(tmp_path, monkeypatch: pytest.Mo
         response = client.post("/allocator/rebalance", json=payload)
         assert response.status_code == 200
         body = response.json()
-        assert body["total_nav"] == pytest.approx(1_000_000.0)
+        assert Decimal(body["total_nav"]) == Decimal("1000000.00")
         accounts = {entry["account_id"]: entry for entry in body["accounts"]}
         assert accounts["director-1"]["throttled"] is True
-        assert accounts["director-1"]["allocation_pct"] == pytest.approx(0.05, rel=1e-6)
-        assert accounts["company"]["allocation_pct"] == pytest.approx(0.65625, rel=1e-6)
-        assert accounts["director-2"]["allocation_pct"] == pytest.approx(0.29375, rel=1e-6)
+        assert Decimal(accounts["director-1"]["allocation_pct"]) == Decimal("0.05")
+        assert Decimal(accounts["company"]["allocation_pct"]).quantize(Decimal("0.000001")) == Decimal("0.656250")
+        assert Decimal(accounts["director-2"]["allocation_pct"]).quantize(Decimal("0.000001")) == Decimal("0.293750")
 
         with module.SessionLocal() as session:
             result = session.execute(text("SELECT COUNT(*) FROM capital_allocations"))
@@ -83,7 +97,122 @@ def test_capital_allocator_rebalance_and_status(tmp_path, monkeypatch: pytest.Mo
         status_body = status.json()
         status_accounts = {entry["account_id"]: entry for entry in status_body["accounts"]}
         assert status_accounts["director-1"]["throttled"] is True
-        assert status_accounts["director-1"]["allocation_pct"] == pytest.approx(0.05, rel=1e-6)
+        assert Decimal(status_accounts["director-1"]["allocation_pct"]) == Decimal("0.05")
+
+    module.ENGINE.dispose()
+    sys.modules.pop("capital_allocator", None)
+
+
+def test_allocator_handles_large_navs_precision(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db_url = "sqlite:///:memory:"
+    module = _reload_allocator(monkeypatch, db_url)
+    engine = module.ENGINE
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS pnl_curves (
+                    account_id TEXT,
+                    nav REAL,
+                    net_asset_value REAL,
+                    equity REAL,
+                    ending_balance REAL,
+                    balance REAL,
+                    drawdown REAL,
+                    realized_drawdown REAL,
+                    drawdown_value REAL,
+                    max_drawdown REAL,
+                    drawdown_limit REAL,
+                    max_drawdown_limit REAL,
+                    drawdown_cap REAL,
+                    drawdown_threshold REAL,
+                    curve_ts TEXT,
+                    valuation_ts TEXT,
+                    ts TEXT,
+                    created_at TEXT
+                )
+                """
+            )
+        )
+        conn.execute(text("DELETE FROM pnl_curves"))
+        conn.execute(text("DELETE FROM capital_allocations"))
+        now = datetime.now(timezone.utc).isoformat()
+        rows = [
+            ("mega-1", 125_000_000.12, 5_000_000.01, 12_500_000.00, now),
+            ("mega-2", 225_000_000.34, 10_000_000.02, 20_000_000.00, now),
+            ("mega-3", 175_000_000.45, 3_500_000.00, 15_000_000.00, now),
+        ]
+        conn.execute(
+            text(
+                "INSERT INTO pnl_curves (account_id, nav, drawdown, drawdown_limit, curve_ts) "
+                "VALUES (:account_id, :nav, :drawdown, :drawdown_limit, :curve_ts)"
+            ),
+            [
+                {
+                    "account_id": account,
+                    "nav": nav,
+                    "drawdown": drawdown,
+                    "drawdown_limit": limit,
+                    "curve_ts": ts,
+                }
+                for account, nav, drawdown, limit, ts in rows
+            ],
+        )
+
+    with TestClient(module.app) as client:
+        payload = {
+            "allocations": {
+                "mega-1": "0.333333",
+                "mega-2": "0.333333",
+                "mega-3": "0.333334",
+            }
+        }
+        response = client.post("/allocator/rebalance", json=payload)
+        assert response.status_code == 200
+        body = response.json()
+
+        total_nav = Decimal(body["total_nav"])
+        expected_total = sum(Decimal(str(row[1])).quantize(Decimal("0.01")) for row in rows)
+        assert total_nav == expected_total
+
+        account_map = {entry["account_id"]: entry for entry in body["accounts"]}
+        allocated_sum = Decimal("0")
+        sorted_accounts = sorted(payload["allocations"].items())
+        for index, (account_id, expected_pct) in enumerate(sorted_accounts, start=1):
+            entry = account_map[account_id]
+            allocation_pct = Decimal(entry["allocation_pct"])
+            allocated_nav = Decimal(entry["allocated_nav"])
+            expected_pct_decimal = Decimal(expected_pct)
+            assert allocation_pct == expected_pct_decimal
+            if index == len(sorted_accounts):
+                expected_nav = (total_nav - allocated_sum).quantize(Decimal("0.01"))
+            else:
+                expected_nav = (expected_pct_decimal * total_nav).quantize(Decimal("0.01"))
+                allocated_sum += expected_nav
+            assert allocated_nav == expected_nav
+        allocated_sum = sum(Decimal(entry["allocated_nav"]) for entry in body["accounts"])
+        assert allocated_sum == total_nav
+
+        status = client.get("/allocator/status")
+        assert status.status_code == 200
+        status_body = status.json()
+        status_total_nav = Decimal(status_body["total_nav"])
+        assert status_total_nav == total_nav
+        status_accounts = {entry["account_id"]: entry for entry in status_body["accounts"]}
+        allocated_status_sum = Decimal("0")
+        for index, (account_id, expected_pct) in enumerate(sorted(payload["allocations"].items()), start=1):
+            entry = status_accounts[account_id]
+            allocation_pct = Decimal(entry["allocation_pct"])
+            allocated_nav = Decimal(entry["allocated_nav"])
+            expected_pct_decimal = Decimal(expected_pct)
+            assert allocation_pct == expected_pct_decimal
+            if index == len(status_accounts):
+                expected_nav = (status_total_nav - allocated_status_sum).quantize(Decimal("0.01"))
+            else:
+                expected_nav = (expected_pct_decimal * status_total_nav).quantize(Decimal("0.01"))
+                allocated_status_sum += expected_nav
+            assert allocated_nav == expected_nav
 
     module.ENGINE.dispose()
     sys.modules.pop("capital_allocator", None)
@@ -96,6 +225,9 @@ def risk_service_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("RISK_DATABASE_URL", f"sqlite:///{db_path}")
     sys.modules.pop("risk_service", None)
     module = importlib.import_module("risk_service")
+    import shared.graceful_shutdown as graceful_shutdown
+
+    monkeypatch.setattr(graceful_shutdown, "install_sigterm_handler", lambda manager: None)
 
     try:
         with TestClient(module.app) as client:

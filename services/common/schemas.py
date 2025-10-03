@@ -389,6 +389,18 @@ class OrderPlacementResponse(BaseModel):
     accepted: bool = Field(..., description="Whether the order was accepted by OMS")
     routed_venue: str = Field(..., description="Venue to which the order is routed")
     fee: FeeBreakdown = Field(..., description="Final fees for the order")
+    exchange_order_id: Optional[str] = Field(
+        None,
+        description="Identifier assigned by the exchange for the order",
+    )
+    kraken_status: Optional[str] = Field(
+        None,
+        description="Raw status string returned from Kraken for the order",
+    )
+    errors: Optional[List[str]] = Field(
+        None,
+        description="Any error messages returned from Kraken during placement",
+    )
 
 
 class FeeScheduleResponse(BaseModel):

@@ -248,6 +248,9 @@ def test_rotate_secret_triggers_oms_reload(monkeypatch: pytest.MonkeyPatch, capl
         order_payload = order_response.json()
         assert order_payload["accepted"] is True
         assert order_payload["routed_venue"] == "kraken"
+        assert order_payload["exchange_order_id"] == "SIM-ROTATE"
+        assert order_payload["kraken_status"] == "ok"
+        assert order_payload["errors"] is None
 
         recorded = _RecordingKrakenWSClient.last_session_credentials or {}
         assert recorded.get("api_key") == new_key
