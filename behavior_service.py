@@ -18,11 +18,11 @@ import logging
 import math
 import os
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from fastapi import FastAPI, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import JSON, Column, DateTime, Integer, String, create_engine
 from sqlalchemy.engine import Engine
@@ -31,6 +31,7 @@ from sqlalchemy.pool import StaticPool
 
 from services.alert_manager import RiskEvent, get_alert_manager_instance
 from services.common.adapters import TimescaleAdapter
+from services.common.security import require_admin_account
 
 
 logger = logging.getLogger(__name__)
@@ -134,7 +135,7 @@ class BehaviorDetector:
     """Encapsulates heuristics for behaviour anomaly detection."""
 
     adapter_factory: type[TimescaleAdapter] = TimescaleAdapter
-    config: DetectorConfig = DetectorConfig()
+    config: DetectorConfig = field(default_factory=DetectorConfig)
 
     def scan_account(self, account_id: str, lookback_minutes: int) -> List[BehaviorIncident]:
         adapter = self.adapter_factory(account_id=account_id)
@@ -390,7 +391,16 @@ def _emit_alert(incident: BehaviorIncident) -> None:
 
 
 @app.post("/behavior/scan", response_model=ScanResponse)
-def scan_behavior(request: ScanRequest) -> ScanResponse:
+def scan_behavior(
+    request: ScanRequest,
+    authorized_account: str = Depends(require_admin_account),
+) -> ScanResponse:
+    if request.account_id.strip().lower() != authorized_account.strip().lower():
+        raise HTTPException(
+            status_code=403,
+            detail="Authenticated account is not authorized for the requested account.",
+        )
+
     incidents = detector.scan_account(request.account_id, request.lookback_minutes)
     if not incidents:
         return ScanResponse(incidents=[])
@@ -410,7 +420,14 @@ def scan_behavior(request: ScanRequest) -> ScanResponse:
 def behavior_status(
     account_id: str = Query(..., min_length=1),
     limit: int = Query(50, ge=1, le=500),
+    authorized_account: str = Depends(require_admin_account),
 ) -> StatusResponse:
+    if account_id.strip().lower() != authorized_account.strip().lower():
+        raise HTTPException(
+            status_code=403,
+            detail="Authenticated account is not authorized for the requested account.",
+        )
+
     with SessionLocal() as session:
         rows: List[BehaviorLog] = (
             session.query(BehaviorLog)
