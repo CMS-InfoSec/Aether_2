@@ -22,10 +22,11 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, MutableMapping, Sequence
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from reports.storage import ArtifactStorage, build_storage_from_env
+from services.common.security import require_admin_account
 from shared.timezone import format_london_time
 from services.models.model_server import get_active_model
 
@@ -43,6 +44,18 @@ LOGGER = logging.getLogger(__name__)
 
 
 DEFAULT_DSN = "postgresql://timescale:password@localhost:5432/aether"
+
+
+def _normalize_account_id(value: str) -> str:
+    return value.strip().lower()
+
+
+def _ensure_caller_matches_account(caller: str, account_id: str) -> None:
+    if _normalize_account_id(caller) != _normalize_account_id(account_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Authenticated account is not authorized for the requested account.",
+        )
 
 
 def _database_url() -> str:
@@ -637,7 +650,8 @@ app = FastAPI(title="Report Service")
 
 @app.get("/reports/trade_explain")
 def get_trade_explanation(
-    trade_id: str = Query(..., description="Unique trade/fill identifier")
+    trade_id: str = Query(..., description="Unique trade/fill identifier"),
+    caller: str = Depends(require_admin_account),
 ) -> JSONResponse:
     """Return the model explanation for a single trade."""
 
@@ -645,6 +659,7 @@ def get_trade_explanation(
     account_id = trade.get("account_id")
     if not account_id:
         raise HTTPException(status_code=422, detail="Trade is missing account context")
+    _ensure_caller_matches_account(caller, str(account_id))
     instrument = trade.get("instrument") or trade.get("symbol")
     if not instrument:
         raise HTTPException(status_code=422, detail="Trade is missing instrument context")
@@ -688,8 +703,11 @@ def get_trade_explanation(
 def get_daily_report(
     account_id: str = Query(..., description="Logical trading account identifier"),
     report_date: str | None = Query(None, description="ISO-8601 date for the report"),
+    caller: str = Depends(require_admin_account),
 ) -> Response:
     """Return the daily operational report as a CSV attachment."""
+
+    _ensure_caller_matches_account(caller, account_id)
 
     resolved_date = _to_date(report_date, default=date.today())
     start = datetime.combine(resolved_date, datetime.min.time(), tzinfo=timezone.utc)
@@ -741,8 +759,11 @@ def get_quarterly_report(
     account_id: str = Query(..., description="Logical trading account identifier"),
     quarter_end: str | None = Query(None, description="Quarter end date in ISO format"),
     fmt: str = Query("csv", description="Output format: csv or parquet"),
+    caller: str = Depends(require_admin_account),
 ) -> Response:
     """Generate quarterly accounting summary in CSV or Parquet format."""
+
+    _ensure_caller_matches_account(caller, account_id)
 
     resolved_end = _to_date(quarter_end, default=date.today())
     quarter_start, quarter_last = _quarter_bounds(resolved_end)
@@ -818,8 +839,11 @@ def get_xai_report(
     account_id: str = Query(..., description="Logical trading account identifier"),
     report_date: str = Query(..., description="ISO-8601 date for the XAI evaluation"),
     fmt: str = Query("json", description="Output format: json or html"),
+    caller: str = Depends(require_admin_account),
 ) -> Response:
     """Produce an explainability report summarising trade drivers."""
+
+    _ensure_caller_matches_account(caller, account_id)
 
     resolved_date = _to_date(report_date, default=date.today())
     start = datetime.combine(resolved_date, datetime.min.time(), tzinfo=timezone.utc)
