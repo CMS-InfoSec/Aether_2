@@ -11,6 +11,9 @@ from fastapi import HTTPException, status
 
 
 
+GTD_EXPIRE_TIME_REQUIRED = "expire_time must be provided when time_in_force is GTD."
+
+
 class FeeDetail(BaseModel):
     """Detailed fee information anchored to a tier lookup."""
 
@@ -340,13 +343,25 @@ class OrderPlacementRequest(BaseModel):
     )
     expire_time: datetime | None = Field(
         default=None,
-        description="UTC timestamp when a GTD order should expire",
+
+        description="UTC expiration timestamp required when time in force is GTD",
+
     )
     take_profit: float | None = Field(
         default=None,
         gt=0.0,
         description="Take profit trigger price",
     )
+
+    @model_validator(mode="after")
+    def _validate_expire_time(self) -> "OrderPlacementRequest":  # type: ignore[override]
+        if self.expire_time is not None:
+            if self.expire_time.tzinfo is None:
+                raise ValueError("expire_time must include timezone information.")
+            self.expire_time = self.expire_time.astimezone(timezone.utc)
+        if self.time_in_force == "GTD" and self.expire_time is None:
+            raise ValueError(GTD_EXPIRE_TIME_REQUIRED)
+        return self
     stop_loss: float | None = Field(
         default=None,
         gt=0.0,
