@@ -270,7 +270,7 @@ def test_place_order_rejected_ack_sets_accepted_false(
             await rest_client.close()
 
     monkeypatch.setattr(app.state, "kraken_client_factory", _factory)
-    monkeypatch.setattr(oms_main, "_ensure_ack_success", lambda ack, transport: None)
+    monkeypatch.setattr(main, "_ensure_ack_success", lambda ack, transport: None)
 
     payload = {
         "account_id": "admin-alpha",
@@ -330,6 +330,9 @@ def test_place_order_snaps_to_exchange_metadata(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     submissions: list[Dict[str, Any]] = []
+    call_state = {"get": 0, "refresh": 0}
+    original_get = main.market_metadata_cache.get
+    original_refresh = main.market_metadata_cache.refresh
 
     async def _capture_submit(
         ws_client: Any, rest_client: Any, payload: Dict[str, Any]
@@ -348,6 +351,27 @@ def test_place_order_snaps_to_exchange_metadata(
 
     monkeypatch.setattr(main, "_submit_order", _capture_submit)
 
+    async def _mock_get(self: Any, instrument: str) -> Dict[str, float] | None:
+        call_state["get"] += 1
+        if call_state["get"] == 1:
+            return None
+        return await original_get(instrument)
+
+    async def _mock_refresh(self: Any) -> None:
+        call_state["refresh"] += 1
+        await original_refresh()
+
+    monkeypatch.setattr(
+        main.market_metadata_cache,
+        "get",
+        types.MethodType(_mock_get, main.market_metadata_cache),
+    )
+    monkeypatch.setattr(
+        main.market_metadata_cache,
+        "refresh",
+        types.MethodType(_mock_refresh, main.market_metadata_cache),
+    )
+
     payload = {
         "account_id": "admin-alpha",
         "order_id": "ord-ada",
@@ -364,5 +388,48 @@ def test_place_order_snaps_to_exchange_metadata(
     assert submissions, "Expected order submission to be captured"
 
     submitted = submissions[0]
-    assert submitted["price"] == pytest.approx(0.123457, rel=0, abs=1e-9)
-    assert submitted["volume"] == pytest.approx(5.43210988, rel=0, abs=1e-9)
+    assert submitted["price"] == pytest.approx(0.123456, rel=0, abs=1e-9)
+    assert submitted["volume"] == pytest.approx(5.43210987, rel=0, abs=1e-9)
+    assert call_state == {"get": 2, "refresh": 1}
+
+
+def test_place_order_returns_424_when_metadata_missing(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    call_state = {"get": 0, "refresh": 0}
+
+    async def _mock_get(self: Any, instrument: str) -> Dict[str, float] | None:
+        call_state["get"] += 1
+        return None
+
+    async def _mock_refresh(self: Any) -> None:
+        call_state["refresh"] += 1
+
+    monkeypatch.setattr(
+        main.market_metadata_cache,
+        "get",
+        types.MethodType(_mock_get, main.market_metadata_cache),
+    )
+    monkeypatch.setattr(
+        main.market_metadata_cache,
+        "refresh",
+        types.MethodType(_mock_refresh, main.market_metadata_cache),
+    )
+
+    payload = {
+        "account_id": "admin-alpha",
+        "order_id": "ord-missing",
+        "instrument": "BTC-USD",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 101.5,
+        "fee": {"currency": "USD", "maker": 0.1, "taker": 0.2},
+    }
+
+    response = client.post("/oms/place", json=payload, headers={"X-Account-ID": "admin-alpha"})
+
+    assert response.status_code == 424
+    assert response.json() == {
+        "detail": "Market metadata unavailable; unable to quantize order safely."
+    }
+    assert call_state == {"get": 2, "refresh": 1}

@@ -772,10 +772,23 @@ async def place_order(
         )
 
 
-    metadata = MARKET_METADATA.get(request.instrument, {"tick": 0.01, "lot": 0.0001})
-    snapped_price = _snap(request.price, metadata["tick"], side=request.side)
+    metadata = await market_metadata_cache.get(request.instrument)
+    if metadata is None:
+        await market_metadata_cache.refresh()
+        metadata = await market_metadata_cache.get(request.instrument)
+
+    tick_size = metadata.get("tick") if metadata else None
+    lot_size = metadata.get("lot") if metadata else None
+
+    if not tick_size or not lot_size:
+        raise HTTPException(
+            status_code=status.HTTP_424_FAILED_DEPENDENCY,
+            detail="Market metadata unavailable; unable to quantize order safely.",
+        )
+
+    snapped_price = _snap(request.price, tick_size, side=request.side)
     snapped_quantity = _snap(
-        request.quantity, metadata["lot"], side=request.side, floor_quantity=True
+        request.quantity, lot_size, side=request.side, floor_quantity=True
     )
 
 
@@ -802,13 +815,13 @@ async def place_order(
     if request.take_profit:
         order_payload["takeProfit"] = _snap(
             request.take_profit,
-            metadata["tick"],
+            tick_size,
             side=request.side,
         )
     if request.stop_loss:
         order_payload["stopLoss"] = _snap(
             request.stop_loss,
-            metadata["tick"],
+            tick_size,
             side=request.side,
         )
 
