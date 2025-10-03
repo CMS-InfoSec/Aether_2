@@ -98,10 +98,10 @@ jobs:
             echo "No Kubernetes manifests found to test."
             exit 0
           fi
-          if [ -d policy ]; then
-            conftest test deploy
+          if [ -d deploy/k8s/policies ]; then
+            conftest test deploy --policy deploy/k8s/policies
           else
-            echo "No OPA policies found. Skipping check."
+            echo "No OPA policies found at deploy/k8s/policies. Skipping check."
             exit 0
           fi
 
