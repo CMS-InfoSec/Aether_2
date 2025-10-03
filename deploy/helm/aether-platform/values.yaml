@@ -294,6 +294,63 @@ backendServices:
     pdb:
       enabled: true
       maxUnavailable: 1
+  hitl:
+    enabled: true
+    nameOverride: hitl-service
+    image:
+      repository: ghcr.io/aether/hitl-service
+      tag: latest
+    replicaCount: 2
+    containerPort: 8000
+    env:
+      - name: HITL_DATABASE_URL
+        valueFrom:
+          secretKeyRef:
+            name: hitl-service-database
+            key: dsn
+    usesKrakenSecrets: false
+    extraVolumeMounts: []
+    extraVolumes: []
+    service:
+      port: 80
+      targetPort: http
+    ingress:
+      enabled: true
+      host: hitl.aether.example.com
+      tlsSecret: hitl-service-tls
+      annotations: {}
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 6
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 60
+        - type: Resource
+          resource:
+            name: memory
+            target:
+              type: Utilization
+              averageUtilization: 70
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 60
+        scaleDown:
+          stabilizationWindowSeconds: 60
+    pdb:
+      enabled: true
+      maxUnavailable: 1
   risk:
     enabled: true
     nameOverride: risk-service

@@ -32,6 +32,7 @@ pytest.importorskip("fastapi", reason="fastapi is required for API integration t
 
 from fastapi.testclient import TestClient
 from auth_service import create_jwt
+from auth.service import InMemorySessionStore
 
 
 def _issue_training_request(client: TestClient) -> Dict[str, Any]:
@@ -59,7 +60,7 @@ def test_training_bootstrap_populates_all_backends(monkeypatch: pytest.MonkeyPat
     from ml.training import workflow as training_workflow
     from services import coingecko_ingest
 
-    app = create_app()
+    app = create_app(session_store=InMemorySessionStore())
     client = TestClient(app)
 
     loader_calls: List[Dict[str, Any]] = []

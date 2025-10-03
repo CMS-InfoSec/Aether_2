@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 
 from app import create_app
+from auth.service import InMemorySessionStore
 import pack_exporter
 from services.common.security import require_admin_account
 
@@ -23,7 +24,7 @@ def test_knowledge_router_available(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(pack_exporter, "KnowledgePackRepository", lambda *_, **__: Repo())
 
-    app = create_app()
+    app = create_app(session_store=InMemorySessionStore())
     app.dependency_overrides[require_admin_account] = lambda: "company"
     with TestClient(app) as client:
         response = client.get("/knowledge/export/latest")
@@ -33,7 +34,7 @@ def test_knowledge_router_available(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_meta_router_available() -> None:
-    app = create_app()
+    app = create_app(session_store=InMemorySessionStore())
     with TestClient(app) as client:
         response = client.get(
             "/meta/weights",

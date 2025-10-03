@@ -22,16 +22,17 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import httpx
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, status
 
 from pydantic import BaseModel, Field, PositiveFloat, constr
 from sqlalchemy import Boolean, Column, DateTime, Float, String, create_engine, func, select
 from sqlalchemy.engine import Engine
+from sqlalchemy.engine.url import URL, make_url
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import NullPool
 
-from auth.service import InMemorySessionStore, RedisSessionStore, SessionStoreProtocol
+from auth.service import RedisSessionStore, SessionStoreProtocol
 from services.common.schemas import RiskValidationRequest, RiskValidationResponse
 from services.common.security import require_admin_account
 from strategy_bus import StrategySignalBus, ensure_signal_tables
@@ -245,36 +246,83 @@ class StrategySignalResponse(BaseModel):
 
 
 def _database_url() -> str:
-    url = (
+    raw_url = (
         os.getenv("STRATEGY_DATABASE_URL")
         or os.getenv("TIMESCALE_DSN")
         or os.getenv("DATABASE_URL")
-        or "sqlite:///./strategy.db"
     )
-    if url.startswith("postgresql://"):
-        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
-    return url
+    if not raw_url:
+        raise RuntimeError(
+            "STRATEGY_DATABASE_URL must be set to a managed PostgreSQL/TimescaleDB DSN."
+        )
+
+    try:
+        url: URL = make_url(raw_url)
+    except Exception as exc:  # pragma: no cover - defensive validation
+        raise RuntimeError(f"Invalid STRATEGY_DATABASE_URL '{raw_url}': {exc}") from exc
+
+    driver = url.drivername.replace("timescale", "postgresql")
+    if driver in {"postgresql", "postgres"}:
+        url = url.set(drivername="postgresql+psycopg")
+    elif driver.startswith("postgresql+"):
+        # Normalise older DSNs using psycopg2 to psycopg for consistency.
+        if driver == "postgresql+psycopg2":
+            url = url.set(drivername="postgresql+psycopg")
+    else:
+        raise RuntimeError(
+            "Strategy orchestrator requires a PostgreSQL/TimescaleDB DSN; "
+            f"received driver '{url.drivername}'."
+        )
+
+    return str(url)
 
 
 def _create_engine(url: str) -> Engine:
-    kwargs: Dict[str, object] = {"future": True}
+    kwargs: Dict[str, object] = {"future": True, "pool_pre_ping": True}
+    connect_args: Dict[str, object] = {}
+
     if url.startswith("sqlite://"):
-        kwargs.setdefault("connect_args", {"check_same_thread": False})
+        connect_args["check_same_thread"] = False
         kwargs["poolclass"] = NullPool
+    else:
+        connect_args["sslmode"] = os.getenv("STRATEGY_DB_SSLMODE", "require")
+        sslrootcert = os.getenv("STRATEGY_DB_SSLROOTCERT")
+        if sslrootcert:
+            connect_args["sslrootcert"] = sslrootcert
+        sslcert = os.getenv("STRATEGY_DB_SSLCERT")
+        if sslcert:
+            connect_args["sslcert"] = sslcert
+        sslkey = os.getenv("STRATEGY_DB_SSLKEY")
+        if sslkey:
+            connect_args["sslkey"] = sslkey
+        kwargs.update(
+            pool_size=int(os.getenv("STRATEGY_DB_POOL_SIZE", "15")),
+            max_overflow=int(os.getenv("STRATEGY_DB_MAX_OVERFLOW", "15")),
+            pool_timeout=int(os.getenv("STRATEGY_DB_POOL_TIMEOUT", "30")),
+            pool_recycle=int(os.getenv("STRATEGY_DB_POOL_RECYCLE", "1800")),
+        )
+
+    if connect_args:
+        kwargs["connect_args"] = connect_args
+
     return create_engine(url, **kwargs)
 
 
 def _build_session_store_from_env() -> SessionStoreProtocol:
     ttl_minutes = int(os.getenv("SESSION_TTL_MINUTES", "60"))
     redis_url = os.getenv("SESSION_REDIS_URL")
-    if redis_url:
-        try:  # pragma: no cover - optional dependency for Redis-backed sessions
-            import redis  # type: ignore[import-not-found]
-        except ImportError as exc:  # pragma: no cover - surfaced when redis is missing at runtime
-            raise RuntimeError("redis package is required when SESSION_REDIS_URL is set") from exc
-        client = redis.Redis.from_url(redis_url)
-        return RedisSessionStore(client, ttl_minutes=ttl_minutes)
-    return InMemorySessionStore(ttl_minutes=ttl_minutes)
+    if not redis_url:
+        raise RuntimeError(
+            "SESSION_REDIS_URL is not configured. Provide a shared session store DSN to enable orchestrator authentication.",
+        )
+
+    try:  # pragma: no cover - optional dependency for Redis-backed sessions
+        import redis  # type: ignore[import-not-found]
+    except ImportError as exc:  # pragma: no cover - surfaced when redis is missing at runtime
+        raise RuntimeError("redis package is required when SESSION_REDIS_URL is set") from exc
+
+    client = redis.Redis.from_url(redis_url)
+    return RedisSessionStore(client, ttl_minutes=ttl_minutes)
 
 
 DATABASE_URL = _database_url()
@@ -313,7 +361,8 @@ def _set_components(registry: StrategyRegistry, signal_bus: StrategySignalBus) -
 
 
 def _initialise_components() -> None:
-    Base.metadata.create_all(bind=ENGINE)
+    with ENGINE.begin() as connection:
+        Base.metadata.create_all(bind=connection)
     ensure_signal_tables(ENGINE)
 
     registry = StrategyRegistry(
@@ -401,9 +450,10 @@ async def _startup_event() -> None:
 async def register_strategy(
     payload: StrategyRegisterRequest, actor: str = Depends(require_admin_account)
 ) -> StrategyStatusResponse:
+    registry = _require_registry()
     try:
         LOGGER.info("Registering strategy '%s' by %s", payload.name.lower(), actor)
-        snapshot = REGISTRY.register(payload.name.lower(), payload.description, payload.max_nav_pct)
+        snapshot = registry.register(payload.name.lower(), payload.description, payload.max_nav_pct)
 
     except StrategyAllocationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -415,11 +465,12 @@ async def register_strategy(
 async def toggle_strategy(
     payload: StrategyToggleRequest, actor: str = Depends(require_admin_account)
 ) -> StrategyStatusResponse:
+    registry = _require_registry()
     try:
         LOGGER.info(
             "Toggling strategy '%s' to %s by %s", payload.name.lower(), payload.enabled, actor
         )
-        snapshot = REGISTRY.toggle(payload.name.lower(), payload.enabled)
+        snapshot = registry.toggle(payload.name.lower(), payload.enabled)
 
     except StrategyNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -430,7 +481,8 @@ async def toggle_strategy(
 
 async def strategy_status(actor: str = Depends(require_admin_account)) -> List[StrategyStatusResponse]:
     LOGGER.info("Fetching strategy status for %s", actor)
-    snapshots = REGISTRY.status()
+    registry = _require_registry()
+    snapshots = registry.status()
 
     return [StrategyStatusResponse(**snapshot.__dict__) for snapshot in snapshots]
 
@@ -440,13 +492,14 @@ async def strategy_status(actor: str = Depends(require_admin_account)) -> List[S
 async def route_intent(
     payload: StrategyIntentRequest, actor: str = Depends(require_admin_account)
 ) -> RiskValidationResponse:
+    registry = _require_registry()
     try:
         LOGGER.info(
             "Routing intent for strategy '%s' submitted by %s",
             payload.strategy_name.lower(),
             actor,
         )
-        return await REGISTRY.route_trade_intent(payload.strategy_name.lower(), payload.request)
+        return await registry.route_trade_intent(payload.strategy_name.lower(), payload.request)
 
     except StrategyNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -458,7 +511,8 @@ async def route_intent(
 
 async def strategy_signals(actor: str = Depends(require_admin_account)) -> List[StrategySignalResponse]:
     LOGGER.info("Listing strategy signals for %s", actor)
-    signals = SIGNAL_BUS.list_signals()
+    signal_bus = _require_signal_bus()
+    signals = signal_bus.list_signals()
 
     return [
         StrategySignalResponse(

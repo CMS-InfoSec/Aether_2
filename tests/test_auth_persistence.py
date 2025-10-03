@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 
 import pyotp
+from fastapi import Depends
 from fastapi.testclient import TestClient
 
 from app import create_app
@@ -12,6 +13,7 @@ from auth.service import (
     RedisSessionStore,
     hash_password,
 )
+from services.common.security import require_admin_account
 
 
 class _MemoryCursor:
@@ -123,7 +125,7 @@ def test_login_and_session_survive_restart_cycle():
 
     secret = pyotp.random_base32()
     admin = AdminAccount(
-        admin_id="admin-42",
+        admin_id="company",
         email="persistence@example.com",
         password_hash=hash_password("CorrectHorseBatteryStaple"),
         mfa_secret=secret,
@@ -163,3 +165,47 @@ def test_login_and_session_survive_restart_cycle():
     body = response.json()
     assert body["admin_id"] == admin.admin_id
     assert body["token"]
+
+
+def test_shared_sessions_allow_cross_instance_authorization() -> None:
+    app, admin_repo, session_store = _build_app_with_memory_backends()
+    client = TestClient(app)
+
+    secret = pyotp.random_base32()
+    admin = AdminAccount(
+        admin_id="company",
+        email="shared@example.com",
+        password_hash=hash_password("CorrectHorseBatteryStaple"),
+        mfa_secret=secret,
+    )
+    admin_repo.add(admin)
+
+    first_code = pyotp.TOTP(secret).now()
+    login = client.post(
+        "/auth/login",
+        json={
+            "email": admin.email,
+            "password": "CorrectHorseBatteryStaple",
+            "mfa_code": first_code,
+        },
+    )
+    assert login.status_code == 200
+    token = login.json()["token"]
+
+    restarted_app = create_app(admin_repository=admin_repo, session_store=session_store)
+
+    @restarted_app.get("/__test/protected")
+    def _protected(account: str = Depends(require_admin_account)) -> dict[str, str]:
+        return {"account": account}
+
+    restarted_client = TestClient(restarted_app)
+    protected = restarted_client.get(
+        "/__test/protected",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "X-Account-ID": admin.admin_id,
+        },
+    )
+
+    assert protected.status_code == 200
+    assert protected.json() == {"account": admin.admin_id}
