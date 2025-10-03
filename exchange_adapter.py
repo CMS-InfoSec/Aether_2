@@ -8,11 +8,25 @@ import logging
 import os
 from abc import ABC, abstractmethod
 
-from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
+
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    MutableMapping,
+    Optional,
+    Sequence,
+)
+
 from uuid import uuid4
 
 
 import httpx
+
+from auth.session_client import AdminSessionManager, get_default_session_manager
 
 from metrics import get_request_id
 
@@ -98,9 +112,12 @@ def _join_url(base_url: str, path: str) -> str:
     return f"{base}{suffix}" if base else suffix
 
 
-def _account_headers(account_id: str) -> Dict[str, str]:
+def _account_headers(account_id: str, *, token: Optional[str] = None) -> Dict[str, str]:
     request_id = get_request_id() or str(uuid4())
-    return {"X-Account-ID": account_id, "X-Request-ID": request_id}
+    headers = {"X-Account-ID": account_id, "X-Request-ID": request_id}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
 
 
 class KrakenAdapter(ExchangeAdapter):
@@ -112,6 +129,7 @@ class KrakenAdapter(ExchangeAdapter):
         primary_url: Optional[str] = None,
         paper_url: Optional[str] = None,
         timeout: Optional[float] = None,
+        session_manager: Optional[AdminSessionManager] = None,
     ) -> None:
         super().__init__(
             "kraken",
@@ -125,6 +143,7 @@ class KrakenAdapter(ExchangeAdapter):
         self._primary_url = (primary_url or _DEFAULT_PRIMARY_URL or "").strip()
         self._paper_url = (paper_url or _DEFAULT_PAPER_URL or "").strip()
         self._timeout = timeout if timeout is not None else _DEFAULT_TIMEOUT
+        self._session_manager = session_manager
 
     async def place_order(
         self,
@@ -143,11 +162,12 @@ class KrakenAdapter(ExchangeAdapter):
             return {}
 
         url = _join_url(base_url, "/oms/place")
+        headers = await self._request_headers(account_id)
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             response = await client.post(
                 url,
                 json=dict(payload),
-                headers=_account_headers(account_id),
+                headers=headers,
             )
             response.raise_for_status()
             try:
@@ -171,11 +191,12 @@ class KrakenAdapter(ExchangeAdapter):
         }
         if exchange_order_id:
             payload["exchange_order_id"] = exchange_order_id
+        headers = await self._request_headers(account_id)
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             response = await client.post(
                 url,
                 json=payload,
-                headers=_account_headers(account_id),
+                headers=headers,
             )
             response.raise_for_status()
             try:
@@ -214,7 +235,7 @@ class KrakenAdapter(ExchangeAdapter):
             raise RuntimeError("Kraken OMS URL is not configured")
 
         url = _join_url(self._primary_url, path)
-        headers = {"X-Account-ID": account_id}
+        headers = await self._request_headers(account_id)
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             response = await client.get(url, params=dict(params or {}), headers=headers)
             response.raise_for_status()
@@ -227,6 +248,21 @@ class KrakenAdapter(ExchangeAdapter):
             if isinstance(payload, list):
                 return {"result": payload}
             return {}
+
+    async def _request_headers(self, account_id: str) -> Dict[str, str]:
+        token = await self._resolve_session_token(account_id)
+        return _account_headers(account_id, token=token)
+
+    async def _resolve_session_token(self, account_id: str) -> str:
+        manager = self._ensure_session_manager()
+        return await manager.token_for_account(account_id)
+
+    def _ensure_session_manager(self) -> AdminSessionManager:
+        manager = self._session_manager
+        if manager is None:
+            manager = get_default_session_manager()
+            self._session_manager = manager
+        return manager
 
     @staticmethod
     def _normalize_balances(account_id: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
