@@ -1,9 +1,11 @@
 """Application factory wiring services, middleware, and routers."""
 from __future__ import annotations
 
+import base64
 import importlib
 import logging
 import os
+import uuid
 from typing import Optional
 
 from fastapi import FastAPI
@@ -12,13 +14,14 @@ from audit_mode import configure_audit_mode
 from accounts.service import AccountsService
 from auth.routes import get_auth_service, router as auth_router
 from auth.service import (
+    AdminAccount,
     AdminRepositoryProtocol,
     AuthService,
     InMemoryAdminRepository,
-    InMemorySessionStore,
     PostgresAdminRepository,
     RedisSessionStore,
     SessionStoreProtocol,
+    hash_password,
 )
 from metrics import setup_metrics
 from services.alert_manager import setup_alerting
@@ -30,9 +33,25 @@ from scaling_controller import (
     configure_scaling_controller,
     router as scaling_router,
 )
-
-
 logger = logging.getLogger(__name__)
+_ADMIN_REPOSITORY_HEALTHCHECK_EMAIL = "__admin_healthcheck__@aether.local"
+_ADMIN_REPOSITORY_HEALTHCHECK_ID = "__admin_repository_healthcheck__"
+
+
+def _generate_random_password() -> str:
+    """Generate a high-entropy password for the sentinel admin record."""
+
+    # 32 bytes provides a large keyspace while remaining URL-safe for storage/logging.
+    raw = os.urandom(32)
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _generate_random_mfa_secret() -> str:
+    """Generate a base32-encoded secret compatible with TOTP generators."""
+
+    # Use 20 bytes (160 bits) to match typical TOTP secret entropy.
+    raw = os.urandom(20)
+    return base64.b32encode(raw).decode("ascii").rstrip("=")
 
 
 def _build_admin_repository_from_env() -> AdminRepositoryProtocol:
@@ -42,23 +61,68 @@ def _build_admin_repository_from_env() -> AdminRepositoryProtocol:
         "ADMIN_DB_DSN",
     )
     dsn = next((os.getenv(var) for var in dsn_env_vars if os.getenv(var)), None)
-    if dsn:
-        return PostgresAdminRepository(dsn)
-    return InMemoryAdminRepository()
+    if not dsn:
+        raise RuntimeError(
+            "A Postgres/Timescale DSN must be provided via ADMIN_POSTGRES_DSN, "
+            "ADMIN_DATABASE_DSN, or ADMIN_DB_DSN."
+        )
+
+    normalized = dsn.lower()
+    if normalized.startswith("postgres://"):
+        dsn = "postgresql://" + dsn.split("://", 1)[1]
+        normalized = dsn.lower()
+
+    allowed_prefixes = (
+        "postgresql://",
+        "postgresql+psycopg://",
+        "postgresql+psycopg2://",
+        "timescale://",
+    )
+    if not normalized.startswith(allowed_prefixes):
+        raise RuntimeError(
+            "Admin repository requires a Postgres/Timescale DSN; "
+            f"received '{dsn}'."
+        )
+
+    return PostgresAdminRepository(dsn)
+
+
+def _verify_admin_repository(admin_repository: AdminRepositoryProtocol) -> None:
+    """Persist and validate a sentinel admin record for startup verification."""
+
+
+    sentinel = AdminAccount(
+        admin_id=_ADMIN_REPOSITORY_HEALTHCHECK_ID,
+        email=_ADMIN_REPOSITORY_HEALTHCHECK_EMAIL,
+        password_hash=hash_password(_generate_random_password()),
+        mfa_secret=_generate_random_mfa_secret(),
+    )
+    admin_repository.add(sentinel)
+    stored = admin_repository.get_by_email(_ADMIN_REPOSITORY_HEALTHCHECK_EMAIL)
+    if not stored or stored.admin_id != _ADMIN_REPOSITORY_HEALTHCHECK_ID:
+        raise RuntimeError("Admin repository is not writable; startup verification failed.")
+
 
 
 def _build_session_store_from_env() -> SessionStoreProtocol:
     ttl_minutes = int(os.getenv("SESSION_TTL_MINUTES", "60"))
-    redis_url = os.getenv("SESSION_REDIS_URL")
-    if not redis_url:
-        raise RuntimeError(
-            "SESSION_REDIS_URL is not configured. Provide a shared session store DSN to enable admin sessions.",
-        )
 
+    dsn_env_vars = (
+        "SESSION_REDIS_URL",
+        "SESSION_STORE_URL",
+        "SESSION_BACKEND_DSN",
+    )
+    redis_url = next((os.getenv(var) for var in dsn_env_vars if os.getenv(var)), None)
+    if not redis_url:
+        joined = ", ".join(dsn_env_vars)
+        raise RuntimeError(
+            "Session store misconfigured: set one of "
+            f"{joined} so the API can use the shared Redis backend"
+        )
     try:  # pragma: no cover - import guarded for optional dependency resolution
         import redis
     except ImportError as exc:  # pragma: no cover - surfaced when dependency missing at runtime
-        raise RuntimeError("redis package is required when SESSION_REDIS_URL is set") from exc
+        raise RuntimeError("redis package is required when SESSION_REDIS_URL is configured") from exc
 
     client = redis.Redis.from_url(redis_url)
     return RedisSessionStore(client, ttl_minutes=ttl_minutes)
@@ -88,6 +152,7 @@ def create_app(
     recorder = SensitiveActionRecorder(audit_logger)
 
     admin_repository = admin_repository or _build_admin_repository_from_env()
+    _verify_admin_repository(admin_repository)
     session_store = session_store or _build_session_store_from_env()
     auth_service = AuthService(admin_repository, session_store)
     accounts_service = AccountsService(recorder)

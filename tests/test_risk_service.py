@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib
 import importlib.util
 import sys
 from decimal import Decimal
@@ -19,6 +18,7 @@ from fastapi.testclient import TestClient
 
 from services.common.security import ADMIN_ACCOUNTS
 from tests.helpers.authentication import override_admin_auth
+from tests.helpers.risk import risk_service_instance
 
 
 AccountClient = Tuple[TestClient, object]
@@ -28,15 +28,9 @@ AccountClient = Tuple[TestClient, object]
 def risk_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[AccountClient]:
     if importlib.util.find_spec("sqlalchemy") is None:
         pytest.skip("sqlalchemy is required for risk service tests")
-    db_path = tmp_path / "risk.db"
-    monkeypatch.setenv("RISK_DATABASE_URL", f"sqlite:///{db_path}")
-    sys.modules.pop("risk_service", None)
-    module = importlib.import_module("risk_service")
-
-    with TestClient(module.app) as client:
-        yield client, module
-    module.ENGINE.dispose()
-    sys.modules.pop("risk_service", None)
+    with risk_service_instance(tmp_path, monkeypatch) as module:
+        with TestClient(module.app) as client:
+            yield client, module
 
 
 def _request_payload(account_id: str, instrument: str) -> dict[str, object]:

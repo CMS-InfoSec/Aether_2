@@ -82,6 +82,62 @@ except Exception:  # pragma: no cover - optional dependency not available
     security_module = None
 
 
+class _RedisSessionBackend:
+    def __init__(self) -> None:
+        self._values: Dict[str, tuple[bytes, datetime]] = {}
+
+    def setex(self, key: str, ttl_seconds: int, value: str) -> None:
+        expires = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
+        self._values[key] = (value.encode("utf-8"), expires)
+
+    def get(self, key: str) -> bytes | None:
+        entry = self._values.get(key)
+        if not entry:
+            return None
+        value, expires = entry
+        if datetime.now(timezone.utc) >= expires:
+            self._values.pop(key, None)
+            return None
+        return value
+
+    def delete(self, key: str) -> None:
+        self._values.pop(key, None)
+
+    def flushall(self) -> None:
+        self._values.clear()
+
+
+@pytest.fixture(autouse=True)
+def _configure_session_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    try:  # pragma: no cover - prefer the real redis client when available
+        import redis  # type: ignore[import-untyped]
+    except Exception:  # pragma: no cover - fallback stub when redis not installed
+        redis = ModuleType("redis")
+
+        class _RedisClient:  # pragma: no cover - minimal stub for session store
+            pass
+
+        redis.Redis = _RedisClient  # type: ignore[attr-defined]
+        sys.modules["redis"] = redis
+    else:
+        if not hasattr(redis, "Redis"):
+            redis.Redis = type("Redis", (), {})  # type: ignore[attr-defined]
+
+    backend = _RedisSessionBackend()
+
+    def _from_url(url: str, *args, **kwargs):  # type: ignore[override]
+        del url, args, kwargs
+        return backend
+
+    monkeypatch.setenv("SESSION_REDIS_URL", "redis://session-backend:6379/0")
+    monkeypatch.setattr("redis.Redis.from_url", _from_url, raising=False)
+
+    try:
+        yield
+    finally:
+        backend.flushall()
+
+
 def _install_sqlalchemy_stub() -> None:
     if "sqlalchemy" in sys.modules:
         return

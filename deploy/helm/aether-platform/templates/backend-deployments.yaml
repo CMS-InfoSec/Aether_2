@@ -36,7 +36,8 @@ spec:
               name: http
           {{- $hasKraken := and $global.krakenSecrets.enabled $svc.usesKrakenSecrets }}
           {{- $extraEnv := $svc.env | default (list) -}}
-          {{- $envEnabled := or $hasKraken (gt (len $extraEnv) 0) -}}
+          {{- $sessionRedis := default "" $global.sessionStore.redisUrl -}}
+          {{- $envEnabled := or $hasKraken (gt (len $extraEnv) 0) (ne $sessionRedis "") -}}
           {{- if $envEnabled }}
           env:
             {{- if $hasKraken }}
@@ -48,6 +49,10 @@ spec:
               value: {{ printf "%s/director-1/credentials.json" $global.krakenSecrets.basePath | quote }}
             - name: AETHER_DIRECTOR_2_KRAKEN_SECRET_PATH
               value: {{ printf "%s/director-2/credentials.json" $global.krakenSecrets.basePath | quote }}
+            {{- end }}
+            {{- if $sessionRedis }}
+            - name: SESSION_REDIS_URL
+              value: {{ $sessionRedis | quote }}
             {{- end }}
             {{- range $extraEnv }}
             {{- toYaml . | nindent 12 }}

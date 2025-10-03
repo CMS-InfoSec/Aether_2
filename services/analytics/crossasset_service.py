@@ -1,9 +1,10 @@
 """FastAPI service exposing cross-asset analytics endpoints.
 
-The service provides synthetic yet deterministic market data to estimate
-lead/lag relationships, rolling beta between assets, and deviation of
-stablecoins from their USD pegs.  Results are persisted into a simple SQL
-back-end to mimic operational storage of computed metrics.
+The service reads historical OHLCV bars from the Timescale-backed
+``ohlcv_bars`` hypertable populated by the ingestion pipeline.  Using the
+authoritative market data ensures lead/lag relationships, rolling beta, and
+stablecoin deviation metrics reflect production state.  Computed metrics are
+persisted into a lightweight SQL table for audit and downstream reporting.
 """
 
 from __future__ import annotations
@@ -12,18 +13,30 @@ import logging
 import math
 import os
 import statistics
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Iterable, Sequence
 
 from fastapi import FastAPI, HTTPException, Query
+from prometheus_client import Gauge
 from pydantic import BaseModel, Field
-from sqlalchemy import Column, DateTime, Float, String, create_engine
+from sqlalchemy import Column, DateTime, Float, String, create_engine, func, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 LOGGER = logging.getLogger(__name__)
+
+DATA_STALENESS_GAUGE = Gauge(
+    "crossasset_data_age_seconds",
+    "Age of the latest OHLCV bar used for cross-asset analytics.",
+    ["symbol"],
+)
+
+DEFAULT_WINDOW_POINTS = 240
+MIN_REQUIRED_POINTS = 30
+STALE_THRESHOLD = timedelta(hours=6)
+STABLECOIN_STALE_THRESHOLD = timedelta(hours=12)
 
 Base = declarative_base()
 
@@ -37,6 +50,20 @@ class CrossAssetMetric(Base):
     metric_type = Column(String, primary_key=True)
     ts = Column(DateTime(timezone=True), primary_key=True)
     value = Column(Float, nullable=False)
+
+
+class OhlcvBar(Base):
+    """Subset of the ``ohlcv_bars`` table used for analytics."""
+
+    __tablename__ = "ohlcv_bars"
+
+    market = Column(String, primary_key=True)
+    bucket_start = Column(DateTime(timezone=True), primary_key=True)
+    open = Column(Float)
+    high = Column(Float)
+    low = Column(Float)
+    close = Column(Float, nullable=False)
+    volume = Column(Float)
 
 
 class LeadLagResponse(BaseModel):
@@ -100,28 +127,74 @@ def _create_tables() -> None:
         raise
 
 
-def _synthetic_price_series(symbol: str, length: int = 240) -> list[float]:
-    """Generate a deterministic synthetic price series for ``symbol``.
+def _coerce_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return None
 
-    The generation uses trigonometric functions to produce pseudo-market
-    behaviour while remaining deterministic across invocations.  This keeps the
-    service self-contained and easily testable.
-    """
 
-    # Normalise symbol to maintain determinism regardless of case.
-    normalised = symbol.upper()
-    seed = sum(ord(char) for char in normalised)
-    base_level = 80 + (seed % 60)
+def _load_price_series(session: Session, symbol: str, window: int) -> tuple[list[float], datetime | None]:
+    normalised = symbol.strip().upper()
+    stmt = (
+        select(OhlcvBar.bucket_start, OhlcvBar.close)
+        .where(func.upper(OhlcvBar.market) == normalised)
+        .order_by(OhlcvBar.bucket_start.desc())
+        .limit(window)
+    )
+
+    try:
+        rows = session.execute(stmt).all()
+    except SQLAlchemyError as exc:
+        LOGGER.exception("Failed to load OHLCV bars for %s", normalised)
+        raise HTTPException(status_code=503, detail="Database error while loading market data") from exc
+
     series: list[float] = []
-    price = float(base_level)
-    for index in range(length):
-        seasonal = math.sin(index / 12 + seed % 11) * 0.005
-        drift = math.cos(index / 60 + seed % 7) * 0.002
-        noise = ((seed * (index + 1)) % 997) / 9970 - 0.05
-        price *= 1 + seasonal + drift + noise / 50
-        price = max(price, 0.5)
-        series.append(round(price, 8))
-    return series
+    latest_ts: datetime | None = None
+    for bucket_start, close in rows:
+        if close is None:
+            continue
+        series.append(float(close))
+        if latest_ts is None:
+            latest_ts = _coerce_datetime(bucket_start)
+
+    series.reverse()
+    return series, latest_ts
+
+
+def _record_data_age(symbol: str, observed_at: datetime | None, *, max_age: timedelta) -> None:
+    symbol_upper = symbol.strip().upper()
+    if observed_at is None:
+        DATA_STALENESS_GAUGE.labels(symbol=symbol_upper).set(float("inf"))
+        raise HTTPException(status_code=404, detail=f"No price history for {symbol_upper}")
+
+    observed = observed_at.astimezone(timezone.utc)
+    age_seconds = max(0.0, (datetime.now(timezone.utc) - observed).total_seconds())
+    DATA_STALENESS_GAUGE.labels(symbol=symbol_upper).set(age_seconds)
+    if age_seconds > max_age.total_seconds():
+        detail = f"Price history for {symbol_upper} is stale ({int(age_seconds)}s old)"
+        LOGGER.warning(detail)
+        raise HTTPException(status_code=503, detail=detail)
+
+
+def _require_series(series: Sequence[float], symbol: str, window: int) -> None:
+    if len(series) < window:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Insufficient price history for {symbol.upper()}; required {window} points",
+        )
+
+
+def _align_series(series_a: Sequence[float], series_b: Sequence[float]) -> tuple[list[float], list[float]]:
+    length = min(len(series_a), len(series_b))
+    if length == 0:
+        return [], []
+    return list(series_a[-length:]), list(series_b[-length:])
 
 
 def _pearson_correlation(series_a: Sequence[float], series_b: Sequence[float]) -> float:
@@ -217,8 +290,16 @@ def lead_lag(
     if not base or not target:
         raise HTTPException(status_code=422, detail="Both base and target are required")
 
-    base_series = _synthetic_price_series(base)
-    target_series = _synthetic_price_series(target)
+    with SessionLocal() as session:
+        base_series, base_ts = _load_price_series(session, base, window=DEFAULT_WINDOW_POINTS)
+        target_series, target_ts = _load_price_series(session, target, window=DEFAULT_WINDOW_POINTS)
+
+    _record_data_age(base, base_ts, max_age=STALE_THRESHOLD)
+    _record_data_age(target, target_ts, max_age=STALE_THRESHOLD)
+    _require_series(base_series, base, MIN_REQUIRED_POINTS)
+    _require_series(target_series, target, MIN_REQUIRED_POINTS)
+
+    base_series, target_series = _align_series(base_series, target_series)
 
     correlation = _pearson_correlation(base_series, target_series)
     lag = _lag_coefficient(base_series, target_series)
@@ -238,8 +319,17 @@ def rolling_beta(
 ) -> BetaResponse:
     """Return a rolling beta estimate for the provided alt/base pair."""
 
-    alt_series = _synthetic_price_series(alt)
-    base_series = _synthetic_price_series(base)
+    lookback = max(DEFAULT_WINDOW_POINTS, window * 3)
+    with SessionLocal() as session:
+        alt_series, alt_ts = _load_price_series(session, alt, window=lookback)
+        base_series, base_ts = _load_price_series(session, base, window=lookback)
+
+    _record_data_age(alt, alt_ts, max_age=STALE_THRESHOLD)
+    _record_data_age(base, base_ts, max_age=STALE_THRESHOLD)
+    _require_series(alt_series, alt, window)
+    _require_series(base_series, base, window)
+
+    alt_series, base_series = _align_series(alt_series, base_series)
     beta_value = _rolling_beta(alt_series, base_series, window=window)
     ts = datetime.now(tz=timezone.utc)
     pair = f"{alt.upper()}/{base.upper()}"
@@ -258,8 +348,13 @@ def stablecoin_deviation(
     if "/" not in symbol:
         raise HTTPException(status_code=422, detail="Symbol must include the quoted currency, e.g. USDT/USD")
 
-    series = _synthetic_price_series(symbol)
-    price = series[-1]
+    with SessionLocal() as session:
+        series, observed_ts = _load_price_series(session, symbol, window=DEFAULT_WINDOW_POINTS)
+
+    _record_data_age(symbol, observed_ts, max_age=STABLECOIN_STALE_THRESHOLD)
+    _require_series(series, symbol, 1)
+
+    price = float(series[-1])
     deviation = price - 1.0
     deviation_bps = deviation * 10000
     ts = datetime.now(tz=timezone.utc)

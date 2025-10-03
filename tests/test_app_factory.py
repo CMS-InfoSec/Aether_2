@@ -65,12 +65,36 @@ class AdminRepositoryProtocol:  # pragma: no cover - structural stub
     pass
 
 
+class AdminAccount:
+    def __init__(
+        self,
+        *,
+        admin_id: str,
+        email: str,
+        password_hash: str,
+        mfa_secret: str,
+        allowed_ips: set[str] | None = None,
+    ) -> None:
+        self.admin_id = admin_id
+        self.email = email
+        self.password_hash = password_hash
+        self.mfa_secret = mfa_secret
+        self.allowed_ips = allowed_ips
+
+
+def hash_password(password: str) -> str:
+    return f"hashed::{password}"
+
+
 class InMemoryAdminRepository(AdminRepositoryProtocol):
     def __init__(self) -> None:
         self._admins: dict[str, object] = {}
 
     def add(self, admin) -> None:  # pragma: no cover - behaviour not under test
         self._admins[getattr(admin, "email", "")] = admin
+
+    def delete(self, email: str) -> None:  # pragma: no cover - behaviour not under test
+        self._admins.pop(email, None)
 
     def get_by_email(self, email: str):  # pragma: no cover - behaviour not under test
         return self._admins.get(email)
@@ -118,6 +142,8 @@ SessionStore = InMemorySessionStore
 
 auth_service_module.AdminRepositoryProtocol = AdminRepositoryProtocol  # type: ignore[attr-defined]
 auth_service_module.InMemoryAdminRepository = InMemoryAdminRepository  # type: ignore[attr-defined]
+auth_service_module.AdminAccount = AdminAccount  # type: ignore[attr-defined]
+auth_service_module.hash_password = hash_password  # type: ignore[attr-defined]
 auth_service_module.PostgresAdminRepository = PostgresAdminRepository  # type: ignore[attr-defined]
 auth_service_module.AuthService = AuthService  # type: ignore[attr-defined]
 auth_service_module.SessionStoreProtocol = SessionStoreProtocol  # type: ignore[attr-defined]
@@ -239,18 +265,29 @@ def test_create_app_uses_postgres_repository_when_dsn(monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(app_module, "PostgresAdminRepository", DummyPostgresRepository)
 
-    session_store = app_module.InMemorySessionStore()
+    session_store = InMemorySessionStore()
     application = app_module.create_app(session_store=session_store)
 
     assert isinstance(application.state.admin_repository, DummyPostgresRepository)
     assert created["dsn"] == "postgresql://example.com/admin"
 
 
-def test_create_app_defaults_to_in_memory_repository(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_create_app_requires_dsn_when_not_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("ADMIN_POSTGRES_DSN", raising=False)
     monkeypatch.delenv("ADMIN_DATABASE_DSN", raising=False)
     monkeypatch.delenv("ADMIN_DB_DSN", raising=False)
 
-    application = app_module.create_app(session_store=app_module.InMemorySessionStore())
+
+    application = app_module.create_app(session_store=InMemorySessionStore())
 
     assert isinstance(application.state.admin_repository, app_module.InMemoryAdminRepository)
+
+
+def test_create_app_requires_session_store_dsn(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SESSION_REDIS_URL", raising=False)
+    monkeypatch.delenv("SESSION_STORE_URL", raising=False)
+    monkeypatch.delenv("SESSION_BACKEND_DSN", raising=False)
+
+    with pytest.raises(RuntimeError, match="Session store misconfigured"):
+        app_module.create_app()
+

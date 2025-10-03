@@ -16,7 +16,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from services.portfolio.balance_reader import BalanceReader, BalanceRetrievalError
 
 try:  # pragma: no cover - shared middleware may be unavailable in minimal environments
-from shared.authz_middleware import (  # type: ignore
+    from shared.authz_middleware import (  # type: ignore
         BearerTokenError,
         _coerce_account_scopes as _shared_coerce_account_scopes,
         _decode_jwt as _shared_decode_jwt,

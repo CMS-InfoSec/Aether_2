@@ -10,6 +10,9 @@ from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, Iterable, List
 
+import os
+import sqlalchemy
+
 import pytest
 
 pytest.importorskip("services.common.security")
@@ -18,6 +21,35 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
 from prometheus_client import generate_latest
+
+from tests.helpers.risk import MANAGED_RISK_DSN
+
+
+_RISK_SQLITE_PATH = Path(__file__).with_name("risk_end_to_end.db")
+
+
+def _configure_risk_service_engine() -> None:
+    real_create_engine = sqlalchemy.create_engine
+
+    def _create_engine(url: str, **kwargs):  # type: ignore[override]
+        if url.startswith("postgresql"):
+            sqlite_kwargs = dict(kwargs)
+            connect_args = dict(sqlite_kwargs.pop("connect_args", {}) or {})
+            connect_args.pop("sslmode", None)
+            connect_args.setdefault("check_same_thread", False)
+            sqlite_kwargs["connect_args"] = connect_args
+            sqlite_kwargs.pop("pool_size", None)
+            sqlite_kwargs.pop("max_overflow", None)
+            sqlite_kwargs.pop("pool_timeout", None)
+            sqlite_kwargs.pop("pool_recycle", None)
+            return real_create_engine(f"sqlite:///{_RISK_SQLITE_PATH}", **sqlite_kwargs)
+        return real_create_engine(url, **kwargs)
+
+    sqlalchemy.create_engine = _create_engine
+    os.environ.setdefault("RISK_DATABASE_URL", MANAGED_RISK_DSN)
+
+
+_configure_risk_service_engine()
 
 import policy_service
 import risk_service
@@ -500,7 +532,7 @@ async def test_trading_sequencer_loop_preserves_correlation_and_audit(
     features = [0.25, 0.33, 0.41]
 
     monkeypatch.setenv("ENABLE_SHADOW_EXECUTION", "false")
-    monkeypatch.setenv("RISK_DATABASE_URL", "sqlite:///:memory:")
+    monkeypatch.setenv("RISK_DATABASE_URL", MANAGED_RISK_DSN)
     monkeypatch.setenv("AETHER_COMPANY_TIMESCALE_DSN", "sqlite:///:memory:")
     monkeypatch.setenv("AETHER_COMPANY_TIMESCALE_SCHEMA", "acct_company")
 
