@@ -68,7 +68,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Run Trivy SAST scan
-        uses: aquasecurity/trivy-action@0.21.0
+        uses: aquasecurity/trivy-action@v0.21.0
         with:
           scan-type: fs
           severity: CRITICAL
