@@ -23,7 +23,7 @@ def test_secret_manager_get_credentials_loads_values() -> None:
     assert metadata["api_secret"] == "***"
     assert metadata["secret_name"] == manager.secret_name
 
-    events = timescale._events["company"]["events"]  # type: ignore[attr-defined]
+    events = timescale.events()["events"]
     assert events
     last_event = events[-1]
     assert last_event["event_type"] == "kraken.credentials.access"
@@ -34,6 +34,7 @@ def test_secret_manager_get_credentials_loads_values() -> None:
     audit_event = audit_events[-1]
     assert audit_event["event_type"] == "kraken.credentials.access"
     assert audit_event["secret_name"] == manager.secret_name
-    assert audit_event["metadata"]["material_present"] is True
-    assert audit_event["metadata"]["api_key"] == "***"
-    assert audit_event["metadata"]["api_secret"] == "***"
+    event_metadata = audit_event["metadata"]
+    assert event_metadata["material_present"] is True
+    assert "encrypted_api_key" in event_metadata
+    assert "encrypted_api_secret" in event_metadata

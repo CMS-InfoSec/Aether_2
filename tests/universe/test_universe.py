@@ -1,3 +1,4 @@
+import pytest
 from fastapi.testclient import TestClient
 
 from services.common.adapters import RedisFeastAdapter
@@ -6,13 +7,44 @@ from services.universe import main as universe_main
 from services.universe.main import app
 
 from services.universe.repository import UniverseRepository
+from tests.universe.conftest import UniverseTimescaleFixture
 
 
 client = TestClient(app)
 
 
-def test_universe_approved_authorized_accounts():
+@pytest.fixture(autouse=True)
+def configure_repository(universe_timescale: UniverseTimescaleFixture) -> None:
     UniverseRepository.reset()
+    universe_timescale.rebind()
+    universe_timescale.clear()
+    yield
+    UniverseRepository.reset()
+    universe_timescale.rebind()
+    universe_timescale.clear()
+
+
+def test_universe_approved_authorized_accounts(universe_timescale: UniverseTimescaleFixture) -> None:
+    universe_timescale.add_snapshot(
+        base_asset="BTC",
+        quote_asset="USD",
+        market_cap=1.2e12,
+        global_volume_24h=5.0e10,
+        kraken_volume_24h=2.5e10,
+        volatility_30d=0.45,
+    )
+    universe_timescale.add_snapshot(
+        base_asset="ETH",
+        quote_asset="USD",
+        market_cap=6.0e11,
+        global_volume_24h=3.0e10,
+        kraken_volume_24h=1.4e10,
+        volatility_30d=0.5,
+    )
+    universe_timescale.add_fee_override(
+        "BTC-USD", currency="USD", maker=0.1, taker=0.2
+    )
+
     for account in ADMIN_ACCOUNTS:
         repo = UniverseRepository(account_id=account)
         adapter = RedisFeastAdapter(account_id=account, repository=repo)

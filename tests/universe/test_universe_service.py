@@ -1,36 +1,41 @@
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from services.common.adapters import RedisFeastAdapter
-from services.universe.repository import MarketSnapshot, UniverseRepository
+from services.universe.repository import UniverseRepository
 from services.universe import main as universe_main
+from tests.universe.conftest import UniverseTimescaleFixture
 
 
-def setup_function(function: object) -> None:
+@pytest.fixture(autouse=True)
+def configure_repository(universe_timescale: UniverseTimescaleFixture) -> None:
     UniverseRepository.reset()
+    universe_timescale.rebind()
+    universe_timescale.clear()
+    yield
+    UniverseRepository.reset()
+    universe_timescale.rebind()
+    universe_timescale.clear()
 
 
-def test_non_usd_symbols_are_filtered() -> None:
-    UniverseRepository.seed_market_snapshots(
-        [
-            MarketSnapshot(
-                base_asset="BTC",
-                quote_asset="USD",
-                market_cap=1.2e12,
-                global_volume_24h=5.0e10,
-                kraken_volume_24h=2.5e10,
-                volatility_30d=0.45,
-            ),
-            MarketSnapshot(
-                base_asset="ETH",
-                quote_asset="USDT",
-                market_cap=4.0e11,
-                global_volume_24h=2.5e10,
-                kraken_volume_24h=1.2e10,
-                volatility_30d=0.50,
-            ),
-        ]
+def test_non_usd_symbols_are_filtered(universe_timescale: UniverseTimescaleFixture) -> None:
+    universe_timescale.add_snapshot(
+        base_asset="BTC",
+        quote_asset="USD",
+        market_cap=1.2e12,
+        global_volume_24h=5.0e10,
+        kraken_volume_24h=2.5e10,
+        volatility_30d=0.45,
+    )
+    universe_timescale.add_snapshot(
+        base_asset="ETH",
+        quote_asset="USDT",
+        market_cap=4.0e11,
+        global_volume_24h=2.5e10,
+        kraken_volume_24h=1.2e10,
+        volatility_30d=0.50,
     )
 
     adapter = RedisFeastAdapter(account_id="company")
@@ -39,26 +44,22 @@ def test_non_usd_symbols_are_filtered() -> None:
     assert instruments == ["BTC-USD"]
 
 
-def test_manual_overrides_are_honored() -> None:
-    UniverseRepository.seed_market_snapshots(
-        [
-            MarketSnapshot(
-                base_asset="BTC",
-                quote_asset="USD",
-                market_cap=1.2e12,
-                global_volume_24h=5.0e10,
-                kraken_volume_24h=2.5e10,
-                volatility_30d=0.45,
-            ),
-            MarketSnapshot(
-                base_asset="DOGE",
-                quote_asset="USD",
-                market_cap=1.0e7,
-                global_volume_24h=1.0e6,
-                kraken_volume_24h=5.0e5,
-                volatility_30d=0.5,
-            ),
-        ]
+def test_manual_overrides_are_honored(universe_timescale: UniverseTimescaleFixture) -> None:
+    universe_timescale.add_snapshot(
+        base_asset="BTC",
+        quote_asset="USD",
+        market_cap=1.2e12,
+        global_volume_24h=5.0e10,
+        kraken_volume_24h=2.5e10,
+        volatility_30d=0.45,
+    )
+    universe_timescale.add_snapshot(
+        base_asset="DOGE",
+        quote_asset="USD",
+        market_cap=1.0e7,
+        global_volume_24h=1.0e6,
+        kraken_volume_24h=5.0e5,
+        volatility_30d=0.5,
     )
 
     repo = UniverseRepository(account_id="company")
@@ -77,26 +78,24 @@ def test_manual_overrides_are_honored() -> None:
     assert audit_entries[-1].after["DOGE-USD"]["approved"] is True
 
 
-def test_volatility_threshold_filters_low_and_high_risk_assets() -> None:
-    UniverseRepository.seed_market_snapshots(
-        [
-            MarketSnapshot(
-                base_asset="ADA",
-                quote_asset="USD",
-                market_cap=2.0e10,
-                global_volume_24h=1.5e9,
-                kraken_volume_24h=8.0e8,
-                volatility_30d=0.35,
-            ),
-            MarketSnapshot(
-                base_asset="AVAX",
-                quote_asset="USD",
-                market_cap=3.5e10,
-                global_volume_24h=2.0e9,
-                kraken_volume_24h=1.2e9,
-                volatility_30d=0.55,
-            ),
-        ]
+def test_volatility_threshold_filters_low_and_high_risk_assets(
+    universe_timescale: UniverseTimescaleFixture,
+) -> None:
+    universe_timescale.add_snapshot(
+        base_asset="ADA",
+        quote_asset="USD",
+        market_cap=2.0e10,
+        global_volume_24h=1.5e9,
+        kraken_volume_24h=8.0e8,
+        volatility_30d=0.35,
+    )
+    universe_timescale.add_snapshot(
+        base_asset="AVAX",
+        quote_asset="USD",
+        market_cap=3.5e10,
+        global_volume_24h=2.0e9,
+        kraken_volume_24h=1.2e9,
+        volatility_30d=0.55,
     )
 
     repo = UniverseRepository(account_id="company")

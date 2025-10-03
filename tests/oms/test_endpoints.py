@@ -7,7 +7,10 @@ from typing import Any, Dict, Iterator, Tuple
 import sys
 import types
 
+import httpx
 import pytest
+import exchange_adapter
+from fastapi import Header, HTTPException, Request, status
 from fastapi.testclient import TestClient
 
 if "aiohttp" not in sys.modules:
@@ -60,11 +63,27 @@ def _stub_kraken_clients(monkeypatch: pytest.MonkeyPatch) -> None:
                 "metadata": {"rotated_at": datetime.now(timezone.utc).isoformat()},
             }
 
+        trade_time = datetime.now(timezone.utc)
+
         class _StubWS:
+            def __init__(self) -> None:
+                self.cancelled: list[Dict[str, Any]] = []
+
             async def add_order(self, payload: Dict[str, Any]) -> OrderAck:
                 return OrderAck(
                     exchange_order_id="SIM-123",
                     status="ok",
+                    filled_qty=None,
+                    avg_price=None,
+                    errors=None,
+                )
+
+            async def cancel_order(self, payload: Dict[str, Any]) -> OrderAck:
+                self.cancelled.append(dict(payload))
+                txid = payload.get("txid") or "SIM-123"
+                return OrderAck(
+                    exchange_order_id=str(txid),
+                    status="canceled",
                     filled_qty=None,
                     avg_price=None,
                     errors=None,
@@ -74,12 +93,34 @@ def _stub_kraken_clients(monkeypatch: pytest.MonkeyPatch) -> None:
                 return []
 
             async def fetch_own_trades_snapshot(self) -> list[Dict[str, Any]]:
-                return []
+                return [
+                    {
+                        "ordertxid": "SIM-123",
+                        "txid": "TRADE-1",
+                        "pair": "BTC/USD",
+                        "price": 101.5,
+                        "volume": 1.0,
+                        "fee": 0.1,
+                        "time": trade_time.timestamp(),
+                    },
+                    {
+                        "ordertxid": "SIM-456",
+                        "txid": "TRADE-2",
+                        "pair": "ETH/USD",
+                        "price": 201.25,
+                        "volume": 2.0,
+                        "fee": 0.2,
+                        "time": trade_time.timestamp() - 60,
+                    },
+                ]
 
             async def close(self) -> None:
                 return None
 
         class _StubREST:
+            def __init__(self) -> None:
+                self.cancelled: list[Dict[str, Any]] = []
+
             async def add_order(self, payload: Dict[str, Any]) -> OrderAck:
                 return OrderAck(
                     exchange_order_id="SIM-123",
@@ -89,11 +130,45 @@ def _stub_kraken_clients(monkeypatch: pytest.MonkeyPatch) -> None:
                     errors=None,
                 )
 
+            async def cancel_order(self, payload: Dict[str, Any]) -> OrderAck:
+                self.cancelled.append(dict(payload))
+                txid = payload.get("txid") or "SIM-123"
+                return OrderAck(
+                    exchange_order_id=str(txid),
+                    status="canceled",
+                    filled_qty=None,
+                    avg_price=None,
+                    errors=None,
+                )
+
             async def open_orders(self) -> Dict[str, Any]:
                 return {"result": {"open": []}}
 
             async def own_trades(self) -> Dict[str, Any]:
-                return {"result": {"trades": {}}}
+                return {
+                    "result": {
+                        "trades": [
+                            {
+                                "ordertxid": "SIM-123",
+                                "txid": "TRADE-REST-1",
+                        "pair": "BTC/USD",
+                        "price": "102.0",
+                        "volume": "1.0",
+                        "fee": "0.1",
+                        "time": trade_time.timestamp(),
+                    }
+                ]
+            }
+                }
+
+            async def balance(self) -> Dict[str, Any]:
+                return {
+                    "result": {
+                        "ZUSD": "1234.56",
+                        "XXBT": "0.789",
+                        "timestamp": trade_time.isoformat(),
+                    }
+                }
 
             async def close(self) -> None:
                 return None
@@ -160,13 +235,57 @@ def client_fixture(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
             api_secret=f"test-secret-{account}",
         )
 
+    allowed_accounts = {account.lower() for account in ADMIN_ACCOUNTS}
+
+    def _allow_admin(
+        request: Request,
+        authorization: str | None = Header(None, alias="Authorization"),
+        x_account_id: str | None = Header(None, alias="X-Account-ID"),
+    ) -> str:
+        header_account = (x_account_id or "").strip()
+        if not header_account:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="X-Account-ID header required",
+            )
+        if header_account.lower() not in allowed_accounts:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Account is not authorized for administrative access.",
+            )
+        return header_account
+
+    app.dependency_overrides[main.require_admin_account] = _allow_admin
+    app.dependency_overrides[security.require_admin_account] = _allow_admin
+
     client = TestClient(app)
     try:
         yield client
     finally:
         client.close()
         KrakenSecretStore.reset()
+        app.dependency_overrides.pop(main.require_admin_account, None)
+        app.dependency_overrides.pop(security.require_admin_account, None)
 
+
+@pytest.fixture
+def kraken_adapter(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[exchange_adapter.KrakenAdapter]:
+    real_async_client = httpx.AsyncClient
+
+    def _async_client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        timeout = kwargs.get("timeout")
+        transport = httpx.ASGITransport(app=app)
+        return real_async_client(
+            transport=transport,
+            base_url=str(client.base_url),
+            timeout=timeout,
+        )
+
+    monkeypatch.setattr(exchange_adapter.httpx, "AsyncClient", _async_client_factory)
+    adapter = exchange_adapter.KrakenAdapter(primary_url=str(client.base_url))
+    yield adapter
 
 @pytest.mark.parametrize("account_id", ADMIN_ACCOUNTS)
 def test_place_order_allows_admin_accounts(client: TestClient, account_id: str) -> None:
@@ -390,6 +509,7 @@ def test_place_order_snaps_to_exchange_metadata(
     submitted = submissions[0]
     assert submitted["price"] == pytest.approx(0.123456, rel=0, abs=1e-9)
     assert submitted["volume"] == pytest.approx(5.43210987, rel=0, abs=1e-9)
+
     assert call_state == {"get": 2, "refresh": 1}
 
 
@@ -433,3 +553,4 @@ def test_place_order_returns_424_when_metadata_missing(
         "detail": "Market metadata unavailable; unable to quantize order safely."
     }
     assert call_state == {"get": 2, "refresh": 1}
+

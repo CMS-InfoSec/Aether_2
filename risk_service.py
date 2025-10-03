@@ -619,7 +619,11 @@ def _flush_risk_event_buffers() -> None:
     """Flush buffered risk service artifacts before shutdown."""
 
     flush_logging_handlers("", __name__, "risk.audit")
-    summary = TimescaleAdapter.flush_event_buffers()
+    loop = asyncio.new_event_loop()
+    try:
+        summary = loop.run_until_complete(TimescaleAdapter.flush_event_buffers())
+    finally:
+        loop.close()
     if summary:
         logger.info("Flushed Timescale event buffers", extra={"buckets": summary})
 
