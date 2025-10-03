@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import psycopg2
-from fastapi import FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from psycopg2 import errors, sql
@@ -21,6 +21,7 @@ from psycopg2.extras import RealDictCursor
 from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, Gauge, generate_latest
 
 from services.common.config import get_timescale_session
+from services.common.security import require_admin_account
 
 try:  # pragma: no cover - optional dependency for local environments.
     import requests
@@ -191,6 +192,16 @@ def _ensure_tables() -> None:
             cursor.execute(create_results_stmt)
             cursor.execute(create_alerts_stmt)
             cursor.execute(create_performance_stmt)
+
+
+def _ensure_account_scope(account_id: str) -> None:
+    """Validate that the authenticated account matches the service scope."""
+
+    if account_id.strip().lower() != ACCOUNT_ID.strip().lower():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authenticated account is not authorized for this drift dataset.",
+        )
 
 
 async def _daily_drift_loop() -> None:
@@ -1175,7 +1186,9 @@ def _run_drift_detection() -> DriftStatus:
 
 
 @app.get("/drift/status", response_model=DriftStatus)
-def drift_status() -> DriftStatus:
+def drift_status(caller: str = Depends(require_admin_account)) -> DriftStatus:
+    _ensure_account_scope(caller)
+
     with _connect() as conn:
         checked_at, metrics = _load_latest_results(conn)
 
@@ -1201,12 +1214,16 @@ def drift_status() -> DriftStatus:
 
 
 @app.post("/drift/run", response_model=DriftStatus)
-def drift_run() -> DriftStatus:
+def drift_run(caller: str = Depends(require_admin_account)) -> DriftStatus:
+    _ensure_account_scope(caller)
+
     return _run_drift_detection()
 
 
 @app.get("/drift/alerts", response_model=DriftAlertsResponse)
-def drift_alerts() -> DriftAlertsResponse:
+def drift_alerts(caller: str = Depends(require_admin_account)) -> DriftAlertsResponse:
+    _ensure_account_scope(caller)
+
     with _connect() as conn:
         records = _fetch_recent_alerts(conn)
 
@@ -1224,7 +1241,9 @@ def drift_alerts() -> DriftAlertsResponse:
 
 
 @app.get("/metrics")
-def metrics() -> PlainTextResponse:
+def metrics(caller: str = Depends(require_admin_account)) -> PlainTextResponse:
+    _ensure_account_scope(caller)
+
     payload = generate_latest(REGISTRY)
     return PlainTextResponse(payload, media_type=CONTENT_TYPE_LATEST)
 
