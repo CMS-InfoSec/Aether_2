@@ -2,14 +2,30 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable
+from typing import Any, Dict, Iterable, List
 
 import pytest
 
 pytest.importorskip("fastapi")
 
-from sequencer import pipeline
+
+from sequencer import StageFailedError, pipeline
+
 from services.common.adapters import KafkaNATSAdapter
+from services.common.schemas import PolicyDecisionRequest, PolicyDecisionResponse
+from tests.factories import policy_decision_response
+
+
+class _StubPolicyClient:
+    def __init__(self, responses: List[PolicyDecisionResponse]) -> None:
+        self._responses = responses
+        self.requests: List[PolicyDecisionRequest] = []
+
+    async def decide(self, *, request: PolicyDecisionRequest) -> PolicyDecisionResponse:
+        self.requests.append(request)
+        if not self._responses:
+            raise AssertionError("No stubbed policy decisions available")
+        return self._responses.pop(0)
 
 
 @pytest.mark.integration
@@ -22,6 +38,12 @@ async def test_sequencer_flow_emits_complete_audit_trail(monkeypatch: pytest.Mon
 
     # ``latest_override`` consults a SQLite store; stub it out so we remain in-memory.
     monkeypatch.setattr("override_service.latest_override", lambda intent_id: None)
+
+
+    decision = policy_decision_response()
+    policy_stub = _StubPolicyClient([decision])
+    monkeypatch.setattr("sequencer.policy_client", policy_stub)
+
 
     intent: Dict[str, Any] = {
         "account_id": "AlphaDesk",
@@ -95,3 +117,38 @@ async def test_sequencer_flow_emits_complete_audit_trail(monkeypatch: pytest.Mon
     # Final fill event should reference all stage artifacts to demonstrate the lifecycle closure.
     lifecycle_artifacts = result.fill_event["stage_artifacts"]
     assert lifecycle_artifacts.keys() == {"policy", "risk", "override", "oms"}
+
+    # Ensure the policy client was invoked with the normalized account and intent metadata.
+    assert policy_stub.requests[0].account_id == intent["account_id"].lower()
+    assert policy_stub.requests[0].order_id == intent["order_id"]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_sequencer_halts_when_policy_rejects(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Policy rejections should terminate the pipeline with a descriptive error."""
+
+    KafkaNATSAdapter.reset()
+    monkeypatch.setattr("override_service.latest_override", lambda intent_id: None)
+
+    rejection = policy_decision_response(approved=False, reason="Risk limit exceeded")
+    policy_stub = _StubPolicyClient([rejection])
+    monkeypatch.setattr("sequencer.policy_client", policy_stub)
+
+    intent: Dict[str, Any] = {
+        "account_id": "AlphaDesk",
+        "order_id": "ORD-2002",
+        "instrument": "ETH-USD",
+        "side": "sell",
+        "quantity": 2.0,
+        "price": 1_750.0,
+        "correlation_id": "corr-alpha-99",
+    }
+
+    with pytest.raises(StageFailedError) as exc:
+        await pipeline.submit(intent)
+
+    assert exc.value.stage == "policy"
+    assert "Risk limit exceeded" in exc.value.message
+    # The request should have been submitted once and captured for inspection.
+    assert len(policy_stub.requests) == 1

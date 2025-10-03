@@ -11,15 +11,22 @@ import logging
 import os
 import time
 import uuid
-from typing import Any, Awaitable, Callable, Deque, Dict, List, Mapping, MutableMapping, Optional, Tuple
+from typing import Any, Awaitable, Callable, Deque, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
 
+import httpx
+from auth.session_client import AdminSessionManager, get_default_session_manager
 from common.utils import tracing
 from services.common.adapters import KafkaNATSAdapter
+
+from services.common.security import require_admin_account
+
 from override_service import OverrideDecision, OverrideRecord, latest_override
+
+import httpx
 
 from metrics import (
     increment_rejected_intents,
@@ -30,6 +37,7 @@ from metrics import (
     set_pipeline_latency,
     setup_metrics,
     traced_span,
+    get_request_id,
 )
 
 
@@ -43,8 +51,142 @@ DEFAULT_RISK_TIMEOUT = float(os.getenv("SEQUENCER_RISK_TIMEOUT", "2.0"))
 DEFAULT_OMS_TIMEOUT = float(os.getenv("SEQUENCER_OMS_TIMEOUT", "2.5"))
 DEFAULT_PUBLISH_TIMEOUT = float(os.getenv("SEQUENCER_PUBLISH_TIMEOUT", "1.0"))
 
+
+POLICY_SERVICE_URL = os.getenv("POLICY_SERVICE_URL", "http://policy-service").strip()
+POLICY_DECISION_ENDPOINT = os.getenv("POLICY_DECISION_ENDPOINT", "/policy/decide").strip()
+
+
 RECENT_RUN_CAPACITY = int(os.getenv("SEQUENCER_HISTORY_SIZE", "200"))
 TOPIC_PREFIX = os.getenv("SEQUENCER_TOPIC_PREFIX", "sequencer")
+DEFAULT_EXCHANGE = os.getenv("PRIMARY_EXCHANGE", "kraken")
+
+
+EXCHANGE_ADAPTER = get_exchange_adapter(DEFAULT_EXCHANGE)
+
+
+def _join_url(base_url: str, endpoint: str) -> str:
+    base = (base_url or "").rstrip("/")
+    path = endpoint.strip()
+    if not path.startswith("/"):
+        path = f"/{path}"
+    if not base:
+        return path
+    return f"{base}{path}"
+
+
+def _optional_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _require_positive_float(
+    intent: Mapping[str, Any],
+    keys: Tuple[str, ...],
+    *,
+    field: str,
+) -> float:
+    for key in keys:
+        if key not in intent:
+            continue
+        try:
+            value = float(intent[key])
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    raise StageFailedError("policy", f"Intent is missing required {field}")
+
+
+def _normalize_side(value: Any) -> str:
+    side = str(value or "").strip().upper()
+    if side not in {"BUY", "SELL"}:
+        raise StageFailedError("policy", "Intent side must be BUY or SELL")
+    return side
+
+
+def _resolve_fee(intent: Mapping[str, Any]) -> FeeBreakdown:
+    raw_fee = intent.get("fee") or intent.get("fees")
+    if isinstance(raw_fee, Mapping):
+        try:
+            return FeeBreakdown.model_validate(raw_fee)
+        except Exception as exc:
+            raise StageFailedError("policy", f"Invalid fee payload: {exc}") from exc
+
+    currency = str(
+        intent.get("fee_currency")
+        or intent.get("quote_currency")
+        or intent.get("settlement_currency")
+        or "USD"
+    ).strip()
+    maker = max(_optional_float(intent.get("maker_fee")) or 0.0, 0.0)
+    taker = max(_optional_float(intent.get("taker_fee")) or 0.0, 0.0)
+    return FeeBreakdown(currency=currency or "USD", maker=maker, taker=taker)
+
+
+class PolicyServiceClient:
+    """HTTP client responsible for fetching decisions from the policy service."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        endpoint: str,
+        timeout: float,
+        session_manager_factory: Callable[[], AdminSessionManager] = get_default_session_manager,
+    ) -> None:
+        self._base_url = base_url
+        self._endpoint = endpoint
+        self._timeout = timeout
+        self._session_manager_factory = session_manager_factory
+
+    def _url(self) -> str:
+        if not self._base_url:
+            raise RuntimeError("Policy service URL is not configured")
+        return _join_url(self._base_url, self._endpoint)
+
+    async def _authorization_headers(self, account_id: str) -> Dict[str, str]:
+        manager = self._session_manager_factory()
+        token = await manager.token_for_account(account_id)
+        if not token:
+            raise RuntimeError("Session service returned empty token for policy request")
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "X-Account-ID": account_id,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        request_id = get_request_id() or str(uuid.uuid4())
+        headers.setdefault("X-Request-ID", request_id)
+        return headers
+
+    async def decide(self, *, request: PolicyDecisionRequest) -> PolicyDecisionResponse:
+        url = self._url()
+        headers = await self._authorization_headers(request.account_id)
+        payload = request.model_dump(mode="json")
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            response = await client.post(url, json=payload, headers=headers)
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError(
+                f"Policy service returned {exc.response.status_code}: {exc.response.text}"
+            ) from exc
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise RuntimeError("Policy service returned invalid JSON payload") from exc
+        return PolicyDecisionResponse.model_validate(data)
+
+
+policy_client = PolicyServiceClient(
+    base_url=POLICY_SERVICE_URL,
+    endpoint=POLICY_DECISION_ENDPOINT or "/policy/decide",
+    timeout=DEFAULT_POLICY_TIMEOUT,
+)
 
 
 class SequencerIntentRequest(BaseModel):
@@ -80,10 +222,11 @@ class SequencerStatusResponse(BaseModel):
 class StageError(Exception):
     """Base class for stage execution errors."""
 
-    def __init__(self, stage: str, message: str) -> None:
+    def __init__(self, stage: str, message: str, *, details: Optional[Mapping[str, Any]] = None) -> None:
         super().__init__(message)
         self.stage = stage
         self.message = message
+        self.details = dict(details) if details is not None else None
 
 
 class StageTimeoutError(StageError):
@@ -136,6 +279,8 @@ class Stage:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+            if isinstance(exc, StageError):
+                raise
             raise StageFailedError(self.name, f"Stage '{self.name}' failed: {exc}") from exc
 
         if not isinstance(result, StageResult):
@@ -336,6 +481,15 @@ class SequencerPipeline:
                         payload = tracing.attach_correlation(result.payload, mutate=True)
                         stage_artifact = tracing.attach_correlation(result.artifact, mutate=True)
                         stage_artifacts[stage.name] = stage_artifact
+
+                        if stage.name == "policy":
+                            decision_payload = payload.get("policy_decision", {})
+                            if isinstance(decision_payload, Mapping) and not decision_payload.get(
+                                "approved", True
+                            ):
+                                reason = str(decision_payload.get("reason") or "Policy decision rejected")
+                                raise StageFailedError("policy", f"Policy decision rejected intent: {reason}")
+
                         executed.append((stage, result))
                         await publisher.publish_event(
                             stage.name,
@@ -370,7 +524,10 @@ class SequencerPipeline:
                 status_value = "failed"
                 error_message = f"{exc.stage}: {exc.message}"
                 increment_rejected_intents(exc.stage, exc.message)
-                error_payload = tracing.attach_correlation({"error": exc.message})
+                error_payload: Dict[str, Any] = {"error": exc.message}
+                if getattr(exc, "details", None):
+                    error_payload["details"] = exc.details
+                error_payload = tracing.attach_correlation(error_payload)
                 await publisher.publish_event(
                     exc.stage,
                     "failed",
@@ -561,18 +718,73 @@ def _safe_float(value: Any) -> float:
         return 0.0
 
 
+
+def _build_policy_request(intent: Mapping[str, Any], ctx: PipelineContext) -> PolicyDecisionRequest:
+    if not intent:
+        raise StageFailedError("policy", "Intent payload is missing for policy evaluation")
+
+    order_id = str(intent.get("order_id") or intent.get("intent_id") or ctx.intent_id)
+    instrument = str(intent.get("instrument") or intent.get("symbol") or "").strip()
+    if not instrument:
+        raise StageFailedError("policy", "Intent instrument is required for policy evaluation")
+
+    side = _normalize_side(intent.get("side") or intent.get("direction"))
+    quantity = _require_positive_float(intent, ("quantity", "qty"), field="quantity")
+    price = _require_positive_float(
+        intent,
+        ("price", "limit_px", "mid_price"),
+        field="price",
+    )
+    fee_breakdown = _resolve_fee(intent)
+
+    request_kwargs: Dict[str, Any] = {
+        "account_id": ctx.account_id,
+        "order_id": order_id,
+        "instrument": instrument,
+        "side": side,
+        "quantity": quantity,
+        "price": price,
+        "fee": fee_breakdown,
+    }
+
+    optional_fields = {
+        "features": intent.get("features"),
+        "book_snapshot": intent.get("book_snapshot"),
+        "state": intent.get("state"),
+        "expected_edge_bps": _optional_float(intent.get("expected_edge_bps")),
+        "slippage_bps": _optional_float(intent.get("slippage_bps")),
+        "take_profit_bps": _optional_float(intent.get("take_profit_bps")),
+        "stop_loss_bps": _optional_float(intent.get("stop_loss_bps")),
+        "confidence": intent.get("confidence"),
+    }
+    for key, value in optional_fields.items():
+        if value is not None:
+            request_kwargs[key] = value
+
+    return PolicyDecisionRequest(**request_kwargs)
+
+
+
 async def policy_handler(payload: Dict[str, Any], ctx: PipelineContext) -> StageResult:
     intent = payload.get("intent", {})
-    now = datetime.now(timezone.utc).isoformat()
-    decision = {
-        "approved": True,
-        "reason": None,
-        "evaluated_at": now,
-        "constraints": intent.get("constraints", {}),
-    }
+    try:
+        request = _build_policy_request(intent, ctx)
+    except StageFailedError:
+        raise
+    except Exception as exc:
+        raise StageFailedError("policy", f"Failed to build policy request: {exc}") from exc
+
+    try:
+        decision = await policy_client.decide(request=request)
+    except httpx.TimeoutException as exc:
+        raise StageFailedError("policy", "Policy service request timed out") from exc
+    except Exception as exc:
+        raise StageFailedError("policy", f"Policy service request failed: {exc}") from exc
+
+    artifact = decision.model_dump(mode="json")
     new_payload = dict(payload)
-    new_payload["policy_decision"] = decision
-    return StageResult(payload=new_payload, artifact=decision)
+    new_payload["policy_decision"] = artifact
+    return StageResult(payload=new_payload, artifact=artifact)
 
 
 async def policy_rollback(result: StageResult, ctx: PipelineContext) -> None:
@@ -589,22 +801,110 @@ async def policy_rollback(result: StageResult, ctx: PipelineContext) -> None:
 async def risk_handler(payload: Dict[str, Any], ctx: PipelineContext) -> StageResult:
     decision = payload.get("policy_decision", {})
     if not decision.get("approved", False):
-        raise StageFailedError("risk", "Policy decision rejected the intent")
+        reason = decision.get("reason")
+        message = "Policy decision rejected the intent"
+        if reason:
+            message = f"{message}: {reason}"
+        raise StageFailedError("risk", message)
 
     intent = payload.get("intent", {})
-    quantity = _safe_float(intent.get("quantity") or intent.get("qty"))
-    price = _safe_float(intent.get("price") or intent.get("limit_px"))
-    notional = abs(quantity * price)
-    assessment = {
-        "valid": True,
-        "reasons": [],
-        "assessed_at": datetime.now(timezone.utc).isoformat(),
-        "projected_notional": notional,
-        "net_exposure": quantity,
+    request_payload: Dict[str, Any] = {
+        "account_id": ctx.account_id,
+        "intent": intent,
+        "policy_decision": decision,
     }
-    new_payload = dict(payload)
-    new_payload["risk_validation"] = assessment
-    return StageResult(payload=new_payload, artifact=assessment)
+    if "portfolio_state" in payload:
+        request_payload["portfolio_state"] = payload["portfolio_state"]
+    if "risk_context" in payload:
+        request_payload["context"] = payload["risk_context"]
+
+    url = f"{RISK_SERVICE_URL.rstrip('/')}/risk/validate"
+    headers = {"X-Account-ID": ctx.account_id}
+
+    max_attempts = max(1, RISK_SERVICE_MAX_RETRIES + 1)
+    backoff = max(0.0, RISK_SERVICE_BACKOFF_SECONDS)
+    attempts = 0
+    last_error: Optional[Exception] = None
+
+    while attempts < max_attempts:
+        attempts += 1
+        try:
+            async with httpx.AsyncClient(timeout=RISK_SERVICE_TIMEOUT) as client:
+                response = await client.post(url, json=request_payload, headers=headers)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code
+            if 500 <= status_code < 600 and attempts < max_attempts:
+                last_error = exc
+                if backoff:
+                    await asyncio.sleep(backoff)
+                    backoff *= 2
+                continue
+
+            try:
+                error_detail = exc.response.json()
+            except ValueError:
+                error_detail = exc.response.text
+
+            raise StageFailedError(
+                "risk",
+                f"Risk validation request failed with status {status_code}",
+                details={
+                    "status_code": status_code,
+                    "response": error_detail,
+                },
+            ) from exc
+        except (httpx.TimeoutException, httpx.RequestError) as exc:
+            last_error = exc
+            if attempts >= max_attempts:
+                raise StageFailedError(
+                    "risk",
+                    f"Risk validation failed after {attempts} attempts: {exc.__class__.__name__}: {exc}",
+                    details={"attempts": attempts, "error": str(exc)},
+                ) from exc
+            if backoff:
+                await asyncio.sleep(backoff)
+                backoff *= 2
+            continue
+
+        try:
+            validation_payload = response.json()
+        except ValueError as exc:
+            raise StageFailedError(
+                "risk",
+                "Risk validation returned invalid JSON",
+                details={"response": response.text},
+            ) from exc
+
+        if not isinstance(validation_payload, Mapping):
+            raise StageFailedError(
+                "risk",
+                "Risk validation returned unexpected payload",
+                details={"response": validation_payload},
+            )
+
+        reasons = [str(reason) for reason in validation_payload.get("reasons") or []]
+        is_valid = bool(validation_payload.get("valid"))
+        if not is_valid:
+            message = "Risk validation rejected intent"
+            if reasons:
+                message += ": " + "; ".join(reasons)
+            raise StageFailedError(
+                "risk",
+                message,
+                details={"reasons": reasons, "response": validation_payload},
+            )
+
+        new_payload = dict(payload)
+        new_payload["risk_validation"] = dict(validation_payload)
+        return StageResult(payload=new_payload, artifact=dict(validation_payload))
+
+    assert last_error is not None  # pragma: no cover - defensive guard
+    raise StageFailedError(
+        "risk",
+        "Risk validation failed due to repeated errors",
+        details={"attempts": attempts, "error": str(last_error)},
+    )
 
 
 async def risk_rollback(result: StageResult, ctx: PipelineContext) -> None:
@@ -658,6 +958,7 @@ async def oms_handler(payload: Dict[str, Any], ctx: PipelineContext) -> StageRes
         raise StageFailedError("oms", "Risk validation failed")
 
     intent = payload.get("intent", {})
+
     client_order_id = intent.get("order_id") or str(uuid.uuid4())
     exchange_order_id = intent.get("exchange_order_id") or f"SIM-{uuid.uuid4().hex[:12]}"
     filled_qty = _safe_float(intent.get("quantity") or intent.get("qty") or 0.0)
@@ -670,23 +971,73 @@ async def oms_handler(payload: Dict[str, Any], ctx: PipelineContext) -> StageRes
         "exchange_order_id": exchange_order_id,
         "txid": exchange_order_id,
         "status": status,
+
         "filled_qty": filled_qty,
         "avg_price": avg_price,
+        "fills": fills,
+        "rejection_reasons": errors,
+        "transport": ack.get("transport") or "exchange_adapter",
         "completed_at": datetime.now(timezone.utc).isoformat(),
     }
+    if "fee" in ack and ack["fee"] is not None:
+        oms_result["fee"] = ack["fee"]
+    if ack.get("kraken_status"):
+        oms_result["kraken_status"] = ack.get("kraken_status")
+
     new_payload = dict(payload)
     new_payload["oms_result"] = oms_result
+
+    if not accepted:
+        detail = ", ".join(errors)
+        if not detail:
+            status_text = ack.get("kraken_status") or ack.get("status")
+            if status_text:
+                detail = str(status_text)
+        if not detail:
+            detail = "Order rejected by OMS"
+        raise StageFailedError("oms", detail)
+
     return StageResult(payload=new_payload, artifact=oms_result)
 
 
 async def oms_rollback(result: StageResult, ctx: PipelineContext) -> None:
+    artifact = result.artifact if isinstance(result.artifact, dict) else {}
+    event_payload = dict(artifact)
+    cancel_result: Optional[Mapping[str, Any]] = None
+    cancel_error: Optional[str] = None
+
+    accepted = bool(artifact.get("accepted"))
+    client_order_id = str(
+        artifact.get("client_order_id") or artifact.get("order_id") or ctx.intent_id
+    )
+    exchange_order_id = artifact.get("exchange_order_id")
+    rollback_account = str(artifact.get("account_id") or ctx.account_id)
+
+    if accepted and EXCHANGE_ADAPTER.supports("cancel_order"):
+        try:
+            cancel_result = await EXCHANGE_ADAPTER.cancel_order(
+                rollback_account,
+                client_order_id,
+                exchange_order_id=str(exchange_order_id) if exchange_order_id else None,
+            )
+        except Exception as exc:  # pragma: no cover - best-effort cancellation
+            LOGGER.warning(
+                "OMS rollback cancellation failed for order %s: %s", client_order_id, exc
+            )
+            cancel_error = str(exc)
+
+    if cancel_result is not None:
+        event_payload["cancel_result"] = _as_dict(cancel_result)
+    if cancel_error is not None:
+        event_payload["cancel_error"] = cancel_error
+
     await ctx.publisher.publish_event(
         "oms",
         "rollback",
         run_id=ctx.run_id,
         intent_id=ctx.intent_id,
         account_id=ctx.account_id,
-        data=result.artifact,
+        data=event_payload,
     )
 
 
@@ -727,7 +1078,22 @@ setup_metrics(app, service_name="sequencer")
 
 
 @app.post("/sequencer/submit_intent", response_model=SequencerResponse)
-async def submit_intent(request: SequencerIntentRequest) -> SequencerResponse:
+async def submit_intent(
+    request: SequencerIntentRequest,
+    authorized_account: str = Depends(require_admin_account),
+) -> SequencerResponse:
+    intent_account = str(request.intent.get("account_id") or "").strip()
+    if not intent_account:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Intent payload must include an account_id.",
+        )
+    if intent_account.lower() != authorized_account.strip().lower():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authenticated account does not match intent payload.",
+        )
+
     try:
         result = await pipeline.submit(request.intent)
     except StageTimeoutError as exc:
@@ -739,7 +1105,9 @@ async def submit_intent(request: SequencerIntentRequest) -> SequencerResponse:
 
 
 @app.get("/sequencer/status", response_model=SequencerStatusResponse)
-async def sequencer_status() -> SequencerStatusResponse:
+async def sequencer_status(
+    _: str = Depends(require_admin_account),
+) -> SequencerStatusResponse:
     runs = await history.snapshot()
     serialized_runs = [run.to_dict() for run in runs]
     latency_values = [run.latency_ms for run in runs if run.latency_ms >= 0]
