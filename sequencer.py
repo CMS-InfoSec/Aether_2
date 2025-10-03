@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 import httpx
 from auth.session_client import AdminSessionManager, get_default_session_manager
 from common.utils import tracing
+from exchange_adapter import get_exchange_adapter
 from services.common.adapters import KafkaNATSAdapter
 
 from services.common.security import require_admin_account
