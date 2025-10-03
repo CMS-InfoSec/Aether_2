@@ -22,6 +22,7 @@ from kubernetes.client import ApiException
 from kubernetes.config.config_exception import ConfigException
 from pydantic import BaseModel, Field, validator
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from services.secrets.signing import sign_kraken_request
 
 try:  # pragma: no cover - optional audit dependency
     from common.utils.audit_logger import hash_ip, log_audit
@@ -398,21 +399,6 @@ def log_rotation(account_id: str, actor: str, timestamp: str) -> None:
         "kraken secret rotated",
         extra={"account_id": account_id, "actor": actor, "ts": timestamp},
     )
-
-
-def sign_kraken_request(path: str, data: Dict[str, Any], api_secret: str) -> Tuple[str, str]:
-    import hashlib
-    import hmac
-    from urllib.parse import urlencode
-
-    post_data = urlencode(data)
-    encoded = (data["nonce"] + post_data).encode()
-    message = hashlib.sha256(encoded).digest()
-    mac = hmac.new(base64.b64decode(api_secret), path.encode() + message, hashlib.sha512)
-    signature = base64.b64encode(mac.digest()).decode()
-    return post_data, signature
-
-
 _UNAVAILABLE_MESSAGE = "Kraken secrets service configuration is unavailable"
 
 
