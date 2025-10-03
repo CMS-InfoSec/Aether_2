@@ -1,11 +1,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 
 from pydantic import BaseModel, Field, model_serializer, model_validator
+
+from fastapi import HTTPException, status
 
 
 
@@ -336,6 +338,10 @@ class OrderPlacementRequest(BaseModel):
         pattern="^(GTC|IOC|GTD)$",
         description="Time in force constraint",
     )
+    expire_time: datetime | None = Field(
+        default=None,
+        description="UTC timestamp when a GTD order should expire",
+    )
     take_profit: float | None = Field(
         default=None,
         gt=0.0,
@@ -346,6 +352,22 @@ class OrderPlacementRequest(BaseModel):
         gt=0.0,
         description="Stop loss trigger price",
     )
+
+    @model_validator(mode="after")
+    def _validate_expire_time(self) -> "OrderPlacementRequest":  # type: ignore[override]
+        if self.time_in_force == "GTD":
+            if self.expire_time is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="expire_time is required when time_in_force is GTD",
+                )
+            if self.expire_time.tzinfo is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="expire_time must include timezone information",
+                )
+            self.expire_time = self.expire_time.astimezone(timezone.utc)
+        return self
 
 
 class OrderPlacementResponse(BaseModel):
