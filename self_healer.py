@@ -7,13 +7,14 @@ is expected to expose and restarts unhealthy pods through the Kubernetes API.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
-import sqlite3
-from contextlib import contextmanager, suppress
+import uuid
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Protocol
 
 import httpx
 from fastapi import FastAPI
@@ -24,6 +25,102 @@ from kubernetes.config.config_exception import ConfigException
 
 
 logger = logging.getLogger("self_healer")
+
+
+def _int_from_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning("Invalid value for %s=%s; falling back to %s", name, value, default)
+        return default
+
+
+class RestartLogStore(Protocol):
+    """Persistence interface for restart events."""
+
+    def record_restart(self, service: str, reason: str, when: datetime) -> None:
+        ...
+
+    def last_actions(self, limit: int) -> List[Dict[str, Any]]:
+        ...
+
+    def count_recent_restarts(
+        self, service: str, window_seconds: int, *, now: Optional[datetime] = None
+    ) -> int:
+        ...
+
+
+class RedisRestartLogStore:
+    """Redis-backed implementation of the restart log."""
+
+    def __init__(
+        self,
+        redis_client: Any,
+        *,
+        log_key: str,
+        service_index_prefix: str,
+        retention: int,
+        per_service_retention_seconds: int,
+    ) -> None:
+        self._redis = redis_client
+        self._log_key = log_key
+        self._service_index_prefix = service_index_prefix
+        self._retention = max(1, retention)
+        self._per_service_retention_seconds = max(1, per_service_retention_seconds)
+
+    def _service_key(self, service: str) -> str:
+        return f"{self._service_index_prefix}{service}"
+
+    def record_restart(self, service: str, reason: str, when: datetime) -> None:
+        timestamp = when.astimezone(timezone.utc)
+        entry = json.dumps(
+            {"service": service, "reason": reason, "ts": timestamp.isoformat()},
+            separators=(",", ":"),
+        )
+        epoch = timestamp.timestamp()
+        service_member = f"{timestamp.isoformat()}:{uuid.uuid4().hex}"
+        service_key = self._service_key(service)
+
+        pipe = self._redis.pipeline()
+        pipe.lpush(self._log_key, entry)
+        pipe.ltrim(self._log_key, 0, self._retention - 1)
+        pipe.zadd(service_key, {service_member: epoch})
+        cutoff = epoch - self._per_service_retention_seconds
+        pipe.zremrangebyscore(service_key, "-inf", cutoff)
+        pipe.expire(service_key, self._per_service_retention_seconds)
+        pipe.execute()
+
+    def last_actions(self, limit: int) -> List[Dict[str, Any]]:
+        if limit <= 0:
+            return []
+        entries = self._redis.lrange(self._log_key, 0, limit - 1)
+        actions: List[Dict[str, Any]] = []
+        for raw in entries:
+            try:
+                payload = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                logger.debug("Discarding malformed restart log payload: %s", raw)
+                continue
+            if isinstance(payload, dict):
+                actions.append(payload)
+        return actions
+
+    def count_recent_restarts(
+        self, service: str, window_seconds: int, *, now: Optional[datetime] = None
+    ) -> int:
+        if window_seconds <= 0:
+            return 0
+        timestamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        cutoff = timestamp.timestamp() - window_seconds
+        service_key = self._service_key(service)
+        # Prune stale entries opportunistically before counting.
+        self._redis.zremrangebyscore(
+            service_key, "-inf", timestamp.timestamp() - self._per_service_retention_seconds
+        )
+        return int(self._redis.zcount(service_key, cutoff, "+inf"))
 
 
 @dataclass(slots=True)
@@ -57,17 +154,35 @@ class SelfHealer:
         *,
         poll_interval: float = 30.0,
         http_timeout: float = 5.0,
-        db_path: str = "data/self_healer.db",
+        redis_url: Optional[str] = None,
+        restart_store: Optional["RestartLogStore"] = None,
     ) -> None:
         self.services: List[ServiceConfig] = list(services)
         self.poll_interval = poll_interval
         self.http_timeout = http_timeout
-        self.db_path = db_path
         self._task: Optional[asyncio.Task[None]] = None
-        self._last_actions: List[Dict[str, Any]] = []
 
         self._core_v1_api: Optional[CoreV1Api] = self._load_kubernetes_api()
-        self._ensure_db()
+        self._rate_limit_per_service = _int_from_env("SELF_HEALER_RESTART_LIMIT", 3)
+        self._rate_limit_window = _int_from_env("SELF_HEALER_RESTART_WINDOW_SECONDS", 900)
+        log_retention = max(1, _int_from_env("SELF_HEALER_LOG_RETENTION", 200))
+        service_log_retention_seconds = max(
+            1,
+            _int_from_env(
+                "SELF_HEALER_SERVICE_LOG_RETENTION_SECONDS",
+                max(self._rate_limit_window, 86400),
+            ),
+        )
+
+        redis_url = redis_url or os.getenv("SELF_HEALER_REDIS_URL", "redis://localhost:6379/0")
+        self._restart_store: RestartLogStore = restart_store or RedisRestartLogStore(
+            self._create_redis_client(redis_url),
+            log_key=os.getenv("SELF_HEALER_REDIS_LOG_KEY", "self_healer:restart_log"),
+            service_index_prefix=os.getenv(
+                "SELF_HEALER_REDIS_SERVICE_PREFIX", "self_healer:service:"),
+            retention=log_retention,
+            per_service_retention_seconds=service_log_retention_seconds,
+        )
 
     @staticmethod
     def _load_kubernetes_api() -> Optional[CoreV1Api]:
@@ -83,27 +198,13 @@ class SelfHealer:
                 return None
         return CoreV1Api()
 
-    def _ensure_db(self) -> None:
-        os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
-        with self._db_connection() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS self_heal_log (
-                    service TEXT NOT NULL,
-                    reason TEXT NOT NULL,
-                    ts TEXT NOT NULL
-                )
-                """
-            )
-            conn.commit()
-
-    @contextmanager
-    def _db_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+    @staticmethod
+    def _create_redis_client(redis_url: str):
         try:
-            yield conn
-        finally:
-            conn.close()
+            import redis  # type: ignore[import-not-found]
+        except ImportError as exc:  # pragma: no cover - surfaced when redis missing
+            raise RuntimeError("redis package is required for self-healer persistence") from exc
+        return redis.Redis.from_url(redis_url, decode_responses=True)
 
     async def start(self) -> None:
         if self._task is None or self._task.done():
@@ -237,6 +338,22 @@ class SelfHealer:
         return False
 
     async def _restart(self, service: ServiceConfig, reason: str) -> None:
+        if (
+            self._rate_limit_per_service > 0
+            and self._rate_limit_window > 0
+            and self._restart_store.count_recent_restarts(
+                service.name, self._rate_limit_window
+            )
+            >= self._rate_limit_per_service
+        ):
+            logger.warning(
+                "Restart for %s suppressed due to rate limit (%s restarts within %ss)",
+                service.name,
+                self._rate_limit_per_service,
+                self._rate_limit_window,
+            )
+            return
+
         logger.error("Restarting %s due to %s", service.name, reason)
         self._record_restart(service.name, reason)
         if not self._core_v1_api:
@@ -272,26 +389,11 @@ class SelfHealer:
                 logger.exception("Failed to delete pod %s for %s", pod_name, service.name)
 
     def _record_restart(self, service: str, reason: str) -> None:
-        timestamp = datetime.now(timezone.utc).isoformat()
-        with self._db_connection() as conn:
-            conn.execute(
-                "INSERT INTO self_heal_log(service, reason, ts) VALUES (?, ?, ?)",
-                (service, reason, timestamp),
-            )
-            conn.commit()
-
-        self._last_actions.append({"service": service, "reason": reason, "ts": timestamp})
-        self._last_actions = self._last_actions[-20:]
+        when = datetime.now(timezone.utc)
+        self._restart_store.record_restart(service, reason, when)
 
     def last_actions(self, limit: int = 20) -> List[Dict[str, Any]]:
-        with self._db_connection() as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.execute(
-                "SELECT service, reason, ts FROM self_heal_log ORDER BY ts DESC LIMIT ?",
-                (limit,),
-            )
-            rows = cursor.fetchall()
-        return [dict(row) for row in rows]
+        return self._restart_store.last_actions(limit)
 
 
 def _build_service_configs() -> List[ServiceConfig]:
