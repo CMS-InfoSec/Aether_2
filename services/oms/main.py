@@ -1373,7 +1373,14 @@ async def place_order(
 
     accepted = (not status_value) or status_value in _SUCCESS_STATUSES
     venue = "kraken"
-    return OrderPlacementResponse(accepted=accepted, routed_venue=venue, fee=request.fee)
+    return OrderPlacementResponse(
+        accepted=accepted,
+        routed_venue=venue,
+        fee=request.fee,
+        exchange_order_id=ack.exchange_order_id,
+        kraken_status=ack_payload.get("status"),
+        errors=ack_payload.get("errors"),
+    )
 
 
 @app.post("/oms/cancel", response_model=CancelOrderResponse)
