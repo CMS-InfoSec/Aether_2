@@ -30,40 +30,9 @@ os.environ.setdefault("LOCAL_KMS_MASTER_KEY", _DEFAULT_MASTER_KEY)
 
 os.environ.setdefault("AUTH_JWT_SECRET", "unit-test-secret")
 os.environ.setdefault("AUTH_DATABASE_URL", "sqlite:////tmp/aether-auth-test.db")
-os.environ.setdefault("SESSION_REDIS_URL", "redis://tests")
 
+os.environ.setdefault("SESSION_REDIS_URL", "memory://oms-test")
 
-if "redis" not in sys.modules:
-    _redis_backends: Dict[str, Dict[str, tuple[bytes, datetime]]] = {}
-
-    class _FakeRedisClient:
-        def __init__(self, url: str) -> None:
-            self._url = url
-            self._store = _redis_backends.setdefault(url, {})
-
-        def setex(self, key: str, ttl_seconds: int, value: str) -> None:
-            expires_at = datetime.now(timezone.utc) + timedelta(seconds=int(ttl_seconds))
-            self._store[key] = (value.encode("utf-8"), expires_at)
-
-        def get(self, key: str) -> bytes | None:
-            entry = self._store.get(key)
-            if not entry:
-                return None
-            payload, expires_at = entry
-            if datetime.now(timezone.utc) >= expires_at:
-                self._store.pop(key, None)
-                return None
-            return payload
-
-        def delete(self, key: str) -> None:
-            self._store.pop(key, None)
-
-    def _redis_from_url(url: str, **_: object) -> _FakeRedisClient:
-        return _FakeRedisClient(url)
-
-    redis_module = ModuleType("redis")
-    redis_module.Redis = SimpleNamespace(from_url=_redis_from_url)  # type: ignore[attr-defined]
-    sys.modules["redis"] = redis_module
 
 
 

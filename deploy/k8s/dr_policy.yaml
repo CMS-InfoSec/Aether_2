@@ -26,6 +26,9 @@ spec:
           ports:
             - containerPort: 8000
               name: http
+          env:
+            - name: SESSION_REDIS_URL
+              value: redis://redis:6379/0
           readinessProbe:
             httpGet:
               path: /health

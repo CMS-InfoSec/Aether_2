@@ -75,8 +75,11 @@ def _build_session_store_from_env() -> SessionStoreProtocol:
     redis_url = os.getenv("SESSION_REDIS_URL")
     if not redis_url:
         raise RuntimeError(
-            "SESSION_REDIS_URL is not configured. Provide a shared session store DSN to enable OMS authentication.",
+
+            "SESSION_REDIS_URL environment variable is required to configure OMS sessions"
         )
+    if redis_url.startswith("memory://"):
+        return InMemorySessionStore(ttl_minutes=ttl_minutes)
 
     try:  # pragma: no cover - optional dependency for redis-backed sessions
         import redis  # type: ignore[import-not-found]
