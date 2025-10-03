@@ -16,8 +16,8 @@ Endpoints
 ``POST /hitl/approve``
     Record a director's decision and update the trade's lifecycle state.
 
-The implementation stores state in a lightweight SQLite database by default and
-uses asynchronous tasks to expire pending reviews when they time out.
+The queue persists in a managed PostgreSQL/Timescale database shared by all HITL
+replicas and asynchronous tasks enforce the approval SLA.
 """
 
 from __future__ import annotations
@@ -31,13 +31,13 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Iterator, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field, PositiveFloat
 from sqlalchemy import Column, DateTime, String, Text, create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
-from sqlalchemy.pool import StaticPool
 
+from services.common.security import require_admin_account
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -63,23 +63,33 @@ class HitlQueueEntry(Base):
     ts = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
 
-_DEFAULT_DB_URL = "sqlite:///./hitl.db"
+DATABASE_URL_ENV = "HITL_DATABASE_URL"
 
 
 def _database_url() -> str:
-    url = os.getenv("HITL_DATABASE_URL") or os.getenv("TIMESCALE_DSN") or _DEFAULT_DB_URL
-    if url.startswith("postgresql://"):
-        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
-    return url
+    url = os.getenv(DATABASE_URL_ENV) or os.getenv("TIMESCALE_DSN")
+    if not url:
+        raise RuntimeError(
+            "HITL service requires a PostgreSQL/Timescale DSN via "
+            f"{DATABASE_URL_ENV} or TIMESCALE_DSN",
+        )
+
+    normalized = url.strip()
+    if normalized.startswith("postgresql://"):
+        normalized = normalized.replace("postgresql://", "postgresql+psycopg://", 1)
+    elif normalized.startswith("postgresql+psycopg://") or normalized.startswith("postgresql+psycopg2://"):
+        pass
+    else:
+        raise RuntimeError(
+            "HITL service requires a PostgreSQL/Timescale DSN via "
+            f"{DATABASE_URL_ENV} or TIMESCALE_DSN",
+        )
+
+    return normalized
 
 
-def _engine_options(url: str) -> Dict[str, Any]:
-    options: Dict[str, Any] = {"future": True}
-    if url.startswith("sqlite://"):
-        options.setdefault("connect_args", {"check_same_thread": False})
-        if url in {"sqlite:///:memory:", "sqlite://"} or url.endswith(":memory:"):
-            options["poolclass"] = StaticPool
-    return options
+def _engine_options(_url: str) -> Dict[str, Any]:
+    return {"future": True, "pool_pre_ping": True}
 
 
 _DB_URL = _database_url()
@@ -172,6 +182,10 @@ class ApprovalResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+def _normalize_account(account: str) -> str:
+    return account.strip().lower()
+
+
 class HitlService:
     """Encapsulates trade evaluation logic and queue management."""
 
@@ -249,7 +263,13 @@ class HitlService:
     # ------------------------------
     # Public API
     # ------------------------------
-    async def review_trade(self, request: ReviewRequest) -> ReviewResponse:
+    async def review_trade(self, request: ReviewRequest, *, actor: str) -> ReviewResponse:
+        if _normalize_account(request.account_id) != _normalize_account(actor):
+            raise HTTPException(
+                status_code=403,
+                detail="Account mismatch between authenticated session and payload.",
+            )
+
         trade = request.trade_details
         if not self.is_high_risk(trade):
             logger.info(
@@ -282,12 +302,14 @@ class HitlService:
             message="Trade requires director approval before execution.",
         )
 
-    def pending_trades(self) -> List[PendingTrade]:
+    def pending_trades(self, *, account_id: str) -> List[PendingTrade]:
         timeout = self.config.approval_timeout_seconds
         entries: List[PendingTrade] = []
         with db_session() as session:
             rows: Iterable[HitlQueueEntry] = session.query(HitlQueueEntry).filter(HitlQueueEntry.status == "pending").order_by(HitlQueueEntry.ts.asc())
             for row in rows:
+                if _normalize_account(row.account_id) != _normalize_account(account_id):
+                    continue
                 submitted_at = row.ts
                 expires_at = submitted_at + timedelta(seconds=timeout) if timeout > 0 else None
                 entries.append(
@@ -327,7 +349,7 @@ class HitlService:
             else:
                 self._schedule_timeout(intent_id, delay=remaining)
 
-    def record_decision(self, request: ApprovalRequest) -> ApprovalResponse:
+    def record_decision(self, request: ApprovalRequest, *, actor: str) -> ApprovalResponse:
         with db_session() as session:
             entry = session.get(HitlQueueEntry, request.intent_id)
             if entry is None:
@@ -337,6 +359,12 @@ class HitlService:
                 raise HTTPException(
                     status_code=409,
                     detail="Intent expired and was cancelled automatically.",
+                )
+
+            if _normalize_account(entry.account_id) != _normalize_account(actor):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Account mismatch between authenticated session and intent owner.",
                 )
 
             if entry.status != "pending":
@@ -370,18 +398,22 @@ app = FastAPI(title="Aether HITL Service")
 
 
 @app.post("/hitl/review", response_model=ReviewResponse)
-async def review_trade(request: ReviewRequest) -> ReviewResponse:
-    return await service.review_trade(request)
+async def review_trade(
+    request: ReviewRequest, actor: str = Depends(require_admin_account)
+) -> ReviewResponse:
+    return await service.review_trade(request, actor=actor)
 
 
 @app.get("/hitl/pending", response_model=List[PendingTrade])
-def get_pending_trades() -> List[PendingTrade]:
-    return service.pending_trades()
+def get_pending_trades(actor: str = Depends(require_admin_account)) -> List[PendingTrade]:
+    return service.pending_trades(account_id=actor)
 
 
 @app.post("/hitl/approve", response_model=ApprovalResponse)
-def approve_trade(request: ApprovalRequest) -> ApprovalResponse:
-    return service.record_decision(request)
+def approve_trade(
+    request: ApprovalRequest, actor: str = Depends(require_admin_account)
+) -> ApprovalResponse:
+    return service.record_decision(request, actor=actor)
 
 
 @app.on_event("startup")

@@ -91,14 +91,18 @@ def _verify_admin_repository(admin_repository: AdminRepositoryProtocol) -> None:
 def _build_session_store_from_env() -> SessionStoreProtocol:
     ttl_minutes = int(os.getenv("SESSION_TTL_MINUTES", "60"))
     redis_url = os.getenv("SESSION_REDIS_URL")
-    if redis_url:
-        try:  # pragma: no cover - import guarded for optional dependency resolution
-            import redis
-        except ImportError as exc:  # pragma: no cover - surfaced when dependency missing at runtime
-            raise RuntimeError("redis package is required when SESSION_REDIS_URL is set") from exc
-        client = redis.Redis.from_url(redis_url)
-        return RedisSessionStore(client, ttl_minutes=ttl_minutes)
-    return InMemorySessionStore(ttl_minutes=ttl_minutes)
+    if not redis_url:
+        raise RuntimeError(
+            "SESSION_REDIS_URL is not configured. Provide a shared session store DSN to enable admin sessions.",
+        )
+
+    try:  # pragma: no cover - import guarded for optional dependency resolution
+        import redis
+    except ImportError as exc:  # pragma: no cover - surfaced when dependency missing at runtime
+        raise RuntimeError("redis package is required when SESSION_REDIS_URL is set") from exc
+
+    client = redis.Redis.from_url(redis_url)
+    return RedisSessionStore(client, ttl_minutes=ttl_minutes)
 
 
 def _maybe_include_router(app: FastAPI, module: str, attribute: str) -> None:

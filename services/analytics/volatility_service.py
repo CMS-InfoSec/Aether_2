@@ -6,13 +6,18 @@ import math
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Generator, List, Sequence
+from pathlib import Path
+from typing import Any, Generator, List, Sequence
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from prometheus_client import Gauge
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import Column, DateTime, Float, String, create_engine, func, select
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Engine, URL
+from sqlalchemy.engine.url import make_url
+from sqlalchemy.exc import ArgumentError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 import metrics
@@ -20,10 +25,55 @@ import metrics
 logger = logging.getLogger(__name__)
 
 
-DATABASE_URL = os.getenv(
-    "ANALYTICS_DATABASE_URL",
-    os.getenv("TIMESCALE_DATABASE_URI", "sqlite:///./analytics.db"),
-)
+def _require_database_url() -> URL:
+    primary = os.getenv("ANALYTICS_DATABASE_URL")
+    fallback = os.getenv("TIMESCALE_DATABASE_URI")
+    raw_url = primary or fallback
+
+    if not raw_url:
+        raise RuntimeError(
+            "ANALYTICS_DATABASE_URL must be defined and point to a Timescale/PostgreSQL database."
+        )
+
+    normalised = _normalise_database_url(raw_url)
+
+    try:
+        url = make_url(normalised)
+    except ArgumentError as exc:  # pragma: no cover - configuration error
+        raise RuntimeError(f"Invalid analytics database URL '{raw_url}': {exc}") from exc
+
+    drivername = url.drivername.lower()
+    if not drivername.startswith("postgresql"):
+        raise RuntimeError(
+            "Volatility service requires a PostgreSQL/TimescaleDSN; received "
+            f"driver '{url.drivername}'."
+        )
+
+    return url
+
+
+def _engine_options(url: URL) -> dict[str, Any]:
+    options: dict[str, Any] = {
+        "future": True,
+        "pool_pre_ping": True,
+        "pool_size": int(os.getenv("ANALYTICS_DB_POOL_SIZE", "15")),
+        "max_overflow": int(os.getenv("ANALYTICS_DB_MAX_OVERFLOW", "10")),
+        "pool_timeout": int(os.getenv("ANALYTICS_DB_POOL_TIMEOUT", "30")),
+        "pool_recycle": int(os.getenv("ANALYTICS_DB_POOL_RECYCLE", "1800")),
+    }
+
+    connect_args: dict[str, Any] = {}
+
+    forced_sslmode = os.getenv("ANALYTICS_DB_SSLMODE")
+    if forced_sslmode:
+        connect_args["sslmode"] = forced_sslmode
+    elif "sslmode" not in url.query and url.host not in {None, "localhost", "127.0.0.1"}:
+        connect_args["sslmode"] = "require"
+
+    if connect_args:
+        options["connect_args"] = connect_args
+
+    return options
 
 
 def _normalise_database_url(url: str) -> str:
@@ -38,8 +88,25 @@ def _normalise_database_url(url: str) -> str:
     return url
 
 
-ENGINE: Engine = create_engine(_normalise_database_url(DATABASE_URL), future=True)
+DATABASE_URL: URL = _require_database_url()
+ENGINE: Engine = create_engine(
+    DATABASE_URL.render_as_string(hide_password=False),
+    **_engine_options(DATABASE_URL),
+)
 SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
+
+_MIGRATIONS_PATH = Path(__file__).resolve().parents[2] / "data" / "migrations"
+
+
+def run_migrations() -> None:
+    """Apply all outstanding Timescale migrations for analytics data."""
+
+    config = Config()
+    config.set_main_option("script_location", str(_MIGRATIONS_PATH))
+    config.set_main_option("sqlalchemy.url", DATABASE_URL.render_as_string(hide_password=False))
+    config.attributes["configure_logger"] = False
+
+    command.upgrade(config, "head")
 
 
 Base = declarative_base()
@@ -127,7 +194,7 @@ def _volatility_gauge() -> Gauge:
 
 @app.on_event("startup")
 def _on_startup() -> None:
-    VolatilityMetric.__table__.create(bind=ENGINE, checkfirst=True)
+    run_migrations()
 
 
 def get_session() -> Generator[Session, None, None]:
