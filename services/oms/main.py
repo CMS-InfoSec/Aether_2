@@ -100,7 +100,13 @@ def _flush_adapters() -> None:
     if kafka_counts:
         logger.info("Flushed Kafka/NATS buffers", extra={"event_counts": kafka_counts})
 
-    timescale_summary = TimescaleAdapter.flush_event_buffers()
+    loop = asyncio.new_event_loop()
+    try:
+        timescale_summary = loop.run_until_complete(
+            TimescaleAdapter.flush_event_buffers()
+        )
+    finally:
+        loop.close()
     if timescale_summary:
         logger.info(
             "Flushed Timescale buffers", extra={"bucket_counts": timescale_summary}

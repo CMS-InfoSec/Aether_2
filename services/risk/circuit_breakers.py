@@ -8,7 +8,7 @@ from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import ClassVar, Deque, Dict, Iterable, List, Mapping, MutableMapping, Optional
+from typing import Any, ClassVar, Deque, Dict, Iterable, List, Mapping, MutableMapping, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
@@ -149,22 +149,20 @@ class CircuitBreakerConfigStore:
         self._timescale = timescale or TimescaleAdapter(account_id=account_id)
         self._auditor = auditor or SensitiveActionRecorder(self._audit_logger)
 
-    def _raw_bucket(self) -> MutableMapping[str, Dict[str, object]]:
-        config = TimescaleAdapter._risk_configs.setdefault(  # type: ignore[attr-defined]
-            self.account_id, deepcopy(TimescaleAdapter._default_risk_config)  # type: ignore[attr-defined]
-        )
+    def _load_bucket(self) -> tuple[Dict[str, Any], MutableMapping[str, Dict[str, object]]]:
+        config = self._timescale.load_risk_config()
         bucket = config.setdefault(self.CONFIG_KEY, {})
         if not isinstance(bucket, dict):
             bucket = {}
             config[self.CONFIG_KEY] = bucket
-        return bucket
+        return config, bucket
 
     def thresholds(self) -> Dict[str, SymbolThresholds]:
-        payload = self._raw_bucket()
+        _, payload = self._load_bucket()
         return {symbol: self._deserialize(entry) for symbol, entry in payload.items()}
 
     def threshold_for(self, symbol: str) -> Optional[SymbolThresholds]:
-        bucket = self._raw_bucket()
+        _, bucket = self._load_bucket()
         entry = bucket.get(_normalize_symbol(symbol))
         if entry is None:
             return None
@@ -180,7 +178,7 @@ class CircuitBreakerConfigStore:
         actor_id: str,
     ) -> None:
         normalized = _normalize_symbol(symbol)
-        bucket = self._raw_bucket()
+        config, bucket = self._load_bucket()
         before = bucket.get(normalized)
         after: Dict[str, object] = {}
         if max_spread_bps is not None:
@@ -189,6 +187,7 @@ class CircuitBreakerConfigStore:
             after["max_volatility"] = float(max_volatility)
         after["trigger_safe_mode"] = bool(trigger_safe_mode)
         bucket[normalized] = dict(after)
+        self._timescale.save_risk_config(config)
         self._auditor.record(
             action="risk.circuit_breaker.update",
             actor_id=actor_id,
@@ -198,10 +197,11 @@ class CircuitBreakerConfigStore:
 
     def remove(self, symbol: str, *, actor_id: str) -> None:
         normalized = _normalize_symbol(symbol)
-        bucket = self._raw_bucket()
+        config, bucket = self._load_bucket()
         before = bucket.pop(normalized, None)
         if before is None:
             return
+        self._timescale.save_risk_config(config)
         self._auditor.record(
             action="risk.circuit_breaker.delete",
             actor_id=actor_id,
