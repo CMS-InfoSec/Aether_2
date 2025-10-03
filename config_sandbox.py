@@ -3,24 +3,43 @@
 from __future__ import annotations
 
 import copy
+import importlib.util
 import hashlib
 import json
 import math
 import os
 import statistics
+import sys
 import threading
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, MutableMapping
 
 import yaml
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import Column, DateTime, Integer, Text, create_engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from backtests.reporting import compute_max_drawdown, compute_sharpe
+try:  # pragma: no cover - support alternative namespace packages
+    from services.common.security import get_director_accounts, require_admin_account
+except ModuleNotFoundError:  # pragma: no cover - fallback when installed under package namespace
+    try:
+        from aether.services.common.security import get_director_accounts, require_admin_account
+    except ModuleNotFoundError:  # pragma: no cover - direct import when running from source tree
+        spec = importlib.util.spec_from_file_location(
+            "config_sandbox._security",
+            Path(__file__).resolve().parent / "services" / "common" / "security.py",
+        )
+        if spec is None or spec.loader is None:
+            raise
+        security_module = importlib.util.module_from_spec(spec)
+        sys.modules.setdefault("config_sandbox._security", security_module)
+        spec.loader.exec_module(security_module)
+        require_admin_account = getattr(security_module, "require_admin_account")
+        get_director_accounts = getattr(security_module, "get_director_accounts")
 
 # ---------------------------------------------------------------------------
 # Persistent configuration state
@@ -74,7 +93,6 @@ def get_session() -> Iterator[Session]:
 # ---------------------------------------------------------------------------
 
 
-DIRECTOR_ACCOUNTS = {"director-1", "director-2"}
 _CONFIG_LOCK = threading.Lock()
 
 _BASE_DIR = Path(__file__).resolve().parent
@@ -222,8 +240,45 @@ def _promote_config(new_config: Mapping[str, Any]) -> None:
             _LIVE_CONFIG = copy.deepcopy(new_config)
 
 
-def _has_director_approval(directors: Iterable[str]) -> bool:
-    return DIRECTOR_ACCOUNTS.issubset(set(directors))
+def _normalize_account_id(account: str) -> str:
+    return account.strip().lower()
+
+
+def _validate_director_approvals(actor: str, directors: Iterable[str]) -> None:
+    required_directors = {account for account in get_director_accounts(normalized=True)}
+    actor_account = _normalize_account_id(actor)
+
+    if actor_account not in required_directors:
+        raise HTTPException(
+            status_code=403,
+            detail="Authenticated principal is not an authorized director.",
+        )
+
+    supplied_directors = {
+        _normalize_account_id(value)
+        for value in directors
+        if value and value.strip()
+    }
+    supplied_directors.discard(actor_account)
+
+    if not supplied_directors:
+        raise HTTPException(
+            status_code=403,
+            detail="A second director approval is required.",
+        )
+
+    if not supplied_directors.issubset(required_directors):
+        raise HTTPException(
+            status_code=403,
+            detail="Director approvals must match the configured director set.",
+        )
+
+    combined_approvals = supplied_directors | {actor_account}
+    if combined_approvals != required_directors:
+        raise HTTPException(
+            status_code=403,
+            detail="Director approvals must match the configured director set.",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +309,11 @@ app = FastAPI(title="Config Sandbox Service")
 
 
 @app.post("/sandbox/test_config", response_model=SandboxTestResponse)
-def run_sandbox_test(payload: SandboxTestRequest, session: Session = Depends(get_session)) -> SandboxTestResponse:
+def run_sandbox_test(
+    payload: SandboxTestRequest,
+    session: Session = Depends(get_session),
+    actor: str = Depends(require_admin_account),
+) -> SandboxTestResponse:
     baseline_config = _current_config()
     candidate_config = _deep_merge(baseline_config, payload.config_changes)
 
@@ -281,7 +340,8 @@ def run_sandbox_test(payload: SandboxTestRequest, session: Session = Depends(get
     session.add(run_entry)
     session.commit()
 
-    if payload.directors and _has_director_approval(payload.directors):
+    if payload.directors:
+        _validate_director_approvals(actor, payload.directors)
         _promote_config(candidate_config)
 
     return comparison
