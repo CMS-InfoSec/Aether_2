@@ -50,6 +50,7 @@ from services.oms.kraken_ws import (
     _WebsocketTransport,
 )
 from services.oms.oms_kraken import KrakenCredentialWatcher
+from services.oms.order_ack_cache import get_order_ack_cache
 from services.oms.rate_limit_guard import rate_limit_guard
 from services.oms.shadow_oms import shadow_oms
 from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
@@ -560,6 +561,10 @@ MARKET_METADATA: MarketMetadataDict = {}
 
 
 _SUCCESS_STATUSES = {"ok", "accepted", "open"}
+
+ACK_CACHE_TTL_SECONDS = max(
+    0.0, float(os.getenv("OMS_ACK_CACHE_TTL_SECONDS", os.getenv("OMS_ACK_CACHE_TTL", "30")))
+)
 
 
 @dataclass
@@ -1227,6 +1232,27 @@ async def place_order(
             detail="Snapped price/quantity must be positive.",
         )
 
+    ack_cache = None
+    if ACK_CACHE_TTL_SECONDS > 0:
+        ack_cache = get_order_ack_cache(account_id)
+        cached_ack = await ack_cache.get(request.order_id)
+        if cached_ack is not None:
+            status_value = str(cached_ack.payload.get("status", "")).lower()
+            accepted = (not status_value) or status_value in _SUCCESS_STATUSES
+            logger.info(
+                "Reusing cached Kraken acknowledgement",
+                extra={
+                    "account_id": account_id,
+                    "order_id": request.order_id,
+                    "cached_at": cached_ack.stored_at.isoformat(),
+                },
+            )
+            return OrderPlacementResponse(
+                accepted=accepted,
+                routed_venue="kraken",
+                fee=request.fee,
+            )
+
     kafka = KafkaNATSAdapter(account_id=account_id)
     timescale = TimescaleAdapter(account_id=account_id)
 
@@ -1417,6 +1443,9 @@ async def place_order(
         shadow_fills = []
     for shadow_fill in shadow_fills:
         timescale.record_shadow_fill(shadow_fill)
+
+    if ack_cache is not None:
+        await ack_cache.store(request.order_id, ack_payload, ACK_CACHE_TTL_SECONDS)
 
     accepted = (not status_value) or status_value in _SUCCESS_STATUSES
     venue = "kraken"
