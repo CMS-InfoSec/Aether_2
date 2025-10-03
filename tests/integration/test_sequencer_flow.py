@@ -8,6 +8,7 @@ import pytest
 
 pytest.importorskip("fastapi")
 
+import sequencer
 from sequencer import pipeline
 from services.common.adapters import KafkaNATSAdapter
 
@@ -22,6 +23,36 @@ async def test_sequencer_flow_emits_complete_audit_trail(monkeypatch: pytest.Mon
 
     # ``latest_override`` consults a SQLite store; stub it out so we remain in-memory.
     monkeypatch.setattr("override_service.latest_override", lambda intent_id: None)
+
+    class _Adapter:
+        def __init__(self) -> None:
+            self.counter = 0
+
+        def supports(self, operation: str) -> bool:
+            return operation in {"place_order", "cancel_order"}
+
+        async def place_order(
+            self,
+            account_id: str,
+            payload: Dict[str, Any],
+            *,
+            shadow: bool = False,
+        ) -> Dict[str, Any]:
+            self.counter += 1
+            qty = float(payload.get("qty", 0.0))
+            limit_px = float(payload.get("limit_px") or intent.get("price", 0.0))
+            return {
+                "accepted": True,
+                "routed_venue": payload.get("symbol", "demo-exchange"),
+                "exchange_order_id": f"EX-{self.counter}",
+                "fills": [{"price": limit_px, "quantity": qty}],
+                "transport": "integration-test",
+            }
+
+        async def cancel_order(self, *args, **kwargs) -> Dict[str, Any]:  # pragma: no cover - unused
+            return {"status": "cancelled"}
+
+    monkeypatch.setattr(sequencer, "EXCHANGE_ADAPTER", _Adapter())
 
     intent: Dict[str, Any] = {
         "account_id": "AlphaDesk",
