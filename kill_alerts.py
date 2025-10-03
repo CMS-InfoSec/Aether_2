@@ -2,46 +2,36 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import logging
+import os
 from datetime import datetime
-from typing import Callable, Dict, Iterable, List, Sequence
+from typing import Callable, Dict, List, Mapping, Sequence
+
+import requests
 
 logger = logging.getLogger(__name__)
 
-_SENT_EMAILS: List[Dict[str, object]] = []
-_SENT_SMS: List[Dict[str, object]] = []
-_SENT_WEBHOOKS: List[Dict[str, object]] = []
+
+class NotificationDispatchError(RuntimeError):
+    """Raised when one or more notification channels fail to deliver."""
+
+    def __init__(self, delivered: Sequence[str], failures: Mapping[str, Exception]):
+        self.delivered = list(delivered)
+        self.failed = dict(failures)
+        failure_list = ", ".join(f"{name}: {exc}" for name, exc in self.failed.items()) or "unknown"
+        super().__init__(f"Failed to dispatch notifications for: {failure_list}")
 
 
-def reset_notifications() -> None:
-    """Clear previously recorded notifications.
-
-    The notifier functions append payloads to in-memory collections so tests can
-    assert behaviour without requiring real network calls. Resetting ensures a
-    clean slate between invocations.
-    """
-
-    _SENT_EMAILS.clear()
-    _SENT_SMS.clear()
-    _SENT_WEBHOOKS.clear()
-
-
-def email_notifications() -> List[Dict[str, object]]:
-    """Return a copy of email notifications that have been dispatched."""
-
-    return list(_SENT_EMAILS)
-
-
-def sms_notifications() -> List[Dict[str, object]]:
-    """Return a copy of SMS notifications that have been dispatched."""
-
-    return list(_SENT_SMS)
-
-
-def webhook_notifications() -> List[Dict[str, object]]:
-    """Return a copy of webhook notifications that have been dispatched."""
-
-    return list(_SENT_WEBHOOKS)
+def _require_env(key: str) -> str:
+    value = os.getenv(key)
+    if not value:
+        raise RuntimeError(
+            f"Environment variable '{key}' is required for kill switch notifications"
+        )
+    return value
 
 
 def _build_payload(account_id: str, reason_code: str, triggered_at: datetime) -> Dict[str, object]:
@@ -54,38 +44,109 @@ def _build_payload(account_id: str, reason_code: str, triggered_at: datetime) ->
 
 
 def _send_email(payload: Dict[str, object]) -> None:
-    message = {
-        "to": "risk-ops@example.com",
+    """Send kill switch notification email via SendGrid-compatible API."""
+
+    api_key = _require_env("KILL_ALERT_EMAIL_API_KEY")
+    sender = _require_env("KILL_ALERT_EMAIL_FROM")
+    recipients = _require_env("KILL_ALERT_EMAIL_TO")
+    endpoint = os.getenv("KILL_ALERT_EMAIL_ENDPOINT", "https://api.sendgrid.com/v3/mail/send")
+
+    body = {
+        "personalizations": [
+            {
+                "to": [
+                    {"email": recipient.strip()}
+                    for recipient in recipients.split(",")
+                    if recipient.strip()
+                ],
+            }
+        ],
+        "from": {"email": sender},
         "subject": "Kill switch engaged",
-        "body": (
-            "Kill switch engaged for account {account_id} due to {reason_code}."
-        ).format(
-            account_id=payload["account_id"], reason_code=payload["reason_code"]
-        ),
-        "payload": payload,
+        "content": [
+            {
+                "type": "text/plain",
+                "value": (
+                    "Kill switch engaged for account {account_id} due to {reason_code}."
+                ).format(
+                    account_id=payload["account_id"],
+                    reason_code=payload["reason_code"],
+                ),
+            }
+        ],
+        "custom_args": payload,
     }
-    _SENT_EMAILS.append(message)
+
+    response = requests.post(
+        endpoint,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json=body,
+        timeout=10,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Email notification failed with status {response.status_code}: {response.text}"
+        )
 
 
 def _send_sms(payload: Dict[str, object]) -> None:
-    message = {
-        "to": "+15555550100",
-        "body": (
-            "Kill switch engaged: {account_id} ({reason_code})"
-        ).format(
-            account_id=payload["account_id"], reason_code=payload["reason_code"]
-        ),
-        "payload": payload,
-    }
-    _SENT_SMS.append(message)
+    """Send kill switch notification SMS via Twilio-compatible API."""
+
+    account_sid = _require_env("KILL_ALERT_SMS_ACCOUNT_SID")
+    auth_token = _require_env("KILL_ALERT_SMS_AUTH_TOKEN")
+    from_number = _require_env("KILL_ALERT_SMS_FROM")
+    to_number = _require_env("KILL_ALERT_SMS_TO")
+    endpoint = os.getenv(
+        "KILL_ALERT_SMS_ENDPOINT",
+        f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json",
+    )
+
+    message_body = "Kill switch engaged: {account_id} ({reason_code})".format(
+        account_id=payload["account_id"],
+        reason_code=payload["reason_code"],
+    )
+
+    response = requests.post(
+        endpoint,
+        data={
+            "To": to_number,
+            "From": from_number,
+            "Body": message_body,
+        },
+        auth=(account_sid, auth_token),
+        timeout=10,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"SMS notification failed with status {response.status_code}: {response.text}"
+        )
 
 
 def _send_webhook(payload: Dict[str, object]) -> None:
-    message = {
-        "url": "https://hooks.internal/kill-switch",
-        "payload": payload,
-    }
-    _SENT_WEBHOOKS.append(message)
+    """Send kill switch notification to an internal signed webhook."""
+
+    url = _require_env("KILL_ALERT_WEBHOOK_URL")
+    secret = _require_env("KILL_ALERT_WEBHOOK_SECRET")
+
+    body = json.dumps(payload, sort_keys=True).encode("utf-8")
+    signature = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+
+    response = requests.post(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Signature": signature,
+        },
+        timeout=5,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Webhook notification failed with status {response.status_code}: {response.text}"
+        )
 
 
 def dispatch_notifications(
@@ -111,23 +172,20 @@ def dispatch_notifications(
     )
 
     delivered: List[str] = []
+    failures: Dict[str, Exception] = {}
     for name, handler in channels:
         try:
             handler(payload)
-        except Exception:  # pragma: no cover - defensive logging only
-            logger.exception("Failed to dispatch kill switch notification", extra={"channel": name})
-            continue
-        delivered.append(name)
+        except Exception as exc:  # pragma: no cover - logged and aggregated
+            failures[name] = exc
+            logger.exception(
+                "Failed to dispatch kill switch notification", extra={"channel": name}
+            )
+        else:
+            delivered.append(name)
+
+    if failures:
+        raise NotificationDispatchError(delivered=delivered, failures=failures)
 
     return delivered
-
-
-def notification_summary() -> Dict[str, Iterable[Dict[str, object]]]:
-    """Return a snapshot of delivered notifications by channel."""
-
-    return {
-        "email": email_notifications(),
-        "sms": sms_notifications(),
-        "webhook": webhook_notifications(),
-    }
 
