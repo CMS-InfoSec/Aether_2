@@ -18,11 +18,12 @@ from typing import Generator, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field, PositiveFloat
-from sqlalchemy import Column, DateTime, Float, Integer, String, create_engine, select
+from sqlalchemy import Column, DateTime, Float, Integer, String, create_engine, select, func
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from services.common.security import require_admin_account
 
 # ---------------------------------------------------------------------------
 # Database setup
@@ -102,6 +103,29 @@ def get_session() -> Generator[Session, None, None]:
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _normalize_account_id(value: str) -> str:
+    return value.strip().lower()
+
+
+def _ensure_caller_matches_account(caller: str, account_id: str) -> None:
+    if _normalize_account_id(caller) != _normalize_account_id(account_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authenticated account is not authorized for the requested account.",
+        )
+
+
+def _resolve_account_scope(caller: str, requested: Optional[str]) -> tuple[str, str]:
+    """Return the account filter (original and normalized) enforcing caller alignment."""
+
+    if requested is None:
+        normalized = _normalize_account_id(caller)
+        return caller, normalized
+
+    _ensure_caller_matches_account(caller, requested)
+    return requested, _normalize_account_id(requested)
 
 
 # ---------------------------------------------------------------------------
@@ -256,10 +280,13 @@ app = FastAPI(title="Capital Flow Service", version="1.0.0")
     summary="Record a capital deposit",
 )
 def record_deposit(
-    payload: CapitalFlowRequest, session: Session = Depends(get_session)
+    payload: CapitalFlowRequest,
+    session: Session = Depends(get_session),
+    caller: str = Depends(require_admin_account),
 ) -> CapitalFlowResponse:
     """Persist a deposit and update the NAV baseline."""
 
+    _ensure_caller_matches_account(caller, payload.account_id)
     return _record_flow(session, payload, CapitalFlowType.DEPOSIT)
 
 
@@ -270,10 +297,13 @@ def record_deposit(
     summary="Record a capital withdrawal",
 )
 def record_withdrawal(
-    payload: CapitalFlowRequest, session: Session = Depends(get_session)
+    payload: CapitalFlowRequest,
+    session: Session = Depends(get_session),
+    caller: str = Depends(require_admin_account),
 ) -> CapitalFlowResponse:
     """Persist a withdrawal and update the NAV baseline."""
 
+    _ensure_caller_matches_account(caller, payload.account_id)
     return _record_flow(session, payload, CapitalFlowType.WITHDRAW)
 
 
@@ -286,12 +316,18 @@ def list_flows(
     account_id: Optional[str] = Query(None, description="Filter flows to a specific account"),
     limit: int = Query(100, ge=1, le=1000, description="Maximum number of records to return"),
     session: Session = Depends(get_session),
+    caller: str = Depends(require_admin_account),
 ) -> FlowHistoryResponse:
     """Return recent capital flows with their resulting NAV baselines."""
 
-    stmt = select(CapitalFlowRecord).order_by(CapitalFlowRecord.ts.desc()).limit(limit)
-    if account_id:
-        stmt = stmt.where(CapitalFlowRecord.account_id == account_id)
+    _, normalized_filter = _resolve_account_scope(caller, account_id)
+
+    stmt = (
+        select(CapitalFlowRecord)
+        .order_by(CapitalFlowRecord.ts.desc())
+        .limit(limit)
+        .where(func.lower(CapitalFlowRecord.account_id) == normalized_filter)
+    )
 
     records = list(session.execute(stmt).scalars())
     account_ids = {record.account_id for record in records}
