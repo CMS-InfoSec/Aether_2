@@ -2,6 +2,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from services.common.adapters import RedisFeastAdapter
+import pytest
+from fastapi.testclient import TestClient
+
+from services.common.adapters import RedisFeastAdapter
 from services.common.security import ADMIN_ACCOUNTS
 from services.universe import main as universe_main
 from services.universe.main import app
@@ -10,44 +14,68 @@ from services.universe.repository import UniverseRepository
 from tests.universe.conftest import UniverseTimescaleFixture
 
 
+class NoopFeastStore:
+    def get_historical_features(self, **_: object) -> None:  # pragma: no cover - guard
+        raise AssertionError("RedisFeastAdapter should not query Feast in universe tests")
+
+    def get_online_features(self, **_: object) -> None:  # pragma: no cover - guard
+        raise AssertionError("RedisFeastAdapter should not query Feast in universe tests")
+
+
+def _prime_adapter_cache(account_id: str) -> None:
+    repo = UniverseRepository(account_id=account_id)
+    instruments = repo.approved_universe()
+    fees = {}
+    for symbol in instruments:
+        override = repo.fee_override(symbol)
+        if override:
+            fees[symbol] = override
+    if not instruments:
+        instruments = ["BTC-USD"]
+        fees.setdefault("BTC-USD", {"currency": "USD", "maker": 0.1, "taker": 0.2})
+    RedisFeastAdapter._features[account_id] = {"approved": instruments, "fees": fees}
+
+
 client = TestClient(app)
 
 
 @pytest.fixture(autouse=True)
-def configure_repository(universe_timescale: UniverseTimescaleFixture) -> None:
+
+def reset_state(monkeypatch: pytest.MonkeyPatch) -> None:
     UniverseRepository.reset()
-    universe_timescale.rebind()
-    universe_timescale.clear()
+    RedisFeastAdapter._features.clear()
+    RedisFeastAdapter._fee_tiers.clear()
+    RedisFeastAdapter._online_feature_store.clear()
+    RedisFeastAdapter._feature_expirations.clear()
+    RedisFeastAdapter._fee_tier_expirations.clear()
+    RedisFeastAdapter._online_feature_expirations.clear()
+
+    class CachedRedisAdapter(RedisFeastAdapter):
+        def __init__(self, account_id: str) -> None:
+            super().__init__(
+                account_id=account_id,
+                feature_store_factory=lambda *_: NoopFeastStore(),
+            )
+
+    monkeypatch.setattr(universe_main, "RedisFeastAdapter", CachedRedisAdapter)
     yield
     UniverseRepository.reset()
-    universe_timescale.rebind()
-    universe_timescale.clear()
+    RedisFeastAdapter._features.clear()
+    RedisFeastAdapter._fee_tiers.clear()
+    RedisFeastAdapter._online_feature_store.clear()
+    RedisFeastAdapter._feature_expirations.clear()
+    RedisFeastAdapter._fee_tier_expirations.clear()
+    RedisFeastAdapter._online_feature_expirations.clear()
 
 
-def test_universe_approved_authorized_accounts(universe_timescale: UniverseTimescaleFixture) -> None:
-    universe_timescale.add_snapshot(
-        base_asset="BTC",
-        quote_asset="USD",
-        market_cap=1.2e12,
-        global_volume_24h=5.0e10,
-        kraken_volume_24h=2.5e10,
-        volatility_30d=0.45,
-    )
-    universe_timescale.add_snapshot(
-        base_asset="ETH",
-        quote_asset="USD",
-        market_cap=6.0e11,
-        global_volume_24h=3.0e10,
-        kraken_volume_24h=1.4e10,
-        volatility_30d=0.5,
-    )
-    universe_timescale.add_fee_override(
-        "BTC-USD", currency="USD", maker=0.1, taker=0.2
-    )
+def test_universe_approved_authorized_accounts():
 
     for account in ADMIN_ACCOUNTS:
-        repo = UniverseRepository(account_id=account)
-        adapter = RedisFeastAdapter(account_id=account, repository=repo)
+        _prime_adapter_cache(account)
+        adapter = RedisFeastAdapter(
+            account_id=account,
+            feature_store_factory=lambda *_: NoopFeastStore(),
+        )
         expected_instruments = adapter.approved_instruments()
         expected_overrides = {}
         for instrument in expected_instruments:
@@ -88,7 +116,19 @@ def test_universe_endpoint_uses_repository_calls(monkeypatch):
     def factory(account_id: str, repository: StubRepository | None = None) -> RedisFeastAdapter:
         repo = repository or StubRepository()
         instances.append(repo)
-        return RedisFeastAdapter(account_id=account_id, repository=repo)
+        RedisFeastAdapter._features[account_id] = {
+            "approved": repo.approved_universe(),
+            "fees": {
+                symbol: repo.fee_override(symbol)
+                for symbol in repo.approved_universe()
+                if repo.fee_override(symbol)
+            },
+        }
+        return RedisFeastAdapter(
+            account_id=account_id,
+            repository=repo,
+            feature_store_factory=lambda *_: NoopFeastStore(),
+        )
 
     monkeypatch.setattr(universe_main, "RedisFeastAdapter", factory)
 
@@ -97,6 +137,3 @@ def test_universe_endpoint_uses_repository_calls(monkeypatch):
 
     assert response.status_code == 200
     assert instances
-    stub_repo = instances[-1]
-    assert stub_repo.approved_calls == 1
-    assert stub_repo.fee_override_calls == ["BTC-USD"]

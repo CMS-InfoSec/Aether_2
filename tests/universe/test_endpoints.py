@@ -5,10 +5,33 @@ from fastapi.testclient import TestClient
 
 from services.common.adapters import RedisFeastAdapter
 from services.common.security import ADMIN_ACCOUNTS
+from services.universe import main as universe_main
 from services.universe.main import app
 
 from services.universe.repository import UniverseRepository
 from tests.universe.conftest import UniverseTimescaleFixture
+
+
+class NoopFeastStore:
+    def get_historical_features(self, **_: object) -> None:  # pragma: no cover - guard
+        raise AssertionError("RedisFeastAdapter should not query Feast during endpoint tests")
+
+    def get_online_features(self, **_: object) -> None:  # pragma: no cover - guard
+        raise AssertionError("RedisFeastAdapter should not query Feast during endpoint tests")
+
+
+def _prime_adapter_cache(account_id: str) -> None:
+    repo = UniverseRepository(account_id=account_id)
+    instruments = repo.approved_universe()
+    fees = {}
+    for symbol in instruments:
+        override = repo.fee_override(symbol)
+        if override:
+            fees[symbol] = override
+    if not instruments:
+        instruments = ["BTC-USD"]
+        fees.setdefault("BTC-USD", {"currency": "USD", "maker": 0.1, "taker": 0.2})
+    RedisFeastAdapter._features[account_id] = {"approved": instruments, "fees": fees}
 
 
 
@@ -18,14 +41,33 @@ def client_fixture() -> TestClient:
 
 
 @pytest.fixture(autouse=True)
-def configure_repository(universe_timescale: UniverseTimescaleFixture) -> None:
+
+def reset_universe_repository(monkeypatch: pytest.MonkeyPatch) -> None:
     UniverseRepository.reset()
-    universe_timescale.rebind()
-    universe_timescale.clear()
+    RedisFeastAdapter._features.clear()
+    RedisFeastAdapter._fee_tiers.clear()
+    RedisFeastAdapter._online_feature_store.clear()
+    RedisFeastAdapter._feature_expirations.clear()
+    RedisFeastAdapter._fee_tier_expirations.clear()
+    RedisFeastAdapter._online_feature_expirations.clear()
+
+    class CachedRedisAdapter(RedisFeastAdapter):
+        def __init__(self, account_id: str) -> None:
+            super().__init__(
+                account_id=account_id,
+                feature_store_factory=lambda *_: NoopFeastStore(),
+            )
+
+    monkeypatch.setattr(universe_main, "RedisFeastAdapter", CachedRedisAdapter)
     yield
     UniverseRepository.reset()
-    universe_timescale.rebind()
-    universe_timescale.clear()
+    RedisFeastAdapter._features.clear()
+    RedisFeastAdapter._fee_tiers.clear()
+    RedisFeastAdapter._online_feature_store.clear()
+    RedisFeastAdapter._feature_expirations.clear()
+    RedisFeastAdapter._fee_tier_expirations.clear()
+    RedisFeastAdapter._online_feature_expirations.clear()
+
 
 
 @pytest.mark.parametrize("account_id", sorted(ADMIN_ACCOUNTS))
@@ -44,7 +86,11 @@ def test_get_universe_allows_admin_accounts(
         "BTC-USD", currency="USD", maker=0.1, taker=0.2
     )
 
-    adapter = RedisFeastAdapter(account_id=account_id)
+    _prime_adapter_cache(account_id)
+    adapter = RedisFeastAdapter(
+        account_id=account_id,
+        feature_store_factory=lambda *_: NoopFeastStore(),
+    )
     expected_instruments = adapter.approved_instruments()
     expected_overrides = {}
     for instrument in expected_instruments:
@@ -84,7 +130,10 @@ def test_universe_endpoint_uses_fallback_when_timescale_empty(
     client: TestClient, account_id: str, universe_timescale: UniverseTimescaleFixture
 ) -> None:
 
-    universe_timescale.clear()
+
+    UniverseRepository.seed_market_snapshots([])
+    _prime_adapter_cache(account_id)
+
 
     response = client.get(
         "/universe/approved",
@@ -94,7 +143,10 @@ def test_universe_endpoint_uses_fallback_when_timescale_empty(
     assert response.status_code == 200
     body = response.json()
 
-    adapter = RedisFeastAdapter(account_id=account_id)
+    adapter = RedisFeastAdapter(
+        account_id=account_id,
+        feature_store_factory=lambda *_: NoopFeastStore(),
+    )
     expected_instruments = adapter.approved_instruments()
 
     assert body["instruments"] == expected_instruments

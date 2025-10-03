@@ -6,21 +6,18 @@ import base64
 import hashlib
 import json
 import logging
-import sqlite3
-import tempfile
-import threading
-import time
+
+import os
+
 import uuid
 from copy import deepcopy
 from dataclasses import dataclass, field
-
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, ClassVar, Dict, Iterable, List, Mapping, Optional
-from urllib.parse import urlparse
-from weakref import WeakSet
 
-import httpx
+
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, ClassVar, Dict, Iterable, List, Mapping, Optional, Tuple
+
 
 from common.utils.tracing import attach_correlation, current_correlation_id
 from shared.k8s import ANNOTATION_ROTATED_AT as K8S_ROTATED_AT, KrakenSecretStore
@@ -28,13 +25,15 @@ from services.secrets.secure_secrets import (
     EncryptedSecretEnvelope,
     EnvelopeEncryptor,
 )
-from services.common.config import (
-    get_kafka_producer,
-    get_nats_producer,
-    get_timescale_session,
-)
 
+from services.common.config import get_feast_client, get_redis_client
+main
 from services.universe.repository import UniverseRepository
+
+try:
+    from feast import FeatureStore
+except Exception:  # pragma: no cover - Feast is optional during testing
+    FeatureStore = None  # type: ignore[assignment]
 
 def _normalize_account_id(account_id: str) -> str:
     """Convert human readable admin labels into canonical keys."""
@@ -1410,9 +1409,44 @@ class TimescaleAdapter:
         if account_id is None:
             _TimescaleStore.clear_all_rotation_state()
             return
-        normalized = _normalize_account_id(account_id)
-        _TimescaleStore.clear_all_rotation_state(normalized)
 
+
+        for cache in rotation_caches:
+            cache.pop(account_id, None)
+
+        account_events = cls._events.get(account_id)
+        if account_events is not None and "credential_rotations" in account_events:
+            rotations = account_events["credential_rotations"]
+            if isinstance(rotations, list):
+                rotations.clear()
+            else:
+                account_events["credential_rotations"] = []
+
+
+
+
+    def record_credential_access(self, *, secret_name: str, metadata: Dict[str, Any]) -> None:
+        sanitized = deepcopy(metadata)
+        for key in ("api_key", "api_secret"):
+            if key in sanitized and sanitized[key]:
+                sanitized[key] = "***"
+        if "material_present" not in sanitized:
+            sanitized["material_present"] = bool(
+                sanitized.get("api_key") and sanitized.get("api_secret")
+            )
+        payload = {
+            "event": "access",
+            "event_type": "kraken.credentials.access",
+            "secret_name": secret_name,
+            "metadata": sanitized,
+            "timestamp": datetime.now(timezone.utc),
+        }
+        events = self._credential_events.setdefault(self.account_id, [])
+        events.append(deepcopy(payload))
+
+
+    def credential_events(self) -> List[Dict[str, Any]]:
+        return [deepcopy(event) for event in self._credential_events.get(self.account_id, [])]
 
 @dataclass
 class RedisFeastAdapter:
@@ -1421,111 +1455,171 @@ class RedisFeastAdapter:
         default=UniverseRepository, repr=False
     )
     repository: UniverseRepository | None = field(default=None, repr=False)
+    feast_client_factory: Callable[[str], "FeastClient"] = field(
+        default=get_feast_client, repr=False
+    )
+    redis_client_factory: Callable[[str], "RedisClient"] = field(
+        default=get_redis_client, repr=False
+    )
+    feature_store_factory: Callable[["FeastClient", "RedisClient"], Any] | None = field(
+        default=None, repr=False
+    )
+    cache_ttl: int = 60
 
-
-    _FEATURE_TEMPLATES: ClassVar[Dict[str, Dict[str, Any]]] = {
-        "company": {
-            "approved": ["BTC-USD", "ETH-USD"],
-            "fees": {
-                "BTC-USD": {"currency": "USD", "maker": 0.1, "taker": 0.2},
-                "ETH-USD": {"currency": "USD", "maker": 0.13, "taker": 0.26},
-            },
-        },
-        "director-1": {
-            "approved": ["SOL-USD"],
-            "fees": {
-                "SOL-USD": {"currency": "USD", "maker": 0.12, "taker": 0.24}
-            },
-        },
-        "director-2": {
-            "approved": ["BTC-USD", "ETH-USD"],
-            "fees": {
-                "BTC-USD": {"currency": "USD", "maker": 0.09, "taker": 0.18},
-                "ETH-USD": {"currency": "USD", "maker": 0.11, "taker": 0.22},
-            },
-        },
-        "default": {"approved": [], "fees": {}},
-    }
-    _FEE_TIER_TEMPLATES: ClassVar[
-        Dict[str, Dict[str, List[Dict[str, Any]]]]
-    ] = {
-        "company": {"default": []},
-        "director-1": {"default": []},
-        "director-2": {"default": []},
-        "default": {"default": []},
-    }
-    _ONLINE_FEATURE_TEMPLATES: ClassVar[
-        Dict[str, Dict[str, Dict[str, Any]]]
-    ] = {
-        "company": {
-            "BTC-USD": {
-                "features": [18.0, 4.0, -2.0],
-                "book_snapshot": {
-                    "mid_price": 30_000.0,
-                    "spread_bps": 3.0,
-                    "imbalance": 0.15,
-                },
-                "state": {
-                    "regime": "neutral",
-                    "volatility": 0.35,
-                    "liquidity_score": 0.75,
-                    "conviction": 0.6,
-                },
-                "expected_edge_bps": 14.0,
-                "take_profit_bps": 25.0,
-                "stop_loss_bps": 10.0,
-                "confidence": {
-                    "model_confidence": 0.62,
-                    "state_confidence": 0.58,
-                    "execution_confidence": 0.64,
-                },
-            }
-        },
-        "director-1": {},
-        "director-2": {},
-        "default": {},
-    }
     _features: ClassVar[Dict[str, Dict[str, Any]]] = {}
     _fee_tiers: ClassVar[Dict[str, Dict[str, List[Dict[str, Any]]]]] = {}
     _online_feature_store: ClassVar[Dict[str, Dict[str, Dict[str, Any]]]] = {}
+    _feature_expirations: ClassVar[Dict[str, datetime]] = {}
+    _fee_tier_expirations: ClassVar[Dict[str, datetime]] = {}
+    _online_feature_expirations: ClassVar[Dict[str, Dict[str, datetime]]] = {}
 
+    _APPROVED_FIELDS: ClassVar[Tuple[str, ...]] = ("instrument", "approved")
+    _FEE_OVERRIDE_FIELDS: ClassVar[Tuple[str, ...]] = (
+        "instrument",
+        "maker_bps",
+        "taker_bps",
+        "currency",
+    )
+    _FEE_TIER_FIELDS: ClassVar[Tuple[str, ...]] = (
+        "pair",
+        "tier",
+        "maker_bps",
+        "taker_bps",
+        "notional_threshold",
+    )
+    _ONLINE_FIELDS: ClassVar[Tuple[str, ...]] = (
+        "features",
+        "book_snapshot",
+        "state",
+        "expected_edge_bps",
+        "take_profit_bps",
+        "stop_loss_bps",
+        "confidence",
+    )
 
     def __post_init__(self) -> None:
-
         repository = self.repository
         if repository is not None:
             self._repository = repository
         else:
             self._repository = self.repository_factory(account_id=self.account_id)
 
-
+        feast_client = self.feast_client_factory(self.account_id)
+        redis_client = self.redis_client_factory(self.account_id)
+        factory = self.feature_store_factory or self._default_feature_store_factory
+        self._feast_client = feast_client
+        self._redis_client = redis_client
+        self._store = factory(feast_client, redis_client)
 
     def approved_instruments(self) -> List[str]:
+        cached = self._features.get(self.account_id)
+        expires = self._feature_expirations.get(self.account_id)
+        if cached and cached.get("approved") and (
+            expires is None or not self._cache_expired(expires)
+        ):
+            return [str(symbol) for symbol in cached["approved"]]
 
-        assert self._repository is not None
+        records = self._load_historical_records(
+            view_suffix="approved_instruments",
+            fields=self._APPROVED_FIELDS,
+            window_minutes=60,
+        )
 
-        instruments = self._repository.approved_universe()
-        if not instruments:
-            fallback = self._account_config().get("approved", [])
-            instruments = list(fallback)
+        approved = {
+            str(record["instrument"]): record
+            for record in records
+            if record.get("approved")
+        }
+        if not approved:
+            raise RuntimeError(
+                "Feast returned no approved instruments for account '%s'" % self.account_id
+            )
 
-        return [symbol for symbol in instruments if symbol.endswith("-USD")]
-
+        instruments = sorted(approved.keys())
+        payload = self._features.setdefault(self.account_id, {})
+        payload["approved"] = instruments
+        self._feature_expirations[self.account_id] = datetime.now(timezone.utc).replace(
+            microsecond=0
+        ) + timedelta(seconds=self.cache_ttl)
+        return instruments
 
     def fee_override(self, instrument: str) -> Dict[str, Any] | None:
-        override = self._repository.fee_override(instrument)
-        if override:
-            return dict(override)
-        account_config = self._account_config()
-        fees = account_config.get("fees", {})
-        if instrument not in fees:
+        cache_key = instrument.upper()
+        cached_account = self._features.setdefault(self.account_id, {})
+        cached_fees = cached_account.setdefault("fees", {})
+        expires = self._feature_expirations.get(self.account_id)
+        if cache_key in cached_fees and (
+            expires is None or not self._cache_expired(expires)
+        ):
+            return dict(cached_fees[cache_key])
+
+        records = self._load_historical_records(
+            view_suffix="fee_overrides",
+            fields=self._FEE_OVERRIDE_FIELDS,
+            window_minutes=240,
+        )
+
+        matched = None
+        for record in sorted(
+            records,
+            key=lambda item: item.get("event_timestamp", datetime.min),
+            reverse=True,
+        ):
+            if str(record.get("instrument", "")).upper() == cache_key:
+                matched = record
+                break
+
+        if matched is None:
             return None
-        return dict(fees[instrument])
+
+        override = {
+            "currency": matched.get("currency", "USD"),
+            "maker": float(matched.get("maker_bps", matched.get("maker", 0.0))),
+            "taker": float(matched.get("taker_bps", matched.get("taker", 0.0))),
+        }
+        cached_fees[cache_key] = dict(override)
+        self._feature_expirations[self.account_id] = datetime.now(timezone.utc).replace(
+            microsecond=0
+        ) + timedelta(seconds=self.cache_ttl)
+        return override
 
     def fee_tiers(self, pair: str) -> List[Dict[str, Any]]:
-        account_tiers = self._account_fee_tiers()
-        tiers = account_tiers.get(pair) or account_tiers.get("default", [])
-        return [dict(tier) for tier in tiers]
+        account_cache = self._fee_tiers.setdefault(self.account_id, {})
+        expires = self._fee_tier_expirations.get(self.account_id)
+        if pair in account_cache and (
+            expires is None or not self._cache_expired(expires)
+        ):
+            return [dict(entry) for entry in account_cache[pair]]
+
+        records = self._load_historical_records(
+            view_suffix="fee_tiers",
+            fields=self._FEE_TIER_FIELDS,
+            window_minutes=240,
+        )
+
+        tiers: List[Dict[str, Any]] = []
+        for record in records:
+            record_pair = str(record.get("pair", "")).upper()
+            if record_pair not in {pair.upper(), "DEFAULT"}:
+                continue
+            tiers.append(
+                {
+                    "tier": record.get("tier"),
+                    "maker": float(record.get("maker_bps", 0.0)),
+                    "taker": float(record.get("taker_bps", 0.0)),
+                    "notional_threshold": float(record.get("notional_threshold", 0.0)),
+                }
+            )
+
+        if not tiers:
+            raise RuntimeError(f"Feast returned no fee tiers for {pair}")
+
+        tiers.sort(key=lambda item: item.get("notional_threshold", 0.0))
+        account_cache[pair] = [dict(entry) for entry in tiers]
+        self._fee_tier_expirations[self.account_id] = datetime.now(timezone.utc).replace(
+            microsecond=0
+        ) + timedelta(seconds=self.cache_ttl)
+        return tiers
 
     @classmethod
     def seed_fee_tiers(
@@ -1538,35 +1632,148 @@ class RedisFeastAdapter:
             }
             for account, account_tiers in tiers.items()
         }
-
+        cls._fee_tier_expirations.clear()
 
     def fetch_online_features(self, instrument: str) -> Dict[str, Any]:
-        account_store = self._account_feature_store()
-        feature_payload = account_store.get(instrument, {})
-        return dict(feature_payload)
+        account_cache = self._online_feature_store.setdefault(self.account_id, {})
+        instrument_key = instrument.upper()
+        expires = self._online_feature_expirations.setdefault(self.account_id, {})
+        cached = account_cache.get(instrument_key)
+        if cached:
+            cached_expiry = expires.get(instrument_key)
+            if cached_expiry is None or not self._cache_expired(cached_expiry):
+                return dict(cached)
 
-    def _account_config(self) -> Dict[str, Any]:
-        normalized = _normalize_account_id(self.account_id)
-        template = self._FEATURE_TEMPLATES.get(
-            normalized, self._FEATURE_TEMPLATES["default"]
-        )
-        return self._features.setdefault(self.account_id, deepcopy(template))
+        features = self._online_feature_refs()
+        entity_rows = [
+            {
+                "account_id": self._feast_client.account_namespace,
+                "instrument": instrument,
+            }
+        ]
+        try:
+            response = self._store.get_online_features(
+                features=features,
+                entity_rows=entity_rows,
+            )
+        except Exception as exc:  # pragma: no cover - safety net
+            raise RuntimeError("Failed to fetch online features from Feast") from exc
 
-    def _account_fee_tiers(self) -> Dict[str, List[Dict[str, Any]]]:
-        normalized = _normalize_account_id(self.account_id)
-        template = self._FEE_TIER_TEMPLATES.get(
-            normalized, self._FEE_TIER_TEMPLATES["default"]
-        )
-        return self._fee_tiers.setdefault(self.account_id, deepcopy(template))
+        payload = self._coerce_online_payload(response)
+        if not payload:
+            raise RuntimeError(
+                f"Feast returned empty online feature payload for {instrument}"
+            )
 
-    def _account_feature_store(self) -> Dict[str, Dict[str, Any]]:
-        normalized = _normalize_account_id(self.account_id)
-        template = self._ONLINE_FEATURE_TEMPLATES.get(
-            normalized, self._ONLINE_FEATURE_TEMPLATES["default"]
+        account_cache[instrument_key] = dict(payload)
+        expires[instrument_key] = datetime.now(timezone.utc).replace(
+            microsecond=0
+        ) + timedelta(seconds=self.cache_ttl)
+        return dict(payload)
+
+    def _default_feature_store_factory(
+        self, feast_client: "FeastClient", redis_client: "RedisClient"
+    ) -> Any:
+        if FeatureStore is None:
+            raise RuntimeError(
+                "feast.FeatureStore is unavailable; install Feast to use RedisFeastAdapter"
+            )
+        repo_path = Path(os.getenv("FEAST_REPO_PATH", "data/feast"))
+        if repo_path.exists():
+            return FeatureStore(repo_path=str(repo_path))
+        try:
+            from feast.infra.online_stores.redis import RedisOnlineStoreConfig
+            from feast.repo_config import RepoConfig
+        except Exception as exc:  # pragma: no cover - depends on Feast install
+            raise RuntimeError("Unable to construct Feast configuration") from exc
+
+        config = RepoConfig(
+            project=feast_client.project,
+            provider="local",
+            registry=str(repo_path / "registry.db"),
+            online_store=RedisOnlineStoreConfig(
+                connection_string=redis_client.dsn,
+            ),
+            entity_key_serialization_version=2,
         )
-        return self._online_feature_store.setdefault(
-            self.account_id, deepcopy(template)
-        )
+        return FeatureStore(config=config)
+
+    def _load_historical_records(
+        self,
+        *,
+        view_suffix: str,
+        fields: Tuple[str, ...],
+        window_minutes: int,
+    ) -> List[Dict[str, Any]]:
+        feature_refs = [f"{self._view_name(view_suffix)}:{field}" for field in fields]
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(minutes=window_minutes)
+        entity_rows = [
+            {
+                "account_id": self._feast_client.account_namespace,
+            }
+        ]
+        try:
+            job = self._store.get_historical_features(
+                entity_rows=entity_rows,
+                feature_refs=feature_refs,
+                start_date=start,
+                end_date=end,
+            )
+        except Exception as exc:
+            raise RuntimeError("Failed to query Feast historical store") from exc
+
+        records = self._coerce_records(job)
+        if not records:
+            raise RuntimeError(
+                f"Feast returned no data for feature view '{self._view_name(view_suffix)}'"
+            )
+        return records
+
+    def _view_name(self, suffix: str) -> str:
+        return f"{self._feast_client.account_namespace}__{suffix}"
+
+    def _coerce_records(self, job: Any) -> List[Dict[str, Any]]:
+        if hasattr(job, "to_dicts"):
+            return [dict(record) for record in job.to_dicts()]
+        if hasattr(job, "to_df"):
+            frame = job.to_df()
+            if hasattr(frame, "to_dict"):
+                records = frame.to_dict(orient="records")  # type: ignore[arg-type]
+                return [dict(record) for record in records]
+        if isinstance(job, Iterable):
+            return [dict(record) for record in job]
+        return []
+
+    def _coerce_online_payload(self, payload: Any) -> Dict[str, Any]:
+        data: Mapping[str, Any]
+        if hasattr(payload, "to_dict"):
+            data = payload.to_dict()
+        elif isinstance(payload, Mapping):
+            data = payload
+        else:
+            try:
+                data = dict(payload)
+            except Exception:  # pragma: no cover - fallback
+                return {}
+
+        normalized: Dict[str, Any] = {}
+        for key, value in data.items():
+            if isinstance(key, str) and ":" in key:
+                normalized_key = key.split(":", 1)[-1]
+            else:
+                normalized_key = str(key)
+            normalized[normalized_key] = value
+        return normalized
+
+    def _online_feature_refs(self) -> List[str]:
+        view = self._view_name("instrument_features")
+        return [f"{view}:{field}" for field in self._ONLINE_FIELDS]
+
+    def _cache_expired(self, expires: Optional[datetime]) -> bool:
+        if expires is None:
+            return True
+        return datetime.now(timezone.utc) >= expires
 
 
 def _extract_secret_rotated_at(metadata: Mapping[str, Any]) -> Optional[str]:
