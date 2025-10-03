@@ -105,13 +105,25 @@ jobs:
       - name: Install Syft
         uses: anchore/syft-action/download-syft@v0
 
+      - name: Authenticate to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
       - name: Scan image for vulnerabilities
         uses: anchore/grype-action@v0
         with:
           image: ${{ needs.build-image.outputs.image_ref }}@${{ needs.build-image.outputs.image_digest }}
           fail-on-severity: critical
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ secrets.GHCR_TOKEN }}
 
       - name: Generate SBOM
+        env:
+          SYFT_REGISTRY_AUTH_USERNAME: ${{ github.actor }}
+          SYFT_REGISTRY_AUTH_PASSWORD: ${{ secrets.GHCR_TOKEN }}
         run: |
           syft "${{ needs.build-image.outputs.image_ref }}@${{ needs.build-image.outputs.image_digest }}" -o json > sbom.json
 
