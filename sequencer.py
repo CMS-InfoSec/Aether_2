@@ -11,7 +11,7 @@ import logging
 import os
 import time
 import uuid
-from typing import Any, Awaitable, Callable, Deque, Dict, List, Mapping, MutableMapping, Optional, Tuple
+from typing import Any, Awaitable, Callable, Deque, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 from fastapi import FastAPI, HTTPException, status
 from fastapi.encoders import jsonable_encoder
@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 
 from common.utils import tracing
 from services.common.adapters import KafkaNATSAdapter
+from exchange_adapter import get_exchange_adapter
 from override_service import OverrideDecision, OverrideRecord, latest_override
 
 from metrics import (
@@ -45,6 +46,10 @@ DEFAULT_PUBLISH_TIMEOUT = float(os.getenv("SEQUENCER_PUBLISH_TIMEOUT", "1.0"))
 
 RECENT_RUN_CAPACITY = int(os.getenv("SEQUENCER_HISTORY_SIZE", "200"))
 TOPIC_PREFIX = os.getenv("SEQUENCER_TOPIC_PREFIX", "sequencer")
+DEFAULT_EXCHANGE = os.getenv("PRIMARY_EXCHANGE", "kraken")
+
+
+EXCHANGE_ADAPTER = get_exchange_adapter(DEFAULT_EXCHANGE)
 
 
 class SequencerIntentRequest(BaseModel):
@@ -494,6 +499,118 @@ def _safe_float(value: Any) -> float:
         return 0.0
 
 
+def _build_order_payload(
+    intent: Mapping[str, Any], account_id: str, client_order_id: str
+) -> Tuple[Dict[str, Any], bool]:
+    instrument = str(intent.get("instrument") or intent.get("symbol") or "").strip()
+    if not instrument:
+        raise StageFailedError("oms", "Intent is missing instrument for order submission")
+
+    side = str(intent.get("side") or "").strip().lower()
+    if side not in {"buy", "sell"}:
+        raise StageFailedError("oms", f"Unsupported side '{side or 'unknown'}' for order submission")
+
+    quantity = _safe_float(intent.get("quantity") or intent.get("qty"))
+    if quantity <= 0.0:
+        raise StageFailedError("oms", "Intent must specify a positive quantity")
+
+    limit_price = _safe_float(intent.get("limit_px") or intent.get("price"))
+    order_type_hint = str(intent.get("order_type") or intent.get("type") or "").strip().lower()
+    if order_type_hint in {"limit", "market"}:
+        order_type = order_type_hint
+    else:
+        order_type = "limit" if limit_price > 0.0 else "market"
+
+    post_only_raw = intent.get("post_only")
+    reduce_only_raw = intent.get("reduce_only")
+    flags_raw = intent.get("flags")
+    flags: List[str] = []
+    if isinstance(flags_raw, Sequence) and not isinstance(flags_raw, (str, bytes, bytearray)):
+        flags = [str(flag) for flag in flags_raw if flag is not None]
+
+    shadow = bool(intent.get("shadow", False))
+
+    order_payload: Dict[str, Any] = {
+        "account_id": account_id,
+        "client_id": client_order_id,
+        "symbol": instrument,
+        "side": side,
+        "order_type": order_type,
+        "qty": quantity,
+        "post_only": bool(post_only_raw) if post_only_raw is not None else False,
+        "reduce_only": bool(reduce_only_raw) if reduce_only_raw is not None else False,
+        "flags": flags,
+        "shadow": shadow,
+    }
+    if order_type == "limit" and limit_price > 0.0:
+        order_payload["limit_px"] = limit_price
+
+    for optional_key in ("time_in_force", "expire_time", "requested_by", "client_tag"):
+        if optional_key in intent and intent[optional_key] is not None:
+            order_payload[optional_key] = intent[optional_key]
+
+    if intent.get("stop_loss") is not None:
+        order_payload["stop_loss"] = _safe_float(intent.get("stop_loss"))
+    if intent.get("take_profit") is not None:
+        order_payload["take_profit"] = _safe_float(intent.get("take_profit"))
+
+    return order_payload, shadow
+
+
+def _normalize_strings(value: Any) -> List[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [str(entry) for entry in value if entry is not None]
+    return [str(value)]
+
+
+def _normalize_fills(value: Any) -> List[Dict[str, Any]]:
+    if not value:
+        return []
+    if isinstance(value, Mapping):
+        return [dict(value)]
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        fills: List[Dict[str, Any]] = []
+        for entry in value:
+            if isinstance(entry, Mapping):
+                fills.append(dict(entry))
+        return fills
+    return []
+
+
+def _extract_quantity(fill: Mapping[str, Any]) -> Any:
+    for key in ("quantity", "qty", "volume", "vol", "filled_qty"):
+        if key in fill:
+            return fill.get(key)
+    return 0.0
+
+
+def _as_dict(value: Any) -> Dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, Mapping):
+        return dict(value)
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):  # type: ignore[call-arg]
+        try:
+            return dict(model_dump())  # type: ignore[arg-type]
+        except Exception:  # pragma: no cover - defensive conversion
+            pass
+    dict_method = getattr(value, "dict", None)
+    if callable(dict_method):  # type: ignore[call-arg]
+        try:
+            return dict(dict_method())  # type: ignore[arg-type]
+        except Exception:  # pragma: no cover - defensive conversion
+            pass
+    try:
+        return dict(value)
+    except Exception:  # pragma: no cover - final fallback
+        return {}
+
+
 async def policy_handler(payload: Dict[str, Any], ctx: PipelineContext) -> StageResult:
     intent = payload.get("intent", {})
     now = datetime.now(timezone.utc).isoformat()
@@ -591,30 +708,125 @@ async def oms_handler(payload: Dict[str, Any], ctx: PipelineContext) -> StageRes
         raise StageFailedError("oms", "Risk validation failed")
 
     intent = payload.get("intent", {})
-    client_order_id = intent.get("order_id") or str(uuid.uuid4())
-    filled_qty = _safe_float(intent.get("quantity") or intent.get("qty") or 0.0)
-    avg_price = _safe_float(intent.get("price") or intent.get("limit_px") or 0.0)
-    oms_result = {
-        "accepted": True,
-        "routed_venue": intent.get("venue") or "default",
+    account_id = str(intent.get("account_id") or ctx.account_id or "").strip()
+    if not account_id:
+        raise StageFailedError("oms", "Intent is missing account_id for order submission")
+
+    client_order_id = (
+        str(intent.get("order_id") or intent.get("client_id") or ctx.intent_id or uuid.uuid4())
+    )
+
+    order_payload, shadow = _build_order_payload(intent, account_id, client_order_id)
+
+    if not EXCHANGE_ADAPTER.supports("place_order"):
+        raise StageFailedError(
+            "oms",
+            f"Exchange adapter '{EXCHANGE_ADAPTER.name}' does not support order placement",
+        )
+
+    try:
+        adapter_response = await EXCHANGE_ADAPTER.place_order(
+            account_id,
+            order_payload,
+            shadow=shadow,
+        )
+    except Exception as exc:  # pragma: no cover - defensive guard
+        LOGGER.exception("OMS submission failed for order %s", client_order_id)
+        raise StageFailedError("oms", f"Failed to submit order: {exc}") from exc
+
+    ack = _as_dict(adapter_response)
+    accepted = bool(ack.get("accepted"))
+    errors = _normalize_strings(ack.get("errors") or ack.get("rejection_reasons"))
+    fills = _normalize_fills(ack.get("fills") or ack.get("executions"))
+    filled_qty = _safe_float(ack.get("filled_qty"))
+    if filled_qty <= 0.0 and fills:
+        filled_qty = sum(_safe_float(_extract_quantity(fill)) for fill in fills)
+    if filled_qty <= 0.0:
+        filled_qty = _safe_float(intent.get("quantity") or intent.get("qty"))
+
+    avg_price = _safe_float(ack.get("avg_price"))
+    if avg_price <= 0.0:
+        notional = sum(
+            _safe_float(fill.get("price")) * _safe_float(_extract_quantity(fill))
+            for fill in fills
+        )
+        if filled_qty > 0.0 and notional > 0.0:
+            avg_price = notional / filled_qty
+        else:
+            avg_price = _safe_float(intent.get("price") or intent.get("limit_px"))
+
+    oms_result: Dict[str, Any] = {
+        "accepted": accepted,
+        "account_id": account_id,
+        "routed_venue": ack.get("routed_venue") or intent.get("venue"),
         "client_order_id": client_order_id,
+        "exchange_order_id": ack.get("exchange_order_id") or ack.get("txid"),
         "filled_qty": filled_qty,
         "avg_price": avg_price,
+        "fills": fills,
+        "rejection_reasons": errors,
+        "transport": ack.get("transport") or "exchange_adapter",
         "completed_at": datetime.now(timezone.utc).isoformat(),
     }
+    if "fee" in ack and ack["fee"] is not None:
+        oms_result["fee"] = ack["fee"]
+    if ack.get("kraken_status"):
+        oms_result["kraken_status"] = ack.get("kraken_status")
+
     new_payload = dict(payload)
     new_payload["oms_result"] = oms_result
+
+    if not accepted:
+        detail = ", ".join(errors)
+        if not detail:
+            status_text = ack.get("kraken_status") or ack.get("status")
+            if status_text:
+                detail = str(status_text)
+        if not detail:
+            detail = "Order rejected by OMS"
+        raise StageFailedError("oms", detail)
+
     return StageResult(payload=new_payload, artifact=oms_result)
 
 
 async def oms_rollback(result: StageResult, ctx: PipelineContext) -> None:
+    artifact = result.artifact if isinstance(result.artifact, dict) else {}
+    event_payload = dict(artifact)
+    cancel_result: Optional[Mapping[str, Any]] = None
+    cancel_error: Optional[str] = None
+
+    accepted = bool(artifact.get("accepted"))
+    client_order_id = str(
+        artifact.get("client_order_id") or artifact.get("order_id") or ctx.intent_id
+    )
+    exchange_order_id = artifact.get("exchange_order_id")
+    rollback_account = str(artifact.get("account_id") or ctx.account_id)
+
+    if accepted and EXCHANGE_ADAPTER.supports("cancel_order"):
+        try:
+            cancel_result = await EXCHANGE_ADAPTER.cancel_order(
+                rollback_account,
+                client_order_id,
+                exchange_order_id=str(exchange_order_id) if exchange_order_id else None,
+            )
+        except Exception as exc:  # pragma: no cover - best-effort cancellation
+            LOGGER.warning(
+                "OMS rollback cancellation failed for order %s: %s", client_order_id, exc
+            )
+            cancel_error = str(exc)
+
+    if cancel_result is not None:
+        event_payload["cancel_result"] = _as_dict(cancel_result)
+    if cancel_error is not None:
+        event_payload["cancel_error"] = cancel_error
+
     await ctx.publisher.publish_event(
         "oms",
         "rollback",
         run_id=ctx.run_id,
         intent_id=ctx.intent_id,
         account_id=ctx.account_id,
-        data=result.artifact,
+        data=event_payload,
     )
 
 
