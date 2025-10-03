@@ -4,12 +4,10 @@ import asyncio
 import contextlib
 import logging
 import os
-import sqlite3
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
-from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import httpx
@@ -27,63 +25,114 @@ ZERO = Decimal("0")
 router = APIRouter()
 
 
+try:  # pragma: no cover - psycopg may be unavailable in lightweight tests
+    import psycopg
+except Exception:  # pragma: no cover - allow graceful degradation when psycopg missing
+    psycopg = None  # type: ignore[assignment]
+
+
 class ReconcileLogStore:
     """Minimal persistence layer for reconciliation outcomes."""
 
-    def __init__(self, db_path: str = "data/oms_reconcile.db") -> None:
-        path = Path(db_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(path, check_same_thread=False, detect_types=sqlite3.PARSE_DECLTYPES)
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS reconcile_log (
-                ts TIMESTAMP NOT NULL,
-                account_id TEXT NOT NULL,
-                mismatches INTEGER NOT NULL DEFAULT 0,
-                mismatches_json TEXT NOT NULL
-            )
-            """
+    _DEFAULT_TABLE_SQL = """
+        CREATE TABLE IF NOT EXISTS reconcile_log (
+            ts TIMESTAMPTZ NOT NULL,
+            account_id TEXT NOT NULL,
+            mismatches INTEGER NOT NULL DEFAULT 0,
+            mismatches_json JSONB NOT NULL DEFAULT '{}'::jsonb
         )
-        columns = {
-            row[1]
-            for row in self._conn.execute("PRAGMA table_info(reconcile_log)")
-        }
-        if "mismatches" not in columns:
-            self._conn.execute(
-                "ALTER TABLE reconcile_log ADD COLUMN mismatches INTEGER NOT NULL DEFAULT 0"
-            )
-            columns.add("mismatches")
-        if "mismatches_json" not in columns:
-            self._conn.execute("ALTER TABLE reconcile_log ADD COLUMN mismatches_json TEXT")
-            self._conn.execute(
-                "UPDATE reconcile_log SET mismatches_json = ? WHERE mismatches_json IS NULL",
-                (json.dumps({}, sort_keys=True),),
-            )
-        self._has_mismatches_column = "mismatches" in columns
-        self._conn.commit()
+    """
+
+    def __init__(self, dsn: Optional[str] = None) -> None:
+        self._dsn = dsn or os.getenv("OMS_RECONCILE_DSN") or os.getenv("TIMESCALE_DSN")
         self._lock = asyncio.Lock()
+        self._memory_fallback: List[Tuple[datetime, str, int, str]] = []
+
+        if psycopg is None or not self._dsn:
+            if not self._dsn:
+                logger.debug(
+                    "ReconcileLogStore initialised without Timescale DSN; falling back to in-memory log"
+                )
+            else:
+                logger.warning(
+                    "psycopg is unavailable; OMS reconciliation log will operate in-memory only"
+                )
+            return
+
+        self._ensure_schema()
+
+    def _ensure_schema(self) -> None:
+        assert self._dsn is not None
+        assert psycopg is not None  # nosec - guarded by __init__
+
+        with psycopg.connect(self._dsn, autocommit=True) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(self._DEFAULT_TABLE_SQL)
+                cursor.execute(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = 'reconcile_log'
+                    """
+                )
+                columns = {row[0] for row in cursor.fetchall()}
+                if "mismatches" not in columns:
+                    cursor.execute(
+                        "ALTER TABLE reconcile_log ADD COLUMN mismatches INTEGER NOT NULL DEFAULT 0"
+                    )
+                if "mismatches_json" not in columns:
+                    cursor.execute(
+                        "ALTER TABLE reconcile_log ADD COLUMN mismatches_json JSONB NOT NULL DEFAULT '{}'::jsonb"
+                    )
 
     async def record(
         self, account_id: str, mismatches: Dict[str, Sequence[str]]
     ) -> None:
         timestamp = datetime.now(timezone.utc)
-        payload = json.dumps(mismatches, sort_keys=True)
-        mismatch_count = sum(len(entries) for entries in mismatches.values())
+        normalized = {
+            key: [str(entry) for entry in sequence]
+            for key, sequence in mismatches.items()
+        }
+        payload = json.dumps(normalized, sort_keys=True)
+        mismatch_count = sum(len(entries) for entries in normalized.values())
+
+        use_fallback = False
         async with self._lock:
-            if self._has_mismatches_column:
-                self._conn.execute(
+            use_fallback = psycopg is None or not self._dsn
+            if use_fallback:
+                self._memory_fallback.append((timestamp, account_id, mismatch_count, payload))
+
+        if use_fallback:
+            return
+
+        await asyncio.to_thread(
+            self._record_sync,
+            timestamp,
+            account_id,
+            mismatch_count,
+            payload,
+        )
+
+    def _record_sync(
+        self,
+        timestamp: datetime,
+        account_id: str,
+        mismatch_count: int,
+        payload: str,
+    ) -> None:
+        assert psycopg is not None and self._dsn is not None  # nosec - validated by caller
+
+        with psycopg.connect(self._dsn) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
                     """
-                    INSERT INTO reconcile_log(ts, account_id, mismatches, mismatches_json)
-                    VALUES(?, ?, ?, ?)
+                    INSERT INTO reconcile_log (ts, account_id, mismatches, mismatches_json)
+                    VALUES (%s, %s, %s, %s::jsonb)
                     """,
                     (timestamp, account_id, mismatch_count, payload),
                 )
-            else:
-                self._conn.execute(
-                    "INSERT INTO reconcile_log(ts, account_id, mismatches_json) VALUES(?, ?, ?)",
-                    (timestamp, account_id, payload),
-                )
-            self._conn.commit()
+            conn.commit()
 
 
 @dataclass
