@@ -24,6 +24,9 @@ class _EmptyRepository(auth_service.AdminRepositoryProtocol):  # type: ignore[mi
     def add(self, admin: auth_service.AdminAccount) -> None:  # pragma: no cover
         raise NotImplementedError
 
+    def delete(self, email: str) -> None:  # pragma: no cover
+        raise NotImplementedError
+
     def get_by_email(self, email: str):  # type: ignore[override]
         return None
 
