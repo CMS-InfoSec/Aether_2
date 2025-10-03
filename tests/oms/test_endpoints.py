@@ -42,6 +42,7 @@ if "aiohttp" not in sys.modules:
     sys.modules["aiohttp"] = aiohttp_stub
 
 from services.common import security
+from services.common.schemas import GTD_EXPIRE_TIME_REQUIRED
 
 from services.oms import main
 
@@ -511,6 +512,76 @@ def test_place_order_snaps_to_exchange_metadata(
     assert submitted["volume"] == pytest.approx(5.43210987, rel=0, abs=1e-9)
 
     assert call_state == {"get": 2, "refresh": 1}
+
+
+def test_place_order_includes_expire_time_for_gtd(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    submissions: list[Dict[str, Any]] = []
+
+    async def _capture_submit(
+        ws_client: Any, rest_client: Any, payload: Dict[str, Any]
+    ) -> Tuple[OrderAck, str]:
+        submissions.append(payload)
+        return (
+            OrderAck(
+                exchange_order_id="SIM-GTD-123",
+                status="ok",
+                filled_qty=None,
+                avg_price=None,
+                errors=None,
+            ),
+            "websocket",
+        )
+
+    monkeypatch.setattr(main, "_submit_order", _capture_submit)
+
+    expire_at = datetime(2025, 5, 20, 15, 30, 0, tzinfo=timezone.utc)
+
+    payload = {
+        "account_id": "admin-alpha",
+        "order_id": "ord-gtd",
+        "instrument": "BTC-USD",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 101.5,
+        "fee": {"currency": "USD", "maker": 0.1, "taker": 0.2},
+        "time_in_force": "GTD",
+        "expire_time": expire_at.isoformat(),
+    }
+
+    response = client.post("/oms/place", json=payload, headers={"X-Account-ID": "admin-alpha"})
+
+    assert response.status_code == 200
+    assert submissions, "Expected Kraken submission to be captured"
+
+    submitted = submissions[0]
+    assert submitted["timeInForce"] == "GTD"
+    expected_ts = int(expire_at.timestamp())
+    assert submitted["expireTime"] == expected_ts
+    assert submitted["expiretm"] == expected_ts
+
+
+def test_place_order_requires_expire_time_for_gtd(client: TestClient) -> None:
+    payload = {
+        "account_id": "admin-alpha",
+        "order_id": "ord-gtd-missing",
+        "instrument": "BTC-USD",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 101.5,
+        "fee": {"currency": "USD", "maker": 0.1, "taker": 0.2},
+        "time_in_force": "GTD",
+    }
+
+    response = client.post(
+        "/oms/place",
+        json=payload,
+        headers={"X-Account-ID": "admin-alpha"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": GTD_EXPIRE_TIME_REQUIRED}
 
 
 def test_place_order_returns_424_when_metadata_missing(

@@ -13,11 +13,18 @@ from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, InvalidOperation
 import time
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
-from services.common.schemas import OrderPlacementRequest, OrderPlacementResponse
+from services.common.schemas import (
+    GTD_EXPIRE_TIME_REQUIRED,
+    OrderPlacementRequest,
+    OrderPlacementResponse,
+)
 from services.common.security import require_admin_account
 from services.oms.kraken_client import (
     KrakenCredentialExpired,
@@ -60,6 +67,19 @@ setup_metrics(app)
 
 
 logger = logging.getLogger(__name__)
+
+
+@app.exception_handler(RequestValidationError)
+async def _handle_validation_error(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    errors = exc.errors()
+    if any(error.get("msg") == GTD_EXPIRE_TIME_REQUIRED for error in errors):
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"detail": GTD_EXPIRE_TIME_REQUIRED},
+        )
+    return await request_validation_exception_handler(request, exc)
 
 
 async def _production_transport_factory(
@@ -1070,6 +1090,15 @@ async def place_order(
     }
     if request.time_in_force:
         order_payload["timeInForce"] = request.time_in_force
+        if request.time_in_force == "GTD":
+            if request.expire_time is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=GTD_EXPIRE_TIME_REQUIRED,
+                )
+            expire_ts = int(request.expire_time.timestamp())
+            order_payload["expireTime"] = expire_ts
+            order_payload["expiretm"] = expire_ts
     if request.take_profit:
         order_payload["takeProfit"] = _snap(
             request.take_profit,
