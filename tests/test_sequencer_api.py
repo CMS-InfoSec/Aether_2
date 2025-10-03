@@ -26,6 +26,7 @@ if "metrics" not in sys.modules:
     metrics_stub.observe_risk_validation_latency = _noop
     metrics_stub.set_pipeline_latency = _noop
     metrics_stub.setup_metrics = _noop
+    metrics_stub.get_request_id = lambda: "test-request"
 
     class _Span(types.SimpleNamespace):
         async def __aenter__(self) -> "_Span":
@@ -126,6 +127,10 @@ def stubbed_pipeline(
 
     monkeypatch.setattr(sequencer_module.pipeline, "submit", _submit)
     return calls
+
+
+def test_module_initializes_exchange_adapter(sequencer_module: ModuleType) -> None:
+    assert getattr(sequencer_module, "EXCHANGE_ADAPTER") is not None
 
 
 def test_submit_intent_requires_authentication(
