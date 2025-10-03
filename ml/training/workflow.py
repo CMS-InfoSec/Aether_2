@@ -131,6 +131,18 @@ class MLflowConfig:
     experiment_name: str
     run_name: Optional[str] = None
     registry_model_name: Optional[str] = None
+    target_stage: str = "Staging"
+
+
+@dataclass
+class TrainingResult:
+    """Outcome metadata produced by :func:`run_training_job`."""
+
+    metrics: Dict[str, float]
+    mlflow_run_id: Optional[str] = None
+    model_version: Optional[str] = None
+    model_stage: Optional[str] = None
+    canary_ready: bool = False
 
 
 @dataclass
@@ -725,6 +737,10 @@ def run_training_job(
 
     predictions = _predict(model, test_loader, device)
     metrics = _evaluate_strategy(predictions, test_targets[: len(predictions)])
+    canary_ready = config.thresholds.satisfied_by(metrics)
+    mlflow_run_id: Optional[str] = None
+    registered_version: Optional[str] = None
+    model_stage: Optional[str] = None
 
     run_prefix = datetime.now(timezone.utc).strftime("run_%Y%m%dT%H%M%SZ")
     artifacts: Dict[str, bytes] = {
@@ -765,6 +781,13 @@ def run_training_job(
             mlflow.set_tag("feature_set_hash", feature_hash)
             if registration_tags:
                 mlflow.set_tags(registration_tags)
+            if config.metadata.feature_version:
+                mlflow.set_tag("feature_version", config.metadata.feature_version)
+            if config.metadata.label_horizon:
+                mlflow.set_tag("label_horizon", str(config.metadata.label_horizon))
+            if config.metadata.granularity:
+                mlflow.set_tag("granularity", config.metadata.granularity)
+            mlflow.set_tag("canary_ready", str(canary_ready).lower())
 
             artifact_dir = Path(config.artifacts.base_path) / run_prefix
             if not config.artifacts.is_s3() and artifact_dir.exists():
@@ -773,10 +796,17 @@ def run_training_job(
             if mlflow_pytorch is not None:
                 mlflow_pytorch.log_model(model, artifact_path="model")
 
-            if config.mlflow.registry_model_name and config.thresholds.satisfied_by(metrics):
-                LOGGER.info("Metric thresholds satisfied; registering model as canary")
-                model_uri = f"runs:/{run.info.run_id}/model"
+            mlflow_run_id = run.info.run_id
+            if config.mlflow.registry_model_name:
+                LOGGER.info(
+                    "Registering model version from run %s to stage %s",
+                    mlflow_run_id,
+                    config.mlflow.target_stage,
+                )
+                model_uri = f"runs:/{mlflow_run_id}/model"
                 result = mlflow.register_model(model_uri, config.mlflow.registry_model_name)
+                registered_version = str(result.version)
+                model_stage = config.mlflow.target_stage
                 client = mlflow.tracking.MlflowClient()
                 for key, value in registration_tags.items():
                     client.set_model_version_tag(
@@ -785,16 +815,28 @@ def run_training_job(
                         key=key,
                         value=value,
                     )
+                client.set_model_version_tag(
+                    name=config.mlflow.registry_model_name,
+                    version=result.version,
+                    key="canary_ready",
+                    value=str(canary_ready).lower(),
+                )
                 client.transition_model_version_stage(
                     name=config.mlflow.registry_model_name,
                     version=result.version,
-                    stage="canary",
+                    stage=model_stage,
                     archive_existing_versions=False,
                 )
     elif config.mlflow and mlflow is None:
         LOGGER.warning("MLflow configuration supplied but mlflow is not installed.")
 
-    return metrics
+    return TrainingResult(
+        metrics=metrics,
+        mlflow_run_id=mlflow_run_id,
+        model_version=registered_version,
+        model_stage=model_stage,
+        canary_ready=canary_ready,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -928,8 +970,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:  # pragma: no cover - CL
     logging.basicConfig(level=logging.INFO)
     args = _parse_args(argv)
     config = _build_config(args)
-    metrics = run_training_job(config)
-    print(json.dumps(metrics, indent=2))
+    result = run_training_job(config)
+    print(json.dumps(result.metrics, indent=2))
 
 
 if __name__ == "__main__":  # pragma: no cover - module execution
