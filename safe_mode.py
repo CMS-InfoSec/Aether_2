@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from threading import Lock
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Request, status
 
@@ -228,33 +229,257 @@ def clear_safe_mode_log() -> None:
 # ---------------------------------------------------------------------------
 
 
-class OrderControls:
-    """Minimal representation of trading order controls."""
+@dataclass(frozen=True)
+class _OpenOrder:
+    client_id: str
+    exchange_order_id: str
 
-    def __init__(self) -> None:
+
+class OrderControls:
+    """Production order controls backed by OMS/Timescale adapters."""
+
+    _DEFAULT_ACCOUNTS: Sequence[str] = ("company",)
+
+    def __init__(
+        self,
+        *,
+        account_ids: Optional[Sequence[str]] = None,
+        exchange_factory: Optional[Callable[[str], "ExchangeAdapter"]] = None,
+        timescale_factory: Optional[Callable[[str], "TimescaleAdapter"]] = None,
+        order_snapshot_loader: Optional[
+            Callable[[str, "TimescaleAdapter"], Iterable[Mapping[str, Any]] | Mapping[str, Any] | None]
+        ] = None,
+    ) -> None:
+        from exchange_adapter import KrakenAdapter, ExchangeAdapter
+        from services.common.adapters import TimescaleAdapter
+
+        self._logger = LOGGER.getChild("OrderControls")
         self.open_orders: List[str] = []
         self.cancelled_orders: List[str] = []
         self.hedging_only: bool = False
         # ``only_hedging`` is kept for backwards compatibility with legacy callers.
         self.only_hedging: bool = False
+        self._last_reason: Optional[str] = None
 
+        accounts = self._resolve_accounts(account_ids)
+        self._accounts: Sequence[str] = accounts
+
+        exchange_factory = exchange_factory or (lambda _: KrakenAdapter())
+        timescale_factory = timescale_factory or (
+            lambda account: TimescaleAdapter(account_id=account)
+        )
+
+        self._exchange_adapters: Dict[str, ExchangeAdapter] = {}
+        for account in accounts:
+            try:
+                self._exchange_adapters[account] = exchange_factory(account)
+            except Exception:
+                self._logger.exception(
+                    "Failed to initialise exchange adapter for safe mode",
+                    extra={"account_id": account},
+                )
+        self._timescale_adapters: Dict[str, Optional[TimescaleAdapter]] = {}
+        for account in accounts:
+            try:
+                self._timescale_adapters[account] = timescale_factory(account)
+            except Exception:
+                self._logger.exception(
+                    "Failed to initialise Timescale adapter for safe mode",
+                    extra={"account_id": account},
+                )
+                self._timescale_adapters[account] = None
+
+        if order_snapshot_loader is None:
+            self._order_snapshot_loader = self._default_snapshot_loader
+        else:
+            self._order_snapshot_loader = order_snapshot_loader
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
     def cancel_open_orders(self) -> None:
-        self.cancelled_orders.extend(self.open_orders)
+        cancelled: List[str] = []
+        for account in self._accounts:
+            orders = self._load_open_orders(account)
+            if not orders:
+                continue
+            captured = [order.client_id for order in orders]
+            self.open_orders.extend(captured)
+            for order in orders:
+                try:
+                    self._execute_cancel(account, order)
+                    cancelled.append(order.client_id)
+                except Exception:
+                    self._logger.exception(
+                        "Failed to cancel order during safe mode entry",
+                        extra={
+                            "account_id": account,
+                            "client_id": order.client_id,
+                            "exchange_order_id": order.exchange_order_id,
+                        },
+                    )
+        if cancelled:
+            self.cancelled_orders.extend(cancelled)
         self.open_orders.clear()
 
-    def restrict_to_hedging(self) -> None:
+    def restrict_to_hedging(self, *, reason: Optional[str] = None, actor: Optional[str] = None) -> None:
         self.hedging_only = True
         self.only_hedging = True
+        self._last_reason = reason or self._last_reason
+        self._set_safe_mode_state(True, reason=reason, actor=actor)
 
-    def lift_restrictions(self) -> None:
+    def lift_restrictions(self, *, reason: Optional[str] = None, actor: Optional[str] = None) -> None:
         self.hedging_only = False
         self.only_hedging = False
+        release_reason = reason or self._last_reason
+        self._set_safe_mode_state(False, reason=release_reason, actor=actor)
 
     def reset(self) -> None:
         self.open_orders.clear()
         self.cancelled_orders.clear()
         self.hedging_only = False
         self.only_hedging = False
+        self._last_reason = None
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _resolve_accounts(self, provided: Optional[Sequence[str]]) -> Sequence[str]:
+        if provided:
+            return tuple(dict.fromkeys(account.strip() for account in provided if account.strip()))
+        env_accounts = os.getenv("SAFE_MODE_ACCOUNTS")
+        if env_accounts:
+            parsed = [account.strip() for account in env_accounts.split(",") if account.strip()]
+            if parsed:
+                return tuple(dict.fromkeys(parsed))
+        env_single = os.getenv("SAFE_MODE_ACCOUNT_ID")
+        if env_single:
+            normalized = env_single.strip()
+            if normalized:
+                return (normalized,)
+        return tuple(self._DEFAULT_ACCOUNTS)
+
+    def _default_snapshot_loader(
+        self, account_id: str, timescale: "TimescaleAdapter"
+    ) -> Iterable[Mapping[str, Any]] | Mapping[str, Any] | None:
+        try:
+            events = timescale.events()
+        except Exception:
+            self._logger.exception(
+                "Failed to fetch Timescale events for safe mode order snapshot",
+                extra={"account_id": account_id},
+            )
+            return None
+        acks = events.get("acks") if isinstance(events, dict) else None
+        if not isinstance(acks, list):
+            return None
+        for entry in reversed(acks):
+            if isinstance(entry, Mapping):
+                open_orders = entry.get("open_orders")
+                if open_orders:
+                    return open_orders
+        return None
+
+    def _load_open_orders(self, account_id: str) -> List[_OpenOrder]:
+        timescale = self._timescale_adapters.get(account_id)
+        if not timescale:
+            return []
+        snapshot = self._order_snapshot_loader(account_id, timescale)
+        return self._normalize_orders(snapshot)
+
+    def _normalize_orders(
+        self, snapshot: Iterable[Mapping[str, Any]] | Mapping[str, Any] | None
+    ) -> List[_OpenOrder]:
+        if snapshot is None:
+            return []
+        if isinstance(snapshot, Mapping):
+            candidates: Iterable[Any] = snapshot.values()
+        elif isinstance(snapshot, Iterable) and not isinstance(snapshot, (str, bytes)):
+            candidates = snapshot
+        else:
+            return []
+
+        orders: List[_OpenOrder] = []
+        for candidate in candidates:
+            if not isinstance(candidate, Mapping):
+                continue
+            client_id = self._extract_client_id(candidate)
+            exchange_id = self._extract_exchange_id(candidate)
+            if not client_id or not exchange_id:
+                continue
+            orders.append(_OpenOrder(client_id=client_id, exchange_order_id=exchange_id))
+        return orders
+
+    def _extract_client_id(self, payload: Mapping[str, Any]) -> Optional[str]:
+        keys = ("clientOrderId", "client_order_id", "client_id", "userref", "order_id", "id")
+        for key in keys:
+            value = payload.get(key)
+            if value is not None:
+                return str(value)
+        nested = payload.get("order")
+        if isinstance(nested, Mapping):
+            for key in keys:
+                value = nested.get(key)
+                if value is not None:
+                    return str(value)
+        return None
+
+    def _extract_exchange_id(self, payload: Mapping[str, Any]) -> Optional[str]:
+        keys = ("ordertxid", "txid", "order_id", "orderid", "id")
+        for key in keys:
+            value = payload.get(key)
+            if value is not None:
+                return str(value)
+        nested = payload.get("order")
+        if isinstance(nested, Mapping):
+            for key in keys:
+                value = nested.get(key)
+                if value is not None:
+                    return str(value)
+        return None
+
+    def _execute_cancel(self, account_id: str, order: _OpenOrder) -> None:
+        adapter = self._exchange_adapters.get(account_id)
+        if adapter is None:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(
+                adapter.cancel_order(
+                    account_id,
+                    order.client_id,
+                    exchange_order_id=order.exchange_order_id,
+                )
+            )
+        else:
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(
+                    adapter.cancel_order(
+                        account_id,
+                        order.client_id,
+                        exchange_order_id=order.exchange_order_id,
+                    )
+                )
+            finally:
+                asyncio.set_event_loop(None)
+                loop.close()
+
+    def _set_safe_mode_state(
+        self, engaged: bool, *, reason: Optional[str], actor: Optional[str]
+    ) -> None:
+        for account, adapter in self._timescale_adapters.items():
+            if adapter is None:
+                continue
+            try:
+                adapter.set_safe_mode(engaged=engaged, reason=reason, actor=actor)
+            except Exception:
+                self._logger.exception(
+                    "Failed to update safe mode flag in Timescale",
+                    extra={"account_id": account, "engaged": engaged, "reason": reason},
+                )
 
 
 class IntentGuard:
@@ -352,7 +577,10 @@ class SafeModeController:
         )
         if persisted.active:
             self.intent_guard.disable()
-            self.order_controls.restrict_to_hedging()
+            self.order_controls.restrict_to_hedging(
+                reason=persisted.reason,
+                actor=self._state.actor,
+            )
         self._lock = Lock()
 
     # Public API ---------------------------------------------------------
@@ -367,7 +595,10 @@ class SafeModeController:
         with self._lock:
             if self._state.active:
                 self.intent_guard.disable()
-                self.order_controls.restrict_to_hedging()
+                self.order_controls.restrict_to_hedging(
+                    reason=self._state.reason or normalized_reason,
+                    actor=self._state.actor,
+                )
                 self._state_store.save(
                     SafeModePersistedState(
                         active=True,
@@ -383,7 +614,10 @@ class SafeModeController:
                 )
 
             self.order_controls.cancel_open_orders()
-            self.order_controls.restrict_to_hedging()
+            self.order_controls.restrict_to_hedging(
+                reason=normalized_reason,
+                actor=actor,
+            )
             self.intent_guard.disable()
             self._state = _SafeModeInternalState(
                 active=True,
@@ -416,7 +650,10 @@ class SafeModeController:
 
             reason = self._state.reason or "manual_exit"
             self.intent_guard.enable()
-            self.order_controls.lift_restrictions()
+            self.order_controls.lift_restrictions(
+                reason=reason,
+                actor=actor,
+            )
             self._state = _SafeModeInternalState(active=False, actor=actor)
             self._state_store.save(
                 SafeModePersistedState(active=False, reason=None, timestamp=None)
