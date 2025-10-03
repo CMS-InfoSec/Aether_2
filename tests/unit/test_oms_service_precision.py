@@ -92,6 +92,7 @@ if "metrics" not in sys.modules:
     metrics_stub.record_oms_latency = _noop
     metrics_stub.setup_metrics = _noop
     metrics_stub.traced_span = traced_span
+    metrics_stub.get_request_id = lambda: None
     metrics_stub._REGISTRY = object()
     sys.modules["metrics"] = metrics_stub
 

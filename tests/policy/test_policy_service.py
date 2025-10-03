@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 if "metrics" not in sys.modules:
     metrics_stub = types.ModuleType("metrics")
-    def _setup_metrics(app):
+    def _setup_metrics(app, *args, **kwargs):
         if not any(route.path == "/metrics" for route in app.routes):
             @app.get("/metrics")  # pragma: no cover - simple stub endpoint
             def _metrics_endpoint():
@@ -22,6 +22,7 @@ if "metrics" not in sys.modules:
     metrics_stub.record_drift_score = lambda *args, **kwargs: None
     metrics_stub.record_scaling_state = lambda *args, **kwargs: None
     metrics_stub.observe_scaling_evaluation = lambda *args, **kwargs: None
+    metrics_stub.get_request_id = lambda: None
     sys.modules["metrics"] = metrics_stub
 
 from services.common.schemas import ActionTemplate, ConfidenceMetrics, PolicyDecisionResponse

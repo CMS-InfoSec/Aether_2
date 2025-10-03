@@ -19,6 +19,10 @@ import httpx
 from fastapi import Depends, FastAPI, HTTPException, status
 
 
+from services.common.precision import (
+    PrecisionMetadataUnavailable,
+    precision_provider,
+)
 from services.common.schemas import (
     ActionTemplate,
     BookSnapshot,
@@ -68,13 +72,6 @@ EIGHT_DP = Decimal("0.00000001")
 ZERO_DECIMAL = Decimal("0")
 
 _ATR_CACHE: Dict[str, float] = {}
-
-KRAKEN_PRECISION: Dict[str, Dict[str, float]] = {
-    "BTC-USD": {"tick": 0.1, "lot": 0.0001},
-    "ETH-USD": {"tick": 0.01, "lot": 0.001},
-    "SOL-USD": {"tick": 0.001, "lot": 0.01},
-}
-
 
 logger = logging.getLogger(__name__)
 
@@ -315,7 +312,14 @@ def _reset_regime_state() -> None:
 
 
 def _resolve_precision(symbol: str) -> Dict[str, float]:
-    return KRAKEN_PRECISION.get(symbol.upper(), {"tick": 0.01, "lot": 0.0001})
+    try:
+        return precision_provider.require(symbol)
+    except PrecisionMetadataUnavailable as exc:
+        logger.error("Precision metadata unavailable for instrument %s", symbol)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Precision metadata unavailable",
+        ) from exc
 
 
 def _snap(value: float, step: float) -> float:
