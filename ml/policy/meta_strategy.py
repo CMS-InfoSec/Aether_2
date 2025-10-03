@@ -15,12 +15,14 @@ from typing import Dict, List, Mapping, Optional
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 from sklearn.base import ClassifierMixin
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+
+from services.common.security import require_admin_account
 
 logger = logging.getLogger(__name__)
 
@@ -264,7 +266,10 @@ _allocator = MetaStrategyAllocator()
 
 
 @app.get("/meta/strategy_weights", response_model=StrategyWeightsResponse)
-def get_strategy_weights(symbol: str = Query(..., min_length=1)) -> StrategyWeightsResponse:
+def get_strategy_weights(
+    symbol: str = Query(..., min_length=1),
+    admin_account: str = Depends(require_admin_account),
+) -> StrategyWeightsResponse:
     """Expose the most recent allocation for ``symbol``.
 
     The endpoint returns the last computed allocation or raises a ``404`` if we
@@ -274,7 +279,24 @@ def get_strategy_weights(symbol: str = Query(..., min_length=1)) -> StrategyWeig
     try:
         allocation = _allocator.get_allocation(symbol)
     except KeyError as exc:  # pragma: no cover - HTTP layer
+        logger.warning(
+            "Meta strategy allocation missing",
+            extra={"symbol": symbol, "account_id": admin_account},
+        )
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    audit_details = {
+        "symbol": allocation.get("symbol", symbol),
+        "regime": allocation.get("regime"),
+        "weights": dict(allocation.get("weights", {})),
+        "account_id": admin_account,
+        "timestamp": allocation.get("timestamp"),
+    }
+    timestamp = audit_details.get("timestamp")
+    if isinstance(timestamp, datetime):
+        audit_details["timestamp"] = timestamp.isoformat()
+
+    logger.info("Meta strategy allocation served", extra=audit_details)
     return StrategyWeightsResponse(**allocation)
 
 
