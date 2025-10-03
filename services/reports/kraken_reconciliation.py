@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import threading
+from decimal import Decimal, ROUND_HALF_EVEN
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -112,18 +113,28 @@ def _parse_datetime(value: Any) -> datetime:
     return dt
 
 
-def _as_float(value: Any, default: float = 0.0) -> float:
-    """Convert numeric and decimal-like values into ``float`` instances."""
+def _as_decimal(value: Any, default: Decimal | None = None) -> Decimal:
+    """Convert numeric and decimal-like values into :class:`Decimal` instances."""
 
+    if default is None:
+        default = Decimal("0")
     if value is None or value == "":
         return default
+    if isinstance(value, Decimal):
+        return value
     if isinstance(value, (int, float)):
-        return float(value)
+        return Decimal(str(value))
     try:
-        return float(str(value))
+        return Decimal(str(value))
     except (TypeError, ValueError):  # pragma: no cover - defensive
-        LOGGER.debug("Failed to parse float from value: %s", value)
+        LOGGER.debug("Failed to parse decimal from value: %s", value)
         return default
+
+
+def _quantize_decimal(value: Decimal, exponent: Decimal = Decimal("0.00000001")) -> Decimal:
+    """Quantize ``value`` to a consistent precision for reporting/serialization."""
+
+    return value.quantize(exponent, rounding=ROUND_HALF_EVEN)
 
 
 @dataclass(slots=True)
@@ -132,17 +143,17 @@ class KrakenFill:
 
     order_id: str
     executed_at: datetime
-    quantity: float
-    price: float
-    fee: float
+    quantity: Decimal
+    price: Decimal
+    fee: Decimal
 
     def as_dict(self) -> Dict[str, Any]:
         return {
             "order_id": self.order_id,
             "executed_at": self.executed_at.isoformat(),
-            "quantity": self.quantity,
-            "price": self.price,
-            "fee": self.fee,
+            "quantity": float(_quantize_decimal(self.quantity)),
+            "price": float(_quantize_decimal(self.price)),
+            "fee": float(_quantize_decimal(self.fee)),
         }
 
 
@@ -150,11 +161,11 @@ class KrakenFill:
 class KrakenFeeAdjustment:
     """Fee adjustment entry supplied by Kraken."""
 
-    amount: float
+    amount: Decimal
     reason: Optional[str] = None
 
     def as_dict(self) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {"amount": self.amount}
+        payload: Dict[str, Any] = {"amount": float(_quantize_decimal(self.amount))}
         if self.reason:
             payload["reason"] = self.reason
         return payload
@@ -165,10 +176,13 @@ class KrakenNavSnapshot:
     """Net asset value snapshot included in the Kraken statement."""
 
     as_of: datetime
-    nav: float
+    nav: Decimal
 
     def as_dict(self) -> Dict[str, Any]:
-        return {"as_of": self.as_of.isoformat(), "nav": self.nav}
+        return {
+            "as_of": self.as_of.isoformat(),
+            "nav": float(_quantize_decimal(self.nav)),
+        }
 
 
 @dataclass(slots=True)
@@ -183,13 +197,13 @@ class KrakenStatement:
     fee_adjustments: Sequence[KrakenFeeAdjustment] = field(default_factory=list)
 
     @property
-    def total_fees(self) -> float:
-        return sum(fill.fee for fill in self.fills) + sum(
-            adjustment.amount for adjustment in self.fee_adjustments
+    def total_fees(self) -> Decimal:
+        return sum((fill.fee for fill in self.fills), Decimal("0")) + sum(
+            (adjustment.amount for adjustment in self.fee_adjustments), Decimal("0")
         )
 
     @property
-    def latest_nav(self) -> Optional[float]:
+    def latest_nav(self) -> Optional[Decimal]:
         if not self.nav_snapshots:
             return None
         latest = max(self.nav_snapshots, key=lambda snapshot: snapshot.as_of)
@@ -205,7 +219,7 @@ class KrakenStatement:
             "fills": [fill.as_dict() for fill in self.fills],
             "nav_snapshots": [snapshot.as_dict() for snapshot in self.nav_snapshots],
             "fee_adjustments": [adj.as_dict() for adj in self.fee_adjustments],
-            "total_fees": self.total_fees,
+            "total_fees": float(_quantize_decimal(self.total_fees)),
         }
 
 
@@ -307,9 +321,9 @@ class KrakenStatementDownloader:
                 or row.get("time")
                 or row.get("timestamp")
             )
-            quantity = _as_float(row.get("quantity") or row.get("vol") or row.get("size"))
-            price = _as_float(row.get("price") or row.get("avg_price") or row.get("avg"))
-            fee = _as_float(row.get("fee") or row.get("fee_paid"))
+            quantity = _as_decimal(row.get("quantity") or row.get("vol") or row.get("size"))
+            price = _as_decimal(row.get("price") or row.get("avg_price") or row.get("avg"))
+            fee = _as_decimal(row.get("fee") or row.get("fee_paid"))
             fills.append(
                 KrakenFill(
                     order_id=order_id,
@@ -345,7 +359,7 @@ class KrakenStatementDownloader:
             if as_of is None or nav_value is None:
                 continue
             snapshots.append(
-                KrakenNavSnapshot(as_of=_parse_datetime(as_of), nav=_as_float(nav_value))
+                KrakenNavSnapshot(as_of=_parse_datetime(as_of), nav=_as_decimal(nav_value))
             )
         return snapshots
 
@@ -354,10 +368,10 @@ class KrakenStatementDownloader:
         adjustments: list[KrakenFeeAdjustment] = []
         for entry in raw_adjustments:
             if isinstance(entry, Mapping):
-                amount = _as_float(entry.get("amount") or entry.get("value"))
+                amount = _as_decimal(entry.get("amount") or entry.get("value"))
                 reason = entry.get("reason") or entry.get("description")
             else:
-                amount = _as_float(entry)
+                amount = _as_decimal(entry)
                 reason = None
             if amount == 0:
                 continue
@@ -371,17 +385,17 @@ class InternalFill:
 
     order_id: str
     executed_at: datetime
-    quantity: float
-    price: float
-    fee: float
+    quantity: Decimal
+    price: Decimal
+    fee: Decimal
 
     def as_dict(self) -> Dict[str, Any]:
         return {
             "order_id": self.order_id,
             "executed_at": self.executed_at.isoformat(),
-            "quantity": self.quantity,
-            "price": self.price,
-            "fee": self.fee,
+            "quantity": float(_quantize_decimal(self.quantity)),
+            "price": float(_quantize_decimal(self.price)),
+            "fee": float(_quantize_decimal(self.fee)),
         }
 
 
@@ -391,7 +405,7 @@ class InternalLedger(Protocol):
     def fetch_fills(self, account_id: str, start: datetime, end: datetime) -> Sequence[InternalFill]:
         ...
 
-    def fetch_nav(self, account_id: str, start: datetime, end: datetime) -> Optional[float]:
+    def fetch_nav(self, account_id: str, start: datetime, end: datetime) -> Optional[Decimal]:
         ...
 
 
@@ -447,21 +461,21 @@ class TimescaleInternalLedger:
                 InternalFill(
                     order_id=str(row.get("order_id")),
                     executed_at=executed_at,
-                    quantity=_as_float(row.get("quantity")),
-                    price=_as_float(row.get("price")),
-                    fee=_as_float(row.get("fee")),
+                    quantity=_as_decimal(row.get("quantity")),
+                    price=_as_decimal(row.get("price")),
+                    fee=_as_decimal(row.get("fee")),
                 )
             )
         return fills
 
-    def fetch_nav(self, account_id: str, start: datetime, end: datetime) -> Optional[float]:
+    def fetch_nav(self, account_id: str, start: datetime, end: datetime) -> Optional[Decimal]:
         params = {"account_id": account_id, "start": start, "end": end}
         with self._cursor(account_id) as cursor:
             cursor.execute(NAV_QUERY, params)
             row = cursor.fetchone()
         if not row:
             return None
-        return _as_float(row.get("nav"))
+        return _as_decimal(row.get("nav"))
 
 
 class KrakenReconciliationMetrics:
@@ -526,12 +540,12 @@ class KrakenReconciliationResult:
     account_id: str
     period_start: datetime
     period_end: datetime
-    fee_difference: float
-    nav_difference: float
-    external_total_fees: float
-    internal_total_fees: float
-    external_nav: Optional[float]
-    internal_nav: Optional[float]
+    fee_difference: Decimal
+    nav_difference: Decimal
+    external_total_fees: Decimal
+    internal_total_fees: Decimal
+    external_nav: Optional[Decimal]
+    internal_nav: Optional[Decimal]
     missing_external_fills: Sequence[KrakenFill]
     unexpected_internal_fills: Sequence[InternalFill]
     fee_adjustments: Sequence[KrakenFeeAdjustment]
@@ -544,14 +558,15 @@ class KrakenReconciliationResult:
     def ok(self) -> bool:
         return (
             self.missing_fill_count == 0
-            and abs(self.fee_difference) <= 1e-9
-            and abs(self.nav_difference) <= 1e-9
+            and abs(self.fee_difference) <= Decimal("1e-9")
+            and abs(self.nav_difference) <= Decimal("1e-9")
         )
 
     def exceeds_tolerance(self, tolerance: float) -> bool:
         if self.missing_fill_count:
             return True
-        return abs(self.fee_difference) > tolerance or abs(self.nav_difference) > tolerance
+        tol = Decimal(str(tolerance))
+        return abs(self.fee_difference) > tol or abs(self.nav_difference) > tol
 
     def as_dict(self) -> Dict[str, Any]:
         status = "matched" if self.ok else "mismatch"
@@ -562,12 +577,12 @@ class KrakenReconciliationResult:
                 "end": self.period_end.isoformat(),
             },
             "status": status,
-            "fee_difference": self.fee_difference,
-            "nav_difference": self.nav_difference,
-            "external_total_fees": self.external_total_fees,
-            "internal_total_fees": self.internal_total_fees,
-            "external_nav": self.external_nav,
-            "internal_nav": self.internal_nav,
+            "fee_difference": float(_quantize_decimal(self.fee_difference)),
+            "nav_difference": float(_quantize_decimal(self.nav_difference)),
+            "external_total_fees": float(_quantize_decimal(self.external_total_fees)),
+            "internal_total_fees": float(_quantize_decimal(self.internal_total_fees)),
+            "external_nav": float(_quantize_decimal(self.external_nav)) if self.external_nav is not None else None,
+            "internal_nav": float(_quantize_decimal(self.internal_nav)) if self.internal_nav is not None else None,
             "missing_external_fills": [fill.as_dict() for fill in self.missing_external_fills],
             "unexpected_internal_fills": [fill.as_dict() for fill in self.unexpected_internal_fills],
             "fee_adjustments": [adj.as_dict() for adj in self.fee_adjustments],
@@ -590,20 +605,20 @@ class KrakenReconciliationService:
         self._ledger = ledger
         self._metrics = metrics or get_reconciliation_metrics()
         self._alert_manager = alert_manager
-        self._tolerance = tolerance
+        self._tolerance = Decimal(str(tolerance))
 
     def reconcile_account(
         self, account_id: str, start: datetime, end: datetime
     ) -> KrakenReconciliationResult:
         statement = self._downloader.fetch(account_id, start, end)
         internal_fills = list(self._ledger.fetch_fills(account_id, start, end))
-        internal_total_fees = sum(fill.fee for fill in internal_fills)
+        internal_total_fees = sum((fill.fee for fill in internal_fills), Decimal("0"))
         external_total_fees = statement.total_fees
         fee_difference = external_total_fees - internal_total_fees
 
         external_nav = statement.latest_nav
         internal_nav = self._ledger.fetch_nav(account_id, start, end)
-        nav_difference = (external_nav or 0.0) - (internal_nav or 0.0)
+        nav_difference = (external_nav or Decimal("0")) - (internal_nav or Decimal("0"))
 
         internal_index = {fill.order_id: fill for fill in internal_fills}
         external_index = {fill.order_id: fill for fill in statement.fills}
@@ -636,20 +651,24 @@ class KrakenReconciliationService:
         return [self.reconcile_account(account_id, start, end) for account_id in accounts]
 
     def _emit_metrics(self, account_id: str, result: KrakenReconciliationResult) -> None:
-        self._metrics.fee_difference.labels(account_id).set(abs(result.fee_difference))
-        self._metrics.nav_difference.labels(account_id).set(abs(result.nav_difference))
+        self._metrics.fee_difference.labels(account_id).set(
+            float(_quantize_decimal(abs(result.fee_difference)))
+        )
+        self._metrics.nav_difference.labels(account_id).set(
+            float(_quantize_decimal(abs(result.nav_difference)))
+        )
         self._metrics.missing_fills.labels(account_id).set(result.missing_fill_count)
         self._metrics.reconciliation_success.labels(account_id).set(1 if result.ok else 0)
 
     def _maybe_alert(self, result: KrakenReconciliationResult) -> None:
         if not self._alert_manager:
             return
-        if not result.exceeds_tolerance(self._tolerance):
+        if not result.exceeds_tolerance(float(self._tolerance)):
             return
 
         description_parts = [
-            f"Fee diff={result.fee_difference:.4f}",
-            f"NAV diff={result.nav_difference:.4f}",
+            f"Fee diff={_quantize_decimal(result.fee_difference)}",
+            f"NAV diff={_quantize_decimal(result.nav_difference)}",
             f"missing_fills={result.missing_fill_count}",
         ]
         description = "Kraken reconciliation mismatch: " + ", ".join(description_parts)
