@@ -3,42 +3,175 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, model_validator
+from sqlalchemy import JSON, Column, DateTime, Integer, String, create_engine, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, declarative_base, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 DATA_PATH = Path("data/capital_opt_runs.json")
+
+
+def _database_url() -> str:
+    return (
+        os.getenv("CAPITAL_OPTIMIZER_DB_URL")
+        or os.getenv("CAPITAL_OPTIMIZER_DATABASE_URL")
+        or os.getenv("TIMESCALE_DSN")
+        or os.getenv("DATABASE_URL")
+        or "sqlite:///./capital_optimizer.db"
+    )
+
+
+def _engine_options(url: str) -> Dict[str, object]:
+    options: Dict[str, object] = {"future": True, "pool_pre_ping": True}
+    if url.startswith("sqlite://"):
+        options.setdefault("connect_args", {"check_same_thread": False})
+        if ":memory:" in url:
+            options["poolclass"] = StaticPool
+    return options
+
+
+_DB_URL = _database_url()
+_ENGINE = create_engine(_DB_URL, **_engine_options(_DB_URL))
+SessionFactory = sessionmaker(
+    bind=_ENGINE,
+    expire_on_commit=False,
+    autoflush=False,
+    future=True,
+)
+
+Base = declarative_base()
+
+
+class CapitalOptimizationRun(Base):
+    __tablename__ = "capital_optimizer_runs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(String, nullable=False, unique=True, index=True)
+    method = Column(String, nullable=False)
+    inputs = Column(JSON, nullable=False)
+    outputs = Column(JSON, nullable=False)
+    ts = Column(DateTime(timezone=True), nullable=False, index=True)
+
+
+if _DB_URL.startswith("sqlite"):
+    Base.metadata.create_all(bind=_ENGINE)
 
 
 app = FastAPI(title="Capital Optimizer", version="1.0.0")
 
 
-def _ensure_store() -> None:
-    DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
-    if not DATA_PATH.exists():
-        DATA_PATH.write_text("[]", encoding="utf-8")
+class RunRepository:
+    """Persistence layer for capital optimizer runs backed by SQLAlchemy."""
 
+    def __init__(self, session: Session) -> None:
+        self._session = session
 
-def _load_runs() -> List[Mapping[str, object]]:
-    _ensure_store()
-    with DATA_PATH.open("r", encoding="utf-8") as file:
+    def latest(self) -> Optional[CapitalOptimizationRun]:
+        stmt = (
+            select(CapitalOptimizationRun)
+            .order_by(CapitalOptimizationRun.ts.desc())
+            .limit(1)
+        )
+        return self._session.execute(stmt).scalar_one_or_none()
+
+    def create(
+        self,
+        *,
+        run_id: str,
+        method: str,
+        inputs: Mapping[str, object],
+        outputs: Mapping[str, object],
+        timestamp: datetime,
+    ) -> CapitalOptimizationRun:
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        else:
+            timestamp = timestamp.astimezone(timezone.utc)
+        record = CapitalOptimizationRun(
+            run_id=str(run_id),
+            method=str(method),
+            inputs=json.loads(json.dumps(inputs)),
+            outputs=json.loads(json.dumps(outputs)),
+            ts=timestamp,
+        )
+        self._session.add(record)
         try:
-            data = json.load(file)
-        except json.JSONDecodeError as exc:  # pragma: no cover - corruption is unexpected
+            self._session.flush()
+        except IntegrityError as exc:
+            raise RuntimeError(f"Run with id '{run_id}' already exists") from exc
+        return record
+
+
+def _to_allocation_result(record: CapitalOptimizationRun) -> "AllocationResult":
+    return AllocationResult(
+        run_id=record.run_id,
+        timestamp=record.ts,
+        method=record.method,
+        inputs=record.inputs,
+        account_allocations=record.outputs.get("accounts", {}),
+        strategy_allocations=record.outputs.get("strategies", {}),
+    )
+
+
+def migrate_runs_from_file(
+    store_path: Path = DATA_PATH,
+    *,
+    session_factory: Optional[Callable[[], Session]] = None,
+) -> int:
+    """Migrate historical runs from the legacy JSON store into the database."""
+
+    if not store_path.exists():
+        return 0
+
+    with store_path.open("r", encoding="utf-8") as handle:
+        try:
+            payload = json.load(handle)
+        except json.JSONDecodeError as exc:
             raise RuntimeError("capital_opt_runs store is corrupted") from exc
-    return list(data)
 
+    if not isinstance(payload, list):
+        raise RuntimeError("capital_opt_runs store must contain a JSON array")
 
-def _append_run(run: Mapping[str, object]) -> None:
-    runs = _load_runs()
-    runs.append(run)
-    with DATA_PATH.open("w", encoding="utf-8") as file:
-        json.dump(runs, file, indent=2, sort_keys=True, default=str)
+    factory = session_factory or SessionFactory
+    imported = 0
+
+    with factory() as session:
+        with session.begin():
+            repo = RunRepository(session)
+            existing_ids = set(
+                session.execute(select(CapitalOptimizationRun.run_id)).scalars()
+            )
+            for raw in sorted(payload, key=lambda item: item.get("ts", "")):
+                run_id = str(raw.get("run_id", "")).strip()
+                if not run_id or run_id in existing_ids:
+                    continue
+                ts_raw = raw.get("ts")
+                if isinstance(ts_raw, str):
+                    timestamp = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                elif isinstance(ts_raw, datetime):
+                    timestamp = ts_raw
+                else:
+                    timestamp = datetime.now(timezone.utc)
+                repo.create(
+                    run_id=run_id,
+                    method=str(raw.get("method", "unknown")),
+                    inputs=raw.get("inputs", {}),
+                    outputs=raw.get("outputs", {}),
+                    timestamp=timestamp,
+                )
+                existing_ids.add(run_id)
+                imported += 1
+
+    return imported
 
 
 class StrategyInput(BaseModel):
@@ -294,18 +427,14 @@ def _aggregate_allocations(
 async def optimizer_status() -> Optional[AllocationResult]:
     """Return the allocations from the most recent optimization run."""
 
-    runs = _load_runs()
-    if not runs:
-        return None
-    latest = runs[-1]
-    return AllocationResult(
-        run_id=latest["run_id"],
-        timestamp=datetime.fromisoformat(latest["ts"]),
-        method=latest["method"],
-        inputs=latest["inputs"],
-        account_allocations=latest["outputs"]["accounts"],
-        strategy_allocations=latest["outputs"]["strategies"],
-    )
+    with SessionFactory() as session:
+        with session.begin():
+            repo = RunRepository(session)
+            latest = repo.latest()
+            if latest is None:
+                return None
+            result = _to_allocation_result(latest)
+    return result
 
 
 @app.post("/optimizer/rebalance", response_model=AllocationResult)
@@ -332,26 +461,32 @@ async def optimizer_rebalance(payload: RebalanceRequest) -> AllocationResult:
     account_allocations, strategy_allocations = _aggregate_allocations(weights, contexts)
     timestamp = datetime.now(timezone.utc)
     run_id = f"run_{timestamp.strftime('%Y%m%dT%H%M%S%f')}"
-    record = {
-        "run_id": run_id,
-        "inputs": payload.model_dump(mode="json"),
-        "outputs": {
-            "accounts": account_allocations,
-            "strategies": strategy_allocations,
-        },
-        "method": payload.method,
-        "ts": timestamp.isoformat(),
+    run_inputs = payload.model_dump(mode="json")
+    run_outputs = {
+        "accounts": account_allocations,
+        "strategies": strategy_allocations,
     }
-    _append_run(record)
 
-    return AllocationResult(
-        run_id=run_id,
-        timestamp=timestamp,
-        method=payload.method,
-        inputs=record["inputs"],
-        account_allocations=account_allocations,
-        strategy_allocations=strategy_allocations,
-    )
+    with SessionFactory() as session:
+        with session.begin():
+            repo = RunRepository(session)
+            record = repo.create(
+                run_id=run_id,
+                method=payload.method,
+                inputs=run_inputs,
+                outputs=run_outputs,
+                timestamp=timestamp,
+            )
+            result = _to_allocation_result(record)
+
+    return result
 
 
-__all__ = ["app"]
+__all__ = [
+    "app",
+    "RunRepository",
+    "CapitalOptimizationRun",
+    "Base",
+    "SessionFactory",
+    "migrate_runs_from_file",
+]
