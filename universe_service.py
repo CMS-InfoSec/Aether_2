@@ -15,12 +15,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import requests
-from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import JSON, Boolean, Column, DateTime, Integer, String, create_engine, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
+
+from services.common.security import require_admin_account
 
 
 LOGGER = logging.getLogger("universe.service")
@@ -274,7 +276,10 @@ async def _startup_event() -> None:
 
 
 @app.get("/universe/approved", response_model=UniverseResponse)
-def get_universe(session: Session = Depends(get_session)) -> UniverseResponse:
+def get_universe(
+    session: Session = Depends(get_session),
+    _: str = Depends(require_admin_account),
+) -> UniverseResponse:
     """Return the currently approved trading universe."""
 
     entries = session.execute(
@@ -300,7 +305,12 @@ def get_universe(session: Session = Depends(get_session)) -> UniverseResponse:
 
 
 @app.post("/universe/override", status_code=204)
-def override_symbol(payload: OverrideRequest, session: Session = Depends(get_session)) -> Response:
+def override_symbol(
+    payload: OverrideRequest,
+    request: Request,
+    session: Session = Depends(get_session),
+    actor: str = Depends(require_admin_account),
+) -> Response:
     """Manually toggle a symbol's eligibility and record the action."""
 
     symbol = payload.symbol.upper()
@@ -308,6 +318,27 @@ def override_symbol(payload: OverrideRequest, session: Session = Depends(get_ses
     if entry is None:
         entry = UniverseWhitelist(symbol=symbol, metrics_json={})
         session.add(entry)
+
+    header_account = (request.headers.get("X-Account-ID") or "").strip().lower()
+    normalized_actor = actor.strip().lower()
+    if header_account and header_account != normalized_actor:
+        raise HTTPException(
+            status_code=403,
+            detail="Account scope does not match authenticated administrator.",
+        )
+
+    request_scopes = getattr(request.state, "account_scopes", None)
+    if request_scopes:
+        normalized_scopes = {
+            str(scope).strip().lower()
+            for scope in request_scopes
+            if str(scope or "").strip()
+        }
+        if normalized_scopes and normalized_actor not in normalized_scopes:
+            raise HTTPException(
+                status_code=403,
+                detail="Authenticated administrator lacks access to the requested account scope.",
+            )
 
     entry.enabled = payload.enabled
     entry.ts = datetime.now(timezone.utc)
