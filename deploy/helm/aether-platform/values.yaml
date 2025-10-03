@@ -421,17 +421,18 @@ backendServices:
     replicaCount: 2
     containerPort: 8000
     env:
-      - name: COMPLIANCE_DATABASE_URL
+
+      - name: RISK_DATABASE_URL
         valueFrom:
           secretKeyRef:
-            name: compliance-service-database
+            name: risk-service-database
             key: dsn
-      - name: COMPLIANCE_DB_SSLMODE
+      - name: RISK_DB_SSLMODE
         valueFrom:
           secretKeyRef:
-            name: compliance-service-database
+            name: risk-service-database
             key: sslmode
-            optional: true
+
     usesKrakenSecrets: true
     extraVolumeMounts: []
     extraVolumes: []
