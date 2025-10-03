@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
+from fastapi.testclient import TestClient
+
+from auth.service import InMemoryAdminRepository
+
 from app import create_app
 from services.models import model_zoo
 
@@ -11,7 +15,7 @@ def setup_function() -> None:
 
 
 def _client() -> TestClient:
-    return TestClient(create_app())
+    return TestClient(create_app(admin_repository=InMemoryAdminRepository()))
 
 
 def test_list_models_returns_inventory() -> None:
