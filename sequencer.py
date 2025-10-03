@@ -17,8 +17,15 @@ from fastapi import FastAPI, HTTPException, status
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
 
+import httpx
+from auth.session_client import AdminSessionManager, get_default_session_manager
 from common.utils import tracing
 from services.common.adapters import KafkaNATSAdapter
+from services.common.schemas import (
+    FeeBreakdown,
+    PolicyDecisionRequest,
+    PolicyDecisionResponse,
+)
 from override_service import OverrideDecision, OverrideRecord, latest_override
 
 from metrics import (
@@ -30,6 +37,7 @@ from metrics import (
     set_pipeline_latency,
     setup_metrics,
     traced_span,
+    get_request_id,
 )
 
 
@@ -43,8 +51,136 @@ DEFAULT_RISK_TIMEOUT = float(os.getenv("SEQUENCER_RISK_TIMEOUT", "2.0"))
 DEFAULT_OMS_TIMEOUT = float(os.getenv("SEQUENCER_OMS_TIMEOUT", "2.5"))
 DEFAULT_PUBLISH_TIMEOUT = float(os.getenv("SEQUENCER_PUBLISH_TIMEOUT", "1.0"))
 
+POLICY_SERVICE_URL = os.getenv("POLICY_SERVICE_URL", "http://policy-service").strip()
+POLICY_DECISION_ENDPOINT = os.getenv("POLICY_DECISION_ENDPOINT", "/policy/decide").strip()
+
 RECENT_RUN_CAPACITY = int(os.getenv("SEQUENCER_HISTORY_SIZE", "200"))
 TOPIC_PREFIX = os.getenv("SEQUENCER_TOPIC_PREFIX", "sequencer")
+
+
+def _join_url(base_url: str, endpoint: str) -> str:
+    base = (base_url or "").rstrip("/")
+    path = endpoint.strip()
+    if not path.startswith("/"):
+        path = f"/{path}"
+    if not base:
+        return path
+    return f"{base}{path}"
+
+
+def _optional_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _require_positive_float(
+    intent: Mapping[str, Any],
+    keys: Tuple[str, ...],
+    *,
+    field: str,
+) -> float:
+    for key in keys:
+        if key not in intent:
+            continue
+        try:
+            value = float(intent[key])
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    raise StageFailedError("policy", f"Intent is missing required {field}")
+
+
+def _normalize_side(value: Any) -> str:
+    side = str(value or "").strip().upper()
+    if side not in {"BUY", "SELL"}:
+        raise StageFailedError("policy", "Intent side must be BUY or SELL")
+    return side
+
+
+def _resolve_fee(intent: Mapping[str, Any]) -> FeeBreakdown:
+    raw_fee = intent.get("fee") or intent.get("fees")
+    if isinstance(raw_fee, Mapping):
+        try:
+            return FeeBreakdown.model_validate(raw_fee)
+        except Exception as exc:
+            raise StageFailedError("policy", f"Invalid fee payload: {exc}") from exc
+
+    currency = str(
+        intent.get("fee_currency")
+        or intent.get("quote_currency")
+        or intent.get("settlement_currency")
+        or "USD"
+    ).strip()
+    maker = max(_optional_float(intent.get("maker_fee")) or 0.0, 0.0)
+    taker = max(_optional_float(intent.get("taker_fee")) or 0.0, 0.0)
+    return FeeBreakdown(currency=currency or "USD", maker=maker, taker=taker)
+
+
+class PolicyServiceClient:
+    """HTTP client responsible for fetching decisions from the policy service."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        endpoint: str,
+        timeout: float,
+        session_manager_factory: Callable[[], AdminSessionManager] = get_default_session_manager,
+    ) -> None:
+        self._base_url = base_url
+        self._endpoint = endpoint
+        self._timeout = timeout
+        self._session_manager_factory = session_manager_factory
+
+    def _url(self) -> str:
+        if not self._base_url:
+            raise RuntimeError("Policy service URL is not configured")
+        return _join_url(self._base_url, self._endpoint)
+
+    async def _authorization_headers(self, account_id: str) -> Dict[str, str]:
+        manager = self._session_manager_factory()
+        token = await manager.token_for_account(account_id)
+        if not token:
+            raise RuntimeError("Session service returned empty token for policy request")
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "X-Account-ID": account_id,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        request_id = get_request_id() or str(uuid.uuid4())
+        headers.setdefault("X-Request-ID", request_id)
+        return headers
+
+    async def decide(self, *, request: PolicyDecisionRequest) -> PolicyDecisionResponse:
+        url = self._url()
+        headers = await self._authorization_headers(request.account_id)
+        payload = request.model_dump(mode="json")
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            response = await client.post(url, json=payload, headers=headers)
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError(
+                f"Policy service returned {exc.response.status_code}: {exc.response.text}"
+            ) from exc
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise RuntimeError("Policy service returned invalid JSON payload") from exc
+        return PolicyDecisionResponse.model_validate(data)
+
+
+policy_client = PolicyServiceClient(
+    base_url=POLICY_SERVICE_URL,
+    endpoint=POLICY_DECISION_ENDPOINT or "/policy/decide",
+    timeout=DEFAULT_POLICY_TIMEOUT,
+)
 
 
 class SequencerIntentRequest(BaseModel):
@@ -336,6 +472,15 @@ class SequencerPipeline:
                         payload = tracing.attach_correlation(result.payload, mutate=True)
                         stage_artifact = tracing.attach_correlation(result.artifact, mutate=True)
                         stage_artifacts[stage.name] = stage_artifact
+
+                        if stage.name == "policy":
+                            decision_payload = payload.get("policy_decision", {})
+                            if isinstance(decision_payload, Mapping) and not decision_payload.get(
+                                "approved", True
+                            ):
+                                reason = str(decision_payload.get("reason") or "Policy decision rejected")
+                                raise StageFailedError("policy", f"Policy decision rejected intent: {reason}")
+
                         executed.append((stage, result))
                         await publisher.publish_event(
                             stage.name,
@@ -494,18 +639,71 @@ def _safe_float(value: Any) -> float:
         return 0.0
 
 
+def _build_policy_request(intent: Mapping[str, Any], ctx: PipelineContext) -> PolicyDecisionRequest:
+    if not intent:
+        raise StageFailedError("policy", "Intent payload is missing for policy evaluation")
+
+    order_id = str(intent.get("order_id") or intent.get("intent_id") or ctx.intent_id)
+    instrument = str(intent.get("instrument") or intent.get("symbol") or "").strip()
+    if not instrument:
+        raise StageFailedError("policy", "Intent instrument is required for policy evaluation")
+
+    side = _normalize_side(intent.get("side") or intent.get("direction"))
+    quantity = _require_positive_float(intent, ("quantity", "qty"), field="quantity")
+    price = _require_positive_float(
+        intent,
+        ("price", "limit_px", "mid_price"),
+        field="price",
+    )
+    fee_breakdown = _resolve_fee(intent)
+
+    request_kwargs: Dict[str, Any] = {
+        "account_id": ctx.account_id,
+        "order_id": order_id,
+        "instrument": instrument,
+        "side": side,
+        "quantity": quantity,
+        "price": price,
+        "fee": fee_breakdown,
+    }
+
+    optional_fields = {
+        "features": intent.get("features"),
+        "book_snapshot": intent.get("book_snapshot"),
+        "state": intent.get("state"),
+        "expected_edge_bps": _optional_float(intent.get("expected_edge_bps")),
+        "slippage_bps": _optional_float(intent.get("slippage_bps")),
+        "take_profit_bps": _optional_float(intent.get("take_profit_bps")),
+        "stop_loss_bps": _optional_float(intent.get("stop_loss_bps")),
+        "confidence": intent.get("confidence"),
+    }
+    for key, value in optional_fields.items():
+        if value is not None:
+            request_kwargs[key] = value
+
+    return PolicyDecisionRequest(**request_kwargs)
+
+
 async def policy_handler(payload: Dict[str, Any], ctx: PipelineContext) -> StageResult:
     intent = payload.get("intent", {})
-    now = datetime.now(timezone.utc).isoformat()
-    decision = {
-        "approved": True,
-        "reason": None,
-        "evaluated_at": now,
-        "constraints": intent.get("constraints", {}),
-    }
+    try:
+        request = _build_policy_request(intent, ctx)
+    except StageFailedError:
+        raise
+    except Exception as exc:
+        raise StageFailedError("policy", f"Failed to build policy request: {exc}") from exc
+
+    try:
+        decision = await policy_client.decide(request=request)
+    except httpx.TimeoutException as exc:
+        raise StageFailedError("policy", "Policy service request timed out") from exc
+    except Exception as exc:
+        raise StageFailedError("policy", f"Policy service request failed: {exc}") from exc
+
+    artifact = decision.model_dump(mode="json")
     new_payload = dict(payload)
-    new_payload["policy_decision"] = decision
-    return StageResult(payload=new_payload, artifact=decision)
+    new_payload["policy_decision"] = artifact
+    return StageResult(payload=new_payload, artifact=artifact)
 
 
 async def policy_rollback(result: StageResult, ctx: PipelineContext) -> None:
@@ -522,7 +720,11 @@ async def policy_rollback(result: StageResult, ctx: PipelineContext) -> None:
 async def risk_handler(payload: Dict[str, Any], ctx: PipelineContext) -> StageResult:
     decision = payload.get("policy_decision", {})
     if not decision.get("approved", False):
-        raise StageFailedError("risk", "Policy decision rejected the intent")
+        reason = decision.get("reason")
+        message = "Policy decision rejected the intent"
+        if reason:
+            message = f"{message}: {reason}"
+        raise StageFailedError("risk", message)
 
     intent = payload.get("intent", {})
     quantity = _safe_float(intent.get("quantity") or intent.get("qty"))
