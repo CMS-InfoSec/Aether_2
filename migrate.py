@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -24,23 +25,68 @@ from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 
-DEFAULT_DATABASE_URL = "sqlite+pysqlite:////tmp/config.db"
+LOGGER = logging.getLogger("config_migrate")
+_SQLITE_FALLBACK_FLAG = "CONFIG_ALLOW_SQLITE_FOR_TESTS"
+
+
+def _require_database_url() -> str:
+    url = os.getenv("CONFIG_DATABASE_URL")
+    if not url:
+        raise RuntimeError(
+            "CONFIG_DATABASE_URL must be defined when running config migrations."
+        )
+
+    normalized = url.lower()
+    allowed_prefixes = ("postgresql://", "postgresql+psycopg://", "postgresql+psycopg2://")
+    if normalized.startswith("postgres://"):
+        url = "postgresql://" + url.split("://", 1)[1]
+        normalized = url.lower()
+
+    if normalized.startswith(allowed_prefixes):
+        return url
+
+    if os.getenv(_SQLITE_FALLBACK_FLAG) == "1":
+        LOGGER.warning(
+            "Allowing non-Postgres CONFIG_DATABASE_URL '%s' because %s=1.",
+            url,
+            _SQLITE_FALLBACK_FLAG,
+        )
+        return url
+
+    raise RuntimeError(
+        "CONFIG_DATABASE_URL must point to a PostgreSQL/TimescaleDB instance; "
+        f"received '{url}'."
+    )
 
 
 def _create_engine(database_url: str):
-    """Create a SQLAlchemy engine with SQLite specific safeguards."""
+    """Create a SQLAlchemy engine with driver-appropriate safeguards."""
 
     connect_args: Dict[str, Any] = {}
-    engine_kwargs: Dict[str, Any] = {"future": True}
+    engine_kwargs: Dict[str, Any] = {
+        "future": True,
+        "pool_pre_ping": True,
+    }
+
     if database_url.startswith("sqlite"):
         connect_args["check_same_thread"] = False
         engine_kwargs["connect_args"] = connect_args
         if ":memory:" in database_url:
             engine_kwargs["poolclass"] = StaticPool
+    else:
+        connect_args["sslmode"] = os.getenv("CONFIG_DB_SSLMODE", "require")
+        engine_kwargs["connect_args"] = connect_args
+        engine_kwargs.update(
+            pool_size=int(os.getenv("CONFIG_DB_POOL_SIZE", "10")),
+            max_overflow=int(os.getenv("CONFIG_DB_MAX_OVERFLOW", "5")),
+            pool_timeout=int(os.getenv("CONFIG_DB_POOL_TIMEOUT", "30")),
+            pool_recycle=int(os.getenv("CONFIG_DB_POOL_RECYCLE", "1800")),
+        )
+
     return create_engine(database_url, **engine_kwargs)
 
 
-DATABASE_URL = os.getenv("CONFIG_DATABASE_URL", DEFAULT_DATABASE_URL)
+DATABASE_URL = _require_database_url()
 engine = _create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
 

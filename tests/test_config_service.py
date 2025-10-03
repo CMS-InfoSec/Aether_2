@@ -1,33 +1,13 @@
 from __future__ import annotations
 
-import importlib.util
-from pathlib import Path
-from typing import Iterator
 
-import sys
+import os
 
-import pytest
 from fastapi.testclient import TestClient
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+os.environ.setdefault("CONFIG_ALLOW_SQLITE_FOR_TESTS", "1")
+os.environ.setdefault("CONFIG_DATABASE_URL", "sqlite+pysqlite:///:memory:")
 
-def _import_module(module_name: str, path: Path):
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    if spec is None or spec.loader is None:  # pragma: no cover - defensive
-        raise ModuleNotFoundError(f"Unable to load module from {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-try:
-    from auth.service import InMemorySessionStore
-except ModuleNotFoundError:
-    auth_module = _import_module("tests.config_service_auth", ROOT / "auth" / "service.py")
-    InMemorySessionStore = auth_module.InMemorySessionStore  # type: ignore[attr-defined]
 
 from config_service import app, reset_state, set_guarded_keys
 

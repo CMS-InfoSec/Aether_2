@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -61,7 +62,42 @@ except ImportError:  # pragma: no cover - optional dependency
 DEFAULT_RELEASE_DB_URL = os.getenv(
     "RELEASE_MANIFEST_DATABASE_URL", "sqlite+pysqlite:////tmp/release_manifests.db"
 )
-DEFAULT_CONFIG_DB_URL = os.getenv("CONFIG_DATABASE_URL", "sqlite+pysqlite:////tmp/config.db")
+
+LOGGER = logging.getLogger("release_manifest")
+_SQLITE_FALLBACK_FLAG = "CONFIG_ALLOW_SQLITE_FOR_TESTS"
+
+
+def _require_config_db_url() -> str:
+    url = os.getenv("CONFIG_DATABASE_URL")
+    if not url:
+        raise RuntimeError(
+            "CONFIG_DATABASE_URL must be set to read configs for the release manifest."
+        )
+
+    normalized = url.lower()
+    allowed_prefixes = ("postgresql://", "postgresql+psycopg://", "postgresql+psycopg2://")
+    if normalized.startswith("postgres://"):
+        url = "postgresql://" + url.split("://", 1)[1]
+        normalized = url.lower()
+
+    if normalized.startswith(allowed_prefixes):
+        return url
+
+    if os.getenv(_SQLITE_FALLBACK_FLAG) == "1":
+        LOGGER.warning(
+            "Allowing non-Postgres CONFIG_DATABASE_URL '%s' because %s=1.",
+            url,
+            _SQLITE_FALLBACK_FLAG,
+        )
+        return url
+
+    raise RuntimeError(
+        "CONFIG_DATABASE_URL must point to a PostgreSQL/TimescaleDB instance; "
+        f"received '{url}'."
+    )
+
+
+DEFAULT_CONFIG_DB_URL = _require_config_db_url()
 DEFAULT_SERVICES_DIR = Path("deploy/k8s/base/aether-services")
 DEFAULT_MODELS_DIR = Path("ml/models")
 DEFAULT_MANIFEST_FILE = Path("release_manifest_current.json")

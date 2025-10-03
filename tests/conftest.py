@@ -26,6 +26,8 @@ if str(ROOT) not in sys.path:
 _DEFAULT_MASTER_KEY = base64.b64encode(b"\x00" * 32).decode("ascii")
 os.environ.setdefault("SECRET_ENCRYPTION_KEY", _DEFAULT_MASTER_KEY)
 os.environ.setdefault("LOCAL_KMS_MASTER_KEY", _DEFAULT_MASTER_KEY)
+os.environ.setdefault("CONFIG_ALLOW_SQLITE_FOR_TESTS", "1")
+os.environ.setdefault("CONFIG_DATABASE_URL", "sqlite+pysqlite:///:memory:")
 
 
 pytest_plugins = [
