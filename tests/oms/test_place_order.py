@@ -65,7 +65,9 @@ class _RecordingClient:
         return None
 
 
-def test_precision_snapping(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_precision_snapping_buy_never_exceeds(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
     records: List[_RecordingClient] = []
 
     def factory(**kwargs: Any) -> _RecordingClient:
@@ -75,6 +77,8 @@ def test_precision_snapping(client: TestClient, monkeypatch: pytest.MonkeyPatch)
 
     monkeypatch.setattr(main, "KrakenWSClient", factory)
 
+    _seed_credentials("company")
+
     payload = {
         "account_id": "company",
         "order_id": "snap-1",
@@ -82,6 +86,8 @@ def test_precision_snapping(client: TestClient, monkeypatch: pytest.MonkeyPatch)
         "side": "BUY",
         "quantity": 0.123456,
         "price": 20100.12345,
+        "take_profit": 20150.159,
+        "stop_loss": 20090.987,
         "fee": {"currency": "USD", "maker": 0.1, "taker": 0.2},
         "post_only": True,
     }
@@ -93,7 +99,14 @@ def test_precision_snapping(client: TestClient, monkeypatch: pytest.MonkeyPatch)
     assert records, "Kraken client was not invoked"
     snapped_payload = records[0].requests[0]
     assert snapped_payload["price"] == pytest.approx(20100.1)
-    assert snapped_payload["volume"] == pytest.approx(0.1235)
+    assert snapped_payload["volume"] == pytest.approx(0.1234)
+    assert snapped_payload["takeProfit"] == pytest.approx(20150.1)
+    assert snapped_payload["stopLoss"] == pytest.approx(20090.9)
+
+    assert snapped_payload["price"] <= payload["price"]
+    assert snapped_payload["volume"] <= payload["quantity"]
+    assert snapped_payload["takeProfit"] <= payload["take_profit"]
+    assert snapped_payload["stopLoss"] <= payload["stop_loss"]
     assert "post" in snapped_payload["oflags"]
 
     events = TimescaleAdapter(account_id="company").events()
@@ -103,6 +116,49 @@ def test_precision_snapping(client: TestClient, monkeypatch: pytest.MonkeyPatch)
     history = KafkaNATSAdapter(account_id="company").history()
     assert any(record["topic"] == "oms.acks" for record in history)
 
+
+def test_precision_snapping_sell_never_falls_short(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    records: List[_RecordingClient] = []
+
+    def factory(**kwargs: Any) -> _RecordingClient:
+        inst = _RecordingClient(**kwargs)
+        records.append(inst)
+        return inst
+
+    monkeypatch.setattr(main, "KrakenWSClient", factory)
+
+    _seed_credentials("company")
+
+    payload = {
+        "account_id": "company",
+        "order_id": "snap-sell-1",
+        "instrument": "ETH-USD",
+        "side": "SELL",
+        "quantity": 1.2345,
+        "price": 1500.123,
+        "take_profit": 1495.777,
+        "stop_loss": 1505.345,
+        "fee": {"currency": "USD", "maker": 0.1, "taker": 0.2},
+    }
+
+    response = client.post("/oms/place", json=payload, headers={"X-Account-ID": "company"})
+    assert response.status_code == 200
+    assert response.json()["accepted"] is True
+
+    assert records, "Kraken client was not invoked"
+    snapped_payload = records[0].requests[0]
+
+    assert snapped_payload["price"] == pytest.approx(1500.13)
+    assert snapped_payload["volume"] == pytest.approx(1.234)
+    assert snapped_payload["takeProfit"] == pytest.approx(1495.78)
+    assert snapped_payload["stopLoss"] == pytest.approx(1505.35)
+
+    assert snapped_payload["price"] >= payload["price"]
+    assert snapped_payload["volume"] <= payload["quantity"]
+    assert snapped_payload["takeProfit"] >= payload["take_profit"]
+    assert snapped_payload["stopLoss"] >= payload["stop_loss"]
 
 def test_circuit_breaker_halts(client: TestClient) -> None:
     main.CircuitBreaker.halt("BTC-USD", reason="Limit up")

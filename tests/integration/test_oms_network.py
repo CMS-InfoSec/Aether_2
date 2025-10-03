@@ -178,7 +178,7 @@ def test_place_order_uses_websocket_transport(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(graceful_shutdown, "install_sigterm_handler", lambda manager: None)
 
     KafkaNATSAdapter.reset()
-    TimescaleAdapter.flush_event_buffers()
+    asyncio.run(TimescaleAdapter.flush_event_buffers())
 
     with TestClient(oms_main.app) as client:
         payload = {
@@ -218,7 +218,7 @@ def test_place_order_rejects_on_kraken_error(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(graceful_shutdown, "install_sigterm_handler", lambda manager: None)
 
     KafkaNATSAdapter.reset()
-    TimescaleAdapter.flush_event_buffers()
+    asyncio.run(TimescaleAdapter.flush_event_buffers())
 
     with TestClient(oms_main.app) as client:
         payload = {
@@ -257,7 +257,7 @@ def test_place_order_times_out_when_kraken_stalls(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(graceful_shutdown, "install_sigterm_handler", lambda manager: None)
 
     KafkaNATSAdapter.reset()
-    TimescaleAdapter.flush_event_buffers()
+    asyncio.run(TimescaleAdapter.flush_event_buffers())
 
     with TestClient(oms_main.app) as client:
         payload = {

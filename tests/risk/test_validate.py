@@ -183,8 +183,10 @@ def test_engine_honors_kill_switch_and_short_circuits() -> None:
     adapter = TimescaleAdapter(account_id=account)
     original_config = adapter.load_risk_config()
     try:
+
         TimescaleAdapter._risk_configs[account]["kill_switch"] = True  # type: ignore[attr-defined]
         engine = make_engine(account)
+
         request = make_request(account_id=account)
 
         response = engine.validate(request)
@@ -195,7 +197,7 @@ def test_engine_honors_kill_switch_and_short_circuits() -> None:
         events = TimescaleAdapter(account_id=account).events()
         assert any(event["type"] == "kill_switch_triggered" for event in events["events"])
     finally:
-        TimescaleAdapter._risk_configs[account] = original_config  # type: ignore[attr-defined]
+        adapter.save_risk_config(original_config)
 
 
 def test_engine_records_events_without_exception() -> None:

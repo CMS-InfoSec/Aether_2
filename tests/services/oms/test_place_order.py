@@ -13,6 +13,9 @@ import pytest
 
 class _FastAPIStub:
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.state = types.SimpleNamespace()
+        self.user_middleware: List[Any] = []
+        self.routes: List[Any] = []
         return None
 
     def on_event(self, event: str) -> Any:
@@ -21,14 +24,26 @@ class _FastAPIStub:
 
         return decorator
 
+    def middleware(self, event: str) -> Any:
+        def decorator(func: Any) -> Any:
+            self.user_middleware.append(types.SimpleNamespace(cls=None))
+            return func
+
+        return decorator
+
+    def add_middleware(self, middleware_cls: Any, **kwargs: Any) -> None:
+        self.user_middleware.append(types.SimpleNamespace(cls=middleware_cls, **kwargs))
+
     def post(self, path: str, **_: Any) -> Any:
         def decorator(func: Any) -> Any:
+            self.routes.append(types.SimpleNamespace(path=path))
             return func
 
         return decorator
 
     def get(self, path: str, **_: Any) -> Any:
         def decorator(func: Any) -> Any:
+            self.routes.append(types.SimpleNamespace(path=path))
             return func
 
         return decorator
@@ -164,6 +179,7 @@ metrics_stub.increment_oms_child_orders_total = _noop
 metrics_stub.increment_oms_error_count = _noop
 metrics_stub.increment_oms_stale_feed = _noop
 metrics_stub.increment_oms_auth_failures = _noop
+metrics_stub.increment_trade_rejection = _noop
 metrics_stub.record_oms_latency = _noop
 metrics_stub.record_oms_submit_ack = _noop
 metrics_stub.record_ws_latency = _noop
@@ -198,6 +214,7 @@ sys.modules.setdefault("services.oms.oms_service", oms_service)
 MODULE_SPEC.loader.exec_module(oms_service)
 
 from services.oms.oms_service import AccountContext, OMSPlaceRequest
+from services.oms.main import _snap
 from services.oms.kraken_ws import OrderAck
 from shared.correlation import CorrelationContext
 from shared.simulation import sim_broker, sim_mode_state
@@ -435,6 +452,12 @@ def off_tick_request() -> OMSPlaceRequest:
     )
     request.shadow = False  # type: ignore[attr-defined]
     return request
+
+
+def test_snap_preserves_tick_multiples_for_non_decimal_steps() -> None:
+    assert _snap(0.37, 0.25, side="buy") == pytest.approx(0.25)
+    assert _snap(0.37, 0.25, side="sell") == pytest.approx(0.5)
+    assert _snap(0.37, 0.25, side="sell", floor_quantity=True) == pytest.approx(0.25)
 
 
 def test_place_order_snaps_take_profit_stop_loss_and_trailing(

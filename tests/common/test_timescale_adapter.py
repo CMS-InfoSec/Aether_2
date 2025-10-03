@@ -68,7 +68,7 @@ def test_credential_rotation_status_round_trip() -> None:
 
 
     TimescaleAdapter.reset(account_id="company")
-    assert adapter.credential_rotation_status() is None
+    assert TimescaleAdapter(account_id="company").credential_rotation_status() is None
 
 
 def test_reset_clears_target_account_only() -> None:
@@ -87,9 +87,10 @@ def test_reset_clears_target_account_only() -> None:
 
     TimescaleAdapter.reset(account_id="company")
 
-    assert europe.instrument_exposure("BTC-USD") == pytest.approx(0.0)
-    assert europe.events()["events"] == []
-    assert europe.credential_rotation_status() is None
+    refreshed = TimescaleAdapter(account_id="company")
+    assert refreshed.instrument_exposure("BTC-USD") == pytest.approx(0.0)
+    assert refreshed.events()["events"] == []
+    assert refreshed.credential_rotation_status() is None
 
     assert us.instrument_exposure("BTC-USD") == pytest.approx(5_000.0)
     assert us.events()["events"]
@@ -100,9 +101,9 @@ def test_risk_config_can_be_overridden_without_side_effects() -> None:
     adapter = TimescaleAdapter(account_id="company")
 
     default_snapshot = adapter.load_risk_config()
-    TimescaleAdapter._risk_configs[adapter.account_id].update(
-        {"kill_switch": True, "nav": 3_000_000.0}
-    )
+    overridden = dict(default_snapshot)
+    overridden.update({"kill_switch": True, "nav": 3_000_000.0})
+    adapter.save_risk_config(overridden)
 
     updated = adapter.load_risk_config()
     assert updated["kill_switch"] is True

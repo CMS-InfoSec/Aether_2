@@ -1,3 +1,4 @@
+import asyncio
 import math
 from datetime import datetime, timedelta, timezone
 
@@ -60,7 +61,7 @@ def test_record_event_is_tracked(adapter: TimescaleAdapter) -> None:
     payload = {"reason": "nav limit", "exposure_ratio": 0.42}
     adapter.record_event("nav_limit_breach", payload)
 
-    events = TimescaleAdapter._events[adapter.account_id]["events"]
+    events = adapter.events()["events"]
     assert len(events) == 1
     event = events[0]
     assert event["type"] == "nav_limit_breach"
@@ -78,20 +79,25 @@ def test_order_lifecycle_helpers_store_payloads(adapter: TimescaleAdapter) -> No
     adapter.record_ack(ack_payload)
     adapter.record_fill(fill_payload)
 
-    ack_entries = TimescaleAdapter._events[adapter.account_id]["acks"]
-    fill_entries = TimescaleAdapter._events[adapter.account_id]["fills"]
+    events = adapter.events()
+    ack_entries = events["acks"]
+    fill_entries = events["fills"]
 
     assert len(ack_entries) == 1
     assert len(fill_entries) == 1
-    assert ack_entries[0]["payload"] == ack_payload
-    assert fill_entries[0]["payload"] == fill_payload
-    assert isinstance(ack_entries[0]["recorded_at"], datetime)
-    assert isinstance(fill_entries[0]["recorded_at"], datetime)
+    ack_entry = ack_entries[0]
+    fill_entry = fill_entries[0]
+    assert ack_entry["order_id"] == ack_payload["order_id"]
+    assert ack_entry["status"] == ack_payload["status"]
+    assert fill_entry["order_id"] == fill_payload["order_id"]
+    assert fill_entry["quantity"] == fill_payload["quantity"]
+    assert isinstance(ack_entry["recorded_at"], datetime)
+    assert isinstance(fill_entry["recorded_at"], datetime)
 
     ack_payload["status"] = "mutated"
     fill_payload["quantity"] = math.pi
-    assert ack_entries[0]["payload"]["status"] == "ok"
-    assert fill_entries[0]["payload"]["quantity"] == pytest.approx(1.5)
+    assert ack_entries[0]["status"] == "ok"
+    assert fill_entries[0]["quantity"] == pytest.approx(1.5)
 
 
 def test_credential_rotation_status_returns_latest_entry(adapter: TimescaleAdapter) -> None:
@@ -181,22 +187,24 @@ def test_reset_rotation_state_clears_only_rotation_state_for_account() -> None:
 
     secondary.record_credential_rotation(secret_name="secret-2", rotated_at=rotation_time)
 
-    TimescaleAdapter._events["acct-1"]["credential_rotations"].append({"rotated_at": rotation_time})
-    TimescaleAdapter._events["acct-2"]["credential_rotations"].append({"rotated_at": rotation_time})
+    asyncio.run(TimescaleAdapter.flush_event_buffers())
 
     TimescaleAdapter.reset_rotation_state(account_id="acct-1")
 
-    assert "acct-1" not in TimescaleAdapter._credential_rotations
-    assert "acct-1" not in TimescaleAdapter._credential_events
-    assert TimescaleAdapter._events["acct-1"]["credential_rotations"] == []
+    refreshed_primary = TimescaleAdapter(account_id="acct-1")
+    refreshed_secondary = TimescaleAdapter(account_id="acct-2")
+
+    assert refreshed_primary.credential_rotation_status() is None
+    assert refreshed_primary.events()["credential_rotations"] == []
+    assert refreshed_primary.credential_events()  # access event remains recorded
 
     # Non-credential caches remain untouched
     assert TimescaleAdapter._metrics["acct-1"]["usage"] == pytest.approx(500.0)
-    assert TimescaleAdapter._events["acct-1"]["events"]
+    assert refreshed_primary.events()["events"]
 
     # Other accounts retain their rotation state
-    assert "acct-2" in TimescaleAdapter._credential_rotations
-    assert TimescaleAdapter._events["acct-2"]["credential_rotations"]
+    assert refreshed_secondary.credential_rotation_status() is not None
+    assert refreshed_secondary.events()["credential_rotations"]
 
 
 def test_reset_rotation_state_without_account_clears_all_rotation_state() -> None:
@@ -213,15 +221,17 @@ def test_reset_rotation_state_without_account_clears_all_rotation_state() -> Non
     first.record_credential_rotation(secret_name="secret-1", rotated_at=rotation_time)
     second.record_credential_rotation(secret_name="secret-2", rotated_at=rotation_time)
 
-    TimescaleAdapter._events["acct-1"]["credential_rotations"].append({"rotated_at": rotation_time})
-    TimescaleAdapter._events["acct-2"]["credential_rotations"].append({"rotated_at": rotation_time})
+    asyncio.run(TimescaleAdapter.flush_event_buffers())
 
     TimescaleAdapter.reset_rotation_state()
 
-    assert TimescaleAdapter._credential_rotations == {}
-    assert TimescaleAdapter._credential_events == {}
-    assert TimescaleAdapter._events["acct-1"]["credential_rotations"] == []
-    assert TimescaleAdapter._events["acct-2"]["credential_rotations"] == []
+    refreshed_first = TimescaleAdapter(account_id="acct-1")
+    refreshed_second = TimescaleAdapter(account_id="acct-2")
+
+    assert refreshed_first.credential_rotation_status() is None
+    assert refreshed_second.credential_rotation_status() is None
+    assert refreshed_first.events()["credential_rotations"] == []
+    assert refreshed_second.events()["credential_rotations"] == []
 
     # Existing metrics remain for both accounts
     assert TimescaleAdapter._metrics["acct-1"]["usage"] == pytest.approx(250.0)
