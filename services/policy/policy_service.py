@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 import time
 from dataclasses import asdict, is_dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 from fastapi import FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
@@ -19,7 +21,80 @@ SAFETY_MARGIN_BPS = 1.0
 
 
 class FeeServiceClient:
-    """Lightweight client used to obtain fee estimates for intents."""
+    """Lightweight client used to obtain fee estimates for intents.
+
+    The client consults the OMS/Timescale fee tiers exposed through
+    :class:`services.common.adapters.TimescaleAdapter`.  Results are cached per
+    ``(account_id, symbol)`` for a short period to avoid repeatedly fetching the
+    same tier data.  When the upstream source is unavailable the method falls
+    back to ``0.0`` bps, which is documented so callers understand that cost
+    estimates may be missing instead of silently failing.
+    """
+
+    _DEFAULT_CACHE_TTL_SECONDS = 300.0
+
+    def __init__(
+        self,
+        *,
+        adapter_factory: type["TimescaleAdapter"] | None = None,
+        cache_ttl_seconds: float = _DEFAULT_CACHE_TTL_SECONDS,
+    ) -> None:
+        from services.common.adapters import TimescaleAdapter  # local import to avoid cycles
+
+        self._adapter_factory: type[TimescaleAdapter] = adapter_factory or TimescaleAdapter
+        self._cache_ttl = max(1.0, float(cache_ttl_seconds))
+        self._cache: Dict[tuple[str, str], tuple[float, List[Dict[str, float]]]] = {}
+        self._lock = threading.Lock()
+
+    def _load_fee_tiers(self, account_id: str, symbol: str) -> List[Dict[str, float]]:
+        cache_key = (account_id.lower(), symbol.upper())
+        now = time.monotonic()
+        with self._lock:
+            cached = self._cache.get(cache_key)
+            if cached and cached[0] > now:
+                return [dict(entry) for entry in cached[1]]
+
+        try:
+            adapter = self._adapter_factory(account_id=account_id)
+            tiers = adapter.fee_tiers(symbol)
+        except Exception:
+            tiers = []
+
+        if tiers:
+            with self._lock:
+                self._cache[cache_key] = (now + self._cache_ttl, [dict(entry) for entry in tiers])
+        return [dict(entry) for entry in tiers]
+
+    @staticmethod
+    def _select_tier(
+        tiers: Sequence[Mapping[str, float]],
+        *,
+        liquidity: str,
+        size: float | None,
+    ) -> float:
+        liquidity_key = "maker" if str(liquidity).lower() == "maker" else "taker"
+        if not tiers:
+            return 0.0
+
+        ordered = sorted(
+            (
+                {
+                    "threshold": float(entry.get("notional_threshold", 0.0) or 0.0),
+                    "maker": float(entry.get("maker", entry.get("maker_bps", 0.0)) or 0.0),
+                    "taker": float(entry.get("taker", entry.get("taker_bps", 0.0)) or 0.0),
+                }
+                for entry in tiers
+            ),
+            key=lambda item: item["threshold"],
+        )
+
+        target_size = abs(float(size)) if size is not None else 0.0
+        selected = ordered[0]
+        for tier in ordered:
+            selected = tier
+            if target_size < tier["threshold"]:
+                break
+        return float(max(selected.get(liquidity_key, 0.0), 0.0))
 
     def fee_bps_estimate(
         self,
@@ -29,12 +104,106 @@ class FeeServiceClient:
         liquidity: str,
         size: float | None = None,
     ) -> float:
-        del account_id, symbol, liquidity, size
-        return 0.0
+        tiers = self._load_fee_tiers(account_id, symbol)
+        if not tiers:
+            return 0.0
+        return self._select_tier(tiers, liquidity=liquidity, size=size)
 
 
 class SlippageEstimator:
-    """Simple estimator that provides expected slippage in basis points."""
+    """Estimator that derives historical slippage curves from Timescale/OMS data.
+
+    The estimator queries :mod:`services.oms.impact_store` for historical fill
+    impact points and interpolates the expected basis-point cost for the
+    requested size.  Results are cached per ``(account_id, symbol)`` so repeated
+    requests share the same data.  If the data source is unavailable the method
+    returns ``0.0`` bps, which mirrors the documented fallback for the fee
+    estimator.
+    """
+
+    _DEFAULT_CACHE_TTL_SECONDS = 120.0
+    _DEFAULT_ASYNC_TIMEOUT = 1.0
+
+    def __init__(
+        self,
+        *,
+        impact_store: Any | None = None,
+        cache_ttl_seconds: float = _DEFAULT_CACHE_TTL_SECONDS,
+        async_timeout: float = _DEFAULT_ASYNC_TIMEOUT,
+    ) -> None:
+        from services.oms.impact_store import impact_store as default_store  # lazy import
+
+        self._impact_store = impact_store or default_store
+        self._cache_ttl = max(1.0, float(cache_ttl_seconds))
+        self._async_timeout = max(0.1, float(async_timeout))
+        self._cache: Dict[tuple[str, str], tuple[float, List[Dict[str, float]]]] = {}
+        self._lock = threading.Lock()
+
+    def _fetch_curve(self, account_id: str, symbol: str) -> List[Dict[str, float]]:
+        cache_key = (account_id.lower(), symbol.upper())
+        now = time.monotonic()
+        with self._lock:
+            cached = self._cache.get(cache_key)
+            if cached and cached[0] > now:
+                return [dict(entry) for entry in cached[1]]
+
+        try:
+            coroutine = self._impact_store.impact_curve(account_id=account_id, symbol=symbol)
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+            if loop and loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+                points = future.result(timeout=self._async_timeout)
+            else:
+                points = asyncio.run(coroutine)
+        except Exception:
+            points = []
+
+        if points:
+            with self._lock:
+                self._cache[cache_key] = (now + self._cache_ttl, [dict(entry) for entry in points])
+        return [dict(entry) for entry in points]
+
+    @staticmethod
+    def _interpolate(
+        ordered: Sequence[Mapping[str, float]],
+        target_size: float,
+    ) -> float:
+        if not ordered:
+            return 0.0
+
+        sorted_points = sorted(
+            (
+                {
+                    "size": max(float(point.get("size", 0.0) or 0.0), 0.0),
+                    "impact": float(point.get("impact_bps", 0.0) or 0.0),
+                }
+                for point in ordered
+            ),
+            key=lambda entry: entry["size"],
+        )
+
+        if not sorted_points:
+            return 0.0
+
+        if target_size <= 0.0:
+            return abs(sorted_points[0]["impact"])
+
+        previous = sorted_points[0]
+        for current in sorted_points[1:]:
+            if target_size <= current["size"]:
+                span = current["size"] - previous["size"]
+                if span <= 0:
+                    return abs(current["impact"])
+                weight = (target_size - previous["size"]) / span
+                interpolated = previous["impact"] + (current["impact"] - previous["impact"]) * weight
+                return abs(interpolated)
+            previous = current
+
+        return abs(sorted_points[-1]["impact"])
 
     def estimate_slippage_bps(
         self,
@@ -44,8 +213,14 @@ class SlippageEstimator:
         side: str | None,
         size: float | None = None,
     ) -> float:
-        del account_id, symbol, side, size
-        return 0.0
+        del side  # direction currently unused because impact data is signed
+
+        points = self._fetch_curve(account_id, symbol)
+        if not points:
+            return 0.0
+
+        target_size = abs(float(size)) if size is not None else 0.0
+        return self._interpolate(points, target_size)
 
 
 class PositionSizerAdapter:
