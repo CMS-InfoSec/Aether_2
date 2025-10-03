@@ -9,6 +9,13 @@ on:
       - 'deploy/docker/risk-api/**'
       - 'deploy/docker/risk-ingestor/**'
       - 'deploy/docker/kraken-ws-ingest/**'
+      - 'deploy/docker/**'
+      - 'requirements.txt'
+      - 'pyproject.toml'
+      - 'poetry.lock'
+      - 'services/**'
+      - 'common/**'
+      - 'src/**'
 
 jobs:
   kaniko-build:
