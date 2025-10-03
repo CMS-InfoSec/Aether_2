@@ -13,7 +13,8 @@ from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 import time
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
+from pydantic import BaseModel, Field
 
 from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
 from services.common.schemas import OrderPlacementRequest, OrderPlacementResponse
@@ -362,6 +363,8 @@ class MarketMetadataCache:
             return
         async with self._lock:
             self._data = parsed
+        global MARKET_METADATA
+        MARKET_METADATA = {symbol: dict(values) for symbol, values in parsed.items()}
 
     async def get(self, instrument: str) -> Optional[Dict[str, float]]:
         key = _normalize_instrument(instrument)
@@ -393,6 +396,8 @@ def _metadata_refresh_interval() -> float:
 
 market_metadata_cache = MarketMetadataCache(_metadata_refresh_interval())
 app.state.market_metadata_cache = market_metadata_cache
+
+MARKET_METADATA: Dict[str, Dict[str, float]] = {}
 
 
 _SUCCESS_STATUSES = {"ok", "accepted", "open"}
@@ -533,6 +538,34 @@ def _normalize_ws_client(client: Any) -> Any:
                 errors=errors,
             )
 
+        async def cancel_order(self, payload: Dict[str, Any]) -> OrderAck:
+            try:
+                result = await asyncio.to_thread(
+                    self._inner.cancel_order, payload, timeout=None
+                )
+            except KrakenWebsocketTimeout as exc:
+                raise KrakenWSTimeout(str(exc)) from exc
+            except KrakenWebsocketError as exc:
+                raise KrakenWSError(str(exc)) from exc
+            if isinstance(result, OrderAck):
+                return result
+            txid: Any = None
+            status: Any = None
+            errors: Any = None
+            if isinstance(result, dict):
+                txid = result.get("txid")
+                status = result.get("status")
+                errors = result.get("error") or result.get("errors")
+            if isinstance(errors, str):
+                errors = [errors]
+            return OrderAck(
+                exchange_order_id=str(txid) if txid else None,
+                status=status or "ok",
+                filled_qty=None,
+                avg_price=None,
+                errors=errors,
+            )
+
         async def fetch_open_orders_snapshot(self) -> List[Dict[str, Any]]:
             payload = await asyncio.to_thread(self._inner.open_orders)
             return _extract_open_orders(payload) if isinstance(payload, dict) else []
@@ -572,7 +605,74 @@ async def _submit_order(
         raise HTTPException(
             status.HTTP_502_BAD_GATEWAY,
             detail=str(rest_exc),
-        ) from rest_exc
+            ) from rest_exc
+
+
+async def _cancel_order(
+    ws_client: KrakenWSClient,
+    rest_client: KrakenRESTClient,
+    payload: Dict[str, Any],
+) -> Tuple[OrderAck, str]:
+    try:
+        ack = await ws_client.cancel_order(payload)
+        return ack, "websocket"
+    except (KrakenWSError, KrakenWSTimeout) as ws_error:
+        try:
+            ack = await rest_client.cancel_order(payload)
+            return ack, "rest"
+        except KrakenRESTError as rest_exc:
+            if isinstance(ws_error, KrakenWSTimeout):
+                raise HTTPException(
+                    status.HTTP_504_GATEWAY_TIMEOUT,
+                    detail="Kraken websocket request timed out",
+                ) from rest_exc
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY,
+                detail=str(rest_exc),
+            ) from rest_exc
+
+
+class CancelOrderRequest(BaseModel):
+    account_id: str = Field(..., description="Trading account identifier")
+    client_id: str = Field(..., description="Idempotent client identifier")
+    exchange_order_id: Optional[str] = Field(
+        None,
+        description="Kraken exchange order id (txid)",
+        alias="txid",
+    )
+
+    model_config = {"populate_by_name": True}
+
+
+class CancelOrderResponse(BaseModel):
+    exchange_order_id: str = Field(..., description="Kraken order identifier (txid)")
+    status: str = Field(..., description="Cancellation status reported by Kraken")
+    filled_qty: Optional[float] = Field(
+        None, description="Optional filled quantity returned by Kraken"
+    )
+    avg_price: Optional[float] = Field(
+        None, description="Optional average price returned by Kraken"
+    )
+    errors: Optional[List[str]] = Field(
+        None, description="Errors reported by Kraken during cancellation"
+    )
+
+
+class AccountBalancesResponse(BaseModel):
+    account_id: str = Field(..., description="Trading account identifier")
+    balances: Dict[str, float] = Field(
+        default_factory=dict, description="Asset balances keyed by currency"
+    )
+    net_asset_value: Optional[float] = Field(
+        None, description="Optional net asset value reported by Kraken"
+    )
+    timestamp: str = Field(..., description="Timestamp when the snapshot was taken")
+
+
+class AccountTradesResponse(BaseModel):
+    trades: List[Dict[str, Any]] = Field(
+        default_factory=list, description="Recent Kraken trade executions"
+    )
 
 
 def _ensure_ack_success(ack: OrderAck, transport: str) -> None:
@@ -746,6 +846,158 @@ def _kraken_flags(request: OrderPlacementRequest) -> List[str]:
     if request.reduce_only:
         flags.append("reduce_only")
     return flags
+
+
+def _maybe_to_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_timestamp_value(value: Any) -> str:
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                parsed = datetime.fromtimestamp(float(value), tz=timezone.utc)
+            except (TypeError, ValueError):
+                return value
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).isoformat()
+    if isinstance(value, (int, float)):
+        try:
+            parsed = datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            return datetime.now(timezone.utc).isoformat()
+        return parsed.isoformat()
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _extract_balances(payload: Dict[str, Any]) -> Tuple[Dict[str, float], Optional[float]]:
+    sources: List[Dict[str, Any]] = []
+    balances: Dict[str, float] = {}
+    nav: Optional[float] = None
+
+    if isinstance(payload.get("result"), dict):
+        sources.append(payload["result"])
+    if isinstance(payload.get("balances"), dict):
+        sources.append(payload["balances"])
+    if not sources and isinstance(payload, dict):
+        sources.append(payload)
+
+    for source in sources:
+        raw_balances = source.get("balances") if isinstance(source.get("balances"), dict) else source
+        if isinstance(raw_balances, dict):
+            for asset, amount in raw_balances.items():
+                parsed = _maybe_to_float(amount)
+                if parsed is not None:
+                    balances[str(asset).upper()] = parsed
+        else:
+            for asset, amount in source.items():
+                if asset in {"net_asset_value", "nav", "timestamp", "equity", "portfolio_value", "total_value"}:
+                    continue
+                parsed = _maybe_to_float(amount)
+                if parsed is not None:
+                    balances[str(asset).upper()] = parsed
+
+        nav_candidates = [
+            source.get("net_asset_value"),
+            source.get("nav"),
+            source.get("equity"),
+            source.get("portfolio_value"),
+            source.get("total_value"),
+        ]
+        for candidate in nav_candidates:
+            parsed_nav = _maybe_to_float(candidate)
+            if parsed_nav is not None:
+                nav = parsed_nav
+                break
+        if balances:
+            break
+
+    return balances, nav
+
+
+def _cancel_ack_payload(
+    ack: OrderAck,
+    *,
+    fallback_txid: Optional[str] = None,
+) -> CancelOrderResponse:
+    errors = [str(error) for error in ack.errors or [] if str(error)]
+    if errors:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            detail=", ".join(errors),
+        )
+    status_value = (ack.status or "").strip() or "canceled"
+    normalized_status = status_value.lower()
+    if normalized_status not in {"ok", "canceled", "cancelled"}:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            detail=f"Kraken cancel rejected order: {ack.status}",
+        )
+    order_id = ack.exchange_order_id or fallback_txid
+    if not order_id:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            detail="Kraken did not confirm cancellation for the requested order.",
+        )
+    payload: Dict[str, Any] = {
+        "exchange_order_id": str(order_id),
+        "status": status_value,
+    }
+    if ack.filled_qty is not None:
+        payload["filled_qty"] = float(ack.filled_qty)
+    if ack.avg_price is not None:
+        payload["avg_price"] = float(ack.avg_price)
+    return CancelOrderResponse(**payload)
+
+
+def _extract_balance_timestamp(payload: Dict[str, Any]) -> str:
+    candidates: List[Dict[str, Any]] = []
+    if isinstance(payload.get("result"), dict):
+        candidates.append(payload["result"])
+    if isinstance(payload, dict):
+        candidates.append(payload)
+
+    for candidate in candidates:
+        for key in ("timestamp", "as_of", "time"):
+            value = candidate.get(key)
+            if value is not None:
+                return _normalize_timestamp_value(value)
+    return datetime.now(timezone.utc).isoformat()
+
+
+async def _fetch_account_trades(
+    ws_client: KrakenWSClient,
+    rest_client: KrakenRESTClient,
+) -> Tuple[List[Dict[str, Any]], str]:
+    try:
+        trades = await ws_client.fetch_own_trades_snapshot()
+        return trades, "websocket"
+    except (KrakenWSError, KrakenWSTimeout) as ws_error:
+        try:
+            payload = await rest_client.own_trades()
+        except KrakenRESTError as rest_exc:
+            if isinstance(ws_error, KrakenWSTimeout):
+                raise HTTPException(
+                    status.HTTP_504_GATEWAY_TIMEOUT,
+                    detail="Kraken websocket request timed out",
+                ) from rest_exc
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY,
+                detail=str(rest_exc),
+            ) from rest_exc
+        return _extract_trades(payload), "rest"
+
+
 
 
 @app.post("/oms/place", response_model=OrderPlacementResponse)
@@ -968,6 +1220,120 @@ async def place_order(
     accepted = (not status_value) or status_value in _SUCCESS_STATUSES
     venue = "kraken"
     return OrderPlacementResponse(accepted=accepted, routed_venue=venue, fee=request.fee)
+
+
+@app.post("/oms/cancel", response_model=CancelOrderResponse)
+async def cancel_order(
+    request: CancelOrderRequest,
+    header_account: str = Depends(require_admin_account),
+) -> CancelOrderResponse:
+    if request.account_id != header_account:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account mismatch between header and payload.",
+        )
+
+    if not request.exchange_order_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="exchange_order_id is required for Kraken cancellations.",
+        )
+
+    async with _acquire_kraken_clients(request.account_id) as clients:
+        credentials = await clients.credential_getter()
+        try:
+            _ensure_credentials_valid(credentials)
+        except KrakenCredentialExpired as exc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=str(exc),
+            ) from exc
+
+        ack, _ = await _cancel_order(
+            clients.ws_client,
+            clients.rest_client,
+            {"txid": request.exchange_order_id},
+        )
+
+    return _cancel_ack_payload(ack, fallback_txid=request.exchange_order_id)
+
+
+@app.get(
+    "/oms/accounts/{account_id}/balances",
+    response_model=AccountBalancesResponse,
+)
+async def get_account_balances(
+    account_id: str,
+    header_account: str = Depends(require_admin_account),
+) -> AccountBalancesResponse:
+    if account_id != header_account:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account mismatch between header and path.",
+        )
+
+    async with _acquire_kraken_clients(account_id) as clients:
+        credentials = await clients.credential_getter()
+        try:
+            _ensure_credentials_valid(credentials)
+        except KrakenCredentialExpired as exc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=str(exc),
+            ) from exc
+
+        try:
+            payload = await clients.rest_client.balance()
+        except KrakenRESTError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=str(exc),
+            ) from exc
+
+    balances, nav = _extract_balances(payload)
+    timestamp = _extract_balance_timestamp(payload)
+
+    response = AccountBalancesResponse(
+        account_id=account_id,
+        balances=balances,
+        timestamp=timestamp,
+    )
+    if nav is not None:
+        response.net_asset_value = nav
+    return response
+
+
+@app.get(
+    "/oms/accounts/{account_id}/trades",
+    response_model=AccountTradesResponse,
+)
+async def get_account_trades(
+    account_id: str,
+    limit: int = Query(50, ge=1, le=500),
+    header_account: str = Depends(require_admin_account),
+) -> AccountTradesResponse:
+    if account_id != header_account:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account mismatch between header and path.",
+        )
+
+    async with _acquire_kraken_clients(account_id) as clients:
+        credentials = await clients.credential_getter()
+        try:
+            _ensure_credentials_valid(credentials)
+        except KrakenCredentialExpired as exc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=str(exc),
+            ) from exc
+
+        trades, _ = await _fetch_account_trades(
+            clients.ws_client,
+            clients.rest_client,
+        )
+
+    return AccountTradesResponse(trades=trades[:limit])
 
 
 @app.get("/oms/shadow_pnl")
