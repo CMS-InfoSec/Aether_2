@@ -7,8 +7,9 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi.responses import JSONResponse
 
-from kill_alerts import dispatch_notifications
+from kill_alerts import NotificationDispatchError, dispatch_notifications
 from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
 from services.common.security import require_admin_account
 
@@ -85,12 +86,25 @@ def trigger_kill_switch(
         },
     )
 
-    channels_sent: List[str] = dispatch_notifications(
-        account_id=normalized_account,
-        reason_code=reason_code.value,
-        triggered_at=activation_ts,
-        extra_metadata={"actor": actor_account},
-    )
+    response_status = "ok"
+    http_status = status.HTTP_200_OK
+    failed_channels: List[str] = []
+    try:
+        channels_sent: List[str] = dispatch_notifications(
+            account_id=normalized_account,
+            reason_code=reason_code.value,
+            triggered_at=activation_ts,
+            extra_metadata={"actor": actor_account},
+        )
+    except NotificationDispatchError as exc:
+        channels_sent = list(exc.delivered)
+        failed_channels = sorted(exc.failed.keys())
+        response_status = "partial"
+        http_status = status.HTTP_207_MULTI_STATUS
+        LOGGER.error(
+            "Kill switch notifications partially delivered",
+            extra={"delivered": channels_sent, "failed": failed_channels},
+        )
 
     timescale.record_kill_event(
         reason_code=reason_code.value,
@@ -109,6 +123,7 @@ def trigger_kill_switch(
                     "reason_code": reason_code.value,
                     "reason": reason_description,
                     "channels_sent": channels_sent,
+                    "failed_channels": failed_channels,
                     "triggered_at": activation_ts.isoformat(),
                 },
                 ip_hash=hash_ip(request.client.host if request.client else None),
@@ -118,12 +133,18 @@ def trigger_kill_switch(
                 "Failed to record audit log for kill switch activation on %s", normalized_account
             )
 
-    return {
-        "status": "ok",
+    response_body = {
+        "status": response_status,
         "ts": activation_ts.isoformat(),
         "reason_code": reason_code.value,
         "channels_sent": channels_sent,
+        "failed_channels": failed_channels,
     }
+
+    if http_status != status.HTTP_200_OK:
+        return JSONResponse(status_code=http_status, content=response_body)
+
+    return response_body
 
 
 @app.get("/risk/kill_events")
