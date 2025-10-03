@@ -21,7 +21,6 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from auth.service import (
-    InMemorySessionStore,
     RedisSessionStore,
     SessionStoreProtocol,
 )
@@ -74,14 +73,18 @@ from metrics import (
 def _build_session_store_from_env() -> SessionStoreProtocol:
     ttl_minutes = int(os.getenv("SESSION_TTL_MINUTES", "60"))
     redis_url = os.getenv("SESSION_REDIS_URL")
-    if redis_url:
-        try:  # pragma: no cover - optional dependency for redis-backed sessions
-            import redis  # type: ignore[import-not-found]
-        except ImportError as exc:  # pragma: no cover - surfaced when redis missing
-            raise RuntimeError("redis package is required when SESSION_REDIS_URL is set") from exc
-        client = redis.Redis.from_url(redis_url)
-        return RedisSessionStore(client, ttl_minutes=ttl_minutes)
-    return InMemorySessionStore(ttl_minutes=ttl_minutes)
+    if not redis_url:
+        raise RuntimeError(
+            "SESSION_REDIS_URL is not configured. Provide a shared session store DSN to enable OMS authentication.",
+        )
+
+    try:  # pragma: no cover - optional dependency for redis-backed sessions
+        import redis  # type: ignore[import-not-found]
+    except ImportError as exc:  # pragma: no cover - surfaced when redis missing
+        raise RuntimeError("redis package is required when SESSION_REDIS_URL is set") from exc
+
+    client = redis.Redis.from_url(redis_url)
+    return RedisSessionStore(client, ttl_minutes=ttl_minutes)
 
 
 def _attach_auth_service(store: SessionStoreProtocol) -> object | None:
