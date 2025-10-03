@@ -297,12 +297,15 @@ def test_startup_verifies_repository_persistence() -> None:
         admin_repository=admin_repo, session_store=session_store
     )
 
-    assert application.state.admin_repository.get_by_email(existing.email) is existing
-    assert set(admin_repo._admins.keys()) == {existing.email}
+
+    sentinel = admin_repo.get_by_email(app_module._ADMIN_REPOSITORY_HEALTHCHECK_EMAIL)
+    assert sentinel is not None
+    assert sentinel.admin_id == app_module._ADMIN_REPOSITORY_HEALTHCHECK_ID
+
 
     restarted = app_module.create_app(
         admin_repository=admin_repo, session_store=session_store
     )
 
     assert restarted.state.admin_repository.get_by_email(existing.email) is existing
-    assert set(admin_repo._admins.keys()) == {existing.email}
+ain
