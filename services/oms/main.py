@@ -633,11 +633,13 @@ async def place_order(
             ack_latency_ms,
         )
 
+
         try:
             _ensure_ack_success(ack, transport)
         except HTTPException as exc:
             increment_trade_rejection(account_id, request.instrument)
             raise
+
 
         open_orders = await _fetch_open_orders(
             clients.ws_client,
@@ -664,10 +666,12 @@ async def place_order(
     kafka.publish(topic="oms.acks", payload=ack_payload)
 
     status_value = str(ack_payload.get("status", "")).lower()
+
     if status_value and status_value not in _SUCCESS_STATUSES:
         increment_trade_rejection(account_id, request.instrument)
 
     trades_snapshot = {"trades": trades}
+
     for trade in trades_snapshot.get("trades", []):
         fill_payload = {
             "order_id": request.order_id,
@@ -731,7 +735,7 @@ async def place_order(
         timescale.record_shadow_fill(shadow_fill)
 
     venue = "kraken"
-    return OrderPlacementResponse(accepted=True, routed_venue=venue, fee=request.fee)
+    return OrderPlacementResponse(accepted=accepted, routed_venue=venue, fee=request.fee)
 
 
 @app.get("/oms/shadow_pnl")

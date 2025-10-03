@@ -38,7 +38,11 @@ from services.oms.kraken_ws import (
 from services.oms.routing import LatencyRouter
 from services.oms.rate_limit_guard import rate_limit_guard
 from services.oms.warm_start import WarmStartCoordinator
-from shared.sim_mode import SimulatedOrderSnapshot, sim_broker, sim_mode_repository
+from shared.sim_mode import (
+    SimulatedOrderSnapshot,
+    sim_broker as sim_mode_broker,
+    sim_mode_repository,
+)
 
 
 import websockets
@@ -53,7 +57,11 @@ from metrics import (
     setup_metrics,
 )
 from shared.correlation import get_correlation_id
-from shared.simulation import SimulatedOrder, sim_broker, sim_mode_state
+from shared.simulation import (
+    SimulatedOrder,
+    sim_broker as simulation_broker,
+    sim_mode_state,
+)
 
 
 
@@ -725,7 +733,9 @@ class AccountContext:
         self._balances_lock = asyncio.Lock()
         self.routing = LatencyRouter(account_id)
 
-        self._sim_broker = sim_broker
+        self._simulation_broker = simulation_broker
+        self._sim_mode_broker = sim_mode_broker
+        self._sim_mode_repo = sim_mode_repository
 
         self._impact_store: ImpactAnalyticsStore = impact_store
         self._reconcile_task: Optional[asyncio.Task[None]] = None
@@ -1407,7 +1417,7 @@ class AccountContext:
             payload = self._build_payload(request, qty, px, metadata)
             client_id_used = payload.get("clientOrderId", request.client_id)
             correlation_id = get_correlation_id()
-            simulated: SimulatedOrder = await self._sim_broker.place_order(
+            simulated: SimulatedOrder = await self._simulation_broker.place_order(
                 account_id=self.account_id,
                 payload=payload,
                 correlation_id=correlation_id,
@@ -2179,6 +2189,7 @@ class AccountContext:
             pre_trade_mid=snapshot.pre_trade_mid,
             recorded_qty=response.filled_qty,
             requested_qty=snapshot.qty,
+            origin="SIM",
         )
 
     async def _store_sim_record(self, record: OrderRecord) -> None:
@@ -2187,11 +2198,15 @@ class AccountContext:
 
     async def _lookup_sim_snapshot(self, client_id: str) -> SimulatedOrderSnapshot | None:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._sim_broker.lookup, self.account_id, client_id)
+        return await loop.run_in_executor(
+            None, self._sim_mode_broker.lookup, self.account_id, client_id
+        )
 
     async def _cancel_sim_order(self, client_id: str) -> SimulatedOrderSnapshot | None:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._sim_broker.cancel_order, self.account_id, client_id)
+        return await loop.run_in_executor(
+            None, self._sim_mode_broker.cancel_order, self.account_id, client_id
+        )
 
     async def _execute_simulated_order(
         self, request: OMSPlaceRequest, qty: Decimal, limit_px: Optional[Decimal]
@@ -2199,7 +2214,7 @@ class AccountContext:
         loop = asyncio.get_running_loop()
         execution = await loop.run_in_executor(
             None,
-            self._sim_broker.place_order,
+            self._sim_mode_broker.place_order,
             request.account_id,
             request.client_id,
             request.symbol,
