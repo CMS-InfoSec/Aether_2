@@ -6,8 +6,9 @@ on:
     branches:
       - main
     paths:
-      - 'services/**'
-      - 'Dockerfile*'
+      - 'deploy/docker/risk-api/**'
+      - 'deploy/docker/risk-ingestor/**'
+      - 'deploy/docker/kraken-ws-ingest/**'
 
 jobs:
   kaniko-build:
