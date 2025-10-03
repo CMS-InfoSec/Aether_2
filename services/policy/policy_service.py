@@ -6,7 +6,7 @@ import time
 from dataclasses import asdict, is_dataclass
 from typing import Any, Dict, List, Optional, Union
 
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
 
 try:  # pragma: no cover - optional dependency
@@ -100,6 +100,8 @@ def _to_float(value: Any, *, default: float = 0.0) -> float:
         return default
 
 
+from auth.service import InMemorySessionStore, SessionStoreProtocol
+
 from metrics import (
     observe_policy_inference_latency,
     record_abstention_rate,
@@ -107,7 +109,8 @@ from metrics import (
     setup_metrics,
     traced_span,
 )
-from services.common.security import ADMIN_ACCOUNTS
+from services.common import security
+from services.common.security import ADMIN_ACCOUNTS, require_admin_account
 from services.policy.trade_intensity_controller import (
     controller as trade_intensity_controller,
 )
@@ -243,9 +246,32 @@ app = FastAPI(title="Policy Service", version=APP_VERSION)
 setup_metrics(app, service_name="policy-service")
 
 
+def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
+    existing = getattr(application.state, "session_store", None)
+    if isinstance(existing, SessionStoreProtocol):
+        store = existing
+    else:
+        store = InMemorySessionStore()
+        application.state.session_store = store
+    security.set_default_session_store(store)
+    return store
+
+
+SESSION_STORE = _configure_session_store(app)
+
+
 @app.post("/policy/decide", response_model=PolicyIntent, status_code=status.HTTP_200_OK)
-def decide_policy_intent(request: PolicyDecisionRequest) -> PolicyIntent:
+def decide_policy_intent(
+    request: PolicyDecisionRequest,
+    caller_account: str = Depends(require_admin_account),
+) -> PolicyIntent:
     """Generate a policy intent decision from the provided market and account context."""
+
+    if caller_account != request.account_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account mismatch between authenticated session and payload.",
+        )
 
     if models is None or not hasattr(models, "predict_intent"):
         raise HTTPException(
