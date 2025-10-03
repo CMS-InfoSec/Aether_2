@@ -12,6 +12,10 @@ on:
 env:
   REGISTRY: ghcr.io/aether
 
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   kaniko:
     name: Kaniko Build
@@ -19,7 +23,25 @@ jobs:
     if: ${{ hashFiles('deploy/docker/kraken-ws-ingest/Dockerfile') != '' && hashFiles('deploy/docker/risk-api/Dockerfile') != '' }}
     steps:
       - uses: actions/checkout@v4
-      - name: Build Kraken WS Ingest image
+
+      - name: Authenticate to GHCR for Kaniko
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          mkdir -p /kaniko/.docker
+          AUTH_TOKEN=$(printf '%s' "${GHCR_USER}:${GHCR_TOKEN}" | base64 | tr -d '\n')
+          cat <<EOF >/kaniko/.docker/config.json
+          {
+            "auths": {
+              "ghcr.io": {
+                "auth": "${AUTH_TOKEN}"
+              }
+            }
+          }
+          EOF
+      - name: Build Order Gateway image
+
         uses: addnab/docker-run-action@v3
         with:
           image: gcr.io/kaniko-project/executor:v1.18.0
