@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Dict
@@ -16,22 +17,38 @@ from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
 from services.secrets import secrets_service
 from services.secrets.secure_secrets import EncryptedSecretEnvelope, SecretsMetadataStore
 from services.oms import main as oms_main
-from services.oms.kraken_client import KrakenWSClient, _LoopbackSession
+from services.oms.kraken_ws import OrderAck
 from services.oms.oms_kraken import KrakenCredentialWatcher
 from shared.k8s import KrakenSecretStore
 
 
-class _RecordingKrakenWSClient(KrakenWSClient):
-    """Kraken client wrapper that records credential material used for sessions."""
+class _RecordingKrakenWSClient:
+    """Stub websocket client that records credential snapshots."""
 
     last_session_credentials: Dict[str, Any] | None = None
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:  # noqa: D401 - constructor shim
-        def _recording_factory(credentials: Dict[str, Any]) -> Any:
-            _RecordingKrakenWSClient.last_session_credentials = dict(credentials)
-            return _LoopbackSession(credentials)
+    def __init__(self, credential_getter: Any) -> None:
+        self._credential_getter = credential_getter
 
-        super().__init__(*args, session_factory=_recording_factory, **kwargs)
+    async def add_order(self, payload: Dict[str, Any]) -> OrderAck:
+        credentials = await self._credential_getter()
+        _RecordingKrakenWSClient.last_session_credentials = dict(credentials)
+        return OrderAck(
+            exchange_order_id="SIM-ROTATE",
+            status="ok",
+            filled_qty=None,
+            avg_price=None,
+            errors=None,
+        )
+
+    async def fetch_open_orders_snapshot(self) -> list[Dict[str, Any]]:
+        return []
+
+    async def fetch_own_trades_snapshot(self) -> list[Dict[str, Any]]:
+        return []
+
+    async def close(self) -> None:
+        return None
 
 
 class _FakeCoreV1Api:
@@ -138,7 +155,51 @@ def test_rotate_secret_triggers_oms_reload(monkeypatch: pytest.MonkeyPatch, capl
     secrets_service.app.dependency_overrides[
         secrets_service.require_dual_director_confirmation
     ] = lambda: ("director-a", "director-b")
-    monkeypatch.setattr(oms_main, "KrakenWSClient", _RecordingKrakenWSClient)
+    @asynccontextmanager
+    async def _recording_factory(account: str):
+        watcher = KrakenCredentialWatcher.instance(account)
+
+        async def _credentials() -> Dict[str, Any]:
+            payload, _ = watcher.snapshot()
+            credentials = dict(payload)
+            metadata = credentials.setdefault("metadata", {})
+            metadata.setdefault("rotated_at", datetime.now(timezone.utc).isoformat())
+            metadata.setdefault("last_rotated_at", metadata["rotated_at"])
+            return credentials
+
+        ws_client = _RecordingKrakenWSClient(_credentials)
+
+        class _StubREST:
+            async def add_order(self, payload: Dict[str, Any]) -> OrderAck:
+                return OrderAck(
+                    exchange_order_id="REST-ROTATE",
+                    status="ok",
+                    filled_qty=None,
+                    avg_price=None,
+                    errors=None,
+                )
+
+            async def open_orders(self) -> Dict[str, Any]:
+                return {"result": {"open": []}}
+
+            async def own_trades(self) -> Dict[str, Any]:
+                return {"result": {"trades": {}}}
+
+            async def close(self) -> None:
+                return None
+
+        rest_client = _StubREST()
+        try:
+            yield oms_main.KrakenClientBundle(  # type: ignore[attr-defined]
+                credential_getter=_credentials,
+                ws_client=ws_client,  # type: ignore[arg-type]
+                rest_client=rest_client,  # type: ignore[arg-type]
+            )
+        finally:
+            await ws_client.close()
+            await rest_client.close()
+
+    monkeypatch.setattr(oms_main.app.state, "kraken_client_factory", _recording_factory)
 
     try:
         with TestClient(secrets_service.app, base_url="https://testserver") as secrets_client:

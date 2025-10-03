@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
-import asyncio
-from contextlib import suppress
+import sys
+from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 import time
-from typing import Any, Dict, List
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from fastapi import Depends, FastAPI, HTTPException, status
 
@@ -16,17 +18,33 @@ from services.common.schemas import OrderPlacementRequest, OrderPlacementRespons
 from services.common.security import require_admin_account
 from services.oms.kraken_client import (
     KrakenCredentialExpired,
-    KrakenWSClient,
     KrakenWebsocketError,
+    KrakenWebsocketTimeout,
+    SECRET_MAX_AGE,
 )
+from services.oms.kraken_rest import KrakenRESTClient, KrakenRESTError
+from services.oms.kraken_ws import (
+    KrakenWSError,
+    KrakenWSTimeout,
+    KrakenWSClient,
+    OrderAck,
+    _WebsocketTransport,
+)
+from services.oms.oms_kraken import KrakenCredentialWatcher
 from services.oms.rate_limit_guard import rate_limit_guard
 from services.oms.shadow_oms import shadow_oms
 from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
 
+try:  # pragma: no cover - optional dependency during tests
+    import websockets
+    from websockets import WebSocketClientProtocol
+except Exception:  # pragma: no cover - fallback for environments without websockets
+    websockets = None  # type: ignore[assignment]
+    WebSocketClientProtocol = object  # type: ignore[misc, assignment]
+
 from metrics import (
     increment_trade_rejection,
-    record_oms_submit_ack,
-    record_ws_latency,
+    record_oms_latency,
     setup_metrics,
 )
 
@@ -39,6 +57,27 @@ setup_metrics(app)
 
 
 logger = logging.getLogger(__name__)
+
+
+async def _production_transport_factory(
+    url: str, *, headers: Optional[Dict[str, str]] = None
+) -> _WebsocketTransport:
+    """Establish a production Kraken websocket transport."""
+
+    if websockets is None:  # pragma: no cover - runtime guard
+        raise RuntimeError("websockets module unavailable for Kraken transport")
+    protocol: WebSocketClientProtocol = await websockets.connect(  # type: ignore[assignment]
+        url,
+        ping_interval=None,
+        extra_headers=headers,
+    )
+    return _WebsocketTransport(protocol)
+
+
+if not hasattr(app.state, "kraken_transport_factory"):
+    app.state.kraken_transport_factory = _production_transport_factory
+if not hasattr(app.state, "kraken_client_factory"):
+    app.state.kraken_client_factory = None
 
 
 shutdown_manager = setup_graceful_shutdown(
@@ -165,6 +204,317 @@ MARKET_METADATA: Dict[str, Dict[str, float]] = {
 }
 
 
+_SUCCESS_STATUSES = {"ok", "accepted", "open"}
+
+
+@dataclass
+class KrakenClientBundle:
+    credential_getter: Callable[[], Awaitable[Dict[str, Any]]]
+    ws_client: KrakenWSClient
+    rest_client: KrakenRESTClient
+
+
+def _make_credential_getter(account_id: str) -> Callable[[], Awaitable[Dict[str, Any]]]:
+    watcher = KrakenCredentialWatcher.instance(account_id)
+
+    async def _get_credentials() -> Dict[str, Any]:
+        payload, _ = watcher.snapshot()
+        credentials = dict(payload)
+        credentials.setdefault("account_id", account_id)
+        return credentials
+
+    return _get_credentials
+
+
+def _credentials_expired(credentials: Dict[str, Any]) -> bool:
+    metadata = credentials.get("metadata") if isinstance(credentials, dict) else None
+    rotated_at = None
+    if isinstance(metadata, dict):
+        rotated_at = metadata.get("rotated_at") or metadata.get("last_rotated_at")
+        if rotated_at is None:
+            annotations = metadata.get("annotations")
+            if isinstance(annotations, dict):
+                rotated_at = annotations.get("aether.kraken/lastRotatedAt")
+
+    if rotated_at is None:
+        return True
+
+    if isinstance(rotated_at, datetime):
+        timestamp = rotated_at
+    elif isinstance(rotated_at, str):
+        try:
+            timestamp = datetime.fromisoformat(rotated_at.replace("Z", "+00:00"))
+        except ValueError:
+            return True
+    else:
+        return True
+
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+
+    now = datetime.now(timezone.utc)
+    return now - timestamp > SECRET_MAX_AGE
+
+
+def _ensure_credentials_valid(credentials: Dict[str, Any]) -> None:
+    api_key = credentials.get("api_key")
+    api_secret = credentials.get("api_secret")
+    if not api_key or not api_secret:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Kraken credentials unavailable.",
+        )
+    if _credentials_expired(credentials):
+        raise KrakenCredentialExpired(
+            "Kraken API credentials have expired; rotation required before trading."
+        )
+
+
+@asynccontextmanager
+async def _default_client_factory(account_id: str) -> AsyncIterator[KrakenClientBundle]:
+    credential_getter = _make_credential_getter(account_id)
+    rest_client = KrakenRESTClient(credential_getter=credential_getter)
+    transport_factory = getattr(
+        app.state, "kraken_transport_factory", _production_transport_factory
+    ) or _production_transport_factory
+    ws_ctor = getattr(sys.modules[__name__], "KrakenWSClient")
+    ws_client = ws_ctor(
+        credential_getter=credential_getter,
+        rest_client=rest_client,
+        transport_factory=transport_factory,
+        account_id=account_id,
+    )
+    ws_client = _normalize_ws_client(ws_client)
+    try:
+        yield KrakenClientBundle(
+            credential_getter=credential_getter,
+            ws_client=ws_client,
+            rest_client=rest_client,
+        )
+    finally:
+        await ws_client.close()
+        await rest_client.close()
+
+
+@asynccontextmanager
+async def _acquire_kraken_clients(account_id: str) -> AsyncIterator[KrakenClientBundle]:
+    factory = getattr(app.state, "kraken_client_factory", None)
+    if factory is None:
+        factory = _default_client_factory
+    async with factory(account_id) as bundle:
+        yield bundle
+
+
+def _normalize_ws_client(client: Any) -> Any:
+    add_order = getattr(client, "add_order", None)
+    if asyncio.iscoroutinefunction(add_order):
+        return client
+
+    class _SyncAdapter:
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+
+        async def add_order(self, payload: Dict[str, Any]) -> OrderAck:
+            try:
+                result = await asyncio.to_thread(
+                    self._inner.add_order, payload, timeout=None
+                )
+            except KrakenWebsocketTimeout as exc:
+                raise KrakenWSTimeout(str(exc)) from exc
+            except KrakenWebsocketError as exc:
+                raise KrakenWSError(str(exc)) from exc
+            if isinstance(result, OrderAck):
+                return result
+            txid: Any = None
+            status: Any = None
+            errors: Any = None
+            if isinstance(result, dict):
+                txid = result.get("txid")
+                status = result.get("status")
+                errors = result.get("error") or result.get("errors")
+            if isinstance(errors, str):
+                errors = [errors]
+            return OrderAck(
+                exchange_order_id=str(txid) if txid else None,
+                status=status or "ok",
+                filled_qty=None,
+                avg_price=None,
+                errors=errors,
+            )
+
+        async def fetch_open_orders_snapshot(self) -> List[Dict[str, Any]]:
+            payload = await asyncio.to_thread(self._inner.open_orders)
+            return _extract_open_orders(payload) if isinstance(payload, dict) else []
+
+        async def fetch_own_trades_snapshot(self) -> List[Dict[str, Any]]:
+            payload = await asyncio.to_thread(self._inner.own_trades)
+            return _extract_trades(payload) if isinstance(payload, dict) else []
+
+        async def close(self) -> None:
+            close = getattr(self._inner, "close", None)
+            if close is None:
+                return
+            await asyncio.to_thread(close)
+
+    return _SyncAdapter(client)
+
+
+async def _submit_order(
+    ws_client: KrakenWSClient,
+    rest_client: KrakenRESTClient,
+    payload: Dict[str, Any],
+) -> Tuple[OrderAck, str]:
+    try:
+        ack = await ws_client.add_order(payload)
+        return ack, "websocket"
+    except (KrakenWSError, KrakenWSTimeout) as exc:
+        ws_error = exc
+    try:
+        ack = await rest_client.add_order(payload)
+        return ack, "rest"
+    except KrakenRESTError as rest_exc:
+        if isinstance(ws_error, KrakenWSTimeout):
+            raise HTTPException(
+                status.HTTP_504_GATEWAY_TIMEOUT,
+                detail="Kraken websocket request timed out",
+            ) from rest_exc
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            detail=str(rest_exc),
+        ) from rest_exc
+
+
+def _ensure_ack_success(ack: OrderAck, transport: str) -> None:
+    errors = ack.errors or []
+    if errors:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            detail=", ".join(str(err) for err in errors),
+        )
+    status_value = (ack.status or "").lower()
+    if status_value and status_value not in _SUCCESS_STATUSES:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            detail=f"Kraken {transport} rejected order: {ack.status}",
+        )
+    if not ack.exchange_order_id:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            detail="Kraken did not return an order identifier.",
+        )
+
+
+def _ack_payload(
+    ack: OrderAck,
+    *,
+    request: OrderPlacementRequest,
+    transport: str,
+    snapped_price: float,
+    snapped_quantity: float,
+    flags: str,
+    open_orders: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "order_id": request.order_id,
+        "txid": ack.exchange_order_id,
+        "status": ack.status or "ok",
+        "transport": transport,
+        "price": snapped_price,
+        "quantity": snapped_quantity,
+        "flags": flags,
+        "open_orders": open_orders,
+    }
+    if ack.filled_qty is not None:
+        payload["filled_qty"] = float(ack.filled_qty)
+    if ack.avg_price is not None:
+        payload["avg_price"] = float(ack.avg_price)
+    if ack.errors:
+        payload["errors"] = list(ack.errors)
+    return payload
+
+
+async def _fetch_open_orders(
+    ws_client: KrakenWSClient,
+    rest_client: KrakenRESTClient,
+) -> List[Dict[str, Any]]:
+    try:
+        return await ws_client.fetch_open_orders_snapshot()
+    except (KrakenWSError, KrakenWSTimeout):
+        try:
+            payload = await rest_client.open_orders()
+        except KrakenRESTError as exc:
+            logger.debug("Failed to fetch open orders via REST: %s", exc)
+            return []
+        return _extract_open_orders(payload)
+
+
+def _extract_open_orders(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    candidates: List[Any] = []
+    open_section = payload.get("open")
+    if isinstance(open_section, list):
+        candidates.extend(open_section)
+    elif isinstance(open_section, dict):
+        candidates.extend(open_section.values())
+    result = payload.get("result")
+    if isinstance(result, dict):
+        nested = result.get("open")
+        if isinstance(nested, list):
+            candidates.extend(nested)
+        elif isinstance(nested, dict):
+            candidates.extend(nested.values())
+    orders: List[Dict[str, Any]] = []
+    for entry in candidates:
+        if isinstance(entry, dict):
+            orders.append(entry)
+    return orders
+
+
+async def _fetch_own_trades(
+    ws_client: KrakenWSClient,
+    rest_client: KrakenRESTClient,
+    txid: Optional[str],
+) -> List[Dict[str, Any]]:
+    trades: List[Dict[str, Any]]
+    try:
+        trades = await ws_client.fetch_own_trades_snapshot()
+    except (KrakenWSError, KrakenWSTimeout):
+        try:
+            payload = await rest_client.own_trades()
+        except KrakenRESTError as exc:
+            logger.debug("Failed to fetch own trades via REST: %s", exc)
+            return []
+        trades = _extract_trades(payload)
+    if not txid:
+        return trades
+    matched: List[Dict[str, Any]] = []
+    for trade in trades:
+        order_ref = trade.get("order_id") or trade.get("ordertxid") or trade.get("txid")
+        if order_ref and str(order_ref) == str(txid):
+            matched.append(trade)
+    return matched
+
+
+def _extract_trades(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    candidates: List[Any] = []
+    trades_section = payload.get("trades")
+    if isinstance(trades_section, list):
+        candidates.extend(trades_section)
+    elif isinstance(trades_section, dict):
+        candidates.extend(trades_section.values())
+    result = payload.get("result")
+    if isinstance(result, dict):
+        nested = result.get("trades")
+        if isinstance(nested, list):
+            candidates.extend(nested)
+        elif isinstance(nested, dict):
+            candidates.extend(nested.values())
+    trades: List[Dict[str, Any]] = []
+    for entry in candidates:
+        if isinstance(entry, dict):
+            trades.append(entry)
+    return trades
+
+
 def _snap(value: float, step: float) -> float:
     if step <= 0:
         return value
@@ -183,7 +533,7 @@ def _kraken_flags(request: OrderPlacementRequest) -> List[str]:
 
 
 @app.post("/oms/place", response_model=OrderPlacementResponse)
-def place_order(
+async def place_order(
     request: OrderPlacementRequest,
     account_id: str = Depends(require_admin_account),
 ) -> OrderPlacementResponse:
@@ -217,7 +567,6 @@ def place_order(
 
     kafka = KafkaNATSAdapter(account_id=account_id)
     timescale = TimescaleAdapter(account_id=account_id)
-    client = KrakenWSClient(account_id=account_id)
 
     order_payload = {
         "clientOrderId": request.order_id,
@@ -246,65 +595,108 @@ def place_order(
         },
     )
 
-    start_time = time.perf_counter()
-    try:
-        ack = client.add_order(order_payload, timeout=1.0)
-    except KrakenCredentialExpired as exc:
-        client.close()
-        increment_trade_rejection(account_id, request.instrument)
-        logger.warning(
-            "Rejected order due to expired Kraken credentials",
-            extra={"account_id": account_id, "instrument": request.instrument},
+    async with _acquire_kraken_clients(account_id) as clients:
+        credentials = await clients.credential_getter()
+        try:
+            _ensure_credentials_valid(credentials)
+        except KrakenCredentialExpired as exc:
+            increment_trade_rejection(account_id, request.instrument)
+            logger.warning(
+                "Rejected order due to expired Kraken credentials",
+                extra={"account_id": account_id, "instrument": request.instrument},
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=str(exc),
+            ) from exc
+
+        start_time = time.perf_counter()
+        try:
+            ack, transport = await _submit_order(
+                clients.ws_client,
+                clients.rest_client,
+                order_payload,
+            )
+        except HTTPException as exc:
+            if exc.status_code in (
+                status.HTTP_502_BAD_GATEWAY,
+                status.HTTP_504_GATEWAY_TIMEOUT,
+            ):
+                increment_trade_rejection(account_id, request.instrument)
+            raise
+
+        ack_latency_ms = (time.perf_counter() - start_time) * 1000.0
+        record_oms_latency(
+            account_id,
+            request.instrument,
+            transport,
+            ack_latency_ms,
         )
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=str(exc),
-        ) from exc
-    except KrakenWebsocketError as exc:
-        client.close()
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
 
-    ack_latency_ms = (time.perf_counter() - start_time) * 1000.0
-    record_ws_latency(account_id, request.instrument, ack_latency_ms)
-    record_oms_submit_ack(account_id, request.instrument, ack_latency_ms)
+        try:
+            _ensure_ack_success(ack, transport)
+        except HTTPException as exc:
+            increment_trade_rejection(account_id, request.instrument)
+            raise
 
-    open_snapshot = client.open_orders()
-    trades_snapshot = client.own_trades(txid=ack.get("txid"))
-    client.close()
+        open_orders = await _fetch_open_orders(
+            clients.ws_client,
+            clients.rest_client,
+        )
+        trades = await _fetch_own_trades(
+            clients.ws_client,
+            clients.rest_client,
+            ack.exchange_order_id,
+        )
 
-    ack_payload = {
-        "order_id": request.order_id,
-        "txid": ack.get("txid"),
-        "status": ack.get("status", "ok"),
-        "transport": ack.get("transport", "websocket"),
-        "price": snapped_price,
-        "quantity": snapped_quantity,
-        "flags": order_payload["oflags"],
-        "open_orders": open_snapshot.get("open", []),
-    }
+    ack_payload = _ack_payload(
+        ack,
+        request=request,
+        transport=transport,
+        snapped_price=snapped_price,
+        snapped_quantity=snapped_quantity,
+        flags=order_payload["oflags"],
+        open_orders=open_orders,
+    )
     timescale.record_ack(ack_payload)
     timescale.record_usage(snapped_price * snapped_quantity)
 
     kafka.publish(topic="oms.acks", payload=ack_payload)
 
     status_value = str(ack_payload.get("status", "")).lower()
-    if status_value and status_value not in {"ok", "accepted", "open"}:
+    if status_value and status_value not in _SUCCESS_STATUSES:
         increment_trade_rejection(account_id, request.instrument)
 
+    trades_snapshot = {"trades": trades}
     for trade in trades_snapshot.get("trades", []):
         fill_payload = {
             "order_id": request.order_id,
-            "txid": ack.get("txid"),
-            "price": trade.get("price", snapped_price),
-            "quantity": trade.get("quantity", snapped_quantity),
-            "liquidity": trade.get("liquidity", "maker" if request.post_only else "taker"),
+            "txid": ack.exchange_order_id,
+            "price": trade.get("price") or trade.get("avg_price", snapped_price),
+            "quantity": trade.get("quantity")
+            or trade.get("vol")
+            or trade.get("volume")
+            or snapped_quantity,
+            "liquidity": trade.get(
+                "liquidity",
+                "maker" if request.post_only else "taker",
+            ),
         }
         timescale.record_fill(fill_payload)
         kafka.publish(topic="oms.executions", payload=fill_payload)
 
         trade_side = str(trade.get("side", request.side)).lower()
-        trade_qty = Decimal(str(trade.get("quantity", snapped_quantity)))
-        trade_price = Decimal(str(trade.get("price", snapped_price)))
+        trade_qty = Decimal(
+            str(
+                trade.get("quantity")
+                or trade.get("vol")
+                or trade.get("volume")
+                or snapped_quantity
+            )
+        )
+        trade_price = Decimal(
+            str(trade.get("price") or trade.get("avg_price") or snapped_price)
+        )
         trade_ts: datetime | None = None
         raw_ts = trade.get("time")
         if raw_ts is not None:
@@ -323,14 +715,18 @@ def place_order(
             slippage_bps=float(trade.get("slippage_bps", 0.0) or 0.0),
         )
 
-    shadow_fills = shadow_oms.generate_shadow_fills(
-        account_id=account_id,
-        symbol=request.instrument,
-        side=request.side,
-        quantity=Decimal(str(snapped_quantity)),
-        price=Decimal(str(snapped_price)),
-        timestamp=datetime.now(timezone.utc),
-    )
+    try:
+        shadow_fills = shadow_oms.generate_shadow_fills(
+            account_id=account_id,
+            symbol=request.instrument,
+            side=request.side,
+            quantity=Decimal(str(snapped_quantity)),
+            price=Decimal(str(snapped_price)),
+            timestamp=datetime.now(timezone.utc),
+        )
+    except RuntimeError as exc:
+        logger.debug("Shadow fill generation failed: %s", exc)
+        shadow_fills = []
     for shadow_fill in shadow_fills:
         timescale.record_shadow_fill(shadow_fill)
 

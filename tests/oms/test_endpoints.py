@@ -2,14 +2,113 @@ from __future__ import annotations
 
 from typing import Iterator
 
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Any, Dict, Iterator
+import sys
+import types
+
 import pytest
 from fastapi.testclient import TestClient
 
+if "aiohttp" not in sys.modules:
+    class _StubSession:
+        async def __aenter__(self) -> "_StubSession":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+        async def post(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("aiohttp stub invoked")
+
+        async def get(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("aiohttp stub invoked")
+
+    class _ClientTimeout:
+        def __init__(self, total: float | None = None) -> None:
+            self.total = total
+
+    aiohttp_stub = types.SimpleNamespace(
+        ClientSession=lambda *args, **kwargs: _StubSession(),
+        ClientTimeout=_ClientTimeout,
+        ClientError=Exception,
+    )
+    sys.modules["aiohttp"] = aiohttp_stub
+
 from services.common import security
-from services.oms.main import app
+from services.oms.main import app, KrakenClientBundle
+from services.oms.kraken_ws import OrderAck
 from shared.k8s import KrakenSecretStore
 
 ADMIN_ACCOUNTS = ["admin-alpha", "admin-beta", "admin-gamma"]
+
+
+@pytest.fixture(autouse=True)
+def _stub_kraken_clients(monkeypatch: pytest.MonkeyPatch) -> None:
+    @asynccontextmanager
+    async def _factory(account_id: str):
+        async def _credentials() -> Dict[str, Any]:
+            return {
+                "api_key": f"test-key-{account_id}",
+                "api_secret": "secret",
+                "metadata": {"rotated_at": datetime.now(timezone.utc).isoformat()},
+            }
+
+        class _StubWS:
+            async def add_order(self, payload: Dict[str, Any]) -> OrderAck:
+                return OrderAck(
+                    exchange_order_id="SIM-123",
+                    status="ok",
+                    filled_qty=None,
+                    avg_price=None,
+                    errors=None,
+                )
+
+            async def fetch_open_orders_snapshot(self) -> list[Dict[str, Any]]:
+                return []
+
+            async def fetch_own_trades_snapshot(self) -> list[Dict[str, Any]]:
+                return []
+
+            async def close(self) -> None:
+                return None
+
+        class _StubREST:
+            async def add_order(self, payload: Dict[str, Any]) -> OrderAck:
+                return OrderAck(
+                    exchange_order_id="SIM-123",
+                    status="ok",
+                    filled_qty=None,
+                    avg_price=None,
+                    errors=None,
+                )
+
+            async def open_orders(self) -> Dict[str, Any]:
+                return {"result": {"open": []}}
+
+            async def own_trades(self) -> Dict[str, Any]:
+                return {"result": {"trades": {}}}
+
+            async def close(self) -> None:
+                return None
+
+        ws_client = _StubWS()
+        rest_client = _StubREST()
+        try:
+            yield KrakenClientBundle(
+                credential_getter=_credentials,
+                ws_client=ws_client,  # type: ignore[arg-type]
+                rest_client=rest_client,  # type: ignore[arg-type]
+            )
+        finally:
+            await ws_client.close()
+            await rest_client.close()
+
+    monkeypatch.setattr(app.state, "kraken_client_factory", _factory)
 
 
 @pytest.fixture(name="client")
