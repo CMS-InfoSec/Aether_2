@@ -27,12 +27,12 @@ import os
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Iterable, Mapping, MutableMapping, Sequence
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import Column, DateTime, Float, MetaData, String, create_engine, text
+from sqlalchemy import Column, DateTime, MetaData, Numeric, String, create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
@@ -54,6 +54,20 @@ AUDIT_LOGGER = logging.getLogger("tca.audit")
 
 
 DEFAULT_DATABASE_URL = "sqlite:///./tca.db"
+
+
+DECIMAL_ZERO = Decimal("0")
+DECIMAL_EIGHT_DP = Decimal("0.00000001")
+DECIMAL_FOUR_DP = Decimal("0.0001")
+
+PRICE_QUANT = DECIMAL_EIGHT_DP
+SIZE_QUANT = DECIMAL_EIGHT_DP
+FEE_QUANT = DECIMAL_EIGHT_DP
+NOTIONAL_QUANT = DECIMAL_EIGHT_DP
+USD_QUANT = DECIMAL_EIGHT_DP
+BPS_QUANT = DECIMAL_FOUR_DP
+RATIO_QUANT = DECIMAL_FOUR_DP
+BPS_FACTOR = Decimal("10000")
 
 
 def _database_url() -> str:
@@ -95,8 +109,8 @@ class TCAResult(Base):
 
     account_id = Column(String, primary_key=True)
     trade_id = Column(String, primary_key=True)
-    slippage_bps = Column(Float, nullable=False)
-    fees_usd = Column(Float, nullable=True)
+    slippage_bps = Column(Numeric(24, 12), nullable=False)
+    fees_usd = Column(Numeric(24, 12), nullable=True)
     ts = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC))
 
 
@@ -108,9 +122,9 @@ class TCAReport(Base):
     account_id = Column(String, primary_key=True)
     symbol = Column(String, primary_key=True)
     ts = Column(DateTime(timezone=True), primary_key=True, default=lambda: datetime.now(UTC))
-    expected_cost = Column(Float, nullable=False)
-    realized_cost = Column(Float, nullable=False)
-    slippage_bps = Column(Float, nullable=False)
+    expected_cost = Column(Numeric(24, 12), nullable=False)
+    realized_cost = Column(Numeric(24, 12), nullable=False)
+    slippage_bps = Column(Numeric(24, 12), nullable=False)
 
 
 Base.metadata.create_all(bind=ENGINE)
@@ -153,15 +167,26 @@ def _ensure_datetime(value: datetime | None) -> datetime | None:
     return value.astimezone(UTC)
 
 
-def _coerce_decimal(value: Any) -> float:
+def _extract_decimal(value: Any) -> Decimal | None:
     if value is None:
-        return 0.0
+        return None
     if isinstance(value, Decimal):
-        return float(value)
+        return value
     try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _coerce_decimal(value: Any, *, default: Decimal = DECIMAL_ZERO) -> Decimal:
+    extracted = _extract_decimal(value)
+    if extracted is None:
+        return default
+    return extracted
+
+
+def _quantize(value: Decimal, quantum: Decimal) -> Decimal:
+    return value.quantize(quantum, rounding=ROUND_HALF_UP)
 
 
 def _normalise_metadata(raw: Any) -> dict[str, Any]:
@@ -179,15 +204,14 @@ def _normalise_metadata(raw: Any) -> dict[str, Any]:
     return {}
 
 
-def _mid_price_from_metadata(*payloads: Mapping[str, Any]) -> float | None:
+def _mid_price_from_metadata(*payloads: Mapping[str, Any]) -> Decimal | None:
     for payload in payloads:
         mid = payload.get("mid_price_at_submit")
         if mid is None:
             continue
-        try:
-            return float(mid)
-        except (TypeError, ValueError):  # pragma: no cover - defensive guard
-            continue
+        value = _extract_decimal(mid)
+        if value is not None:
+            return value
     return None
 
 
@@ -228,7 +252,7 @@ def _trade_direction(size: float, *payloads: Mapping[str, Any]) -> int:
     return 1
 
 
-def _expected_price_from_metadata(*payloads: Mapping[str, Any]) -> float | None:
+def _expected_price_from_metadata(*payloads: Mapping[str, Any]) -> Decimal | None:
     """Extract the expected execution price if available."""
 
     candidate_keys = (
@@ -244,14 +268,13 @@ def _expected_price_from_metadata(*payloads: Mapping[str, Any]) -> float | None:
             value = payload.get(key)
             if value is None:
                 continue
-            try:
-                return float(value)
-            except (TypeError, ValueError):  # pragma: no cover - defensive guard
-                continue
+            price = _extract_decimal(value)
+            if price is not None:
+                return price
     return _mid_price_from_metadata(*payloads)
 
 
-def _expected_fee_from_metadata(*payloads: Mapping[str, Any]) -> float:
+def _expected_fee_from_metadata(*payloads: Mapping[str, Any]) -> Decimal:
     """Extract the expected fees if they were estimated upstream."""
 
     candidate_keys = (
@@ -266,17 +289,16 @@ def _expected_fee_from_metadata(*payloads: Mapping[str, Any]) -> float:
             value = payload.get(key)
             if value is None:
                 continue
-            try:
-                return float(value)
-            except (TypeError, ValueError):  # pragma: no cover - defensive guard
-                continue
-    return 0.0
+            fee = _extract_decimal(value)
+            if fee is not None:
+                return fee
+    return DECIMAL_ZERO
 
 
-def _slippage_bps(fill_price: float, mid_price: float) -> float:
-    if mid_price == 0:
-        return 0.0
-    return ((fill_price - mid_price) / mid_price) * 10_000.0
+def _slippage_bps(fill_price: Decimal, mid_price: Decimal) -> Decimal:
+    if mid_price == DECIMAL_ZERO:
+        return DECIMAL_ZERO
+    return ((fill_price - mid_price) / mid_price) * BPS_FACTOR
 
 
 def _daterange_bounds(target_date: date) -> tuple[datetime, datetime]:
@@ -289,28 +311,31 @@ def _daterange_bounds(target_date: date) -> tuple[datetime, datetime]:
 class FillMetrics:
     fill_id: str
     fill_time: datetime
-    fill_price: float
-    size: float
-    fee: float
-    mid_price: float | None
-    slippage_bps: float
-    notional: float
+    fill_price: Decimal
+    size: Decimal
+    fee: Decimal
+    mid_price: Decimal | None
+    slippage_bps: Decimal
+    notional: Decimal
     liquidity: str | None
 
 
 class FillMetricsModel(BaseModel):
     fill_id: str
     fill_time: datetime
-    fill_price: float
-    size: float
-    fee: float
-    mid_price_at_submit: float | None
-    slippage_bps: float
-    notional_usd: float
+    fill_price: Decimal
+    size: Decimal
+    fee: Decimal
+    mid_price_at_submit: Decimal | None
+    slippage_bps: Decimal
+    notional_usd: Decimal
     liquidity: str | None = Field(None, description="Maker or taker attribution if available")
 
     class Config:
-        json_encoders = {datetime: lambda value: value.isoformat()}
+        json_encoders = {
+            datetime: lambda value: value.isoformat(),
+            Decimal: lambda value: format(value, "f"),
+        }
 
 
 class TradeReportModel(BaseModel):
@@ -318,22 +343,22 @@ class TradeReportModel(BaseModel):
     account_id: str
     market: str
     submitted_at: datetime
-    average_slippage_bps: float
-    total_slippage_cost_usd: float
-    fees_usd: float
-    maker_ratio: float
-    taker_ratio: float
+    average_slippage_bps: Decimal
+    total_slippage_cost_usd: Decimal
+    fees_usd: Decimal
+    maker_ratio: Decimal
+    taker_ratio: Decimal
     fills: list[FillMetricsModel]
 
 
 class DailySummaryModel(BaseModel):
     account_id: str
     date: date
-    avg_slippage_bps: float
-    total_cost_usd: float
-    maker_ratio: float
-    taker_ratio: float
-    fee_attribution: dict[str, float]
+    avg_slippage_bps: Decimal
+    total_cost_usd: Decimal
+    maker_ratio: Decimal
+    taker_ratio: Decimal
+    fee_attribution: dict[str, Decimal]
     trade_count: int
 
 
@@ -341,30 +366,49 @@ class TCAReportModel(BaseModel):
     account_id: str
     symbol: str
     date: date
-    expected_cost_usd: float
-    realized_cost_usd: float
-    slippage_bps: float
-    slippage_cost_usd: float
-    fill_quality_bps: float
-    fee_impact_usd: float
+    expected_cost_usd: Decimal
+    realized_cost_usd: Decimal
+    slippage_bps: Decimal
+    slippage_cost_usd: Decimal
+    fill_quality_bps: Decimal
+    fee_impact_usd: Decimal
     trade_count: int
 
     class Config:
-        json_encoders = {datetime: lambda value: value.isoformat()}
+        json_encoders = {
+            datetime: lambda value: value.isoformat(),
+            Decimal: lambda value: format(value, "f"),
+        }
 
 
 @dataclass
 class ExpectedVsRealised:
-    expected_cost: float
-    realized_cost: float
-    slippage_bps: float
-    slippage_cost_usd: float
-    fill_quality_bps: float
-    fee_impact_usd: float
+    expected_cost: Decimal
+    realized_cost: Decimal
+    slippage_bps: Decimal
+    slippage_cost_usd: Decimal
+    fill_quality_bps: Decimal
+    fee_impact_usd: Decimal
     trade_count: int
 
 
 app = FastAPI(title="TCA Service", version="1.0.0")
+
+
+def _serialize_fill(fill: FillMetrics) -> FillMetricsModel:
+    return FillMetricsModel(
+        fill_id=fill.fill_id,
+        fill_time=fill.fill_time,
+        fill_price=_quantize(fill.fill_price, PRICE_QUANT),
+        size=_quantize(fill.size, SIZE_QUANT),
+        fee=_quantize(fill.fee, FEE_QUANT),
+        mid_price_at_submit=(
+            _quantize(fill.mid_price, PRICE_QUANT) if fill.mid_price is not None else None
+        ),
+        slippage_bps=_quantize(fill.slippage_bps, BPS_QUANT),
+        notional_usd=_quantize(fill.notional, NOTIONAL_QUANT),
+        liquidity=fill.liquidity,
+    )
 
 
 def _persist_result(
@@ -372,8 +416,8 @@ def _persist_result(
     *,
     account_id: str,
     trade_id: str,
-    slippage_bps: float,
-    fees_usd: float,
+    slippage_bps: Decimal,
+    fees_usd: Decimal,
 ) -> None:
     record = session.get(TCAResult, (account_id, trade_id))
     if record is None:
@@ -434,7 +478,7 @@ def _build_fill_metrics(rows: Iterable[Mapping[str, Any]]) -> tuple[list[FillMet
         fill_price = _coerce_decimal(row.get("fill_price"))
         size = _coerce_decimal(row.get("size"))
         fee = _coerce_decimal(row.get("fee"))
-        slippage = _slippage_bps(fill_price, mid_price) if mid_price is not None else 0.0
+        slippage = _slippage_bps(fill_price, mid_price) if mid_price is not None else DECIMAL_ZERO
         notional = fill_price * size
         liquidity = _liquidity_flag(fill_metadata, order_metadata)
         fills.append(
@@ -457,15 +501,23 @@ def _build_fill_metrics(rows: Iterable[Mapping[str, Any]]) -> tuple[list[FillMet
 
 def _compare_expected_realised(rows: Sequence[Mapping[str, Any]]) -> ExpectedVsRealised:
     if not rows:
-        return ExpectedVsRealised(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0)
+        return ExpectedVsRealised(
+            expected_cost=DECIMAL_ZERO,
+            realized_cost=DECIMAL_ZERO,
+            slippage_bps=DECIMAL_ZERO,
+            slippage_cost_usd=DECIMAL_ZERO,
+            fill_quality_bps=DECIMAL_ZERO,
+            fee_impact_usd=DECIMAL_ZERO,
+            trade_count=0,
+        )
 
-    expected_cost_total = 0.0
-    realized_cost_total = 0.0
-    weighted_slippage = 0.0
-    weighted_quality = 0.0
-    slippage_cost_total = 0.0
-    fee_impact_total = 0.0
-    total_size = 0.0
+    expected_cost_total = DECIMAL_ZERO
+    realized_cost_total = DECIMAL_ZERO
+    weighted_slippage = DECIMAL_ZERO
+    weighted_quality = DECIMAL_ZERO
+    slippage_cost_total = DECIMAL_ZERO
+    fee_impact_total = DECIMAL_ZERO
+    total_size = DECIMAL_ZERO
     seen_trades: set[str] = set()
 
     for row in rows:
@@ -478,11 +530,11 @@ def _compare_expected_realised(rows: Sequence[Mapping[str, Any]]) -> ExpectedVsR
         fill_price = _coerce_decimal(row.get("fill_price"))
         size = _coerce_decimal(row.get("size"))
         abs_size = abs(size)
-        if abs_size == 0:
+        if abs_size == DECIMAL_ZERO:
             continue
 
         expected_price = _expected_price_from_metadata(fill_metadata, order_metadata)
-        if expected_price is None or expected_price == 0:
+        if expected_price is None or expected_price == DECIMAL_ZERO:
             expected_price = fill_price
 
         expected_fee = _expected_fee_from_metadata(fill_metadata, order_metadata)
@@ -495,7 +547,10 @@ def _compare_expected_realised(rows: Sequence[Mapping[str, Any]]) -> ExpectedVsR
         expected_cost_total += expected_notional + expected_fee
         realized_cost_total += realized_notional + realized_fee
 
-        slippage_bps = ((fill_price - expected_price) * direction / expected_price) * 10_000 if expected_price else 0.0
+        if expected_price != DECIMAL_ZERO:
+            slippage_bps = ((fill_price - expected_price) * direction / expected_price) * BPS_FACTOR
+        else:
+            slippage_bps = DECIMAL_ZERO
         slippage_cost = (fill_price - expected_price) * abs_size * direction
         fee_impact = realized_fee - expected_fee
 
@@ -505,8 +560,8 @@ def _compare_expected_realised(rows: Sequence[Mapping[str, Any]]) -> ExpectedVsR
         fee_impact_total += fee_impact
         total_size += abs_size
 
-    avg_slippage = weighted_slippage / total_size if total_size else 0.0
-    avg_quality = weighted_quality / total_size if total_size else 0.0
+    avg_slippage = weighted_slippage / total_size if total_size else DECIMAL_ZERO
+    avg_quality = weighted_quality / total_size if total_size else DECIMAL_ZERO
 
     return ExpectedVsRealised(
         expected_cost=expected_cost_total,
@@ -521,29 +576,47 @@ def _compare_expected_realised(rows: Sequence[Mapping[str, Any]]) -> ExpectedVsR
 
 def _aggregate_trade(
     fills: Sequence[FillMetrics],
-) -> tuple[float, float, float, float, float]:
+) -> tuple[Decimal, Decimal, Decimal, Decimal, Decimal]:
     if not fills:
-        return 0.0, 0.0, 0.0, 0.0, 0.0
+        return (
+            DECIMAL_ZERO,
+            DECIMAL_ZERO,
+            DECIMAL_ZERO,
+            DECIMAL_ZERO,
+            DECIMAL_ZERO,
+        )
 
-    total_size = sum(fill.size for fill in fills if fill.size)
-    total_notional = sum(fill.notional for fill in fills)
-    total_cost = sum((fill.fill_price - (fill.mid_price or fill.fill_price)) * fill.size for fill in fills)
-    total_fees = sum(fill.fee for fill in fills)
+    total_size = DECIMAL_ZERO
+    total_notional = DECIMAL_ZERO
+    total_cost = DECIMAL_ZERO
+    total_fees = DECIMAL_ZERO
+    weighted = DECIMAL_ZERO
+    maker_notional = DECIMAL_ZERO
+    taker_notional = DECIMAL_ZERO
 
-    if total_size == 0:
-        avg_slippage = 0.0
+    for fill in fills:
+        if fill.size != DECIMAL_ZERO:
+            total_size += fill.size
+            weighted += fill.slippage_bps * fill.size
+        total_notional += fill.notional
+        reference_price = fill.mid_price or fill.fill_price
+        total_cost += (fill.fill_price - reference_price) * fill.size
+        total_fees += fill.fee
+        if fill.liquidity == "maker":
+            maker_notional += fill.notional
+        elif fill.liquidity == "taker":
+            taker_notional += fill.notional
+
+    if total_size == DECIMAL_ZERO:
+        avg_slippage = DECIMAL_ZERO
     else:
-        weighted = sum(fill.slippage_bps * fill.size for fill in fills)
         avg_slippage = weighted / total_size
 
-    maker_notional = sum(fill.notional for fill in fills if fill.liquidity == "maker")
-    taker_notional = sum(fill.notional for fill in fills if fill.liquidity == "taker")
-
-    if total_notional:
+    if total_notional != DECIMAL_ZERO:
         maker_ratio = maker_notional / total_notional
         taker_ratio = taker_notional / total_notional
     else:
-        maker_ratio = taker_ratio = 0.0
+        maker_ratio = taker_ratio = DECIMAL_ZERO
 
     return avg_slippage, total_cost, total_fees, maker_ratio, taker_ratio
 
@@ -621,21 +694,22 @@ def _daily_summary(
     if not fills_by_trade:
         raise HTTPException(status_code=404, detail="No fills found for account and date")
 
-    total_slippage_weighted = 0.0
-    total_size = 0.0
-    total_cost = 0.0
-    total_fees = 0.0
-    total_notional = 0.0
-    maker_notional = 0.0
-    taker_notional = 0.0
-    maker_fees = 0.0
-    taker_fees = 0.0
+    total_slippage_weighted = DECIMAL_ZERO
+    total_size = DECIMAL_ZERO
+    total_cost = DECIMAL_ZERO
+    total_fees = DECIMAL_ZERO
+    total_notional = DECIMAL_ZERO
+    maker_notional = DECIMAL_ZERO
+    taker_notional = DECIMAL_ZERO
+    maker_fees = DECIMAL_ZERO
+    taker_fees = DECIMAL_ZERO
 
     for trade_id, fills in fills_by_trade.items():
         for fill in fills:
             total_slippage_weighted += fill.slippage_bps * fill.size
             total_size += fill.size
-            total_cost += (fill.fill_price - (fill.mid_price or fill.fill_price)) * fill.size
+            reference_price = fill.mid_price or fill.fill_price
+            total_cost += (fill.fill_price - reference_price) * fill.size
             total_fees += fill.fee
             total_notional += fill.notional
             if fill.liquidity == "maker":
@@ -645,9 +719,9 @@ def _daily_summary(
                 taker_notional += fill.notional
                 taker_fees += fill.fee
 
-    avg_slippage = total_slippage_weighted / total_size if total_size else 0.0
-    maker_ratio = maker_notional / total_notional if total_notional else 0.0
-    taker_ratio = taker_notional / total_notional if total_notional else 0.0
+    avg_slippage = total_slippage_weighted / total_size if total_size else DECIMAL_ZERO
+    maker_ratio = maker_notional / total_notional if total_notional else DECIMAL_ZERO
+    taker_ratio = taker_notional / total_notional if total_notional else DECIMAL_ZERO
 
     fee_attribution = {
         "total_fees_usd": total_fees,
@@ -658,11 +732,14 @@ def _daily_summary(
     return DailySummaryModel(
         account_id=account_id,
         date=start.date(),
-        avg_slippage_bps=avg_slippage,
-        total_cost_usd=total_cost,
-        maker_ratio=maker_ratio,
-        taker_ratio=taker_ratio,
-        fee_attribution=fee_attribution,
+        avg_slippage_bps=_quantize(avg_slippage, BPS_QUANT),
+        total_cost_usd=_quantize(total_cost, USD_QUANT),
+        maker_ratio=_quantize(maker_ratio, RATIO_QUANT),
+        taker_ratio=_quantize(taker_ratio, RATIO_QUANT),
+        fee_attribution={
+            key: _quantize(value, USD_QUANT)
+            for key, value in fee_attribution.items()
+        },
         trade_count=len(fills_by_trade),
     )
 
@@ -672,9 +749,9 @@ def _persist_report(
     *,
     account_id: str,
     symbol: str,
-    expected_cost: float,
-    realized_cost: float,
-    slippage_bps: float,
+    expected_cost: Decimal,
+    realized_cost: Decimal,
+    slippage_bps: Decimal,
 ) -> None:
     session.add(
         TCAReport(
@@ -737,12 +814,12 @@ def _build_report_response(
         account_id=account_id,
         symbol=symbol,
         date=target_date,
-        expected_cost_usd=metrics.expected_cost,
-        realized_cost_usd=metrics.realized_cost,
-        slippage_bps=metrics.slippage_bps,
-        slippage_cost_usd=metrics.slippage_cost_usd,
-        fill_quality_bps=metrics.fill_quality_bps,
-        fee_impact_usd=metrics.fee_impact_usd,
+        expected_cost_usd=_quantize(metrics.expected_cost, USD_QUANT),
+        realized_cost_usd=_quantize(metrics.realized_cost, USD_QUANT),
+        slippage_bps=_quantize(metrics.slippage_bps, BPS_QUANT),
+        slippage_cost_usd=_quantize(metrics.slippage_cost_usd, USD_QUANT),
+        fill_quality_bps=_quantize(metrics.fill_quality_bps, BPS_QUANT),
+        fee_impact_usd=_quantize(metrics.fee_impact_usd, USD_QUANT),
         trade_count=metrics.trade_count,
     )
 
@@ -780,25 +857,12 @@ def get_trade_report(
             account_id=str(order_info["account_id"]),
             market=str(order_info["market"]),
             submitted_at=order_info["submitted_at"],
-            average_slippage_bps=avg_slippage,
-            total_slippage_cost_usd=total_cost,
-            fees_usd=total_fees,
-            maker_ratio=maker_ratio,
-            taker_ratio=taker_ratio,
-            fills=[
-                FillMetricsModel(
-                    fill_id=fill.fill_id,
-                    fill_time=fill.fill_time,
-                    fill_price=fill.fill_price,
-                    size=fill.size,
-                    fee=fill.fee,
-                    mid_price_at_submit=fill.mid_price,
-                    slippage_bps=fill.slippage_bps,
-                    notional_usd=fill.notional,
-                    liquidity=fill.liquidity,
-                )
-                for fill in fills
-            ],
+            average_slippage_bps=_quantize(avg_slippage, BPS_QUANT),
+            total_slippage_cost_usd=_quantize(total_cost, USD_QUANT),
+            fees_usd=_quantize(total_fees, USD_QUANT),
+            maker_ratio=_quantize(maker_ratio, RATIO_QUANT),
+            taker_ratio=_quantize(taker_ratio, RATIO_QUANT),
+            fills=[_serialize_fill(fill) for fill in fills],
         )
         _audit_access(
             request,
