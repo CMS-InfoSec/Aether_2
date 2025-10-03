@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import text
 
 from tests.helpers.authentication import override_admin_auth
+from tests.helpers.risk import risk_service_instance
 
 
 def _reload_allocator(monkeypatch: pytest.MonkeyPatch, db_url: str) -> object:
@@ -224,20 +225,13 @@ def risk_service_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     if importlib.util.find_spec("sqlalchemy") is None:
         pytest.skip("sqlalchemy is required for risk service tests")
 
-    db_path = tmp_path / "risk.db"
-    monkeypatch.setenv("RISK_DATABASE_URL", f"sqlite:///{db_path}")
-    sys.modules.pop("risk_service", None)
-    module = importlib.import_module("risk_service")
     import shared.graceful_shutdown as graceful_shutdown
 
     monkeypatch.setattr(graceful_shutdown, "install_sigterm_handler", lambda manager: None)
 
-    try:
+    with risk_service_instance(tmp_path, monkeypatch) as module:
         with TestClient(module.app) as client:
             yield client, module
-    finally:
-        module.ENGINE.dispose()
-        sys.modules.pop("risk_service", None)
 
 
 def test_risk_engine_blocks_when_allocator_throttles(

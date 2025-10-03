@@ -27,7 +27,6 @@ from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, model_validato
 from sqlalchemy import Column, DateTime, Float, Integer, Numeric, String, create_engine, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
-from sqlalchemy.pool import StaticPool
 from statistics import mean
 
 
@@ -228,9 +227,6 @@ class AccountRiskLimit(Base):
         return _parse_cluster_limits(self.diversification_cluster_limits)
 
 
-DEFAULT_DATABASE_URL = "sqlite:///./risk.db"
-
-
 @dataclass
 class AllocatorAccountState:
     account_id: str
@@ -241,20 +237,57 @@ class AllocatorAccountState:
 
 
 def _database_url() -> str:
-    url = os.getenv("RISK_DATABASE_URL") or os.getenv("TIMESCALE_DSN") or os.getenv(
-        "DATABASE_URL", DEFAULT_DATABASE_URL
+    """Return the configured managed Timescale/Postgres database URL."""
+
+    candidates = (
+        os.getenv("RISK_DATABASE_URL"),
+        os.getenv("TIMESCALE_DSN"),
+        os.getenv("DATABASE_URL"),
     )
+
+    url: Optional[str] = next((value.strip() for value in candidates if value), None)
+    if not url:
+        raise RuntimeError(
+            "RISK_DATABASE_URL must be defined with a PostgreSQL/Timescale connection string."
+        )
+
+    normalized = url.lower()
+    if normalized.startswith("postgres://"):
+        url = "postgresql://" + url.split("://", 1)[1]
+        normalized = url.lower()
+
+    allowed_prefixes = (
+        "postgresql://",
+        "postgresql+psycopg://",
+        "postgresql+psycopg2://",
+    )
+    if not normalized.startswith(allowed_prefixes):
+        raise RuntimeError(
+            "Risk service requires a PostgreSQL/Timescale DSN; "
+            f"received '{url}'."
+        )
+
     if url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
+
     return url
 
 
 def _engine_options(url: str) -> Dict[str, object]:
-    options: Dict[str, object] = {"future": True}
-    if url.startswith("sqlite://"):
-        options.setdefault("connect_args", {"check_same_thread": False})
-        if url == "sqlite:///:memory:" or url.endswith(":memory:"):
-            options["poolclass"] = StaticPool
+    options: Dict[str, object] = {
+        "future": True,
+        "pool_pre_ping": True,
+        "pool_size": int(os.getenv("RISK_DB_POOL_SIZE", "10")),
+        "max_overflow": int(os.getenv("RISK_DB_MAX_OVERFLOW", "20")),
+        "pool_timeout": int(os.getenv("RISK_DB_POOL_TIMEOUT", "30")),
+        "pool_recycle": int(os.getenv("RISK_DB_POOL_RECYCLE", "1800")),
+    }
+
+    sslmode = os.getenv("RISK_DB_SSLMODE", "require").strip()
+    connect_args: Dict[str, object] = {}
+    if sslmode:
+        connect_args["sslmode"] = sslmode
+    options["connect_args"] = connect_args
     return options
 
 
@@ -637,8 +670,6 @@ _UNIVERSE_CACHE_EXPIRY: Optional[datetime] = None
 def _on_startup() -> None:
     _bootstrap_storage()
 
-
-_bootstrap_storage()
 
 battle_mode_controller = BattleModeController(
     session_factory=get_session, threshold=_BATTLE_MODE_VOL_THRESHOLD

@@ -300,7 +300,17 @@ backendServices:
       tag: latest
     replicaCount: 2
     containerPort: 8000
-    env: []
+    env:
+      - name: RISK_DATABASE_URL
+        valueFrom:
+          secretKeyRef:
+            name: risk-service-database
+            key: dsn
+      - name: RISK_DB_SSLMODE
+        valueFrom:
+          secretKeyRef:
+            name: risk-service-database
+            key: sslmode
     usesKrakenSecrets: true
     extraVolumeMounts: []
     extraVolumes: []
