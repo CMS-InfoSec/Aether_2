@@ -9,6 +9,8 @@ import pytest
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
+from auth.service import InMemoryAdminRepository
+
 from app import create_app
 from auth.service import InMemorySessionStore
 from policy_service import RegimeSnapshot, _reset_regime_state, regime_classifier
@@ -84,7 +86,9 @@ def test_meta_weights_endpoint_logs_governance_record() -> None:
     with regime_classifier._lock:  # type: ignore[attr-defined]
         regime_classifier._snapshots["ETH-USD"] = snapshot  # type: ignore[attr-defined]
 
-    app = create_app(session_store=InMemorySessionStore())
+
+    app = create_app(admin_repository=InMemoryAdminRepository())
+
     client = TestClient(app)
 
     response = client.get(
