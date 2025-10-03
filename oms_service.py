@@ -6,10 +6,11 @@ import logging
 import math
 import os
 import time
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
@@ -290,43 +291,175 @@ class CredentialProvider:
 
 
 class IdempotencyCache:
-    """Simple cooperative idempotency cache keyed by account and client id."""
+    """Idempotency coordinator backed by Redis with TTL-based eviction."""
 
-    def __init__(self) -> None:
+    _namespace = "oms:idempotency"
+
+    def __init__(
+        self,
+        *,
+        ttl_seconds: float = 300.0,
+        redis_factory: Callable[[str], Any] | None = None,
+    ) -> None:
+        self._ttl_seconds = max(ttl_seconds, 0.0)
         self._lock = asyncio.Lock()
-        self._entries: Dict[str, asyncio.Future[Tuple[PlaceOrderResponse | CancelOrderResponse, bool]]] = {}
+        self._entries: Dict[str, Tuple[asyncio.Future[PlaceOrderResponse | CancelOrderResponse], float]] = {}
+        self._redis_factory = redis_factory or self._default_redis_factory
+        self._redis_clients: Dict[str, Any] = {}
+
+    @staticmethod
+    def _default_redis_factory(account_id: str) -> Any:
+        from redis.asyncio import Redis  # type: ignore import-not-found
+
+        from services.common.config import get_redis_client
+
+        client = get_redis_client(account_id)
+        return Redis.from_url(client.dsn, decode_responses=False)
+
+    async def _redis(self, account_id: str) -> Any:
+        client = self._redis_clients.get(account_id)
+        if client is None:
+            created = self._redis_factory(account_id)
+            if asyncio.iscoroutine(created) or isinstance(created, asyncio.Future):
+                client = await created  # type: ignore[assignment]
+            else:
+                client = created
+            self._redis_clients[account_id] = client
+        return client
+
+    @staticmethod
+    def _serialize(result: PlaceOrderResponse | CancelOrderResponse) -> bytes:
+        if isinstance(result, PlaceOrderResponse):
+            kind = "place"
+        elif isinstance(result, CancelOrderResponse):
+            kind = "cancel"
+        else:  # pragma: no cover - defensive
+            raise TypeError(f"Unsupported idempotency payload: {type(result)!r}")
+
+        payload = {
+            "kind": kind,
+            "timestamp": time.time(),
+            "data": result.model_dump(mode="json"),
+        }
+        return json.dumps(payload).encode("utf-8")
+
+    @staticmethod
+    def _deserialize(payload: bytes) -> Tuple[PlaceOrderResponse | CancelOrderResponse, float]:
+        data = json.loads(payload.decode("utf-8"))
+        timestamp = float(data.get("timestamp", 0.0))
+        kind = data.get("kind")
+        body = data.get("data", {})
+        if kind == "place":
+            return PlaceOrderResponse.model_validate(body), timestamp
+        if kind == "cancel":
+            return CancelOrderResponse.model_validate(body), timestamp
+        raise ValueError(f"Unknown idempotency entry kind: {kind}")
+
+    async def _purge_expired_locked(self, *, now: Optional[float] = None) -> None:
+        current = now or time.monotonic()
+        expired = [
+            key
+            for key, (future, expires_at) in self._entries.items()
+            if future.done() and expires_at <= current
+        ]
+        for key in expired:
+            self._entries.pop(key, None)
+
+    def _key(self, account_id: str, client_id: str) -> str:
+        return f"{self._namespace}:{account_id}:{client_id}"
 
     async def get_or_create(
         self,
-        key: str,
-        factory: "asyncio.Future[Tuple[PlaceOrderResponse | CancelOrderResponse, bool]]",
+        account_id: str,
+        client_id: str,
+        factory: Callable[[], Awaitable[PlaceOrderResponse | CancelOrderResponse]],
     ) -> Tuple[PlaceOrderResponse | CancelOrderResponse, bool]:
-        async with self._lock:
-            existing = self._entries.get(key)
-            if existing is None:
-                self._entries[key] = factory
-                created = True
-            else:
-                created = False
+        key = self._key(account_id, client_id)
+        await self._purge_expired()
 
-        if created:
+        task, reuse = await self._peek_local(key)
+        if task is not None:
+            result = await task
+            return result, reuse
+
+        redis = await self._redis(account_id)
+        cached = await redis.get(key)
+        if cached:
             try:
-                result, reused = await factory
-            except Exception as exc:  # pragma: no cover - propagated upstream
-                async with self._lock:
-                    self._entries.pop(key, None)
-                raise
+                result, timestamp = self._deserialize(cached)
+            except Exception:  # pragma: no cover - defensive
+                await redis.delete(key)
             else:
-                return result, reused
+                if self._ttl_seconds == 0.0 or time.time() - timestamp <= self._ttl_seconds:
+                    loop = asyncio.get_running_loop()
+                    future: asyncio.Future[PlaceOrderResponse | CancelOrderResponse] = loop.create_future()
+                    future.set_result(result)
+                    async with self._lock:
+                        await self._purge_expired_locked()
+                        self._entries[key] = (future, time.monotonic() + self._ttl_seconds)
+                    return result, True
+                await redis.delete(key)
 
-        return await existing
+        loop = asyncio.get_running_loop()
+        task_future = loop.create_task(factory())
+        async with self._lock:
+            await self._purge_expired_locked()
+            self._entries[key] = (task_future, float("inf"))
 
-    def store(self, key: str, result: PlaceOrderResponse | CancelOrderResponse) -> None:
-        """Populate the cache with a completed result."""
+        try:
+            result = await task_future
+        except Exception:
+            async with self._lock:
+                self._entries.pop(key, None)
+            raise
 
-        future: asyncio.Future[Tuple[PlaceOrderResponse | CancelOrderResponse, bool]] = asyncio.get_event_loop().create_future()
-        future.set_result((result, True))
-        self._entries[key] = future
+        return result, False
+
+    async def store(
+        self,
+        account_id: str,
+        client_id: str,
+        result: PlaceOrderResponse | CancelOrderResponse,
+    ) -> None:
+        key = self._key(account_id, client_id)
+        redis = await self._redis(account_id)
+        payload = self._serialize(result)
+        ttl = self._ttl_seconds if self._ttl_seconds > 0 else None
+        await redis.set(key, payload, ex=ttl)
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[PlaceOrderResponse | CancelOrderResponse] = loop.create_future()
+        future.set_result(result)
+        expires_at = time.monotonic() + self._ttl_seconds if self._ttl_seconds > 0 else time.monotonic()
+        async with self._lock:
+            await self._purge_expired_locked()
+            self._entries[key] = (future, expires_at)
+
+    async def purge(self, account_id: str, client_id: str) -> None:
+        key = self._key(account_id, client_id)
+        redis = await self._redis(account_id)
+        await redis.delete(key)
+        async with self._lock:
+            self._entries.pop(key, None)
+
+    async def _peek_local(
+        self, key: str
+    ) -> Tuple[
+        Optional[asyncio.Future[PlaceOrderResponse | CancelOrderResponse]],
+        bool,
+    ]:
+        async with self._lock:
+            await self._purge_expired_locked()
+            entry = self._entries.get(key)
+            if not entry:
+                return None, False
+            future, expires_at = entry
+            reuse = future.done() and expires_at > time.monotonic()
+            return future, reuse
+
+    async def _purge_expired(self) -> None:
+        async with self._lock:
+            await self._purge_expired_locked()
 
 
 @dataclass
@@ -740,9 +873,7 @@ class OMSService:
             expected_fee_bps=request.expected_fee_bps or Decimal("0"),
             expected_slippage_bps=request.expected_slippage_bps or Decimal("0"),
         )
-        cache_key = f"place:{request.account_id}:{request.client_id}"
-
-        async def execute() -> Tuple[PlaceOrderResponse, bool]:
+        async def execute() -> PlaceOrderResponse:
             with traced_span(
                 "oms.place_order",
                 account_id=request.account_id,
@@ -760,27 +891,27 @@ class OMSService:
                 transport=transport,
                 reused=False,
             )
-            return response, False
+            return response
 
-        future: asyncio.Future[Tuple[PlaceOrderResponse, bool]] = asyncio.ensure_future(execute())
         try:
-            result, reused = await self._idempotency.get_or_create(cache_key, future)
+            result, reused = await self._idempotency.get_or_create(
+                request.account_id, request.client_id, execute
+            )
         except Exception:
             increment_oms_error_count(request.account_id, request.symbol, "websocket")
             raise
         if reused:
             result.reused = True
             return result
-        self._idempotency.store(cache_key, result)
+        await self._idempotency.store(request.account_id, request.client_id, result)
         return result
 
     async def cancel_order(self, request: CancelOrderRequest) -> CancelOrderResponse:
         session = await self._session(request.account_id)
-        cache_key = f"cancel:{request.account_id}:{request.order_id}"
         context = session.get_context(request.order_id)
         symbol = context.symbol if context else "unknown"
 
-        async def execute() -> Tuple[CancelOrderResponse, bool]:
+        async def execute() -> CancelOrderResponse:
             with traced_span(
                 "oms.cancel_order",
                 account_id=request.account_id,
@@ -795,14 +926,16 @@ class OMSService:
                 transport=transport,
                 reused=False,
             )
-            return response, False
+            return response
 
-        future: asyncio.Future[Tuple[CancelOrderResponse, bool]] = asyncio.ensure_future(execute())
-        result, reused = await self._idempotency.get_or_create(cache_key, future)
+        scoped_client_id = f"cancel:{request.order_id}"
+        result, reused = await self._idempotency.get_or_create(
+            request.account_id, scoped_client_id, execute
+        )
         if reused:
             result.reused = True
             return result
-        self._idempotency.store(cache_key, result)
+        await self._idempotency.store(request.account_id, scoped_client_id, result)
         return result
 
     async def get_status(self, account_id: str, order_id: str) -> OrderStatusResponse:
