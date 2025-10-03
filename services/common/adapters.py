@@ -3,12 +3,18 @@ from __future__ import annotations
 
 import base64
 import logging
+import threading
+import time
 import uuid
 from copy import deepcopy
 from dataclasses import dataclass, field
 
 from datetime import datetime, timezone
 from typing import Any, Callable, ClassVar, Dict, Iterable, List, Mapping, Optional
+from urllib.parse import urlparse
+from weakref import WeakSet
+
+import httpx
 
 from common.utils.tracing import attach_correlation, current_correlation_id
 from shared.k8s import ANNOTATION_ROTATED_AT as K8S_ROTATED_AT, KrakenSecretStore
@@ -16,6 +22,7 @@ from services.secrets.secure_secrets import (
     EncryptedSecretEnvelope,
     EnvelopeEncryptor,
 )
+from services.common.config import get_kafka_producer, get_nats_producer
 
 from services.universe.repository import UniverseRepository
 
@@ -36,14 +43,56 @@ def _mask_secret(value: str) -> str:
     return f"{value[:2]}{'*' * (len(value) - 4)}{value[-2:]}"
 
 
-@dataclass
+class PublishError(RuntimeError):
+    """Raised when a publish attempt fails for every configured transport."""
+
+
+def _first_endpoint(value: str) -> str:
+    return value.split(",")[0].strip()
+
+
+def _as_base_url(endpoint: str) -> str:
+    parsed = urlparse(endpoint if "://" in endpoint else f"http://{endpoint}")
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError(f"Invalid endpoint '{endpoint}'")
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    if parsed.path and parsed.path != "/":
+        base = f"{base}{parsed.path.rstrip('/')}"
+    return base
+
+
+@dataclass(eq=False)
 class KafkaNATSAdapter:
     account_id: str
+    kafka_config_factory: Callable[[str], "KafkaProducer"] = field(
+        default=get_kafka_producer, repr=False
+    )
+    nats_config_factory: Callable[[str], "NATSProducer"] = field(
+        default=get_nats_producer, repr=False
+    )
+    max_retries: int = 3
+    backoff_seconds: float = 0.25
+    request_timeout: float = 5.0
 
-    _event_store: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
+    _fallback_buffer: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
+    _published_events: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
+    _instances: ClassVar["WeakSet[KafkaNATSAdapter]"] = WeakSet()
 
     def __post_init__(self) -> None:
-        self._event_store.setdefault(self.account_id, [])
+        normalized = _normalize_account_id(self.account_id)
+        object.__setattr__(self, "account_id", normalized)
+
+        self._fallback_buffer.setdefault(self.account_id, [])
+        self._published_events.setdefault(self.account_id, [])
+        self._instances.add(self)
+
+        self._lock = threading.Lock()
+        self._kafka_client: httpx.Client | None = None
+        self._nats_client: httpx.Client | None = None
+        self._kafka_prefix = ""
+        self._nats_prefix = ""
+
+        self._bootstrap_clients()
 
     def publish(self, topic: str, payload: Dict[str, Any]) -> None:
         enriched = attach_correlation(payload)
@@ -52,33 +101,239 @@ class KafkaNATSAdapter:
             "payload": enriched,
             "timestamp": datetime.now(timezone.utc),
             "correlation_id": enriched.get("correlation_id") or current_correlation_id(),
+            "delivered": False,
+            "partial_delivery": False,
         }
-        self._event_store[self.account_id].append(record)
+
+        try:
+            status = self._attempt_publish(record)
+        except PublishError:
+            self._buffer_event(record)
+            self._record_event(record)
+            raise
+
+        if status == "all":
+            record["delivered"] = True
+            self._record_event(record)
+        elif status == "partial":
+            record["partial_delivery"] = True
+            self._record_event(record)
+        else:
+            # Broker unavailable, retain the record for a later flush.
+            self._buffer_event(record)
+            self._record_event(record)
 
     def history(self, correlation_id: str | None = None) -> List[Dict[str, Any]]:
-        records = list(self._event_store.get(self.account_id, []))
+        records = list(self._published_events.get(self.account_id, []))
         if correlation_id:
             return [record for record in records if record.get("correlation_id") == correlation_id]
         return records
 
     @classmethod
     def reset(cls, account_id: str | None = None) -> None:
+        try:
+            get_kafka_producer.cache_clear()  # type: ignore[attr-defined]
+        except AttributeError:  # pragma: no cover - defensive
+            pass
+        try:
+            get_nats_producer.cache_clear()  # type: ignore[attr-defined]
+        except AttributeError:  # pragma: no cover - defensive
+            pass
+
         if account_id is None:
-            cls._event_store.clear()
+            cls.shutdown()
+            cls._fallback_buffer.clear()
+            cls._published_events.clear()
             return
-        cls._event_store.pop(account_id, None)
+
+        normalized = _normalize_account_id(account_id)
+        cls._fallback_buffer.pop(normalized, None)
+        cls._published_events.pop(normalized, None)
+        for instance in list(cls._instances):
+            if instance.account_id == normalized:
+                instance._shutdown()
 
     @classmethod
     def flush_events(cls) -> Dict[str, int]:
-        """Flush buffered publish events and return per-account counts."""
-
-        counts = {account: len(events) for account, events in cls._event_store.items()}
-        for account, count in counts.items():
-            logger.info(
-                "Flushing Kafka/NATS buffer", extra={"account_id": account, "event_count": count}
-            )
-        cls._event_store.clear()
+        counts: Dict[str, int] = {}
+        for instance in list(cls._instances):
+            drained = instance._drain_buffer()
+            if drained:
+                counts[instance.account_id] = drained
         return counts
+
+    @classmethod
+    def shutdown(cls) -> None:
+        for instance in list(cls._instances):
+            instance._shutdown()
+
+    def _bootstrap_clients(self) -> None:
+        try:
+            kafka_config = self.kafka_config_factory(self.account_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception("Unable to load Kafka configuration", exc_info=exc)
+            kafka_config = None
+
+        if kafka_config:
+            self._kafka_prefix = kafka_config.topic_prefix.strip()
+            endpoint = _first_endpoint(kafka_config.bootstrap_servers)
+            self._kafka_client = self._build_client(endpoint)
+
+        try:
+            nats_config = self.nats_config_factory(self.account_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception("Unable to load NATS configuration", exc_info=exc)
+            nats_config = None
+
+        if nats_config and nats_config.servers:
+            self._nats_prefix = nats_config.subject_prefix.strip()
+            endpoint = _first_endpoint(nats_config.servers)
+            self._nats_client = self._build_client(endpoint)
+
+    def _build_client(self, endpoint: str) -> httpx.Client | None:
+        try:
+            base_url = _as_base_url(endpoint)
+            client = httpx.Client(base_url=base_url, timeout=self.request_timeout)
+            attempt = 0
+            while True:
+                attempt += 1
+                try:
+                    response = client.get("/health")
+                    if response.status_code >= 500:
+                        raise PublishError(
+                            f"Broker health check failed ({response.status_code})"
+                        )
+                    break
+                except httpx.HTTPStatusError as exc:
+                    client.close()
+                    raise PublishError("Broker health check failed") from exc
+                except httpx.RequestError:
+                    if attempt >= self.max_retries:
+                        client.close()
+                        return None
+                    time.sleep(self.backoff_seconds * (2 ** (attempt - 1)))
+            return client
+        except Exception:
+            logger.exception("Failed to initialise broker client", extra={"endpoint": endpoint})
+            return None
+
+    def _attempt_publish(self, record: Dict[str, Any]) -> str:
+        transports = []
+        if self._kafka_client is not None:
+            transports.append((self._kafka_client, self._topic_path(record["topic"])))
+        if self._nats_client is not None:
+            transports.append((self._nats_client, self._subject_path(record["topic"])) )
+
+        if not transports:
+            return "offline"
+
+        errors: List[BaseException] = []
+        successes = 0
+        for client, path in transports:
+            try:
+                self._send_with_retry(client, path, record["payload"])
+            except BaseException as exc:
+                errors.append(exc)
+                logger.warning(
+                    "Publish transport failed", extra={"topic": record["topic"], "error": str(exc)}
+                )
+            else:
+                successes += 1
+
+        if successes == 0:
+            reason = errors[-1] if errors else RuntimeError("publish failed")
+            raise PublishError("All publish transports failed") from reason
+
+        if errors:
+            logger.warning(
+                "Partial publish delivery", extra={"topic": record["topic"], "failed": len(errors)}
+            )
+
+        if successes == len(transports):
+            return "all"
+        return "partial"
+
+    def _send_with_retry(self, client: httpx.Client, path: str, payload: Dict[str, Any]) -> None:
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                response = client.post(path, json=payload)
+                response.raise_for_status()
+                return
+            except httpx.HTTPStatusError as exc:
+                if attempt >= self.max_retries:
+                    raise PublishError(f"Broker responded with status {exc.response.status_code}") from exc
+            except httpx.RequestError as exc:
+                if attempt >= self.max_retries:
+                    raise PublishError("Transport error during publish") from exc
+            time.sleep(self.backoff_seconds * (2 ** (attempt - 1)))
+
+    def _topic_path(self, topic: str) -> str:
+        full = topic
+        if self._kafka_prefix and not topic.startswith(self._kafka_prefix):
+            full = f"{self._kafka_prefix}.{topic}" if topic else self._kafka_prefix
+        encoded = full.replace("/", ".")
+        return f"/topics/{encoded}"
+
+    def _subject_path(self, topic: str) -> str:
+        subject = topic
+        if self._nats_prefix and not topic.startswith(self._nats_prefix):
+            subject = f"{self._nats_prefix}.{topic}" if topic else self._nats_prefix
+        encoded = subject.replace("/", ".")
+        return f"/subjects/{encoded}"
+
+    def _buffer_event(self, record: Dict[str, Any]) -> None:
+        buffered = dict(record)
+        buffered["delivered"] = False
+        self._fallback_buffer[self.account_id].append(buffered)
+
+    def _record_event(self, record: Dict[str, Any]) -> None:
+        events = self._published_events.setdefault(self.account_id, [])
+        correlation_id = record.get("correlation_id")
+        for index in range(len(events) - 1, -1, -1):
+            existing = events[index]
+            if (
+                existing.get("topic") == record.get("topic")
+                and existing.get("correlation_id") == correlation_id
+            ):
+                events[index] = dict(record)
+                return
+        events.append(dict(record))
+
+    def _drain_buffer(self) -> int:
+        drained = 0
+        buffer = self._fallback_buffer.get(self.account_id, [])
+        while buffer:
+            record = buffer[0]
+            try:
+                status = self._attempt_publish(record)
+            except PublishError:
+                break
+            if status == "all":
+                record["delivered"] = True
+                record["partial_delivery"] = False
+                self._record_event(record)
+                buffer.pop(0)
+                drained += 1
+            elif status == "partial":
+                record["delivered"] = False
+                record["partial_delivery"] = True
+                self._record_event(record)
+                buffer.pop(0)
+                drained += 1
+            else:
+                break
+        return drained
+
+    def _shutdown(self) -> None:
+        with self._lock:
+            if self._kafka_client is not None:
+                self._kafka_client.close()
+                self._kafka_client = None
+            if self._nats_client is not None:
+                self._nats_client.close()
+                self._nats_client = None
 
 
 @dataclass

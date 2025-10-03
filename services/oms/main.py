@@ -7,7 +7,9 @@ import sys
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
+
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
+
 import time
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple
 
@@ -158,8 +160,14 @@ async def _await_background_tasks(timeout: float) -> None:
             )
 
 
+@app.on_event("startup")
+async def _on_startup_initialize_metadata() -> None:
+    await market_metadata_cache.start()
+
+
 @app.on_event("shutdown")
 async def _on_shutdown_complete() -> None:
+    await market_metadata_cache.stop()
     await _await_background_tasks(shutdown_manager.shutdown_timeout)
     _flush_adapters()
 
@@ -197,11 +205,194 @@ class CircuitBreaker:
         return None if not data else str(data.get("reason"))
 
 
-MARKET_METADATA: Dict[str, Dict[str, float]] = {
-    "BTC-USD": {"tick": 0.1, "lot": 0.0001},
-    "ETH-USD": {"tick": 0.01, "lot": 0.001},
-    "SOL-USD": {"tick": 0.001, "lot": 0.01},
+_BASE_ALIASES: Dict[str, str] = {
+    "XBT": "BTC",
+    "XXBT": "BTC",
+    "XXBTZ": "BTC",
+    "XDG": "DOGE",
+    "XXDG": "DOGE",
+    "XETH": "ETH",
+    "XETC": "ETC",
 }
+
+_QUOTE_ALIASES: Dict[str, str] = {
+    "USD": "USD",
+    "ZUSD": "USD",
+}
+
+
+def _normalize_asset(symbol: str, *, is_quote: bool) -> str:
+    token = (symbol or "").strip().upper()
+    if not token:
+        return ""
+
+    aliases = _QUOTE_ALIASES if is_quote else _BASE_ALIASES
+    direct = aliases.get(token)
+    if direct:
+        return direct
+
+    trimmed = token
+    while len(trimmed) > 3 and trimmed.endswith(("X", "Z")):
+        trimmed = trimmed[:-1]
+    while len(trimmed) > 3 and trimmed.startswith(("X", "Z")):
+        trimmed = trimmed[1:]
+
+    return aliases.get(trimmed, trimmed)
+
+
+def _normalize_instrument(symbol: str) -> str:
+    return symbol.replace("/", "-").upper()
+
+
+def _step_from_metadata(
+    metadata: Dict[str, Any],
+    step_keys: List[str],
+    decimal_keys: List[str],
+) -> Optional[Decimal]:
+    for key in step_keys:
+        value = metadata.get(key)
+        if value is None:
+            continue
+        try:
+            step = Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError):
+            continue
+        if step > 0:
+            return step
+
+    for key in decimal_keys:
+        value = metadata.get(key)
+        if value is None:
+            continue
+        try:
+            decimals = int(value)
+        except (TypeError, ValueError):
+            continue
+        if decimals < 0:
+            continue
+        return Decimal("1") / (Decimal("10") ** decimals)
+
+    return None
+
+
+def _instrument_from_pair(metadata: Dict[str, Any]) -> Optional[str]:
+    base = _normalize_asset(str(metadata.get("base") or ""), is_quote=False)
+    quote = _normalize_asset(str(metadata.get("quote") or ""), is_quote=True)
+
+    if not base or not quote:
+        wsname = metadata.get("wsname")
+        if isinstance(wsname, str) and "/" in wsname:
+            base_part, quote_part = wsname.split("/", 1)
+            base = base or _normalize_asset(base_part, is_quote=False)
+            quote = quote or _normalize_asset(quote_part, is_quote=True)
+
+    if (not base or not quote) and isinstance(metadata.get("altname"), str):
+        altname = metadata["altname"].replace("/", "").upper()
+        if len(altname) >= 6:
+            base = base or _normalize_asset(altname[:-3], is_quote=False)
+            quote = quote or _normalize_asset(altname[-3:], is_quote=True)
+
+    if not base or quote != "USD":
+        return None
+
+    return f"{base}-USD"
+
+
+def _parse_asset_pairs(payload: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
+    parsed: Dict[str, Dict[str, float]] = {}
+    for entry in payload.values():
+        if not isinstance(entry, dict):
+            continue
+        instrument = _instrument_from_pair(entry)
+        if not instrument:
+            continue
+        tick = _step_from_metadata(entry, ["tick_size", "price_increment"], ["pair_decimals"])
+        lot = _step_from_metadata(entry, ["lot_step", "step_size"], ["lot_decimals"])
+        if tick is None or lot is None:
+            continue
+        parsed[_normalize_instrument(instrument)] = {
+            "tick": float(tick),
+            "lot": float(lot),
+        }
+    return parsed
+
+
+async def _fetch_asset_pairs() -> Dict[str, Any]:
+    async def _anonymous_credentials() -> Dict[str, Any]:
+        return {}
+
+    rest_client = KrakenRESTClient(credential_getter=_anonymous_credentials)
+    try:
+        return await rest_client.asset_pairs()
+    except KrakenRESTError as exc:
+        logger.warning("Failed to load Kraken asset metadata: %s", exc)
+        return {}
+    finally:
+        await rest_client.close()
+
+
+class MarketMetadataCache:
+    def __init__(self, refresh_interval: float) -> None:
+        self._data: Dict[str, Dict[str, float]] = {}
+        self._lock = asyncio.Lock()
+        self._refresh_interval = max(refresh_interval, 0.0)
+        self._task: Optional[asyncio.Task[None]] = None
+
+    async def start(self) -> None:
+        await self.refresh()
+        if self._refresh_interval > 0:
+            self._task = asyncio.create_task(
+                self._run(), name="kraken-metadata-refresh"
+            )
+
+    async def stop(self) -> None:
+        if self._task is None:
+            return
+        self._task.cancel()
+        with suppress(asyncio.CancelledError):
+            await self._task
+        self._task = None
+
+    async def refresh(self) -> None:
+        payload = await _fetch_asset_pairs()
+        if not payload:
+            return
+        parsed = _parse_asset_pairs(payload)
+        if not parsed:
+            return
+        async with self._lock:
+            self._data = parsed
+
+    async def get(self, instrument: str) -> Optional[Dict[str, float]]:
+        key = _normalize_instrument(instrument)
+        async with self._lock:
+            entry = self._data.get(key)
+            return dict(entry) if entry else None
+
+    async def snapshot(self) -> Dict[str, Dict[str, float]]:
+        async with self._lock:
+            return {symbol: dict(values) for symbol, values in self._data.items()}
+
+    async def _run(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(self._refresh_interval)
+                await self.refresh()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.warning("Error refreshing Kraken asset metadata: %s", exc)
+
+
+def _metadata_refresh_interval() -> float:
+    try:
+        return float(os.getenv("KRAKEN_METADATA_REFRESH_INTERVAL", "300"))
+    except ValueError:
+        return 300.0
+
+
+market_metadata_cache = MarketMetadataCache(_metadata_refresh_interval())
+app.state.market_metadata_cache = market_metadata_cache
 
 
 _SUCCESS_STATUSES = {"ok", "accepted", "open"}
@@ -580,11 +771,13 @@ async def place_order(
             detail=CircuitBreaker.reason(request.instrument) or "Trading halted",
         )
 
+
     metadata = MARKET_METADATA.get(request.instrument, {"tick": 0.01, "lot": 0.0001})
     snapped_price = _snap(request.price, metadata["tick"], side=request.side)
     snapped_quantity = _snap(
         request.quantity, metadata["lot"], side=request.side, floor_quantity=True
     )
+
 
     if snapped_price <= 0 or snapped_quantity <= 0:
         raise HTTPException(
@@ -701,9 +894,11 @@ async def place_order(
     kafka.publish(topic="oms.acks", payload=ack_payload)
 
     status_value = str(ack_payload.get("status", "")).lower()
+
     accepted = not status_value or status_value in _SUCCESS_STATUSES
 
-    if status_value and status_value not in _SUCCESS_STATUSES:
+
+    if status_value and not accepted:
         increment_trade_rejection(account_id, request.instrument)
 
     trades_snapshot = {"trades": trades}
@@ -770,6 +965,7 @@ async def place_order(
     for shadow_fill in shadow_fills:
         timescale.record_shadow_fill(shadow_fill)
 
+    accepted = (not status_value) or status_value in _SUCCESS_STATUSES
     venue = "kraken"
     return OrderPlacementResponse(accepted=accepted, routed_venue=venue, fee=request.fee)
 
