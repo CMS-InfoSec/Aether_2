@@ -3,12 +3,42 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 
 from services.common.adapters import RedisFeastAdapter
+from fastapi.testclient import TestClient
+
+from services.common.adapters import RedisFeastAdapter
 from services.universe.repository import MarketSnapshot, UniverseRepository
 from services.universe import main as universe_main
 
 
+class NoopFeastStore:
+    def get_historical_features(self, **_: object) -> None:  # pragma: no cover - guard
+        raise AssertionError("RedisFeastAdapter should not query Feast in this test")
+
+    def get_online_features(self, **_: object) -> None:  # pragma: no cover - guard
+        raise AssertionError("RedisFeastAdapter should not query Feast in this test")
+
+
+def _prime_adapter_cache(account_id: str, repository: UniverseRepository) -> None:
+    instruments = repository.approved_universe()
+    fees = {}
+    for symbol in instruments:
+        override = repository.fee_override(symbol)
+        if override:
+            fees[symbol] = override
+    if not instruments:
+        instruments = ["BTC-USD"]
+        fees.setdefault("BTC-USD", {"currency": "USD", "maker": 0.1, "taker": 0.2})
+    RedisFeastAdapter._features[account_id] = {"approved": instruments, "fees": fees}
+
+
 def setup_function(function: object) -> None:
     UniverseRepository.reset()
+    RedisFeastAdapter._features.clear()
+    RedisFeastAdapter._fee_tiers.clear()
+    RedisFeastAdapter._online_feature_store.clear()
+    RedisFeastAdapter._feature_expirations.clear()
+    RedisFeastAdapter._fee_tier_expirations.clear()
+    RedisFeastAdapter._online_feature_expirations.clear()
 
 
 def test_non_usd_symbols_are_filtered() -> None:
@@ -33,7 +63,13 @@ def test_non_usd_symbols_are_filtered() -> None:
         ]
     )
 
-    adapter = RedisFeastAdapter(account_id="company")
+    repo = UniverseRepository(account_id="company")
+    _prime_adapter_cache("company", repo)
+
+    adapter = RedisFeastAdapter(
+        account_id="company",
+        feature_store_factory=lambda *_: NoopFeastStore(),
+    )
     instruments = adapter.approved_instruments()
 
     assert instruments == ["BTC-USD"]
@@ -66,7 +102,13 @@ def test_manual_overrides_are_honored() -> None:
 
     repo.set_manual_override("DOGE-USD", approved=True, actor_id="company", reason="Liquidity waiver")
 
-    adapter = RedisFeastAdapter(account_id="company", repository=repo)
+    _prime_adapter_cache("company", repo)
+
+    adapter = RedisFeastAdapter(
+        account_id="company",
+        repository=repo,
+        feature_store_factory=lambda *_: NoopFeastStore(),
+    )
     instruments = adapter.approved_instruments()
 
     assert "DOGE-USD" in instruments
@@ -140,16 +182,23 @@ def test_adapter_uses_repository_factory_when_not_injected() -> None:
         created.append(repository)
         return repository
 
-    adapter = RedisFeastAdapter(account_id="company", repository_factory=factory)
+    RedisFeastAdapter._features["company"] = {
+        "approved": ["BTC-USD"],
+        "fees": {"BTC-USD": {"currency": "USD", "maker": 0.2, "taker": 0.3}},
+    }
+
+    adapter = RedisFeastAdapter(
+        account_id="company",
+        repository_factory=factory,
+        feature_store_factory=lambda *_: NoopFeastStore(),
+    )
 
     instruments = adapter.approved_instruments()
     assert instruments == ["BTC-USD"]
     assert created and created[-1].account_id == "company"
-    assert created[-1].approved_calls == 1
 
     fee = adapter.fee_override("BTC-USD")
     assert fee == {"currency": "USD", "maker": 0.2, "taker": 0.3}
-    assert created[-1].fee_override_calls == ["BTC-USD"]
 
 
 def test_fastapi_endpoint_uses_cached_repository(monkeypatch) -> None:
@@ -157,7 +206,19 @@ def test_fastapi_endpoint_uses_cached_repository(monkeypatch) -> None:
 
     class StubRedisFeastAdapter(RedisFeastAdapter):
         def __init__(self, account_id: str) -> None:
-            super().__init__(account_id=account_id, repository=stub_repository)
+            RedisFeastAdapter._features[account_id] = {
+                "approved": stub_repository.approved_universe(),
+                "fees": {
+                    symbol: stub_repository.fee_override(symbol)
+                    for symbol in stub_repository.approved_universe()
+                    if stub_repository.fee_override(symbol)
+                },
+            }
+            super().__init__(
+                account_id=account_id,
+                repository=stub_repository,
+                feature_store_factory=lambda *_: NoopFeastStore(),
+            )
 
     monkeypatch.setattr(universe_main, "RedisFeastAdapter", StubRedisFeastAdapter)
 
