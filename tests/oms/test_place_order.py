@@ -94,7 +94,11 @@ def test_precision_snapping_buy_never_exceeds(
 
     response = client.post("/oms/place", json=payload, headers={"X-Account-ID": "company"})
     assert response.status_code == 200
-    assert response.json()["accepted"] is True
+    body = response.json()
+    assert body["accepted"] is True
+    assert body["exchange_order_id"] == "ABC123"
+    assert body["kraken_status"] == "ok"
+    assert body["errors"] is None
 
     assert records, "Kraken client was not invoked"
     snapped_payload = records[0].requests[0]
@@ -145,7 +149,11 @@ def test_precision_snapping_sell_never_falls_short(
 
     response = client.post("/oms/place", json=payload, headers={"X-Account-ID": "company"})
     assert response.status_code == 200
-    assert response.json()["accepted"] is True
+    body = response.json()
+    assert body["accepted"] is True
+    assert body["exchange_order_id"] == "ABC123"
+    assert body["kraken_status"] == "ok"
+    assert body["errors"] is None
 
     assert records, "Kraken client was not invoked"
     snapped_payload = records[0].requests[0]

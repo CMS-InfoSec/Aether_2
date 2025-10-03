@@ -308,6 +308,9 @@ def test_place_order_allows_admin_accounts(client: TestClient, account_id: str) 
         "accepted": True,
         "routed_venue": "kraken",
         "fee": payload["fee"],
+        "exchange_order_id": "SIM-123",
+        "kraken_status": "ok",
+        "errors": None,
     }
 
 
@@ -346,7 +349,7 @@ def test_place_order_rejected_ack_sets_accepted_false(
                     status="rejected",
                     filled_qty=None,
                     avg_price=None,
-                    errors=None,
+                    errors=["EOrder:post only"]
                 )
 
             async def fetch_open_orders_snapshot(self) -> list[Dict[str, Any]]:
@@ -365,7 +368,7 @@ def test_place_order_rejected_ack_sets_accepted_false(
                     status="rejected",
                     filled_qty=None,
                     avg_price=None,
-                    errors=None,
+                    errors=["EOrder:post only"]
                 )
 
             async def open_orders(self) -> Dict[str, Any]:
@@ -410,6 +413,9 @@ def test_place_order_rejected_ack_sets_accepted_false(
         "accepted": False,
         "routed_venue": "kraken",
         "fee": payload["fee"],
+        "exchange_order_id": "SIM-REJECT",
+        "kraken_status": "rejected",
+        "errors": ["EOrder:post only"],
     }
 
 
