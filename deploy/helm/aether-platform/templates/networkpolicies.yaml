@@ -1,0 +1,110 @@
+{{- $global := .Values.global -}}
+{{- if $global.networkPolicy.enabled }}
+{{- range $svcName, $svc := .Values.backendServices }}
+{{- if $svc.enabled }}
+{{- $name := default (printf "%s-service" $svcName) $svc.nameOverride -}}
+{{- $labels := dict "name" $name "Release" $.Release -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ printf "%s-egress" $name }}
+  labels:
+    {{- include "aether-platform.labels" $labels | nindent 4 }}
+    app: {{ $name }}
+spec:
+  podSelector:
+    {{- include "aether-platform.selectorLabels" (dict "name" $name) | nindent 4 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            {{- toYaml $global.networkPolicy.allowFromIngress.namespaceSelector | nindent 12 }}
+          podSelector:
+            {{- toYaml $global.networkPolicy.allowFromIngress.podSelector | nindent 12 }}
+    - from:
+        - namespaceSelector:
+            {{- toYaml $global.networkPolicy.allowFromTrustedNamespaces | nindent 12 }}
+  egress:
+    - to:
+        - podSelector: {}
+    - to:
+        - namespaceSelector:
+            {{- toYaml $global.networkPolicy.allowDnsNamespace | nindent 12 }}
+          podSelector:
+            {{- toYaml $global.networkPolicy.allowDnsPodSelector | nindent 12 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- range $destName, $dest := $global.networkPolicy.destinations }}
+    - to:
+        {{- range $cidr := $dest.cidrs }}
+        - ipBlock:
+            cidr: {{ $cidr }}
+        {{- end }}
+      ports:
+        {{- range $port := $dest.ports }}
+        - protocol: TCP
+          port: {{ $port }}
+        {{- end }}
+    {{- end }}
+---
+{{- end }}
+{{- end }}
+{{- if .Values.ui.enabled }}
+{{- $ui := .Values.ui -}}
+{{- $name := default "aether-2-ui" $ui.nameOverride -}}
+{{- $labels := dict "name" $name "Release" $.Release -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ printf "%s-egress" $name }}
+  labels:
+    {{- include "aether-platform.labels" $labels | nindent 4 }}
+    app: {{ $name }}
+spec:
+  podSelector:
+    {{- include "aether-platform.selectorLabels" (dict "name" $name) | nindent 4 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            {{- toYaml $global.networkPolicy.allowFromIngress.namespaceSelector | nindent 12 }}
+          podSelector:
+            {{- toYaml $global.networkPolicy.allowFromIngress.podSelector | nindent 12 }}
+    - from:
+        - namespaceSelector:
+            {{- toYaml $global.networkPolicy.allowFromTrustedNamespaces | nindent 12 }}
+  egress:
+    - to:
+        - podSelector: {}
+    - to:
+        - namespaceSelector:
+            {{- toYaml $global.networkPolicy.allowDnsNamespace | nindent 12 }}
+          podSelector:
+            {{- toYaml $global.networkPolicy.allowDnsPodSelector | nindent 12 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- range $destName, $dest := $global.networkPolicy.destinations }}
+    - to:
+        {{- range $cidr := $dest.cidrs }}
+        - ipBlock:
+            cidr: {{ $cidr }}
+        {{- end }}
+      ports:
+        {{- range $port := $dest.ports }}
+        - protocol: TCP
+          port: {{ $port }}
+        {{- end }}
+    {{- end }}
+---
+{{- end }}
+{{- end }}

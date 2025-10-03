@@ -1,0 +1,22 @@
+{{- range $svcName, $svc := .Values.backendServices }}
+{{- if $svc.enabled }}
+{{- $name := default (printf "%s-service" $svcName) $svc.nameOverride -}}
+{{- $labels := dict "name" $name "Release" $.Release -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "aether-platform.labels" $labels | nindent 4 }}
+    app: {{ $name }}
+spec:
+  selector:
+    {{- include "aether-platform.selectorLabels" (dict "name" $name) | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ $svc.service.port | default 80 }}
+      targetPort: {{ $svc.service.targetPort | default "http" }}
+  type: ClusterIP
+---
+{{- end }}
+{{- end }}
