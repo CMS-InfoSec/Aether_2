@@ -5,6 +5,8 @@ resources:
 
   - deployment-auth.yaml
 
+  - deployment-strategy-orchestrator.yaml
+
   - deployment-policy.yaml
   - deployment-risk.yaml
   - deployment-oms.yaml

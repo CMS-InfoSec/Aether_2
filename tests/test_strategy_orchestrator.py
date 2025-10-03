@@ -1,14 +1,58 @@
 from __future__ import annotations
 
 import importlib
-from typing import Any, Dict
-from types import SimpleNamespace
+import os
 import sys
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Dict
 
 import pytest
 
 pytest.importorskip("pydantic")
 pytest.importorskip("sqlalchemy")
+
+ROOT = Path(__file__).resolve().parent.parent
+root_str = str(ROOT)
+sys.path = [p for p in sys.path if p != root_str]
+sys.path.insert(0, root_str)
+
+SCHEMAS_MODULE = "services.common.schemas"
+try:
+    schemas = importlib.import_module(SCHEMAS_MODULE)
+except ModuleNotFoundError:
+    spec = importlib.util.spec_from_file_location(
+        SCHEMAS_MODULE,
+        ROOT / "services" / "common" / "schemas.py",
+    )
+    if spec is None or spec.loader is None:  # pragma: no cover - defensive fallback
+        raise
+    schemas = importlib.util.module_from_spec(spec)
+    sys.modules[SCHEMAS_MODULE] = schemas
+    spec.loader.exec_module(schemas)
+
+FeeBreakdown = schemas.FeeBreakdown
+PolicyDecisionPayload = schemas.PolicyDecisionPayload
+PolicyDecisionRequest = schemas.PolicyDecisionRequest
+PortfolioState = schemas.PortfolioState
+RiskIntentMetrics = schemas.RiskIntentMetrics
+RiskIntentPayload = schemas.RiskIntentPayload
+RiskValidationRequest = schemas.RiskValidationRequest
+
+SECURITY_MODULE = "services.common.security"
+if SECURITY_MODULE not in sys.modules:
+    try:
+        importlib.import_module(SECURITY_MODULE)
+    except ModuleNotFoundError:
+        spec = importlib.util.spec_from_file_location(
+            SECURITY_MODULE,
+            ROOT / "services" / "common" / "security.py",
+        )
+        if spec is None or spec.loader is None:  # pragma: no cover - defensive fallback
+            raise
+        security_module = importlib.util.module_from_spec(spec)
+        sys.modules[SECURITY_MODULE] = security_module
+        spec.loader.exec_module(security_module)
 
 
 class _HTTPError(Exception):
@@ -26,67 +70,14 @@ sys.modules.setdefault(
     SimpleNamespace(AsyncClient=None, HTTPError=_HTTPError, HTTPStatusError=_HTTPStatusError),
 )
 
-
-class _HTTPException(Exception):
-    def __init__(self, status_code: int, detail: str) -> None:
-        super().__init__(detail)
-        self.status_code = status_code
-        self.detail = detail
-
-
-class _FastAPI:
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        self._startup_handlers = []
-
-    def post(self, *args: Any, **kwargs: Any):  # type: ignore[override]
-        def decorator(func):
-            return func
-
-        return decorator
-
-    def get(self, *args: Any, **kwargs: Any):  # type: ignore[override]
-        def decorator(func):
-            return func
-
-        return decorator
-
-    def on_event(self, event: str):
-        def decorator(func):
-            if event == "startup":
-                self._startup_handlers.append(func)
-            return func
-
-        return decorator
-
-
-def _depends(*args: Any, **kwargs: Any) -> Any:
-    return None
-
-
-sys.modules.setdefault(
-    "fastapi",
-
-    SimpleNamespace(FastAPI=_FastAPI, HTTPException=_HTTPException, Depends=_depends),
-
-)
+os.environ.setdefault("STRATEGY_DATABASE_URL", "postgresql+psycopg://user:pass@localhost:5432/strategy")
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import NullPool
+from sqlalchemy.pool import StaticPool
 from sqlalchemy.exc import OperationalError
 
 import strategy_orchestrator
-from services.common.schemas import (
-    FeeBreakdown,
-    PolicyDecisionPayload,
-    PolicyDecisionRequest,
-    PortfolioState,
-    RiskIntentMetrics,
-    RiskIntentPayload,
-    RiskValidationRequest,
-)
-
-
 class _DummyResponse:
     def __init__(self, payload: Dict[str, Any] | None = None) -> None:
         self._payload = payload or {
@@ -122,7 +113,7 @@ class _DummyAsyncClient:
 @pytest.fixture
 def registry(monkeypatch: pytest.MonkeyPatch) -> tuple[strategy_orchestrator.StrategyRegistry, Dict[str, Any]]:
     engine = create_engine(
-        "sqlite:///:memory:", future=True, connect_args={"check_same_thread": False}, poolclass=NullPool
+        "sqlite:///:memory:", future=True, connect_args={"check_same_thread": False}, poolclass=StaticPool
     )
     strategy_orchestrator.Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
@@ -195,6 +186,11 @@ async def test_route_trade_intent_forwards_account_header(
 async def test_startup_retry_recovers_after_transient_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     module = importlib.reload(strategy_orchestrator)
 
+    module.ENGINE = create_engine(
+        "sqlite:///:memory:", future=True, connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    module.SessionLocal = sessionmaker(bind=module.ENGINE, autoflush=False, expire_on_commit=False, future=True)
+
     attempts = 0
     real_create_all = module.Base.metadata.create_all
 
@@ -227,6 +223,56 @@ async def test_startup_retry_recovers_after_transient_failure(monkeypatch: pytes
     assert module.REGISTRY is not None
     assert module.SIGNAL_BUS is not None
     assert module.INITIALIZATION_ERROR is None
+
+
+def _make_registry(tmp_path: Path, defaults: list[tuple[str, str, float]] | None = None) -> strategy_orchestrator.StrategyRegistry:
+    db_path = tmp_path / "strategy.db"
+    engine = create_engine(f"sqlite:///{db_path}", future=True, connect_args={"check_same_thread": False})
+    strategy_orchestrator.Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    return strategy_orchestrator.StrategyRegistry(
+        session_factory,
+        risk_engine_url="https://risk.example.com",
+        default_strategies=defaults or [],
+    )
+
+
+def test_registry_state_survives_restart(tmp_path: Path) -> None:
+    registry = _make_registry(tmp_path)
+    registry.register("gamma", "Gamma strategy", 0.2)
+
+    reloaded = _make_registry(tmp_path)
+    snapshot = reloaded.status_for("gamma")
+
+    assert snapshot.name == "gamma"
+    assert snapshot.enabled is True
+    assert snapshot.max_nav_pct == pytest.approx(0.2)
+
+
+def test_registry_updates_visible_to_additional_replicas(tmp_path: Path) -> None:
+    db_path = tmp_path / "shared.db"
+    engine = create_engine(f"sqlite:///{db_path}", future=True, connect_args={"check_same_thread": False})
+    strategy_orchestrator.Base.metadata.create_all(engine)
+
+    factory_a = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    factory_b = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+
+    registry_a = strategy_orchestrator.StrategyRegistry(
+        factory_a,
+        risk_engine_url="https://risk.example.com",
+        default_strategies=[],
+    )
+    registry_b = strategy_orchestrator.StrategyRegistry(
+        factory_b,
+        risk_engine_url="https://risk.example.com",
+        default_strategies=[],
+    )
+
+    registry_a.register("omega", "Omega strategy", 0.15)
+    snapshot = registry_b.status_for("omega")
+
+    assert snapshot.name == "omega"
+    assert snapshot.max_nav_pct == pytest.approx(0.15)
 
 
 @pytest.mark.asyncio
