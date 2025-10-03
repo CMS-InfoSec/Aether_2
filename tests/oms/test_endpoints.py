@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from typing import Iterator
-
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterator
+from typing import Any, Dict, Iterator, Tuple
 import sys
 import types
 
@@ -40,6 +39,7 @@ if "aiohttp" not in sys.modules:
     sys.modules["aiohttp"] = aiohttp_stub
 
 from services.common import security
+from services.oms import main
 from services.oms.main import app, KrakenClientBundle
 from services.oms.kraken_ws import OrderAck
 from shared.k8s import KrakenSecretStore
@@ -113,6 +113,40 @@ def _stub_kraken_clients(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture(name="client")
 def client_fixture(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
+    sample_pairs = {
+        "XBTUSD": {
+            "wsname": "XBT/USD",
+            "base": "XXBT",
+            "quote": "ZUSD",
+            "tick_size": "0.1",
+            "lot_decimals": 4,
+        },
+        "ETHUSD": {
+            "wsname": "ETH/USD",
+            "base": "XETH",
+            "quote": "ZUSD",
+            "tick_size": "0.01",
+            "lot_decimals": 3,
+        },
+        "ADAUSD": {
+            "wsname": "ADA/USD",
+            "base": "ADA",
+            "quote": "ZUSD",
+            "tick_size": "0.000001",
+            "lot_decimals": 8,
+        },
+    }
+
+    async def _stub_asset_pairs() -> Dict[str, Any]:
+        return sample_pairs
+
+    cache = main.MarketMetadataCache(refresh_interval=0.0)
+
+    monkeypatch.setattr(main, "market_metadata_cache", cache)
+    app.state.market_metadata_cache = cache
+    monkeypatch.setattr(main, "_fetch_asset_pairs", _stub_asset_pairs)
+    asyncio.run(cache.refresh())
+
     monkeypatch.setattr(security, "ADMIN_ACCOUNTS", set(ADMIN_ACCOUNTS))
     KrakenSecretStore.reset()
 
@@ -202,3 +236,45 @@ def test_place_order_validates_side(client: TestClient) -> None:
     response = client.post("/oms/place", json=payload, headers={"X-Account-ID": "admin-alpha"})
 
     assert response.status_code == 422
+
+
+def test_place_order_snaps_to_exchange_metadata(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    submissions: list[Dict[str, Any]] = []
+
+    async def _capture_submit(
+        ws_client: Any, rest_client: Any, payload: Dict[str, Any]
+    ) -> Tuple[OrderAck, str]:
+        submissions.append(payload)
+        return (
+            OrderAck(
+                exchange_order_id="SIM-ADA-123",
+                status="ok",
+                filled_qty=None,
+                avg_price=None,
+                errors=None,
+            ),
+            "websocket",
+        )
+
+    monkeypatch.setattr(main, "_submit_order", _capture_submit)
+
+    payload = {
+        "account_id": "admin-alpha",
+        "order_id": "ord-ada",
+        "instrument": "ADA-USD",
+        "side": "BUY",
+        "quantity": 5.432109876,
+        "price": 0.123456789,
+        "fee": {"currency": "USD", "maker": 0.1, "taker": 0.2},
+    }
+
+    response = client.post("/oms/place", json=payload, headers={"X-Account-ID": "admin-alpha"})
+
+    assert response.status_code == 200
+    assert submissions, "Expected order submission to be captured"
+
+    submitted = submissions[0]
+    assert submitted["price"] == pytest.approx(0.123457, rel=0, abs=1e-9)
+    assert submitted["volume"] == pytest.approx(5.43210988, rel=0, abs=1e-9)
