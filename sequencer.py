@@ -21,6 +21,8 @@ from common.utils import tracing
 from services.common.adapters import KafkaNATSAdapter
 from override_service import OverrideDecision, OverrideRecord, latest_override
 
+import httpx
+
 from metrics import (
     increment_rejected_intents,
     increment_trades_submitted,
@@ -42,6 +44,11 @@ DEFAULT_POLICY_TIMEOUT = float(os.getenv("SEQUENCER_POLICY_TIMEOUT", "2.0"))
 DEFAULT_RISK_TIMEOUT = float(os.getenv("SEQUENCER_RISK_TIMEOUT", "2.0"))
 DEFAULT_OMS_TIMEOUT = float(os.getenv("SEQUENCER_OMS_TIMEOUT", "2.5"))
 DEFAULT_PUBLISH_TIMEOUT = float(os.getenv("SEQUENCER_PUBLISH_TIMEOUT", "1.0"))
+
+RISK_SERVICE_URL = os.getenv("RISK_SERVICE_URL", "http://risk-service")
+RISK_SERVICE_TIMEOUT = float(os.getenv("RISK_SERVICE_TIMEOUT", "2.0"))
+RISK_SERVICE_MAX_RETRIES = int(os.getenv("RISK_SERVICE_MAX_RETRIES", "2"))
+RISK_SERVICE_BACKOFF_SECONDS = float(os.getenv("RISK_SERVICE_BACKOFF_SECONDS", "0.25"))
 
 RECENT_RUN_CAPACITY = int(os.getenv("SEQUENCER_HISTORY_SIZE", "200"))
 TOPIC_PREFIX = os.getenv("SEQUENCER_TOPIC_PREFIX", "sequencer")
@@ -80,10 +87,11 @@ class SequencerStatusResponse(BaseModel):
 class StageError(Exception):
     """Base class for stage execution errors."""
 
-    def __init__(self, stage: str, message: str) -> None:
+    def __init__(self, stage: str, message: str, *, details: Optional[Mapping[str, Any]] = None) -> None:
         super().__init__(message)
         self.stage = stage
         self.message = message
+        self.details = dict(details) if details is not None else None
 
 
 class StageTimeoutError(StageError):
@@ -136,6 +144,8 @@ class Stage:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+            if isinstance(exc, StageError):
+                raise
             raise StageFailedError(self.name, f"Stage '{self.name}' failed: {exc}") from exc
 
         if not isinstance(result, StageResult):
@@ -370,7 +380,10 @@ class SequencerPipeline:
                 status_value = "failed"
                 error_message = f"{exc.stage}: {exc.message}"
                 increment_rejected_intents(exc.stage, exc.message)
-                error_payload = tracing.attach_correlation({"error": exc.message})
+                error_payload: Dict[str, Any] = {"error": exc.message}
+                if getattr(exc, "details", None):
+                    error_payload["details"] = exc.details
+                error_payload = tracing.attach_correlation(error_payload)
                 await publisher.publish_event(
                     exc.stage,
                     "failed",
@@ -525,19 +538,103 @@ async def risk_handler(payload: Dict[str, Any], ctx: PipelineContext) -> StageRe
         raise StageFailedError("risk", "Policy decision rejected the intent")
 
     intent = payload.get("intent", {})
-    quantity = _safe_float(intent.get("quantity") or intent.get("qty"))
-    price = _safe_float(intent.get("price") or intent.get("limit_px"))
-    notional = abs(quantity * price)
-    assessment = {
-        "valid": True,
-        "reasons": [],
-        "assessed_at": datetime.now(timezone.utc).isoformat(),
-        "projected_notional": notional,
-        "net_exposure": quantity,
+    request_payload: Dict[str, Any] = {
+        "account_id": ctx.account_id,
+        "intent": intent,
+        "policy_decision": decision,
     }
-    new_payload = dict(payload)
-    new_payload["risk_validation"] = assessment
-    return StageResult(payload=new_payload, artifact=assessment)
+    if "portfolio_state" in payload:
+        request_payload["portfolio_state"] = payload["portfolio_state"]
+    if "risk_context" in payload:
+        request_payload["context"] = payload["risk_context"]
+
+    url = f"{RISK_SERVICE_URL.rstrip('/')}/risk/validate"
+    headers = {"X-Account-ID": ctx.account_id}
+
+    max_attempts = max(1, RISK_SERVICE_MAX_RETRIES + 1)
+    backoff = max(0.0, RISK_SERVICE_BACKOFF_SECONDS)
+    attempts = 0
+    last_error: Optional[Exception] = None
+
+    while attempts < max_attempts:
+        attempts += 1
+        try:
+            async with httpx.AsyncClient(timeout=RISK_SERVICE_TIMEOUT) as client:
+                response = await client.post(url, json=request_payload, headers=headers)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code
+            if 500 <= status_code < 600 and attempts < max_attempts:
+                last_error = exc
+                if backoff:
+                    await asyncio.sleep(backoff)
+                    backoff *= 2
+                continue
+
+            try:
+                error_detail = exc.response.json()
+            except ValueError:
+                error_detail = exc.response.text
+
+            raise StageFailedError(
+                "risk",
+                f"Risk validation request failed with status {status_code}",
+                details={
+                    "status_code": status_code,
+                    "response": error_detail,
+                },
+            ) from exc
+        except (httpx.TimeoutException, httpx.RequestError) as exc:
+            last_error = exc
+            if attempts >= max_attempts:
+                raise StageFailedError(
+                    "risk",
+                    f"Risk validation failed after {attempts} attempts: {exc.__class__.__name__}: {exc}",
+                    details={"attempts": attempts, "error": str(exc)},
+                ) from exc
+            if backoff:
+                await asyncio.sleep(backoff)
+                backoff *= 2
+            continue
+
+        try:
+            validation_payload = response.json()
+        except ValueError as exc:
+            raise StageFailedError(
+                "risk",
+                "Risk validation returned invalid JSON",
+                details={"response": response.text},
+            ) from exc
+
+        if not isinstance(validation_payload, Mapping):
+            raise StageFailedError(
+                "risk",
+                "Risk validation returned unexpected payload",
+                details={"response": validation_payload},
+            )
+
+        reasons = [str(reason) for reason in validation_payload.get("reasons") or []]
+        is_valid = bool(validation_payload.get("valid"))
+        if not is_valid:
+            message = "Risk validation rejected intent"
+            if reasons:
+                message += ": " + "; ".join(reasons)
+            raise StageFailedError(
+                "risk",
+                message,
+                details={"reasons": reasons, "response": validation_payload},
+            )
+
+        new_payload = dict(payload)
+        new_payload["risk_validation"] = dict(validation_payload)
+        return StageResult(payload=new_payload, artifact=dict(validation_payload))
+
+    assert last_error is not None  # pragma: no cover - defensive guard
+    raise StageFailedError(
+        "risk",
+        "Risk validation failed due to repeated errors",
+        details={"attempts": attempts, "error": str(last_error)},
+    )
 
 
 async def risk_rollback(result: StageResult, ctx: PipelineContext) -> None:
