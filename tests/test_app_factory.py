@@ -239,7 +239,7 @@ def test_create_app_uses_postgres_repository_when_dsn(monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(app_module, "PostgresAdminRepository", DummyPostgresRepository)
 
-    session_store = app_module.InMemorySessionStore()
+    session_store = InMemorySessionStore()
     application = app_module.create_app(session_store=session_store)
 
     assert isinstance(application.state.admin_repository, DummyPostgresRepository)
@@ -251,6 +251,15 @@ def test_create_app_defaults_to_in_memory_repository(monkeypatch: pytest.MonkeyP
     monkeypatch.delenv("ADMIN_DATABASE_DSN", raising=False)
     monkeypatch.delenv("ADMIN_DB_DSN", raising=False)
 
-    application = app_module.create_app(session_store=app_module.InMemorySessionStore())
+    application = app_module.create_app(session_store=InMemorySessionStore())
 
     assert isinstance(application.state.admin_repository, app_module.InMemoryAdminRepository)
+
+
+def test_create_app_requires_session_store_dsn(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SESSION_REDIS_URL", raising=False)
+    monkeypatch.delenv("SESSION_STORE_URL", raising=False)
+    monkeypatch.delenv("SESSION_BACKEND_DSN", raising=False)
+
+    with pytest.raises(RuntimeError, match="Session store misconfigured"):
+        app_module.create_app()
