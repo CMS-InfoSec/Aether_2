@@ -1393,6 +1393,9 @@ async def cancel_order(
             detail="exchange_order_id is required for Kraken cancellations.",
         )
 
+    kafka = KafkaNATSAdapter(account_id=request.account_id)
+    timescale = TimescaleAdapter(account_id=request.account_id)
+
     async with _acquire_kraken_clients(request.account_id) as clients:
         credentials = await clients.credential_getter()
         try:
@@ -1403,13 +1406,59 @@ async def cancel_order(
                 detail=str(exc),
             ) from exc
 
-        ack, _ = await _cancel_order(
+        ack, transport = await _cancel_order(
             clients.ws_client,
             clients.rest_client,
             {"txid": request.exchange_order_id},
         )
 
-    return _cancel_ack_payload(ack, fallback_txid=request.exchange_order_id)
+    event_payload: Dict[str, Any] = {
+        "account_id": request.account_id,
+        "order_id": request.client_id,
+        "requested_txid": request.exchange_order_id,
+        "txid": ack.exchange_order_id or request.exchange_order_id,
+        "status": (ack.status or "").strip() or "canceled",
+        "transport": transport,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    if ack.filled_qty is not None:
+        event_payload["filled_qty"] = float(ack.filled_qty)
+    if ack.avg_price is not None:
+        event_payload["avg_price"] = float(ack.avg_price)
+    if ack.errors:
+        errors = [str(error) for error in ack.errors if str(error)]
+        if errors:
+            event_payload["errors"] = errors
+
+    try:
+        response = _cancel_ack_payload(ack, fallback_txid=request.exchange_order_id)
+    except HTTPException:
+        timescale.record_event("oms.cancel", event_payload)
+        kafka.publish(topic="oms.cancels", payload=event_payload)
+        increment_trade_rejection(request.account_id, "unknown")
+        raise
+
+    event_payload.update(
+        {
+            "txid": response.exchange_order_id,
+            "status": response.status,
+        }
+    )
+    if response.filled_qty is not None:
+        event_payload["filled_qty"] = response.filled_qty
+    elif "filled_qty" in event_payload and response.filled_qty is None:
+        event_payload.pop("filled_qty")
+    if response.avg_price is not None:
+        event_payload["avg_price"] = response.avg_price
+    elif "avg_price" in event_payload and response.avg_price is None:
+        event_payload.pop("avg_price")
+    event_payload.pop("errors", None)
+
+    timescale.record_event("oms.cancel", event_payload)
+    kafka.publish(topic="oms.cancels", payload=event_payload)
+
+    return response
 
 
 @app.get(
