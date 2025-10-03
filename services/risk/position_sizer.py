@@ -9,7 +9,10 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Mapping, Optional, Protocol
 
 from services.common.adapters import RedisFeastAdapter, TimescaleAdapter
-from services.common.precision import KRAKEN_PRECISION
+from services.common.precision import (
+    PrecisionMetadataUnavailable,
+    precision_provider,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +172,31 @@ class PositionSizer:
         if notional_cap > 0.0:
             base_size_usd = min(base_size_usd, notional_cap)
 
+        try:
+            lot_size = self._resolve_lot_size(symbol)
+        except PrecisionMetadataUnavailable:
+            diagnostics["precision_metadata_missing"] = True
+            reason = "precision_metadata_missing"
+            result = self._finalize_result(
+                symbol,
+                resolved_nav,
+                resolved_cash,
+                resolved_volatility,
+                risk_budget,
+                base_size_usd,
+                0.0,
+                0.0,
+                reason,
+                resolved_edge,
+                resolved_fee,
+                config,
+                resolved_regime,
+                resolved_price,
+                diagnostics,
+            )
+            self._log(symbol, resolved_volatility, result.max_size_usd, result.timestamp)
+            return result
+
         gate_threshold = (resolved_fee or 0.0) + config.slippage_bps + config.safety_margin_bps
         diagnostics["edge_threshold_bps"] = gate_threshold
 
@@ -201,7 +229,6 @@ class PositionSizer:
 
         if resolved_price and resolved_price > 0.0:
             raw_units = max_size_usd / resolved_price
-            lot_size = self._resolve_lot_size(symbol)
             if lot_size > 0:
                 raw_units = math.floor(raw_units / lot_size) * lot_size
             size_units = max(raw_units, 0.0)
@@ -385,14 +412,15 @@ class PositionSizer:
         return None
 
     def _resolve_lot_size(self, symbol: str) -> float:
-        metadata = KRAKEN_PRECISION.get(symbol.upper())
-        if metadata is None:
-            return 0.0
+        metadata = precision_provider.require(symbol)
         lot_size = metadata.get("lot")
         try:
-            return float(lot_size) if lot_size is not None else 0.0
-        except (TypeError, ValueError):  # pragma: no cover - defensive casting
-            return 0.0
+            value = float(lot_size) if lot_size is not None else 0.0
+        except (TypeError, ValueError) as exc:  # pragma: no cover - defensive casting
+            raise PrecisionMetadataUnavailable(f"Invalid lot size for {symbol}") from exc
+        if value <= 0:
+            raise PrecisionMetadataUnavailable(f"Invalid lot size for {symbol}")
+        return value
 
     def _finalize_result(
         self,

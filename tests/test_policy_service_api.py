@@ -22,7 +22,9 @@ if "metrics" not in sys.modules:
     metrics_stub.record_drift_score = lambda *args, **kwargs: None
     metrics_stub.record_scaling_state = lambda *args, **kwargs: None
     metrics_stub.observe_scaling_evaluation = lambda *args, **kwargs: None
-    metrics_stub.get_request_id = lambda: "test-request"
+
+    metrics_stub.get_request_id = lambda: None
+
     sys.modules["metrics"] = metrics_stub
 
 import policy_service
@@ -49,13 +51,16 @@ def _client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     monkeypatch.setattr(policy_service.EXCHANGE_ADAPTER, "place_order", _noop_place_order)
     monkeypatch.setattr(policy_service.EXCHANGE_ADAPTER, "supports", lambda op: True)
     monkeypatch.setattr(
-        "shared.graceful_shutdown.install_sigterm_handler", lambda manager: None
+
+        "shared.graceful_shutdown.install_sigterm_handler",
+        lambda manager: None,
     )
-    shutdown_manager = getattr(policy_service, "shutdown_manager", None)
-    if shutdown_manager is not None:
-        shutdown_manager._draining = False  # type: ignore[attr-defined]
-        shutdown_manager._drain_started_at = None  # type: ignore[attr-defined]
-        shutdown_manager._inflight = 0  # type: ignore[attr-defined]
+
+    async def _healthy() -> bool:
+        return True
+
+    monkeypatch.setattr(policy_service, "_model_health_ok", _healthy)
+
     policy_service.app.dependency_overrides[policy_service.require_admin_account] = lambda: "company"
     with TestClient(policy_service.app) as client:
         yield client
@@ -301,12 +306,6 @@ def test_policy_decide_preserves_tick_precision(
         return {"maker": Decimal("1.2345"), "taker": Decimal("2.3456")}[liquidity]
 
     monkeypatch.setattr(policy_service, "_fetch_effective_fee", _fake_fee)
-    monkeypatch.setitem(
-        policy_service.KRAKEN_PRECISION,
-        "TST-USD",
-        {"tick": 0.00000001, "lot": 0.00000001},
-    )
-
     payload = {
         "account_id": "company",
         "order_id": "precise-1",
@@ -328,6 +327,18 @@ def test_policy_decide_preserves_tick_precision(
     body = _validate_response(response.json())
     assert body.effective_fee.maker == pytest.approx(1.2345)
     assert body.effective_fee.taker == pytest.approx(2.3456)
+
+
+def test_policy_resolves_precision_for_ada_pair() -> None:
+    precision = policy_service._resolve_precision("ADA-USD")
+    assert precision["tick"] == pytest.approx(0.0001)
+    assert precision["lot"] == pytest.approx(0.1)
+
+    snapped_price = policy_service._snap(0.256789, precision["tick"])
+    snapped_qty = policy_service._snap(12.3456, precision["lot"])
+
+    assert snapped_price == pytest.approx(0.2568)
+    assert snapped_qty == pytest.approx(12.3)
 
 
 def test_policy_decide_rejects_when_slippage_erodes_edge(
