@@ -5,6 +5,7 @@ import base64
 import importlib
 import logging
 import os
+import uuid
 from typing import Optional
 
 from fastapi import FastAPI
@@ -33,8 +34,6 @@ from scaling_controller import (
     configure_scaling_controller,
     router as scaling_router,
 )
-
-
 logger = logging.getLogger(__name__)
 _ADMIN_REPOSITORY_HEALTHCHECK_EMAIL = "__admin_healthcheck__@aether.local"
 _ADMIN_REPOSITORY_HEALTHCHECK_ID = "__admin_repository_healthcheck__"
@@ -92,6 +91,7 @@ def _build_admin_repository_from_env() -> AdminRepositoryProtocol:
 def _verify_admin_repository(admin_repository: AdminRepositoryProtocol) -> None:
     """Persist and validate a sentinel admin record for startup verification."""
 
+
     sentinel = AdminAccount(
         admin_id=_ADMIN_REPOSITORY_HEALTHCHECK_ID,
         email=_ADMIN_REPOSITORY_HEALTHCHECK_EMAIL,
@@ -102,6 +102,7 @@ def _verify_admin_repository(admin_repository: AdminRepositoryProtocol) -> None:
     stored = admin_repository.get_by_email(_ADMIN_REPOSITORY_HEALTHCHECK_EMAIL)
     if not stored or stored.admin_id != _ADMIN_REPOSITORY_HEALTHCHECK_ID:
         raise RuntimeError("Admin repository is not writable; startup verification failed.")
+
 
 
 def _build_session_store_from_env() -> SessionStoreProtocol:

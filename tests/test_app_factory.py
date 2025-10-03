@@ -93,6 +93,9 @@ class InMemoryAdminRepository(AdminRepositoryProtocol):
     def add(self, admin) -> None:  # pragma: no cover - behaviour not under test
         self._admins[getattr(admin, "email", "")] = admin
 
+    def delete(self, email: str) -> None:  # pragma: no cover - behaviour not under test
+        self._admins.pop(email, None)
+
     def get_by_email(self, email: str):  # pragma: no cover - behaviour not under test
         return self._admins.get(email)
 
@@ -294,12 +297,15 @@ def test_startup_verifies_repository_persistence() -> None:
         admin_repository=admin_repo, session_store=session_store
     )
 
+
     sentinel = admin_repo.get_by_email(app_module._ADMIN_REPOSITORY_HEALTHCHECK_EMAIL)
     assert sentinel is not None
     assert sentinel.admin_id == app_module._ADMIN_REPOSITORY_HEALTHCHECK_ID
+
 
     restarted = app_module.create_app(
         admin_repository=admin_repo, session_store=session_store
     )
 
     assert restarted.state.admin_repository.get_by_email(existing.email) is existing
+ain

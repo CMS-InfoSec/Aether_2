@@ -198,6 +198,9 @@ class AdminRepositoryProtocol(Protocol):
     def add(self, admin: AdminAccount) -> None:  # pragma: no cover - Protocol definition
         ...
 
+    def delete(self, email: str) -> None:  # pragma: no cover - Protocol definition
+        ...
+
     def get_by_email(self, email: str) -> Optional[AdminAccount]:  # pragma: no cover - Protocol definition
         ...
 
@@ -211,6 +214,9 @@ class InMemoryAdminRepository(AdminRepositoryProtocol):
 
     def add(self, admin: AdminAccount) -> None:
         self._admins[admin.email] = admin
+
+    def delete(self, email: str) -> None:
+        self._admins.pop(email, None)
 
     def get_by_email(self, email: str) -> Optional[AdminAccount]:
         return self._admins.get(email)
@@ -330,6 +336,15 @@ class PostgresAdminRepository(AdminRepositoryProtocol):
                         admin.mfa_secret,
                         allowed_ips,
                     ),
+                )
+            conn.commit()
+
+    def delete(self, email: str) -> None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM admin_accounts WHERE email = %s",
+                    (email,),
                 )
             conn.commit()
 
