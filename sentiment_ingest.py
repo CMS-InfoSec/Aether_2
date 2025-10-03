@@ -6,7 +6,7 @@ credentials are unavailable it gracefully falls back to deterministic stub data
 so that downstream systems can still exercise the data flow.  All retrieved
 mentions are scored with a pretrained transformer sentiment model when
 available, otherwise a heuristic fallback is used.  The resulting observations
-are stored in a SQLite table named ``sentiment_scores`` and optionally pushed
+are stored in a shared SQL table named ``sentiment_scores`` and optionally pushed
 into the in-memory Feast façade that powers integration tests for the wider
 platform.
 
@@ -20,20 +20,83 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import datetime as dt
+import importlib
+import importlib.util
 import logging
 import os
-import sqlite3
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.routing import APIRouter
 from pydantic import BaseModel
+from sqlalchemy import (
+    BigInteger,
+    Column,
+    DateTime,
+    Index,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    create_engine,
+    func,
+    insert,
+    select,
+)
+from sqlalchemy.engine import Engine
 
 try:  # pragma: no cover - optional dependency for HTTP clients
     import httpx
 except Exception:  # pragma: no cover - keep runtime light during tests
     httpx = None  # type: ignore
+
+def _resolve_security_dependency() -> Callable[..., str]:
+    module_names = ("services.common.security", "aether.services.common.security")
+    for module_name in module_names:
+        try:
+            module = importlib.import_module(module_name)
+        except ModuleNotFoundError:
+            continue
+        except Exception as exc:  # pragma: no cover - fail fast on unexpected import errors
+            raise
+        else:
+            dependency = getattr(module, "require_admin_account", None)
+            if dependency is not None:
+                return dependency
+
+    from pathlib import Path
+    import sys
+
+    base_dir = Path(__file__).resolve().parent
+    fallback_path = base_dir / "services" / "common" / "security.py"
+    if fallback_path.exists():
+        spec = importlib.util.spec_from_file_location("services.common.security", fallback_path)
+        if spec and spec.loader:
+            module = importlib.util.module_from_spec(spec)
+            sys.modules.setdefault(spec.name, module)
+            spec.loader.exec_module(module)  # type: ignore[union-attr]
+            dependency = getattr(module, "require_admin_account", None)
+            if dependency is not None:
+                return dependency
+
+    from fastapi import Header, Request  # type: ignore
+
+    def _missing_dependency(
+        request: Request,
+        authorization: Optional[str] = Header(None, alias="Authorization"),
+        x_account_id: Optional[str] = Header(None, alias="X-Account-ID"),
+    ) -> str:
+        raise HTTPException(
+            status_code=500,
+            detail="Security dependency unavailable; configure services.common.security.",
+        )
+
+    return _missing_dependency
+
+
+require_admin_account = _resolve_security_dependency()
+
 
 LOGGER = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -314,50 +377,105 @@ def _try_parse_iso8601(value: str) -> dt.datetime:
     return dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ")
 
 
-class SentimentRepository:
-    """SQLite-backed storage for sentiment scores."""
+_METADATA = MetaData()
 
-    def __init__(self, db_path: Path | str) -> None:
-        path = Path(db_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(path, check_same_thread=False)
-        self._connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sentiment_scores (
-                symbol TEXT NOT NULL,
-                score TEXT NOT NULL,
-                source TEXT NOT NULL,
-                ts TIMESTAMP NOT NULL
-            )
-            """
-        )
-        self._connection.commit()
-        self._lock = asyncio.Lock()
+
+_SENTIMENT_ID_TYPE = BigInteger().with_variant(Integer, "sqlite")
+
+
+_SENTIMENT_TABLE = Table(
+    "sentiment_scores",
+    _METADATA,
+    Column("id", _SENTIMENT_ID_TYPE, primary_key=True, autoincrement=True),
+    Column("symbol", String(64), nullable=False),
+    Column("score", String(16), nullable=False),
+    Column("source", String(32), nullable=False),
+    Column("ts", DateTime(timezone=True), nullable=False),
+    Column("ingested_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    sqlite_autoincrement=True,
+)
+Index("ix_sentiment_scores_symbol_ts", _SENTIMENT_TABLE.c.symbol, _SENTIMENT_TABLE.c.ts)
+Index("ix_sentiment_scores_ts", _SENTIMENT_TABLE.c.ts)
+
+
+def _default_database_url() -> str:
+    candidates = [
+        os.getenv("SENTIMENT_DATABASE_URL"),
+        os.getenv("TIMESCALE_DATABASE_URL"),
+        os.getenv("TIMESCALE_URI"),
+        os.getenv("DATABASE_URL"),
+    ]
+    for candidate in candidates:
+        if candidate:
+            return candidate
+    default_path = Path("data/sentiment/sentiment.db")
+    default_path.parent.mkdir(parents=True, exist_ok=True)
+    return f"sqlite:///{default_path}"
+
+
+def _create_engine(url: str) -> Engine:
+    options: dict[str, object] = {"future": True, "pool_pre_ping": True}
+    if url.startswith("sqlite"):
+        options["connect_args"] = {"check_same_thread": False}
+    return create_engine(url, **options)
+
+
+class SentimentRepository:
+    """SQLAlchemy-backed storage for sentiment scores."""
+
+    def __init__(self, database_url: str | None = None, *, engine: Engine | None = None) -> None:
+        url = str(database_url) if database_url is not None else _default_database_url()
+        self._engine: Engine = engine or _create_engine(url)
+        self._ensure_schema()
+
+    def _ensure_schema(self) -> None:
+        try:
+            _METADATA.create_all(self._engine, tables=[_SENTIMENT_TABLE])
+        except Exception:  # pragma: no cover - fail fast if schema creation fails
+            LOGGER.exception("Failed to bootstrap sentiment schema")
+            raise
 
     async def insert(self, observation: SocialPost, label: str) -> None:
-        async with self._lock:
-            self._connection.execute(
-                "INSERT INTO sentiment_scores(symbol, score, source, ts) VALUES (?, ?, ?, ?)",
-                (
-                    observation.symbol,
-                    label,
-                    observation.source,
-                    observation.created_at.isoformat(),
-                ),
-            )
-            self._connection.commit()
+        values = {
+            "symbol": observation.symbol.upper(),
+            "score": label,
+            "source": observation.source,
+            "ts": observation.created_at.astimezone(dt.timezone.utc),
+        }
+        await asyncio.to_thread(self._insert_sync, values)
+
+    def _insert_sync(self, values: dict[str, object]) -> None:
+        with self._engine.begin() as connection:
+            connection.execute(insert(_SENTIMENT_TABLE).values(**values))
 
     async def latest(self, symbol: str) -> Optional[Tuple[str, str, str, dt.datetime]]:
-        async with self._lock:
-            cursor = self._connection.execute(
-                "SELECT symbol, score, source, ts FROM sentiment_scores WHERE symbol = ? ORDER BY ts DESC LIMIT 1",
-                (symbol.upper(),),
+        stmt = (
+            select(
+                _SENTIMENT_TABLE.c.symbol,
+                _SENTIMENT_TABLE.c.score,
+                _SENTIMENT_TABLE.c.source,
+                _SENTIMENT_TABLE.c.ts,
             )
-            row = cursor.fetchone()
-        if not row:
+            .where(func.upper(_SENTIMENT_TABLE.c.symbol) == symbol.upper())
+            .order_by(_SENTIMENT_TABLE.c.ts.desc())
+            .limit(1)
+        )
+        row = await asyncio.to_thread(self._fetch_one, stmt)
+        if row is None:
             return None
-        ts = _parse_timestamp(row[3]) or dt.datetime.now(tz=dt.timezone.utc)
-        return row[0], row[1], row[2], ts
+        ts_value = row.ts
+        if isinstance(ts_value, dt.datetime):
+            ts = ts_value if ts_value.tzinfo else ts_value.replace(tzinfo=dt.timezone.utc)
+            ts = ts.astimezone(dt.timezone.utc)
+        else:
+            ts = _parse_timestamp(ts_value) or dt.datetime.now(tz=dt.timezone.utc)
+        return row.symbol, row.score, row.source, ts
+
+    def _fetch_one(self, stmt):
+        with self._engine.begin() as connection:
+            result = connection.execute(stmt)
+            row = result.first()
+        return row
 
 
 class FeastSentimentWriter:
@@ -444,21 +562,33 @@ class SentimentAPI:
 
     def _register_routes(self) -> None:
         @self.router.get("/latest", response_model=SentimentResponse)
-        async def latest(symbol: str = Query(..., description="Symbol ticker, e.g. BTC-USD")) -> SentimentResponse:
+        async def latest(
+            symbol: str = Query(..., description="Symbol ticker, e.g. BTC-USD"),
+            _: str = Depends(require_admin_account),
+        ) -> SentimentResponse:
             record = await self._repository.latest(symbol)
             if record is None:
                 raise HTTPException(status_code=404, detail=f"No sentiment found for {symbol.upper()}")
             return SentimentResponse(symbol=record[0], score=record[1], source=record[2], ts=record[3])
 
         @self.router.post("/refresh")
-        async def refresh(symbols: List[str]) -> dict[str, str]:
+        async def refresh(symbols: List[str], _: str = Depends(require_admin_account)) -> dict[str, str]:
             await self._service.ingest_many(symbols)
             return {"status": "ok", "symbols": ",".join(symbols)}
 
 
-def bootstrap_service(db_path: Path | str | None = None) -> Tuple[SentimentIngestService, SentimentRepository]:
-    db_path = db_path or Path("data/sentiment/sentiment.db")
-    repository = SentimentRepository(db_path)
+def bootstrap_service(
+    database_url: str | Path | None = None,
+) -> Tuple[SentimentIngestService, SentimentRepository]:
+    url: str | None
+    if database_url is None:
+        url = None
+    elif isinstance(database_url, Path):
+        url = f"sqlite:///{database_url}"
+    else:
+        url = str(database_url)
+
+    repository = SentimentRepository(url)
     model = SentimentModel()
 
     twitter_source = TwitterSource(api_key=os.getenv("TWITTER_BEARER_TOKEN"))
@@ -496,8 +626,8 @@ def create_app(
     return app
 
 
-async def run_once(symbols: Sequence[str], *, db_path: Path | str | None = None) -> None:
-    service, _ = bootstrap_service(db_path)
+async def run_once(symbols: Sequence[str], *, database_url: Path | str | None = None) -> None:
+    service, _ = bootstrap_service(database_url=database_url)
     await service.ingest_many(symbols)
 
 
