@@ -13,7 +13,7 @@ import time
 import uuid
 from typing import Any, Awaitable, Callable, Deque, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
 
@@ -22,11 +22,7 @@ from auth.session_client import AdminSessionManager, get_default_session_manager
 from common.utils import tracing
 from services.common.adapters import KafkaNATSAdapter
 
-from services.common.schemas import (
-    FeeBreakdown,
-    PolicyDecisionRequest,
-    PolicyDecisionResponse,
-)
+from services.common.security import require_admin_account
 
 from override_service import OverrideDecision, OverrideRecord, latest_override
 
@@ -1054,7 +1050,22 @@ setup_metrics(app, service_name="sequencer")
 
 
 @app.post("/sequencer/submit_intent", response_model=SequencerResponse)
-async def submit_intent(request: SequencerIntentRequest) -> SequencerResponse:
+async def submit_intent(
+    request: SequencerIntentRequest,
+    authorized_account: str = Depends(require_admin_account),
+) -> SequencerResponse:
+    intent_account = str(request.intent.get("account_id") or "").strip()
+    if not intent_account:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Intent payload must include an account_id.",
+        )
+    if intent_account.lower() != authorized_account.strip().lower():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authenticated account does not match intent payload.",
+        )
+
     try:
         result = await pipeline.submit(request.intent)
     except StageTimeoutError as exc:
@@ -1066,7 +1077,9 @@ async def submit_intent(request: SequencerIntentRequest) -> SequencerResponse:
 
 
 @app.get("/sequencer/status", response_model=SequencerStatusResponse)
-async def sequencer_status() -> SequencerStatusResponse:
+async def sequencer_status(
+    _: str = Depends(require_admin_account),
+) -> SequencerStatusResponse:
     runs = await history.snapshot()
     serialized_runs = [run.to_dict() for run in runs]
     latency_values = [run.latency_ms for run in runs if run.latency_ms >= 0]
