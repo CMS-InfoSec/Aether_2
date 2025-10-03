@@ -26,7 +26,8 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Iterable, List, Optional, Protocol, Sequence
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
+from typing import Iterable, List, Mapping, Optional, Protocol, Sequence
 
 from services.common.adapters import TimescaleAdapter
 
@@ -83,10 +84,73 @@ class HedgeOrder:
     client_order_id: str
     symbol: str
     side: str
-    quantity: float
-    price: float
+    quantity: Decimal
+    price: Decimal
     order_type: str = "limit"
     time_in_force: str = "GTC"
+
+    def to_payload(self) -> dict:
+        return {
+            "account_id": self.account_id,
+            "client_order_id": self.client_order_id,
+            "symbol": self.symbol,
+            "side": self.side,
+            "quantity": str(self.quantity),
+            "price": str(self.price),
+            "order_type": self.order_type,
+            "time_in_force": self.time_in_force,
+        }
+
+
+@dataclass(frozen=True)
+class InstrumentPrecision:
+    tick_size: Decimal
+    lot_size: Decimal
+
+
+class PrecisionProvider(Protocol):
+    def get_precision(self, symbol: str) -> Optional[InstrumentPrecision]:
+        """Return precision metadata for the provided instrument if available."""
+
+
+class MarketMetadataPrecisionProvider:
+    """Fetch precision data from the Kraken market metadata cache."""
+
+    def __init__(self, metadata: Optional[Mapping[str, Mapping[str, float]]] = None) -> None:
+        if metadata is not None:
+            self._metadata_getter = lambda: metadata
+        else:
+            self._metadata_getter = self._default_metadata_getter
+
+    @staticmethod
+    def _default_metadata_getter() -> Mapping[str, Mapping[str, float]]:
+        try:
+            from services.oms import main as oms_main  # Local import to avoid circular deps
+        except Exception:  # pragma: no cover - metadata unavailable in limited envs
+            return {}
+        return getattr(oms_main, "MARKET_METADATA", {})
+
+    @staticmethod
+    def _normalize_symbol(symbol: str) -> str:
+        return symbol.replace("/", "-").upper()
+
+    def get_precision(self, symbol: str) -> Optional[InstrumentPrecision]:
+        metadata = self._metadata_getter()
+        entry = metadata.get(self._normalize_symbol(symbol))
+        if not isinstance(entry, Mapping):
+            return None
+        tick = entry.get("tick")
+        lot = entry.get("lot")
+        if tick is None or lot is None:
+            return None
+        try:
+            tick_size = Decimal(str(tick))
+            lot_size = Decimal(str(lot))
+        except (InvalidOperation, TypeError, ValueError):
+            return None
+        if tick_size <= 0 or lot_size <= 0:
+            return None
+        return InstrumentPrecision(tick_size=tick_size, lot_size=lot_size)
 
 
 @dataclass
@@ -101,7 +165,7 @@ class LoggingOMSClient:
 
     def submit_hedge_order(self, order: HedgeOrder) -> None:  # pragma: no cover - thin wrapper
         logger.info(
-            "Routing hedge order %s %s %s @ %.6f (qty %.6f)",
+            "Routing hedge order %s %s %s @ %s (qty %s)",
             order.client_order_id,
             order.side,
             order.symbol,
@@ -109,7 +173,7 @@ class LoggingOMSClient:
             order.quantity,
         )
         self.timescale.record_event(
-            event_type="hedge.order", payload={"order": order.__dict__}
+            event_type="hedge.order", payload={"order": order.to_payload()}
         )
 
 
@@ -233,6 +297,7 @@ class HedgingService:
         pnl_source: PnLDataSource,
         oms_client: Optional[OMSClient] = None,
         timescale: Optional[TimescaleAdapter] = None,
+        precision_provider: Optional[PrecisionProvider] = None,
     ) -> None:
         self.config = config
         self.market_data = market_data
@@ -241,6 +306,9 @@ class HedgingService:
         self.oms = oms_client or LoggingOMSClient(account_id=config.account_id)
         self.state = HedgeState(current_allocation=config.base_allocation_usd)
         self._cooldown_until: float = 0.0
+        self._precision_provider: PrecisionProvider = (
+            precision_provider or MarketMetadataPrecisionProvider()
+        )
 
     # ------------------------------------------------------------------
     # Public orchestration
@@ -330,10 +398,31 @@ class HedgingService:
         if price <= 0:
             raise ValueError("Cannot rebalance using non-positive prices")
 
-        delta_usd = target_allocation - self.state.current_allocation
+        delta_usd = Decimal(str(target_allocation)) - Decimal(
+            str(self.state.current_allocation)
+        )
+        if delta_usd == 0:
+            return
+
         side = "BUY" if delta_usd > 0 else "SELL"
-        quantity = abs(delta_usd) / price
-        if quantity <= 0:
+        raw_price = Decimal(str(price))
+        if raw_price <= 0:
+            raise ValueError("Cannot rebalance using non-positive prices")
+
+        raw_quantity = delta_usd.copy_abs() / raw_price
+
+        precision = self._precision_provider.get_precision(self.config.hedge_symbol)
+
+        if precision:
+            price_dec = self._apply_price_precision(raw_price, precision.tick_size, side)
+            quantity_dec = self._apply_quantity_precision(
+                raw_quantity, precision.lot_size
+            )
+        else:
+            price_dec = raw_price
+            quantity_dec = raw_quantity
+
+        if quantity_dec <= 0:
             return
 
         order = HedgeOrder(
@@ -341,34 +430,34 @@ class HedgingService:
             client_order_id=f"HEDGE-{uuid.uuid4().hex[:12]}",
             symbol=self.config.hedge_symbol,
             side=side,
-            quantity=quantity,
-            price=price,
-            order_type="market" if price == 1.0 else "limit",
+            quantity=quantity_dec,
+            price=price_dec,
+            order_type="market" if price_dec == Decimal("1") else "limit",
             time_in_force="IOC" if side == "SELL" else "GTC",
         )
 
         logger.info(
-            "Rebalancing hedge to %.2f USD via %s %.4f @ %.4f (risk_score=%.3f)",
+            "Rebalancing hedge to %.2f USD via %s %s @ %s (risk_score=%.3f)",
             target_allocation,
             side,
-            quantity,
-            price,
+            quantity_dec,
+            price_dec,
             risk_score,
         )
 
         self.oms.submit_hedge_order(order)
 
         self.timescale.record_instrument_exposure(
-            self.config.hedge_symbol, delta_usd
+            self.config.hedge_symbol, float(delta_usd)
         )
         self.timescale.record_event(
             event_type="hedge.rebalance",
             payload={
                 "target_allocation": target_allocation,
                 "previous_allocation": self.state.current_allocation,
-                "delta_usd": delta_usd,
-                "quantity": quantity,
-                "price": price,
+                "delta_usd": float(delta_usd),
+                "quantity": str(quantity_dec),
+                "price": str(price_dec),
                 "risk_score": risk_score,
                 "order_id": order.client_order_id,
             },
@@ -378,6 +467,34 @@ class HedgingService:
         self.state.last_risk_score = risk_score
         if risk_score <= 1.0:
             self._cooldown_until = time.time() + self.config.unwind_cooldown_seconds
+
+    @staticmethod
+    def _apply_price_precision(
+        price: Decimal, tick_size: Decimal, side: str
+    ) -> Decimal:
+        if tick_size <= 0:
+            return price
+
+        rounding = ROUND_UP if side == "BUY" else ROUND_DOWN
+        try:
+            snapped = price.quantize(tick_size, rounding=rounding)
+        except InvalidOperation:
+            exponent = tick_size.as_tuple().exponent
+            snapped = price.quantize(Decimal((0, (1,), exponent)), rounding=rounding)
+        if snapped <= 0:
+            return tick_size
+        return snapped
+
+    @staticmethod
+    def _apply_quantity_precision(quantity: Decimal, lot_size: Decimal) -> Decimal:
+        if lot_size <= 0:
+            return quantity
+
+        steps = (quantity / lot_size).to_integral_value(rounding=ROUND_DOWN)
+        snapped = steps * lot_size
+        if snapped <= 0:
+            return Decimal("0")
+        return snapped
 
 
 # ---------------------------------------------------------------------------
