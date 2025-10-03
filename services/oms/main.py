@@ -1107,6 +1107,19 @@ async def place_order(
             detail="Market metadata unavailable; unable to quantize order safely.",
         )
 
+    expire_time_iso: str | None = None
+    if request.time_in_force == "GTD":
+        if request.expire_time is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="expire_time is required when time_in_force is GTD",
+            )
+        expire_time_iso = (
+            request.expire_time.astimezone(timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+
     snapped_price = _snap(request.price, tick_size, side=request.side)
     snapped_quantity = _snap(
         request.quantity, lot_size, side=request.side, floor_quantity=True
@@ -1133,6 +1146,8 @@ async def place_order(
     }
     if request.time_in_force:
         order_payload["timeInForce"] = request.time_in_force
+        if request.time_in_force == "GTD" and expire_time_iso is not None:
+            order_payload["expireTime"] = expire_time_iso
     if request.take_profit:
         order_payload["takeProfit"] = _snap(
             request.take_profit,

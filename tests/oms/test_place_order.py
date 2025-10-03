@@ -160,6 +160,64 @@ def test_precision_snapping_sell_never_falls_short(
     assert snapped_payload["takeProfit"] >= payload["take_profit"]
     assert snapped_payload["stopLoss"] >= payload["stop_loss"]
 
+
+def test_gtd_order_includes_expiry(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    records: List[_RecordingClient] = []
+
+    def factory(**kwargs: Any) -> _RecordingClient:
+        inst = _RecordingClient(**kwargs)
+        records.append(inst)
+        return inst
+
+    monkeypatch.setattr(main, "KrakenWSClient", factory)
+
+    _seed_credentials("company")
+
+    expire_at = datetime(2024, 5, 17, 12, 34, 56, tzinfo=timezone.utc)
+
+    payload = {
+        "account_id": "company",
+        "order_id": "gtd-1",
+        "instrument": "ETH-USD",
+        "side": "SELL",
+        "quantity": 0.5,
+        "price": 1500.0,
+        "fee": {"currency": "USD", "maker": 0.1, "taker": 0.2},
+        "time_in_force": "GTD",
+        "expire_time": expire_at.isoformat().replace("+00:00", "Z"),
+    }
+
+    response = client.post("/oms/place", json=payload, headers={"X-Account-ID": "company"})
+
+    assert response.status_code == 200
+    assert records, "Kraken client was not invoked"
+
+    submitted = records[0].requests[0]
+    assert submitted["timeInForce"] == "GTD"
+    assert submitted["expireTime"] == "2024-05-17T12:34:56Z"
+
+
+def test_gtd_order_requires_expiry(client: TestClient) -> None:
+    _seed_credentials("company")
+
+    payload = {
+        "account_id": "company",
+        "order_id": "gtd-2",
+        "instrument": "ETH-USD",
+        "side": "SELL",
+        "quantity": 0.5,
+        "price": 1500.0,
+        "fee": {"currency": "USD", "maker": 0.1, "taker": 0.2},
+        "time_in_force": "GTD",
+    }
+
+    response = client.post("/oms/place", json=payload, headers={"X-Account-ID": "company"})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "expire_time is required when time_in_force is GTD"
+
 def test_circuit_breaker_halts(client: TestClient) -> None:
     main.CircuitBreaker.halt("BTC-USD", reason="Limit up")
 
