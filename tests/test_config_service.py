@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import os
+
 from fastapi.testclient import TestClient
+
+os.environ.setdefault("CONFIG_ALLOW_SQLITE_FOR_TESTS", "1")
+os.environ.setdefault("CONFIG_DATABASE_URL", "sqlite+pysqlite:///:memory:")
 
 from config_service import app, reset_state, set_guarded_keys
 
