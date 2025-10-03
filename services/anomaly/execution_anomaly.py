@@ -26,7 +26,7 @@ from threading import Lock
 from typing import Deque, Dict, Iterable, List, Optional, Tuple
 
 import httpx
-from fastapi import FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field, validator
 from sqlalchemy import JSON, Column, DateTime, Integer, String, create_engine
 from sqlalchemy.engine import Engine
@@ -34,6 +34,7 @@ from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from metrics import setup_metrics
+from services.common.security import require_admin_account
 
 
 logger = logging.getLogger(__name__)
@@ -355,7 +356,15 @@ def _trigger_safe_mode() -> None:
 
 
 @app.post("/anomaly/execution/sample", response_model=IngestResponse)
-def ingest_sample(sample: ExecutionSample) -> IngestResponse:
+def ingest_sample(
+    sample: ExecutionSample,
+    actor: str = Depends(require_admin_account),
+) -> IngestResponse:
+    if sample.account_id.strip().lower() != actor.strip().lower():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authenticated account is not authorized for the requested account.",
+        )
     incidents = monitor.observe(sample)
     if incidents:
         _log_incidents(incidents)
@@ -395,11 +404,29 @@ def _recent_summary(session: Session) -> List[SummaryItem]:
 
 
 @app.get("/anomaly/execution/status", response_model=StatusResponse)
-def execution_status() -> StatusResponse:
+def execution_status(
+    account_id: Optional[str] = Query(None, min_length=1),
+    actor: str = Depends(require_admin_account),
+) -> StatusResponse:
+    scope_account = account_id or actor
+    if scope_account.strip().lower() != actor.strip().lower():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authenticated account is not authorized for the requested account.",
+        )
+
     try:
-        flags = [flag.to_dict() for flag in monitor.current_flags()]
+        flags = [
+            flag.to_dict()
+            for flag in monitor.current_flags()
+            if flag.account_id.strip().lower() == scope_account.strip().lower()
+        ]
         with SessionLocal() as session:
-            summary = _recent_summary(session)
+            summary = [
+                item
+                for item in _recent_summary(session)
+                if item.account_id.strip().lower() == scope_account.strip().lower()
+            ]
     except Exception as exc:  # pragma: no cover - defensive guard
         logger.exception("Failed to fetch execution anomaly status")
         raise HTTPException(
