@@ -90,10 +90,10 @@ class FeeServiceClient:
 
         target_size = abs(float(size)) if size is not None else 0.0
         selected = ordered[0]
-        for tier in ordered:
-            selected = tier
+        for tier in ordered[1:]:
             if target_size < tier["threshold"]:
                 break
+            selected = tier
         return float(max(selected.get(liquidity_key, 0.0), 0.0))
 
     def fee_bps_estimate(

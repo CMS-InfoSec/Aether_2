@@ -200,6 +200,21 @@ def test_policy_intent_cost_estimators_return_non_zero(monkeypatch: pytest.Monke
     )
 
 
+def test_fee_service_selects_base_tier_when_below_threshold() -> None:
+    tiers = [
+        {"tier": "base", "maker": 4.2, "taker": 6.5, "notional_threshold": 0.0},
+        {"tier": "vip", "maker": 2.1, "taker": 3.0, "notional_threshold": 50.0},
+    ]
+
+    estimate = intent_service.FeeServiceClient._select_tier(
+        tiers,
+        liquidity="taker",
+        size=10.0,
+    )
+
+    assert estimate == pytest.approx(6.5)
+
+
 def test_fee_service_falls_back_to_zero_when_unavailable() -> None:
     class BrokenAdapter:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
