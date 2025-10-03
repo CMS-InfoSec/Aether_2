@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from decimal import Decimal
 from types import SimpleNamespace
-from typing import Any, Dict, List, Tuple
+
+from typing import Any, Dict, List
+from types import SimpleNamespace
+
 
 import pytest
 from fastapi import status
@@ -232,3 +235,96 @@ def test_policy_intent_service_returns_model_payload(
     response = client.post("/policy/decide", json=request, headers=headers)
     assert response.status_code == 200
     assert response.json()["action"] == "enter"
+
+
+def test_policy_intent_cost_estimators_return_non_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeAdapter:
+        def __init__(self, account_id: str, **_: Any) -> None:
+            self.account_id = account_id
+
+        def fee_tiers(self, pair: str) -> List[Dict[str, float]]:
+            assert pair == "BTC-USD"
+            return [
+                {"tier": "base", "maker": 4.2, "taker": 6.5, "notional_threshold": 0.0},
+                {"tier": "vip", "maker": 2.1, "taker": 3.0, "notional_threshold": 50.0},
+            ]
+
+    class FakeImpactStore:
+        async def impact_curve(self, **_: Any) -> List[Dict[str, float]]:
+            return [
+                {"size": 1.0, "impact_bps": 1.5},
+                {"size": 25.0, "impact_bps": 6.0},
+            ]
+
+    fee_client = intent_service.FeeServiceClient(adapter_factory=FakeAdapter, cache_ttl_seconds=1.0)
+    slippage_client = intent_service.SlippageEstimator(
+        impact_store=FakeImpactStore(), cache_ttl_seconds=1.0
+    )
+    monkeypatch.setattr(intent_service, "fee_service", fee_client)
+    monkeypatch.setattr(intent_service, "slippage_estimator", slippage_client)
+    intent_payload = {
+        "action": "enter",
+        "side": "buy",
+        "qty": 10.0,
+        "preference": "maker",
+        "type": "limit",
+        "expected_edge_bps": 40.0,
+        "expected_cost_bps": 0.0,
+        "confidence": 0.9,
+    }
+    monkeypatch.setattr(
+        intent_service,
+        "models",
+        SimpleNamespace(predict_intent=lambda **_: intent_payload),
+    )
+
+    request = intent_service.PolicyDecisionRequest(account_id="company", symbol="BTC-USD")
+    response = intent_service.decide_policy_intent(request)
+
+    diagnostics = response.diagnostics
+    assert diagnostics["fee_bps"] > 0.0
+    assert diagnostics["slippage_bps"] > 0.0
+    assert response.expected_cost_bps == pytest.approx(
+        diagnostics["fee_bps"] + diagnostics["slippage_bps"]
+    )
+
+
+def test_fee_service_selects_base_tier_when_below_threshold() -> None:
+    tiers = [
+        {"tier": "base", "maker": 4.2, "taker": 6.5, "notional_threshold": 0.0},
+        {"tier": "vip", "maker": 2.1, "taker": 3.0, "notional_threshold": 50.0},
+    ]
+
+    estimate = intent_service.FeeServiceClient._select_tier(
+        tiers,
+        liquidity="taker",
+        size=10.0,
+    )
+
+    assert estimate == pytest.approx(6.5)
+
+
+def test_fee_service_falls_back_to_zero_when_unavailable() -> None:
+    class BrokenAdapter:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("unreachable")
+
+    client = intent_service.FeeServiceClient(adapter_factory=BrokenAdapter, cache_ttl_seconds=1.0)
+    estimate = client.fee_bps_estimate(
+        account_id="company", symbol="BTC-USD", liquidity="maker", size=5.0
+    )
+    assert estimate == 0.0
+
+
+def test_slippage_estimator_falls_back_to_zero_when_unavailable() -> None:
+    class BrokenStore:
+        async def impact_curve(self, **_: Any) -> List[Dict[str, float]]:
+            raise RuntimeError("impact unavailable")
+
+    estimator = intent_service.SlippageEstimator(
+        impact_store=BrokenStore(), cache_ttl_seconds=1.0, async_timeout=0.1
+    )
+    slippage = estimator.estimate_slippage_bps(
+        account_id="company", symbol="BTC-USD", side="buy", size=5.0
+    )
+    assert slippage == 0.0
