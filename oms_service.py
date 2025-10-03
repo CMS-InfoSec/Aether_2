@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
@@ -39,6 +39,7 @@ from services.oms.oms_service import (  # type: ignore  # pragma: no cover - sha
     _normalize_symbol,
     _resolve_pair_metadata,
 )
+from services.oms.oms_kraken import KrakenCredentialWatcher
 
 
 logger = logging.getLogger(__name__)
@@ -265,28 +266,95 @@ class OrderStatusResponse(OrderStatus):
 
 
 class CredentialProvider:
-    """Resolves Kraken API credentials from the environment."""
+    """Resolves Kraken API credentials using the shared secret manager."""
 
-    def __init__(self) -> None:
-        self._cache: Dict[str, Dict[str, str]] = {}
+    def __init__(
+        self,
+        *,
+        watcher_factory: Optional[Callable[[str], KrakenCredentialWatcher]] = None,
+    ) -> None:
+        self._cache: Dict[str, Tuple[int, Dict[str, Any]]] = {}
         self._lock = asyncio.Lock()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._subscriptions: Dict[str, Callable[[], None]] = {}
+        self._watcher_factory = watcher_factory or KrakenCredentialWatcher.instance
 
-    async def get(self, account_id: str) -> Dict[str, str]:
+    async def get(self, account_id: str) -> Dict[str, Any]:
+        """Return the latest credentials for *account_id*.
+
+        Raises:
+            RuntimeError: if no valid API key/secret material is available.
+        """
+
+        loop = asyncio.get_running_loop()
+        watcher = self._watcher_factory(account_id)
+        payload, version = watcher.snapshot()
+
         async with self._lock:
+            self._loop = loop
             cached = self._cache.get(account_id)
-            if cached is not None:
-                return dict(cached)
+            if cached is not None and cached[0] == version:
+                return dict(cached[1])
 
-            prefix = account_id.upper().replace("-", "_")
-            credentials = {
-                "api_key": os.getenv(f"KRAKEN_{prefix}_API_KEY", ""),
-                "api_secret": os.getenv(f"KRAKEN_{prefix}_API_SECRET", ""),
-            }
-            ws_token = os.getenv(f"KRAKEN_{prefix}_WS_TOKEN")
-            if ws_token:
-                credentials["ws_token"] = ws_token
-            self._cache[account_id] = credentials
-            return dict(credentials)
+        credentials = self._normalize_credentials(account_id, payload)
+
+        async with self._lock:
+            self._cache[account_id] = (version, credentials)
+            if account_id not in self._subscriptions:
+                self._subscriptions[account_id] = self._subscribe(account_id, watcher)
+
+        return dict(credentials)
+
+    def _normalize_credentials(self, account_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Kraken credentials unavailable for account '{account_id}'.")
+        credentials = dict(payload)
+        api_key = str(credentials.get("api_key") or "").strip()
+        api_secret = str(credentials.get("api_secret") or "").strip()
+        if not api_key or not api_secret:
+            raise RuntimeError(
+                f"Kraken credentials unavailable for account '{account_id}': missing api_key/api_secret."
+            )
+        credentials["api_key"] = api_key
+        credentials["api_secret"] = api_secret
+        return credentials
+
+    def _subscribe(self, account_id: str, watcher: KrakenCredentialWatcher) -> Callable[[], None]:
+        def _listener(payload: Dict[str, Any], version: int) -> None:
+            self._handle_rotation(account_id, payload, version)
+
+        return watcher.subscribe(_listener)
+
+    def _handle_rotation(self, account_id: str, payload: Dict[str, Any], version: int) -> None:
+        loop = self._loop
+        if loop is None:
+            return
+        try:
+            credentials = self._normalize_credentials(account_id, payload)
+        except Exception:
+            logger.exception(
+                "Failed refreshing Kraken credentials; cache invalidated",
+                extra={"account_id": account_id},
+            )
+
+            async def _invalidate() -> None:
+                async with self._lock:
+                    self._cache.pop(account_id, None)
+
+            try:
+                asyncio.run_coroutine_threadsafe(_invalidate(), loop)
+            except RuntimeError:
+                logger.debug("Event loop unavailable while invalidating credentials", exc_info=True)
+            return
+
+        async def _update() -> None:
+            async with self._lock:
+                self._cache[account_id] = (version, dict(credentials))
+
+        try:
+            asyncio.run_coroutine_threadsafe(_update(), loop)
+        except RuntimeError:
+            logger.debug("Event loop unavailable while refreshing credentials", exc_info=True)
 
 
 class IdempotencyCache:
@@ -910,6 +978,33 @@ class OMSService:
 
 
 oms_service = OMSService()
+
+
+def _startup_account_list() -> List[str]:
+    for env_key in ("OMS_REQUIRED_ACCOUNTS", "OMS_STARTUP_ACCOUNTS", "OMS_ACCOUNTS"):
+        raw = os.getenv(env_key, "")
+        accounts = [value.strip() for value in raw.split(",") if value.strip()]
+        if accounts:
+            return accounts
+    return []
+
+
+@app.on_event("startup")
+async def _validate_startup_credentials() -> None:
+    accounts = _startup_account_list()
+    if not accounts:
+        return
+    for account in accounts:
+        try:
+            await oms_service._credential_provider.get(account)
+        except Exception as exc:
+            logger.critical(
+                "Kraken credentials unavailable during startup",
+                extra={"account_id": account},
+            )
+            raise RuntimeError(
+                f"Kraken credentials unavailable for account '{account}' during startup."
+            ) from exc
 
 
 @app.on_event("shutdown")
