@@ -25,6 +25,8 @@ global:
       drop:
         - ALL
     readOnlyRootFilesystem: true
+  sessionStore:
+    redisUrl: redis://redis.aether.svc.cluster.local:6379/0
   probes:
     liveness:
       httpGet:

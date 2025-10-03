@@ -18,7 +18,6 @@ from auth.service import (
     AdminRepositoryProtocol,
     AuthService,
     InMemoryAdminRepository,
-    InMemorySessionStore,
     PostgresAdminRepository,
     RedisSessionStore,
     SessionStoreProtocol,
@@ -107,16 +106,23 @@ def _verify_admin_repository(admin_repository: AdminRepositoryProtocol) -> None:
 
 def _build_session_store_from_env() -> SessionStoreProtocol:
     ttl_minutes = int(os.getenv("SESSION_TTL_MINUTES", "60"))
-    redis_url = os.getenv("SESSION_REDIS_URL")
-    if not redis_url:
-        raise RuntimeError(
-            "SESSION_REDIS_URL is not configured. Provide a shared session store DSN to enable admin sessions.",
-        )
 
+    dsn_env_vars = (
+        "SESSION_REDIS_URL",
+        "SESSION_STORE_URL",
+        "SESSION_BACKEND_DSN",
+    )
+    redis_url = next((os.getenv(var) for var in dsn_env_vars if os.getenv(var)), None)
+    if not redis_url:
+        joined = ", ".join(dsn_env_vars)
+        raise RuntimeError(
+            "Session store misconfigured: set one of "
+            f"{joined} so the API can use the shared Redis backend"
+        )
     try:  # pragma: no cover - import guarded for optional dependency resolution
         import redis
     except ImportError as exc:  # pragma: no cover - surfaced when dependency missing at runtime
-        raise RuntimeError("redis package is required when SESSION_REDIS_URL is set") from exc
+        raise RuntimeError("redis package is required when SESSION_REDIS_URL is configured") from exc
 
     client = redis.Redis.from_url(redis_url)
     return RedisSessionStore(client, ttl_minutes=ttl_minutes)

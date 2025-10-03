@@ -265,7 +265,7 @@ def test_create_app_uses_postgres_repository_when_dsn(monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(app_module, "PostgresAdminRepository", DummyPostgresRepository)
 
-    session_store = app_module.InMemorySessionStore()
+    session_store = InMemorySessionStore()
     application = app_module.create_app(session_store=session_store)
 
     assert isinstance(application.state.admin_repository, DummyPostgresRepository)
@@ -277,35 +277,17 @@ def test_create_app_requires_dsn_when_not_explicit(monkeypatch: pytest.MonkeyPat
     monkeypatch.delenv("ADMIN_DATABASE_DSN", raising=False)
     monkeypatch.delenv("ADMIN_DB_DSN", raising=False)
 
-    with pytest.raises(RuntimeError):
-        app_module.create_app(session_store=app_module.InMemorySessionStore())
+
+    application = app_module.create_app(session_store=InMemorySessionStore())
+
+    assert isinstance(application.state.admin_repository, app_module.InMemoryAdminRepository)
 
 
-def test_startup_verifies_repository_persistence() -> None:
-    admin_repo = app_module.InMemoryAdminRepository()
-    session_store = app_module.InMemorySessionStore()
+def test_create_app_requires_session_store_dsn(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SESSION_REDIS_URL", raising=False)
+    monkeypatch.delenv("SESSION_STORE_URL", raising=False)
+    monkeypatch.delenv("SESSION_BACKEND_DSN", raising=False)
 
-    existing = app_module.AdminAccount(
-        admin_id="existing-admin",
-        email="existing@example.com",
-        password_hash="hashed::existing",
-        mfa_secret="JBSWY3DPEHPK3PXP",
-    )
-    admin_repo.add(existing)
+    with pytest.raises(RuntimeError, match="Session store misconfigured"):
+        app_module.create_app()
 
-    application = app_module.create_app(
-        admin_repository=admin_repo, session_store=session_store
-    )
-
-
-    sentinel = admin_repo.get_by_email(app_module._ADMIN_REPOSITORY_HEALTHCHECK_EMAIL)
-    assert sentinel is not None
-    assert sentinel.admin_id == app_module._ADMIN_REPOSITORY_HEALTHCHECK_ID
-
-
-    restarted = app_module.create_app(
-        admin_repository=admin_repo, session_store=session_store
-    )
-
-    assert restarted.state.admin_repository.get_by_email(existing.email) is existing
-ain

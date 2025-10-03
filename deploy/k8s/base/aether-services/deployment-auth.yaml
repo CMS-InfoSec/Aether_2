@@ -40,6 +40,8 @@ spec:
               value: "30"
             - name: AUTH_DATABASE_POOL_RECYCLE_SECONDS
               value: "300"
+            - name: SESSION_REDIS_URL
+              value: redis://redis.aether.svc.cluster.local:6379/0
           readinessProbe:
             httpGet:
               path: /healthz
