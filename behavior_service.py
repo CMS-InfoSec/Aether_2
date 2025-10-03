@@ -18,16 +18,17 @@ import logging
 import math
 import os
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from fastapi import FastAPI, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import JSON, Column, DateTime, Integer, String, create_engine
+from sqlalchemy import JSON, Column, DateTime, Integer, String, create_engine, inspect
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
+from sqlalchemy.schema import CreateSchema
 
 from services.alert_manager import RiskEvent, get_alert_manager_instance
 from services.common.adapters import TimescaleAdapter
@@ -37,19 +38,103 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
-DATABASE_URL = os.getenv("BEHAVIOR_DATABASE_URL", "sqlite:///./behavior.db")
+_DATABASE_ENV_VAR = "BEHAVIOR_DATABASE_URL"
+_SQLITE_FALLBACK_FLAG = "BEHAVIOR_ALLOW_SQLITE_FOR_TESTS"
 
 
-def _engine_options(url: str) -> Dict[str, Any]:
-    options: Dict[str, Any] = {"future": True}
-    if url.startswith("sqlite://"):
-        options.setdefault("connect_args", {"check_same_thread": False})
-        if url.endswith(":memory:"):
-            options["poolclass"] = StaticPool
-    return options
+def _normalize_database_url(url: str) -> str:
+    normalized = url.strip()
+    if normalized.lower().startswith("postgres://"):
+        normalized = "postgresql://" + normalized.split("://", 1)[1]
+    return normalized
 
 
-ENGINE: Engine = create_engine(DATABASE_URL, **_engine_options(DATABASE_URL))
+def _require_database_url() -> str:
+    url = os.getenv(_DATABASE_ENV_VAR)
+    if not url:
+        raise RuntimeError(
+            f"{_DATABASE_ENV_VAR} must be defined and point to the shared PostgreSQL/Timescale database."
+        )
+
+    normalized = _normalize_database_url(url)
+    lowered = normalized.lower()
+    allowed_prefixes = (
+        "postgresql://",
+        "postgresql+psycopg://",
+        "postgresql+psycopg2://",
+        "timescaledb://",
+        "timescaledb+psycopg://",
+        "timescaledb+psycopg2://",
+    )
+
+    if lowered.startswith(allowed_prefixes):
+        return normalized
+
+    if os.getenv(_SQLITE_FALLBACK_FLAG) == "1":
+        logger.warning(
+            "Allowing non-Postgres BEHAVIOR_DATABASE_URL '%s' because %s=1.",
+            normalized,
+            _SQLITE_FALLBACK_FLAG,
+        )
+        return normalized
+
+    raise RuntimeError(
+        f"{_DATABASE_ENV_VAR} must point to a PostgreSQL/Timescale instance; received '{url}'."
+    )
+
+
+def _create_engine(url: str) -> Engine:
+    connect_args: Dict[str, Any] = {}
+    engine_options: Dict[str, Any] = {
+        "future": True,
+        "pool_pre_ping": True,
+    }
+
+    if url.startswith("sqlite"):
+        connect_args["check_same_thread"] = False
+        engine_options["connect_args"] = connect_args
+        if ":memory:" in url:
+            engine_options["poolclass"] = StaticPool
+    else:
+        sslmode = os.getenv("BEHAVIOR_DB_SSLMODE", "require").strip()
+        if sslmode:
+            connect_args["sslmode"] = sslmode
+        engine_options["connect_args"] = connect_args
+        engine_options.update(
+            pool_size=int(os.getenv("BEHAVIOR_DB_POOL_SIZE", "10")),
+            max_overflow=int(os.getenv("BEHAVIOR_DB_MAX_OVERFLOW", "5")),
+            pool_timeout=int(os.getenv("BEHAVIOR_DB_POOL_TIMEOUT", "30")),
+            pool_recycle=int(os.getenv("BEHAVIOR_DB_POOL_RECYCLE", "1800")),
+        )
+
+    return create_engine(url, **engine_options)
+
+
+def _ensure_schema(engine: Engine, schema: Optional[str]) -> None:
+    if not schema:
+        return
+    if engine.dialect.name != "postgresql":
+        return
+    try:
+        inspector = inspect(engine)
+        if schema in inspector.get_schema_names():
+            return
+    except Exception:  # pragma: no cover - diagnostics only
+        logger.warning("Unable to inspect database schemas; continuing without schema creation.", exc_info=True)
+        return
+
+    try:
+        with engine.begin() as connection:
+            connection.execute(CreateSchema(schema))
+    except Exception:  # pragma: no cover - defensive
+        logger.warning("Failed to create schema '%s'", schema, exc_info=True)
+
+
+DATABASE_URL = _require_database_url()
+DATABASE_SCHEMA = os.getenv("BEHAVIOR_DB_SCHEMA")
+
+ENGINE: Engine = _create_engine(DATABASE_URL)
+_ensure_schema(ENGINE, DATABASE_SCHEMA)
 SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
 Base = declarative_base()
 
@@ -58,6 +143,8 @@ class BehaviorLog(Base):
     """SQLAlchemy model backing the ``behavior_log`` table."""
 
     __tablename__ = "behavior_log"
+    if DATABASE_SCHEMA:
+        __table_args__ = {"schema": DATABASE_SCHEMA}
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     account_id = Column(String, nullable=False, index=True)
@@ -66,7 +153,7 @@ class BehaviorLog(Base):
     ts = Column(DateTime(timezone=True), nullable=False, index=True)
 
 
-Base.metadata.create_all(bind=ENGINE)
+Base.metadata.create_all(bind=ENGINE, checkfirst=True)
 
 
 class ScanRequest(BaseModel):
@@ -134,7 +221,7 @@ class BehaviorDetector:
     """Encapsulates heuristics for behaviour anomaly detection."""
 
     adapter_factory: type[TimescaleAdapter] = TimescaleAdapter
-    config: DetectorConfig = DetectorConfig()
+    config: DetectorConfig = field(default_factory=DetectorConfig)
 
     def scan_account(self, account_id: str, lookback_minutes: int) -> List[BehaviorIncident]:
         adapter = self.adapter_factory(account_id=account_id)
