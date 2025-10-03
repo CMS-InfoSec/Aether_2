@@ -2,132 +2,77 @@
 
 This FastAPI application bundles together a selection of advanced
 microstructure analytics that we rely on for monitoring derivatives and
-spot venues.  The implementation is intentionally self-contained and uses
-synthetic-yet-deterministic market data so the service remains functional
-in development and unit test environments without external market data
-feeds.
+spot venues.  The handlers source market data directly from the
+authoritative TimescaleDB-backed market-data store via pluggable adapters
+so results reflect the latest production context while remaining fully
+testable using recorded fixtures.
 """
 
 from __future__ import annotations
 
+import logging
 import math
 import statistics
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Iterable, List, Mapping, MutableMapping, Sequence
+from typing import Dict, Iterable, List, Mapping, Sequence
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query
+from prometheus_client import Gauge
 from pydantic import BaseModel
 
-
-# ---------------------------------------------------------------------------
-# Synthetic market data generation
-# ---------------------------------------------------------------------------
-
-
-@dataclass(slots=True)
-class Trade:
-    """Lightweight trade representation used by the simulator."""
-
-    side: str
-    volume: float
-    price: float
-    ts: datetime
+from services.analytics.market_data_store import (
+    MarketDataAdapter,
+    MarketDataUnavailable,
+    TimescaleMarketDataAdapter,
+    Trade,
+)
 
 
-class MarketDataSimulator:
-    """Produce deterministic synthetic market data series for analytics."""
-
-    def __init__(self) -> None:
-        self._trade_cache: MutableMapping[tuple[str, int], List[Trade]] = {}
-        self._price_cache: MutableMapping[tuple[str, int], List[float]] = {}
-
-    @staticmethod
-    def _rng_seed(symbol: str) -> int:
-        return sum(ord(char) for char in symbol.upper())
-
-    def _rng(self, symbol: str, window: int) -> np.random.Generator:
-        seed = self._rng_seed(symbol) + window * 7919
-        return np.random.default_rng(seed)
-
-    def price_series(self, symbol: str, length: int = 240) -> List[float]:
-        cache_key = (symbol, length)
-        if cache_key in self._price_cache:
-            return self._price_cache[cache_key]
-
-        rng = self._rng(symbol, length)
-        base_level = 50 + (self._rng_seed(symbol) % 200)
-        prices: List[float] = []
-        price = float(base_level)
-        for idx in range(length):
-            seasonal = math.sin(idx / 18 + base_level / 17) * 0.012
-            drift = math.cos(idx / 80 + base_level / 23) * 0.004
-            noise = rng.normal(0, 0.006)
-            price *= 1 + seasonal + drift + noise
-            price = max(price, 0.5)
-            prices.append(round(price, 6))
-        self._price_cache[cache_key] = prices
-        return prices
-
-    def correlated_price_series(
-        self, base_symbol: str, alt_symbol: str, length: int = 240
-    ) -> tuple[List[float], List[float]]:
-        base = self.price_series(base_symbol, length)
-        rng = self._rng(alt_symbol, length)
-        noise = rng.normal(0, 0.5, size=length)
-        lag = (self._rng_seed(alt_symbol) % 5) - 2
-        alt = []
-        for idx in range(length):
-            base_idx = min(max(idx - lag, 0), length - 1)
-            base_price = base[base_idx]
-            adjustment = 1 + noise[idx] / 100
-            alt.append(round(base_price * adjustment, 6))
-        return base, alt
-
-    def trades(self, symbol: str, window: int = 600) -> List[Trade]:
-        cache_key = (symbol, window)
-        if cache_key in self._trade_cache:
-            return self._trade_cache[cache_key]
-
-        rng = self._rng(symbol, window)
-        base_price = self.price_series(symbol, length=1)[-1]
-        now = datetime.now(timezone.utc)
-        trades: List[Trade] = []
-        count = max(60, min(600, window // 5))
-        for idx in range(count):
-            side = "buy" if rng.random() < 0.5 + math.sin(idx / 30) * 0.05 else "sell"
-            volume = float(max(0.01, rng.gamma(2.0, 1.5)))
-            price = float(max(0.1, base_price * (1 + rng.normal(0, 0.0015))))
-            ts = now - timedelta(seconds=window - idx * window / count)
-            trades.append(Trade(side=side, volume=round(volume, 6), price=round(price, 6), ts=ts))
-        self._trade_cache[cache_key] = trades
-        return trades
-
-    def order_book(self, symbol: str, levels: int = 10) -> Dict[str, List[List[float]]]:
-        rng = self._rng(symbol, levels)
-        base_price = self.price_series(symbol, length=1)[-1]
-        spread = max(0.1, base_price * 0.0015)
-        bids: List[List[float]] = []
-        asks: List[List[float]] = []
-        depth_scale = 1 + (self._rng_seed(symbol) % 7) / 5
-        for level in range(levels):
-            decay = 0.9 ** level
-            bid_price = round(base_price - spread * (level + 1), 6)
-            ask_price = round(base_price + spread * (level + 1), 6)
-            bid_size = round(max(0.05, rng.uniform(0.2, 5.0) * depth_scale * decay), 6)
-            ask_size = round(max(0.05, rng.uniform(0.2, 5.0) * depth_scale * decay), 6)
-            bids.append([bid_price, bid_size])
-            asks.append([ask_price, ask_size])
-        return {"bids": bids, "asks": asks}
+logger = logging.getLogger(__name__)
 
 
-SIMULATOR = MarketDataSimulator()
+DATA_STALENESS_GAUGE = Gauge(
+    "signal_service_data_age_seconds",
+    "Age of the market data powering signal service computations.",
+    ["symbol", "feed"],
+)
+
+
+DEFAULT_ADAPTER = TimescaleMarketDataAdapter()
 
 
 # ---------------------------------------------------------------------------
 # Helper computations
 # ---------------------------------------------------------------------------
+
+
+def _coerce_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
+def _ensure_fresh(symbol: str, feed: str, observed_at: datetime | None, max_age: timedelta) -> None:
+    if observed_at is None:
+        detail = f"{feed} feed unavailable for {symbol.upper()}"
+        logger.warning(detail)
+        raise HTTPException(status_code=503, detail=detail)
+
+    observed = observed_at.astimezone(timezone.utc)
+    age_seconds = max(0.0, (datetime.now(timezone.utc) - observed).total_seconds())
+    DATA_STALENESS_GAUGE.labels(symbol=symbol.upper(), feed=feed).set(age_seconds)
+
+    if age_seconds > max_age.total_seconds():
+        detail = f"{feed} feed stale for {symbol.upper()} ({int(age_seconds)}s old)"
+        logger.warning(detail)
+        raise HTTPException(status_code=503, detail=detail)
 
 
 def _order_flow_metrics(trades: Sequence[Trade]) -> Dict[str, float]:
@@ -406,12 +351,30 @@ class StressTestResponse(BaseModel):
 app = FastAPI(title="Advanced Signal Service", version="1.0.0")
 
 
+def _market_data_adapter() -> MarketDataAdapter:
+    adapter = getattr(app.state, "market_data_adapter", None)
+    if adapter is None:
+        adapter = DEFAULT_ADAPTER
+    return adapter
+
+
 @app.get("/signals/orderflow/{symbol}", response_model=OrderFlowResponse)
 def order_flow_signals(symbol: str, window: int = Query(300, ge=60, le=3600)) -> OrderFlowResponse:
-    trades = SIMULATOR.trades(symbol, window=window)
-    order_book = SIMULATOR.order_book(symbol)
+    adapter = _market_data_adapter()
+    try:
+        trades = adapter.recent_trades(symbol, window=window)
+        order_book = adapter.order_book_snapshot(symbol)
+    except MarketDataUnavailable as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
     order_flow = _order_flow_metrics(trades)
     queue = _queue_depth_anomalies(order_book)
+
+    latest_trade_ts = max((trade.ts for trade in trades), default=None)
+    _ensure_fresh(symbol, "trades", latest_trade_ts, timedelta(seconds=window * 2))
+    book_ts = _coerce_datetime(order_book.get("as_of"))
+    _ensure_fresh(symbol, "order_book", book_ts, timedelta(seconds=max(60, window // 2)))
+
     ts = datetime.now(timezone.utc)
     return OrderFlowResponse(
         symbol=symbol,
@@ -436,7 +399,18 @@ def cross_asset_signals(
     window: int = Query(180, ge=30, le=720),
     max_lag: int = Query(10, ge=1, le=50),
 ) -> CrossAssetResponse:
-    base_series, alt_series = SIMULATOR.correlated_price_series(base_symbol, alt_symbol, length=window)
+    adapter = _market_data_adapter()
+    try:
+        base_series = adapter.price_history(base_symbol, length=window)
+        base_ts = adapter.latest_price_timestamp(base_symbol)
+        alt_series = adapter.price_history(alt_symbol, length=window)
+        alt_ts = adapter.latest_price_timestamp(alt_symbol)
+    except MarketDataUnavailable as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    _ensure_fresh(base_symbol, "prices", base_ts, timedelta(hours=6))
+    _ensure_fresh(alt_symbol, "prices", alt_ts, timedelta(hours=6))
+
     beta = _rolling_beta(alt_series, base_series, window=min(window, 120))
     correlation = _pearson(base_series, alt_series)
     lag = _lag(base_series, alt_series, max_lag=max_lag)
@@ -457,7 +431,15 @@ def volatility_signals(
     window: int = Query(240, ge=60, le=960),
     horizon: int = Query(12, ge=1, le=60),
 ) -> VolatilityResponse:
-    prices = SIMULATOR.price_series(symbol, length=window)
+    adapter = _market_data_adapter()
+    try:
+        prices = adapter.price_history(symbol, length=window)
+        price_ts = adapter.latest_price_timestamp(symbol)
+    except MarketDataUnavailable as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    _ensure_fresh(symbol, "prices", price_ts, timedelta(hours=6))
+
     garch = _garch_forecast(prices, horizon=horizon)
     ts = datetime.now(timezone.utc)
     return VolatilityResponse(
@@ -475,7 +457,15 @@ def whale_signals(
     window: int = Query(900, ge=120, le=7200),
     threshold_sigma: float = Query(2.5, ge=1.0, le=6.0),
 ) -> WhaleResponse:
-    trades = SIMULATOR.trades(symbol, window=window)
+    adapter = _market_data_adapter()
+    try:
+        trades = adapter.recent_trades(symbol, window=window)
+    except MarketDataUnavailable as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    latest_trade_ts = max((trade.ts for trade in trades), default=None)
+    _ensure_fresh(symbol, "trades", latest_trade_ts, timedelta(seconds=window * 2))
+
     whales = _detect_whales(trades, threshold_sigma)
     ts = datetime.now(timezone.utc)
     return WhaleResponse(
@@ -490,11 +480,26 @@ def whale_signals(
 
 @app.get("/signals/stress/{symbol}", response_model=StressTestResponse)
 def stress_test_signals(symbol: str, window: int = Query(240, ge=60, le=960)) -> StressTestResponse:
-    prices = SIMULATOR.price_series(symbol, length=window)
-    book = SIMULATOR.order_book(symbol)
+    adapter = _market_data_adapter()
+    try:
+        prices = adapter.price_history(symbol, length=window)
+        price_ts = adapter.latest_price_timestamp(symbol)
+        book = adapter.order_book_snapshot(symbol)
+    except MarketDataUnavailable as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    _ensure_fresh(symbol, "prices", price_ts, timedelta(hours=6))
+    book_ts = _coerce_datetime(book.get("as_of"))
+    _ensure_fresh(symbol, "order_book", book_ts, timedelta(minutes=10))
+
     stress = _stress_test(symbol, prices, book)
     ts = datetime.now(timezone.utc)
-    return StressTestResponse(symbol=stress["symbol"], flash_crash=stress["flash_crash"], spread_widening=stress["spread_widening"], ts=ts)
+    return StressTestResponse(
+        symbol=stress["symbol"],
+        flash_crash=stress["flash_crash"],
+        spread_widening=stress["spread_widening"],
+        ts=ts,
+    )
 
 
 __all__ = [

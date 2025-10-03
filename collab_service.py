@@ -8,12 +8,13 @@ from datetime import datetime
 from typing import Any, List, Mapping
 
 import psycopg
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from psycopg import sql
 from psycopg.rows import dict_row
 
 from services.common.config import get_timescale_session
+from services.common.security import require_admin_account
 from shared.audit import AuditLogStore, TimescaleAuditLogger
 from shared.correlation import CorrelationIdMiddleware
 
@@ -37,7 +38,6 @@ class CommentCreate(BaseModel):
     """Request model for creating a trade collaboration comment."""
 
     trade_id: str = Field(..., min_length=1, max_length=128)
-    author: str = Field(..., min_length=1, max_length=128)
     text: str = Field(..., min_length=1, max_length=10_000)
 
 
@@ -133,6 +133,18 @@ def startup_event() -> None:
     _ensure_tables()
 
 
+def _assert_account_scope(actor_account: str) -> None:
+    """Ensure the authenticated caller matches the service account scope."""
+
+    normalized_actor = actor_account.strip().lower()
+    normalized_scope = ACCOUNT_ID.strip().lower()
+    if normalized_scope and normalized_actor != normalized_scope:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authenticated account does not match collaboration scope.",
+        )
+
+
 def _record_comment_audit(row: Mapping[str, Any]) -> dict[str, Any]:
     """Persist an audit entry for a new comment."""
 
@@ -174,8 +186,12 @@ def _record_proposal_audit(row: Mapping[str, Any]) -> dict[str, Any]:
 
 
 @app.post("/collab/comment", response_model=Comment, status_code=status.HTTP_201_CREATED)
-def create_comment(payload: CommentCreate) -> Comment:
+def create_comment(
+    payload: CommentCreate, actor_account: str = Depends(require_admin_account)
+) -> Comment:
     """Store a new collaboration comment tied to a trade identifier."""
+
+    _assert_account_scope(actor_account)
 
     try:
         with _get_conn() as conn:
@@ -186,7 +202,7 @@ def create_comment(payload: CommentCreate) -> Comment:
                     VALUES (%s, %s, %s)
                     RETURNING trade_id, author, text, ts
                     """,
-                    (payload.trade_id, payload.author, payload.text),
+                    (payload.trade_id, actor_account, payload.text),
                 )
                 row = cur.fetchone()
     except Exception as exc:  # pragma: no cover - network/database errors.
@@ -208,8 +224,13 @@ def create_comment(payload: CommentCreate) -> Comment:
 
 
 @app.get("/collab/comments", response_model=List[Comment])
-def list_comments(trade_id: str = Query(..., min_length=1, max_length=128)) -> List[Comment]:
+def list_comments(
+    trade_id: str = Query(..., min_length=1, max_length=128),
+    actor_account: str = Depends(require_admin_account),
+) -> List[Comment]:
     """Return comments for the given trade ordered by timestamp."""
+
+    _assert_account_scope(actor_account)
 
     try:
         with _get_conn() as conn:
@@ -250,9 +271,12 @@ def _decode_new_value(serialized: str) -> Any:
 
 
 @app.post("/collab/proposal", response_model=Proposal, status_code=status.HTTP_201_CREATED)
-def create_proposal(payload: ProposalCreate) -> Proposal:
+def create_proposal(
+    payload: ProposalCreate, actor_account: str = Depends(require_admin_account)
+) -> Proposal:
     """Store a new configuration proposal pending review."""
 
+    _assert_account_scope(actor_account)
     serialized_value = _normalize_new_value(payload.new_value)
 
     try:
@@ -286,8 +310,12 @@ def create_proposal(payload: ProposalCreate) -> Proposal:
 
 
 @app.get("/collab/proposals", response_model=List[Proposal])
-def list_pending_proposals() -> List[Proposal]:
+def list_pending_proposals(
+    actor_account: str = Depends(require_admin_account),
+) -> List[Proposal]:
     """Return all pending configuration proposals."""
+
+    _assert_account_scope(actor_account)
 
     try:
         with _get_conn() as conn:

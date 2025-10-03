@@ -8,6 +8,7 @@ resources:
   - kafka
   - nats
   - fastapi
+  - secrets/external-secrets.yaml
   - ingress
   - networkpolicies
   - aether-services

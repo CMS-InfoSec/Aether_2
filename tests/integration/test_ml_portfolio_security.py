@@ -31,6 +31,8 @@ os.environ.setdefault("AUTH_DATABASE_URL", "sqlite:///./test-auth-service.db")
 pytest.importorskip("fastapi", reason="fastapi is required for API integration tests")
 
 from fastapi.testclient import TestClient
+
+from auth.service import InMemoryAdminRepository
 from auth_service import create_jwt
 from auth.service import InMemorySessionStore
 
@@ -60,7 +62,9 @@ def test_training_bootstrap_populates_all_backends(monkeypatch: pytest.MonkeyPat
     from ml.training import workflow as training_workflow
     from services import coingecko_ingest
 
-    app = create_app(session_store=InMemorySessionStore())
+
+    app = create_app(admin_repository=InMemoryAdminRepository())
+
     client = TestClient(app)
 
     loader_calls: List[Dict[str, Any]] = []

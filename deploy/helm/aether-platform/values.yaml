@@ -188,6 +188,67 @@ backendServices:
     pdb:
       enabled: true
       maxUnavailable: 1
+  volatility:
+    enabled: true
+    nameOverride: volatility-service
+    image:
+      repository: ghcr.io/aether/volatility-service
+      tag: latest
+    replicaCount: 2
+    containerPort: 8000
+    env:
+      - name: ANALYTICS_DATABASE_URL
+        valueFrom:
+          secretKeyRef:
+            name: volatility-service-database
+            key: dsn
+      - name: ANALYTICS_DB_SSLMODE
+        value: require
+      - name: ANALYTICS_DB_POOL_SIZE
+        value: "20"
+      - name: ANALYTICS_DB_MAX_OVERFLOW
+        value: "10"
+      - name: ANALYTICS_DB_POOL_TIMEOUT
+        value: "30"
+      - name: ANALYTICS_DB_POOL_RECYCLE
+        value: "1800"
+    usesKrakenSecrets: false
+    extraVolumeMounts: []
+    extraVolumes: []
+    service:
+      port: 80
+      targetPort: http
+    ingress:
+      enabled: true
+      host: volatility.aether.example.com
+      tlsSecret: volatility-service-tls
+      annotations: {}
+    resources:
+      requests:
+        cpu: 150m
+        memory: 384Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 5
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 65
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 60
+        scaleDown:
+          stabilizationWindowSeconds: 120
+    pdb:
+      enabled: true
+      maxUnavailable: 1
   oms:
     enabled: true
     nameOverride: oms-service
@@ -196,7 +257,9 @@ backendServices:
       tag: latest
     replicaCount: 2
     containerPort: 8000
-    env: []
+    env:
+      - name: SESSION_REDIS_URL
+        value: redis://redis:6379/0
     usesKrakenSecrets: true
     extraVolumeMounts: []
     extraVolumes: []
@@ -292,6 +355,63 @@ backendServices:
     pdb:
       enabled: true
       maxUnavailable: 1
+  hitl:
+    enabled: true
+    nameOverride: hitl-service
+    image:
+      repository: ghcr.io/aether/hitl-service
+      tag: latest
+    replicaCount: 2
+    containerPort: 8000
+    env:
+      - name: HITL_DATABASE_URL
+        valueFrom:
+          secretKeyRef:
+            name: hitl-service-database
+            key: dsn
+    usesKrakenSecrets: false
+    extraVolumeMounts: []
+    extraVolumes: []
+    service:
+      port: 80
+      targetPort: http
+    ingress:
+      enabled: true
+      host: hitl.aether.example.com
+      tlsSecret: hitl-service-tls
+      annotations: {}
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 6
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 60
+        - type: Resource
+          resource:
+            name: memory
+            target:
+              type: Utilization
+              averageUtilization: 70
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 60
+        scaleDown:
+          stabilizationWindowSeconds: 60
+    pdb:
+      enabled: true
+      maxUnavailable: 1
   risk:
     enabled: true
     nameOverride: risk-service
@@ -301,6 +421,7 @@ backendServices:
     replicaCount: 2
     containerPort: 8000
     env:
+
       - name: RISK_DATABASE_URL
         valueFrom:
           secretKeyRef:
@@ -311,6 +432,7 @@ backendServices:
           secretKeyRef:
             name: risk-service-database
             key: sslmode
+
     usesKrakenSecrets: true
     extraVolumeMounts: []
     extraVolumes: []

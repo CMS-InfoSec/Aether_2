@@ -60,3 +60,26 @@ single source of truth for development conventions.
   failures, and kill-switch activation.
 - Administrators can use the [on-call readiness and compliance checklist](docs/checklists/oncall.md)
   to attest to operational readiness and file regulatory attestations.
+
+## Admin Platform Persistence
+
+The administrative FastAPI application now **requires** a shared Postgres/Timescale
+database for persisting operator credentials. Deployments must provide a DSN via
+one of the following environment variables (checked in order):
+
+- `ADMIN_POSTGRES_DSN`
+- `ADMIN_DATABASE_DSN`
+- `ADMIN_DB_DSN`
+
+Set the DSN in the platform's Kubernetes secret or Helm values so that the
+application can connect to the shared database. A helper script is available to
+migrate any historical administrator exports:
+
+```bash
+python ops/migrate_admin_repository.py --source legacy_admins.json
+```
+
+The script accepts either plaintext passwords or pre-hashed credentials in the
+JSON export and will upsert the records into the configured database. See the
+[admin database migration runbook](docs/runbooks/admin-database-migration.md)
+for end-to-end instructions covering secret rotation and verification steps.
