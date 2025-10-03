@@ -12,6 +12,10 @@ on:
 env:
   REGISTRY: ghcr.io/aether
 
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   kaniko:
     name: Kaniko Build
@@ -19,6 +23,22 @@ jobs:
     if: ${{ hashFiles('services/order-gateway/Dockerfile') != '' && hashFiles('services/pricing-service/Dockerfile') != '' }}
     steps:
       - uses: actions/checkout@v4
+      - name: Authenticate to GHCR for Kaniko
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          mkdir -p /kaniko/.docker
+          AUTH_TOKEN=$(printf '%s' "${GHCR_USER}:${GHCR_TOKEN}" | base64 | tr -d '\n')
+          cat <<EOF >/kaniko/.docker/config.json
+          {
+            "auths": {
+              "ghcr.io": {
+                "auth": "${AUTH_TOKEN}"
+              }
+            }
+          }
+          EOF
       - name: Build Order Gateway image
         uses: addnab/docker-run-action@v3
         with:
