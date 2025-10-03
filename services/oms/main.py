@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from auth.service import (
+    InMemorySessionStore,
     RedisSessionStore,
     SessionStoreProtocol,
 )
