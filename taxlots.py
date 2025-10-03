@@ -14,13 +14,14 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from enum import Enum
 from threading import RLock
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 
 
 class CostBasisMethod(str, Enum):
@@ -44,8 +45,8 @@ class TaxLot:
 
     account_id: str
     symbol: str
-    qty: float
-    price: float
+    qty: Decimal
+    price: Decimal
     ts: datetime
     lot_id: str
 
@@ -59,7 +60,7 @@ class OpenPosition:
     """Track remaining quantity for an open lot."""
 
     lot: TaxLot
-    remaining: float  # absolute quantity still open
+    remaining: Decimal  # absolute quantity still open
     direction: int
 
 
@@ -68,18 +69,37 @@ class TaxLotCreate(BaseModel):
 
     account_id: str = Field(..., min_length=1)
     symbol: str = Field(..., min_length=1)
-    qty: float = Field(..., description="Signed fill quantity; positive for buy, negative for sell")
-    price: float = Field(..., gt=0)
+    qty: Decimal = Field(..., description="Signed fill quantity; positive for buy, negative for sell")
+    price: Decimal = Field(..., gt=0)
     ts: datetime
     lot_id: Optional[str] = Field(default=None, description="Optional unique identifier for the fill")
 
-    @validator("qty")
-    def validate_quantity(cls, value: float) -> float:
+    @field_validator("qty", "price", mode="before")
+    @classmethod
+    def parse_decimal(cls, value: Any) -> Decimal:
+        if isinstance(value, Decimal):
+            return value
+        if isinstance(value, (float, int)):
+            value = str(value)
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                raise ValueError("Value must be a decimal-compatible type")
+            try:
+                return Decimal(value)
+            except InvalidOperation as exc:  # pragma: no cover - defensive validation
+                raise ValueError("Invalid decimal value") from exc
+        raise ValueError("Value must be a decimal-compatible type")
+
+    @field_validator("qty")
+    @classmethod
+    def validate_quantity(cls, value: Decimal) -> Decimal:
         if value == 0:
             raise ValueError("Quantity must be non-zero")
         return value
 
-    @validator("lot_id", pre=True, always=True)
+    @field_validator("lot_id", mode="before")
+    @classmethod
     def default_lot_id(cls, value: Optional[str]) -> str:
         return value or str(uuid.uuid4())
 
@@ -99,8 +119,8 @@ class TaxLotResponse(BaseModel):
 
     account_id: str
     symbol: str
-    qty: float
-    price: float
+    qty: Decimal
+    price: Decimal
     ts: datetime
     lot_id: str
 
@@ -110,15 +130,15 @@ class RealizedLotDetail(BaseModel):
 
     account_id: str
     symbol: str
-    quantity: float
+    quantity: Decimal
     position_direction: str
-    entry_price: float
+    entry_price: Decimal
     entry_ts: datetime
     open_lot_id: Optional[str]
-    exit_price: float
+    exit_price: Decimal
     exit_ts: datetime
     close_lot_id: str
-    realized_pnl: float
+    realized_pnl: Decimal
     method: CostBasisMethod
 
 
@@ -127,8 +147,8 @@ class RealizedResponse(BaseModel):
 
     account_id: str
     method: CostBasisMethod
-    total_realized_pnl: float
-    realized_by_symbol: Dict[str, float]
+    total_realized_pnl: Decimal
+    realized_by_symbol: Dict[str, Decimal]
     lots: List[RealizedLotDetail]
 
 
@@ -137,11 +157,11 @@ class UnrealizedLotDetail(BaseModel):
 
     account_id: str
     symbol: str
-    quantity: float
+    quantity: Decimal
     position_direction: str
-    cost_basis: float
-    current_price: float
-    unrealized_pnl: float
+    cost_basis: Decimal
+    current_price: Decimal
+    unrealized_pnl: Decimal
     lot_ids: List[str]
     entry_ts: datetime
     method: CostBasisMethod
@@ -152,8 +172,8 @@ class UnrealizedResponse(BaseModel):
 
     account_id: str
     method: CostBasisMethod
-    total_unrealized_pnl: float
-    unrealized_by_symbol: Dict[str, float]
+    total_unrealized_pnl: Decimal
+    unrealized_by_symbol: Dict[str, Decimal]
     lots: List[UnrealizedLotDetail]
 
 
@@ -187,6 +207,16 @@ store = TaxLotStore()
 app = FastAPI(title="Tax Lot Service", version="1.0.0")
 
 
+USD_PRECISION = Decimal("0.00000001")
+ZERO = Decimal("0")
+
+
+def _quantize_usd(value: Decimal) -> Decimal:
+    """Quantize ``value`` to the configured USD precision."""
+
+    return value.quantize(USD_PRECISION, rounding=ROUND_HALF_EVEN)
+
+
 def _group_by_symbol(lots: Iterable[TaxLot]) -> Dict[str, List[TaxLot]]:
     grouped: Dict[str, List[TaxLot]] = defaultdict(list)
     for lot in lots:
@@ -198,7 +228,7 @@ def _realized_fifo_lifo(symbol: str, lots: List[TaxLot], method: CostBasisMethod
     long_open: List[OpenPosition] = []
     short_open: List[OpenPosition] = []
     realized_details: List[RealizedLotDetail] = []
-    realized_by_symbol: Dict[str, float] = defaultdict(float)
+    realized_by_symbol: Dict[str, Decimal] = defaultdict(Decimal)
 
     def pick_open(container: List[OpenPosition]) -> OpenPosition:
         if not container:
@@ -206,23 +236,23 @@ def _realized_fifo_lifo(symbol: str, lots: List[TaxLot], method: CostBasisMethod
         return container[0] if method == CostBasisMethod.FIFO else container[-1]
 
     def maybe_remove(container: List[OpenPosition], position: OpenPosition) -> None:
-        if position.remaining <= 1e-9:
+        if position.remaining <= ZERO:
             if method == CostBasisMethod.FIFO:
                 container.pop(0)
             else:
                 container.pop()
 
-    total_realized = 0.0
     for lot in lots:
-        direction = 1 if lot.qty > 0 else -1
+        direction = 1 if lot.qty > ZERO else -1
         qty_remaining = abs(lot.qty)
         opposing = short_open if direction > 0 else long_open
         supporting = long_open if direction > 0 else short_open
 
-        while qty_remaining > 0 and opposing:
+        while qty_remaining > ZERO and opposing:
             open_pos = pick_open(opposing)
             matched = min(qty_remaining, open_pos.remaining)
-            realized = matched * (lot.price - open_pos.lot.price) * open_pos.direction
+            price_diff = lot.price - open_pos.lot.price
+            realized = matched * price_diff * Decimal(open_pos.direction)
             realized_details.append(
                 RealizedLotDetail(
                     account_id=lot.account_id,
@@ -240,12 +270,11 @@ def _realized_fifo_lifo(symbol: str, lots: List[TaxLot], method: CostBasisMethod
                 )
             )
             realized_by_symbol[symbol] += realized
-            total_realized += realized
             open_pos.remaining -= matched
             qty_remaining -= matched
             maybe_remove(opposing, open_pos)
 
-        if qty_remaining > 0:
+        if qty_remaining > ZERO:
             supporting.append(
                 OpenPosition(
                     lot=lot,
@@ -254,25 +283,31 @@ def _realized_fifo_lifo(symbol: str, lots: List[TaxLot], method: CostBasisMethod
                 )
             )
 
+    total_realized = sum(realized_by_symbol.values(), ZERO)
+    quantized_details = [
+        detail.model_copy(update={"realized_pnl": _quantize_usd(detail.realized_pnl)})
+        for detail in realized_details
+    ]
+    quantized_by_symbol = {symbol: _quantize_usd(value) for symbol, value in realized_by_symbol.items()}
     return RealizedResponse(
         account_id=lots[0].account_id if lots else "",
         method=method,
-        total_realized_pnl=sum(realized_by_symbol.values()),
-        realized_by_symbol=dict(realized_by_symbol),
-        lots=realized_details,
+        total_realized_pnl=_quantize_usd(total_realized),
+        realized_by_symbol=quantized_by_symbol,
+        lots=quantized_details,
     )
 
 
 def _unrealized_fifo_lifo(symbol: str, lots: List[TaxLot], method: CostBasisMethod) -> UnrealizedResponse:
     long_open: List[OpenPosition] = []
     short_open: List[OpenPosition] = []
-    last_price: Optional[float] = None
+    last_price: Optional[Decimal] = None
 
     def pick_open(container: List[OpenPosition]) -> OpenPosition:
         return container[0] if method == CostBasisMethod.FIFO else container[-1]
 
     def maybe_remove(container: List[OpenPosition], position: OpenPosition) -> None:
-        if position.remaining <= 1e-9:
+        if position.remaining <= ZERO:
             if method == CostBasisMethod.FIFO:
                 container.pop(0)
             else:
@@ -280,92 +315,103 @@ def _unrealized_fifo_lifo(symbol: str, lots: List[TaxLot], method: CostBasisMeth
 
     for lot in lots:
         last_price = lot.price
-        direction = 1 if lot.qty > 0 else -1
+        direction = 1 if lot.qty > ZERO else -1
         qty_remaining = abs(lot.qty)
         opposing = short_open if direction > 0 else long_open
         supporting = long_open if direction > 0 else short_open
 
-        while qty_remaining > 0 and opposing:
+        while qty_remaining > ZERO and opposing:
             open_pos = pick_open(opposing)
             matched = min(qty_remaining, open_pos.remaining)
             open_pos.remaining -= matched
             qty_remaining -= matched
             maybe_remove(opposing, open_pos)
 
-        if qty_remaining > 0:
+        if qty_remaining > ZERO:
             supporting.append(OpenPosition(lot=lot, remaining=qty_remaining, direction=direction))
 
     if last_price is None:
         raise HTTPException(status_code=404, detail=f"No fills recorded for symbol {symbol}")
 
     unrealized_details: List[UnrealizedLotDetail] = []
-    unrealized_by_symbol: Dict[str, float] = {}
+    unrealized_by_symbol: Dict[str, Decimal] = {}
 
     for open_pos in long_open + short_open:
-        quantity = open_pos.remaining * open_pos.direction
-        unrealized = open_pos.remaining * (last_price - open_pos.lot.price) * open_pos.direction
-        unrealized_details.append(
-            UnrealizedLotDetail(
-                account_id=open_pos.lot.account_id,
-                symbol=symbol,
-                quantity=quantity,
-                position_direction="LONG" if open_pos.direction > 0 else "SHORT",
-                cost_basis=open_pos.lot.price,
-                current_price=last_price,
-                unrealized_pnl=unrealized,
-                lot_ids=[open_pos.lot.lot_id],
-                entry_ts=open_pos.lot.ts,
-                method=method,
-            )
+        quantity = open_pos.remaining * Decimal(open_pos.direction)
+        unrealized = open_pos.remaining * (last_price - open_pos.lot.price) * Decimal(open_pos.direction)
+        detail = UnrealizedLotDetail(
+            account_id=open_pos.lot.account_id,
+            symbol=symbol,
+            quantity=quantity,
+            position_direction="LONG" if open_pos.direction > 0 else "SHORT",
+            cost_basis=open_pos.lot.price,
+            current_price=last_price,
+            unrealized_pnl=unrealized,
+            lot_ids=[open_pos.lot.lot_id],
+            entry_ts=open_pos.lot.ts,
+            method=method,
         )
-        unrealized_by_symbol[symbol] = unrealized_by_symbol.get(symbol, 0.0) + unrealized
+        unrealized_details.append(detail)
+        unrealized_by_symbol[symbol] = unrealized_by_symbol.get(symbol, ZERO) + unrealized
 
-    total_unrealized = sum(unrealized_by_symbol.values())
+    total_unrealized = sum(unrealized_by_symbol.values(), ZERO)
     account_id = lots[0].account_id if lots else ""
+    quantized_details = [
+        detail.model_copy(update={"unrealized_pnl": _quantize_usd(detail.unrealized_pnl)})
+        for detail in unrealized_details
+    ]
+    quantized_by_symbol = {symbol: _quantize_usd(value) for symbol, value in unrealized_by_symbol.items()}
     return UnrealizedResponse(
         account_id=account_id,
         method=method,
-        total_unrealized_pnl=total_unrealized,
-        unrealized_by_symbol=unrealized_by_symbol,
-        lots=unrealized_details,
+        total_unrealized_pnl=_quantize_usd(total_unrealized),
+        unrealized_by_symbol=quantized_by_symbol,
+        lots=quantized_details,
     )
 
 
 def _realized_average(symbol: str, lots: List[TaxLot]) -> RealizedResponse:
-    position = 0.0
-    avg_cost = 0.0
+    position = ZERO
+    avg_cost = ZERO
     components: List[OpenPosition] = []
     realized_details: List[RealizedLotDetail] = []
-    realized_total = 0.0
-    realized_by_symbol: Dict[str, float] = defaultdict(float)
+    realized_by_symbol: Dict[str, Decimal] = defaultdict(Decimal)
 
-    def sign(value: float) -> int:
-        return 1 if value > 0 else -1 if value < 0 else 0
+    def sign(value: Decimal) -> int:
+        return 1 if value > ZERO else -1 if value < ZERO else 0
 
     for lot in lots:
         remaining = lot.qty
-        while remaining != 0:
-            if position == 0:
+        while remaining != ZERO:
+            if position == ZERO:
                 position = remaining
                 avg_cost = lot.price
-                components = [OpenPosition(lot=lot, remaining=abs(remaining), direction=sign(remaining))]
-                remaining = 0
+                components = [
+                    OpenPosition(lot=lot, remaining=abs(remaining), direction=sign(remaining))
+                ]
+                remaining = ZERO
             elif sign(position) == sign(remaining):
                 new_position = position + remaining
-                if new_position == 0:
-                    avg_cost = 0.0
+                if new_position == ZERO:
+                    avg_cost = ZERO
                     components = []
-                    position = 0.0
-                    remaining = 0
+                    position = ZERO
+                    remaining = ZERO
                 else:
-                    avg_cost = (avg_cost * abs(position) + lot.price * abs(remaining)) / abs(new_position)
-                    components.append(OpenPosition(lot=lot, remaining=abs(remaining), direction=sign(remaining)))
+                    abs_position = abs(position)
+                    abs_remaining = abs(remaining)
+                    avg_cost = (avg_cost * abs_position + lot.price * abs_remaining) / (
+                        abs_position + abs_remaining
+                    )
+                    components.append(
+                        OpenPosition(lot=lot, remaining=abs_remaining, direction=sign(remaining))
+                    )
                     position = new_position
-                    remaining = 0
+                    remaining = ZERO
             else:
                 close_qty = min(abs(position), abs(remaining))
                 direction = sign(position)
-                realized = close_qty * (lot.price - avg_cost) * direction
+                realized = close_qty * (lot.price - avg_cost) * Decimal(direction)
                 entry_ts = components[0].lot.ts if components else lot.ts
                 realized_details.append(
                     RealizedLotDetail(
@@ -383,152 +429,174 @@ def _realized_average(symbol: str, lots: List[TaxLot]) -> RealizedResponse:
                         method=CostBasisMethod.AVERAGE,
                     )
                 )
-                realized_total += realized
                 realized_by_symbol[symbol] += realized
 
-                position -= close_qty * direction
-                remaining += close_qty * direction
+                position -= close_qty * Decimal(direction)
+                remaining += close_qty * Decimal(direction)
 
-                # Reduce components using FIFO order
                 qty_to_reduce = close_qty
-                while qty_to_reduce > 0 and components:
+                while qty_to_reduce > ZERO and components:
                     component = components[0]
                     reduction = min(qty_to_reduce, component.remaining)
                     component.remaining -= reduction
                     qty_to_reduce -= reduction
-                    if component.remaining <= 1e-9:
+                    if component.remaining <= ZERO:
                         components.pop(0)
-                if position == 0:
-                    avg_cost = 0.0
+                if position == ZERO:
+                    avg_cost = ZERO
                     components = []
 
+    total_realized = sum(realized_by_symbol.values(), ZERO)
+    quantized_details = [
+        detail.model_copy(update={"realized_pnl": _quantize_usd(detail.realized_pnl)})
+        for detail in realized_details
+    ]
+    quantized_by_symbol = {symbol: _quantize_usd(value) for symbol, value in realized_by_symbol.items()}
     return RealizedResponse(
         account_id=lots[0].account_id if lots else "",
         method=CostBasisMethod.AVERAGE,
-        total_realized_pnl=realized_total,
-        realized_by_symbol=dict(realized_by_symbol),
-        lots=realized_details,
+        total_realized_pnl=_quantize_usd(total_realized),
+        realized_by_symbol=quantized_by_symbol,
+        lots=quantized_details,
     )
 
 
 def _unrealized_average(symbol: str, lots: List[TaxLot]) -> UnrealizedResponse:
-    position = 0.0
-    avg_cost = 0.0
+    position = ZERO
+    avg_cost = ZERO
     components: List[OpenPosition] = []
-    last_price: Optional[float] = None
+    last_price: Optional[Decimal] = None
 
-    def sign(value: float) -> int:
-        return 1 if value > 0 else -1 if value < 0 else 0
+    def sign(value: Decimal) -> int:
+        return 1 if value > ZERO else -1 if value < ZERO else 0
 
     for lot in lots:
         last_price = lot.price
         remaining = lot.qty
-        while remaining != 0:
-            if position == 0:
+        while remaining != ZERO:
+            if position == ZERO:
                 position = remaining
                 avg_cost = lot.price
                 components = [OpenPosition(lot=lot, remaining=abs(remaining), direction=sign(remaining))]
-                remaining = 0
+                remaining = ZERO
             elif sign(position) == sign(remaining):
                 new_position = position + remaining
-                if new_position == 0:
-                    position = 0.0
-                    avg_cost = 0.0
+                if new_position == ZERO:
+                    position = ZERO
+                    avg_cost = ZERO
                     components = []
                 else:
-                    avg_cost = (avg_cost * abs(position) + lot.price * abs(remaining)) / abs(new_position)
-                    components.append(OpenPosition(lot=lot, remaining=abs(remaining), direction=sign(remaining)))
+                    abs_position = abs(position)
+                    abs_remaining = abs(remaining)
+                    avg_cost = (avg_cost * abs_position + lot.price * abs_remaining) / (
+                        abs_position + abs_remaining
+                    )
+                    components.append(OpenPosition(lot=lot, remaining=abs_remaining, direction=sign(remaining)))
                     position = new_position
-                remaining = 0
+                remaining = ZERO
             else:
                 close_qty = min(abs(position), abs(remaining))
                 direction = sign(position)
-                position -= close_qty * direction
-                remaining += close_qty * direction
+                position -= close_qty * Decimal(direction)
+                remaining += close_qty * Decimal(direction)
                 qty_to_reduce = close_qty
-                while qty_to_reduce > 0 and components:
+                while qty_to_reduce > ZERO and components:
                     component = components[0]
                     reduction = min(qty_to_reduce, component.remaining)
                     component.remaining -= reduction
                     qty_to_reduce -= reduction
-                    if component.remaining <= 1e-9:
+                    if component.remaining <= ZERO:
                         components.pop(0)
-                if position == 0:
-                    avg_cost = 0.0
+                if position == ZERO:
+                    avg_cost = ZERO
                     components = []
 
     if last_price is None:
         raise HTTPException(status_code=404, detail=f"No fills recorded for symbol {symbol}")
 
     unrealized_details: List[UnrealizedLotDetail] = []
-    unrealized_by_symbol: Dict[str, float] = {}
+    unrealized_by_symbol: Dict[str, Decimal] = {}
 
-    if position != 0 and components:
-        direction = 1 if position > 0 else -1
-        unrealized = abs(position) * (last_price - avg_cost) * direction
+    if position != ZERO and components:
+        direction = 1 if position > ZERO else -1
+        unrealized = abs(position) * (last_price - avg_cost) * Decimal(direction)
         lot_ids = [component.lot.lot_id for component in components]
         entry_ts = min(component.lot.ts for component in components)
-        unrealized_details.append(
-            UnrealizedLotDetail(
-                account_id=lots[0].account_id,
-                symbol=symbol,
-                quantity=position,
-                position_direction="LONG" if direction > 0 else "SHORT",
-                cost_basis=avg_cost,
-                current_price=last_price,
-                unrealized_pnl=unrealized,
-                lot_ids=lot_ids,
-                entry_ts=entry_ts,
-                method=CostBasisMethod.AVERAGE,
-            )
+        detail = UnrealizedLotDetail(
+            account_id=lots[0].account_id,
+            symbol=symbol,
+            quantity=position,
+            position_direction="LONG" if direction > 0 else "SHORT",
+            cost_basis=avg_cost,
+            current_price=last_price,
+            unrealized_pnl=unrealized,
+            lot_ids=lot_ids,
+            entry_ts=entry_ts,
+            method=CostBasisMethod.AVERAGE,
         )
+        unrealized_details.append(detail)
         unrealized_by_symbol[symbol] = unrealized
 
-    total_unrealized = sum(unrealized_by_symbol.values())
+    total_unrealized = sum(unrealized_by_symbol.values(), ZERO)
+    quantized_details = [
+        detail.model_copy(update={"unrealized_pnl": _quantize_usd(detail.unrealized_pnl)})
+        for detail in unrealized_details
+    ]
+    quantized_by_symbol = {symbol: _quantize_usd(value) for symbol, value in unrealized_by_symbol.items()}
     return UnrealizedResponse(
         account_id=lots[0].account_id if lots else "",
         method=CostBasisMethod.AVERAGE,
-        total_unrealized_pnl=total_unrealized,
-        unrealized_by_symbol=unrealized_by_symbol,
-        lots=unrealized_details,
+        total_unrealized_pnl=_quantize_usd(total_unrealized),
+        unrealized_by_symbol=quantized_by_symbol,
+        lots=quantized_details,
     )
 
 
 def _merge_realized(responses: Iterable[RealizedResponse], account_id: str, method: CostBasisMethod) -> RealizedResponse:
     merged_details: List[RealizedLotDetail] = []
-    realized_by_symbol: Dict[str, float] = {}
-    total = 0.0
+    realized_by_symbol: Dict[str, Decimal] = {}
+    total = ZERO
     for response in responses:
         merged_details.extend(response.lots)
         for symbol, value in response.realized_by_symbol.items():
-            realized_by_symbol[symbol] = realized_by_symbol.get(symbol, 0.0) + value
+            realized_by_symbol[symbol] = realized_by_symbol.get(symbol, ZERO) + value
         total += response.total_realized_pnl
     merged_details.sort(key=lambda detail: detail.exit_ts)
+    quantized_details = [
+        detail.model_copy(update={"realized_pnl": _quantize_usd(detail.realized_pnl)})
+        for detail in merged_details
+    ]
+    quantized_by_symbol = {symbol: _quantize_usd(value) for symbol, value in realized_by_symbol.items()}
     return RealizedResponse(
         account_id=account_id,
         method=method,
-        total_realized_pnl=total,
-        realized_by_symbol=realized_by_symbol,
-        lots=merged_details,
+        total_realized_pnl=_quantize_usd(total),
+        realized_by_symbol=quantized_by_symbol,
+        lots=quantized_details,
     )
 
 
 def _merge_unrealized(responses: Iterable[UnrealizedResponse], account_id: str, method: CostBasisMethod) -> UnrealizedResponse:
     merged_details: List[UnrealizedLotDetail] = []
-    unrealized_by_symbol: Dict[str, float] = {}
-    total = 0.0
+    unrealized_by_symbol: Dict[str, Decimal] = {}
+    total = ZERO
     for response in responses:
         merged_details.extend(response.lots)
         for symbol, value in response.unrealized_by_symbol.items():
-            unrealized_by_symbol[symbol] = unrealized_by_symbol.get(symbol, 0.0) + value
+            unrealized_by_symbol[symbol] = unrealized_by_symbol.get(symbol, ZERO) + value
         total += response.total_unrealized_pnl
     merged_details.sort(key=lambda detail: detail.entry_ts)
+    quantized_details = [
+        detail.model_copy(update={"unrealized_pnl": _quantize_usd(detail.unrealized_pnl)})
+        for detail in merged_details
+    ]
+    quantized_by_symbol = {symbol: _quantize_usd(value) for symbol, value in unrealized_by_symbol.items()}
     return UnrealizedResponse(
         account_id=account_id,
         method=method,
-        total_unrealized_pnl=total,
-        unrealized_by_symbol=unrealized_by_symbol,
-        lots=merged_details,
+        total_unrealized_pnl=_quantize_usd(total),
+        unrealized_by_symbol=quantized_by_symbol,
+        lots=quantized_details,
     )
 
 
