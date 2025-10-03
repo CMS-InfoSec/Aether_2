@@ -49,8 +49,8 @@ jobs:
     env:
       DOCKER_CONFIG: /kaniko/.docker/
     outputs:
-      image-ref: ${{ steps.publish.outputs.image_ref }}
-      image-digest: ${{ steps.publish.outputs.digest }}
+      image_ref: ${{ steps.publish.outputs.image_ref }}
+      image_digest: ${{ steps.publish.outputs.digest }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -108,12 +108,12 @@ jobs:
       - name: Scan image for vulnerabilities
         uses: anchore/grype-action@v0
         with:
-          image: ${{ needs.build-image.outputs.image-ref }}@${{ needs.build-image.outputs.image-digest }}
+          image: ${{ needs.build-image.outputs.image_ref }}@${{ needs.build-image.outputs.image_digest }}
           fail-on-severity: critical
 
       - name: Generate SBOM
         run: |
-          syft "${{ needs.build-image.outputs.image-ref }}@${{ needs.build-image.outputs.image-digest }}" -o json > sbom.json
+          syft "${{ needs.build-image.outputs.image_ref }}@${{ needs.build-image.outputs.image_digest }}" -o json > sbom.json
 
       - name: Upload SBOM artifact
         uses: actions/upload-artifact@v4
@@ -136,7 +136,7 @@ jobs:
           fi
           echo "$COSIGN_PRIVATE_KEY" > cosign.key
           trap 'rm -f cosign.key' EXIT
-          cosign sign --key cosign.key "${{ needs.build-image.outputs.image-ref }}@${{ needs.build-image.outputs.image-digest }}"
+          cosign sign --key cosign.key "${{ needs.build-image.outputs.image_ref }}@${{ needs.build-image.outputs.image_digest }}"
 
   deploy:
     name: Deploy to Linode via Argo CD
