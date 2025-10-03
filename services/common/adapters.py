@@ -775,9 +775,7 @@ class RedisFeastAdapter:
                 break
 
         if matched is None:
-            raise RuntimeError(
-                f"Feast returned no fee override data for {instrument}"
-            )
+            return None
 
         override = {
             "currency": matched.get("currency", "USD"),
