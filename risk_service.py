@@ -469,6 +469,9 @@ _STUB_ACCOUNT_RETURNS: Dict[str, List[float]] = {
 }
 
 
+_STUB_RISK_LIMITS: Dict[str, Dict[str, Any]] = {}
+
+
 _STUB_ACCOUNT_USAGE: Dict[str, Dict[str, Decimal]] = {}
 
 
@@ -885,6 +888,10 @@ async def get_throttle_status(
 
 
 def _load_account_limits(account_id: str) -> AccountRiskLimit:
+    stub_limits = _STUB_RISK_LIMITS.get(account_id)
+    if stub_limits is not None:
+        return AccountRiskLimit(**dict(stub_limits))
+
     with get_session() as session:
         limits = session.get(AccountRiskLimit, account_id)
         if not limits:
