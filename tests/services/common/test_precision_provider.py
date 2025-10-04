@@ -157,6 +157,21 @@ async def test_precision_provider_coalesces_concurrent_refreshes() -> None:
     assert all(result["lot"] == pytest.approx(0.1) for result in results)
 
 
+@pytest.mark.asyncio
+async def test_precision_provider_get_normalizes_symbols() -> None:
+    provider = PrecisionMetadataProvider(fetcher=lambda: {}, refresh_interval=0.0)
+
+    provider._cache = {  # type: ignore[attr-defined]
+        "ADA-USD": {"tick": 0.1, "lot": 1.0, "native_pair": "ADA/USD"}
+    }
+    provider._aliases = {"ADAUSD": "ADA-USD"}  # type: ignore[attr-defined]
+    provider._refresh_interval = float("inf")  # type: ignore[attr-defined]
+    provider._last_refresh = provider._time_source()  # type: ignore[attr-defined]
+
+    result = await provider.get("adausd")
+
+    assert result == {"tick": 0.1, "lot": 1.0, "native_pair": "ADA/USD"}
+
 
 def test_precision_module_import_and_instantiation() -> None:
     module = importlib.import_module("services.common.precision")
