@@ -5935,4 +5935,4 @@ test = ["httpx", "pytest", "pytest-asyncio"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11,<3.14"
-content-hash = "9c7587d5a9fbe4589f8dc1b1e55435b6a1a5e773d19c09e67fec018031879199"
+content-hash = "ffe44d5f15d4a35eeb6792ca5a5ba0a7716e19f05e0cc35df0dbcc14c89fe78f"
