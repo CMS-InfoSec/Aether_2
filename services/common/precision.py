@@ -75,7 +75,7 @@ class PrecisionMetadataProvider:
     # Public API
     # ------------------------------------------------------------------
 
-    async def get(self, symbol: str) -> Optional[Dict[str, float]]:
+    async def get(self, symbol: str) -> Optional[Dict[str, Decimal | str]]:
         """Return precision metadata for ``symbol`` if available."""
 
         normalized = _normalize_symbol(symbol)
@@ -91,7 +91,7 @@ class PrecisionMetadataProvider:
             return dict(entry) if entry else None
 
 
-    async def require(self, symbol: str) -> Dict[str, float]:
+    async def require(self, symbol: str) -> Dict[str, Decimal | str]:
 
         """Return precision metadata for ``symbol`` or raise."""
 
@@ -400,8 +400,8 @@ def _parse_asset_pairs(payload: Mapping[str, Any]) -> Tuple[Dict[str, Dict[str, 
 
         key = _normalize_symbol(native_pair)
         metadata = {
-            "tick": float(tick),
-            "lot": float(lot),
+            "tick": tick,
+            "lot": lot,
             "native_pair": native_pair,
         }
         parsed[key] = metadata

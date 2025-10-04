@@ -361,10 +361,10 @@ def _reset_regime_state() -> None:
 
 
 
-async def _resolve_precision(symbol: str) -> Dict[str, float]:
+async def _resolve_precision(symbol: str) -> Dict[str, Decimal | str]:
+    native = symbol.replace("-", "/") if symbol else symbol
     try:
-        return await precision_provider.require(symbol)
-
+        metadata = await precision_provider.require(symbol)
     except PrecisionMetadataUnavailable as exc:
         logger.error(
             "Precision metadata unavailable for native instrument %s", native,
@@ -375,19 +375,22 @@ async def _resolve_precision(symbol: str) -> Dict[str, float]:
             detail="Precision metadata unavailable",
         ) from exc
 
+    metadata = dict(metadata)
     native_pair = metadata.get("native_pair")
     if not native_pair and symbol:
-        metadata = dict(metadata)
         metadata["native_pair"] = symbol.replace("-", "/")
     return metadata
 
 
-def _snap(value: float, step: float) -> float:
+def _snap(value: float | Decimal, step: float | Decimal) -> float:
 
-    if step <= 0:
+    if step is None:
         return float(value)
-    quant = Decimal(str(step))
-    snapped = (Decimal(str(value)) / quant).to_integral_value(rounding=ROUND_HALF_UP) * quant
+    step_decimal = Decimal(str(step))
+    if step_decimal <= 0:
+        return float(value)
+    operand = Decimal(str(value))
+    snapped = (operand / step_decimal).to_integral_value(rounding=ROUND_HALF_UP) * step_decimal
     return float(snapped)
 
 
