@@ -1507,7 +1507,8 @@ class TimescaleAdapter:
         normalized = _normalize_account_id(account_id)
         for cache in caches:
             cache.pop(normalized, None)
-        _TimescaleStore.reset_account(normalized)
+        store_account_id = cls._resolve_store_account_id(account_id)
+        _TimescaleStore.reset_account(store_account_id)
 
     @classmethod
     def reset_rotation_state(cls, account_id: str | None = None) -> None:
@@ -1515,8 +1516,35 @@ class TimescaleAdapter:
             _TimescaleStore.clear_all_rotation_state()
             return
 
+        store_account_id = cls._resolve_store_account_id(account_id)
+        _TimescaleStore.clear_all_rotation_state(store_account_id)
+
+    @staticmethod
+    def _resolve_store_account_id(account_id: str) -> str:
+        trimmed = account_id.strip()
+        connections: Mapping[str, Any] = getattr(_TimescaleStore, "_connections", {})
+        lock = getattr(_TimescaleStore, "_lock", None)
         normalized = _normalize_account_id(account_id)
-        _TimescaleStore.clear_all_rotation_state(normalized)
+
+        def _find_match() -> str | None:
+            if trimmed and trimmed in connections:
+                return trimmed
+            for key in connections.keys():
+                if _normalize_account_id(key) == normalized:
+                    return key
+            return None
+
+        if lock is None:
+            match = _find_match()
+        else:
+            with lock:  # type: ignore[call-arg]
+                match = _find_match()
+
+        if match is not None:
+            return match
+        if trimmed:
+            return trimmed
+        return normalized
 
 
 @dataclass
