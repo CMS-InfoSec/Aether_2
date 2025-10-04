@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import os
 import sys
 import types
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Callable, Iterator
 
 import pytest
 from fastapi.testclient import TestClient
 
+from auth.service import InMemorySessionStore
+
+os.environ.setdefault("SESSION_REDIS_URL", "memory://policy-tests")
+
+import services.common.security as security
 from services.common.schemas import ActionTemplate, ConfidenceMetrics, PolicyDecisionResponse
 from tests import factories
 
@@ -35,8 +42,33 @@ class StaticIntent:
     approved: bool
 
 
+@pytest.fixture(name="session_store")
+def _session_store() -> Iterator[InMemorySessionStore]:
+    previous_store = getattr(policy_service.app.state, "session_store", None)
+    previous_global = getattr(policy_service, "SESSION_STORE", None)
+    previous_default = getattr(security, "_DEFAULT_SESSION_STORE", None)
+
+    store = InMemorySessionStore()
+    policy_service.app.state.session_store = store
+    policy_service.SESSION_STORE = store
+    security.set_default_session_store(store)
+
+    try:
+        yield store
+    finally:
+        if previous_store is None:
+            policy_service.app.state.session_store = None
+        else:
+            policy_service.app.state.session_store = previous_store
+        policy_service.SESSION_STORE = previous_global
+        security.set_default_session_store(previous_default)
+
+
 @pytest.fixture(name="policy_client")
-def _policy_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+def _policy_client(
+    monkeypatch: pytest.MonkeyPatch,
+    session_store: InMemorySessionStore,
+) -> Iterator[TestClient]:
     async def _health_ok() -> bool:
         return True
 
@@ -49,7 +81,33 @@ def _policy_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     monkeypatch.setattr(policy_service, "_dispatch_shadow_orders", _noop_dispatch)
     policy_service._ATR_CACHE.clear()
     policy_service._reset_regime_state()
-    return TestClient(policy_service.app)
+    del session_store
+    monkeypatch.setattr(
+        "shared.graceful_shutdown.install_sigterm_handler",
+        lambda manager: None,
+    )
+    async def _noop_place_order(*args: object, **kwargs: object) -> dict[str, str]:
+        return {"order_id": "test"}
+
+    monkeypatch.setattr(
+        policy_service.EXCHANGE_ADAPTER,
+        "place_order",
+        _noop_place_order,
+    )
+    with TestClient(policy_service.app) as client:
+        yield client
+
+
+@pytest.fixture
+def auth_headers(session_store: InMemorySessionStore) -> Callable[[str], dict[str, str]]:
+    def _build(account: str) -> dict[str, str]:
+        session = session_store.create(account)
+        return {
+            "Authorization": f"Bearer {session.token}",
+            "X-Account-ID": account,
+        }
+
+    return _build
 
 
 def _intent(edge_bps: float) -> StaticIntent:
@@ -80,7 +138,9 @@ def _intent(edge_bps: float) -> StaticIntent:
 
 
 def test_fee_gate_rejects_when_edge_below_total_cost(
-    monkeypatch: pytest.MonkeyPatch, policy_client: TestClient
+    monkeypatch: pytest.MonkeyPatch,
+    policy_client: TestClient,
+    auth_headers: Callable[[str], dict[str, str]],
 ) -> None:
     monkeypatch.setattr(policy_service, "MODEL_VARIANTS", ["alpha"], raising=False)
     monkeypatch.setattr(policy_service, "_model_sharpe_weights", lambda: {"alpha": 1.0})
@@ -103,7 +163,7 @@ def test_fee_gate_rejects_when_edge_below_total_cost(
     response = policy_client.post(
         "/policy/decide",
         json=request.model_dump(mode="json"),
-        headers={"X-Account-ID": request.account_id},
+        headers=auth_headers(request.account_id),
     )
     assert response.status_code == 200
 
@@ -115,7 +175,9 @@ def test_fee_gate_rejects_when_edge_below_total_cost(
 
 
 def test_fee_gate_approves_when_edge_exceeds_total_cost(
-    monkeypatch: pytest.MonkeyPatch, policy_client: TestClient
+    monkeypatch: pytest.MonkeyPatch,
+    policy_client: TestClient,
+    auth_headers: Callable[[str], dict[str, str]],
 ) -> None:
     monkeypatch.setattr(policy_service, "MODEL_VARIANTS", ["alpha"], raising=False)
     monkeypatch.setattr(policy_service, "_model_sharpe_weights", lambda: {"alpha": 1.0})
@@ -138,7 +200,7 @@ def test_fee_gate_approves_when_edge_exceeds_total_cost(
     response = policy_client.post(
         "/policy/decide",
         json=request.model_dump(mode="json"),
-        headers={"X-Account-ID": request.account_id},
+        headers=auth_headers(request.account_id),
     )
     assert response.status_code == 200
 
