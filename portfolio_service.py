@@ -7,6 +7,7 @@ import io
 import logging
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
@@ -14,19 +15,51 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from services.portfolio.balance_reader import BalanceReader, BalanceRetrievalError
-
-try:  # pragma: no cover - shared middleware may be unavailable in minimal environments
-    from shared.authz_middleware import (  # type: ignore
-        BearerTokenError,
-        _coerce_account_scopes as _shared_coerce_account_scopes,
-        _decode_jwt as _shared_decode_jwt,
-        _extract_bearer_token as _shared_extract_bearer_token,
+try:
+    from services.common.security import (
+        AuthenticatedPrincipal,
+        _get_session_store,
+        require_admin_account,
+        require_authenticated_principal,
     )
-except Exception:  # pragma: no cover - fall back to header based scopes when helpers missing
-    BearerTokenError = HTTPException  # type: ignore[assignment]
-    _shared_coerce_account_scopes = None  # type: ignore[assignment]
-    _shared_decode_jwt = None  # type: ignore[assignment]
-    _shared_extract_bearer_token = None  # type: ignore[assignment]
+except ModuleNotFoundError:  # pragma: no cover - fallback for dynamic test loaders
+    ROOT = Path(__file__).resolve().parent
+    if str(ROOT) not in os.sys.path:
+        os.sys.path.insert(0, str(ROOT))
+    import importlib.util
+
+    services_path = ROOT / "services" / "__init__.py"
+    spec = importlib.util.spec_from_file_location(
+        "services", services_path, submodule_search_locations=[str(services_path.parent)]
+    )
+    if spec is None or spec.loader is None:  # pragma: no cover - defensive guard
+        raise
+    module = importlib.util.module_from_spec(spec)
+    os.sys.modules.setdefault("services", module)
+    spec.loader.exec_module(module)
+
+    common_path = ROOT / "services" / "common" / "__init__.py"
+    common_spec = importlib.util.spec_from_file_location(
+        "services.common", common_path, submodule_search_locations=[str(common_path.parent)]
+    )
+    if common_spec is None or common_spec.loader is None:  # pragma: no cover
+        raise
+    common_module = importlib.util.module_from_spec(common_spec)
+    os.sys.modules.setdefault("services.common", common_module)
+    common_spec.loader.exec_module(common_module)
+
+    security_path = ROOT / "services" / "common" / "security.py"
+    security_spec = importlib.util.spec_from_file_location("services.common.security", security_path)
+    if security_spec is None or security_spec.loader is None:  # pragma: no cover
+        raise
+    security_module = importlib.util.module_from_spec(security_spec)
+    os.sys.modules.setdefault("services.common.security", security_module)
+    security_spec.loader.exec_module(security_module)
+
+    AuthenticatedPrincipal = security_module.AuthenticatedPrincipal  # type: ignore[assignment]
+    _get_session_store = security_module._get_session_store  # type: ignore[assignment]
+    require_admin_account = security_module.require_admin_account  # type: ignore[assignment]
+    require_authenticated_principal = security_module.require_authenticated_principal  # type: ignore[assignment]
 
 try:  # pragma: no cover - psycopg is optional in certain environments
     import psycopg
@@ -43,29 +76,22 @@ LOGGER = logging.getLogger(__name__)
 
 
 class AccountScopeMiddleware(BaseHTTPMiddleware):
-    """Populate the request state with the allowed account scopes."""
-
-    def __init__(self, app: FastAPI, header_name: str = "x-account-scopes") -> None:
-        super().__init__(app)
-        self._header_name = header_name
+    """Populate the request state with account scopes derived from the session."""
 
     async def dispatch(self, request: Request, call_next):  # type: ignore[override]
-        header_value = request.headers.get(self._header_name, "")
-        scopes = _normalize_account_scopes(header_value.split(","))
+        scopes: tuple[str, ...] = tuple()
+        principal: AuthenticatedPrincipal | None = None
 
-        # Fall back to decoding the bearer token when explicit scope headers are missing.
-        if not scopes and _shared_extract_bearer_token and _shared_decode_jwt:
-            try:
-                token = _shared_extract_bearer_token(request)
-                payload = _shared_decode_jwt(token)
-            except BearerTokenError:  # pragma: no cover - unauthenticated requests handled downstream
-                payload = None
-            except HTTPException:
-                raise
-            else:
-                if payload and _shared_coerce_account_scopes:
-                    token_scopes = _shared_coerce_account_scopes(payload.get("account_scopes"))
-                    scopes = _normalize_account_scopes(token_scopes)
+        try:
+            principal = require_authenticated_principal(
+                request, authorization=request.headers.get("Authorization")
+            )
+        except HTTPException:
+            principal = None
+        else:
+            scopes = _account_scopes_from_session(request, principal)
+            request.state.authenticated_principal = principal
+            request.scope["authenticated_principal"] = principal
 
         request.state.account_scopes = scopes
         request.scope["account_scopes"] = scopes
@@ -153,6 +179,7 @@ def _to_csv(rows: Iterable[Mapping[str, Any]]) -> io.StringIO:
 async def requires_account_scope(
     request: Request,
     account_id: str = Query(..., description="Account identifier"),
+    _: str = Depends(require_admin_account),
 ) -> str:
     scopes = set(getattr(request.state, "account_scopes", ()))
     if "*" in scopes or account_id in scopes:
@@ -210,6 +237,7 @@ def _resolve_format(format: str | None, request: Request) -> str:
 @app.get("/portfolio/balances")
 async def get_balances(
     account_id: str = Depends(requires_account_scope),
+    _: str = Depends(require_admin_account),
 ) -> Mapping[str, float]:
     try:
         return await BALANCE_READER.get_account_balances(account_id)
@@ -221,6 +249,7 @@ async def get_balances(
 async def get_positions(
     request: Request,
     account_id: str = Depends(requires_account_scope),
+    _: str = Depends(require_admin_account),
     limit: int = Query(100, ge=1, le=10_000),
     offset: int = Query(0, ge=0),
     format: str | None = Query(None, regex="^(json|csv)$"),
@@ -249,6 +278,7 @@ async def get_positions(
 async def get_pnl(
     request: Request,
     account_id: str = Depends(requires_account_scope),
+    _: str = Depends(require_admin_account),
     from_ts: str | None = Query(None, alias="from"),
     to_ts: str | None = Query(None, alias="to"),
     limit: int = Query(500, ge=1, le=50_000),
@@ -281,6 +311,7 @@ async def get_pnl(
 async def get_orders(
     request: Request,
     account_id: str = Depends(requires_account_scope),
+    _: str = Depends(require_admin_account),
     from_ts: str | None = Query(None, alias="from"),
     to_ts: str | None = Query(None, alias="to"),
     limit: int = Query(500, ge=1, le=50_000),
@@ -313,6 +344,7 @@ async def get_orders(
 async def get_fills(
     request: Request,
     account_id: str = Depends(requires_account_scope),
+    _: str = Depends(require_admin_account),
     from_ts: str | None = Query(None, alias="from"),
     to_ts: str | None = Query(None, alias="to"),
     limit: int = Query(500, ge=1, le=50_000),
@@ -341,13 +373,16 @@ async def get_fills(
     )
 
 
-def _normalize_account_scopes(scopes: Iterable[str] | None) -> tuple[str, ...]:
+def _normalize_account_scopes(scopes: Iterable[str] | str | None) -> tuple[str, ...]:
     """Return a normalised tuple of scope identifiers."""
 
     normalized: list[str] = []
     seen: set[str] = set()
     if scopes is None:
         return tuple()
+
+    if isinstance(scopes, str):
+        scopes = scopes.split(",")
 
     for raw in scopes:
         if raw is None:
@@ -359,6 +394,34 @@ def _normalize_account_scopes(scopes: Iterable[str] | None) -> tuple[str, ...]:
         seen.add(candidate)
 
     return tuple(normalized)
+
+
+def _account_scopes_from_session(
+    request: Request, principal: AuthenticatedPrincipal
+) -> tuple[str, ...]:
+    """Extract account scopes bound to the authenticated session."""
+
+    try:
+        store = _get_session_store(request)
+    except HTTPException as exc:  # pragma: no cover - misconfiguration bubbled up
+        LOGGER.error("Session store misconfigured for account scope enforcement", exc_info=exc)
+        raise
+
+    session = store.get(principal.token)
+    if session is None:  # pragma: no cover - defensive guard, validation already occurred
+        LOGGER.warning(
+            "Authenticated principal %s missing session when deriving account scopes",
+            principal.account_id,
+        )
+        return tuple()
+
+    raw_scopes = getattr(session, "account_scopes", None)
+    normalized = _normalize_account_scopes(raw_scopes)
+    if normalized:
+        return normalized
+
+    fallback = principal.normalized_account
+    return (fallback,) if fallback else tuple()
 
 
 def _scopes_from_request(request: Request) -> tuple[str, ...]:

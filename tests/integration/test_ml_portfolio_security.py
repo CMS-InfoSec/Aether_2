@@ -33,7 +33,6 @@ pytest.importorskip("fastapi", reason="fastapi is required for API integration t
 from fastapi.testclient import TestClient
 
 from auth.service import InMemoryAdminRepository
-from auth_service import create_jwt
 from auth.service import InMemorySessionStore
 
 
@@ -171,30 +170,76 @@ def test_training_bootstrap_populates_all_backends(monkeypatch: pytest.MonkeyPat
     assert mlflow_events["registrations"], "Model registry did not receive a new version"
 
 
-@pytest.mark.integration
-def test_portfolio_positions_enforce_account_scopes(monkeypatch: pytest.MonkeyPatch) -> None:
-    """JWT account scopes should gate access to portfolio positions."""
+@pytest.fixture
+def portfolio_client() -> tuple[TestClient, InMemorySessionStore, Any]:
+    """Return a configured portfolio service client with session backing."""
 
     try:
         import portfolio_service
     except ImportError as exc:  # pragma: no cover - make failure explicit for missing module
         pytest.fail(f"Portfolio service is not available: {exc}")
 
+    store = InMemorySessionStore()
+    previous_store = getattr(portfolio_service.app.state, "session_store", None)
+    portfolio_service.app.state.session_store = store
+
     client = TestClient(portfolio_service.app)
 
-    token, _ = create_jwt(subject="user_1", role="analyst", claims={"account_scopes": ["company"]})
-    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        yield client, store, portfolio_service
+    finally:
+        if previous_store is None:
+            if hasattr(portfolio_service.app.state, "session_store"):
+                delattr(portfolio_service.app.state, "session_store")
+        else:
+            portfolio_service.app.state.session_store = previous_store
+
+
+@pytest.mark.integration
+def test_portfolio_positions_require_authenticated_session(
+    portfolio_client: tuple[TestClient, InMemorySessionStore, Any]
+) -> None:
+    """Requests without a verified session should be rejected."""
+
+    client, _, _ = portfolio_client
+
+    response = client.get("/portfolio/positions", params={"account_id": "company"})
+
+    assert response.status_code == 401
+
+
+@pytest.mark.integration
+def test_portfolio_positions_enforce_account_scopes(
+    portfolio_client: tuple[TestClient, InMemorySessionStore, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Session-derived account scopes gate access to portfolio positions."""
+
+    client, store, portfolio_service = portfolio_client
+
+    session = store.create("company")
+    session.account_scopes = ("company",)
+    headers = {"Authorization": f"Bearer {session.token}"}
 
     forbidden = client.get("/portfolio/positions", params={"account_id": "director1"}, headers=headers)
     assert forbidden.status_code == 403
+
+    monkeypatch.setattr(
+        portfolio_service,
+        "_query_records",
+        lambda request, table, account_id, **kwargs: [
+            {"account_id": account_id, "symbol": "BTC/USD", "notional": 100000.0}
+        ],
+        raising=False,
+    )
 
     allowed = client.get("/portfolio/positions", params={"account_id": "company"}, headers=headers)
     assert allowed.status_code == 200
 
     payload = allowed.json()
-    positions = payload.get("positions", []) if isinstance(payload, dict) else []
-    assert positions, "Portfolio endpoint returned no rows"
-    assert all(entry.get("account_id") == "company" for entry in positions)
+    assert isinstance(payload, dict)
+    assert payload.get("data"), "Portfolio endpoint returned no rows"
+    assert all(entry.get("account_id") == "company" for entry in payload["data"])
 
 
 @pytest.mark.integration
