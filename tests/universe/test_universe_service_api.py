@@ -6,11 +6,14 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.dialects.postgresql import JSONB
 
-os.environ.setdefault("TIMESCALE_DATABASE_URI", "sqlite:///./universe_service_test.db")
+os.environ.setdefault(
+    "UNIVERSE_DATABASE_URL",
+    "postgresql://universe:test@localhost/universe",
+)
 
 from services.universe import universe_service
 from services.universe.universe_service import (
