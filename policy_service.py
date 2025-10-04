@@ -365,10 +365,19 @@ async def _resolve_precision(symbol: str) -> Dict[str, Decimal | str]:
     native = symbol.replace("-", "/") if symbol else symbol
     try:
         metadata = await precision_provider.require(symbol)
+
     except PrecisionMetadataUnavailable as exc:
+        normalized_symbol = (symbol or "").replace("/", "-").strip().upper()
+        alias_map = getattr(precision_provider, "_aliases", {})  # type: ignore[attr-defined]
+        alias = alias_map.get(normalized_symbol)
         logger.error(
-            "Precision metadata unavailable for native instrument %s", native,
-            extra={"requested_symbol": symbol},
+            "Precision metadata unavailable for instrument %s",
+            symbol,
+            extra={
+                "requested_symbol": symbol,
+                "normalized_symbol": normalized_symbol,
+                "alias": alias,
+            },
         )
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

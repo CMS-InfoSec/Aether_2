@@ -7,12 +7,11 @@ import io
 import json
 import logging
 import threading
-
 import time
-
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_EVEN
 from typing import Any, Callable, Dict, Iterable, Iterator, Mapping, Optional, Protocol, Sequence
 
 try:  # pragma: no cover - optional dependency for tests

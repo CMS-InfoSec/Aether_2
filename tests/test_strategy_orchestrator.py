@@ -71,6 +71,7 @@ sys.modules.setdefault(
 )
 
 os.environ.setdefault("STRATEGY_DATABASE_URL", "postgresql+psycopg://user:pass@localhost:5432/strategy")
+os.environ["SESSION_REDIS_URL"] = "redis://session-backend:6379/0"
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -185,11 +186,14 @@ async def test_route_trade_intent_forwards_account_header(
 @pytest.mark.asyncio
 async def test_startup_retry_recovers_after_transient_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     module = importlib.reload(strategy_orchestrator)
+    state = module.app.state.orchestrator_state
 
-    module.ENGINE = create_engine(
+    engine = create_engine(
         "sqlite:///:memory:", future=True, connect_args={"check_same_thread": False}, poolclass=StaticPool
     )
-    module.SessionLocal = sessionmaker(bind=module.ENGINE, autoflush=False, expire_on_commit=False, future=True)
+
+    monkeypatch.setattr(module, "_database_url", lambda: "sqlite:///:memory:")
+    monkeypatch.setattr(module, "_create_engine", lambda *_: engine)
 
     attempts = 0
     real_create_all = module.Base.metadata.create_all
@@ -216,13 +220,13 @@ async def test_startup_retry_recovers_after_transient_failure(monkeypatch: pytes
 
     monkeypatch.setattr(module.asyncio, "sleep", immediate_sleep)
 
-    await module._initialise_with_retry(max_attempts=5, base_delay=0.0)
+    await module._initialise_with_retry(state, max_attempts=5, base_delay=0.0)
 
     assert attempts == 3
     assert ensure_calls == 1
-    assert module.REGISTRY is not None
-    assert module.SIGNAL_BUS is not None
-    assert module.INITIALIZATION_ERROR is None
+    assert state.registry is not None
+    assert state.signal_bus is not None
+    assert state.initialization_error is None
 
 
 def _make_registry(tmp_path: Path, defaults: list[tuple[str, str, float]] | None = None) -> strategy_orchestrator.StrategyRegistry:
@@ -278,12 +282,16 @@ def test_registry_updates_visible_to_additional_replicas(tmp_path: Path) -> None
 @pytest.mark.asyncio
 async def test_requests_return_503_until_initialised(monkeypatch: pytest.MonkeyPatch) -> None:
     module = importlib.reload(strategy_orchestrator)
-    module.REGISTRY = None
-    module.SIGNAL_BUS = None
-    module.INITIALIZATION_ERROR = RuntimeError("database unavailable")
+    state = module.app.state.orchestrator_state
+    state.registry = None
+    state.signal_bus = None
+    state.initialization_error = RuntimeError("database unavailable")
+    module._update_module_state(state)
+
+    request = SimpleNamespace(app=module.app)
 
     with pytest.raises(module.HTTPException) as excinfo:
-        await module.strategy_status()
+        await module.strategy_status(request, actor="tester")
 
     assert excinfo.value.status_code == 503
     assert "database unavailable" in excinfo.value.detail

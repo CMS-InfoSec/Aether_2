@@ -75,11 +75,19 @@ def _reload_service(monkeypatch: pytest.MonkeyPatch, sqlite_url: str) -> Any:
     module = util.module_from_spec(spec)
     sys.modules[_SERVICE_MODULE] = module
     spec.loader.exec_module(module)
+    module.ensure_database()
     return module
 
 
 def _install_migration_stub(module: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     def _stub() -> None:
+        from sqlalchemy.dialects.postgresql import JSONB
+        from sqlalchemy.ext.compiler import compiles
+
+        @compiles(JSONB, "sqlite")
+        def _compile_jsonb_sqlite(type_, compiler, **kw):  # pragma: no cover - SQLAlchemy hook
+            return "JSON"
+
         module.Base.metadata.create_all(bind=module.ENGINE)
 
     monkeypatch.setattr(module, "run_migrations", _stub)
