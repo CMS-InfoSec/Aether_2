@@ -14,6 +14,10 @@ from sqlalchemy import Column, DateTime, Float, String, create_engine, func, sel
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
+from auth.service import InMemorySessionStore, RedisSessionStore, SessionStoreProtocol
+from services.common import security
+from services.common.security import require_admin_account
+
 __all__ = ["app"]
 
 
@@ -343,11 +347,52 @@ def _assert_data_available(bars: Sequence[Bar], symbol: str) -> None:
 app = FastAPI(title="Seasonality Analytics Service")
 
 
+def _resolve_session_store_dsn() -> str:
+    for env_var in ("SESSION_REDIS_URL", "SESSION_STORE_URL", "SESSION_BACKEND_DSN"):
+        value = os.getenv(env_var)
+        if value:
+            return value
+    raise RuntimeError(
+        "Session store misconfigured: set SESSION_REDIS_URL, SESSION_STORE_URL, or SESSION_BACKEND_DSN "
+        "so the seasonality service can validate administrator tokens."
+    )
+
+
+def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
+    existing = getattr(application.state, "session_store", None)
+    if isinstance(existing, SessionStoreProtocol):
+        store = existing
+    else:
+        dsn = _resolve_session_store_dsn()
+        ttl_minutes = int(os.getenv("SESSION_TTL_MINUTES", "60"))
+        if dsn.startswith("memory://"):
+            store = InMemorySessionStore(ttl_minutes=ttl_minutes)
+        else:
+            try:  # pragma: no cover - optional dependency for production deployments
+                import redis  # type: ignore[import-not-found]
+            except ImportError as exc:  # pragma: no cover - surfaced when redis missing locally
+                raise RuntimeError(
+                    "redis package is required when SESSION_REDIS_URL is configured for the seasonality service."
+                ) from exc
+
+            client = redis.Redis.from_url(dsn)
+            store = RedisSessionStore(client, ttl_minutes=ttl_minutes)
+
+        application.state.session_store = store
+
+    security.set_default_session_store(store)
+    return store
+
+
+SESSION_STORE = _configure_session_store(app)
+
+
 @app.get("/seasonality/dayofweek", response_model=DayOfWeekResponse)
 def day_of_week(
     *,
     symbol: str = Query(..., description="Market symbol", example="BTC/USD"),
     session: Session = Depends(get_session),
+    _caller: str = Depends(require_admin_account),
 ) -> DayOfWeekResponse:
     symbol_key = _validate_symbol(symbol)
     bars = _load_bars(session, symbol_key)
@@ -386,6 +431,7 @@ def hour_of_day(
     *,
     symbol: str = Query(..., description="Market symbol", example="BTC/USD"),
     session: Session = Depends(get_session),
+    _caller: str = Depends(require_admin_account),
 ) -> HourOfDayResponse:
     symbol_key = _validate_symbol(symbol)
     bars = _load_bars(session, symbol_key)
@@ -424,6 +470,7 @@ def session_liquidity(
     *,
     symbol: str = Query(..., description="Market symbol", example="BTC/USD"),
     session: Session = Depends(get_session),
+    _caller: str = Depends(require_admin_account),
 ) -> SessionLiquidityResponse:
     symbol_key = _validate_symbol(symbol)
     bars = _load_bars(session, symbol_key)
@@ -458,7 +505,11 @@ def session_liquidity(
 
 
 @app.get("/seasonality/current_session", response_model=CurrentSessionResponse)
-def current_session(*, session: Session = Depends(get_session)) -> CurrentSessionResponse:
+def current_session(
+    *,
+    session: Session = Depends(get_session),
+    _caller: str = Depends(require_admin_account),
+) -> CurrentSessionResponse:
     now = datetime.now(timezone.utc)
     session_name = _session_for_hour(now.hour)
 
