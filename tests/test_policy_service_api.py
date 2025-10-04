@@ -333,12 +333,20 @@ def test_policy_resolves_precision_for_ada_pair() -> None:
     precision = policy_service._resolve_precision("ADA-USD")
     assert precision["tick"] == pytest.approx(0.0001)
     assert precision["lot"] == pytest.approx(0.1)
+    assert precision["native_pair"] == "ADA/USD"
 
     snapped_price = policy_service._snap(0.256789, precision["tick"])
     snapped_qty = policy_service._snap(12.3456, precision["lot"])
 
     assert snapped_price == pytest.approx(0.2568)
     assert snapped_qty == pytest.approx(12.3)
+
+
+def test_policy_resolves_precision_for_eur_pair() -> None:
+    precision = policy_service._resolve_precision("BTC-EUR")
+    assert precision["tick"] == pytest.approx(0.5)
+    assert precision["lot"] == pytest.approx(0.0005)
+    assert precision["native_pair"] == "XBT/EUR"
 
 
 def test_policy_decide_rejects_when_slippage_erodes_edge(

@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, InvalidOperation
 
 import time
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.exception_handlers import request_validation_exception_handler
@@ -363,6 +363,20 @@ _BASE_ALIASES: Dict[str, str] = {
 _QUOTE_ALIASES: Dict[str, str] = {
     "USD": "USD",
     "ZUSD": "USD",
+    "USDT": "USDT",
+    "ZUSDT": "USDT",
+    "EUR": "EUR",
+    "ZEUR": "EUR",
+    "GBP": "GBP",
+    "ZGBP": "GBP",
+    "CAD": "CAD",
+    "ZCAD": "CAD",
+    "CHF": "CHF",
+    "ZCHF": "CHF",
+    "JPY": "JPY",
+    "ZJPY": "JPY",
+    "USDC": "USDC",
+    "ZUSDC": "USDC",
 }
 
 
@@ -420,30 +434,57 @@ def _step_from_metadata(
     return None
 
 
+def _sanitize_pair(value: str, entry: Mapping[str, Any]) -> str:
+    token = (value or "").strip().upper()
+    if not token:
+        return ""
+    if "/" in token:
+        base_part, quote_part = token.split("/", 1)
+        base = base_part.strip()
+        quote = quote_part.strip()
+        if base and quote:
+            return f"{base}/{quote}"
+        return ""
+
+    base = str(entry.get("base") or "").strip().upper()
+    quote = str(entry.get("quote") or "").strip().upper()
+    if base and quote and token == f"{base}{quote}":
+        return f"{base}/{quote}"
+
+    quote_candidates = [quote]
+    normalized_quote = _normalize_asset(quote, is_quote=True)
+    if normalized_quote and normalized_quote != quote:
+        quote_candidates.append(normalized_quote)
+
+    for candidate in quote_candidates:
+        if candidate and token.endswith(candidate) and len(token) > len(candidate):
+            base_part = token[: -len(candidate)]
+            if base_part:
+                return f"{base_part}/{candidate}"
+    return ""
+
+
 def _instrument_from_pair(metadata: Dict[str, Any]) -> Optional[str]:
-    base = _normalize_asset(str(metadata.get("base") or ""), is_quote=False)
-    quote = _normalize_asset(str(metadata.get("quote") or ""), is_quote=True)
+    wsname = metadata.get("wsname")
+    if isinstance(wsname, str):
+        pair = _sanitize_pair(wsname, metadata)
+        if pair:
+            return pair
 
-    if not base or not quote:
-        wsname = metadata.get("wsname")
-        if isinstance(wsname, str) and "/" in wsname:
-            base_part, quote_part = wsname.split("/", 1)
-            base = base or _normalize_asset(base_part, is_quote=False)
-            quote = quote or _normalize_asset(quote_part, is_quote=True)
+    altname = metadata.get("altname")
+    if isinstance(altname, str):
+        pair = _sanitize_pair(altname, metadata)
+        if pair:
+            return pair
 
-    if (not base or not quote) and isinstance(metadata.get("altname"), str):
-        altname = metadata["altname"].replace("/", "").upper()
-        if len(altname) >= 6:
-            base = base or _normalize_asset(altname[:-3], is_quote=False)
-            quote = quote or _normalize_asset(altname[-3:], is_quote=True)
-
-    if not base or quote != "USD":
-        return None
-
-    return f"{base}-USD"
+    base = str(metadata.get("base") or "").strip().upper()
+    quote = str(metadata.get("quote") or "").strip().upper()
+    if base and quote:
+        return f"{base}/{quote}"
+    return None
 
 
-MetadataEntry = Dict[str, float | str]
+MetadataEntry = Dict[str, Any]
 MarketMetadataDict = Dict[str, MetadataEntry]
 
 
@@ -465,24 +506,90 @@ def _native_pair_identifier(entry: Dict[str, Any], instrument: str) -> str:
     return fallback
 
 
-def _parse_asset_pairs(payload: Dict[str, Any]) -> MarketMetadataDict:
+def _collect_aliases(entry: Dict[str, Any], native_pair: str) -> Tuple[str, ...]:
+    base_native, quote_native = native_pair.split("/", 1)
+
+    bases = {base_native}
+    quotes = {quote_native}
+
+    base_raw = str(entry.get("base") or "").strip().upper()
+    if base_raw:
+        bases.add(base_raw)
+        normalized_base = _normalize_asset(base_raw, is_quote=False)
+        if normalized_base:
+            bases.add(normalized_base)
+
+    quote_raw = str(entry.get("quote") or "").strip().upper()
+    if quote_raw:
+        quotes.add(quote_raw)
+        normalized_quote = _normalize_asset(quote_raw, is_quote=True)
+        if normalized_quote:
+            quotes.add(normalized_quote)
+
+    altname = entry.get("altname")
+    if isinstance(altname, str):
+        cleaned = altname.strip().upper()
+        if "/" in cleaned:
+            alt_base, alt_quote = cleaned.split("/", 1)
+            if alt_base:
+                bases.add(alt_base)
+                normalized = _normalize_asset(alt_base, is_quote=False)
+                if normalized:
+                    bases.add(normalized)
+            if alt_quote:
+                quotes.add(alt_quote)
+                normalized = _normalize_asset(alt_quote, is_quote=True)
+                if normalized:
+                    quotes.add(normalized)
+        else:
+            for candidate in list(quotes):
+                if candidate and cleaned.endswith(candidate) and len(cleaned) > len(candidate):
+                    alt_base = cleaned[: -len(candidate)]
+                    if alt_base:
+                        bases.add(alt_base)
+                        normalized = _normalize_asset(alt_base, is_quote=False)
+                        if normalized:
+                            bases.add(normalized)
+
+    aliases = set()
+    for base in bases:
+        for quote in quotes:
+            if not base or not quote:
+                continue
+            aliases.add(f"{base}-{quote}")
+            aliases.add(f"{base}/{quote}")
+            aliases.add(f"{base}{quote}")
+
+    return tuple(sorted({alias for alias in aliases if alias}))
+
+
+def _parse_asset_pairs(payload: Dict[str, Any]) -> Tuple[MarketMetadataDict, Dict[str, str]]:
     parsed: MarketMetadataDict = {}
+    aliases: Dict[str, str] = {}
     for entry in payload.values():
         if not isinstance(entry, dict):
             continue
-        instrument = _instrument_from_pair(entry)
-        if not instrument:
+        native_pair = _instrument_from_pair(entry)
+        if not native_pair:
             continue
         tick = _step_from_metadata(entry, ["tick_size", "price_increment"], ["pair_decimals"])
         lot = _step_from_metadata(entry, ["lot_step", "step_size"], ["lot_decimals"])
         if tick is None or lot is None:
             continue
-        parsed[_normalize_instrument(instrument)] = {
+        key = _normalize_instrument(native_pair)
+        alias_values = _collect_aliases(entry, native_pair)
+        parsed[key] = {
             "tick": float(tick),
             "lot": float(lot),
-            "native_pair": _native_pair_identifier(entry, instrument),
+            "native_pair": _native_pair_identifier(entry, native_pair),
+            "aliases": [alias for alias in alias_values if _normalize_instrument(alias) != key],
         }
-    return parsed
+        aliases.setdefault(key, key)
+        for alias in alias_values:
+            alias_key = _normalize_instrument(alias)
+            if alias_key and alias_key not in aliases:
+                aliases[alias_key] = key
+    return parsed, aliases
 
 
 async def _fetch_asset_pairs() -> Dict[str, Any]:
@@ -502,6 +609,7 @@ async def _fetch_asset_pairs() -> Dict[str, Any]:
 class MarketMetadataCache:
     def __init__(self, refresh_interval: float) -> None:
         self._data: MarketMetadataDict = {}
+        self._aliases: Dict[str, str] = {}
         self._lock = asyncio.Lock()
         self._refresh_interval = max(refresh_interval, 0.0)
         self._task: Optional[asyncio.Task[None]] = None
@@ -525,18 +633,22 @@ class MarketMetadataCache:
         payload = await _fetch_asset_pairs()
         if not payload:
             return
-        parsed = _parse_asset_pairs(payload)
+        parsed, aliases = _parse_asset_pairs(payload)
         if not parsed:
             return
         async with self._lock:
             self._data = parsed
+            self._aliases = aliases
         global MARKET_METADATA
         MARKET_METADATA = {symbol: dict(values) for symbol, values in parsed.items()}
 
     async def get(self, instrument: str) -> Optional[MetadataEntry]:
         key = _normalize_instrument(instrument)
         async with self._lock:
-            entry = self._data.get(key)
+            lookup_key = self._aliases.get(key, key)
+            entry = self._data.get(lookup_key)
+            if entry is None and key in self._data:
+                entry = self._data.get(key)
             return dict(entry) if entry else None
 
     async def snapshot(self) -> MarketMetadataDict:

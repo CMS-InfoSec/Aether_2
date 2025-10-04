@@ -311,15 +311,21 @@ def _reset_regime_state() -> None:
 
 
 
-def _resolve_precision(symbol: str) -> Dict[str, float]:
+def _resolve_precision(symbol: str) -> Dict[str, float | str]:
     try:
-        return precision_provider.require(symbol)
+        metadata = precision_provider.require(symbol)
     except PrecisionMetadataUnavailable as exc:
         logger.error("Precision metadata unavailable for instrument %s", symbol)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Precision metadata unavailable",
         ) from exc
+
+    native_pair = metadata.get("native_pair")
+    if not native_pair and symbol:
+        metadata = dict(metadata)
+        metadata["native_pair"] = symbol.replace("-", "/")
+    return metadata
 
 
 def _snap(value: float, step: float) -> float:
