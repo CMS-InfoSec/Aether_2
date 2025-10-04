@@ -119,13 +119,14 @@ class PrecisionMetadataProvider:
                 logger.warning("Failed to fetch Kraken precision metadata: %s", exc)
                 return
 
-            parsed = _parse_asset_pairs(payload)
+            parsed, aliases = _parse_asset_pairs(payload)
             if not parsed:
                 logger.warning("Received empty Kraken precision metadata payload")
                 return
 
             with self._lock:
                 self._cache = parsed
+                self._aliases = aliases
                 self._last_refresh = self._time_source()
 
 
@@ -374,7 +375,13 @@ def _parse_asset_pairs(payload: Mapping[str, Any]) -> Tuple[Dict[str, Dict[str, 
         if not native_pair:
 
             continue
-        native, base, quote = normalized
+        native = native_pair
+        try:
+            raw_base, raw_quote = native_pair.split("/", 1)
+        except ValueError:
+            continue
+        base = _normalize_asset(raw_base, is_quote=False) or raw_base
+        quote = _normalize_asset(raw_quote, is_quote=True) or raw_quote
         tick = _step_from_metadata(
             entry,
             ("tick_size", "price_increment"),

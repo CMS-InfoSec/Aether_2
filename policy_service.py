@@ -19,6 +19,10 @@ from typing import TYPE_CHECKING, Dict, List, MutableMapping, Sequence
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, status
 
+from auth.service import InMemorySessionStore, RedisSessionStore, SessionStoreProtocol
+
+from services.common import security
+
 
 from services.common.precision import (
     PrecisionMetadataUnavailable,
@@ -82,6 +86,37 @@ SHUTDOWN_TIMEOUT = float(os.getenv("POLICY_SHUTDOWN_TIMEOUT", os.getenv("SERVICE
 app = FastAPI(title="Policy Service", version="2.0.0")
 setup_metrics(app, service_name="policy-service")
 EXCHANGE_ADAPTER = get_exchange_adapter(DEFAULT_EXCHANGE)
+
+
+def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
+    """Ensure the FastAPI app exposes the shared authentication session store."""
+
+    existing = getattr(application.state, "session_store", None)
+    if isinstance(existing, SessionStoreProtocol):
+        store = existing
+    else:
+        redis_url = os.getenv("SESSION_REDIS_URL") or "memory://policy-service"
+        ttl_minutes = int(os.getenv("SESSION_TTL_MINUTES", "60"))
+        if redis_url.startswith("memory://"):
+            store = InMemorySessionStore(ttl_minutes=ttl_minutes)
+        else:
+            try:  # pragma: no cover - optional Redis dependency in some environments
+                import redis  # type: ignore[import-not-found]
+            except ImportError as exc:  # pragma: no cover - surfaced when redis missing locally
+                raise RuntimeError(
+                    "redis package is required when SESSION_REDIS_URL is set"
+                ) from exc
+
+            client = redis.Redis.from_url(redis_url)
+            store = RedisSessionStore(client, ttl_minutes=ttl_minutes)
+
+        application.state.session_store = store
+
+    security.set_default_session_store(store)
+    return store
+
+
+SESSION_STORE = _configure_session_store(app)
 
 shutdown_manager = setup_graceful_shutdown(
     app,
@@ -637,7 +672,17 @@ async def ready() -> Dict[str, str]:
 
 
 @app.get("/policy/regime", tags=["policy"])
-async def get_regime(symbol: str) -> Dict[str, float | int | str]:
+async def get_regime(
+    symbol: str,
+    account_id: str | None = None,
+    caller: str = Depends(require_admin_account),
+) -> Dict[str, float | int | str]:
+    if account_id and account_id.strip().lower() != caller.strip().lower():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authenticated account is not authorized for the requested account.",
+        )
+
     snapshot = regime_classifier.get_snapshot(symbol)
     if snapshot is None:
         raise HTTPException(
