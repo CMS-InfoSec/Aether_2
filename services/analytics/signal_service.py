@@ -43,9 +43,6 @@ DATA_STALENESS_GAUGE = Gauge(
 )
 
 
-DEFAULT_ADAPTER = TimescaleMarketDataAdapter()
-
-
 # ---------------------------------------------------------------------------
 # Helper computations
 # ---------------------------------------------------------------------------
@@ -355,50 +352,52 @@ class StressTestResponse(BaseModel):
 app = FastAPI(title="Advanced Signal Service", version="1.0.0")
 
 
-def _resolve_session_store_dsn() -> str:
-    for env_var in ("SESSION_REDIS_URL", "SESSION_STORE_URL", "SESSION_BACKEND_DSN"):
-        value = os.getenv(env_var)
-        if value:
-            return value
-    raise RuntimeError(
-        "Session store misconfigured: configure SESSION_REDIS_URL, SESSION_STORE_URL, or SESSION_BACKEND_DSN so "
-        "the signal service can authenticate administrative callers.",
-    )
+
+_PRIMARY_DSN_ENV = "SIGNAL_DATABASE_URL"
+_FALLBACK_DSN_ENV = "TIMESCALE_DSN"
+_PRIMARY_SCHEMA_ENV = "SIGNAL_SCHEMA"
+_FALLBACK_SCHEMA_ENV = "TIMESCALE_SCHEMA"
 
 
-def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
-    existing = getattr(application.state, "session_store", None)
-    if isinstance(existing, SessionStoreProtocol):
-        store = existing
-    else:
-        dsn = _resolve_session_store_dsn()
-        ttl_minutes = int(os.getenv("SESSION_TTL_MINUTES", "60"))
-        if dsn.startswith("memory://"):
-            store = InMemorySessionStore(ttl_minutes=ttl_minutes)
-        else:
-            try:  # pragma: no cover - optional dependency for production deployments
-                import redis  # type: ignore[import-not-found]
-            except ImportError as exc:  # pragma: no cover - surfaced when redis package missing locally
-                raise RuntimeError(
-                    "redis package is required when configuring the signal service session store via SESSION_REDIS_URL.",
-                ) from exc
-
-            client = redis.Redis.from_url(dsn)
-            store = RedisSessionStore(client, ttl_minutes=ttl_minutes)
-
-        application.state.session_store = store
-
-    security.set_default_session_store(store)
-    return store
+def _resolve_market_data_dsn() -> str:
+    dsn = os.getenv(_PRIMARY_DSN_ENV) or os.getenv(_FALLBACK_DSN_ENV)
+    if not dsn:
+        raise RuntimeError(
+            "SIGNAL_DATABASE_URL or TIMESCALE_DSN must be configured with a PostgreSQL/Timescale DSN for the signal service."
+        )
+    return dsn
 
 
-SESSION_STORE = _configure_session_store(app)
+def _resolve_market_data_schema() -> str | None:
+    return os.getenv(_PRIMARY_SCHEMA_ENV) or os.getenv(_FALLBACK_SCHEMA_ENV)
+
+
+@app.on_event("startup")
+def _configure_market_data_adapter() -> None:
+    dsn = _resolve_market_data_dsn()
+    schema = _resolve_market_data_schema()
+    app.state.market_data_adapter = TimescaleMarketDataAdapter(database_url=dsn, schema=schema)
+
+
+@app.on_event("shutdown")
+def _reset_market_data_adapter() -> None:
+    if hasattr(app.state, "market_data_adapter"):
+        adapter = getattr(app.state, "market_data_adapter", None)
+        if adapter is not None:
+            engine = getattr(adapter, "_engine", None)
+            if engine is not None:
+                try:
+                    engine.dispose()
+                except Exception:  # pragma: no cover - defensive cleanup
+                    logger.debug("Failed to dispose Timescale engine during shutdown", exc_info=True)
+        app.state.market_data_adapter = None
+
 
 
 def _market_data_adapter() -> MarketDataAdapter:
     adapter = getattr(app.state, "market_data_adapter", None)
     if adapter is None:
-        adapter = DEFAULT_ADAPTER
+        raise HTTPException(status_code=503, detail="Market data adapter is not configured")
     return adapter
 
 

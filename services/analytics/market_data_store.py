@@ -66,7 +66,16 @@ class TimescaleMarketDataAdapter:
         prices_table: str = "ohlcv_bars",
         orders_side_table: str = "orders",
     ) -> None:
-        self._engine = engine or create_engine(database_url or "sqlite:///./marketdata.db", future=True)
+        if engine is not None:
+            self._engine = engine
+        else:
+            if not database_url:
+                LOGGER.warning(
+                    "TimescaleMarketDataAdapter instantiated without database_url or engine; "
+                    "defaulting to in-memory sqlite fallback."
+                )
+                database_url = "sqlite+pysqlite:///:memory:"
+            self._engine = create_engine(database_url, future=True)
         self._schema = schema
         self._trades_table = trades_table
         self._orderbook_table = orders_table
