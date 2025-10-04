@@ -6,31 +6,20 @@ import calendar
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Iterator, List, Sequence
+from typing import Any, Dict, Iterator, List, Sequence
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import Column, DateTime, Float, String, create_engine, func, select
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Engine, URL
+from sqlalchemy.engine.url import make_url
+from sqlalchemy.exc import ArgumentError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 __all__ = ["app"]
 
 
-DEFAULT_DATABASE_URL = "sqlite:///./seasonality.db"
-
-DATABASE_URL = (
-    # Dedicated seasonality database override.
-    # Falls back to the Timescale/primary database if not provided so the service can
-    # operate against existing OHLCV data in integration tests.
-    os.getenv("SEASONALITY_DATABASE_URI")
-    or os.getenv("TIMESCALE_DATABASE_URI")
-    or os.getenv("DATABASE_URL")
-    or DEFAULT_DATABASE_URL
-)
-
-
-def _normalize_database_url(url: str) -> str:
+def _normalise_database_url(url: str) -> str:
     """Ensure SQLAlchemy uses the psycopg2 driver for PostgreSQL URLs."""
 
     if url.startswith("postgresql+psycopg://"):
@@ -42,7 +31,64 @@ def _normalize_database_url(url: str) -> str:
     return url
 
 
-ENGINE: Engine = create_engine(_normalize_database_url(DATABASE_URL), future=True)
+def _require_database_url() -> URL:
+    """Resolve and validate the managed Timescale/PostgreSQL DSN."""
+
+    primary = os.getenv("SEASONALITY_DATABASE_URI")
+    fallback = os.getenv("TIMESCALE_DATABASE_URI") or os.getenv("DATABASE_URL")
+    raw_url = primary or fallback
+
+    if not raw_url:
+        raise RuntimeError(
+            "Seasonality service requires SEASONALITY_DATABASE_URI (or TIMESCALE_DATABASE_URI) "
+            "to point at a managed Timescale/PostgreSQL database."
+        )
+
+    normalised = _normalise_database_url(raw_url)
+
+    try:
+        url = make_url(normalised)
+    except ArgumentError as exc:  # pragma: no cover - configuration error
+        raise RuntimeError(f"Invalid seasonality database URL '{raw_url}': {exc}") from exc
+
+    if not url.drivername.lower().startswith("postgresql"):
+        raise RuntimeError(
+            "Seasonality service requires a PostgreSQL/Timescale DSN; "
+            f"received driver '{url.drivername}'."
+        )
+
+    return url
+
+
+def _engine_options(url: URL) -> Dict[str, Any]:
+    options: Dict[str, Any] = {
+        "future": True,
+        "pool_pre_ping": True,
+        "pool_size": int(os.getenv("SEASONALITY_DB_POOL_SIZE", "15")),
+        "max_overflow": int(os.getenv("SEASONALITY_DB_MAX_OVERFLOW", "10")),
+        "pool_timeout": int(os.getenv("SEASONALITY_DB_POOL_TIMEOUT", "30")),
+        "pool_recycle": int(os.getenv("SEASONALITY_DB_POOL_RECYCLE", "1800")),
+    }
+
+    connect_args: Dict[str, Any] = {}
+
+    forced_sslmode = os.getenv("SEASONALITY_DB_SSLMODE")
+    if forced_sslmode:
+        connect_args["sslmode"] = forced_sslmode
+    elif "sslmode" not in url.query and url.host not in {None, "localhost", "127.0.0.1"}:
+        connect_args["sslmode"] = "require"
+
+    if connect_args:
+        options["connect_args"] = connect_args
+
+    return options
+
+
+DATABASE_URL: URL = _require_database_url()
+ENGINE: Engine = create_engine(
+    DATABASE_URL.render_as_string(hide_password=False),
+    **_engine_options(DATABASE_URL),
+)
 SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
 
 
@@ -75,9 +121,6 @@ class SeasonalityMetric(MetricsBase):
     avg_vol = Column(Float, nullable=False)
     avg_volume = Column(Float, nullable=False)
     ts = Column(DateTime(timezone=True), nullable=False)
-
-
-MetricsBase.metadata.create_all(bind=ENGINE)
 
 
 @dataclass
