@@ -11,11 +11,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Iterable, List, Sequence
 
 import psycopg2
-from fastapi import FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
 from psycopg2 import errors, sql
 
 from services.common.config import get_timescale_session
+from services.common.security import require_admin_account
 
 
 LOGGER = logging.getLogger(__name__)
@@ -512,17 +513,46 @@ async def _on_shutdown() -> None:
     await refiner.stop()
 
 
+def _assert_account_scope(actor_account: str, requested_account: str | None) -> None:
+    """Ensure the authenticated caller matches the service scope and request."""
+
+    normalized_actor = actor_account.strip().lower()
+    normalized_scope = ACCOUNT_ID.strip().lower()
+    if normalized_scope and normalized_actor != normalized_scope:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authenticated account does not match prompt refiner scope.",
+        )
+
+    if requested_account:
+        normalized_requested = requested_account.strip().lower()
+        if normalized_requested and normalized_requested != normalized_actor:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Requested account does not match authenticated session.",
+            )
+
+
 @app.get("/ml/prompts/latest", response_model=PromptRecord)
-async def get_latest_prompt() -> PromptRecord:
+async def get_latest_prompt(
+    account_id: str | None = None,
+    actor: str = Depends(require_admin_account),
+) -> PromptRecord:
     """Return the latest generated prompt artifact."""
 
+    _assert_account_scope(actor, account_id)
     return refiner.latest_prompt()
 
 
 @app.post("/ml/prompts/test", response_model=PromptTestResponse, status_code=status.HTTP_201_CREATED)
-async def post_prompt_test(payload: PromptTestRequest) -> PromptTestResponse:
+async def post_prompt_test(
+    payload: PromptTestRequest,
+    account_id: str | None = None,
+    actor: str = Depends(require_admin_account),
+) -> PromptTestResponse:
     """Record a prompt experiment and surface follow-up candidates if needed."""
 
+    _assert_account_scope(actor, account_id)
     run_id = payload.run_id or str(uuid.uuid4())
     stored_prompt = refiner.record_prompt(run_id, payload.prompt_text)
 
