@@ -42,18 +42,18 @@ def test_position_sizer_quantizes_using_precision() -> None:
     )
 
     result = sizer.suggest_max_position(
-        "ADA-USD",
+        "ETH-USDT",
         nav=2000.0,
         available_balance=2000.0,
         volatility=0.25,
         expected_edge_bps=50.0,
         fee_bps_estimate=1.0,
-        price=0.25973,
+        price=1875.12,
         regime="trend",
     )
 
     assert result.reason == "sized"
-    multiple = result.size_units / 0.1
+    multiple = result.size_units / 0.001
     assert multiple == pytest.approx(round(multiple), abs=1e-9)
     assert result.size_units > 0
 

@@ -115,6 +115,13 @@ class GracefulShutdownManager:
                 callback()
         return started
 
+    def reset(self) -> None:
+        """Clear draining state to allow the service to accept requests again."""
+
+        with self._condition:
+            self._draining = False
+            self._drain_started_at = None
+
     def wait_for_inflight(self, timeout: Optional[float] = None) -> bool:
         deadline = None if timeout is None else time.monotonic() + max(timeout, 0.0)
         with self._condition:
@@ -241,6 +248,7 @@ def setup_graceful_shutdown(
 
     @app.on_event("startup")
     async def _on_startup() -> None:
+        manager.reset()
         install_sigterm_handler(manager)
 
     @app.on_event("shutdown")

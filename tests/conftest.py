@@ -422,20 +422,49 @@ if _class_validators is not None:
 
 
 def _precision_fixture_payload() -> Dict[str, Dict[str, str]]:
-    def _entry(base: str, tick: float, lot: float) -> Dict[str, str]:
+    def _entry(
+        base: str,
+        quote: str,
+        tick: float,
+        lot: float,
+        *,
+        alt: str | None = None,
+        base_field: str | None = None,
+        quote_field: str | None = None,
+    ) -> Dict[str, str]:
         return {
-            "wsname": f"{base}/USD",
+            "wsname": f"{base}/{quote}",
+            "altname": alt or f"{base}{quote}",
+            "base": base_field or base,
+            "quote": quote_field or quote,
             "tick_size": str(tick),
             "lot_step": str(lot),
         }
 
     return {
-        "BTCUSD": _entry("BTC", 0.1, 0.0001),
-        "ETHUSD": _entry("ETH", 0.05, 0.001),
-        "SOLUSD": _entry("SOL", 0.01, 0.1),
-        "USDTUSD": _entry("USDT", 0.001, 1.0),
-        "ADAUSD": _entry("ADA", 0.0001, 0.1),
-        "TSTUSD": _entry("TST", 1e-08, 1e-08),
+        "BTCUSD": _entry("BTC", "USD", 0.1, 0.0001, base_field="XXBT", quote_field="ZUSD"),
+        "ETHUSD": _entry("ETH", "USD", 0.05, 0.001, base_field="XETH", quote_field="ZUSD"),
+        "SOLUSD": _entry("SOL", "USD", 0.01, 0.1),
+        "USDTUSD": _entry("USDT", "USD", 0.001, 1.0),
+        "ADAUSD": _entry("ADA", "USD", 0.0001, 0.1),
+        "TSTUSD": _entry("TST", "USD", 1e-08, 1e-08),
+        "ETHUSDT": _entry(
+            "ETH",
+            "USDT",
+            0.01,
+            0.001,
+            alt="ETHUSDT",
+            base_field="XETH",
+            quote_field="USDT",
+        ),
+        "ADAEUR": _entry(
+            "ADA",
+            "EUR",
+            0.0001,
+            0.1,
+            alt="ADAEUR",
+            quote_field="ZEUR",
+        ),
     }
 
 

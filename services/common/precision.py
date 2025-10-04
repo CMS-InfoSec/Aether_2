@@ -60,7 +60,10 @@ class PrecisionMetadataProvider:
         self._timeout = max(float(timeout), 0.0)
         self._time_source = time_source
         self._lock = threading.Lock()
+        # Cache keyed by Kraken native pair identifier (e.g. "ETH/USDT").
         self._cache: Dict[str, Dict[str, float]] = {}
+        # Mapping of normalized client symbols to cached native identifiers.
+        self._aliases: Dict[str, str] = {}
         self._last_refresh: float = 0.0
 
     # ------------------------------------------------------------------
@@ -69,12 +72,12 @@ class PrecisionMetadataProvider:
     def get(self, symbol: str) -> Optional[Dict[str, float]]:
         """Return precision metadata for ``symbol`` if available."""
 
-        normalized = _normalize_symbol(symbol)
-        if not normalized:
-            return None
         self._maybe_refresh()
         with self._lock:
-            entry = self._cache.get(normalized)
+            native = self._resolve_native_locked(symbol)
+            if not native:
+                return None
+            entry = self._cache.get(native)
             return dict(entry) if entry else None
 
     def require(self, symbol: str) -> Dict[str, float]:
@@ -85,7 +88,37 @@ class PrecisionMetadataProvider:
             raise PrecisionMetadataUnavailable(f"Precision metadata unavailable for {symbol}")
         return metadata
 
-    async def refresh(self, *, force: bool = False) -> None:
+
+    def resolve_native(self, symbol: str) -> Optional[str]:
+        """Resolve a client-facing symbol to the cached native pair identifier."""
+
+        self._maybe_refresh()
+        with self._lock:
+            return self._resolve_native_locked(symbol)
+
+    def get_native(self, native_symbol: str) -> Optional[Dict[str, float]]:
+        """Return precision metadata for a native Kraken pair identifier."""
+
+        key = (native_symbol or "").strip().upper()
+        if not key:
+            return None
+        self._maybe_refresh()
+        with self._lock:
+            entry = self._cache.get(key)
+        return dict(entry) if entry else None
+
+    def require_native(self, native_symbol: str) -> Dict[str, float]:
+        """Return precision metadata for a native Kraken pair identifier or raise."""
+
+        metadata = self.get_native(native_symbol)
+        if metadata is None:
+            raise PrecisionMetadataUnavailable(
+                f"Precision metadata unavailable for native pair {native_symbol}"
+            )
+        return metadata
+
+    def refresh(self, *, force: bool = False) -> None:
+
         """Force a metadata refresh regardless of cache age if requested."""
 
         if not force and not self._needs_refresh():
@@ -96,13 +129,14 @@ class PrecisionMetadataProvider:
             logger.warning("Failed to fetch Kraken precision metadata: %s", exc)
             return
 
-        parsed = _parse_asset_pairs(payload)
+        parsed, aliases = _parse_asset_pairs(payload)
         if not parsed:
             logger.warning("Received empty Kraken precision metadata payload")
             return
 
         with self._lock:
             self._cache = parsed
+            self._aliases = aliases
             self._last_refresh = self._time_source()
 
     # ------------------------------------------------------------------
@@ -134,7 +168,26 @@ class PrecisionMetadataProvider:
 
         self._refresh_sync(force=force)
 
-    async def _default_fetcher(self) -> Mapping[str, Any]:
+
+    def _resolve_native_locked(self, symbol: str) -> Optional[str]:
+        normalized = _normalize_symbol(symbol)
+        if not normalized:
+            return None
+        native = self._aliases.get(normalized)
+        if native:
+            return native
+
+        direct = (symbol or "").strip().upper()
+        if direct and direct in self._cache:
+            return direct
+
+        fallback = normalized.replace("-", "/")
+        if fallback in self._cache:
+            return fallback
+        return None
+
+    def _default_fetcher(self) -> Mapping[str, Any]:
+
         url = "https://api.kraken.com/0/public/AssetPairs"
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             response = await client.get(url)
@@ -182,28 +235,38 @@ def _normalize_asset(symbol: str, *, is_quote: bool) -> str:
     return aliases.get(trimmed, trimmed)
 
 
-def _normalize_instrument(entry: Mapping[str, Any]) -> str:
-    wsname = entry.get("wsname")
-    if isinstance(wsname, str) and "/" in wsname:
-        base_part, quote_part = wsname.split("/", 1)
-        base = _normalize_asset(base_part, is_quote=False)
-        quote = _normalize_asset(quote_part, is_quote=True)
-        if base and quote == "USD":
-            return f"{base}-USD"
-
-    altname = entry.get("altname")
-    if isinstance(altname, str):
-        cleaned = altname.replace("/", "").upper()
-        if cleaned.endswith("USD") and len(cleaned) > 3:
-            base = _normalize_asset(cleaned[:-3], is_quote=False)
-            if base:
-                return f"{base}-USD"
-
+def _normalize_instrument(entry: Mapping[str, Any]) -> Optional[tuple[str, str, str]]:
     base = _normalize_asset(str(entry.get("base") or ""), is_quote=False)
     quote = _normalize_asset(str(entry.get("quote") or ""), is_quote=True)
-    if base and quote == "USD":
-        return f"{base}-USD"
-    return ""
+
+    native: Optional[str] = None
+
+    wsname = entry.get("wsname")
+    if isinstance(wsname, str):
+        candidate = wsname.strip().upper()
+        if candidate:
+            native = candidate
+            if "/" in candidate:
+                base_part, quote_part = candidate.split("/", 1)
+                parsed_base = _normalize_asset(base_part, is_quote=False)
+                parsed_quote = _normalize_asset(quote_part, is_quote=True)
+                base = parsed_base or base
+                quote = parsed_quote or quote
+
+    if native is None:
+        altname = entry.get("altname")
+        if isinstance(altname, str):
+            candidate = altname.strip().upper()
+            if candidate:
+                native = candidate
+
+    if native is None and base and quote:
+        native = f"{base}/{quote}"
+
+    if not native or not base or not quote:
+        return None
+
+    return native, base, quote
 
 
 def _step_from_metadata(
@@ -236,17 +299,21 @@ def _step_from_metadata(
     return None
 
 
-def _parse_asset_pairs(payload: Mapping[str, Any]) -> Dict[str, Dict[str, float]]:
+def _parse_asset_pairs(
+    payload: Mapping[str, Any]
+) -> tuple[Dict[str, Dict[str, float]], Dict[str, str]]:
     if isinstance(payload.get("result"), Mapping):
         payload = payload["result"]  # type: ignore[assignment]
 
     parsed: Dict[str, Dict[str, float]] = {}
+    aliases: Dict[str, str] = {}
     for entry in payload.values():
         if not isinstance(entry, Mapping):
             continue
-        instrument = _normalize_instrument(entry)
-        if not instrument:
+        normalized = _normalize_instrument(entry)
+        if not normalized:
             continue
+        native, base, quote = normalized
         tick = _step_from_metadata(
             entry,
             ("tick_size", "price_increment"),
@@ -259,8 +326,31 @@ def _parse_asset_pairs(payload: Mapping[str, Any]) -> Dict[str, Dict[str, float]
         )
         if tick is None or lot is None:
             continue
-        parsed[instrument] = {"tick": float(tick), "lot": float(lot)}
-    return parsed
+        native_key = native.strip().upper()
+        parsed[native_key] = {"tick": float(tick), "lot": float(lot)}
+
+        alias_candidates = {
+            native_key,
+            native_key.replace("/", "-"),
+            f"{base}-{quote}",
+            f"{base}/{quote}",
+            f"{base}{quote}",
+        }
+
+        wsname = entry.get("wsname")
+        if isinstance(wsname, str):
+            alias_candidates.add(wsname.strip().upper())
+
+        altname = entry.get("altname")
+        if isinstance(altname, str):
+            alias_candidates.add(altname.strip().upper())
+
+        for candidate in alias_candidates:
+            normalized_alias = _normalize_symbol(candidate)
+            if normalized_alias:
+                aliases.setdefault(normalized_alias, native_key)
+
+    return parsed, aliases
 
 
 precision_provider = PrecisionMetadataProvider()

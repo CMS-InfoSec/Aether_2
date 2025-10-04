@@ -15,6 +15,9 @@ def _payload(tick: float, lot: float) -> dict[str, dict[str, str]]:
     return {
         "ADAUSD": {
             "wsname": "ADA/USD",
+            "altname": "ADAUSD",
+            "base": "ADA",
+            "quote": "ZUSD",
             "tick_size": str(tick),
             "lot_step": str(lot),
         }
@@ -43,13 +46,48 @@ async def test_precision_provider_refreshes_metadata() -> None:
     assert updated["lot"] == pytest.approx(5.0)
 
 
-@pytest.mark.asyncio
-async def test_precision_provider_missing_symbol_raises() -> None:
-    async def _fetch_empty() -> dict[str, dict[str, str]]:
-        return {}
 
-    provider = PrecisionMetadataProvider(fetcher=_fetch_empty, refresh_interval=0.0)
-    await provider.refresh(force=True)
+def test_precision_provider_handles_non_usd_pairs() -> None:
+    payload = {
+        "ETHUSDT": {
+            "wsname": "ETH/USDT",
+            "altname": "ETHUSDT",
+            "base": "XETH",
+            "quote": "USDT",
+            "tick_size": "0.01",
+            "lot_step": "0.001",
+        },
+        "ADAEUR": {
+            "wsname": "ADA/EUR",
+            "altname": "ADAEUR",
+            "base": "ADA",
+            "quote": "ZEUR",
+            "tick_size": "0.0001",
+            "lot_step": "0.1",
+        },
+    }
+
+    provider = PrecisionMetadataProvider(fetcher=lambda: payload, refresh_interval=0.0)
+    provider.refresh(force=True)
+
+    native = provider.resolve_native("ETH-USDT")
+    assert native == "ETH/USDT"
+
+    metadata = provider.require_native(native)
+    assert metadata["tick"] == pytest.approx(0.01)
+    assert metadata["lot"] == pytest.approx(0.001)
+
+    ada_native = provider.resolve_native("ADA-EUR")
+    assert ada_native == "ADA/EUR"
+    ada_metadata = provider.require("ADA-EUR")
+    assert ada_metadata["tick"] == pytest.approx(0.0001)
+    assert ada_metadata["lot"] == pytest.approx(0.1)
+
+
+def test_precision_provider_missing_symbol_raises() -> None:
+    provider = PrecisionMetadataProvider(fetcher=lambda: {}, refresh_interval=0.0)
+    provider.refresh(force=True)
+
 
     with pytest.raises(PrecisionMetadataUnavailable):
         await asyncio.to_thread(provider.require, "UNKNOWN")
