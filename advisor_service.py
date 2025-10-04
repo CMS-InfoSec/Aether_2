@@ -20,15 +20,17 @@ import logging
 import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, status
 from pydantic import BaseModel, Field, validator
 from sqlalchemy import JSON, Column, DateTime, Integer, String, create_engine
+from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from auth.service import InMemorySessionStore, RedisSessionStore, SessionStoreProtocol
 from services.common import security
@@ -41,31 +43,79 @@ LOGGER = logging.getLogger(__name__)
 # Database setup
 # ---------------------------------------------------------------------------
 
-DEFAULT_DATABASE_URL = os.getenv("ADVISOR_DATABASE_URL", "sqlite:///./advisor.db")
+_DATABASE_URL_ENV = "ADVISOR_DATABASE_URL"
+_SQLITE_FALLBACK_FLAG = "ADVISOR_ALLOW_SQLITE_FOR_TESTS"
+_SSL_MODE_ENV = "ADVISOR_DB_SSLMODE"
+_POOL_SIZE_ENV = "ADVISOR_DB_POOL_SIZE"
+_MAX_OVERFLOW_ENV = "ADVISOR_DB_MAX_OVERFLOW"
+_POOL_TIMEOUT_ENV = "ADVISOR_DB_POOL_TIMEOUT"
+_POOL_RECYCLE_ENV = "ADVISOR_DB_POOL_RECYCLE"
 
 
-def _needs_sqlite_directory(url: str) -> Optional[Path]:
-    """Return the sqlite file path if the engine needs a directory created."""
+def _require_database_url() -> str:
+    """Return the managed Postgres/Timescale database URL for advisor history."""
 
-    if not url.startswith("sqlite://"):
-        return None
+    raw_url = os.getenv(_DATABASE_URL_ENV)
+    if not raw_url:
+        raise RuntimeError(
+            "ADVISOR_DATABASE_URL must be set and point to the shared TimescaleDB cluster."
+        )
 
-    # sqlite:///relative/path.db -> relative/path.db
-    relative_path = url.removeprefix("sqlite:///")
-    # Memory databases use the special :memory: marker.
-    if relative_path in {":memory:", ""}:
-        return None
-    db_path = Path(relative_path)
-    return db_path.parent
+    normalized = raw_url.lower()
+    if normalized.startswith("postgres://"):
+        raw_url = "postgresql://" + raw_url.split("://", 1)[1]
+        normalized = raw_url.lower()
+
+    allowed_prefixes = (
+        "postgresql://",
+        "postgresql+psycopg://",
+        "postgresql+psycopg2://",
+    )
+    if normalized.startswith(allowed_prefixes):
+        return raw_url
+
+    if os.getenv(_SQLITE_FALLBACK_FLAG) == "1":
+        LOGGER.warning(
+            "Allowing non-Postgres ADVISOR_DATABASE_URL '%s' because %s=1.",
+            raw_url,
+            _SQLITE_FALLBACK_FLAG,
+        )
+        return raw_url
+
+    raise RuntimeError(
+        "ADVISOR_DATABASE_URL must use a PostgreSQL-compatible driver (e.g. postgresql://)."
+    )
 
 
-sqlite_parent = _needs_sqlite_directory(DEFAULT_DATABASE_URL)
-if sqlite_parent and not sqlite_parent.exists():  # pragma: no cover - filesystem guard
-    sqlite_parent.mkdir(parents=True, exist_ok=True)
+def _create_engine(database_url: str) -> Engine:
+    """Create a SQLAlchemy engine configured for pooled, managed connections."""
+
+    connect_args: Dict[str, Any] = {}
+    engine_kwargs: Dict[str, Any] = {
+        "future": True,
+        "pool_pre_ping": True,
+    }
+
+    if database_url.startswith("sqlite"):
+        connect_args["check_same_thread"] = False
+        engine_kwargs["connect_args"] = connect_args
+        if ":memory:" in database_url:
+            engine_kwargs["poolclass"] = StaticPool
+    else:
+        connect_args["sslmode"] = os.getenv(_SSL_MODE_ENV, "require")
+        engine_kwargs["connect_args"] = connect_args
+        engine_kwargs.update(
+            pool_size=int(os.getenv(_POOL_SIZE_ENV, "10")),
+            max_overflow=int(os.getenv(_MAX_OVERFLOW_ENV, "5")),
+            pool_timeout=int(os.getenv(_POOL_TIMEOUT_ENV, "30")),
+            pool_recycle=int(os.getenv(_POOL_RECYCLE_ENV, "1800")),
+        )
+
+    return create_engine(database_url, **engine_kwargs)
 
 
-engine = create_engine(DEFAULT_DATABASE_URL, future=True)
-SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False, future=True)
+ENGINE = _create_engine(_require_database_url())
+SessionLocal = sessionmaker(bind=ENGINE, autocommit=False, autoflush=False, future=True)
 Base = declarative_base()
 
 
@@ -426,11 +476,6 @@ def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
 
 
 SESSION_STORE = _configure_session_store(app)
-
-
-@app.on_event("startup")
-def _create_tables() -> None:  # pragma: no cover - exercised via FastAPI runtime
-    Base.metadata.create_all(bind=engine)
 
 
 async def _gather_context() -> Dict[str, Any]:
