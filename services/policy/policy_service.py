@@ -279,6 +279,7 @@ def _to_float(value: Any, *, default: float = 0.0) -> float:
 from auth.service import RedisSessionStore, SessionStoreProtocol
 
 from metrics import (
+    metric_context,
     observe_policy_inference_latency,
     record_abstention_rate,
     record_drift_score,
@@ -642,11 +643,22 @@ def decide_policy_intent(
         drift = float(raw)
     except (TypeError, ValueError):
         drift = 0.0
-    record_drift_score(request.account_id, request.symbol, drift)
+    metrics_ctx = metric_context(account_id=request.account_id, symbol=request.symbol)
+    record_drift_score(
+        request.account_id,
+        request.symbol,
+        drift,
+        context=metrics_ctx,
+    )
 
     action = (response.action or "").lower()
     abstain = 1.0 if action in {"hold", "abstain"} else 0.0
-    record_abstention_rate(request.account_id, request.symbol, abstain)
+    record_abstention_rate(
+        request.account_id,
+        request.symbol,
+        abstain,
+        context=metrics_ctx,
+    )
 
     return response
 

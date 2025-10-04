@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: capital-allocator
+  labels:
+    app: capital-allocator
+    app.kubernetes.io/name: capital-allocator
+    app.kubernetes.io/component: api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: capital-allocator
+  template:
+    metadata:
+      labels:
+        app: capital-allocator
+        app.kubernetes.io/name: capital-allocator
+        app.kubernetes.io/component: api
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 2000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: capital-allocator
+          image: ghcr.io/aether/capital-allocator:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: CAPITAL_ALLOCATOR_DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: capital-allocator-database
+                  key: dsn
+            - name: CAPITAL_ALLOCATOR_SSLMODE
+              valueFrom:
+                secretKeyRef:
+                  name: capital-allocator-database
+                  key: sslmode
+                  optional: true
+          readinessProbe:
+            httpGet:
+              path: /allocator/status
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /allocator/status
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

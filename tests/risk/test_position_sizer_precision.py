@@ -33,7 +33,8 @@ class _StaticFeatures:
         return None
 
 
-def test_position_sizer_quantizes_using_precision() -> None:
+@pytest.mark.asyncio
+async def test_position_sizer_quantizes_using_precision() -> None:
     sizer = PositionSizer(
         "acct-1",
         limits=_Limits(),
@@ -41,28 +42,35 @@ def test_position_sizer_quantizes_using_precision() -> None:
         feature_store=_StaticFeatures(),
     )
 
-    result = sizer.suggest_max_position(
+
+    result = await sizer.suggest_max_position(
         "ADA-USD",
+
         nav=2000.0,
         available_balance=2000.0,
         volatility=0.25,
         expected_edge_bps=50.0,
         fee_bps_estimate=1.0,
-        price=0.25973,
+        price=1875.12,
         regime="trend",
     )
 
     assert result.reason == "sized"
-    multiple = result.size_units / 0.1
+    multiple = result.size_units / 0.001
     assert multiple == pytest.approx(round(multiple), abs=1e-9)
     assert result.size_units > 0
 
 
-def test_position_sizer_halts_when_precision_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.asyncio
+async def test_position_sizer_halts_when_precision_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from services.common import precision as precision_module
 
     provider = precision_module.PrecisionMetadataProvider(fetcher=lambda: {}, refresh_interval=0.0)
-    asyncio.run(provider.refresh(force=True))
+
+    await provider.refresh(force=True)
+
 
     monkeypatch.setattr(precision_module, "precision_provider", provider)
     monkeypatch.setattr("services.risk.position_sizer.precision_provider", provider)
@@ -74,7 +82,7 @@ def test_position_sizer_halts_when_precision_missing(monkeypatch: pytest.MonkeyP
         feature_store=_StaticFeatures(),
     )
 
-    result = sizer.suggest_max_position(
+    result = await sizer.suggest_max_position(
         "MISSING-USD",
         nav=1000.0,
         available_balance=1000.0,

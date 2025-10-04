@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
+
 import logging
 import threading
 import time
+from collections.abc import Awaitable, Callable, Mapping
 from decimal import Decimal, InvalidOperation
-from typing import Any, Awaitable, Callable, Dict, Mapping, Optional
+
+from typing import Any, Dict, Optional
+
 
 import httpx
+import inspect
 
 # Module-level logger for metadata refresh diagnostics.
 logger = logging.getLogger(__name__)
@@ -60,50 +64,70 @@ class PrecisionMetadataProvider:
         self._timeout = max(float(timeout), 0.0)
         self._time_source = time_source
         self._lock = threading.Lock()
-        self._cache: Dict[str, Dict[str, float]] = {}
+
+        self._cache: Dict[str, Dict[str, Any]] = {}
+
+        self._aliases: Dict[str, str] = {}
         self._last_refresh: float = 0.0
+        self._refresh_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def get(self, symbol: str) -> Optional[Dict[str, float]]:
+
+    async def get(self, symbol: str) -> Optional[Dict[str, float]]:
         """Return precision metadata for ``symbol`` if available."""
 
         normalized = _normalize_symbol(symbol)
         if not normalized:
             return None
-        self._maybe_refresh()
+        await self._maybe_refresh()
+
         with self._lock:
-            entry = self._cache.get(normalized)
+
+            key = self._aliases.get(normalized, normalized)
+            entry = self._cache.get(key)
+            if entry is None and normalized in self._cache:
+                entry = self._cache.get(normalized)
+
             return dict(entry) if entry else None
 
-    def require(self, symbol: str) -> Dict[str, float]:
+
+    async def require(self, symbol: str) -> Dict[str, float]:
+
         """Return precision metadata for ``symbol`` or raise."""
 
-        metadata = self.get(symbol)
+        metadata = await self.get(symbol)
         if metadata is None:
             raise PrecisionMetadataUnavailable(f"Precision metadata unavailable for {symbol}")
         return metadata
 
+
     async def refresh(self, *, force: bool = False) -> None:
+
         """Force a metadata refresh regardless of cache age if requested."""
 
         if not force and not self._needs_refresh():
             return
-        try:
-            payload = await self._fetcher()
-        except Exception as exc:  # pragma: no cover - defensive logging
-            logger.warning("Failed to fetch Kraken precision metadata: %s", exc)
-            return
 
-        parsed = _parse_asset_pairs(payload)
-        if not parsed:
-            logger.warning("Received empty Kraken precision metadata payload")
-            return
+        async with self._refresh_lock:
+            if not force and not self._needs_refresh():
+                return
+            try:
+                payload = await self._call_fetcher()
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.warning("Failed to fetch Kraken precision metadata: %s", exc)
+                return
 
-        with self._lock:
-            self._cache = parsed
-            self._last_refresh = self._time_source()
+            parsed = _parse_asset_pairs(payload)
+            if not parsed:
+                logger.warning("Received empty Kraken precision metadata payload")
+                return
+
+            with self._lock:
+                self._cache = parsed
+                self._last_refresh = self._time_source()
+
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -114,27 +138,23 @@ class PrecisionMetadataProvider:
         age = self._time_source() - self._last_refresh
         return age >= self._refresh_interval
 
-    def _maybe_refresh(self) -> None:
+    async def _maybe_refresh(self) -> None:
         if self._needs_refresh():
-            self._refresh_sync(force=True)
 
-    def _refresh_sync(self, *, force: bool) -> None:
-        try:
-            asyncio.run(self.refresh(force=force))
-        except RuntimeError as exc:  # pragma: no cover - defensive guard
-            if "asyncio.run()" in str(exc):
-                raise RuntimeError(
-                    "PrecisionMetadataProvider.refresh() cannot be called from an "
-                    "active event loop; await refresh() or call within asyncio.to_thread()."
-                ) from exc
-            raise
+            await self.refresh(force=False)
 
-    def refresh_sync(self, *, force: bool = False) -> None:
-        """Synchronously refresh metadata for callers without an event loop."""
-
-        self._refresh_sync(force=force)
+    async def _call_fetcher(self) -> Mapping[str, Any]:
+        fetcher = self._fetcher
+        if inspect.iscoroutinefunction(fetcher):
+            result = await fetcher()
+        else:
+            result = await asyncio.to_thread(fetcher)
+        if isinstance(result, Mapping):
+            return result
+        return {}
 
     async def _default_fetcher(self) -> Mapping[str, Any]:
+
         url = "https://api.kraken.com/0/public/AssetPairs"
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             response = await client.get(url)
@@ -161,7 +181,24 @@ _BASE_ALIASES: Dict[str, str] = {
     "XXDG": "DOGE",
     "XDG": "DOGE",
 }
-_QUOTE_ALIASES: Dict[str, str] = {"ZUSD": "USD", "USD": "USD"}
+_QUOTE_ALIASES: Dict[str, str] = {
+    "ZUSD": "USD",
+    "USD": "USD",
+    "ZUSDT": "USDT",
+    "USDT": "USDT",
+    "ZEUR": "EUR",
+    "EUR": "EUR",
+    "ZGBP": "GBP",
+    "GBP": "GBP",
+    "ZCAD": "CAD",
+    "CAD": "CAD",
+    "ZCHF": "CHF",
+    "CHF": "CHF",
+    "ZJPY": "JPY",
+    "JPY": "JPY",
+    "ZUSDC": "USDC",
+    "USDC": "USDC",
+}
 
 
 def _normalize_asset(symbol: str, *, is_quote: bool) -> str:
@@ -182,28 +219,113 @@ def _normalize_asset(symbol: str, *, is_quote: bool) -> str:
     return aliases.get(trimmed, trimmed)
 
 
+
+def _sanitize_pair(value: str, entry: Mapping[str, Any]) -> str:
+    token = (value or "").strip().upper()
+    if not token:
+        return ""
+    if "/" in token:
+        base_part, quote_part = token.split("/", 1)
+        base = base_part.strip()
+        quote = quote_part.strip()
+        if base and quote:
+            return f"{base}/{quote}"
+        return ""
+
+    base = str(entry.get("base") or "").strip().upper()
+    quote = str(entry.get("quote") or "").strip().upper()
+    if base and quote and token == f"{base}{quote}":
+        return f"{base}/{quote}"
+
+    quote_candidates = [quote]
+    normalized_quote = _normalize_asset(quote, is_quote=True)
+    if normalized_quote and normalized_quote != quote:
+        quote_candidates.append(normalized_quote)
+
+    for candidate in quote_candidates:
+        if candidate and token.endswith(candidate) and len(token) > len(candidate):
+            base_part = token[: -len(candidate)]
+            if base_part:
+                return f"{base_part}/{candidate}"
+    return ""
+
+
 def _normalize_instrument(entry: Mapping[str, Any]) -> str:
     wsname = entry.get("wsname")
-    if isinstance(wsname, str) and "/" in wsname:
-        base_part, quote_part = wsname.split("/", 1)
-        base = _normalize_asset(base_part, is_quote=False)
-        quote = _normalize_asset(quote_part, is_quote=True)
-        if base and quote == "USD":
-            return f"{base}-USD"
+    if isinstance(wsname, str):
+        pair = _sanitize_pair(wsname, entry)
+        if pair:
+            return pair
 
     altname = entry.get("altname")
     if isinstance(altname, str):
-        cleaned = altname.replace("/", "").upper()
-        if cleaned.endswith("USD") and len(cleaned) > 3:
-            base = _normalize_asset(cleaned[:-3], is_quote=False)
-            if base:
-                return f"{base}-USD"
+        pair = _sanitize_pair(altname, entry)
+        if pair:
+            return pair
 
-    base = _normalize_asset(str(entry.get("base") or ""), is_quote=False)
-    quote = _normalize_asset(str(entry.get("quote") or ""), is_quote=True)
-    if base and quote == "USD":
-        return f"{base}-USD"
+    base = str(entry.get("base") or "").strip().upper()
+    quote = str(entry.get("quote") or "").strip().upper()
+    if base and quote:
+        return f"{base}/{quote}"
     return ""
+
+
+
+def _alias_candidates(entry: Mapping[str, Any], native_pair: str) -> Tuple[str, ...]:
+    base_native, quote_native = native_pair.split("/", 1)
+
+    bases = {base_native}
+    quotes = {quote_native}
+
+    base_raw = str(entry.get("base") or "").strip().upper()
+    if base_raw:
+        bases.add(base_raw)
+        normalized_base = _normalize_asset(base_raw, is_quote=False)
+        if normalized_base:
+            bases.add(normalized_base)
+
+    quote_raw = str(entry.get("quote") or "").strip().upper()
+    if quote_raw:
+        quotes.add(quote_raw)
+        normalized_quote = _normalize_asset(quote_raw, is_quote=True)
+        if normalized_quote:
+            quotes.add(normalized_quote)
+
+    altname = entry.get("altname")
+    if isinstance(altname, str):
+        cleaned = altname.strip().upper()
+        if "/" in cleaned:
+            alt_base, alt_quote = cleaned.split("/", 1)
+            if alt_base:
+                bases.add(alt_base)
+                normalized = _normalize_asset(alt_base, is_quote=False)
+                if normalized:
+                    bases.add(normalized)
+            if alt_quote:
+                quotes.add(alt_quote)
+                normalized = _normalize_asset(alt_quote, is_quote=True)
+                if normalized:
+                    quotes.add(normalized)
+        else:
+            for candidate in list(quotes):
+                if candidate and cleaned.endswith(candidate) and len(cleaned) > len(candidate):
+                    alt_base = cleaned[: -len(candidate)]
+                    if alt_base:
+                        bases.add(alt_base)
+                        normalized = _normalize_asset(alt_base, is_quote=False)
+                        if normalized:
+                            bases.add(normalized)
+
+    aliases = set()
+    for base in bases:
+        for quote in quotes:
+            if not base or not quote:
+                continue
+            aliases.add(f"{base}-{quote}")
+            aliases.add(f"{base}/{quote}")
+            aliases.add(f"{base}{quote}")
+
+    return tuple(sorted({alias for alias in aliases if alias}))
 
 
 def _step_from_metadata(
@@ -236,17 +358,23 @@ def _step_from_metadata(
     return None
 
 
-def _parse_asset_pairs(payload: Mapping[str, Any]) -> Dict[str, Dict[str, float]]:
+
+def _parse_asset_pairs(payload: Mapping[str, Any]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str]]:
     if isinstance(payload.get("result"), Mapping):
         payload = payload["result"]  # type: ignore[assignment]
 
-    parsed: Dict[str, Dict[str, float]] = {}
+    parsed: Dict[str, Dict[str, Any]] = {}
+
+    aliases: Dict[str, str] = {}
     for entry in payload.values():
         if not isinstance(entry, Mapping):
             continue
-        instrument = _normalize_instrument(entry)
-        if not instrument:
+
+        native_pair = _normalize_instrument(entry)
+        if not native_pair:
+
             continue
+        native, base, quote = normalized
         tick = _step_from_metadata(
             entry,
             ("tick_size", "price_increment"),
@@ -259,8 +387,21 @@ def _parse_asset_pairs(payload: Mapping[str, Any]) -> Dict[str, Dict[str, float]
         )
         if tick is None or lot is None:
             continue
-        parsed[instrument] = {"tick": float(tick), "lot": float(lot)}
-    return parsed
+
+        key = _normalize_symbol(native_pair)
+        metadata = {
+            "tick": float(tick),
+            "lot": float(lot),
+            "native_pair": native_pair,
+        }
+        parsed[key] = metadata
+        aliases.setdefault(key, key)
+        for alias in _alias_candidates(entry, native_pair):
+            alias_key = _normalize_symbol(alias)
+            if alias_key and alias_key not in aliases:
+                aliases[alias_key] = key
+
+    return parsed, aliases
 
 
 precision_provider = PrecisionMetadataProvider()

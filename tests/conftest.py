@@ -422,20 +422,58 @@ if _class_validators is not None:
 
 
 def _precision_fixture_payload() -> Dict[str, Dict[str, str]]:
-    def _entry(base: str, tick: float, lot: float) -> Dict[str, str]:
-        return {
-            "wsname": f"{base}/USD",
-            "tick_size": str(tick),
-            "lot_step": str(lot),
-        }
 
     return {
-        "BTCUSD": _entry("BTC", 0.1, 0.0001),
-        "ETHUSD": _entry("ETH", 0.05, 0.001),
-        "SOLUSD": _entry("SOL", 0.01, 0.1),
-        "USDTUSD": _entry("USDT", 0.001, 1.0),
-        "ADAUSD": _entry("ADA", 0.0001, 0.1),
-        "TSTUSD": _entry("TST", 1e-08, 1e-08),
+        "XXBTZUSD": {
+            "wsname": "XBT/USD",
+            "base": "XXBT",
+            "quote": "ZUSD",
+            "tick_size": "0.1",
+            "lot_step": "0.0001",
+        },
+        "XXBTZEUR": {
+            "wsname": "XBT/EUR",
+            "base": "XXBT",
+            "quote": "ZEUR",
+            "tick_size": "0.5",
+            "lot_step": "0.0005",
+        },
+        "XETHZUSD": {
+            "wsname": "ETH/USD",
+            "base": "XETH",
+            "quote": "ZUSD",
+            "tick_size": "0.05",
+            "lot_step": "0.001",
+        },
+        "SOLUSD": {
+            "wsname": "SOL/USD",
+            "base": "SOL",
+            "quote": "ZUSD",
+            "tick_size": "0.01",
+            "lot_step": "0.1",
+        },
+        "USDTZUSD": {
+            "wsname": "USDT/USD",
+            "base": "USDT",
+            "quote": "ZUSD",
+            "tick_size": "0.001",
+            "lot_step": "1.0",
+        },
+        "ADAUSD": {
+            "wsname": "ADA/USD",
+            "base": "ADA",
+            "quote": "ZUSD",
+            "tick_size": "0.0001",
+            "lot_step": "0.1",
+        },
+        "TSTUSD": {
+            "wsname": "TST/USD",
+            "base": "TST",
+            "quote": "USD",
+            "tick_size": str(1e-08),
+            "lot_step": str(1e-08),
+        },
+
     }
 
 
@@ -447,17 +485,27 @@ def _seed_precision_cache(monkeypatch: pytest.MonkeyPatch):
         yield
         return
 
+    monkeypatch.setenv("MODEL_HEALTH_URL", "")
     payload = _precision_fixture_payload()
     provider = precision_module.PrecisionMetadataProvider(
         fetcher=lambda: payload,
         refresh_interval=0.0,
     )
-    asyncio.run(provider.refresh(force=True))
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(provider.refresh(force=True))
+    finally:
+        loop.close()
+
     monkeypatch.setattr(precision_module, "precision_provider", provider)
 
     policy_module = sys.modules.get("policy_service")
     if policy_module is not None:
         monkeypatch.setattr(policy_module, "precision_provider", provider, raising=False)
+        async def _always_healthy() -> bool:
+            return True
+        monkeypatch.setattr(policy_module, "_model_health_ok", _always_healthy, raising=False)
 
     position_sizer_module = sys.modules.get("services.risk.position_sizer")
     if position_sizer_module is not None:

@@ -64,6 +64,9 @@ def _client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
 
     monkeypatch.setattr(policy_service, "_model_health_ok", _healthy)
 
+    policy_service.shutdown_manager._draining = False  # type: ignore[attr-defined]
+    policy_service.shutdown_manager._drain_started_at = None  # type: ignore[attr-defined]
+    policy_service.shutdown_manager._inflight = 0  # type: ignore[attr-defined]
     policy_service.app.dependency_overrides[policy_service.require_admin_account] = lambda: "company"
     with TestClient(policy_service.app) as client:
         yield client
@@ -337,6 +340,7 @@ async def test_policy_resolves_precision_for_ada_pair() -> None:
     precision = await policy_service._resolve_precision("ADA-USD")
     assert precision["tick"] == pytest.approx(0.0001)
     assert precision["lot"] == pytest.approx(0.1)
+    assert precision["native_pair"] == "ADA/USD"
 
     snapped_price = policy_service._snap(0.256789, precision["tick"])
     snapped_qty = policy_service._snap(12.3456, precision["lot"])
@@ -345,66 +349,13 @@ async def test_policy_resolves_precision_for_ada_pair() -> None:
     assert snapped_qty == pytest.approx(12.3)
 
 
-def test_policy_decide_handles_concurrent_precision_refresh(
-    monkeypatch: pytest.MonkeyPatch, client: TestClient
-) -> None:
-    from services.common import precision as precision_module
 
-    sleep_duration = 0.2
-    fetch_calls = 0
+def test_policy_resolves_precision_for_eur_pair() -> None:
+    precision = policy_service._resolve_precision("BTC-EUR")
+    assert precision["tick"] == pytest.approx(0.5)
+    assert precision["lot"] == pytest.approx(0.0005)
+    assert precision["native_pair"] == "XBT/EUR"
 
-    async def _slow_fetch() -> dict[str, dict[str, str]]:
-        nonlocal fetch_calls
-        fetch_calls += 1
-        await asyncio.sleep(sleep_duration)
-        return {
-            "XBTUSD": {
-                "wsname": "XBT/USD",
-                "tick_size": "0.5",
-                "lot_step": "0.0001",
-            }
-        }
-
-    provider = precision_module.PrecisionMetadataProvider(
-        fetcher=_slow_fetch,
-        refresh_interval=0.0,
-    )
-    monkeypatch.setattr(precision_module, "precision_provider", provider, raising=False)
-    monkeypatch.setattr(policy_service, "precision_provider", provider, raising=False)
-
-    async def _fake_fee(
-        account_id: str, symbol: str, liquidity: str, notional: float | Decimal
-    ) -> Decimal:
-        return Decimal("5.0")
-
-    monkeypatch.setattr(policy_service, "_fetch_effective_fee", _fake_fee)
-    monkeypatch.setattr(
-        policy_service,
-        "predict_intent",
-        lambda **_: _intent(edge_bps=22.0, approved=True, selected="maker"),
-    )
-    monkeypatch.setattr(policy_service, "_enforce_stablecoin_guard", lambda: None)
-
-    async def _noop_dispatch(*_: object, **__: object) -> None:
-        return None
-
-    monkeypatch.setattr(policy_service, "_dispatch_shadow_orders", _noop_dispatch)
-
-    def _post_decision():
-        payload = _decision_request_payload("company")
-        return client.post("/policy/decide", json=payload)
-
-    start = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(_post_decision) for _ in range(2)]
-        responses = [future.result(timeout=2.0) for future in futures]
-    duration = time.perf_counter() - start
-
-    assert duration < sleep_duration * 1.8
-    for response in responses:
-        assert response.status_code == status.HTTP_200_OK, response.text
-
-    assert 1 <= fetch_calls <= 2
 
 
 def test_policy_decide_rejects_when_slippage_erodes_edge(

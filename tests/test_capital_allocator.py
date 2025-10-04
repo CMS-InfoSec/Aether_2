@@ -4,31 +4,130 @@ import sys
 from decimal import Decimal
 from pathlib import Path
 from datetime import datetime, timezone
+from typing import Any
 
 import pytest
 
 pytest.importorskip("services.common.security")
 pytest.importorskip("fastapi")
+pytest.importorskip("sqlalchemy")
 from fastapi.testclient import TestClient
-from sqlalchemy import text
+from sqlalchemy import create_engine as _sa_create_engine, text
+from sqlalchemy.engine import Engine
+from sqlalchemy.engine.url import make_url
+from sqlalchemy.pool import StaticPool
 
 from tests.helpers.authentication import override_admin_auth
 from tests.helpers.risk import risk_service_instance
 
 
+_REAL_CREATE_ENGINE = _sa_create_engine
+
+
+class _EngineProxy:
+    """Proxy that mimics a PostgreSQL engine for SQLite-backed tests."""
+
+    def __init__(self, inner: Engine) -> None:
+        self._inner = inner
+        self.url = make_url("postgresql+psycopg2://allocator:test@localhost/allocator")
+
+    def __getattr__(self, item: str) -> Any:
+        return getattr(self._inner, item)
+
+    def dispose(self) -> None:  # pragma: no cover - passthrough
+        self._inner.dispose()
+
+
 def _reload_allocator(monkeypatch: pytest.MonkeyPatch, db_url: str) -> object:
-    monkeypatch.setenv("CAPITAL_ALLOCATOR_DB_URL", db_url)
+    monkeypatch.setenv("CAPITAL_ALLOCATOR_DB_URL", "postgresql://allocator:test@localhost/allocator")
     monkeypatch.setenv("ALLOCATOR_DRAWDOWN_THRESHOLD", "0.8")
     monkeypatch.setenv("ALLOCATOR_MIN_THROTTLE_PCT", "0.05")
+    monkeypatch.delenv("CAPITAL_ALLOCATOR_SSLMODE", raising=False)
+
+    def _patched_create_engine(url: str, **kwargs: Any) -> _EngineProxy:  # type: ignore[override]
+        assert url.startswith("postgresql")
+        kwargs.pop("pool_size", None)
+        kwargs.pop("max_overflow", None)
+        kwargs.pop("pool_timeout", None)
+        kwargs.pop("pool_recycle", None)
+        connect_args = kwargs.pop("connect_args", {}) or {}
+        connect_args.pop("sslmode", None)
+        connect_args.pop("application_name", None)
+        inner = _REAL_CREATE_ENGINE(
+            db_url,
+            future=True,
+            connect_args={**connect_args, "check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        return _EngineProxy(inner)
+
+    monkeypatch.setattr("sqlalchemy.create_engine", _patched_create_engine, raising=False)
     sys.modules.pop("capital_allocator", None)
     module = importlib.import_module("capital_allocator")
+    monkeypatch.setattr(
+        module,
+        "run_allocator_migrations",
+        lambda: module.Base.metadata.create_all(bind=module.ENGINE),
+    )
+    module.run_allocator_migrations()
     return module
+
+
+def test_allocator_endpoints_require_auth(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db_url = "sqlite:///:memory:"
+    module = _reload_allocator(monkeypatch, db_url)
+
+    with TestClient(module.app) as client:
+        unauthorized_status = client.get("/allocator/status")
+        assert unauthorized_status.status_code == 401
+        assert unauthorized_status.json()["detail"] == "Missing Authorization header."
+
+        unauthorized_rebalance = client.post(
+            "/allocator/rebalance",
+            json={"allocations": {"company": 1.0}},
+        )
+        assert unauthorized_rebalance.status_code == 401
+        assert unauthorized_rebalance.json()["detail"] == "Missing Authorization header."
+
+    module.ENGINE.dispose()
+    sys.modules.pop("capital_allocator", None)
+
+
+def test_allocator_rejects_accounts_without_privileges(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db_url = "sqlite:///:memory:"
+    module = _reload_allocator(monkeypatch, db_url)
+    monkeypatch.setenv("CAPITAL_ALLOCATOR_ADMINS", "director-1")
+
+    with TestClient(module.app) as client:
+        with override_admin_auth(client.app, module.require_admin_account, "company") as headers:
+            denied_status = client.get("/allocator/status", headers=headers)
+            assert denied_status.status_code == 403
+            assert (
+                denied_status.json()["detail"]
+                == "Account is not authorized to manage capital allocations."
+            )
+
+            denied_rebalance = client.post(
+                "/allocator/rebalance",
+                json={"allocations": {"company": 1.0}},
+                headers=headers,
+            )
+            assert denied_rebalance.status_code == 403
+            assert (
+                denied_rebalance.json()["detail"]
+                == "Account is not authorized to manage capital allocations."
+            )
+
+    module.ENGINE.dispose()
+    sys.modules.pop("capital_allocator", None)
 
 
 def test_capital_allocator_rebalance_and_status(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     db_url = "sqlite:///:memory:"
     module = _reload_allocator(monkeypatch, db_url)
     engine = module.ENGINE
+
+    monkeypatch.setenv("CAPITAL_ALLOCATOR_ADMINS", "company,director-1,director-2")
 
     with engine.begin() as conn:
         conn.execute(
@@ -82,7 +181,12 @@ def test_capital_allocator_rebalance_and_status(tmp_path, monkeypatch: pytest.Mo
 
     with TestClient(module.app) as client:
         payload = {"allocations": {"company": 0.5, "director-1": 0.3, "director-2": 0.2}}
-        response = client.post("/allocator/rebalance", json=payload)
+        with override_admin_auth(client.app, module.require_admin_account, "company") as headers:
+            response = client.post(
+                "/allocator/rebalance",
+                json=payload,
+                headers=headers,
+            )
         assert response.status_code == 200
         body = response.json()
         assert Decimal(body["total_nav"]) == Decimal("1000000.00")
@@ -96,7 +200,8 @@ def test_capital_allocator_rebalance_and_status(tmp_path, monkeypatch: pytest.Mo
             result = session.execute(text("SELECT COUNT(*) FROM capital_allocations"))
             assert result.scalar() == 3
 
-        status = client.get("/allocator/status")
+        with override_admin_auth(client.app, module.require_admin_account, "company") as headers:
+            status = client.get("/allocator/status", headers=headers)
         assert status.status_code == 200
         status_body = status.json()
         status_accounts = {entry["account_id"]: entry for entry in status_body["accounts"]}
@@ -164,6 +269,8 @@ def test_allocator_handles_large_navs_precision(tmp_path, monkeypatch: pytest.Mo
             ],
         )
 
+    monkeypatch.setenv("CAPITAL_ALLOCATOR_ADMINS", "mega-1,mega-2,mega-3")
+
     with TestClient(module.app) as client:
         payload = {
             "allocations": {
@@ -172,7 +279,8 @@ def test_allocator_handles_large_navs_precision(tmp_path, monkeypatch: pytest.Mo
                 "mega-3": "0.333334",
             }
         }
-        response = client.post("/allocator/rebalance", json=payload)
+        with override_admin_auth(client.app, module.require_admin_account, "mega-1") as headers:
+            response = client.post("/allocator/rebalance", json=payload, headers=headers)
         assert response.status_code == 200
         body = response.json()
 
@@ -198,7 +306,8 @@ def test_allocator_handles_large_navs_precision(tmp_path, monkeypatch: pytest.Mo
         allocated_sum = sum(Decimal(entry["allocated_nav"]) for entry in body["accounts"])
         assert allocated_sum == total_nav
 
-        status = client.get("/allocator/status")
+        with override_admin_auth(client.app, module.require_admin_account, "mega-1") as headers:
+            status = client.get("/allocator/status", headers=headers)
         assert status.status_code == 200
         status_body = status.json()
         status_total_nav = Decimal(status_body["total_nav"])
@@ -247,7 +356,10 @@ def test_risk_engine_blocks_when_allocator_throttles(
         throttled=True,
     )
 
-    monkeypatch.setattr(module, "_query_allocator_state", lambda account_id: throttled_state)
+    async def _stub_allocator_state(account_id: str) -> module.AllocatorAccountState:
+        return throttled_state
+
+    monkeypatch.setattr(module, "_query_allocator_state", _stub_allocator_state)
 
     payload = {
         "account_id": "company",

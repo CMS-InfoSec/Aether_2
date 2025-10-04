@@ -48,11 +48,14 @@ from shared.sim_mode import (
 import websockets
 
 from metrics import (
+    TransportType,
+    bind_metric_context,
     get_request_id,
     increment_oms_auth_failures,
     increment_oms_child_orders_total,
     increment_oms_error_count,
     increment_oms_stale_feed,
+    metric_context,
     record_oms_latency,
     setup_metrics,
 )
@@ -800,7 +803,17 @@ class AccountContext:
             try:
                 await self.credentials.start()
             except CredentialLoadError as exc:
-                increment_oms_error_count(self.account_id, "credentials", "startup")
+                ctx = metric_context(
+                    account_id=self.account_id,
+                    symbol="credentials",
+                    transport=TransportType.INTERNAL,
+                )
+                increment_oms_error_count(
+                    self.account_id,
+                    "credentials",
+                    TransportType.INTERNAL.value,
+                    context=ctx,
+                )
                 logger.error(
                     "Failed to start account %s due to credential load error: %s",
                     self.account_id,
@@ -1511,11 +1524,16 @@ class AccountContext:
                             if last_update is not None
                             else None
                         )
+                        ctx = metric_context(
+                            account_id=self.account_id,
+                            symbol=request.symbol,
+                        )
                         increment_oms_stale_feed(
                             self.account_id,
                             request.symbol,
                             source="public_order_book",
                             action="rejected",
+                            context=ctx,
                         )
                         age_display = f"{age:.2f}s" if age is not None else "unknown"
                         logger.warning(
@@ -1545,11 +1563,16 @@ class AccountContext:
                 heartbeat_age = self.ws_client.heartbeat_age()
                 if heartbeat_age is not None and heartbeat_age > self._feed_sla_seconds:
                     force_rest = True
+                    ctx = metric_context(
+                        account_id=self.account_id,
+                        symbol=request.symbol,
+                    )
                     increment_oms_stale_feed(
                         self.account_id,
                         request.symbol,
                         source="private_stream",
                         action="rerouted",
+                        context=ctx,
                     )
                     logger.warning(
                         "Private stream heartbeat stale for account %s symbol %s (age=%.2fs > %.2fs); forcing REST submission",
@@ -1618,11 +1641,17 @@ class AccountContext:
             )
             aggregate_transport = self._aggregate_transport(transports_used)
 
+            order_ctx = metric_context(
+                account_id=self.account_id,
+                symbol=request.symbol,
+                transport=aggregate_transport,
+            )
             increment_oms_child_orders_total(
                 self.account_id,
                 request.symbol,
                 aggregate_transport,
                 count=len(child_quantities),
+                context=order_ctx,
             )
 
 
@@ -2021,6 +2050,11 @@ class AccountContext:
                 rest_after_ws_attempted = True
                 attempt_payload["clientOrderId"] = self._derive_retry_client_id(base_client_id)
             attempt_payload.setdefault("idempotencyKey", base_client_id)
+            attempt_ctx = metric_context(
+                account_id=self.account_id,
+                symbol=symbol,
+                transport=transport,
+            )
 
             start = time.perf_counter()
             try:
@@ -2032,7 +2066,12 @@ class AccountContext:
                     await self._throttle_rest("/private/AddOrder", urgent=urgent)
                     ack = await self.rest_client.add_order(attempt_payload)
             except (KrakenWSTimeout, KrakenWSError) as exc:
-                increment_oms_error_count(self.account_id, symbol, "websocket")
+                increment_oms_error_count(
+                    self.account_id,
+                    symbol,
+                    "websocket",
+                    context=attempt_ctx,
+                )
                 logger.warning(
                     "Websocket add_order failed for account %s (%s): %s",
                     self.account_id,
@@ -2048,7 +2087,12 @@ class AccountContext:
                 last_ws_error = exc
                 continue
             except KrakenRESTError as rest_exc:
-                increment_oms_error_count(self.account_id, symbol, "rest")
+                increment_oms_error_count(
+                    self.account_id,
+                    symbol,
+                    "rest",
+                    context=attempt_ctx,
+                )
                 logger.warning(
                     "REST add_order failed for account %s (%s): %s",
                     self.account_id,
@@ -2065,7 +2109,13 @@ class AccountContext:
 
             latency_ms = (time.perf_counter() - start) * 1000.0
             self.routing.record_latency(transport, latency_ms)
-            record_oms_latency(self.account_id, symbol, transport, latency_ms)
+            record_oms_latency(
+                self.account_id,
+                symbol,
+                transport,
+                latency_ms,
+                context=attempt_ctx,
+            )
             logger.info(
                 "Order latency account=%s symbol=%s transport=%s latency=%.2fms",
                 self.account_id,
@@ -2086,20 +2136,36 @@ class AccountContext:
             rest_payload = dict(base_payload)
             rest_payload["clientOrderId"] = self._derive_retry_client_id(base_client_id)
             rest_payload.setdefault("idempotencyKey", base_client_id)
+            retry_ctx = metric_context(
+                account_id=self.account_id,
+                symbol=symbol,
+                transport="rest",
+            )
             start = time.perf_counter()
             try:
                 urgent = self._is_urgent_order(rest_payload)
                 await self._throttle_rest("/private/AddOrder", urgent=urgent)
                 ack = await self.rest_client.add_order(rest_payload)
             except KrakenRESTError as rest_exc:
-                increment_oms_error_count(self.account_id, symbol, "rest")
+                increment_oms_error_count(
+                    self.account_id,
+                    symbol,
+                    "rest",
+                    context=retry_ctx,
+                )
                 raise HTTPException(
                     status_code=status.HTTP_502_BAD_GATEWAY,
                     detail=str(rest_exc),
                 ) from rest_exc
             latency_ms = (time.perf_counter() - start) * 1000.0
             self.routing.record_latency("rest", latency_ms)
-            record_oms_latency(self.account_id, symbol, "rest", latency_ms)
+            record_oms_latency(
+                self.account_id,
+                symbol,
+                "rest",
+                latency_ms,
+                context=retry_ctx,
+            )
             logger.info(
                 "Order latency account=%s symbol=%s transport=rest latency=%.2fms",
                 self.account_id,
@@ -2467,7 +2533,8 @@ async def place_order(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="limit_px required for limit orders")
 
     account = await manager.get_account(payload.account_id)
-    result = await account.place_order(payload)
+    with bind_metric_context(account_id=payload.account_id, symbol=payload.symbol):
+        result = await account.place_order(payload)
     return result
 
 
@@ -2481,7 +2548,8 @@ async def cancel_order(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account mismatch")
 
     account = await manager.get_account(payload.account_id)
-    result = await account.cancel_order(payload)
+    with bind_metric_context(account_id=payload.account_id):
+        result = await account.cancel_order(payload)
     return result
 
 
