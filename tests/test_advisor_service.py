@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib
 import os
 import sys
 from pathlib import Path
@@ -13,6 +12,7 @@ pytest.importorskip("fastapi", reason="FastAPI is required for advisor service t
 from fastapi.testclient import TestClient
 
 from auth.service import InMemorySessionStore
+from tests.helpers.advisor_service import bootstrap_advisor_service
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,8 +26,6 @@ def advisor_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[
 
     monkeypatch.syspath_prepend(str(ROOT))
     monkeypatch.setenv("PYTHONPATH", str(ROOT) + os.pathsep + os.environ.get("PYTHONPATH", ""))
-    monkeypatch.setenv("ADVISOR_DATABASE_URL", f"sqlite:///{tmp_path}/advisor.db")
-    monkeypatch.setenv("SESSION_REDIS_URL", "memory://advisor-tests")
 
     previous_modules = {
         "services.common.security": sys.modules.get("services.common.security"),
@@ -39,8 +37,8 @@ def advisor_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[
     for name in list(previous_modules):
         sys.modules.pop(name, None)
 
-    module = importlib.import_module("advisor_service")
-    security = importlib.import_module("services.common.security")
+    module = bootstrap_advisor_service(tmp_path, monkeypatch, reset=True)
+    security = sys.modules["services.common.security"]
 
     store = getattr(module, "SESSION_STORE", None)
     if not isinstance(store, InMemorySessionStore):
@@ -56,6 +54,7 @@ def advisor_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[
         finally:
             security.set_default_session_store(previous_store)
             client.app.dependency_overrides.clear()
+            module.ENGINE.dispose()
             for name, previous in previous_modules.items():
                 if previous is None:
                     sys.modules.pop(name, None)
