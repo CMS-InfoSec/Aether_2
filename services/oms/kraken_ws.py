@@ -17,6 +17,12 @@ from websockets import WebSocketClientProtocol
 from websockets.exceptions import WebSocketException
 
 
+if TYPE_CHECKING:
+    from services.oms.kraken_rest import KrakenRESTClient
+else:  # prevent runtime NameError when annotations are evaluated
+    KrakenRESTClient = Any
+
+
 from metrics import get_request_id
 from services.oms.rate_limit_guard import (
     RateLimitGuard,
@@ -123,7 +129,7 @@ class KrakenWSClient:
             Callable[..., Awaitable[_WebsocketTransport]]
         ] = None,
         stream_update_cb: Optional[Callable[[OrderState], Awaitable[None]]] = None,
-        rest_client: Optional["KrakenRESTClient"] = None,
+        rest_client: Optional[KrakenRESTClient] = None,
         request_timeout: float = 5.0,
         rate_limit_guard: Optional[RateLimitGuard] = None,
         account_id: Optional[str] = None,
@@ -159,7 +165,7 @@ class KrakenWSClient:
         )
         return _WebsocketTransport(protocol)
 
-    def set_rest_client(self, rest_client: "KrakenRESTClient") -> None:
+    def set_rest_client(self, rest_client: KrakenRESTClient) -> None:
         """Attach a REST client used for obtaining websocket tokens."""
 
         self._rest_client = rest_client
