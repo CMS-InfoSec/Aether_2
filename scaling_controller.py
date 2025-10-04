@@ -24,6 +24,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
 from metrics import observe_scaling_evaluation, record_scaling_state, traced_span
+from services.common.security import require_admin_account
 
 try:  # pragma: no cover - optional dependency in CI
     from kubernetes import client, config
@@ -673,7 +674,10 @@ router = APIRouter(prefix="/infra/scaling", tags=["infrastructure"])
 
 
 @router.get("/status", response_model=ScalingStatus)
-async def scaling_status(controller: ScalingController = Depends(get_scaling_controller)) -> ScalingStatus:
+async def scaling_status(
+    controller: ScalingController = Depends(get_scaling_controller),
+    caller: str = Depends(require_admin_account),
+) -> ScalingStatus:
     return controller.status
 
 
