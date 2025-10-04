@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import statistics
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Mapping, Sequence
@@ -37,9 +38,6 @@ DATA_STALENESS_GAUGE = Gauge(
     "Age of the market data powering signal service computations.",
     ["symbol", "feed"],
 )
-
-
-DEFAULT_ADAPTER = TimescaleMarketDataAdapter()
 
 
 # ---------------------------------------------------------------------------
@@ -351,10 +349,50 @@ class StressTestResponse(BaseModel):
 app = FastAPI(title="Advanced Signal Service", version="1.0.0")
 
 
+_PRIMARY_DSN_ENV = "SIGNAL_DATABASE_URL"
+_FALLBACK_DSN_ENV = "TIMESCALE_DSN"
+_PRIMARY_SCHEMA_ENV = "SIGNAL_SCHEMA"
+_FALLBACK_SCHEMA_ENV = "TIMESCALE_SCHEMA"
+
+
+def _resolve_market_data_dsn() -> str:
+    dsn = os.getenv(_PRIMARY_DSN_ENV) or os.getenv(_FALLBACK_DSN_ENV)
+    if not dsn:
+        raise RuntimeError(
+            "SIGNAL_DATABASE_URL or TIMESCALE_DSN must be configured with a PostgreSQL/Timescale DSN for the signal service."
+        )
+    return dsn
+
+
+def _resolve_market_data_schema() -> str | None:
+    return os.getenv(_PRIMARY_SCHEMA_ENV) or os.getenv(_FALLBACK_SCHEMA_ENV)
+
+
+@app.on_event("startup")
+def _configure_market_data_adapter() -> None:
+    dsn = _resolve_market_data_dsn()
+    schema = _resolve_market_data_schema()
+    app.state.market_data_adapter = TimescaleMarketDataAdapter(database_url=dsn, schema=schema)
+
+
+@app.on_event("shutdown")
+def _reset_market_data_adapter() -> None:
+    if hasattr(app.state, "market_data_adapter"):
+        adapter = getattr(app.state, "market_data_adapter", None)
+        if adapter is not None:
+            engine = getattr(adapter, "_engine", None)
+            if engine is not None:
+                try:
+                    engine.dispose()
+                except Exception:  # pragma: no cover - defensive cleanup
+                    logger.debug("Failed to dispose Timescale engine during shutdown", exc_info=True)
+        app.state.market_data_adapter = None
+
+
 def _market_data_adapter() -> MarketDataAdapter:
     adapter = getattr(app.state, "market_data_adapter", None)
     if adapter is None:
-        adapter = DEFAULT_ADAPTER
+        raise HTTPException(status_code=503, detail="Market data adapter is not configured")
     return adapter
 
 

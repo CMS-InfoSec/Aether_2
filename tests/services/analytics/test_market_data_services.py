@@ -44,8 +44,24 @@ _load_module("services", "services/__init__.py")
 _load_module("services.analytics", "services/analytics/__init__.py")
 _load_module("services.analytics.market_data_store", "services/analytics/market_data_store.py")
 
-signal_service = _load_module("services.analytics.signal_service", "services/analytics/signal_service.py")
 crossasset_service = _load_module("services.analytics.crossasset_service", "services/analytics/crossasset_service.py")
+
+
+from prometheus_client import REGISTRY
+
+
+def _reload_signal_service():
+    module_name = "services.analytics.signal_service"
+    existing = sys.modules.get(module_name)
+    if existing is not None:
+        gauge = getattr(existing, "DATA_STALENESS_GAUGE", None)
+        if gauge is not None:
+            try:
+                REGISTRY.unregister(gauge)
+            except KeyError:
+                pass
+    sys.modules.pop(module_name, None)
+    return _load_module(module_name, "services/analytics/signal_service.py")
 
 from services.analytics.market_data_store import TimescaleMarketDataAdapter
 
@@ -58,13 +74,10 @@ def fixture_payload() -> dict:
 
 
 @pytest.fixture()
-def market_data_engine(fixture_payload: dict):
-    engine = create_engine(
-        "sqlite://",
-        future=True,
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
+def market_data_dsn(tmp_path, fixture_payload: dict):
+    database_path = tmp_path / "signal-timescale.db"
+    dsn = f"sqlite:///{database_path}"
+    engine = create_engine(dsn, future=True)
     metadata = MetaData()
 
     orders = Table(
@@ -152,20 +165,42 @@ def market_data_engine(fixture_payload: dict):
                 ],
             )
 
-    return engine
+    yield dsn
+
+    engine.dispose()
 
 
 @pytest.fixture()
-def timescale_adapter(market_data_engine):
-    return TimescaleMarketDataAdapter(engine=market_data_engine)
+def timescale_adapter(market_data_dsn: str):
+    adapter = TimescaleMarketDataAdapter(database_url=market_data_dsn)
+    try:
+        yield adapter
+    finally:
+        engine = getattr(adapter, "_engine", None)
+        if engine is not None:
+            engine.dispose()
 
 
 @pytest.fixture()
-def signal_client(timescale_adapter: TimescaleMarketDataAdapter):
-    signal_service.app.state.market_data_adapter = timescale_adapter
-    client = TestClient(signal_service.app)
-    yield client
-    signal_service.app.state.market_data_adapter = None
+def signal_service_module(monkeypatch: pytest.MonkeyPatch, market_data_dsn: str):
+    monkeypatch.setenv("SIGNAL_DATABASE_URL", market_data_dsn)
+    module = _reload_signal_service()
+    yield module
+    module.app.dependency_overrides.clear()
+    module.app.state.market_data_adapter = None
+    gauge = getattr(module, "DATA_STALENESS_GAUGE", None)
+    if gauge is not None:
+        try:
+            REGISTRY.unregister(gauge)
+        except KeyError:
+            pass
+    sys.modules.pop("services.analytics.signal_service", None)
+
+
+@pytest.fixture()
+def signal_client(signal_service_module) -> TestClient:
+    with TestClient(signal_service_module.app) as client:
+        yield client
 
 
 @pytest.fixture()
@@ -264,6 +299,22 @@ def test_signal_stress_endpoint(signal_client: TestClient):
     payload = response.json()
     assert "flash_crash" in payload
     assert "spread_widening" in payload
+
+
+def test_signal_service_requires_dsn(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("SIGNAL_DATABASE_URL", raising=False)
+    monkeypatch.delenv("TIMESCALE_DSN", raising=False)
+    module = _reload_signal_service()
+    with pytest.raises(RuntimeError, match="SIGNAL_DATABASE_URL or TIMESCALE_DSN"):
+        with TestClient(module.app):
+            pass
+    gauge = getattr(module, "DATA_STALENESS_GAUGE", None)
+    if gauge is not None:
+        try:
+            REGISTRY.unregister(gauge)
+        except KeyError:
+            pass
+    sys.modules.pop("services.analytics.signal_service", None)
 
 
 def test_crossasset_lead_lag(crossasset_client: TestClient):
