@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib
+
 import pytest
 
 from services.common.precision import (
@@ -45,4 +47,12 @@ def test_precision_provider_missing_symbol_raises() -> None:
 
     with pytest.raises(PrecisionMetadataUnavailable):
         provider.require("UNKNOWN")
+
+
+def test_precision_module_import_and_instantiation() -> None:
+    module = importlib.import_module("services.common.precision")
+
+    provider = module.PrecisionMetadataProvider()
+
+    assert isinstance(provider, PrecisionMetadataProvider)
 
