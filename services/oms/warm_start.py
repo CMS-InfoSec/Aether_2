@@ -186,15 +186,6 @@ class KafkaFillReplayer:
 
         return offsets
 
-
-def _coerce_int(value: Any) -> Optional[int]:
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):  # pragma: no cover - defensive
-        return None
-
     @staticmethod
     def _deserialize(payload: bytes | str | Dict[str, Any] | None) -> Dict[str, Any] | None:
         if payload is None:
@@ -211,6 +202,15 @@ def _coerce_int(value: Any) -> Optional[int]:
                 return json.loads(payload)
             except Exception:  # pragma: no cover - defensive
                 return None
+        return None
+
+
+def _coerce_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
         return None
 
 

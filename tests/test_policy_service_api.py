@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
+import time
 import types
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 
 from typing import List
@@ -329,8 +332,9 @@ def test_policy_decide_preserves_tick_precision(
     assert body.effective_fee.taker == pytest.approx(2.3456)
 
 
-def test_policy_resolves_precision_for_ada_pair() -> None:
-    precision = policy_service._resolve_precision("ADA-USD")
+@pytest.mark.asyncio
+async def test_policy_resolves_precision_for_ada_pair() -> None:
+    precision = await policy_service._resolve_precision("ADA-USD")
     assert precision["tick"] == pytest.approx(0.0001)
     assert precision["lot"] == pytest.approx(0.1)
     assert precision["native_pair"] == "ADA/USD"
@@ -342,11 +346,13 @@ def test_policy_resolves_precision_for_ada_pair() -> None:
     assert snapped_qty == pytest.approx(12.3)
 
 
+
 def test_policy_resolves_precision_for_eur_pair() -> None:
     precision = policy_service._resolve_precision("BTC-EUR")
     assert precision["tick"] == pytest.approx(0.5)
     assert precision["lot"] == pytest.approx(0.0005)
     assert precision["native_pair"] == "XBT/EUR"
+
 
 
 def test_policy_decide_rejects_when_slippage_erodes_edge(

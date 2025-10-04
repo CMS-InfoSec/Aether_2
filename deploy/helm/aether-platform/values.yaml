@@ -149,6 +149,65 @@ backendServices:
     pdb:
       enabled: true
       maxUnavailable: 1
+  benchmark:
+    enabled: true
+    nameOverride: benchmark-service
+    image:
+      repository: ghcr.io/aether/benchmark-service
+      tag: latest
+    replicaCount: 2
+    containerPort: 8000
+    env:
+      - name: BENCHMARK_DATABASE_URL
+        valueFrom:
+          secretKeyRef:
+            name: benchmark-service-database
+            key: dsn
+      - name: BENCHMARK_DB_SSLMODE
+        valueFrom:
+          secretKeyRef:
+            name: benchmark-service-database
+            key: sslmode
+      - name: BENCHMARK_DB_POOL_SIZE
+        value: "15"
+      - name: BENCHMARK_DB_MAX_OVERFLOW
+        value: "5"
+      - name: BENCHMARK_DB_POOL_TIMEOUT
+        value: "30"
+      - name: BENCHMARK_DB_POOL_RECYCLE
+        value: "1800"
+    usesKrakenSecrets: false
+    extraVolumeMounts: []
+    extraVolumes: []
+    service:
+      port: 80
+      targetPort: http
+    ingress:
+      enabled: true
+      host: benchmark.aether.example.com
+      tlsSecret: benchmark-service-tls
+      annotations: {}
+    resources:
+      requests:
+        cpu: 150m
+        memory: 384Mi
+      limits:
+        cpu: 400m
+        memory: 768Mi
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 4
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 60
+    pdb:
+      enabled: true
+      maxUnavailable: 1
   fees:
     enabled: true
     nameOverride: fees-service
@@ -593,7 +652,18 @@ backendServices:
       tag: latest
     replicaCount: 2
     containerPort: 8000
-    env: []
+    env:
+      - name: UNIVERSE_DATABASE_URL
+        valueFrom:
+          secretKeyRef:
+            name: universe-service-database
+            key: dsn
+      - name: UNIVERSE_DB_SSLMODE
+        valueFrom:
+          secretKeyRef:
+            name: universe-service-database
+            key: sslmode
+            optional: true
     usesKrakenSecrets: true
     extraVolumeMounts: []
     extraVolumes: []

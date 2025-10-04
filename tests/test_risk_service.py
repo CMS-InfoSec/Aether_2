@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import sys
+import time
 from decimal import Decimal
 from pathlib import Path
 from typing import Iterator, Tuple
@@ -9,6 +11,7 @@ from typing import Iterator, Tuple
 if str(Path(__file__).resolve().parents[1]) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import httpx
 import pytest
 
 pytest.importorskip("services.common.security")
@@ -190,3 +193,94 @@ def test_limits_preserve_large_decimal_usage(risk_app: AccountClient) -> None:
             "var_99": None,
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_validate_risk_allocator_latency_does_not_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if importlib.util.find_spec("sqlalchemy") is None:
+        pytest.skip("sqlalchemy is required for risk service tests")
+
+    delay = 0.25
+    account_id = "company"
+    allocator_payload = {
+        "total_nav": 1_000_000.0,
+        "accounts": [
+            {
+                "account_id": account_id,
+                "allocation_pct": 0.4,
+                "allocated_nav": 400_000.0,
+                "drawdown_ratio": 0.1,
+                "throttled": False,
+            }
+        ],
+    }
+
+    class _AllocatorResponse:
+        def __init__(self, data: dict[str, object]) -> None:
+            self._data = data
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return self._data
+
+    class _SlowAllocatorClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self) -> "_SlowAllocatorClient":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        def get(self, _endpoint: str) -> _AllocatorResponse:
+            time.sleep(delay)
+            return _AllocatorResponse(allocator_payload)
+
+    class _SlowAllocatorAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self) -> "_SlowAllocatorAsyncClient":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def get(self, _endpoint: str) -> _AllocatorResponse:
+            await asyncio.sleep(delay)
+            return _AllocatorResponse(allocator_payload)
+
+    with risk_service_instance(tmp_path, monkeypatch) as module:
+        monkeypatch.setenv("CAPITAL_ALLOCATOR_URL", "http://allocator.internal")
+        monkeypatch.setattr(module.httpx, "Client", _SlowAllocatorClient)
+        monkeypatch.setattr(module.httpx, "AsyncClient", _SlowAllocatorAsyncClient)
+
+        app = module.app
+
+        with override_admin_auth(app, module.require_admin_account, account_id) as headers:
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as client:
+                payload = _request_payload(account_id, "BTC-USD")
+                requests = 3
+                start = time.perf_counter()
+                responses = await asyncio.gather(
+                    *(
+                        client.post(
+                            "/risk/validate",
+                            json=payload,
+                            headers={**headers, "X-Account-ID": account_id},
+                        )
+                        for _ in range(requests)
+                    )
+                )
+                elapsed = time.perf_counter() - start
+
+    assert all(response.status_code == 200 for response in responses)
+    assert elapsed < delay * 2

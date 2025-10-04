@@ -1075,7 +1075,7 @@ async def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
             normalized_instrument,
         )
 
-    allocator_state = _query_allocator_state(context.request.account_id)
+    allocator_state = await _query_allocator_state(context.request.account_id)
     if allocator_state:
         _apply_allocator_guard(
             allocator_state,
@@ -1938,15 +1938,15 @@ def set_stub_account_returns(account_id: str, pnl_history: List[float]) -> None:
 def set_stub_fills(records: List[Dict[str, object]]) -> None:
     _STUB_FILLS.clear()
     _STUB_FILLS.extend(records)
-def _query_allocator_state(account_id: str) -> Optional[AllocatorAccountState]:
+async def _query_allocator_state(account_id: str) -> Optional[AllocatorAccountState]:
     url = os.getenv("CAPITAL_ALLOCATOR_URL", _CAPITAL_ALLOCATOR_URL)
     if not url:
         return None
 
     endpoint = url.rstrip("/") + "/allocator/status"
     try:
-        with httpx.Client(timeout=_CAPITAL_ALLOCATOR_TIMEOUT) as client:
-            response = client.get(endpoint)
+        async with httpx.AsyncClient(timeout=_CAPITAL_ALLOCATOR_TIMEOUT) as client:
+            response = await client.get(endpoint)
             response.raise_for_status()
     except httpx.HTTPError as exc:
         logger.warning("Capital allocator query failed for account %s: %s", account_id, exc)

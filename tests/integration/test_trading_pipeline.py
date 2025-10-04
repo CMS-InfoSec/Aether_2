@@ -211,7 +211,7 @@ def test_trading_pipeline_emits_fill_event(
         ) -> None:
             if shadow:
                 return
-            precision = policy_module._resolve_precision(request.instrument)
+            precision = await policy_module._resolve_precision(request.instrument)
             snapped_price = policy_module._snap(request.price, precision["tick"])
             snapped_qty = policy_module._snap(request.quantity, precision["lot"])
             order_type = "limit" if response.selected_action.lower() == "maker" else "market"

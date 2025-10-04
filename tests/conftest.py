@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import os
 import sys
@@ -421,6 +422,7 @@ if _class_validators is not None:
 
 
 def _precision_fixture_payload() -> Dict[str, Dict[str, str]]:
+
     return {
         "XXBTZUSD": {
             "wsname": "XBT/USD",
@@ -471,6 +473,7 @@ def _precision_fixture_payload() -> Dict[str, Dict[str, str]]:
             "tick_size": str(1e-08),
             "lot_step": str(1e-08),
         },
+
     }
 
 
@@ -487,7 +490,7 @@ def _seed_precision_cache(monkeypatch: pytest.MonkeyPatch):
         fetcher=lambda: payload,
         refresh_interval=0.0,
     )
-    provider.refresh(force=True)
+    asyncio.run(provider.refresh(force=True))
     monkeypatch.setattr(precision_module, "precision_provider", provider)
 
     policy_module = sys.modules.get("policy_service")

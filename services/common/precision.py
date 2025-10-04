@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
 import threading
 import time
 from decimal import Decimal, InvalidOperation
+
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
+
 
 import httpx
 
@@ -24,17 +28,43 @@ class PrecisionMetadataProvider:
     def __init__(
         self,
         *,
-        fetcher: Callable[[], Mapping[str, Any]] | None = None,
+        fetcher: Callable[[], Mapping[str, Any]]
+        | Callable[[], Awaitable[Mapping[str, Any]]]
+        | None = None,
         refresh_interval: float = 300.0,
         timeout: float = 2.5,
         time_source: Callable[[], float] = time.monotonic,
     ) -> None:
-        self._fetcher = fetcher or self._default_fetcher
+        raw_fetcher = fetcher or self._default_fetcher
+        self._fetcher: Callable[[], Awaitable[Mapping[str, Any]]]
+        if inspect.iscoroutinefunction(raw_fetcher):
+
+            async def _async_fetcher() -> Mapping[str, Any]:
+                result = raw_fetcher()
+                if inspect.isawaitable(result):
+                    return await result
+                return result
+
+            self._fetcher = _async_fetcher
+        else:
+
+            def _call_fetcher() -> Mapping[str, Any] | Awaitable[Mapping[str, Any]]:
+                return raw_fetcher()
+
+            async def _threaded_fetcher() -> Mapping[str, Any]:
+                result = await asyncio.to_thread(_call_fetcher)
+                if inspect.isawaitable(result):
+                    return await result
+                return result
+
+            self._fetcher = _threaded_fetcher
         self._refresh_interval = max(float(refresh_interval), 0.0)
         self._timeout = max(float(timeout), 0.0)
         self._time_source = time_source
         self._lock = threading.Lock()
+
         self._cache: Dict[str, Dict[str, Any]] = {}
+
         self._aliases: Dict[str, str] = {}
         self._last_refresh: float = 0.0
 
@@ -44,15 +74,14 @@ class PrecisionMetadataProvider:
     def get(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Return precision metadata for ``symbol`` if available."""
 
-        normalized = _normalize_symbol(symbol)
-        if not normalized:
-            return None
         self._maybe_refresh()
         with self._lock:
+
             key = self._aliases.get(normalized, normalized)
             entry = self._cache.get(key)
             if entry is None and normalized in self._cache:
                 entry = self._cache.get(normalized)
+
             return dict(entry) if entry else None
 
     def require(self, symbol: str) -> Dict[str, Any]:
@@ -63,13 +92,43 @@ class PrecisionMetadataProvider:
             raise PrecisionMetadataUnavailable(f"Precision metadata unavailable for {symbol}")
         return metadata
 
+
+    def resolve_native(self, symbol: str) -> Optional[str]:
+        """Resolve a client-facing symbol to the cached native pair identifier."""
+
+        self._maybe_refresh()
+        with self._lock:
+            return self._resolve_native_locked(symbol)
+
+    def get_native(self, native_symbol: str) -> Optional[Dict[str, float]]:
+        """Return precision metadata for a native Kraken pair identifier."""
+
+        key = (native_symbol or "").strip().upper()
+        if not key:
+            return None
+        self._maybe_refresh()
+        with self._lock:
+            entry = self._cache.get(key)
+        return dict(entry) if entry else None
+
+    def require_native(self, native_symbol: str) -> Dict[str, float]:
+        """Return precision metadata for a native Kraken pair identifier or raise."""
+
+        metadata = self.get_native(native_symbol)
+        if metadata is None:
+            raise PrecisionMetadataUnavailable(
+                f"Precision metadata unavailable for native pair {native_symbol}"
+            )
+        return metadata
+
     def refresh(self, *, force: bool = False) -> None:
+
         """Force a metadata refresh regardless of cache age if requested."""
 
         if not force and not self._needs_refresh():
             return
         try:
-            payload = self._fetcher()
+            payload = await self._fetcher()
         except Exception as exc:  # pragma: no cover - defensive logging
             logger.warning("Failed to fetch Kraken precision metadata: %s", exc)
             return
@@ -95,12 +154,47 @@ class PrecisionMetadataProvider:
 
     def _maybe_refresh(self) -> None:
         if self._needs_refresh():
-            self.refresh(force=True)
+            self._refresh_sync(force=True)
+
+    def _refresh_sync(self, *, force: bool) -> None:
+        try:
+            asyncio.run(self.refresh(force=force))
+        except RuntimeError as exc:  # pragma: no cover - defensive guard
+            if "asyncio.run()" in str(exc):
+                raise RuntimeError(
+                    "PrecisionMetadataProvider.refresh() cannot be called from an "
+                    "active event loop; await refresh() or call within asyncio.to_thread()."
+                ) from exc
+            raise
+
+    def refresh_sync(self, *, force: bool = False) -> None:
+        """Synchronously refresh metadata for callers without an event loop."""
+
+        self._refresh_sync(force=force)
+
+
+    def _resolve_native_locked(self, symbol: str) -> Optional[str]:
+        normalized = _normalize_symbol(symbol)
+        if not normalized:
+            return None
+        native = self._aliases.get(normalized)
+        if native:
+            return native
+
+        direct = (symbol or "").strip().upper()
+        if direct and direct in self._cache:
+            return direct
+
+        fallback = normalized.replace("-", "/")
+        if fallback in self._cache:
+            return fallback
+        return None
 
     def _default_fetcher(self) -> Mapping[str, Any]:
+
         url = "https://api.kraken.com/0/public/AssetPairs"
-        with httpx.Client(timeout=self._timeout) as client:
-            response = client.get(url)
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            response = await client.get(url)
             response.raise_for_status()
             payload = response.json()
         if isinstance(payload, Mapping):
@@ -162,6 +256,7 @@ def _normalize_asset(symbol: str, *, is_quote: bool) -> str:
     return aliases.get(trimmed, trimmed)
 
 
+
 def _sanitize_pair(value: str, entry: Mapping[str, Any]) -> str:
     token = (value or "").strip().upper()
     if not token:
@@ -210,6 +305,7 @@ def _normalize_instrument(entry: Mapping[str, Any]) -> str:
     if base and quote:
         return f"{base}/{quote}"
     return ""
+
 
 
 def _alias_candidates(entry: Mapping[str, Any], native_pair: str) -> Tuple[str, ...]:
@@ -299,18 +395,23 @@ def _step_from_metadata(
     return None
 
 
+
 def _parse_asset_pairs(payload: Mapping[str, Any]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str]]:
     if isinstance(payload.get("result"), Mapping):
         payload = payload["result"]  # type: ignore[assignment]
 
     parsed: Dict[str, Dict[str, Any]] = {}
+
     aliases: Dict[str, str] = {}
     for entry in payload.values():
         if not isinstance(entry, Mapping):
             continue
+
         native_pair = _normalize_instrument(entry)
         if not native_pair:
+
             continue
+        native, base, quote = normalized
         tick = _step_from_metadata(
             entry,
             ("tick_size", "price_increment"),
@@ -323,6 +424,7 @@ def _parse_asset_pairs(payload: Mapping[str, Any]) -> Tuple[Dict[str, Dict[str, 
         )
         if tick is None or lot is None:
             continue
+
         key = _normalize_symbol(native_pair)
         metadata = {
             "tick": float(tick),
@@ -335,6 +437,7 @@ def _parse_asset_pairs(payload: Mapping[str, Any]) -> Tuple[Dict[str, Dict[str, 
             alias_key = _normalize_symbol(alias)
             if alias_key and alias_key not in aliases:
                 aliases[alias_key] = key
+
     return parsed, aliases
 
 

@@ -8,24 +8,95 @@ changes are captured in the audit log for traceability.
 
 from __future__ import annotations
 
+import logging
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Iterator, List, Optional, Sequence
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, Optional, Sequence
 from uuid import UUID, uuid4
 
+from alembic import command
+from alembic.config import Config
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import Boolean, Column, DateTime, Float, String, create_engine, func, select
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PGUUID
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Engine, URL
+from sqlalchemy.engine.url import make_url
+from sqlalchemy.exc import ArgumentError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 from services.common.security import require_admin_account
 
-DATABASE_URL = os.getenv(
-    "TIMESCALE_DATABASE_URI",
-    os.getenv("DATABASE_URL", "postgresql+psycopg2://timescale:password@localhost:5432/aether"),
-)
+LOGGER = logging.getLogger(__name__)
+
+
+def _normalize_database_url(url: str) -> str:
+    """Ensure SQLAlchemy uses the psycopg2 dialect when possible."""
+
+    if url.startswith("postgresql+psycopg://"):
+        return "postgresql+psycopg2://" + url[len("postgresql+psycopg://") :]
+    if url.startswith("postgresql://"):
+        return "postgresql+psycopg2://" + url[len("postgresql://") :]
+    if url.startswith("postgres://"):
+        return "postgresql+psycopg2://" + url[len("postgres://") :]
+    return url
+
+
+def _require_database_url() -> URL:
+    """Return the configured Timescale/PostgreSQL DSN for the universe service."""
+
+    primary = os.getenv("UNIVERSE_DATABASE_URL")
+    fallback = os.getenv("TIMESCALE_DATABASE_URI")
+    legacy = os.getenv("DATABASE_URL")
+    raw_url = primary or fallback or legacy
+
+    if not raw_url:
+        raise RuntimeError(
+            "UNIVERSE_DATABASE_URL (or legacy DATABASE_URL/TIMESCALE_DATABASE_URI) must point to a managed Timescale/PostgreSQL DSN."
+        )
+
+    normalised = _normalize_database_url(raw_url)
+
+    try:
+        url = make_url(normalised)
+    except ArgumentError as exc:  # pragma: no cover - configuration error
+        raise RuntimeError(f"Invalid universe database URL '{raw_url}': {exc}") from exc
+
+    if not url.drivername.lower().startswith("postgresql"):
+        raise RuntimeError(
+            "Universe service requires a PostgreSQL/TimescaleDSN; "
+            f"received driver '{url.drivername}'."
+        )
+
+    return url
+
+
+def _engine_options(url: URL) -> dict[str, Any]:
+    options: dict[str, Any] = {
+        "future": True,
+        "pool_pre_ping": True,
+        "pool_size": int(os.getenv("UNIVERSE_DB_POOL_SIZE", "15")),
+        "max_overflow": int(os.getenv("UNIVERSE_DB_MAX_OVERFLOW", "10")),
+        "pool_timeout": int(os.getenv("UNIVERSE_DB_POOL_TIMEOUT", "30")),
+        "pool_recycle": int(os.getenv("UNIVERSE_DB_POOL_RECYCLE", "1800")),
+    }
+
+    connect_args: dict[str, Any] = {}
+
+    forced_sslmode = os.getenv("UNIVERSE_DB_SSLMODE")
+    if forced_sslmode:
+        connect_args["sslmode"] = forced_sslmode
+    elif "sslmode" not in url.query and url.host not in {None, "localhost", "127.0.0.1"}:
+        connect_args["sslmode"] = "require"
+
+    if connect_args:
+        options["connect_args"] = connect_args
+
+    return options
+
+
+DATABASE_URL: URL = _require_database_url()
 
 
 Base = declarative_base()
@@ -83,25 +154,29 @@ class AuditLog(Base):
     attributes = Column("metadata", JSONB, default=dict)
 
 
-def _normalize_database_url(url: str) -> str:
-    """Ensure PostgreSQL URLs use the psycopg2 dialect."""
-
-    if url.startswith("postgresql+psycopg://"):
-        return "postgresql+psycopg2://" + url[len("postgresql+psycopg://") :]
-    if url.startswith("postgresql://"):
-        return "postgresql+psycopg2://" + url[len("postgresql://") :]
-    if url.startswith("postgres://"):
-        return "postgresql+psycopg2://" + url[len("postgres://") :]
-    return url
-
-
 def _create_engine() -> Engine:
-    database_url = _normalize_database_url(DATABASE_URL)
-    return create_engine(database_url, future=True)
+    return create_engine(
+        DATABASE_URL.render_as_string(hide_password=False),
+        **_engine_options(DATABASE_URL),
+    )
 
 
 ENGINE = _create_engine()
 SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
+
+_MIGRATIONS_PATH = Path(__file__).resolve().parents[2] / "data" / "migrations"
+
+
+def run_migrations() -> None:
+    """Apply outstanding database migrations for the universe service."""
+
+    config = Config()
+    config.set_main_option("script_location", str(_MIGRATIONS_PATH))
+    config.set_main_option("sqlalchemy.url", DATABASE_URL.render_as_string(hide_password=False))
+    config.attributes["configure_logger"] = False
+
+    LOGGER.info("Applying universe service migrations")
+    command.upgrade(config, "head")
 
 
 def get_session() -> Iterator[Session]:
@@ -113,6 +188,12 @@ def get_session() -> Iterator[Session]:
 
 
 app = FastAPI(title="Universe Selection Service")
+app.state.db_sessionmaker = SessionLocal
+
+
+@app.on_event("startup")
+def _on_startup() -> None:
+    run_migrations()
 
 
 class UniverseResponse(BaseModel):
@@ -239,6 +320,8 @@ def _normalize_market(market: str) -> Optional[str]:
             break
 
     if not base_token or not quote_token:
+        if "/" in token or "-" in token:
+            return None
         base = _normalize_asset_symbol(compact, is_quote=False)
         return f"{base}-USD" if base else None
 
@@ -421,5 +504,6 @@ __all__ = [
     "app",
     "approved_universe",
     "override_symbol",
+    "run_migrations",
 ]
 

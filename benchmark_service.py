@@ -15,7 +15,8 @@ from sqlalchemy import Column, DateTime, Float, String, create_engine, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
-from sqlalchemy.pool import StaticPool
+
+from services.common.security import require_admin_account
 
 LOGGER = logging.getLogger(__name__)
 
@@ -103,24 +104,64 @@ class BenchmarkCurveRepository:
         return float(result) if result is not None else None
 
 
+_DATABASE_ENV_VARS: tuple[str, ...] = (
+    "BENCHMARK_DATABASE_URL",
+    "TIMESCALE_DSN",
+    "DATABASE_URL",
+)
+_SSL_MODE_ENV = "BENCHMARK_DB_SSLMODE"
+_POOL_SIZE_ENV = "BENCHMARK_DB_POOL_SIZE"
+_MAX_OVERFLOW_ENV = "BENCHMARK_DB_MAX_OVERFLOW"
+_POOL_TIMEOUT_ENV = "BENCHMARK_DB_POOL_TIMEOUT"
+_POOL_RECYCLE_ENV = "BENCHMARK_DB_POOL_RECYCLE"
+
+
 def _database_url() -> str:
-    url = (
-        os.getenv("BENCHMARK_DATABASE_URL")
-        or os.getenv("TIMESCALE_DSN")
-        or os.getenv("DATABASE_URL")
-        or "sqlite:///./benchmark.db"
-    )
-    if url.startswith("postgresql://"):
-        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
+    """Return the configured PostgreSQL/Timescale connection string."""
+
+    raw_url = next((os.getenv(name) for name in _DATABASE_ENV_VARS if os.getenv(name)), None)
+    if not raw_url:
+        raise RuntimeError(
+            "BENCHMARK_DATABASE_URL (or TIMESCALE_DSN/DATABASE_URL) must be set to a "
+            "PostgreSQL/Timescale DSN"
+        )
+
+    url = raw_url.strip()
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url.split("://", 1)[1]
+
+    normalized = url.lower()
+    if normalized.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+psycopg://", 1)
+        normalized = url.lower()
+
+    allowed_prefixes = ("postgresql+psycopg://", "postgresql+psycopg2://")
+    if not normalized.startswith(allowed_prefixes):
+        raise RuntimeError(
+            "Benchmark service requires a PostgreSQL/Timescale DSN via BENCHMARK_DATABASE_URL "
+            "(or TIMESCALE_DSN/DATABASE_URL)."
+        )
+
     return url
 
 
 def _engine_options(url: str) -> Mapping[str, object]:
-    options: dict[str, object] = {"future": True}
-    if url.startswith("sqlite://"):
-        options.setdefault("connect_args", {"check_same_thread": False})
-        if url.endswith(":memory:"):
-            options["poolclass"] = StaticPool
+    options: dict[str, object] = {
+        "future": True,
+        "pool_pre_ping": True,
+    }
+
+    connect_args: dict[str, object] = {}
+    if url.startswith("postgresql"):
+        connect_args["sslmode"] = os.getenv(_SSL_MODE_ENV, "require")
+        options.update(
+            connect_args=connect_args,
+            pool_size=int(os.getenv(_POOL_SIZE_ENV, "10")),
+            max_overflow=int(os.getenv(_MAX_OVERFLOW_ENV, "5")),
+            pool_timeout=int(os.getenv(_POOL_TIMEOUT_ENV, "30")),
+            pool_recycle=int(os.getenv(_POOL_RECYCLE_ENV, "1800")),
+        )
+
     return options
 
 
@@ -129,6 +170,7 @@ ENGINE: Engine = create_engine(DATABASE_URL, **_engine_options(DATABASE_URL))
 SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
 
 app = FastAPI(title="Benchmark Service", version="1.0.0")
+app.state.db_sessionmaker = SessionLocal
 
 
 @app.on_event("startup")
@@ -286,4 +328,3 @@ def compare_benchmarks(
         basket_return=basket,
         excess_return=excess,
     )
-from services.common.security import require_admin_account

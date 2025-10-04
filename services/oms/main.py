@@ -128,18 +128,30 @@ SHUTDOWN_TIMEOUT = float(
     os.getenv("OMS_SHUTDOWN_TIMEOUT", os.getenv("SERVICE_SHUTDOWN_TIMEOUT", "60.0"))
 )
 
-app = FastAPI(title="OMS Service")
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    try:
+        session_store = _build_session_store_from_env()
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "OMS Service failed to configure the session store during startup"
+        ) from exc
+
+    app.state.session_store = session_store
+
+    auth_service = _attach_auth_service(session_store)
+    if auth_service is None:
+        security.set_default_session_store(session_store)
+
+    yield
+
+
+app = FastAPI(title="OMS Service", lifespan=_lifespan)
 setup_metrics(app)
 
 
 logger = logging.getLogger(__name__)
-
-SESSION_STORE = _build_session_store_from_env()
-app.state.session_store = SESSION_STORE
-
-_AUTH_SERVICE = _attach_auth_service(SESSION_STORE)
-if _AUTH_SERVICE is None:
-    security.set_default_session_store(SESSION_STORE)
 
 
 @app.exception_handler(RequestValidationError)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 
+import asyncio
 import logging
 import math
 import os
@@ -311,11 +312,16 @@ def _reset_regime_state() -> None:
 
 
 
+
 def _resolve_precision(symbol: str) -> Dict[str, float | str]:
     try:
         metadata = precision_provider.require(symbol)
+
     except PrecisionMetadataUnavailable as exc:
-        logger.error("Precision metadata unavailable for instrument %s", symbol)
+        logger.error(
+            "Precision metadata unavailable for native instrument %s", native,
+            extra={"requested_symbol": symbol},
+        )
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Precision metadata unavailable",
@@ -663,7 +669,7 @@ async def decide_policy(
         request.order_id,
         request_account,
     )
-    precision = _resolve_precision(request.instrument)
+    precision = await _resolve_precision(request.instrument)
     snapped_price = _snap(request.price, precision["tick"])
     snapped_qty = _snap(request.quantity, precision["lot"])
 
@@ -968,7 +974,7 @@ async def _submit_execution(
 ) -> None:
     """Submit the execution payload to the configured OMS endpoint."""
 
-    precision = _resolve_precision(request.instrument)
+    precision = await _resolve_precision(request.instrument)
     snapped_price = _snap(request.price, precision["tick"])
     snapped_qty = _snap(request.quantity, precision["lot"])
 
