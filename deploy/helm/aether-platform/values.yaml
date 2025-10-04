@@ -27,6 +27,12 @@ global:
     readOnlyRootFilesystem: true
   sessionStore:
     redisUrl: redis://redis.aether.svc.cluster.local:6379/0
+  releaseManifest:
+    enabled: true
+    databaseSecretName: release-manifest-database
+    databaseSecretKey: dsn
+    sslmode: require
+    appName: release-manifest
   probes:
     liveness:
       httpGet:
