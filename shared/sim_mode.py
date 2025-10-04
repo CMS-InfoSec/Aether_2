@@ -25,6 +25,7 @@ from typing import Dict, Iterator, Optional, Tuple
 
 from sqlalchemy import Boolean, Column, DateTime, Integer, Numeric, String, Text, create_engine, select, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.engine.url import make_url
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from common.schemas.contracts import FillEvent
@@ -41,15 +42,52 @@ def _utcnow() -> datetime:
 def _database_url() -> str:
     candidates = [os.getenv("SIM_MODE_DATABASE_URL"), os.getenv("DATABASE_URL")]
     for candidate in candidates:
-        if candidate:
-            return candidate
-    return "sqlite:///./sim_mode.db"
+        if not candidate:
+            continue
+        normalized = candidate
+        if normalized.startswith("postgres://"):
+            normalized = "postgresql://" + normalized.split("://", 1)[1]
+        try:
+            url_obj = make_url(normalized)
+        except Exception as exc:  # pragma: no cover - defensive validation
+            raise RuntimeError("Invalid simulation mode database URL") from exc
+
+        driver = url_obj.drivername.lower()
+        if driver.startswith("postgresql") or driver.startswith("timescale"):
+            return str(url_obj)
+        raise RuntimeError(
+            "Simulation mode requires a PostgreSQL/TimescaleDB DSN; "
+            f"received driver '{url_obj.drivername}'."
+        )
+    raise RuntimeError(
+        "SIM_MODE_DATABASE_URL (or DATABASE_URL) must be set to a PostgreSQL/TimescaleDB DSN."
+    )
 
 
 def _engine() -> Engine:
     url = _database_url()
-    connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
-    return create_engine(url, future=True, pool_pre_ping=True, connect_args=connect_args)
+    url_obj = make_url(url)
+
+    engine_kwargs = {"future": True, "pool_pre_ping": True}
+    connect_args: Dict[str, object] = {}
+
+    driver = url_obj.drivername.lower()
+    if driver.startswith("postgresql") or "timescale" in driver:
+        if "sslmode" not in url_obj.query:
+            connect_args["sslmode"] = os.getenv("SIM_MODE_DB_SSLMODE", "require")
+        engine_kwargs.update(
+            pool_size=int(os.getenv("SIM_MODE_DB_POOL_SIZE", "10")),
+            max_overflow=int(os.getenv("SIM_MODE_DB_MAX_OVERFLOW", "10")),
+            pool_timeout=int(os.getenv("SIM_MODE_DB_POOL_TIMEOUT", "30")),
+            pool_recycle=int(os.getenv("SIM_MODE_DB_POOL_RECYCLE", "1800")),
+        )
+    else:  # pragma: no cover - only exercised in tests with alternative engines
+        connect_args["check_same_thread"] = False
+
+    if connect_args:
+        engine_kwargs["connect_args"] = connect_args
+
+    return create_engine(url, **engine_kwargs)
 
 
 ENGINE = _engine()

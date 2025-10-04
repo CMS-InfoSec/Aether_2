@@ -45,6 +45,16 @@ spec:
               value: /var/run/secrets/kraken/director-2/credentials.json
             - name: SESSION_REDIS_URL
               value: redis://redis:6379/0
+            - name: SIM_MODE_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: sim-mode-database
+                  key: dsn
+            - name: SIM_MODE_DB_SSLMODE
+              valueFrom:
+                secretKeyRef:
+                  name: sim-mode-database
+                  key: sslmode
           readinessProbe:
             httpGet:
               path: /metrics
