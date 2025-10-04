@@ -81,14 +81,12 @@ class PrecisionMetadataProvider:
         normalized = _normalize_symbol(symbol)
         if not normalized:
             return None
+
         await self._maybe_refresh()
 
         with self._lock:
-
             key = self._aliases.get(normalized, normalized)
             entry = self._cache.get(key)
-            if entry is None and normalized in self._cache:
-                entry = self._cache.get(normalized)
 
             return dict(entry) if entry else None
 
@@ -119,13 +117,14 @@ class PrecisionMetadataProvider:
                 logger.warning("Failed to fetch Kraken precision metadata: %s", exc)
                 return
 
-            parsed = _parse_asset_pairs(payload)
-            if not parsed:
+            cache, aliases = _parse_asset_pairs(payload)
+            if not cache:
                 logger.warning("Received empty Kraken precision metadata payload")
                 return
 
             with self._lock:
-                self._cache = parsed
+                self._cache = cache
+                self._aliases = aliases
                 self._last_refresh = self._time_source()
 
 
@@ -372,9 +371,7 @@ def _parse_asset_pairs(payload: Mapping[str, Any]) -> Tuple[Dict[str, Dict[str, 
 
         native_pair = _normalize_instrument(entry)
         if not native_pair:
-
             continue
-        native, base, quote = normalized
         tick = _step_from_metadata(
             entry,
             ("tick_size", "price_increment"),
