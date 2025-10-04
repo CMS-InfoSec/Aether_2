@@ -113,7 +113,6 @@ def test_audit_chain_across_services(tmp_path, monkeypatch, capsys):
     config_service = importlib.import_module("config_service")
     secrets_service = importlib.import_module("secrets_service")
 
-    config_service.reset_state()
     settings = secrets_service.load_settings()
     secrets_service.SETTINGS = settings
     secrets_service.CIPHER = secrets_service.SecretCipher(  # type: ignore[attr-defined]
@@ -131,6 +130,7 @@ def test_audit_chain_across_services(tmp_path, monkeypatch, capsys):
 
     config_service.app.dependency_overrides[config_service.require_admin_account] = lambda: "company"
     with TestClient(config_service.app) as config_client:
+        config_service.reset_state()
         response = config_client.post(
             "/config/update",
             params={"account_id": "global"},
