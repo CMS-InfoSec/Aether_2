@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import asyncio
-import pickle
+import json
+import math
 import time
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Protocol, Tuple
+
+from decimal import Decimal
 
 from services.common.config import get_redis_client
 
@@ -83,12 +86,81 @@ class RedisIdempotencyBackend:
         return f"{self._namespace}:{account_id}:{client_id}"
 
     @staticmethod
+    def _ensure_json_compatible(value: Any) -> Any:
+        if value is None or isinstance(value, (str, bool, int)):
+            return value
+        if isinstance(value, Decimal):
+            return str(value)
+        model_dump = getattr(value, "model_dump", None)
+        if callable(model_dump):
+            dumped = model_dump(mode="json")
+            return RedisIdempotencyBackend._ensure_json_compatible(dumped)
+        if hasattr(value, "__dict__") and not isinstance(value, type):
+            return RedisIdempotencyBackend._ensure_json_compatible(vars(value))
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                raise TypeError("Non-finite floats are not supported in idempotency payloads")
+            return value
+        if isinstance(value, (list, tuple)):
+            return [RedisIdempotencyBackend._ensure_json_compatible(item) for item in value]
+        if isinstance(value, dict):
+            safe_dict: dict[str, Any] = {}
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise TypeError("JSON object keys must be strings")
+                safe_dict[key] = RedisIdempotencyBackend._ensure_json_compatible(item)
+            return safe_dict
+        raise TypeError("Idempotency payload contains non JSON-serializable data")
+
+    @staticmethod
+    def _validate_json_payload(value: Any) -> None:
+        if value is None or isinstance(value, (str, bool, int)):
+            return
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                raise ValueError("Invalid non-finite float in idempotency payload")
+            return
+        if isinstance(value, list):
+            for item in value:
+                RedisIdempotencyBackend._validate_json_payload(item)
+            return
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise ValueError("Invalid non-string key in idempotency payload")
+                RedisIdempotencyBackend._validate_json_payload(item)
+            return
+        raise ValueError("Invalid idempotency payload type")
+
+    @staticmethod
     def _encode(state: str, payload: Any) -> bytes:
-        return pickle.dumps((state, time.time(), payload))
+        serializable_payload = RedisIdempotencyBackend._ensure_json_compatible(payload)
+        document = {
+            "state": state,
+            "timestamp": time.time(),
+            "payload": serializable_payload,
+        }
+        return json.dumps(document, separators=(",", ":"), sort_keys=True).encode("utf-8")
 
     @staticmethod
     def _decode(value: bytes) -> tuple[str, float, Any]:
-        state, timestamp, payload = pickle.loads(value)
+        try:
+            document = json.loads(value.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("Invalid idempotency payload encoding") from exc
+
+        if not isinstance(document, dict):
+            raise ValueError("Invalid idempotency payload structure")
+
+        state = document.get("state")
+        timestamp = document.get("timestamp")
+        payload = document.get("payload")
+
+        if not isinstance(state, str):
+            raise ValueError("Invalid idempotency state")
+        if not isinstance(timestamp, (int, float)):
+            raise ValueError("Invalid idempotency timestamp")
+        RedisIdempotencyBackend._validate_json_payload(payload)
         return state, float(timestamp), payload
 
     async def reserve(
@@ -111,7 +183,17 @@ class RedisIdempotencyBackend:
 
             payload = await self._redis.get(key)
             if payload:
-                state, _, data = self._decode(payload)
+                try:
+                    state, _, data = self._decode(payload)
+                except ValueError:
+                    future = loop.create_future()
+                    future.set_exception(RuntimeError("Invalid idempotency payload"))
+                    await self._redis.delete(key)
+                    async with self._lock:
+                        self._entries[key] = _LocalEntry(
+                            future=future, expiry=time.monotonic()
+                        )
+                    return future, False
                 future = loop.create_future()
                 if state == _STATE_RESULT:
                     future.set_result(data)
@@ -178,7 +260,18 @@ class RedisIdempotencyBackend:
                 payload = await self._redis.get(key)
                 if payload is None:
                     raise RuntimeError("Idempotency entry disappeared before completion")
-                state, _, data = self._decode(payload)
+                try:
+                    state, _, data = self._decode(payload)
+                except ValueError:
+                    await self._redis.delete(key)
+                    if not future.done():
+                        future.set_exception(RuntimeError("Invalid idempotency payload"))
+                    expiry = time.monotonic()
+                    async with self._lock:
+                        entry = self._entries.get(key)
+                        if entry and entry.future is future:
+                            entry.expiry = expiry
+                    break
                 if state == _STATE_PENDING:
                     await asyncio.sleep(self._poll_interval)
                     continue
