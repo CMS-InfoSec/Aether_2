@@ -341,6 +341,11 @@ def test_policy_resolves_precision_for_ada_pair() -> None:
     assert snapped_qty == pytest.approx(12.3)
 
 
+def test_policy_resolves_precision_for_usdt_pair() -> None:
+    precision = policy_service._resolve_precision("ETH-USDT")
+    assert precision["tick"] == pytest.approx(0.01)
+    assert precision["lot"] == pytest.approx(0.001)
+
 def test_policy_decide_rejects_when_slippage_erodes_edge(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
