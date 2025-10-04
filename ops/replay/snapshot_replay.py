@@ -17,8 +17,10 @@ if fastapi_spec is not None:
     fastapi_module = importlib.import_module("fastapi")
     FastAPI = fastapi_module.FastAPI
     HTTPException = fastapi_module.HTTPException
+    Depends = fastapi_module.Depends
 else:  # pragma: no cover - FastAPI optional dependency
     FastAPI = None  # type: ignore[assignment]
+    Depends = None  # type: ignore[assignment]
 
     class HTTPException(RuntimeError):  # type: ignore[no-redef]
         def __init__(self, status_code: int, detail: str) -> None:
@@ -28,6 +30,8 @@ else:  # pragma: no cover - FastAPI optional dependency
 
 from pydantic import BaseModel, Field
 
+from auth.service import InMemorySessionStore, RedisSessionStore, SessionStoreProtocol
+import services.common.security as security
 from services.common.schemas import (
     BookSnapshot,
     ConfidenceMetrics,
@@ -42,6 +46,7 @@ from services.common.schemas import (
     RiskValidationRequest,
     RiskValidationResponse,
 )
+from services.common.security import require_admin_account
 from services.policy.main import decide_policy
 from services.risk.engine import RiskEngine
 from services.oms.shadow_oms import shadow_oms
@@ -651,6 +656,45 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 if FastAPI is not None:  # pragma: no branch - simple module guard
     app = FastAPI(title="Snapshot Replay")
+    _SESSION_DSN_ENV_VARS = ("SESSION_REDIS_URL", "SESSION_STORE_URL", "SESSION_BACKEND_DSN")
+
+    def _resolve_session_store_dsn() -> str:
+        for env_var in _SESSION_DSN_ENV_VARS:
+            value = os.getenv(env_var)
+            if value:
+                return value
+        joined = ", ".join(_SESSION_DSN_ENV_VARS)
+        raise RuntimeError(
+            "Session store misconfigured: configure one of "
+            f"{joined} so the snapshot replay service can authenticate callers.",
+        )
+
+    def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
+        existing = getattr(application.state, "session_store", None)
+        if isinstance(existing, SessionStoreProtocol):
+            store = existing
+        else:
+            dsn = _resolve_session_store_dsn()
+            ttl_minutes = int(os.getenv("SESSION_TTL_MINUTES", "60"))
+            if dsn.startswith("memory://"):
+                store = InMemorySessionStore(ttl_minutes=ttl_minutes)
+            else:
+                try:  # pragma: no cover - optional dependency for production deployments
+                    import redis  # type: ignore[import-not-found]
+                except ImportError as exc:  # pragma: no cover - surfaced when redis missing locally
+                    raise RuntimeError(
+                        "redis package is required when configuring the snapshot replay session store via SESSION_REDIS_URL.",
+                    ) from exc
+
+                client = redis.Redis.from_url(dsn)
+                store = RedisSessionStore(client, ttl_minutes=ttl_minutes)
+
+            application.state.session_store = store
+
+        security.set_default_session_store(store)
+        return store
+
+    SESSION_STORE = _configure_session_store(app)
 
     class ReplayRunRequest(BaseModel):
         start: datetime = Field(..., alias="from")
@@ -665,11 +709,21 @@ if FastAPI is not None:  # pragma: no branch - simple module guard
         report_html: str
 
     @app.post("/replay/run", response_model=ReplayRunResponse)
-    def trigger_replay(request: ReplayRunRequest) -> ReplayRunResponse:
+    def trigger_replay(
+        request: ReplayRunRequest,
+        actor_account: str = Depends(require_admin_account),
+    ) -> ReplayRunResponse:
+        request_account = request.account_id.strip()
+        if request_account.lower() != actor_account.strip().lower():
+            raise HTTPException(
+                status_code=403,
+                detail="Account mismatch between authenticated session and replay request.",
+            )
+
         config = SnapshotReplayConfig(
             start=request.start,
             end=request.end,
-            account_id=request.account_id,
+            account_id=request_account,
             output_dir=request.output_dir or DEFAULT_OUTPUT_DIR,
             storage_path=request.storage_path or DEFAULT_STORAGE_PATH,
         )
