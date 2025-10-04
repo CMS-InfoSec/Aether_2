@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 
 import pytest
@@ -61,7 +62,7 @@ def test_position_sizer_halts_when_precision_missing(monkeypatch: pytest.MonkeyP
     from services.common import precision as precision_module
 
     provider = precision_module.PrecisionMetadataProvider(fetcher=lambda: {}, refresh_interval=0.0)
-    provider.refresh(force=True)
+    asyncio.run(provider.refresh(force=True))
 
     monkeypatch.setattr(precision_module, "precision_provider", provider)
     monkeypatch.setattr("services.risk.position_sizer.precision_provider", provider)
