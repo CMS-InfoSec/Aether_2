@@ -15,15 +15,20 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import statistics
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from threading import Lock
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query
+
+from auth.service import InMemorySessionStore, RedisSessionStore, SessionStoreProtocol
 
 from services.common.config import get_timescale_session
+from services.common import security
+from services.common.security import require_admin_account
 
 try:  # pragma: no cover - optional dependency during CI
     import psycopg
@@ -439,6 +444,7 @@ async def buy_sell_imbalance(
     *,
     symbol: str = Query(..., description="Market symbol to analyse"),
     window: int = Query(300, ge=1, le=3_600, description="Lookback window in seconds"),
+    _: str = Depends(require_admin_account),
 ) -> Dict[str, Any]:
     snapshot = await _service.snapshot(symbol, window)
     return {
@@ -454,6 +460,7 @@ async def queue_depth(
     *,
     symbol: str = Query(..., description="Market symbol to analyse"),
     window: int = Query(300, ge=1, le=3_600, description="Lookback window in seconds"),
+    _: str = Depends(require_admin_account),
 ) -> Dict[str, Any]:
     snapshot = await _service.snapshot(symbol, window)
     return {
@@ -470,6 +477,7 @@ async def liquidity_holes(
     *,
     symbol: str = Query(..., description="Market symbol to analyse"),
     window: int = Query(300, ge=1, le=3_600, description="Lookback window in seconds"),
+    _: str = Depends(require_admin_account),
 ) -> Dict[str, Any]:
     snapshot = await _service.snapshot(symbol, window)
     return {
@@ -480,7 +488,44 @@ async def liquidity_holes(
     }
 
 
+app = FastAPI(title="Orderflow Analytics Service", version="1.0.0")
+
+
+def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
+    existing = getattr(application.state, "session_store", None)
+    if isinstance(existing, SessionStoreProtocol):
+        store = existing
+    else:
+        redis_url = os.getenv("SESSION_REDIS_URL")
+        if not redis_url:
+            raise RuntimeError(
+                "SESSION_REDIS_URL is not configured. Provide a shared session store DSN to enable orderflow authentication.",
+            )
+
+        ttl_minutes = int(os.getenv("SESSION_TTL_MINUTES", "60"))
+        if redis_url.startswith("memory://"):
+            store = InMemorySessionStore(ttl_minutes=ttl_minutes)
+        else:
+            try:  # pragma: no cover - optional dependency import for production deployments
+                import redis  # type: ignore[import-not-found]
+            except ImportError as exc:  # pragma: no cover - surfaced when redis package missing at runtime
+                raise RuntimeError("redis package is required when SESSION_REDIS_URL is set") from exc
+
+            client = redis.Redis.from_url(redis_url)
+            store = RedisSessionStore(client, ttl_minutes=ttl_minutes)
+
+        application.state.session_store = store
+
+    security.set_default_session_store(store)
+    return store
+
+
+SESSION_STORE = _configure_session_store(app)
+app.include_router(router)
+
+
 __all__ = [
+    "app",
     "router",
     "OrderflowService",
     "OrderflowMetricsStore",
