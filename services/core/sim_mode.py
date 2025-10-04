@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime
 from typing import Optional
@@ -56,7 +57,7 @@ class SimModeTransitionResponse(SimModeStatusResponse):
 def _publish_event(status: SimModeStatus, actor: str) -> None:
     adapter = KafkaNATSAdapter(account_id="platform")
     event = SimModeEvent(active=status.active, reason=status.reason, ts=status.ts, actor=actor)
-    adapter.publish("platform.sim_mode", event.model_dump(mode="json"))
+    asyncio.run(adapter.publish("platform.sim_mode", event.model_dump(mode="json")))
 
 
 async def _sync_runtime_state(active: bool) -> None:

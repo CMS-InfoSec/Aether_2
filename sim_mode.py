@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
+import asyncio
 import logging
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Request, status
@@ -60,7 +61,7 @@ class SimModeTransitionResponse(SimModeStatusResponse):
 def _publish_event(status: SimModeStatus, actor: str) -> None:
     adapter = KafkaNATSAdapter(account_id="platform")
     event = SimModeEvent(active=status.active, reason=status.reason, ts=status.ts, actor=actor)
-    adapter.publish("platform.sim_mode", event.model_dump(mode="json"))
+    asyncio.run(adapter.publish("platform.sim_mode", event.model_dump(mode="json")))
 
 
 def _log_audit_transition(before: SimModeStatus, after: SimModeStatus, actor: str, request: Request) -> None:

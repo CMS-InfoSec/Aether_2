@@ -70,7 +70,7 @@ def _flush_oms_event_buffers() -> None:
     """Flush OMS event buffers (Kafka and activity logs)."""
 
     flush_logging_handlers("", __name__)
-    kafka_counts = KafkaNATSAdapter.flush_events()
+    kafka_counts = asyncio.run(KafkaNATSAdapter.flush_events())
     if kafka_counts:
         logger.info("Flushed Kafka/NATS buffers", extra={"event_counts": kafka_counts})
     activity_count = len(_OMS_ACTIVITY_LOG)
@@ -825,10 +825,10 @@ class KrakenSession:
                 context = self._contexts.get(resolved)
                 exchange_id = resolved
         if context:
-            self._maybe_publish_fill(exchange_id, context, state)
+            await self._maybe_publish_fill(exchange_id, context, state)
         oms_log(exchange_id, self.account_id, self._orders[exchange_id].status, updated_at)
 
-    def _maybe_publish_fill(self, exchange_id: str, context: OrderContext, state: OrderState) -> None:
+    async def _maybe_publish_fill(self, exchange_id: str, context: OrderContext, state: OrderState) -> None:
         filled_decimal = _coerce_optional_decimal(state.filled_qty)
         if filled_decimal is None:
             return
@@ -899,7 +899,7 @@ class KrakenSession:
             liquidity=liquidity,
             ts=datetime.now(timezone.utc),
         )
-        self._kafka.publish("fill-events", event.model_dump(mode="json"))
+        await self._kafka.publish("fill-events", event.model_dump(mode="json"))
 
 
 class OMSService:

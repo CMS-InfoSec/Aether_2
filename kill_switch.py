@@ -6,6 +6,8 @@ import logging
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+import asyncio
+
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 
@@ -74,16 +76,18 @@ def trigger_kill_switch(
     )
 
     kafka = KafkaNATSAdapter(account_id=normalized_account)
-    kafka.publish(
-        topic="risk.events",
-        payload={
-            "event": "KILL_SWITCH_TRIGGERED",
-            "account_id": normalized_account,
-            "actor": actor_account,
-            "timestamp": activation_ts.isoformat(),
-            "actions": ["CANCEL_OPEN_ORDERS", "FLATTEN_POSITIONS"],
-            "reason_code": reason_code.value,
-        },
+    asyncio.run(
+        kafka.publish(
+            topic="risk.events",
+            payload={
+                "event": "KILL_SWITCH_TRIGGERED",
+                "account_id": normalized_account,
+                "actor": actor_account,
+                "timestamp": activation_ts.isoformat(),
+                "actions": ["CANCEL_OPEN_ORDERS", "FLATTEN_POSITIONS"],
+                "reason_code": reason_code.value,
+            },
+        )
     )
 
     response_status = "ok"

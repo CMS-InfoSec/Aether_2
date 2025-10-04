@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 import time
@@ -114,7 +115,7 @@ def test_publish_delivers_to_all_transports(mock_broker_server: Tuple[_BrokerSta
     _configure_account(monkeypatch, account, base_url)
 
     adapter = KafkaNATSAdapter(account_id=account)
-    adapter.publish("events.trade", {"id": "abc123", "qty": 1})
+    asyncio.run(adapter.publish("events.trade", {"id": "abc123", "qty": 1}))
 
     assert state.topics, "Kafka endpoint did not receive any messages"
     assert state.subjects, "NATS endpoint did not receive any messages"
@@ -137,12 +138,12 @@ def test_flush_retries_failed_publishes(mock_broker_server: Tuple[_BrokerState, 
     state.topic_failures = 1
     state.subject_failures = 1
     with pytest.raises(PublishError):
-        adapter.publish("events.retry", {"attempt": 1})
+        asyncio.run(adapter.publish("events.retry", {"attempt": 1}))
 
     assert not state.topics
 
     state.topic_failures = 0
-    counts = KafkaNATSAdapter.flush_events()
+    counts = asyncio.run(KafkaNATSAdapter.flush_events())
     assert counts.get(account) == 1
     assert state.topics, "Expected buffered event to reach Kafka after flush"
 

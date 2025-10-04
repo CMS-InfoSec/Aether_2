@@ -737,19 +737,21 @@ class WatchdogCoordinator:
         outcome: DetectionOutcome,
     ) -> None:
         adapter = KafkaNATSAdapter(account_id=intent.account_id)
-        adapter.publish(
-            topic="override.queue",
-            payload={
-                "intent_id": intent.intent_id,
-                "account_id": intent.account_id,
-                "instrument": decision.instrument or intent.symbol,
-                "decision": "reject",
-                "reason": outcome.reason,
-                "score": outcome.score,
-                "details": outcome.details,
-                "recorded_at": _now().isoformat(),
-                "source": "watchdog",
-            },
+        asyncio.run(
+            adapter.publish(
+                topic="override.queue",
+                payload={
+                    "intent_id": intent.intent_id,
+                    "account_id": intent.account_id,
+                    "instrument": decision.instrument or intent.symbol,
+                    "decision": "reject",
+                    "reason": outcome.reason,
+                    "score": outcome.score,
+                    "details": outcome.details,
+                    "recorded_at": _now().isoformat(),
+                    "source": "watchdog",
+                },
+            )
         )
 
     def _cleanup_stale_entries(self) -> None:

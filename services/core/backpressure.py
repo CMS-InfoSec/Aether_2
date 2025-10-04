@@ -77,7 +77,7 @@ def _default_publisher(account_id: str, dropped_count: int, ts: datetime) -> Non
 
     adapter = KafkaNATSAdapter(account_id=account_id)
     event = BackpressureEvent(account_id=account_id, dropped_count=dropped_count, ts=ts)
-    adapter.publish(_BACKPRESSURE_TOPIC, event.to_payload())
+    asyncio.run(adapter.publish(_BACKPRESSURE_TOPIC, event.to_payload()))
 
 
 class BackpressureStatus(BaseModel):
