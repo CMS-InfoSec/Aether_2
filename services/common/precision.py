@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, Mapping, Optional
 
 import httpx
 
+# Module-level logger for metadata refresh diagnostics.
 logger = logging.getLogger(__name__)
 
 
