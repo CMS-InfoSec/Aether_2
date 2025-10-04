@@ -1,29 +1,37 @@
 """Order flow analytics API surface.
 
 This module provides lightweight analytical endpoints derived from recent
-trading activity and order book depth.  The implementation is intentionally
-self contained so it can operate in environments without direct market data
-feeds or a live TimescaleDB instance.  When the optional psycopg dependency is
-available the computed metrics are persisted into an ``orderflow_metrics``
-hypertable for historical analysis.  If psycopg is unavailable, the service
-falls back to an in-memory store which keeps the API functional for unit tests
-and local development sessions.
+trading activity and order book depth sourced from the production market data
+pipeline.  Metrics are computed using trades and book snapshots stored in
+TimescaleDB (populated by the ingestion service) and are persisted for
+historical analysis when the optional psycopg dependency is available.  If
+psycopg is unavailable, the service falls back to an in-memory store which
+keeps the API functional for unit tests and local development sessions.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import math
+
 import statistics
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from threading import Lock
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query
 
+from auth.service import InMemorySessionStore, RedisSessionStore, SessionStoreProtocol
+
+from services.analytics.market_data_store import (
+    MarketDataAdapter,
+    MarketDataUnavailable,
+    TimescaleMarketDataAdapter,
+)
 from services.common.config import get_timescale_session
+from services.common import security
+from services.common.security import require_admin_account
 
 try:  # pragma: no cover - optional dependency during CI
     import psycopg
@@ -37,61 +45,66 @@ LOGGER = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Synthetic market data provider
+# Market data provider
 # ---------------------------------------------------------------------------
 
 
 class MarketDataProvider:
-    """Deterministic synthetic market data used when live feeds are absent."""
+    """Client that reads trades and order books from the market data pipeline."""
 
-    def __init__(self) -> None:
-        self._cache: MutableMapping[str, Dict[str, Any]] = {}
-
-    @staticmethod
-    def _base_price(symbol: str) -> float:
-        seed = sum(ord(char) for char in symbol.upper())
-        return max(25.0, 100.0 + (seed % 5_000))
-
-    @staticmethod
-    def _rng(symbol: str, window: int) -> "random.Random":
-        import random
-
-        today_bucket = datetime.now(timezone.utc).strftime("%Y%m%d%H")
-        return random.Random(f"{symbol}:{window}:{today_bucket}")
+    def __init__(
+        self,
+        *,
+        adapter: MarketDataAdapter | None = None,
+        order_book_depth: int = 10,
+    ) -> None:
+        self._adapter = adapter or TimescaleMarketDataAdapter()
+        self._depth = max(1, order_book_depth)
 
     def get_recent_trades(self, symbol: str, window: int) -> List[Dict[str, float]]:
-        rng = self._rng(symbol, window)
-        base_price = self._base_price(symbol)
-        bias = math.sin(len(symbol)) * 0.05
-        trades: List[Dict[str, float]] = []
-        for _ in range(max(10, min(120, window // 5))):
-            side = "buy" if rng.random() < 0.5 + bias else "sell"
-            volume = round(rng.uniform(0.05, 5.0), 6)
-            price = round(base_price * (1 + rng.uniform(-0.0015, 0.0015)), 2)
-            trades.append({"side": side, "volume": volume, "price": price})
-        return trades
+        trades = self._adapter.recent_trades(symbol, window)
+        normalized: List[Dict[str, float]] = []
+        for trade in trades:
+            side = getattr(trade, "side", "")
+            volume = getattr(trade, "volume", 0.0)
+            price = getattr(trade, "price", 0.0)
+            if not side:
+                continue
+            normalized.append(
+                {
+                    "side": str(side).lower(),
+                    "volume": float(volume),
+                    "price": float(price),
+                }
+            )
+        return normalized
 
     def get_order_book(self, symbol: str) -> Dict[str, List[List[float]]]:
-        window = 300
-        rng = self._rng(symbol, window)
-        base_price = self._base_price(symbol)
-        spread = max(0.5, base_price * 0.0008)
-        levels = 10
-
-        bids: List[List[float]] = []
-        asks: List[List[float]] = []
-        depth_scale = 1.0 + len(symbol) / 10.0
-
-        for level in range(levels):
-            decay = 0.88 ** level
-            bid_price = round(base_price - spread * (level + 1), 2)
-            ask_price = round(base_price + spread * (level + 1), 2)
-            bid_size = round(max(0.05, rng.uniform(0.5, 8.0) * depth_scale * decay), 6)
-            ask_size = round(max(0.05, rng.uniform(0.5, 8.0) * depth_scale * decay), 6)
-            bids.append([bid_price, bid_size])
-            asks.append([ask_price, ask_size])
-
+        snapshot = self._adapter.order_book_snapshot(symbol, depth=self._depth)
+        bids = self._normalize_levels(snapshot.get("bids", []))
+        asks = self._normalize_levels(snapshot.get("asks", []))
+        if not bids or not asks:
+            raise MarketDataUnavailable(f"Order book for {symbol} is empty")
         return {"bids": bids, "asks": asks}
+
+    @staticmethod
+    def _normalize_levels(levels: Sequence[Sequence[float]] | Iterable[Mapping[str, float]]) -> List[List[float]]:
+        normalized: List[List[float]] = []
+        for entry in levels:
+            price: float
+            size: float
+            if isinstance(entry, Mapping):
+                price = float(entry.get("price", 0.0))
+                size = float(entry.get("size", entry.get("volume", 0.0)))
+            elif isinstance(entry, Sequence) and len(entry) >= 2:
+                price = float(entry[0])
+                size = float(entry[1])
+            else:
+                continue
+            if price <= 0 or size <= 0:
+                continue
+            normalized.append([price, size])
+        return normalized
 
 
 # ---------------------------------------------------------------------------
@@ -400,8 +413,12 @@ class OrderflowService:
         if window <= 0:
             raise HTTPException(status_code=400, detail="window must be positive")
 
-        trades = self._provider.get_recent_trades(symbol, window)
-        order_book = self._provider.get_order_book(symbol)
+        try:
+            trades = self._provider.get_recent_trades(symbol, window)
+            order_book = self._provider.get_order_book(symbol)
+        except MarketDataUnavailable as exc:
+            LOGGER.warning("Market data unavailable for %s: %s", symbol, exc)
+            raise HTTPException(status_code=503, detail=f"market data unavailable for {symbol}") from exc
 
         buy_sell_imbalance = _compute_buy_sell_imbalance(trades)
         depth_imbalance, bid_depth, ask_depth = _compute_depth_imbalance(order_book)
@@ -439,6 +456,7 @@ async def buy_sell_imbalance(
     *,
     symbol: str = Query(..., description="Market symbol to analyse"),
     window: int = Query(300, ge=1, le=3_600, description="Lookback window in seconds"),
+    _: str = Depends(require_admin_account),
 ) -> Dict[str, Any]:
     snapshot = await _service.snapshot(symbol, window)
     return {
@@ -454,6 +472,7 @@ async def queue_depth(
     *,
     symbol: str = Query(..., description="Market symbol to analyse"),
     window: int = Query(300, ge=1, le=3_600, description="Lookback window in seconds"),
+    _: str = Depends(require_admin_account),
 ) -> Dict[str, Any]:
     snapshot = await _service.snapshot(symbol, window)
     return {
@@ -470,6 +489,7 @@ async def liquidity_holes(
     *,
     symbol: str = Query(..., description="Market symbol to analyse"),
     window: int = Query(300, ge=1, le=3_600, description="Lookback window in seconds"),
+    _: str = Depends(require_admin_account),
 ) -> Dict[str, Any]:
     snapshot = await _service.snapshot(symbol, window)
     return {
@@ -480,7 +500,44 @@ async def liquidity_holes(
     }
 
 
+app = FastAPI(title="Orderflow Analytics Service", version="1.0.0")
+
+
+def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
+    existing = getattr(application.state, "session_store", None)
+    if isinstance(existing, SessionStoreProtocol):
+        store = existing
+    else:
+        redis_url = os.getenv("SESSION_REDIS_URL")
+        if not redis_url:
+            raise RuntimeError(
+                "SESSION_REDIS_URL is not configured. Provide a shared session store DSN to enable orderflow authentication.",
+            )
+
+        ttl_minutes = int(os.getenv("SESSION_TTL_MINUTES", "60"))
+        if redis_url.startswith("memory://"):
+            store = InMemorySessionStore(ttl_minutes=ttl_minutes)
+        else:
+            try:  # pragma: no cover - optional dependency import for production deployments
+                import redis  # type: ignore[import-not-found]
+            except ImportError as exc:  # pragma: no cover - surfaced when redis package missing at runtime
+                raise RuntimeError("redis package is required when SESSION_REDIS_URL is set") from exc
+
+            client = redis.Redis.from_url(redis_url)
+            store = RedisSessionStore(client, ttl_minutes=ttl_minutes)
+
+        application.state.session_store = store
+
+    security.set_default_session_store(store)
+    return store
+
+
+SESSION_STORE = _configure_session_store(app)
+app.include_router(router)
+
+
 __all__ = [
+    "app",
     "router",
     "OrderflowService",
     "OrderflowMetricsStore",

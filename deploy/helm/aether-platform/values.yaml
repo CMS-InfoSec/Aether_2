@@ -27,6 +27,12 @@ global:
     readOnlyRootFilesystem: true
   sessionStore:
     redisUrl: redis://redis.aether.svc.cluster.local:6379/0
+  releaseManifest:
+    enabled: true
+    databaseSecretName: release-manifest-database
+    databaseSecretKey: dsn
+    sslmode: require
+    appName: release-manifest
   probes:
     liveness:
       httpGet:
@@ -208,6 +214,79 @@ backendServices:
     pdb:
       enabled: true
       maxUnavailable: 1
+  capitalFlow:
+    enabled: true
+    nameOverride: capital-flow-service
+    image:
+      repository: ghcr.io/aether/capital-flow-service
+      tag: latest
+    replicaCount: 2
+    containerPort: 8000
+    env:
+      - name: CAPITAL_FLOW_DATABASE_URL
+        valueFrom:
+          secretKeyRef:
+            name: capital-flow-service-database
+            key: dsn
+      - name: CAPITAL_FLOW_DB_SSLMODE
+        valueFrom:
+          secretKeyRef:
+            name: capital-flow-service-database
+            key: sslmode
+            optional: true
+      - name: CAPITAL_FLOW_DB_POOL_SIZE
+        value: "10"
+      - name: CAPITAL_FLOW_DB_MAX_OVERFLOW
+        value: "5"
+      - name: CAPITAL_FLOW_DB_POOL_TIMEOUT
+        value: "30"
+      - name: CAPITAL_FLOW_DB_POOL_RECYCLE
+        value: "1800"
+      - name: CAPITAL_FLOW_DB_APP_NAME
+        value: capital-flow-service
+    usesKrakenSecrets: false
+    extraVolumeMounts: []
+    extraVolumes: []
+    service:
+      port: 80
+      targetPort: http
+    ingress:
+      enabled: false
+      host: ""
+      tlsSecret: ""
+      annotations: {}
+    resources:
+      requests:
+        cpu: 150m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 4
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 60
+        - type: Resource
+          resource:
+            name: memory
+            target:
+              type: Utilization
+              averageUtilization: 70
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 60
+        scaleDown:
+          stabilizationWindowSeconds: 120
+    pdb:
+      enabled: true
+      maxUnavailable: 1
   fees:
     enabled: true
     nameOverride: fees-service
@@ -307,6 +386,62 @@ backendServices:
           stabilizationWindowSeconds: 60
         scaleDown:
           stabilizationWindowSeconds: 120
+    pdb:
+      enabled: true
+      maxUnavailable: 1
+  seasonality:
+    enabled: true
+    nameOverride: seasonality-service
+    image:
+      repository: ghcr.io/aether/seasonality-service
+      tag: latest
+    replicaCount: 2
+    containerPort: 8000
+    env:
+      - name: SEASONALITY_DATABASE_URI
+        valueFrom:
+          secretKeyRef:
+            name: seasonality-service-database
+            key: dsn
+      - name: SEASONALITY_DB_SSLMODE
+        value: require
+      - name: SEASONALITY_DB_POOL_SIZE
+        value: "20"
+      - name: SEASONALITY_DB_MAX_OVERFLOW
+        value: "10"
+      - name: SEASONALITY_DB_POOL_TIMEOUT
+        value: "30"
+      - name: SEASONALITY_DB_POOL_RECYCLE
+        value: "1800"
+    usesKrakenSecrets: false
+    extraVolumeMounts: []
+    extraVolumes: []
+    service:
+      port: 80
+      targetPort: http
+    ingress:
+      enabled: true
+      host: seasonality.aether.example.com
+      tlsSecret: seasonality-service-tls
+      annotations: {}
+    resources:
+      requests:
+        cpu: 150m
+        memory: 384Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 5
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 65
     pdb:
       enabled: true
       maxUnavailable: 1

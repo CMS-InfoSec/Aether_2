@@ -2,10 +2,15 @@ import importlib
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 from decimal import Decimal
 
 import pytest
+from sqlalchemy import create_engine as _sa_create_engine
+from sqlalchemy.engine import Engine
+from sqlalchemy.engine.url import make_url
+from sqlalchemy.pool import StaticPool
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -18,6 +23,24 @@ from fastapi.testclient import TestClient
 from auth.service import InMemorySessionStore
 
 
+_REAL_CREATE_ENGINE = _sa_create_engine
+_POSTGRES_DSN = "postgresql://capital_flow:test@localhost/capital_flow"
+
+
+class _EngineProxy:
+    """Proxy Postgres engine wrapper delegating to SQLite."""
+
+    def __init__(self, inner: Engine) -> None:
+        self._inner = inner
+        self.url = make_url("postgresql+psycopg://capital_flow:test@localhost/capital_flow")
+
+    def __getattr__(self, item: str) -> Any:
+        return getattr(self._inner, item)
+
+    def dispose(self) -> None:  # pragma: no cover - passthrough
+        self._inner.dispose()
+
+
 @pytest.fixture()
 def capital_flow_client(tmp_path, monkeypatch: pytest.MonkeyPatch):
     """Provide a fresh capital flow service client backed by an isolated database."""
@@ -27,7 +50,33 @@ def capital_flow_client(tmp_path, monkeypatch: pytest.MonkeyPatch):
         "PYTHONPATH",
         str(ROOT) + os.pathsep + os.environ.get("PYTHONPATH", ""),
     )
-    monkeypatch.setenv("CAPITAL_FLOW_DATABASE_URL", f"sqlite:///{tmp_path}/capital_flows.db")
+
+    sqlite_path = tmp_path / "capital_flows.db"
+    sqlite_url = f"sqlite:///{sqlite_path}"
+
+    monkeypatch.setenv("CAPITAL_FLOW_DATABASE_URL", _POSTGRES_DSN)
+    monkeypatch.delenv("CAPITAL_FLOW_DB_SSLMODE", raising=False)
+
+    def _patched_create_engine(url: str, **kwargs: Any) -> _EngineProxy:  # type: ignore[override]
+        kwargs.pop("pool_size", None)
+        kwargs.pop("max_overflow", None)
+        kwargs.pop("pool_timeout", None)
+        kwargs.pop("pool_recycle", None)
+        connect_args = dict(kwargs.pop("connect_args", {}) or {})
+        connect_args.pop("sslmode", None)
+        connect_args.pop("application_name", None)
+        connect_args.pop("sslrootcert", None)
+        connect_args.pop("sslcert", None)
+        connect_args.pop("sslkey", None)
+        inner = _REAL_CREATE_ENGINE(
+            sqlite_url,
+            future=True,
+            connect_args={**connect_args, "check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        return _EngineProxy(inner)
+
+    monkeypatch.setattr("sqlalchemy.create_engine", _patched_create_engine, raising=False)
 
     previous_modules = {
         "services.common.security": sys.modules.get("services.common.security"),
@@ -53,6 +102,7 @@ def capital_flow_client(tmp_path, monkeypatch: pytest.MonkeyPatch):
     finally:
         security.set_default_session_store(previous_store)
         client.app.dependency_overrides.clear()
+        module.ENGINE.dispose()
         for name, module in previous_modules.items():
             if module is None:
                 sys.modules.pop(name, None)

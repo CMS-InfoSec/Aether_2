@@ -37,7 +37,9 @@ spec:
           {{- $hasKraken := and $global.krakenSecrets.enabled $svc.usesKrakenSecrets }}
           {{- $extraEnv := $svc.env | default (list) -}}
           {{- $sessionRedis := default "" $global.sessionStore.redisUrl -}}
-          {{- $envEnabled := or $hasKraken (gt (len $extraEnv) 0) (ne $sessionRedis "") -}}
+          {{- $releaseManifest := $global.releaseManifest | default (dict) -}}
+          {{- $releaseManifestEnabled := and ($releaseManifest.enabled | default false) $releaseManifest.databaseSecretName -}}
+          {{- $envEnabled := or $hasKraken (gt (len $extraEnv) 0) (ne $sessionRedis "") $releaseManifestEnabled -}}
           {{- if $envEnabled }}
           env:
             {{- if $hasKraken }}
@@ -53,6 +55,21 @@ spec:
             {{- if $sessionRedis }}
             - name: SESSION_REDIS_URL
               value: {{ $sessionRedis | quote }}
+            {{- end }}
+            {{- if $releaseManifestEnabled }}
+            - name: RELEASE_MANIFEST_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $releaseManifest.databaseSecretName }}
+                  key: {{ $releaseManifest.databaseSecretKey | default "dsn" }}
+            {{- if $releaseManifest.sslmode }}
+            - name: RELEASE_MANIFEST_SSLMODE
+              value: {{ $releaseManifest.sslmode | quote }}
+            {{- end }}
+            {{- if $releaseManifest.appName }}
+            - name: RELEASE_MANIFEST_APP_NAME
+              value: {{ $releaseManifest.appName | quote }}
+            {{- end }}
             {{- end }}
             {{- range $extraEnv }}
             {{- toYaml . | nindent 12 }}

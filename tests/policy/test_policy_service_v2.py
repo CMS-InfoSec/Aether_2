@@ -1,18 +1,76 @@
 from __future__ import annotations
 
+import os
 from decimal import Decimal
+from typing import Callable, Iterator
 
 import pytest
 from fastapi.testclient import TestClient
 
+from auth.service import InMemorySessionStore
+
+os.environ.setdefault("SESSION_REDIS_URL", "memory://policy-tests")
+
+import services.common.security as security
 import policy_service
 from services.common.schemas import ActionTemplate, ConfidenceMetrics
 from services.models.model_server import Intent
 
 
+@pytest.fixture(name="session_store")
+def _session_store() -> Iterator[InMemorySessionStore]:
+    previous_store = getattr(policy_service.app.state, "session_store", None)
+    previous_global = getattr(policy_service, "SESSION_STORE", None)
+    previous_default = getattr(security, "_DEFAULT_SESSION_STORE", None)
+
+    store = InMemorySessionStore()
+    policy_service.app.state.session_store = store
+    policy_service.SESSION_STORE = store
+    security.set_default_session_store(store)
+
+    try:
+        yield store
+    finally:
+        if previous_store is None:
+            policy_service.app.state.session_store = None
+        else:
+            policy_service.app.state.session_store = previous_store
+        policy_service.SESSION_STORE = previous_global
+        security.set_default_session_store(previous_default)
+
+
 @pytest.fixture(name="client")
-def _client() -> TestClient:
-    return TestClient(policy_service.app)
+def _client(
+    session_store: InMemorySessionStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[TestClient]:
+    del session_store
+    monkeypatch.setattr(
+        "shared.graceful_shutdown.install_sigterm_handler",
+        lambda manager: None,
+    )
+    async def _noop_place_order(*args: object, **kwargs: object) -> dict[str, str]:
+        return {"order_id": "test"}
+
+    monkeypatch.setattr(
+        policy_service.EXCHANGE_ADAPTER,
+        "place_order",
+        _noop_place_order,
+    )
+    with TestClient(policy_service.app) as client:
+        yield client
+
+
+@pytest.fixture
+def auth_headers(session_store: InMemorySessionStore) -> Callable[[str], dict[str, str]]:
+    def _build(account: str) -> dict[str, str]:
+        session = session_store.create(account)
+        return {
+            "Authorization": f"Bearer {session.token}",
+            "X-Account-ID": account,
+        }
+
+    return _build
 
 
 def _intent() -> Intent:
@@ -48,7 +106,11 @@ def _intent() -> Intent:
     )
 
 
-def test_policy_service_decision(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
+def test_policy_service_decision(
+    monkeypatch: pytest.MonkeyPatch,
+    client: TestClient,
+    auth_headers: Callable[[str], dict[str, str]],
+) -> None:
     async def _fake_fee(
         account_id: str, symbol: str, liquidity: str, notional: float | Decimal
     ) -> Decimal:
@@ -75,7 +137,7 @@ def test_policy_service_decision(monkeypatch: pytest.MonkeyPatch, client: TestCl
         "book_snapshot": {"mid_price": 30125.4, "spread_bps": 2.4, "imbalance": 0.05},
     }
 
-    response = client.post("/policy/decide", json=payload)
+    response = client.post("/policy/decide", json=payload, headers=auth_headers("company"))
 
     assert response.status_code == 200
     body = response.json()

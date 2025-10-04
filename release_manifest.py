@@ -35,6 +35,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional
 
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import (
     JSON,
     Column,
@@ -44,12 +46,11 @@ from sqlalchemy import (
     Table,
     create_engine,
     func,
-    inspect,
     select,
-    text,
 )
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import NoSuchTableError, SQLAlchemyError
+from sqlalchemy.engine.url import make_url
+from sqlalchemy.exc import ArgumentError, NoSuchTableError, SQLAlchemyError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -59,11 +60,78 @@ except ImportError:  # pragma: no cover - optional dependency
     yaml = None  # type: ignore
 
 
-DEFAULT_RELEASE_DB_URL = os.getenv(
-    "RELEASE_MANIFEST_DATABASE_URL", "sqlite+pysqlite:////tmp/release_manifests.db"
-)
-
 LOGGER = logging.getLogger("release_manifest")
+_RELEASE_MANIFEST_ALLOW_SQLITE_FLAG = "RELEASE_MANIFEST_ALLOW_SQLITE_FOR_TESTS"
+
+
+def _normalize_release_db_url(raw_url: str) -> str:
+    """Normalise *raw_url* so SQLAlchemy uses the psycopg2 driver."""
+
+    if raw_url.startswith("postgres://"):
+        raw_url = "postgresql://" + raw_url.split("://", 1)[1]
+    if raw_url.startswith("timescale://"):
+        raw_url = "postgresql+psycopg2://" + raw_url.split("://", 1)[1]
+
+    url = make_url(raw_url)
+    driver = url.drivername.lower()
+
+    if driver in {"postgres", "postgresql"}:
+        url = url.set(drivername="postgresql+psycopg2")
+    elif driver == "timescale":
+        url = url.set(drivername="postgresql+psycopg2")
+    elif driver.startswith("postgresql+psycopg"):
+        url = url.set(drivername="postgresql+psycopg2")
+
+    return url.render_as_string(hide_password=False)
+
+
+def _require_release_db_url() -> str:
+    """Return the managed Postgres/Timescale DSN for release manifests."""
+
+    raw_url = (
+        os.getenv("RELEASE_MANIFEST_DATABASE_URL")
+        or os.getenv("RELEASE_DATABASE_URL")
+        or os.getenv("TIMESCALE_DSN")
+        or os.getenv("DATABASE_URL")
+    )
+
+    if not raw_url:
+        raise RuntimeError(
+            "RELEASE_MANIFEST_DATABASE_URL (or legacy RELEASE_DATABASE_URL/TIMESCALE_DSN/DATABASE_URL) must be set "
+            "to a managed Postgres/Timescale DSN."
+        )
+
+    try:
+        normalised = _normalize_release_db_url(raw_url)
+        parsed = make_url(normalised)
+    except ArgumentError as exc:
+        raise RuntimeError(f"Invalid release manifest database URL '{raw_url}': {exc}") from exc
+
+    driver = parsed.drivername.lower()
+    if driver.startswith("sqlite"):
+        if os.getenv(_RELEASE_MANIFEST_ALLOW_SQLITE_FLAG) == "1":
+            LOGGER.warning(
+                "Allowing SQLite release manifest database URL '%s' because %s=1.",
+                raw_url,
+                _RELEASE_MANIFEST_ALLOW_SQLITE_FLAG,
+            )
+            return normalised
+        raise RuntimeError(
+            "Release manifests require a PostgreSQL/Timescale database; "
+            f"received driver '{parsed.drivername}'."
+        )
+
+    if not driver.startswith("postgresql"):
+        raise RuntimeError(
+            "Release manifests require a PostgreSQL/Timescale database; "
+            f"received driver '{parsed.drivername}'."
+        )
+
+    return normalised
+
+
+DEFAULT_RELEASE_DB_URL = _require_release_db_url()
+
 _SQLITE_FALLBACK_FLAG = "CONFIG_ALLOW_SQLITE_FOR_TESTS"
 
 
@@ -136,41 +204,85 @@ class Manifest:
         }
 
 
+def _env_int(key: str, default: int) -> int:
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    try:
+        return int(str(raw))
+    except (TypeError, ValueError):
+        LOGGER.warning("Invalid integer value for %s: %s", key, raw)
+        return default
+
+
 def _create_engine(url: str) -> Engine:
-    """Create a SQLAlchemy engine with sensible defaults for SQLite."""
+    """Create a SQLAlchemy engine with sensible defaults for Postgres/Timescale."""
 
-    kwargs = {"future": True}
-    if url.startswith("sqlite"):  # pragma: no cover - defensive branch for sqlite
+    options: Dict[str, object] = {"future": True, "pool_pre_ping": True}
+
+    try:
+        parsed = make_url(url)
+    except ArgumentError:
+        parsed = None
+
+    if parsed and parsed.drivername.startswith("sqlite"):
         connect_args = {"check_same_thread": False}
-        kwargs["connect_args"] = connect_args
-        if ":memory:" in url:
-            kwargs["poolclass"] = StaticPool
-    return create_engine(url, **kwargs)
+        if ":memory:" in url or parsed.database in {":memory:", None}:
+            options["poolclass"] = StaticPool
+        options["connect_args"] = connect_args
+        return create_engine(url, **options)
+
+    options["pool_size"] = _env_int("RELEASE_MANIFEST_POOL_SIZE", 5)
+    options["max_overflow"] = _env_int("RELEASE_MANIFEST_MAX_OVERFLOW", 5)
+    options["pool_timeout"] = _env_int("RELEASE_MANIFEST_POOL_TIMEOUT", 30)
+    options["pool_recycle"] = _env_int("RELEASE_MANIFEST_POOL_RECYCLE", 1800)
+
+    connect_args: Dict[str, object] = {}
+    forced_sslmode = os.getenv("RELEASE_MANIFEST_SSLMODE")
+    if forced_sslmode:
+        connect_args["sslmode"] = forced_sslmode
+    elif parsed and "sslmode" not in parsed.query and parsed.host not in {None, "localhost", "127.0.0.1"}:
+        connect_args["sslmode"] = "require"
+
+    app_name = os.getenv("RELEASE_MANIFEST_APP_NAME", "release-manifest")
+    if app_name:
+        connect_args["application_name"] = app_name
+
+    if connect_args:
+        options["connect_args"] = connect_args
+
+    return create_engine(url, **options)
 
 
+_MIGRATIONS_PATH = Path(__file__).resolve().parent / "release_manifest_migrations"
+
+
+def run_release_manifest_migrations(database_url: Optional[str] = None) -> None:
+    """Apply outstanding migrations for the release manifest schema."""
+
+    url = (database_url or DEFAULT_RELEASE_DB_URL).strip()
+    if not url:
+        raise RuntimeError("Release manifest migrations require a valid database URL")
+
+    config = Config()
+    config.set_main_option("script_location", str(_MIGRATIONS_PATH))
+    config.set_main_option("sqlalchemy.url", url)
+    config.attributes["configure_logger"] = False
+
+    command.upgrade(config, "head")
+
+
+run_release_manifest_migrations(DEFAULT_RELEASE_DB_URL)
 release_engine = _create_engine(DEFAULT_RELEASE_DB_URL)
-Base.metadata.create_all(bind=release_engine)
 
 
-def _ensure_manifest_hash_column(engine: Engine) -> None:
-    """Ensure the ``manifest_hash`` column exists for backwards compatibility."""
-
-    try:
-        inspector = inspect(engine)
-        columns = {col["name"] for col in inspector.get_columns("release_manifests")}
-    except SQLAlchemyError:  # pragma: no cover - introspection failure
-        return
-    if "manifest_hash" in columns:
-        return
-    try:
-        with engine.begin() as conn:
-            conn.execute(text("ALTER TABLE release_manifests ADD COLUMN manifest_hash VARCHAR"))
-    except SQLAlchemyError:  # pragma: no cover - alteration failure
-        return
-
-
-_ensure_manifest_hash_column(release_engine)
-SessionLocal = sessionmaker(bind=release_engine, autoflush=False, autocommit=False, expire_on_commit=False)
+SessionLocal = sessionmaker(
+    bind=release_engine,
+    autoflush=False,
+    autocommit=False,
+    expire_on_commit=False,
+    future=True,
+)
 
 
 def _backfill_manifest_hashes() -> None:
