@@ -6,6 +6,7 @@ import asyncio
 import sys
 import time
 import types
+import contextlib
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 
@@ -26,12 +27,14 @@ if "metrics" not in sys.modules:
     metrics_stub.record_scaling_state = lambda *args, **kwargs: None
     metrics_stub.observe_scaling_evaluation = lambda *args, **kwargs: None
 
+    metrics_stub.metric_context = lambda *args, **kwargs: contextlib.nullcontext()
     metrics_stub.get_request_id = lambda: None
 
     sys.modules["metrics"] = metrics_stub
 
 import policy_service
 
+from services.common.precision import PrecisionMetadataUnavailable
 from services.common.schemas import (
     ActionTemplate,
     BookSnapshot,
@@ -355,6 +358,32 @@ def test_policy_resolves_precision_for_eur_pair() -> None:
     assert precision["tick"] == pytest.approx(0.5)
     assert precision["lot"] == pytest.approx(0.0005)
     assert precision["native_pair"] == "XBT/EUR"
+
+
+def test_policy_decide_returns_503_when_precision_unavailable(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    async def _raise_precision(_: str) -> dict:
+        raise PrecisionMetadataUnavailable("boom")
+
+    monkeypatch.setattr(policy_service.precision_provider, "require", _raise_precision)
+
+    payload = {
+        "account_id": "company",
+        "order_id": "precision-missing",
+        "instrument": "DOGE-USD",
+        "side": "BUY",
+        "quantity": 10.0,
+        "price": 0.1,
+        "fee": {"currency": "USD", "maker": 0.0, "taker": 0.0},
+        "features": [0.0, 0.0],
+        "book_snapshot": {"mid_price": 0.1, "spread_bps": 0.1, "imbalance": 0.0},
+    }
+
+    response = client.post("/policy/decide", json=payload)
+
+    assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+    assert response.json()["detail"] == "Precision metadata unavailable"
 
 
 
