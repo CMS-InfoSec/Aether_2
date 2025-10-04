@@ -1,0 +1,109 @@
+{
+  "orders": [
+    {
+      "order_id": "krk-b-1",
+      "market": "BTC-USD",
+      "side": "buy",
+      "submitted_at": "2050-02-01T12:00:00+00:00"
+    },
+    {
+      "order_id": "krk-s-1",
+      "market": "BTC-USD",
+      "side": "sell",
+      "submitted_at": "2050-02-01T12:00:05+00:00"
+    },
+    {
+      "order_id": "krk-b-2",
+      "market": "BTC-USD",
+      "side": "buy",
+      "submitted_at": "2050-02-01T12:01:00+00:00"
+    },
+    {
+      "order_id": "krk-s-2",
+      "market": "BTC-USD",
+      "side": "sell",
+      "submitted_at": "2050-02-01T12:02:00+00:00"
+    },
+    {
+      "order_id": "krk-b-3",
+      "market": "BTC-USD",
+      "side": "buy",
+      "submitted_at": "2050-02-01T12:03:00+00:00"
+    },
+    {
+      "order_id": "krk-s-3",
+      "market": "BTC-USD",
+      "side": "sell",
+      "submitted_at": "2050-02-01T12:04:00+00:00"
+    }
+  ],
+  "fills": [
+    {
+      "order_id": "krk-b-1",
+      "fill_time": "2050-02-01T12:00:01+00:00",
+      "price": 30150.2,
+      "size": 1.5
+    },
+    {
+      "order_id": "krk-s-1",
+      "fill_time": "2050-02-01T12:00:06+00:00",
+      "price": 30152.4,
+      "size": 1.0
+    },
+    {
+      "order_id": "krk-b-2",
+      "fill_time": "2050-02-01T12:01:05+00:00",
+      "price": 30155.8,
+      "size": 2.0
+    },
+    {
+      "order_id": "krk-s-2",
+      "fill_time": "2050-02-01T12:02:05+00:00",
+      "price": 30153.1,
+      "size": 1.2
+    },
+    {
+      "order_id": "krk-b-3",
+      "fill_time": "2050-02-01T12:03:10+00:00",
+      "price": 30158.9,
+      "size": 1.5
+    },
+    {
+      "order_id": "krk-s-3",
+      "fill_time": "2050-02-01T12:04:10+00:00",
+      "price": 30156.7,
+      "size": 0.8
+    }
+  ],
+  "orderbook_snapshots": [
+    {
+      "symbol": "BTC-USD",
+      "depth": 10,
+      "as_of": "2050-02-01T12:05:00+00:00",
+      "bids": [
+        {"price": 30158.0, "size": 30.0},
+        {"price": 30157.5, "size": 25.0},
+        {"price": 30157.0, "size": 20.0},
+        {"price": 30156.5, "size": 15.0},
+        {"price": 30156.0, "size": 12.0},
+        {"price": 30155.5, "size": 10.0},
+        {"price": 30155.0, "size": 9.0},
+        {"price": 30154.5, "size": 8.0},
+        {"price": 30154.0, "size": 7.0},
+        {"price": 30153.5, "size": 6.0}
+      ],
+      "asks": [
+        {"price": 30159.0, "size": 20.0},
+        {"price": 30159.5, "size": 18.0},
+        {"price": 30160.0, "size": 15.0},
+        {"price": 30160.5, "size": 14.0},
+        {"price": 30161.0, "size": 12.0},
+        {"price": 30161.5, "size": 10.0},
+        {"price": 30162.0, "size": 8.0},
+        {"price": 30162.5, "size": 6.0},
+        {"price": 30163.0, "size": 5.0},
+        {"price": 30163.5, "size": 4.0}
+      ]
+    }
+  ]
+}
