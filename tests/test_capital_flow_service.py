@@ -3,6 +3,8 @@ import os
 import sys
 from pathlib import Path
 
+from decimal import Decimal
+
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,7 +69,7 @@ def test_deposit_requires_authentication(capital_flow_client) -> None:
 
     response = client.post(
         "/finance/deposit",
-        json={"account_id": "company", "amount": 100.0, "currency": "USD"},
+        json={"account_id": "company", "amount": "100.0", "currency": "USD"},
     )
 
     assert response.status_code == 401
@@ -80,7 +82,7 @@ def test_deposit_rejects_account_mismatch(capital_flow_client) -> None:
     response = client.post(
         "/finance/deposit",
         headers=_auth_headers(session.token),
-        json={"account_id": "Shadow", "amount": 50.0, "currency": "USD"},
+        json={"account_id": "Shadow", "amount": "50.0", "currency": "USD"},
     )
 
     assert response.status_code == 403
@@ -105,13 +107,13 @@ def test_deposit_and_list_flows_with_valid_session(capital_flow_client) -> None:
     deposit_response = client.post(
         "/finance/deposit",
         headers=_auth_headers(session.token),
-        json={"account_id": "COMPANY", "amount": 75.0, "currency": "USD"},
+        json={"account_id": "COMPANY", "amount": "75.0", "currency": "USD"},
     )
 
     assert deposit_response.status_code == 201
     payload = deposit_response.json()
     assert payload["account_id"] == "COMPANY"
-    assert payload["nav_baseline"] == pytest.approx(75.0)
+    assert Decimal(payload["nav_baseline"]) == Decimal("75.0")
 
     flows_response = client.get(
         "/finance/flows",
@@ -123,4 +125,46 @@ def test_deposit_and_list_flows_with_valid_session(capital_flow_client) -> None:
     flows = flows_response.json()["flows"]
     assert len(flows) == 1
     assert flows[0]["account_id"] == "COMPANY"
-    assert flows[0]["nav_baseline"] == pytest.approx(75.0)
+    assert Decimal(flows[0]["nav_baseline"]) == Decimal("75.0")
+
+
+def test_high_precision_deposit_and_withdrawal(capital_flow_client) -> None:
+    client, _, store = capital_flow_client
+    session = store.create("company")
+
+    deposit_amount = "1000000.123456789123456789"
+    withdrawal_amount = "0.123456789123456789"
+
+    deposit_response = client.post(
+        "/finance/deposit",
+        headers=_auth_headers(session.token),
+        json={"account_id": "company", "amount": deposit_amount, "currency": "USD"},
+    )
+
+    assert deposit_response.status_code == 201
+    deposit_payload = deposit_response.json()
+    assert deposit_payload["amount"] == deposit_amount
+    assert Decimal(deposit_payload["nav_baseline"]) == Decimal(deposit_amount)
+
+    withdrawal_response = client.post(
+        "/finance/withdraw",
+        headers=_auth_headers(session.token),
+        json={"account_id": "company", "amount": withdrawal_amount, "currency": "USD"},
+    )
+
+    assert withdrawal_response.status_code == 201
+    withdrawal_payload = withdrawal_response.json()
+    assert withdrawal_payload["amount"] == withdrawal_amount
+    assert Decimal(withdrawal_payload["nav_baseline"]) == Decimal("1000000.0")
+
+    history = client.get(
+        "/finance/flows",
+        headers=_auth_headers(session.token),
+        params={"account_id": "company"},
+    )
+
+    assert history.status_code == 200
+    entries = history.json()["flows"]
+    assert {entry["type"] for entry in entries} == {"deposit", "withdraw"}
+    baseline_values = [Decimal(entry["nav_baseline"]) for entry in entries]
+    assert Decimal("1000000.0") in baseline_values

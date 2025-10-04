@@ -14,16 +14,66 @@ import enum
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from typing import Generator, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
-from pydantic import BaseModel, ConfigDict, Field, PositiveFloat
-from sqlalchemy import Column, DateTime, Float, Integer, String, create_engine, select, func
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
+from sqlalchemy import Column, DateTime, Integer, Numeric, String, create_engine, select, func
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
+from sqlalchemy.types import TypeDecorator
 
 from services.common.security import require_admin_account
+
+
+_DECIMAL_PRECISION = 38
+_DECIMAL_SCALE = 18
+
+ZERO = Decimal("0")
+_QUANT = Decimal("1").scaleb(-_DECIMAL_SCALE)
+
+
+def _quantize(value: Decimal) -> Decimal:
+    return value.quantize(_QUANT, rounding=ROUND_HALF_EVEN)
+
+
+class PreciseDecimal(TypeDecorator):
+    """Type decorator storing high-precision decimals losslessly on SQLite."""
+
+    impl = Numeric
+    cache_ok = True
+
+    def __init__(self, precision: int, scale: int, **kwargs):
+        super().__init__(**kwargs)
+        self.precision = precision
+        self.scale = scale
+        self._numeric = Numeric(precision, scale, asdecimal=True)
+
+    @property
+    def python_type(self) -> type[Decimal]:  # pragma: no cover - SQLAlchemy hook
+        return Decimal
+
+    def load_dialect_impl(self, dialect):
+        if dialect.name == "sqlite":
+            return dialect.type_descriptor(String(self.precision + self.scale + 2))
+        return dialect.type_descriptor(self._numeric)
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        if not isinstance(value, Decimal):
+            value = Decimal(str(value))
+        value = _quantize(value)
+        if dialect.name == "sqlite":
+            return format(value, f".{self.scale}f")
+        return value
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        return _quantize(Decimal(str(value)))
 
 # ---------------------------------------------------------------------------
 # Database setup
@@ -67,7 +117,7 @@ class CapitalFlowRecord(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     account_id = Column(String, nullable=False, index=True)
     type = Column(String, nullable=False)
-    amount = Column(Float, nullable=False)
+    amount = Column(PreciseDecimal(_DECIMAL_PRECISION, _DECIMAL_SCALE), nullable=False)
     currency = Column(String, nullable=False)
     ts = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
@@ -79,7 +129,11 @@ class NavBaselineRecord(Base):
 
     account_id = Column(String, primary_key=True)
     currency = Column(String, nullable=False)
-    baseline = Column(Float, nullable=False, default=0.0)
+    baseline = Column(
+        PreciseDecimal(_DECIMAL_PRECISION, _DECIMAL_SCALE),
+        nullable=False,
+        default=ZERO,
+    )
     updated_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
 
@@ -135,8 +189,27 @@ def _resolve_account_scope(caller: str, requested: Optional[str]) -> tuple[str, 
 
 class CapitalFlowRequest(BaseModel):
     account_id: str = Field(..., min_length=1, description="Unique account identifier")
-    amount: PositiveFloat = Field(..., description="Absolute amount of the flow in account currency")
+    amount: Decimal = Field(..., description="Absolute amount of the flow in account currency")
     currency: str = Field(..., min_length=1, description="ISO currency code for the flow")
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def _coerce_decimal(cls, value: object) -> Decimal:
+        """Ensure ``amount`` is a positive Decimal parsed from the incoming payload."""
+
+        if isinstance(value, Decimal):
+            candidate = value
+        else:
+            try:
+                candidate = Decimal(str(value))
+            except (InvalidOperation, TypeError, ValueError) as exc:  # pragma: no cover - invalid payload
+                raise ValueError("amount must be a decimal-compatible value") from exc
+
+        quantized = _quantize(candidate)
+        if quantized <= ZERO:
+            raise ValueError("amount must be greater than zero")
+
+        return quantized
 
 
 class CapitalFlowResponse(BaseModel):
@@ -145,10 +218,14 @@ class CapitalFlowResponse(BaseModel):
     id: int
     account_id: str
     type: CapitalFlowType
-    amount: float
+    amount: Decimal
     currency: str
     ts: datetime
-    nav_baseline: float = Field(..., description="NAV baseline after applying the flow")
+    nav_baseline: Decimal = Field(..., description="NAV baseline after applying the flow")
+
+    @field_serializer("amount", "nav_baseline", when_used="json")
+    def _serialize_decimal(self, value: Decimal) -> str:
+        return format(value, "f")
 
 
 class FlowHistoryResponse(BaseModel):
@@ -192,7 +269,7 @@ def _apply_flow(
         baseline = NavBaselineRecord(
             account_id=payload.account_id,
             currency=payload.currency,
-            baseline=0.0,
+            baseline=ZERO,
             updated_at=timestamp,
         )
         session.add(baseline)
@@ -200,16 +277,18 @@ def _apply_flow(
     else:
         _ensure_currency_consistency(baseline, payload.currency)
 
-    delta = float(payload.amount)
+    delta = _quantize(payload.amount)
+    current_baseline = _quantize(baseline.baseline)
     if flow_type is CapitalFlowType.WITHDRAW:
-        new_baseline = baseline.baseline - delta
-        if new_baseline < 0:
+        new_baseline = current_baseline - delta
+        if new_baseline < ZERO:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Withdrawal amount exceeds available NAV baseline",
             )
+        new_baseline = _quantize(new_baseline)
     else:
-        new_baseline = baseline.baseline + delta
+        new_baseline = _quantize(current_baseline + delta)
 
     baseline.baseline = new_baseline
     baseline.currency = payload.currency
@@ -245,23 +324,23 @@ def _record_flow(
             id=result.flow.id,
             account_id=result.flow.account_id,
             type=flow_type,
-            amount=result.flow.amount,
+            amount=_quantize(result.flow.amount),
             currency=result.flow.currency,
             ts=result.flow.ts,
-            nav_baseline=result.baseline.baseline,
+            nav_baseline=_quantize(result.baseline.baseline),
         )
 
 
-def _serialize_flow(record: CapitalFlowRecord, baseline_lookup: dict[str, float]) -> CapitalFlowResponse:
-    nav_baseline = baseline_lookup.get(record.account_id, 0.0)
+def _serialize_flow(record: CapitalFlowRecord, baseline_lookup: dict[str, Decimal]) -> CapitalFlowResponse:
+    nav_baseline = baseline_lookup.get(record.account_id, ZERO)
     return CapitalFlowResponse(
         id=record.id,
         account_id=record.account_id,
         type=CapitalFlowType(record.type),
-        amount=record.amount,
+        amount=_quantize(record.amount),
         currency=record.currency,
         ts=record.ts,
-        nav_baseline=nav_baseline,
+        nav_baseline=_quantize(nav_baseline),
     )
 
 
@@ -331,11 +410,11 @@ def list_flows(
 
     records = list(session.execute(stmt).scalars())
     account_ids = {record.account_id for record in records}
-    baseline_lookup: dict[str, float] = {}
+    baseline_lookup: dict[str, Decimal] = {}
     if account_ids:
         baseline_stmt = select(NavBaselineRecord).where(NavBaselineRecord.account_id.in_(account_ids))
         for baseline_record in session.execute(baseline_stmt).scalars():
-            baseline_lookup[baseline_record.account_id] = baseline_record.baseline
+            baseline_lookup[baseline_record.account_id] = _quantize(baseline_record.baseline)
 
     flows = [_serialize_flow(record, baseline_lookup) for record in records]
     return FlowHistoryResponse(flows=flows)
