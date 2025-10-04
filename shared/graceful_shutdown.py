@@ -63,6 +63,7 @@ class GracefulShutdownManager:
                 self.allow_path(path)
         self._flush_callbacks: List[FlushCallback] = []
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._loop_thread: Optional[threading.Thread] = None
 
     @property
     def draining(self) -> bool:
@@ -89,6 +90,7 @@ class GracefulShutdownManager:
 
     def bind_event_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
+        self._loop_thread = threading.current_thread()
 
     def _prepare_draining(self, reason: str) -> tuple[bool, List[FlushCallback]]:
         callbacks: List[FlushCallback] = []
@@ -132,6 +134,13 @@ class GracefulShutdownManager:
                 except RuntimeError:
                     loop = None
         if loop is not None and loop.is_running():
+            if self._loop_thread is threading.current_thread():
+                temp_loop = asyncio.new_event_loop()
+                try:
+                    temp_loop.run_until_complete(_await_wrapper())
+                finally:
+                    temp_loop.close()
+                return
             future = asyncio.run_coroutine_threadsafe(_await_wrapper(), loop)
             future.result()
             return
