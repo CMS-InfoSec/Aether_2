@@ -55,6 +55,8 @@ def universe_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
             return vols
         return caps
 
+    monkeypatch.setattr(universe_service, "ENGINE", object())
+    monkeypatch.setattr(universe_service, "SessionLocal", object())
     monkeypatch.setattr(universe_service, "_latest_feature_map", fake_feature_map)
     monkeypatch.setattr(universe_service, "_kraken_volume_24h", lambda session: volumes)
     monkeypatch.setattr(universe_service, "_latest_manual_overrides", lambda session, migrate=False: overrides)

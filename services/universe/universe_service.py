@@ -96,7 +96,9 @@ def _engine_options(url: URL) -> dict[str, Any]:
     return options
 
 
-DATABASE_URL: URL = _require_database_url()
+DATABASE_URL: Optional[URL] = None
+ENGINE: Optional[Engine] = None
+SessionLocal: Optional[sessionmaker] = None
 
 
 Base = declarative_base()
@@ -154,25 +156,71 @@ class AuditLog(Base):
     attributes = Column("metadata", JSONB, default=dict)
 
 
-def _create_engine() -> Engine:
+def _create_engine(url: URL) -> Engine:
     return create_engine(
-        DATABASE_URL.render_as_string(hide_password=False),
-        **_engine_options(DATABASE_URL),
+        url.render_as_string(hide_password=False),
+        **_engine_options(url),
     )
 
 
-ENGINE = _create_engine()
-SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
+def ensure_database(app: Optional[FastAPI] = None) -> None:
+    """Initialise database connectivity lazily when required."""
+
+    global DATABASE_URL, ENGINE, SessionLocal
+
+    if ENGINE is not None and SessionLocal is not None:
+        if app is not None:
+            app.state.universe_engine = ENGINE
+            app.state.db_sessionmaker = SessionLocal
+            if DATABASE_URL is not None:
+                app.state.universe_database_url = DATABASE_URL
+        return
+
+    if app is not None:
+        existing_sessionmaker = getattr(app.state, "db_sessionmaker", None)
+        existing_engine = getattr(app.state, "universe_engine", None)
+        existing_url = getattr(app.state, "universe_database_url", None)
+
+        if existing_sessionmaker is not None and existing_engine is not None:
+            SessionLocal = existing_sessionmaker
+            ENGINE = existing_engine
+            if isinstance(existing_url, URL):
+                DATABASE_URL = existing_url
+            elif isinstance(existing_url, str):
+                try:
+                    DATABASE_URL = make_url(existing_url)
+                except ArgumentError:  # pragma: no cover - defensive guard
+                    DATABASE_URL = None
+            return
+
+    url = _require_database_url()
+    engine = _create_engine(url)
+    session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True)
+
+    DATABASE_URL = url
+    ENGINE = engine
+    SessionLocal = session_factory
+
+    if app is not None:
+        app.state.universe_database_url = url
+        app.state.universe_engine = engine
+        app.state.db_sessionmaker = session_factory
 
 _MIGRATIONS_PATH = Path(__file__).resolve().parents[2] / "data" / "migrations"
 
 
-def run_migrations() -> None:
+def run_migrations(url: Optional[URL] = None) -> None:
     """Apply outstanding database migrations for the universe service."""
+
+    ensure_database()
+
+    target_url = url or DATABASE_URL
+    if target_url is None:
+        raise RuntimeError("Universe database is not configured; cannot run migrations.")
 
     config = Config()
     config.set_main_option("script_location", str(_MIGRATIONS_PATH))
-    config.set_main_option("sqlalchemy.url", DATABASE_URL.render_as_string(hide_password=False))
+    config.set_main_option("sqlalchemy.url", target_url.render_as_string(hide_password=False))
     config.attributes["configure_logger"] = False
 
     LOGGER.info("Applying universe service migrations")
@@ -180,6 +228,13 @@ def run_migrations() -> None:
 
 
 def get_session() -> Iterator[Session]:
+    ensure_database()
+
+    if SessionLocal is None:
+        raise RuntimeError(
+            "Universe database session factory is not initialised. Ensure service startup has executed or configure SessionLocal manually."
+        )
+
     session = SessionLocal()
     try:
         yield session
@@ -188,12 +243,17 @@ def get_session() -> Iterator[Session]:
 
 
 app = FastAPI(title="Universe Selection Service")
-app.state.db_sessionmaker = SessionLocal
+app.state.db_sessionmaker = None
+app.state.universe_engine = None
+app.state.universe_database_url = None
 
 
 @app.on_event("startup")
 def _on_startup() -> None:
-    run_migrations()
+    ensure_database(app)
+
+    if DATABASE_URL is not None:
+        run_migrations(DATABASE_URL)
 
 
 class UniverseResponse(BaseModel):
@@ -236,6 +296,23 @@ KRAKEN_QUOTE_ALIASES = {
     "USD": "USD",
     "ZUSD": "USD",
 }
+
+
+_UNSUPPORTED_QUOTE_SUFFIXES = (
+    "EUR",
+    "GBP",
+    "CAD",
+    "AUD",
+    "JPY",
+    "CHF",
+    "NZD",
+    "SGD",
+    "HKD",
+    "CNY",
+    "KRW",
+    "TRY",
+    "USDT",
+)
 
 
 def _latest_feature_map(session: Session, feature_names: Sequence[str]) -> Dict[str, Feature]:
@@ -323,7 +400,11 @@ def _normalize_market(market: str) -> Optional[str]:
         if "/" in token or "-" in token:
             return None
         base = _normalize_asset_symbol(compact, is_quote=False)
-        return f"{base}-USD" if base else None
+        if not base:
+            return None
+        if base.endswith(_UNSUPPORTED_QUOTE_SUFFIXES):
+            return None
+        return f"{base}-USD"
 
     base = _normalize_asset_symbol(base_token, is_quote=False)
     quote = _normalize_asset_symbol(quote_token, is_quote=True)
