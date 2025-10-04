@@ -485,6 +485,16 @@ backendServices:
           secretKeyRef:
             name: risk-service-database
             key: sslmode
+      - name: ESG_DATABASE_URL
+        valueFrom:
+          secretKeyRef:
+            name: risk-service-database
+            key: dsn
+      - name: ESG_DB_SSLMODE
+        valueFrom:
+          secretKeyRef:
+            name: risk-service-database
+            key: sslmode
 
     usesKrakenSecrets: true
     extraVolumeMounts: []

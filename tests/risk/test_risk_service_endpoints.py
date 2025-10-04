@@ -8,6 +8,10 @@ from pathlib import Path
 if str(Path(__file__).resolve().parents[1]) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from tests.helpers.risk import patch_sqlalchemy_for_risk
+
+_RESTORE_SQLALCHEMY = patch_sqlalchemy_for_risk(Path(__file__).with_name("risk_endpoints.db"))
+
 import pytest
 from fastapi import status
 from fastapi.testclient import TestClient
@@ -49,6 +53,8 @@ pytest.importorskip("services.common.security")
 from risk_service import app, require_admin_account
 from services.common import security
 from tests.helpers.authentication import override_admin_auth
+
+_RESTORE_SQLALCHEMY()
 
 
 @pytest.fixture(autouse=True)
