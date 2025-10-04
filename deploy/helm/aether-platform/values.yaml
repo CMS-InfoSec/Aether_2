@@ -593,7 +593,18 @@ backendServices:
       tag: latest
     replicaCount: 2
     containerPort: 8000
-    env: []
+    env:
+      - name: UNIVERSE_DATABASE_URL
+        valueFrom:
+          secretKeyRef:
+            name: universe-service-database
+            key: dsn
+      - name: UNIVERSE_DB_SSLMODE
+        valueFrom:
+          secretKeyRef:
+            name: universe-service-database
+            key: sslmode
+            optional: true
     usesKrakenSecrets: true
     extraVolumeMounts: []
     extraVolumes: []
