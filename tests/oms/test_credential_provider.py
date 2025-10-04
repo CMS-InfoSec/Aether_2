@@ -24,10 +24,10 @@ class _StubKafkaAdapter:
         self.account_id = account_id
 
     @staticmethod
-    def flush_events() -> Dict[str, int]:  # pragma: no cover - trivial stub
+    async def flush_events() -> Dict[str, int]:  # pragma: no cover - trivial stub
         return {}
 
-    def publish(self, *args: Any, **kwargs: Any) -> None:  # pragma: no cover - trivial stub
+    async def publish(self, *args: Any, **kwargs: Any) -> None:  # pragma: no cover - trivial stub
         return None
 
 

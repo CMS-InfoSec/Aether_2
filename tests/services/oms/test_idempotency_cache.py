@@ -36,7 +36,7 @@ if "services.common.adapters" not in sys.modules:
 
     class _KafkaNATSAdapter:
         @staticmethod
-        def flush_events() -> Dict[str, int]:
+        async def flush_events() -> Dict[str, int]:
             return {}
 
     adapters_mod.KafkaNATSAdapter = _KafkaNATSAdapter  # type: ignore[attr-defined]

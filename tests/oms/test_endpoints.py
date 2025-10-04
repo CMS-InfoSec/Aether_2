@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, Tuple
@@ -632,6 +633,68 @@ def test_place_order_returns_424_when_metadata_missing(
     assert call_state == {"get": 2, "refresh": 1}
 
 
+def test_place_order_latency_with_retry_backoff(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ensure slow broker responses do not violate the request latency budget."""
+
+    class _SlowTimescale:
+        def __init__(self, account_id: str) -> None:
+            self.account_id = account_id
+
+        def record_ack(self, payload: Dict[str, Any]) -> None:
+            return None
+
+        def record_usage(self, notional: float) -> None:
+            return None
+
+        def record_fill(self, payload: Dict[str, Any]) -> None:
+            return None
+
+        def record_shadow_fill(self, payload: Dict[str, Any]) -> None:
+            return None
+
+    attempt_log: Dict[str, list[int]] = {}
+    retry_delay = 0.03
+    simulated_retries = 3
+
+    class _SlowKafka:
+        def __init__(self, account_id: str) -> None:
+            self.account_id = account_id
+
+        async def publish(self, *, topic: str, payload: Dict[str, Any]) -> None:
+            attempts = 0
+            for _ in range(simulated_retries):
+                attempts += 1
+                await asyncio.sleep(retry_delay)
+            attempt_log.setdefault(topic, []).append(attempts)
+
+    monkeypatch.setattr(main, "KafkaNATSAdapter", _SlowKafka)
+    monkeypatch.setattr(main, "TimescaleAdapter", _SlowTimescale)
+    monkeypatch.setattr(main, "ACK_CACHE_TTL_SECONDS", 0.0)
+
+    payload = {
+        "account_id": "admin-alpha",
+        "order_id": "order-latency",
+        "instrument": "BTC-USD",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 101.5,
+        "fee": {"currency": "USD", "maker": 0.1, "taker": 0.2},
+    }
+
+    start = time.perf_counter()
+    response = client.post("/oms/place", json=payload, headers={"X-Account-ID": "admin-alpha"})
+    duration = time.perf_counter() - start
+
+    assert response.status_code == 200
+    assert duration < 0.35, f"request exceeded latency budget: {duration:.3f}s"
+    assert attempt_log, "expected publish attempts to be recorded"
+    for topic, attempts in attempt_log.items():
+        for count in attempts:
+            assert count == simulated_retries, f"unexpected retry count for {topic}: {count}"
+
+
 def test_cancel_order_records_events(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -642,7 +705,7 @@ def test_cancel_order_records_events(
         def __init__(self, account_id: str, **_: Any) -> None:
             self.account_id = account_id
 
-        def publish(self, *, topic: str, payload: Dict[str, Any]) -> None:
+        async def publish(self, *, topic: str, payload: Dict[str, Any]) -> None:
             published.append(
                 {"account_id": self.account_id, "topic": topic, "payload": payload}
             )
@@ -708,7 +771,7 @@ def test_cancel_order_rejection_records_events(
         def __init__(self, account_id: str, **_: Any) -> None:
             self.account_id = account_id
 
-        def publish(self, *, topic: str, payload: Dict[str, Any]) -> None:
+        async def publish(self, *, topic: str, payload: Dict[str, Any]) -> None:
             published.append(
                 {"account_id": self.account_id, "topic": topic, "payload": payload}
             )

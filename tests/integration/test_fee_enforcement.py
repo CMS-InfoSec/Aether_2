@@ -118,7 +118,7 @@ def test_fee_enforcement_blocks_negative_edge(monkeypatch: pytest.MonkeyPatch) -
             self.account_id = account_id
             self._event_store.setdefault(account_id, [])
 
-        def publish(self, topic: str, payload: Dict[str, Any]) -> None:
+        async def publish(self, topic: str, payload: Dict[str, Any]) -> None:
             record = {"topic": topic, "payload": dict(payload)}
             self._event_store[self.account_id].append(record)
 

@@ -43,7 +43,12 @@ from ml.policy.fallback_policy import FallbackDecision, FallbackPolicy
 
 
 from exchange_adapter import get_exchange_adapter, get_exchange_adapters_status
-from metrics import record_abstention_rate, record_drift_score, setup_metrics
+from metrics import (
+    metric_context,
+    record_abstention_rate,
+    record_drift_score,
+    setup_metrics,
+)
 from services.common.security import ADMIN_ACCOUNTS, require_admin_account
 from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
 
@@ -94,6 +99,14 @@ shutdown_manager = setup_graceful_shutdown(
 
 if TYPE_CHECKING:  # pragma: no cover - type checking only
     from services.models.model_server import Intent
+
+try:  # pragma: no cover - optional dependency during testing
+    from services.models.model_server import Intent as Intent
+except Exception:  # pragma: no cover - fallback for limited environments
+    class Intent:  # type: ignore[no-redef]
+        def __init__(self, **kwargs) -> None:
+            for key, value in kwargs.items():
+                setattr(self, key, value)
 
 
 def _predict_intent(**kwargs) -> "Intent":
@@ -313,9 +326,9 @@ def _reset_regime_state() -> None:
 
 
 
-def _resolve_precision(symbol: str) -> Dict[str, float | str]:
+async def _resolve_precision(symbol: str) -> Dict[str, float]:
     try:
-        metadata = precision_provider.require(symbol)
+        return await precision_provider.require(symbol)
 
     except PrecisionMetadataUnavailable as exc:
         logger.error(
@@ -913,9 +926,20 @@ async def decide_policy(
     except (TypeError, ValueError):
         drift_value = 0.0
 
-    record_drift_score(account_id, request.instrument, drift_value)
+    metrics_ctx = metric_context(account_id=account_id, symbol=request.instrument)
+    record_drift_score(
+        account_id,
+        request.instrument,
+        drift_value,
+        context=metrics_ctx,
+    )
     abstain_metric = 0.0 if approved and selected_action != "abstain" else 1.0
-    record_abstention_rate(account_id, request.instrument, abstain_metric)
+    record_abstention_rate(
+        account_id,
+        request.instrument,
+        abstain_metric,
+        context=metrics_ctx,
+    )
 
     response = PolicyDecisionResponse(
         approved=approved,

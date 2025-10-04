@@ -4,24 +4,72 @@ import sys
 from decimal import Decimal
 from pathlib import Path
 from datetime import datetime, timezone
+from typing import Any
 
 import pytest
 
 pytest.importorskip("services.common.security")
 pytest.importorskip("fastapi")
+pytest.importorskip("sqlalchemy")
 from fastapi.testclient import TestClient
-from sqlalchemy import text
+from sqlalchemy import create_engine as _sa_create_engine, text
+from sqlalchemy.engine import Engine
+from sqlalchemy.engine.url import make_url
+from sqlalchemy.pool import StaticPool
 
 from tests.helpers.authentication import override_admin_auth
 from tests.helpers.risk import risk_service_instance
 
 
+_REAL_CREATE_ENGINE = _sa_create_engine
+
+
+class _EngineProxy:
+    """Proxy that mimics a PostgreSQL engine for SQLite-backed tests."""
+
+    def __init__(self, inner: Engine) -> None:
+        self._inner = inner
+        self.url = make_url("postgresql+psycopg2://allocator:test@localhost/allocator")
+
+    def __getattr__(self, item: str) -> Any:
+        return getattr(self._inner, item)
+
+    def dispose(self) -> None:  # pragma: no cover - passthrough
+        self._inner.dispose()
+
+
 def _reload_allocator(monkeypatch: pytest.MonkeyPatch, db_url: str) -> object:
-    monkeypatch.setenv("CAPITAL_ALLOCATOR_DB_URL", db_url)
+    monkeypatch.setenv("CAPITAL_ALLOCATOR_DB_URL", "postgresql://allocator:test@localhost/allocator")
     monkeypatch.setenv("ALLOCATOR_DRAWDOWN_THRESHOLD", "0.8")
     monkeypatch.setenv("ALLOCATOR_MIN_THROTTLE_PCT", "0.05")
+    monkeypatch.delenv("CAPITAL_ALLOCATOR_SSLMODE", raising=False)
+
+    def _patched_create_engine(url: str, **kwargs: Any) -> _EngineProxy:  # type: ignore[override]
+        assert url.startswith("postgresql")
+        kwargs.pop("pool_size", None)
+        kwargs.pop("max_overflow", None)
+        kwargs.pop("pool_timeout", None)
+        kwargs.pop("pool_recycle", None)
+        connect_args = kwargs.pop("connect_args", {}) or {}
+        connect_args.pop("sslmode", None)
+        connect_args.pop("application_name", None)
+        inner = _REAL_CREATE_ENGINE(
+            db_url,
+            future=True,
+            connect_args={**connect_args, "check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        return _EngineProxy(inner)
+
+    monkeypatch.setattr("sqlalchemy.create_engine", _patched_create_engine, raising=False)
     sys.modules.pop("capital_allocator", None)
     module = importlib.import_module("capital_allocator")
+    monkeypatch.setattr(
+        module,
+        "run_allocator_migrations",
+        lambda: module.Base.metadata.create_all(bind=module.ENGINE),
+    )
+    module.run_allocator_migrations()
     return module
 
 

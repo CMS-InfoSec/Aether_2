@@ -11,10 +11,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
 
 from services.common.adapters import TimescaleAdapter
+from services.common.security import get_admin_accounts, require_admin_account
 
 
 PORTFOLIO_LOGGER = logging.getLogger("portfolio_risk_log")
@@ -423,12 +424,35 @@ aggregator = PortfolioRiskAggregator(
     correlation_limit=_load_correlation_limit(),
 )
 
+def _load_authorized_viewers() -> set[str]:
+    payload = _json_env(
+        "PORTFOLIO_RISK_VIEWERS",
+        tuple(sorted(get_admin_accounts(normalized=True))),
+    )
+    viewers: set[str] = set()
+    if isinstance(payload, Sequence) and not isinstance(payload, (str, bytes)):
+        for entry in payload:
+            normalized = str(entry).strip().lower()
+            if normalized:
+                viewers.add(normalized)
+    return viewers or {account.lower() for account in get_admin_accounts(normalized=True)}
+
+
+AUTHORIZED_VIEWERS: set[str] = _load_authorized_viewers()
+
 app = FastAPI(title="Portfolio Risk Service")
 
 
 @app.get("/risk/portfolio/status", response_model=PortfolioStatusResponse)
-def portfolio_status() -> PortfolioStatusResponse:
+def portfolio_status(caller: str = Depends(require_admin_account)) -> PortfolioStatusResponse:
     """Return aggregated risk posture across all configured accounts."""
+
+    normalized_caller = caller.strip().lower()
+    if normalized_caller not in AUTHORIZED_VIEWERS:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account is not authorised to view portfolio risk aggregates.",
+        )
 
     return aggregator.portfolio_status()
 

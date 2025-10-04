@@ -754,14 +754,16 @@ class KafkaNATSAdapter:
         self._instances.add(self)
 
         self._lock = threading.Lock()
-        self._kafka_client: httpx.Client | None = None
-        self._nats_client: httpx.Client | None = None
+        self._kafka_client: httpx.AsyncClient | None = None
+        self._nats_client: httpx.AsyncClient | None = None
+        self._kafka_client_task: asyncio.Task[httpx.AsyncClient | None] | None = None
+        self._nats_client_task: asyncio.Task[httpx.AsyncClient | None] | None = None
         self._kafka_prefix = ""
         self._nats_prefix = ""
 
         self._bootstrap_clients()
 
-    def publish(self, topic: str, payload: Dict[str, Any]) -> None:
+    async def publish(self, topic: str, payload: Dict[str, Any]) -> None:
         enriched = attach_correlation(payload)
         record = {
             "topic": topic,
@@ -773,7 +775,7 @@ class KafkaNATSAdapter:
         }
 
         try:
-            status = self._attempt_publish(record)
+            status = await self._attempt_publish(record)
         except PublishError:
             self._buffer_event(record)
             self._record_event(record)
@@ -821,10 +823,10 @@ class KafkaNATSAdapter:
                 instance._shutdown()
 
     @classmethod
-    def flush_events(cls) -> Dict[str, int]:
+    async def flush_events(cls) -> Dict[str, int]:
         counts: Dict[str, int] = {}
         for instance in list(cls._instances):
-            drained = instance._drain_buffer()
+            drained = await instance._drain_buffer()
             if drained:
                 counts[instance.account_id] = drained
         return counts
@@ -844,7 +846,11 @@ class KafkaNATSAdapter:
         if kafka_config:
             self._kafka_prefix = kafka_config.topic_prefix.strip()
             endpoint = _first_endpoint(kafka_config.bootstrap_servers)
-            self._kafka_client = self._build_client(endpoint)
+            kafka_client = self._build_client(endpoint)
+            if isinstance(kafka_client, asyncio.Task):
+                self._kafka_client_task = kafka_client
+            else:
+                self._kafka_client = kafka_client
 
         try:
             nats_config = self.nats_config_factory(self.account_id)
@@ -855,41 +861,107 @@ class KafkaNATSAdapter:
         if nats_config and nats_config.servers:
             self._nats_prefix = nats_config.subject_prefix.strip()
             endpoint = _first_endpoint(nats_config.servers)
-            self._nats_client = self._build_client(endpoint)
+            nats_client = self._build_client(endpoint)
+            if isinstance(nats_client, asyncio.Task):
+                self._nats_client_task = nats_client
+            else:
+                self._nats_client = nats_client
 
-    def _build_client(self, endpoint: str) -> httpx.Client | None:
-        try:
-            base_url = _as_base_url(endpoint)
-            client = httpx.Client(base_url=base_url, timeout=self.request_timeout)
+    def _build_client(
+        self, endpoint: str
+    ) -> httpx.AsyncClient | asyncio.Task[httpx.AsyncClient | None] | None:
+        async def _initialise() -> httpx.AsyncClient | None:
+            try:
+                base_url = _as_base_url(endpoint)
+                client = httpx.AsyncClient(base_url=base_url, timeout=self.request_timeout)
+            except Exception:
+                logger.exception(
+                    "Failed to initialise broker client", extra={"endpoint": endpoint}
+                )
+                return None
+
             attempt = 0
             while True:
                 attempt += 1
                 try:
-                    response = client.get("/health")
+                    response = await client.get("/health")
+                    response.raise_for_status()
                     if response.status_code >= 500:
                         raise PublishError(
                             f"Broker health check failed ({response.status_code})"
                         )
-                    break
+                    return client
                 except httpx.HTTPStatusError as exc:
-                    client.close()
+                    await client.aclose()
                     raise PublishError("Broker health check failed") from exc
                 except httpx.RequestError:
                     if attempt >= self.max_retries:
-                        client.close()
+                        await client.aclose()
                         return None
-                    time.sleep(self.backoff_seconds * (2 ** (attempt - 1)))
-            return client
-        except Exception:
-            logger.exception("Failed to initialise broker client", extra={"endpoint": endpoint})
+                    await asyncio.sleep(self.backoff_seconds * (2 ** (attempt - 1)))
+
+        async def _wrapper() -> httpx.AsyncClient | None:
+            try:
+                return await _initialise()
+            except PublishError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Failed to initialise broker client", extra={"endpoint": endpoint}
+                )
+                return None
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            return loop.create_task(_wrapper())
+
+        try:
+            return asyncio.run(_wrapper())
+        except PublishError:
             return None
 
-    def _attempt_publish(self, record: Dict[str, Any]) -> str:
+    async def _ensure_client(
+        self,
+        client_attr: str,
+        task_attr: str,
+        transport: str,
+    ) -> httpx.AsyncClient | None:
+        client = getattr(self, client_attr)
+        if client is not None:
+            return client
+
+        task: asyncio.Task[httpx.AsyncClient | None] | None = getattr(self, task_attr)
+        if task is None:
+            return None
+
+        try:
+            client = await task
+        except PublishError:
+            client = None
+        except Exception:
+            logger.exception(
+                "Broker bootstrap task failed", extra={"transport": transport}
+            )
+            client = None
+
+        setattr(self, task_attr, None)
+        setattr(self, client_attr, client)
+        return client
+
+    async def _attempt_publish(self, record: Dict[str, Any]) -> str:
         transports = []
-        if self._kafka_client is not None:
-            transports.append((self._kafka_client, self._topic_path(record["topic"])))
-        if self._nats_client is not None:
-            transports.append((self._nats_client, self._subject_path(record["topic"])) )
+
+        kafka_client = await self._ensure_client("_kafka_client", "_kafka_client_task", "kafka")
+        if kafka_client is not None:
+            transports.append((kafka_client, self._topic_path(record["topic"])))
+
+        nats_client = await self._ensure_client("_nats_client", "_nats_client_task", "nats")
+        if nats_client is not None:
+            transports.append((nats_client, self._subject_path(record["topic"])) )
 
         if not transports:
             return "offline"
@@ -898,7 +970,7 @@ class KafkaNATSAdapter:
         successes = 0
         for client, path in transports:
             try:
-                self._send_with_retry(client, path, record["payload"])
+                await self._send_with_retry(client, path, record["payload"])
             except BaseException as exc:
                 errors.append(exc)
                 logger.warning(
@@ -920,12 +992,14 @@ class KafkaNATSAdapter:
             return "all"
         return "partial"
 
-    def _send_with_retry(self, client: httpx.Client, path: str, payload: Dict[str, Any]) -> None:
+    async def _send_with_retry(
+        self, client: httpx.AsyncClient, path: str, payload: Dict[str, Any]
+    ) -> None:
         attempt = 0
         while True:
             attempt += 1
             try:
-                response = client.post(path, json=payload)
+                response = await client.post(path, json=payload)
                 response.raise_for_status()
                 return
             except httpx.HTTPStatusError as exc:
@@ -934,7 +1008,7 @@ class KafkaNATSAdapter:
             except httpx.RequestError as exc:
                 if attempt >= self.max_retries:
                     raise PublishError("Transport error during publish") from exc
-            time.sleep(self.backoff_seconds * (2 ** (attempt - 1)))
+            await asyncio.sleep(self.backoff_seconds * (2 ** (attempt - 1)))
 
     def _topic_path(self, topic: str) -> str:
         full = topic
@@ -968,13 +1042,13 @@ class KafkaNATSAdapter:
                 return
         events.append(dict(record))
 
-    def _drain_buffer(self) -> int:
+    async def _drain_buffer(self) -> int:
         drained = 0
         buffer = self._fallback_buffer.get(self.account_id, [])
         while buffer:
             record = buffer[0]
             try:
-                status = self._attempt_publish(record)
+                status = await self._attempt_publish(record)
             except PublishError:
                 break
             if status == "all":
@@ -994,13 +1068,38 @@ class KafkaNATSAdapter:
         return drained
 
     def _shutdown(self) -> None:
+        clients: List[httpx.AsyncClient] = []
         with self._lock:
+            if self._kafka_client_task is not None:
+                self._kafka_client_task.cancel()
+                self._kafka_client_task = None
+            if self._nats_client_task is not None:
+                self._nats_client_task.cancel()
+                self._nats_client_task = None
+
             if self._kafka_client is not None:
-                self._kafka_client.close()
+                clients.append(self._kafka_client)
                 self._kafka_client = None
             if self._nats_client is not None:
-                self._nats_client.close()
+                clients.append(self._nats_client)
                 self._nats_client = None
+
+        if not clients:
+            return
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        for client in clients:
+            if loop and loop.is_running():
+                loop.create_task(client.aclose())
+            else:
+                try:
+                    asyncio.run(client.aclose())
+                except RuntimeError:
+                    logger.exception("Failed to close broker client", exc_info=True)
 
 
 class TimescaleAdapter:
