@@ -138,7 +138,7 @@ jobs:
           fi
           echo "$COSIGN_PRIVATE_KEY" > cosign.key
           trap 'rm -f cosign.key' EXIT
-          cosign sign --key cosign.key "${{ needs.build-image.outputs.image_ref }}@${{ needs.build-image.outputs.image_digest }}"
+          cosign sign --key cosign.key "${{ needs.build-image.outputs.image_ref }}@${{ needs.build-image.outputs.image_digest}}"
 
   deploy:
     name: Deploy to Linode via Argo CD
