@@ -10,9 +10,13 @@ from typing import Dict, Iterator
 
 import pytest
 
+from tests.helpers.risk import patch_sqlalchemy_for_risk
+
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+_RESTORE_SQLALCHEMY = patch_sqlalchemy_for_risk(Path(__file__).with_name("risk_service_unit.db"))
 
 pytest.importorskip("fastapi")
 pytest.importorskip("services.common.security")
@@ -21,6 +25,8 @@ from fastapi.testclient import TestClient
 
 from risk_service import RiskEvaluationContext, app as risk_app, require_admin_account
 from tests.helpers.authentication import override_admin_auth
+
+_RESTORE_SQLALCHEMY()
 
 config = dict(getattr(RiskEvaluationContext, "model_config", {}))
 config["arbitrary_types_allowed"] = True

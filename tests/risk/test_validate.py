@@ -4,8 +4,21 @@ from __future__ import annotations
 from collections.abc import Generator
 from typing import Any
 
+from pathlib import Path
+
 import pytest
 
+import sys
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from tests.helpers.risk import patch_sqlalchemy_for_risk
+
+_RESTORE_SQLALCHEMY = patch_sqlalchemy_for_risk(Path(__file__).with_name("risk_validate.db"))
+
+pytest.importorskip("services.common.adapters")
 from services.common.adapters import RedisFeastAdapter, TimescaleAdapter
 from services.common.schemas import (
     FeeBreakdown,
@@ -18,6 +31,8 @@ from services.common.schemas import (
     RiskValidationResponse,
 )
 from services.risk.engine import RiskEngine
+
+_RESTORE_SQLALCHEMY()
 
 class StubUniverseRepository:
     def __init__(self) -> None:

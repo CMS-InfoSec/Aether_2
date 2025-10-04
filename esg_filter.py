@@ -23,7 +23,6 @@ from sqlalchemy import (
 )
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
-from sqlalchemy.pool import StaticPool
 
 from services.common.security import require_admin_account
 
@@ -75,36 +74,67 @@ class ESGRejection(Base):
     )
 
 
-DEFAULT_DATABASE_URL = "sqlite:///./risk.db"
-
-
 def _database_url() -> str:
-    url = (
-        os.getenv("ESG_DATABASE_URL")
-        or os.getenv("RISK_DATABASE_URL")
-        or os.getenv("TIMESCALE_DSN")
-        or os.getenv("DATABASE_URL")
-        or DEFAULT_DATABASE_URL
+    url = os.getenv("ESG_DATABASE_URL")
+    if not url:
+        raise RuntimeError(
+            "ESG_DATABASE_URL must be defined with a PostgreSQL/Timescale connection string."
+        )
+
+    normalized = url.lower()
+    if normalized.startswith("postgres://"):
+        url = "postgresql://" + url.split("://", 1)[1]
+        normalized = url.lower()
+
+    allowed_prefixes = (
+        "postgresql://",
+        "postgresql+psycopg://",
+        "postgresql+psycopg2://",
     )
+    if not normalized.startswith(allowed_prefixes):
+        raise RuntimeError(
+            "ESG filter requires a PostgreSQL/Timescale DSN; "
+            f"received '{url}'."
+        )
+
     if url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
     return url
 
 
 def _engine_options(url: str) -> dict[str, object]:
-    options: dict[str, object] = {"future": True}
-    if url.startswith("sqlite://"):
-        options.setdefault("connect_args", {"check_same_thread": False})
-        if url.endswith(":memory:"):
-            options["poolclass"] = StaticPool
+    options: dict[str, object] = {
+        "future": True,
+        "pool_pre_ping": True,
+        "pool_size": int(os.getenv("ESG_DB_POOL_SIZE", "10")),
+        "max_overflow": int(os.getenv("ESG_DB_MAX_OVERFLOW", "20")),
+        "pool_timeout": int(os.getenv("ESG_DB_POOL_TIMEOUT", "30")),
+        "pool_recycle": int(os.getenv("ESG_DB_POOL_RECYCLE", "1800")),
+    }
+
+    sslmode = os.getenv("ESG_DB_SSLMODE", "require").strip()
+    connect_args: dict[str, object] = {}
+    if sslmode:
+        connect_args["sslmode"] = sslmode
+    options["connect_args"] = connect_args
     return options
+
+
+def _run_migrations(engine: Engine) -> None:
+    """Ensure ESG tables exist in the configured database."""
+
+    Base.metadata.create_all(
+        bind=engine,
+        tables=[ESGAsset.__table__, ESGRejection.__table__],
+        checkfirst=True,
+    )
 
 
 _DB_URL = _database_url()
 ENGINE: Engine = create_engine(_DB_URL, **_engine_options(_DB_URL))
 SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
 
-Base.metadata.create_all(bind=ENGINE)
+_run_migrations(ENGINE)
 
 
 ALLOWED_FLAGS = {"clear", "watch", "high_environmental", "high_regulatory"}
