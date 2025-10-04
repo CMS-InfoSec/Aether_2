@@ -61,8 +61,8 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum(rate(policy_latency_ms_bucket[$__rate_interval])) by (le, symbol, account_id))",
-          "legendFormat": "policy p50 {{symbol}}/{{account_id}}",
+          "expr": "histogram_quantile(0.50, sum(rate(policy_latency_ms_bucket[$__rate_interval])) by (le, symbol_tier, account_segment))",
+          "legendFormat": "policy p50 {{symbol_tier}}/{{account_segment}}",
           "refId": "A"
         },
         {
@@ -71,8 +71,8 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum(rate(policy_latency_ms_bucket[$__rate_interval])) by (le, symbol, account_id))",
-          "legendFormat": "policy p95 {{symbol}}/{{account_id}}",
+          "expr": "histogram_quantile(0.95, sum(rate(policy_latency_ms_bucket[$__rate_interval])) by (le, symbol_tier, account_segment))",
+          "legendFormat": "policy p95 {{symbol_tier}}/{{account_segment}}",
           "refId": "B"
         },
         {
@@ -81,8 +81,8 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum(rate(policy_latency_ms_bucket[$__rate_interval])) by (le, symbol, account_id))",
-          "legendFormat": "policy p99 {{symbol}}/{{account_id}}",
+          "expr": "histogram_quantile(0.99, sum(rate(policy_latency_ms_bucket[$__rate_interval])) by (le, symbol_tier, account_segment))",
+          "legendFormat": "policy p99 {{symbol_tier}}/{{account_segment}}",
           "refId": "C"
         }
       ],
@@ -126,8 +126,8 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum(rate(risk_latency_ms_bucket[$__rate_interval])) by (le, symbol, account_id))",
-          "legendFormat": "risk p50 {{symbol}}/{{account_id}}",
+          "expr": "histogram_quantile(0.50, sum(rate(risk_latency_ms_bucket[$__rate_interval])) by (le, symbol_tier, account_segment))",
+          "legendFormat": "risk p50 {{symbol_tier}}/{{account_segment}}",
           "refId": "A"
         },
         {
@@ -136,8 +136,8 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum(rate(risk_latency_ms_bucket[$__rate_interval])) by (le, symbol, account_id))",
-          "legendFormat": "risk p95 {{symbol}}/{{account_id}}",
+          "expr": "histogram_quantile(0.95, sum(rate(risk_latency_ms_bucket[$__rate_interval])) by (le, symbol_tier, account_segment))",
+          "legendFormat": "risk p95 {{symbol_tier}}/{{account_segment}}",
           "refId": "B"
         },
         {
@@ -146,8 +146,8 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum(rate(risk_latency_ms_bucket[$__rate_interval])) by (le, symbol, account_id))",
-          "legendFormat": "risk p99 {{symbol}}/{{account_id}}",
+          "expr": "histogram_quantile(0.99, sum(rate(risk_latency_ms_bucket[$__rate_interval])) by (le, symbol_tier, account_segment))",
+          "legendFormat": "risk p99 {{symbol_tier}}/{{account_segment}}",
           "refId": "C"
         }
       ],
@@ -191,8 +191,8 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum(rate(oms_latency_ms_bucket[$__rate_interval])) by (le, symbol, account_id))",
-          "legendFormat": "oms p50 {{symbol}}/{{account_id}}",
+          "expr": "histogram_quantile(0.50, sum(rate(oms_latency_ms_bucket[$__rate_interval])) by (le, symbol_tier, account_segment))",
+          "legendFormat": "oms p50 {{symbol_tier}}/{{account_segment}}",
           "refId": "A"
         },
         {
@@ -201,8 +201,8 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum(rate(oms_latency_ms_bucket[$__rate_interval])) by (le, symbol, account_id))",
-          "legendFormat": "oms p95 {{symbol}}/{{account_id}}",
+          "expr": "histogram_quantile(0.95, sum(rate(oms_latency_ms_bucket[$__rate_interval])) by (le, symbol_tier, account_segment))",
+          "legendFormat": "oms p95 {{symbol_tier}}/{{account_segment}}",
           "refId": "B"
         },
         {
@@ -211,8 +211,8 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum(rate(oms_latency_ms_bucket[$__rate_interval])) by (le, symbol, account_id))",
-          "legendFormat": "oms p99 {{symbol}}/{{account_id}}",
+          "expr": "histogram_quantile(0.99, sum(rate(oms_latency_ms_bucket[$__rate_interval])) by (le, symbol_tier, account_segment))",
+          "legendFormat": "oms p99 {{symbol_tier}}/{{account_segment}}",
           "refId": "C"
         }
       ],

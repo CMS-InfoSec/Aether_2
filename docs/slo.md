@@ -14,19 +14,19 @@ This document defines the quantitative availability and responsiveness expectati
 | Model Canary Promotion | Completion time of canary to production promotion (`model_canary_promotion_duration_minutes`) | ≤ 45 minutes for 95% of promotions in 30-day window | `model_canary_promotion_slow` fires when 3 consecutive promotions exceed 30 minutes |
 
 ## Policy Latency
-- **Measurement**: Prometheus histogram `policy_latency_ms` tagged by `symbol` and `account_id` tracks end-to-end policy evaluation time.
+- **Measurement**: Prometheus histogram `policy_latency_ms` tagged by `symbol_tier` and `account_segment` tracks end-to-end policy evaluation time without exploding series cardinality.
 - **Target**: Keep the rolling 5-minute p95 ≤ 200 ms to prevent backlog in the decisioning pipeline.
 - **Alerting**: `policy_latency_p95_slo_breach` triggers when p95 latency breaches 200 ms for two of the last three evaluations.
 - **Runbooks**: Use [`docs/runbooks/policy_latency.md`](runbooks/policy_latency.md) for triage steps.
 
 ## Risk Latency
-- **Measurement**: Histogram `risk_latency_ms` captures validation latency per order candidate across risk controls.
+- **Measurement**: Histogram `risk_latency_ms` captures validation latency per order candidate, aggregated by `symbol_tier` and `account_segment`.
 - **Target**: Maintain rolling 5-minute p95 ≤ 200 ms to ensure OMS submissions are not blocked.
 - **Alerting**: `risk_latency_p95_slo_breach` fires when p95 latency is above 200 ms for two of the last three intervals.
 - **Runbooks**: Follow [`docs/runbooks/risk_latency.md`](runbooks/risk_latency.md).
 
 ## OMS Latency
-- **Measurement**: Histogram `oms_latency_ms` records submission latency to external venues, keyed by symbol and account.
+- **Measurement**: Histogram `oms_latency_ms` records submission latency to external venues, keyed by `symbol_tier` and `account_segment`.
 - **Target**: Hold the rolling 5-minute p95 ≤ 500 ms to absorb market spikes without missing fills.
 - **Alerting**: `oms_latency_p95_slo_breach` fires when the rolling p95 is above 500 ms for two of the last three evaluations.
 - **Runbooks**: See [`docs/runbooks/oms_latency.md`](runbooks/oms_latency.md) and [`docs/runbooks/kill_switch_activation.md`](runbooks/kill_switch_activation.md) for remediation guidance.
