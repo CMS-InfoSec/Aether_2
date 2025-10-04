@@ -96,6 +96,49 @@ global:
         ports:
           - 443
 backendServices:
+  accountService:
+    enabled: true
+    nameOverride: account-service
+    image:
+      repository: cmsinfosec/aether-account-service
+      tag: latest
+    replicaCount: 1
+    containerPort: 8000
+    env:
+      - name: ACCOUNTS_DATABASE_URL
+        valueFrom:
+          secretKeyRef:
+            name: account-service-database
+            key: dsn
+      - name: ACCOUNT_ENCRYPTION_KEY
+        valueFrom:
+          secretKeyRef:
+            name: account-service-secrets
+            key: encryptionKey
+      - name: K8S_SECRET_SYNC
+        value: "true"
+    usesKrakenSecrets: true
+    extraVolumeMounts: []
+    extraVolumes: []
+    service:
+      port: 80
+      targetPort: http
+    ingress:
+      enabled: true
+      host: accounts.aether.example.com
+      tlsSecret: account-service-tls
+      annotations: {}
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 300m
+        memory: 512Mi
+    hpa:
+      enabled: false
+    pdb:
+      enabled: false
   behavior:
     enabled: true
     nameOverride: behavior-service

@@ -1,0 +1,12 @@
+trading:
+  max_positions: 10
+  max_notional_per_symbol: 250000
+risk:
+  max_drawdown_pct: 0.2
+  max_var_pct: 0.05
+training:
+  retrain_interval_days: 7
+  window_days: 90
+hedge:
+  target_pct: 0.25
+  rebalance_frequency: daily
