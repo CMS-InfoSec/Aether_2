@@ -247,7 +247,10 @@ def test_risk_engine_blocks_when_allocator_throttles(
         throttled=True,
     )
 
-    monkeypatch.setattr(module, "_query_allocator_state", lambda account_id: throttled_state)
+    async def _stub_allocator_state(account_id: str) -> module.AllocatorAccountState:
+        return throttled_state
+
+    monkeypatch.setattr(module, "_query_allocator_state", _stub_allocator_state)
 
     payload = {
         "account_id": "company",
