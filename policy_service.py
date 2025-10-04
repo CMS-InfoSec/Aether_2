@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 
+import asyncio
 import logging
 import math
 import os
@@ -319,15 +320,26 @@ def _reset_regime_state() -> None:
 
 
 
+
 async def _resolve_precision(symbol: str) -> Dict[str, float]:
     try:
         return await precision_provider.require(symbol)
+
     except PrecisionMetadataUnavailable as exc:
-        logger.error("Precision metadata unavailable for instrument %s", symbol)
+        logger.error(
+            "Precision metadata unavailable for native instrument %s", native,
+            extra={"requested_symbol": symbol},
+        )
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Precision metadata unavailable",
         ) from exc
+
+    native_pair = metadata.get("native_pair")
+    if not native_pair and symbol:
+        metadata = dict(metadata)
+        metadata["native_pair"] = symbol.replace("-", "/")
+    return metadata
 
 
 def _snap(value: float, step: float) -> float:

@@ -9,13 +9,15 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 from sqlalchemy import Column, DateTime, Integer, Numeric, String, create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
+
+from services.common.security import get_admin_accounts, require_admin_account
 
 
 LOGGER = logging.getLogger(__name__)
@@ -428,7 +430,8 @@ app = FastAPI(title="Capital Allocator Service", version="1.0.0")
 
 
 @app.get("/allocator/status", response_model=AllocationResponse)
-def allocator_status() -> AllocationResponse:
+def allocator_status(actor: str = Depends(require_admin_account)) -> AllocationResponse:
+    _ensure_allocator_privileges(actor)
     with SessionLocal() as session:
         navs = _load_latest_navs(session)
         if not navs:
@@ -443,7 +446,11 @@ def allocator_status() -> AllocationResponse:
 
 
 @app.post("/allocator/rebalance", response_model=AllocationResponse)
-def rebalance_allocation(request: AllocationRequest) -> AllocationResponse:
+def rebalance_allocation(
+    request: AllocationRequest,
+    actor: str = Depends(require_admin_account),
+) -> AllocationResponse:
+    _ensure_allocator_privileges(actor)
     with SessionLocal() as session:
         navs = _load_latest_navs(session)
         if not navs:
@@ -471,3 +478,26 @@ def rebalance_allocation(request: AllocationRequest) -> AllocationResponse:
 
 __all__ = ["app", "SessionLocal", "ENGINE", "CapitalAllocation"]
 
+_ALLOCATOR_PRIVILEGE_ENV = "CAPITAL_ALLOCATOR_ADMINS"
+
+
+def _allocator_privileged_accounts() -> set[str]:
+    raw = os.getenv(_ALLOCATOR_PRIVILEGE_ENV)
+    if raw:
+        return {
+            entry.strip().lower()
+            for entry in raw.split(",")
+            if entry and entry.strip()
+        }
+    return {account for account in get_admin_accounts(normalized=True)}
+
+
+def _ensure_allocator_privileges(account_id: str) -> None:
+    normalized = account_id.strip().lower()
+    if not normalized:
+        raise HTTPException(status_code=403, detail="Account is not authorized to manage capital allocations.")
+    if normalized not in _allocator_privileged_accounts():
+        raise HTTPException(
+            status_code=403,
+            detail="Account is not authorized to manage capital allocations.",
+        )

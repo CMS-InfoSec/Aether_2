@@ -411,15 +411,21 @@ class PositionSizer:
             return max(maker, taker, 0.0)
         return None
 
+
     async def _resolve_lot_size(self, symbol: str) -> float:
         metadata = await precision_provider.require(symbol)
+
         lot_size = metadata.get("lot")
         try:
             value = float(lot_size) if lot_size is not None else 0.0
         except (TypeError, ValueError) as exc:  # pragma: no cover - defensive casting
-            raise PrecisionMetadataUnavailable(f"Invalid lot size for {symbol}") from exc
+
+            pair = native_pair or symbol
+            raise PrecisionMetadataUnavailable(f"Invalid lot size for {pair}") from exc
         if value <= 0:
-            raise PrecisionMetadataUnavailable(f"Invalid lot size for {symbol}")
+            pair = native_pair or symbol
+            raise PrecisionMetadataUnavailable(f"Invalid lot size for {pair}")
+
         return value
 
     def _finalize_result(
