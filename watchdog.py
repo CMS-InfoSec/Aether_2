@@ -64,11 +64,9 @@ def _database_url() -> str:
     return normalized
 
 
-DATABASE_URL = _database_url()
-
-
-ENGINE: Engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)
-SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
+# Lazily initialized database engine/session
+ENGINE: Optional[Engine] = None
+SessionLocal: Optional[sessionmaker] = None
 Base = declarative_base()
 
 
@@ -86,7 +84,28 @@ class WatchdogLog(Base):
     ts = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), index=True)
 
 
-Base.metadata.create_all(bind=ENGINE)
+def _initialise_database(app: FastAPI) -> WatchdogRepository:
+    """Initialise the database engine and session factory at startup."""
+
+    global ENGINE, SessionLocal
+
+    if ENGINE is None or SessionLocal is None:
+        database_url = _database_url()
+        ENGINE = create_engine(database_url, future=True, pool_pre_ping=True)
+        SessionLocal = sessionmaker(
+            bind=ENGINE, autoflush=False, expire_on_commit=False, future=True
+        )
+        Base.metadata.create_all(bind=ENGINE)
+
+    if ENGINE is None or SessionLocal is None:  # pragma: no cover - defensive
+        raise RuntimeError("Watchdog database session not initialised")
+
+    session_factory = SessionLocal
+    app.state.watchdog_engine = ENGINE
+    app.state.watchdog_session_factory = session_factory
+    repository = WatchdogRepository(session_factory)
+    app.state.watchdog_repository = repository
+    return repository
 
 
 # ---------------------------------------------------------------------------
@@ -792,13 +811,13 @@ class OversightStatusResponse(BaseModel):
 app = FastAPI(title="Watchdog Oversight Service", version="1.0.0")
 
 
-WATCHDOG_REPOSITORY = WatchdogRepository(SessionLocal)
 WATCHDOG_DETECTOR = IrrationalTradeDetector()
 
 
 @app.on_event("startup")
 async def startup_event() -> None:
-    coordinator = WatchdogCoordinator(detector=WATCHDOG_DETECTOR, repository=WATCHDOG_REPOSITORY)
+    repository = _initialise_database(app)
+    coordinator = WatchdogCoordinator(detector=WATCHDOG_DETECTOR, repository=repository)
     app.state.watchdog_coordinator = coordinator
     await coordinator.start()
 
@@ -811,7 +830,10 @@ async def shutdown_event() -> None:
 
 
 def get_repository() -> WatchdogRepository:
-    return WATCHDOG_REPOSITORY
+    repository: Optional[WatchdogRepository] = getattr(app.state, "watchdog_repository", None)
+    if repository is None:
+        raise RuntimeError("Watchdog repository is not initialised")
+    return repository
 
 
 @app.get("/oversight/status", response_model=OversightStatusResponse)
