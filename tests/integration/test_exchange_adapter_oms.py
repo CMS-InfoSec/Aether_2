@@ -266,11 +266,11 @@ async def test_kraken_adapter_round_trip_through_oms(monkeypatch: pytest.MonkeyP
         def __init__(self, *args, **kwargs) -> None:
             return None
 
-        def publish(self, *args, **kwargs) -> None:
+        async def publish(self, *args, **kwargs) -> None:
             return None
 
         @classmethod
-        def flush_events(cls) -> dict[str, int]:
+        async def flush_events(cls) -> dict[str, int]:
             return {}
 
         @classmethod
@@ -434,11 +434,11 @@ async def test_duplicate_orders_reuse_cached_ack(monkeypatch: pytest.MonkeyPatch
             self.account_id = account_id
             self.messages: list[dict[str, Any]] = []
 
-        def publish(self, *, topic: str, payload: dict[str, Any]) -> None:
+        async def publish(self, *, topic: str, payload: dict[str, Any]) -> None:
             self.messages.append({"topic": topic, "payload": dict(payload)})
 
         @classmethod
-        def flush_events(cls) -> dict[str, int]:
+        async def flush_events(cls) -> dict[str, int]:
             return {}
 
         @classmethod

@@ -110,11 +110,11 @@ class _StubKafka:
         self.account_id = account_id
         self.messages: List[Dict[str, Any]] = []
 
-    def publish(self, *, topic: str, payload: Dict[str, Any]) -> None:
+    async def publish(self, *, topic: str, payload: Dict[str, Any]) -> None:
         self.messages.append({"topic": topic, "payload": dict(payload)})
 
     @classmethod
-    def flush_events(cls) -> Dict[str, int]:
+    async def flush_events(cls) -> Dict[str, int]:
         return {}
 
     @classmethod

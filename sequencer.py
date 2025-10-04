@@ -345,7 +345,7 @@ class AuditPublisher:
         topic = f"{self._topic_prefix}.{topic_suffix}" if topic_suffix else self._topic_prefix
         enriched = tracing.attach_correlation(payload)
         encoded = jsonable_encoder(enriched)
-        await asyncio.to_thread(self._adapter.publish, topic, encoded)  # type: ignore[arg-type]
+        await self._adapter.publish(topic, encoded)  # type: ignore[arg-type]
 
     async def publish_event(
         self,

@@ -203,12 +203,12 @@ def _flush_adapters() -> None:
 
     flush_logging_handlers("", __name__)
 
-    kafka_counts = KafkaNATSAdapter.flush_events()
-    if kafka_counts:
-        logger.info("Flushed Kafka/NATS buffers", extra={"event_counts": kafka_counts})
-
     loop = asyncio.new_event_loop()
     try:
+        kafka_counts = loop.run_until_complete(KafkaNATSAdapter.flush_events())
+        if kafka_counts:
+            logger.info("Flushed Kafka/NATS buffers", extra={"event_counts": kafka_counts})
+
         timescale_summary = loop.run_until_complete(
             TimescaleAdapter.flush_event_buffers()
         )
@@ -1425,7 +1425,7 @@ async def place_order(
             side=request.side,
         )
 
-    kafka.publish(
+    await kafka.publish(
         topic="oms.orders",
         payload={
             "order_id": request.order_id,
@@ -1522,7 +1522,7 @@ async def place_order(
     timescale.record_ack(ack_payload)
     timescale.record_usage(snapped_price * snapped_quantity)
 
-    kafka.publish(topic="oms.acks", payload=ack_payload)
+    await kafka.publish(topic="oms.acks", payload=ack_payload)
 
     status_value = str(ack_payload.get("status", "")).lower()
 
@@ -1553,7 +1553,7 @@ async def place_order(
             ),
         }
         timescale.record_fill(fill_payload)
-        kafka.publish(topic="oms.executions", payload=fill_payload)
+        await kafka.publish(topic="oms.executions", payload=fill_payload)
 
         trade_side = str(trade.get("side", request.side)).lower()
         trade_qty = Decimal(
@@ -1675,12 +1675,10 @@ async def cancel_order(
         response = _cancel_ack_payload(ack, fallback_txid=request.exchange_order_id)
     except HTTPException:
         timescale.record_event("oms.cancel", event_payload)
-        kafka.publish(topic="oms.cancels", payload=event_payload)
-        increment_trade_rejection(
-            request.account_id,
-            "unknown",
-            context=metrics_ctx,
-        )
+
+        await kafka.publish(topic="oms.cancels", payload=event_payload)
+        increment_trade_rejection(request.account_id, "unknown")
+
         raise
 
     event_payload.update(
@@ -1700,7 +1698,7 @@ async def cancel_order(
     event_payload.pop("errors", None)
 
     timescale.record_event("oms.cancel", event_payload)
-    kafka.publish(topic="oms.cancels", payload=event_payload)
+    await kafka.publish(topic="oms.cancels", payload=event_payload)
 
     return response
 

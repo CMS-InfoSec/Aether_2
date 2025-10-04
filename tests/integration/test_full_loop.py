@@ -431,9 +431,11 @@ def test_full_loop_across_accounts(
             if pnl < 0:
                 safe_mode.controller.enter(reason="pnl_limit", actor="sequencer")
 
-            KafkaNATSAdapter(account_id=account_id).publish(
-                "sequencer.fill",
-                {"order_id": order_id, "pnl": pnl, "fee_bps": fee_bps},
+            asyncio.run(
+                KafkaNATSAdapter(account_id=account_id).publish(
+                    "sequencer.fill",
+                    {"order_id": order_id, "pnl": pnl, "fee_bps": fee_bps},
+                )
             )
 
             audit_logger.log_audit(

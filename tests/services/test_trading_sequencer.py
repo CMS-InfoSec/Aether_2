@@ -31,7 +31,7 @@ def _load_sequencer_module() -> ModuleType:
             def __init__(self, account_id: str) -> None:  # pragma: no cover - simple stub
                 self.account_id = account_id
 
-            def publish(self, topic: str, payload: Dict[str, Any]) -> None:  # pragma: no cover
+            async def publish(self, topic: str, payload: Dict[str, Any]) -> None:  # pragma: no cover
                 return None
 
         adapters_module.KafkaNATSAdapter = _StubKafkaAdapter
@@ -133,7 +133,7 @@ class StubKafkaAdapter:
         self.account_id = account_id
         self.published: list[tuple[str, Dict[str, Any]]] = []
 
-    def publish(self, topic: str, payload: Dict[str, Any]) -> None:
+    async def publish(self, topic: str, payload: Dict[str, Any]) -> None:
         self.published.append((topic, dict(payload)))
 
 

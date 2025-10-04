@@ -436,7 +436,7 @@ class SimBroker:
                 liquidity=execution.liquidity,
                 ts=_utcnow(),
             )
-            adapter.publish("oms.fills.simulated", event.model_dump(mode="json"))
+            asyncio.run(adapter.publish("oms.fills.simulated", event.model_dump(mode="json")))
         return execution
 
     def cancel_order(self, account_id: str, client_id: str) -> Optional[SimulatedOrderSnapshot]:

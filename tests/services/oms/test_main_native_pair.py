@@ -17,7 +17,7 @@ class _InitialKafkaAdapter:
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         return None
 
-    def publish(self, *args: Any, **kwargs: Any) -> None:
+    async def publish(self, *args: Any, **kwargs: Any) -> None:
         return None
 
 
@@ -101,7 +101,7 @@ class _StubKafkaAdapter:
         self.account_id = account_id
         self.published: List[Dict[str, Any]] = []
 
-    def publish(self, *, topic: str, payload: Dict[str, Any]) -> None:
+    async def publish(self, *, topic: str, payload: Dict[str, Any]) -> None:
         self.published.append({"topic": topic, "payload": dict(payload)})
 
 
