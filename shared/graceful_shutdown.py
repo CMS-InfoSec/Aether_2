@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import signal
 import sys
@@ -10,7 +11,7 @@ import threading
 import time
 from contextlib import suppress
 from datetime import datetime, timezone
-from typing import Callable, Iterable, List, Optional, Set
+from typing import Awaitable, Callable, Iterable, List, Optional, Sequence, Set
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
@@ -19,7 +20,7 @@ from starlette import status as http_status
 
 logger = logging.getLogger(__name__)
 
-FlushCallback = Callable[[], None]
+FlushCallback = Callable[[], Awaitable[None] | None]
 
 
 def _normalise_path(path: str) -> str:
@@ -61,6 +62,7 @@ class GracefulShutdownManager:
             for path in allowed_paths:
                 self.allow_path(path)
         self._flush_callbacks: List[FlushCallback] = []
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     @property
     def draining(self) -> bool:
@@ -85,6 +87,67 @@ class GracefulShutdownManager:
     def register_flush_callback(self, callback: FlushCallback) -> None:
         self._flush_callbacks.append(callback)
 
+    def bind_event_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+
+    def _prepare_draining(self, reason: str) -> tuple[bool, List[FlushCallback]]:
+        callbacks: List[FlushCallback] = []
+        with self._condition:
+            if self._draining:
+                return False, callbacks
+            self._draining = True
+            self._drain_started_at = datetime.now(timezone.utc)
+            callbacks = list(self._flush_callbacks)
+        if callbacks:
+            logger.info(
+                "Initiating drain for service %s (reason=%s)", self.service_name, reason
+            )
+        return True, callbacks
+
+    async def _run_flush_callbacks_async(self, callbacks: Sequence[FlushCallback]) -> None:
+        self.bind_event_loop(asyncio.get_running_loop())
+        for callback in callbacks:
+            with suppress(Exception):
+                result = callback()
+                if inspect.isawaitable(result):
+                    await result
+
+    async def start_draining_async(self, *, reason: str = "manual") -> bool:
+        started, callbacks = self._prepare_draining(reason)
+        if callbacks:
+            await self._run_flush_callbacks_async(callbacks)
+        return started
+
+    def _await_in_loop(self, awaitable: Awaitable[None]) -> None:
+        async def _await_wrapper() -> None:
+            await awaitable
+
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                try:
+                    loop = asyncio.get_event_loop_policy().get_event_loop()
+                except RuntimeError:
+                    loop = None
+        if loop is not None and loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(_await_wrapper(), loop)
+            future.result()
+            return
+        temp_loop = asyncio.new_event_loop()
+        try:
+            temp_loop.run_until_complete(_await_wrapper())
+        finally:
+            temp_loop.close()
+
+    def _run_flush_callbacks_sync(self, callbacks: Sequence[FlushCallback]) -> None:
+        for callback in callbacks:
+            with suppress(Exception):
+                result = callback()
+                if inspect.isawaitable(result):
+                    self._await_in_loop(result)
+
     def increment_inflight(self) -> None:
         with self._condition:
             self._inflight += 1
@@ -99,20 +162,9 @@ class GracefulShutdownManager:
                 self._condition.notify_all()
 
     def start_draining(self, *, reason: str = "manual") -> bool:
-        callbacks: List[FlushCallback] = []
-        with self._condition:
-            if self._draining:
-                started = False
-            else:
-                started = True
-                self._draining = True
-                self._drain_started_at = datetime.now(timezone.utc)
-                callbacks = list(self._flush_callbacks)
+        started, callbacks = self._prepare_draining(reason)
         if callbacks:
-            logger.info("Initiating drain for service %s (reason=%s)", self.service_name, reason)
-        for callback in callbacks:
-            with suppress(Exception):
-                callback()
+            self._run_flush_callbacks_sync(callbacks)
         return started
 
     def reset(self) -> None:
@@ -238,7 +290,7 @@ def setup_graceful_shutdown(
 
     @app.post("/ops/drain/start", tags=["ops"])
     async def start_drain(response: Response):
-        started = manager.start_draining(reason="api")
+        started = await manager.start_draining_async(reason="api")
         response.status_code = (
             http_status.HTTP_202_ACCEPTED if started else http_status.HTTP_200_OK
         )
@@ -252,11 +304,12 @@ def setup_graceful_shutdown(
     @app.on_event("startup")
     async def _on_startup() -> None:
         manager.reset()
+        manager.bind_event_loop(asyncio.get_running_loop())
         install_sigterm_handler(manager)
 
     @app.on_event("shutdown")
     async def _on_shutdown() -> None:
-        manager.start_draining(reason="shutdown_event")
+        await manager.start_draining_async(reason="shutdown_event")
         await manager.wait_for_inflight_async(timeout=manager.shutdown_timeout)
 
     return manager
