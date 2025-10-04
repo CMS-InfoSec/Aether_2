@@ -1416,43 +1416,9 @@ class TimescaleAdapter:
             _TimescaleStore.clear_all_rotation_state()
             return
 
+        normalized = _normalize_account_id(account_id)
+        _TimescaleStore.clear_all_rotation_state(normalized)
 
-        for cache in rotation_caches:
-            cache.pop(account_id, None)
-
-        account_events = cls._events.get(account_id)
-        if account_events is not None and "credential_rotations" in account_events:
-            rotations = account_events["credential_rotations"]
-            if isinstance(rotations, list):
-                rotations.clear()
-            else:
-                account_events["credential_rotations"] = []
-
-
-
-
-    def record_credential_access(self, *, secret_name: str, metadata: Dict[str, Any]) -> None:
-        sanitized = deepcopy(metadata)
-        for key in ("api_key", "api_secret"):
-            if key in sanitized and sanitized[key]:
-                sanitized[key] = "***"
-        if "material_present" not in sanitized:
-            sanitized["material_present"] = bool(
-                sanitized.get("api_key") and sanitized.get("api_secret")
-            )
-        payload = {
-            "event": "access",
-            "event_type": "kraken.credentials.access",
-            "secret_name": secret_name,
-            "metadata": sanitized,
-            "timestamp": datetime.now(timezone.utc),
-        }
-        events = self._credential_events.setdefault(self.account_id, [])
-        events.append(deepcopy(payload))
-
-
-    def credential_events(self) -> List[Dict[str, Any]]:
-        return [deepcopy(event) for event in self._credential_events.get(self.account_id, [])]
 
 @dataclass
 class RedisFeastAdapter:
