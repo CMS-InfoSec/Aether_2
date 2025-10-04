@@ -422,7 +422,11 @@ class CostThrottler:
         }
 
     def evaluate(self, account_id: str) -> ThrottleStatus:
-        metrics = self._extract_metrics(get_cost_metrics(account_id))
+        snapshot = get_cost_metrics(account_id)
+        if snapshot.metrics is None or snapshot.is_stale():
+            return self.get_status(account_id)
+
+        metrics = self._extract_metrics(snapshot.metrics)
         if metrics is None:
             return self.get_status(account_id)
 
@@ -433,7 +437,7 @@ class CostThrottler:
         else:
             cost_ratio = infra_cost / pnl_reference
 
-        now = datetime.now(timezone.utc)
+        now = snapshot.retrieved_at
         if cost_ratio >= self._ratio_threshold:
             action = self._determine_action(cost_ratio)
             reason = (
