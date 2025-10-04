@@ -12,21 +12,25 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import statistics
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Mapping, Sequence
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from prometheus_client import Gauge
 from pydantic import BaseModel
 
+from auth.service import InMemorySessionStore, RedisSessionStore, SessionStoreProtocol
 from services.analytics.market_data_store import (
     MarketDataAdapter,
     MarketDataUnavailable,
     TimescaleMarketDataAdapter,
     Trade,
 )
+from services.common import security
+from services.common.security import require_admin_account
 
 
 logger = logging.getLogger(__name__)
@@ -351,6 +355,46 @@ class StressTestResponse(BaseModel):
 app = FastAPI(title="Advanced Signal Service", version="1.0.0")
 
 
+def _resolve_session_store_dsn() -> str:
+    for env_var in ("SESSION_REDIS_URL", "SESSION_STORE_URL", "SESSION_BACKEND_DSN"):
+        value = os.getenv(env_var)
+        if value:
+            return value
+    raise RuntimeError(
+        "Session store misconfigured: configure SESSION_REDIS_URL, SESSION_STORE_URL, or SESSION_BACKEND_DSN so "
+        "the signal service can authenticate administrative callers.",
+    )
+
+
+def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
+    existing = getattr(application.state, "session_store", None)
+    if isinstance(existing, SessionStoreProtocol):
+        store = existing
+    else:
+        dsn = _resolve_session_store_dsn()
+        ttl_minutes = int(os.getenv("SESSION_TTL_MINUTES", "60"))
+        if dsn.startswith("memory://"):
+            store = InMemorySessionStore(ttl_minutes=ttl_minutes)
+        else:
+            try:  # pragma: no cover - optional dependency for production deployments
+                import redis  # type: ignore[import-not-found]
+            except ImportError as exc:  # pragma: no cover - surfaced when redis package missing locally
+                raise RuntimeError(
+                    "redis package is required when configuring the signal service session store via SESSION_REDIS_URL.",
+                ) from exc
+
+            client = redis.Redis.from_url(dsn)
+            store = RedisSessionStore(client, ttl_minutes=ttl_minutes)
+
+        application.state.session_store = store
+
+    security.set_default_session_store(store)
+    return store
+
+
+SESSION_STORE = _configure_session_store(app)
+
+
 def _market_data_adapter() -> MarketDataAdapter:
     adapter = getattr(app.state, "market_data_adapter", None)
     if adapter is None:
@@ -359,7 +403,11 @@ def _market_data_adapter() -> MarketDataAdapter:
 
 
 @app.get("/signals/orderflow/{symbol}", response_model=OrderFlowResponse)
-def order_flow_signals(symbol: str, window: int = Query(300, ge=60, le=3600)) -> OrderFlowResponse:
+def order_flow_signals(
+    symbol: str,
+    window: int = Query(300, ge=60, le=3600),
+    _caller: str = Depends(require_admin_account),
+) -> OrderFlowResponse:
     adapter = _market_data_adapter()
     try:
         trades = adapter.recent_trades(symbol, window=window)
@@ -398,6 +446,7 @@ def cross_asset_signals(
     alt_symbol: str,
     window: int = Query(180, ge=30, le=720),
     max_lag: int = Query(10, ge=1, le=50),
+    _caller: str = Depends(require_admin_account),
 ) -> CrossAssetResponse:
     adapter = _market_data_adapter()
     try:
@@ -430,6 +479,7 @@ def volatility_signals(
     symbol: str,
     window: int = Query(240, ge=60, le=960),
     horizon: int = Query(12, ge=1, le=60),
+    _caller: str = Depends(require_admin_account),
 ) -> VolatilityResponse:
     adapter = _market_data_adapter()
     try:
@@ -456,6 +506,7 @@ def whale_signals(
     symbol: str,
     window: int = Query(900, ge=120, le=7200),
     threshold_sigma: float = Query(2.5, ge=1.0, le=6.0),
+    _caller: str = Depends(require_admin_account),
 ) -> WhaleResponse:
     adapter = _market_data_adapter()
     try:
@@ -479,7 +530,11 @@ def whale_signals(
 
 
 @app.get("/signals/stress/{symbol}", response_model=StressTestResponse)
-def stress_test_signals(symbol: str, window: int = Query(240, ge=60, le=960)) -> StressTestResponse:
+def stress_test_signals(
+    symbol: str,
+    window: int = Query(240, ge=60, le=960),
+    _caller: str = Depends(require_admin_account),
+) -> StressTestResponse:
     adapter = _market_data_adapter()
     try:
         prices = adapter.price_history(symbol, length=window)
