@@ -756,6 +756,8 @@ class KafkaNATSAdapter:
         self._lock = threading.Lock()
         self._kafka_client: httpx.AsyncClient | None = None
         self._nats_client: httpx.AsyncClient | None = None
+        self._kafka_client_task: asyncio.Task[httpx.AsyncClient | None] | None = None
+        self._nats_client_task: asyncio.Task[httpx.AsyncClient | None] | None = None
         self._kafka_prefix = ""
         self._nats_prefix = ""
 
@@ -844,7 +846,11 @@ class KafkaNATSAdapter:
         if kafka_config:
             self._kafka_prefix = kafka_config.topic_prefix.strip()
             endpoint = _first_endpoint(kafka_config.bootstrap_servers)
-            self._kafka_client = self._build_client(endpoint)
+            kafka_client = self._build_client(endpoint)
+            if isinstance(kafka_client, asyncio.Task):
+                self._kafka_client_task = kafka_client
+            else:
+                self._kafka_client = kafka_client
 
         try:
             nats_config = self.nats_config_factory(self.account_id)
@@ -855,9 +861,15 @@ class KafkaNATSAdapter:
         if nats_config and nats_config.servers:
             self._nats_prefix = nats_config.subject_prefix.strip()
             endpoint = _first_endpoint(nats_config.servers)
-            self._nats_client = self._build_client(endpoint)
+            nats_client = self._build_client(endpoint)
+            if isinstance(nats_client, asyncio.Task):
+                self._nats_client_task = nats_client
+            else:
+                self._nats_client = nats_client
 
-    def _build_client(self, endpoint: str) -> httpx.AsyncClient | None:
+    def _build_client(
+        self, endpoint: str
+    ) -> httpx.AsyncClient | asyncio.Task[httpx.AsyncClient | None] | None:
         async def _initialise() -> httpx.AsyncClient | None:
             try:
                 base_url = _as_base_url(endpoint)
@@ -900,24 +912,56 @@ class KafkaNATSAdapter:
                 return None
 
         try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            return loop.create_task(_wrapper())
+
+        try:
             return asyncio.run(_wrapper())
         except PublishError:
             return None
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            try:
-                return loop.run_until_complete(_wrapper())
-            except PublishError:
-                return None
-            finally:
-                loop.close()
+
+    async def _ensure_client(
+        self,
+        client_attr: str,
+        task_attr: str,
+        transport: str,
+    ) -> httpx.AsyncClient | None:
+        client = getattr(self, client_attr)
+        if client is not None:
+            return client
+
+        task: asyncio.Task[httpx.AsyncClient | None] | None = getattr(self, task_attr)
+        if task is None:
+            return None
+
+        try:
+            client = await task
+        except PublishError:
+            client = None
+        except Exception:
+            logger.exception(
+                "Broker bootstrap task failed", extra={"transport": transport}
+            )
+            client = None
+
+        setattr(self, task_attr, None)
+        setattr(self, client_attr, client)
+        return client
 
     async def _attempt_publish(self, record: Dict[str, Any]) -> str:
         transports = []
-        if self._kafka_client is not None:
-            transports.append((self._kafka_client, self._topic_path(record["topic"])))
-        if self._nats_client is not None:
-            transports.append((self._nats_client, self._subject_path(record["topic"])) )
+
+        kafka_client = await self._ensure_client("_kafka_client", "_kafka_client_task", "kafka")
+        if kafka_client is not None:
+            transports.append((kafka_client, self._topic_path(record["topic"])))
+
+        nats_client = await self._ensure_client("_nats_client", "_nats_client_task", "nats")
+        if nats_client is not None:
+            transports.append((nats_client, self._subject_path(record["topic"])) )
 
         if not transports:
             return "offline"
@@ -1024,13 +1068,38 @@ class KafkaNATSAdapter:
         return drained
 
     def _shutdown(self) -> None:
+        clients: List[httpx.AsyncClient] = []
         with self._lock:
+            if self._kafka_client_task is not None:
+                self._kafka_client_task.cancel()
+                self._kafka_client_task = None
+            if self._nats_client_task is not None:
+                self._nats_client_task.cancel()
+                self._nats_client_task = None
+
             if self._kafka_client is not None:
-                self._kafka_client.close()
+                clients.append(self._kafka_client)
                 self._kafka_client = None
             if self._nats_client is not None:
-                self._nats_client.close()
+                clients.append(self._nats_client)
                 self._nats_client = None
+
+        if not clients:
+            return
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        for client in clients:
+            if loop and loop.is_running():
+                loop.create_task(client.aclose())
+            else:
+                try:
+                    asyncio.run(client.aclose())
+                except RuntimeError:
+                    logger.exception("Failed to close broker client", exc_info=True)
 
 
 class TimescaleAdapter:
