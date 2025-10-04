@@ -66,11 +66,11 @@ shutdown_manager = setup_graceful_shutdown(
 )
 
 
-def _flush_oms_event_buffers() -> None:
+async def _flush_oms_event_buffers() -> None:
     """Flush OMS event buffers (Kafka and activity logs)."""
 
     flush_logging_handlers("", __name__)
-    kafka_counts = asyncio.run(KafkaNATSAdapter.flush_events())
+    kafka_counts = await KafkaNATSAdapter.flush_events()
     if kafka_counts:
         logger.info("Flushed Kafka/NATS buffers", extra={"event_counts": kafka_counts})
     activity_count = len(_OMS_ACTIVITY_LOG)
