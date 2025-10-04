@@ -25,10 +25,61 @@ def _reload_allocator(monkeypatch: pytest.MonkeyPatch, db_url: str) -> object:
     return module
 
 
+def test_allocator_endpoints_require_auth(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db_url = "sqlite:///:memory:"
+    module = _reload_allocator(monkeypatch, db_url)
+
+    with TestClient(module.app) as client:
+        unauthorized_status = client.get("/allocator/status")
+        assert unauthorized_status.status_code == 401
+        assert unauthorized_status.json()["detail"] == "Missing Authorization header."
+
+        unauthorized_rebalance = client.post(
+            "/allocator/rebalance",
+            json={"allocations": {"company": 1.0}},
+        )
+        assert unauthorized_rebalance.status_code == 401
+        assert unauthorized_rebalance.json()["detail"] == "Missing Authorization header."
+
+    module.ENGINE.dispose()
+    sys.modules.pop("capital_allocator", None)
+
+
+def test_allocator_rejects_accounts_without_privileges(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db_url = "sqlite:///:memory:"
+    module = _reload_allocator(monkeypatch, db_url)
+    monkeypatch.setenv("CAPITAL_ALLOCATOR_ADMINS", "director-1")
+
+    with TestClient(module.app) as client:
+        with override_admin_auth(client.app, module.require_admin_account, "company") as headers:
+            denied_status = client.get("/allocator/status", headers=headers)
+            assert denied_status.status_code == 403
+            assert (
+                denied_status.json()["detail"]
+                == "Account is not authorized to manage capital allocations."
+            )
+
+            denied_rebalance = client.post(
+                "/allocator/rebalance",
+                json={"allocations": {"company": 1.0}},
+                headers=headers,
+            )
+            assert denied_rebalance.status_code == 403
+            assert (
+                denied_rebalance.json()["detail"]
+                == "Account is not authorized to manage capital allocations."
+            )
+
+    module.ENGINE.dispose()
+    sys.modules.pop("capital_allocator", None)
+
+
 def test_capital_allocator_rebalance_and_status(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     db_url = "sqlite:///:memory:"
     module = _reload_allocator(monkeypatch, db_url)
     engine = module.ENGINE
+
+    monkeypatch.setenv("CAPITAL_ALLOCATOR_ADMINS", "company,director-1,director-2")
 
     with engine.begin() as conn:
         conn.execute(
@@ -82,7 +133,12 @@ def test_capital_allocator_rebalance_and_status(tmp_path, monkeypatch: pytest.Mo
 
     with TestClient(module.app) as client:
         payload = {"allocations": {"company": 0.5, "director-1": 0.3, "director-2": 0.2}}
-        response = client.post("/allocator/rebalance", json=payload)
+        with override_admin_auth(client.app, module.require_admin_account, "company") as headers:
+            response = client.post(
+                "/allocator/rebalance",
+                json=payload,
+                headers=headers,
+            )
         assert response.status_code == 200
         body = response.json()
         assert Decimal(body["total_nav"]) == Decimal("1000000.00")
@@ -96,7 +152,8 @@ def test_capital_allocator_rebalance_and_status(tmp_path, monkeypatch: pytest.Mo
             result = session.execute(text("SELECT COUNT(*) FROM capital_allocations"))
             assert result.scalar() == 3
 
-        status = client.get("/allocator/status")
+        with override_admin_auth(client.app, module.require_admin_account, "company") as headers:
+            status = client.get("/allocator/status", headers=headers)
         assert status.status_code == 200
         status_body = status.json()
         status_accounts = {entry["account_id"]: entry for entry in status_body["accounts"]}
@@ -164,6 +221,8 @@ def test_allocator_handles_large_navs_precision(tmp_path, monkeypatch: pytest.Mo
             ],
         )
 
+    monkeypatch.setenv("CAPITAL_ALLOCATOR_ADMINS", "mega-1,mega-2,mega-3")
+
     with TestClient(module.app) as client:
         payload = {
             "allocations": {
@@ -172,7 +231,8 @@ def test_allocator_handles_large_navs_precision(tmp_path, monkeypatch: pytest.Mo
                 "mega-3": "0.333334",
             }
         }
-        response = client.post("/allocator/rebalance", json=payload)
+        with override_admin_auth(client.app, module.require_admin_account, "mega-1") as headers:
+            response = client.post("/allocator/rebalance", json=payload, headers=headers)
         assert response.status_code == 200
         body = response.json()
 
@@ -198,7 +258,8 @@ def test_allocator_handles_large_navs_precision(tmp_path, monkeypatch: pytest.Mo
         allocated_sum = sum(Decimal(entry["allocated_nav"]) for entry in body["accounts"])
         assert allocated_sum == total_nav
 
-        status = client.get("/allocator/status")
+        with override_admin_auth(client.app, module.require_admin_account, "mega-1") as headers:
+            status = client.get("/allocator/status", headers=headers)
         assert status.status_code == 200
         status_body = status.json()
         status_total_nav = Decimal(status_body["total_nav"])
