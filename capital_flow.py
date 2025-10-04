@@ -2,10 +2,10 @@
 
 This module provides lightweight APIs for recording deposits and withdrawals
 against trading accounts while maintaining a running NAV baseline per account.
-The data is persisted in a SQLite database by default (configurable via the
-``CAPITAL_FLOW_DATABASE_URL`` environment variable), making it suitable for
-local development and unit testing while remaining portable to production
-deployments backed by PostgreSQL.
+All persistence happens in a managed PostgreSQL/TimescaleDB cluster referenced
+via the ``CAPITAL_FLOW_DATABASE_URL`` environment variable. The service fails
+fast when the DSN is missing or incorrectly configured so that deployments do
+not silently fall back to local storage.
 """
 
 from __future__ import annotations
@@ -14,14 +14,14 @@ import enum
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Generator, Optional
+from typing import Any, Generator, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field, PositiveFloat
 from sqlalchemy import Column, DateTime, Float, Integer, String, create_engine, select, func
 from sqlalchemy.engine import Engine
+from sqlalchemy.engine.url import URL, make_url
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
-from sqlalchemy.pool import StaticPool
 
 from services.common.security import require_admin_account
 
@@ -30,22 +30,85 @@ from services.common.security import require_admin_account
 # ---------------------------------------------------------------------------
 
 
-DEFAULT_DATABASE_URL = "sqlite:///./capital_flows.db"
+_DATABASE_ENV = "CAPITAL_FLOW_DATABASE_URL"
+_SSL_MODE_ENV = "CAPITAL_FLOW_DB_SSLMODE"
+_SSL_ROOT_CERT_ENV = "CAPITAL_FLOW_DB_SSLROOTCERT"
+_SSL_CERT_ENV = "CAPITAL_FLOW_DB_SSLCERT"
+_SSL_KEY_ENV = "CAPITAL_FLOW_DB_SSLKEY"
+_APP_NAME_ENV = "CAPITAL_FLOW_DB_APP_NAME"
+_POOL_SIZE_ENV = "CAPITAL_FLOW_DB_POOL_SIZE"
+_MAX_OVERFLOW_ENV = "CAPITAL_FLOW_DB_MAX_OVERFLOW"
+_POOL_TIMEOUT_ENV = "CAPITAL_FLOW_DB_POOL_TIMEOUT"
+_POOL_RECYCLE_ENV = "CAPITAL_FLOW_DB_POOL_RECYCLE"
+
+
+def _require_database_url() -> str:
+    """Return a managed PostgreSQL/TimescaleDB DSN or raise an error."""
+
+    raw_url = os.getenv(_DATABASE_ENV)
+    if not raw_url:
+        raise RuntimeError(
+            "CAPITAL_FLOW_DATABASE_URL must be set to a managed PostgreSQL/TimescaleDB DSN."
+        )
+
+    try:
+        url: URL = make_url(raw_url)
+    except Exception as exc:  # pragma: no cover - defensive validation
+        raise RuntimeError(f"Invalid CAPITAL_FLOW_DATABASE_URL '{raw_url}': {exc}") from exc
+
+    driver = url.drivername.replace("timescale", "postgresql")
+    if driver in {"postgresql", "postgres"}:
+        url = url.set(drivername="postgresql+psycopg")
+    elif driver.startswith("postgresql+"):
+        if driver == "postgresql+psycopg2":
+            url = url.set(drivername="postgresql+psycopg")
+    else:
+        raise RuntimeError(
+            "Capital flow service requires a PostgreSQL/TimescaleDB DSN; "
+            f"received driver '{url.drivername}'."
+        )
+
+    return url.render_as_string(hide_password=False)
 
 
 def _create_engine(database_url: str) -> Engine:
-    """Create a SQLAlchemy engine with sensible defaults for SQLite."""
+    """Create a SQLAlchemy engine configured for the managed database."""
 
-    options: dict[str, object] = {"future": True}
-    if database_url.startswith("sqlite"):
-        connect_args = {"check_same_thread": False}
+    options: dict[str, Any] = {
+        "future": True,
+        "pool_pre_ping": True,
+        "pool_size": int(os.getenv(_POOL_SIZE_ENV, "10")),
+        "max_overflow": int(os.getenv(_MAX_OVERFLOW_ENV, "5")),
+        "pool_timeout": int(os.getenv(_POOL_TIMEOUT_ENV, "30")),
+        "pool_recycle": int(os.getenv(_POOL_RECYCLE_ENV, "1800")),
+    }
+
+    connect_args: dict[str, Any] = {}
+    sslmode = os.getenv(_SSL_MODE_ENV, "require").strip()
+    if sslmode:
+        connect_args["sslmode"] = sslmode
+
+    sslrootcert = os.getenv(_SSL_ROOT_CERT_ENV)
+    if sslrootcert:
+        connect_args["sslrootcert"] = sslrootcert
+    sslcert = os.getenv(_SSL_CERT_ENV)
+    if sslcert:
+        connect_args["sslcert"] = sslcert
+    sslkey = os.getenv(_SSL_KEY_ENV)
+    if sslkey:
+        connect_args["sslkey"] = sslkey
+
+    app_name = os.getenv(_APP_NAME_ENV, "capital-flow")
+    if app_name:
+        connect_args["application_name"] = app_name
+
+    if connect_args:
         options["connect_args"] = connect_args
-        if ":memory:" in database_url:
-            options["poolclass"] = StaticPool
+
     return create_engine(database_url, **options)
 
 
-DATABASE_URL = os.getenv("CAPITAL_FLOW_DATABASE_URL", DEFAULT_DATABASE_URL)
+DATABASE_URL = _require_database_url()
 ENGINE = _create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
 

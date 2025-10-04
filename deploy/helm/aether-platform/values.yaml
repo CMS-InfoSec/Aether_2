@@ -208,6 +208,79 @@ backendServices:
     pdb:
       enabled: true
       maxUnavailable: 1
+  capitalFlow:
+    enabled: true
+    nameOverride: capital-flow-service
+    image:
+      repository: ghcr.io/aether/capital-flow-service
+      tag: latest
+    replicaCount: 2
+    containerPort: 8000
+    env:
+      - name: CAPITAL_FLOW_DATABASE_URL
+        valueFrom:
+          secretKeyRef:
+            name: capital-flow-service-database
+            key: dsn
+      - name: CAPITAL_FLOW_DB_SSLMODE
+        valueFrom:
+          secretKeyRef:
+            name: capital-flow-service-database
+            key: sslmode
+            optional: true
+      - name: CAPITAL_FLOW_DB_POOL_SIZE
+        value: "10"
+      - name: CAPITAL_FLOW_DB_MAX_OVERFLOW
+        value: "5"
+      - name: CAPITAL_FLOW_DB_POOL_TIMEOUT
+        value: "30"
+      - name: CAPITAL_FLOW_DB_POOL_RECYCLE
+        value: "1800"
+      - name: CAPITAL_FLOW_DB_APP_NAME
+        value: capital-flow-service
+    usesKrakenSecrets: false
+    extraVolumeMounts: []
+    extraVolumes: []
+    service:
+      port: 80
+      targetPort: http
+    ingress:
+      enabled: false
+      host: ""
+      tlsSecret: ""
+      annotations: {}
+    resources:
+      requests:
+        cpu: 150m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 4
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 60
+        - type: Resource
+          resource:
+            name: memory
+            target:
+              type: Utilization
+              averageUtilization: 70
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 60
+        scaleDown:
+          stabilizationWindowSeconds: 120
+    pdb:
+      enabled: true
+      maxUnavailable: 1
   fees:
     enabled: true
     nameOverride: fees-service
