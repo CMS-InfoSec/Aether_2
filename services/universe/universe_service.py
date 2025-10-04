@@ -48,11 +48,12 @@ def _require_database_url() -> URL:
 
     primary = os.getenv("UNIVERSE_DATABASE_URL")
     fallback = os.getenv("TIMESCALE_DATABASE_URI")
-    raw_url = primary or fallback
+    legacy = os.getenv("DATABASE_URL")
+    raw_url = primary or fallback or legacy
 
     if not raw_url:
         raise RuntimeError(
-            "UNIVERSE_DATABASE_URL must be defined and point to a managed Timescale/PostgreSQL DSN."
+            "UNIVERSE_DATABASE_URL (or legacy DATABASE_URL/TIMESCALE_DATABASE_URI) must point to a managed Timescale/PostgreSQL DSN."
         )
 
     normalised = _normalize_database_url(raw_url)
