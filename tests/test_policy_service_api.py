@@ -64,6 +64,9 @@ def _client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
 
     monkeypatch.setattr(policy_service, "_model_health_ok", _healthy)
 
+    policy_service.shutdown_manager._draining = False  # type: ignore[attr-defined]
+    policy_service.shutdown_manager._drain_started_at = None  # type: ignore[attr-defined]
+    policy_service.shutdown_manager._inflight = 0  # type: ignore[attr-defined]
     policy_service.app.dependency_overrides[policy_service.require_admin_account] = lambda: "company"
     with TestClient(policy_service.app) as client:
         yield client

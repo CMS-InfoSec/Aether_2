@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
+
 import logging
 import threading
 import time
+from collections.abc import Awaitable, Callable, Mapping
 from decimal import Decimal, InvalidOperation
 
-from typing import Any, Callable, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Optional
 
 
 import httpx
+import inspect
 
 # Module-level logger for metadata refresh diagnostics.
 logger = logging.getLogger(__name__)
@@ -67,14 +69,20 @@ class PrecisionMetadataProvider:
 
         self._aliases: Dict[str, str] = {}
         self._last_refresh: float = 0.0
+        self._refresh_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def get(self, symbol: str) -> Optional[Dict[str, Any]]:
+
+    async def get(self, symbol: str) -> Optional[Dict[str, float]]:
         """Return precision metadata for ``symbol`` if available."""
 
-        self._maybe_refresh()
+        normalized = _normalize_symbol(symbol)
+        if not normalized:
+            return None
+        await self._maybe_refresh()
+
         with self._lock:
 
             key = self._aliases.get(normalized, normalized)
@@ -84,64 +92,42 @@ class PrecisionMetadataProvider:
 
             return dict(entry) if entry else None
 
-    def require(self, symbol: str) -> Dict[str, Any]:
+
+    async def require(self, symbol: str) -> Dict[str, float]:
+
         """Return precision metadata for ``symbol`` or raise."""
 
-        metadata = self.get(symbol)
+        metadata = await self.get(symbol)
         if metadata is None:
             raise PrecisionMetadataUnavailable(f"Precision metadata unavailable for {symbol}")
         return metadata
 
 
-    def resolve_native(self, symbol: str) -> Optional[str]:
-        """Resolve a client-facing symbol to the cached native pair identifier."""
-
-        self._maybe_refresh()
-        with self._lock:
-            return self._resolve_native_locked(symbol)
-
-    def get_native(self, native_symbol: str) -> Optional[Dict[str, float]]:
-        """Return precision metadata for a native Kraken pair identifier."""
-
-        key = (native_symbol or "").strip().upper()
-        if not key:
-            return None
-        self._maybe_refresh()
-        with self._lock:
-            entry = self._cache.get(key)
-        return dict(entry) if entry else None
-
-    def require_native(self, native_symbol: str) -> Dict[str, float]:
-        """Return precision metadata for a native Kraken pair identifier or raise."""
-
-        metadata = self.get_native(native_symbol)
-        if metadata is None:
-            raise PrecisionMetadataUnavailable(
-                f"Precision metadata unavailable for native pair {native_symbol}"
-            )
-        return metadata
-
-    def refresh(self, *, force: bool = False) -> None:
+    async def refresh(self, *, force: bool = False) -> None:
 
         """Force a metadata refresh regardless of cache age if requested."""
 
         if not force and not self._needs_refresh():
             return
-        try:
-            payload = await self._fetcher()
-        except Exception as exc:  # pragma: no cover - defensive logging
-            logger.warning("Failed to fetch Kraken precision metadata: %s", exc)
-            return
 
-        parsed, aliases = _parse_asset_pairs(payload)
-        if not parsed:
-            logger.warning("Received empty Kraken precision metadata payload")
-            return
+        async with self._refresh_lock:
+            if not force and not self._needs_refresh():
+                return
+            try:
+                payload = await self._call_fetcher()
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.warning("Failed to fetch Kraken precision metadata: %s", exc)
+                return
 
-        with self._lock:
-            self._cache = parsed
-            self._aliases = aliases
-            self._last_refresh = self._time_source()
+            parsed = _parse_asset_pairs(payload)
+            if not parsed:
+                logger.warning("Received empty Kraken precision metadata payload")
+                return
+
+            with self._lock:
+                self._cache = parsed
+                self._last_refresh = self._time_source()
+
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -152,45 +138,22 @@ class PrecisionMetadataProvider:
         age = self._time_source() - self._last_refresh
         return age >= self._refresh_interval
 
-    def _maybe_refresh(self) -> None:
+    async def _maybe_refresh(self) -> None:
         if self._needs_refresh():
-            self._refresh_sync(force=True)
 
-    def _refresh_sync(self, *, force: bool) -> None:
-        try:
-            asyncio.run(self.refresh(force=force))
-        except RuntimeError as exc:  # pragma: no cover - defensive guard
-            if "asyncio.run()" in str(exc):
-                raise RuntimeError(
-                    "PrecisionMetadataProvider.refresh() cannot be called from an "
-                    "active event loop; await refresh() or call within asyncio.to_thread()."
-                ) from exc
-            raise
+            await self.refresh(force=False)
 
-    def refresh_sync(self, *, force: bool = False) -> None:
-        """Synchronously refresh metadata for callers without an event loop."""
+    async def _call_fetcher(self) -> Mapping[str, Any]:
+        fetcher = self._fetcher
+        if inspect.iscoroutinefunction(fetcher):
+            result = await fetcher()
+        else:
+            result = await asyncio.to_thread(fetcher)
+        if isinstance(result, Mapping):
+            return result
+        return {}
 
-        self._refresh_sync(force=force)
-
-
-    def _resolve_native_locked(self, symbol: str) -> Optional[str]:
-        normalized = _normalize_symbol(symbol)
-        if not normalized:
-            return None
-        native = self._aliases.get(normalized)
-        if native:
-            return native
-
-        direct = (symbol or "").strip().upper()
-        if direct and direct in self._cache:
-            return direct
-
-        fallback = normalized.replace("-", "/")
-        if fallback in self._cache:
-            return fallback
-        return None
-
-    def _default_fetcher(self) -> Mapping[str, Any]:
+    async def _default_fetcher(self) -> Mapping[str, Any]:
 
         url = "https://api.kraken.com/0/public/AssetPairs"
         async with httpx.AsyncClient(timeout=self._timeout) as client:

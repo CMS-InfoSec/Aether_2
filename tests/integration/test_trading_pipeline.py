@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import importlib
 import sys
 import types
@@ -124,6 +125,8 @@ def test_trading_pipeline_emits_fill_event(
         record_oms_submit_ack=lambda *args, **kwargs: None,
         record_scaling_state=lambda *args, **kwargs: None,
         observe_scaling_evaluation=lambda *args, **kwargs: None,
+        observe_risk_validation_latency=lambda *args, **kwargs: None,
+        traced_span=lambda *args, **kwargs: contextlib.nullcontext(),
         get_request_id=lambda: None,
     )
     sys.modules["metrics"] = metrics_stub

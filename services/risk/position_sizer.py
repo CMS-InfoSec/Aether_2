@@ -96,7 +96,7 @@ class PositionSizer:
         self._log_callback = log_callback
         self._sizing_config: PositionSizingConfig | None = None
 
-    def suggest_max_position(
+    async def suggest_max_position(
         self,
         symbol: str,
         *,
@@ -173,7 +173,7 @@ class PositionSizer:
             base_size_usd = min(base_size_usd, notional_cap)
 
         try:
-            lot_size = self._resolve_lot_size(symbol)
+            lot_size = await self._resolve_lot_size(symbol)
         except PrecisionMetadataUnavailable:
             diagnostics["precision_metadata_missing"] = True
             reason = "precision_metadata_missing"
@@ -411,10 +411,9 @@ class PositionSizer:
             return max(maker, taker, 0.0)
         return None
 
-    def _resolve_lot_size(self, symbol: str) -> float:
 
-        metadata = precision_provider.require(symbol)
-        native_pair = metadata.get("native_pair")
+    async def _resolve_lot_size(self, symbol: str) -> float:
+        metadata = await precision_provider.require(symbol)
 
         lot_size = metadata.get("lot")
         try:
