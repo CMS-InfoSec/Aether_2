@@ -116,10 +116,13 @@ class GracefulShutdownManager:
         return started
 
     def reset(self) -> None:
-        """Clear draining state to allow the service to accept requests again."""
+
+        """Reset draining state. Primarily used for tests where the app restarts."""
 
         with self._condition:
             self._draining = False
+            self._inflight = 0
+
             self._drain_started_at = None
 
     def wait_for_inflight(self, timeout: Optional[float] = None) -> bool:

@@ -27,7 +27,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
-from typing import Iterable, List, Mapping, Optional, Protocol, Sequence
+from typing import Any, Iterable, List, Mapping, Optional, Protocol, Sequence
 
 from services.common.adapters import TimescaleAdapter
 
@@ -116,14 +116,14 @@ class PrecisionProvider(Protocol):
 class MarketMetadataPrecisionProvider:
     """Fetch precision data from the Kraken market metadata cache."""
 
-    def __init__(self, metadata: Optional[Mapping[str, Mapping[str, float]]] = None) -> None:
+    def __init__(self, metadata: Optional[Mapping[str, Mapping[str, Any]]] = None) -> None:
         if metadata is not None:
             self._metadata_getter = lambda: metadata
         else:
             self._metadata_getter = self._default_metadata_getter
 
     @staticmethod
-    def _default_metadata_getter() -> Mapping[str, Mapping[str, float]]:
+    def _default_metadata_getter() -> Mapping[str, Mapping[str, Any]]:
         try:
             from services.oms import main as oms_main  # Local import to avoid circular deps
         except Exception:  # pragma: no cover - metadata unavailable in limited envs
@@ -134,9 +134,36 @@ class MarketMetadataPrecisionProvider:
     def _normalize_symbol(symbol: str) -> str:
         return symbol.replace("/", "-").upper()
 
+    def _resolve_entry(
+        self, metadata: Mapping[str, Mapping[str, Any]], symbol: str
+    ) -> Optional[Mapping[str, Any]]:
+        entry = metadata.get(symbol)
+        if isinstance(entry, Mapping):
+            return entry
+
+        for key, candidate in metadata.items():
+            if not isinstance(candidate, Mapping):
+                continue
+            candidates = {self._normalize_symbol(str(key))}
+            native_pair = candidate.get("native_pair")
+            if isinstance(native_pair, str):
+                candidates.add(self._normalize_symbol(native_pair))
+            aliases = candidate.get("aliases")
+            if isinstance(aliases, (list, tuple, set)):
+                for alias in aliases:
+                    try:
+                        alias_key = self._normalize_symbol(str(alias))
+                    except Exception:  # pragma: no cover - defensive
+                        continue
+                    candidates.add(alias_key)
+            if symbol in candidates:
+                return candidate
+        return None
+
     def get_precision(self, symbol: str) -> Optional[InstrumentPrecision]:
         metadata = self._metadata_getter()
-        entry = metadata.get(self._normalize_symbol(symbol))
+        normalized = self._normalize_symbol(symbol)
+        entry = self._resolve_entry(metadata, normalized)
         if not isinstance(entry, Mapping):
             return None
         tick = entry.get("tick")

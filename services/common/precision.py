@@ -8,7 +8,9 @@ import logging
 import threading
 import time
 from decimal import Decimal, InvalidOperation
-from typing import Any, Awaitable, Callable, Dict, Mapping, Optional
+
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
+
 
 import httpx
 
@@ -60,27 +62,29 @@ class PrecisionMetadataProvider:
         self._timeout = max(float(timeout), 0.0)
         self._time_source = time_source
         self._lock = threading.Lock()
-        # Cache keyed by Kraken native pair identifier (e.g. "ETH/USDT").
-        self._cache: Dict[str, Dict[str, float]] = {}
-        # Mapping of normalized client symbols to cached native identifiers.
+
+        self._cache: Dict[str, Dict[str, Any]] = {}
+
         self._aliases: Dict[str, str] = {}
         self._last_refresh: float = 0.0
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def get(self, symbol: str) -> Optional[Dict[str, float]]:
+    def get(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Return precision metadata for ``symbol`` if available."""
 
         self._maybe_refresh()
         with self._lock:
-            native = self._resolve_native_locked(symbol)
-            if not native:
-                return None
-            entry = self._cache.get(native)
+
+            key = self._aliases.get(normalized, normalized)
+            entry = self._cache.get(key)
+            if entry is None and normalized in self._cache:
+                entry = self._cache.get(normalized)
+
             return dict(entry) if entry else None
 
-    def require(self, symbol: str) -> Dict[str, float]:
+    def require(self, symbol: str) -> Dict[str, Any]:
         """Return precision metadata for ``symbol`` or raise."""
 
         metadata = self.get(symbol)
@@ -214,7 +218,24 @@ _BASE_ALIASES: Dict[str, str] = {
     "XXDG": "DOGE",
     "XDG": "DOGE",
 }
-_QUOTE_ALIASES: Dict[str, str] = {"ZUSD": "USD", "USD": "USD"}
+_QUOTE_ALIASES: Dict[str, str] = {
+    "ZUSD": "USD",
+    "USD": "USD",
+    "ZUSDT": "USDT",
+    "USDT": "USDT",
+    "ZEUR": "EUR",
+    "EUR": "EUR",
+    "ZGBP": "GBP",
+    "GBP": "GBP",
+    "ZCAD": "CAD",
+    "CAD": "CAD",
+    "ZCHF": "CHF",
+    "CHF": "CHF",
+    "ZJPY": "JPY",
+    "JPY": "JPY",
+    "ZUSDC": "USDC",
+    "USDC": "USDC",
+}
 
 
 def _normalize_asset(symbol: str, *, is_quote: bool) -> str:
@@ -235,38 +256,113 @@ def _normalize_asset(symbol: str, *, is_quote: bool) -> str:
     return aliases.get(trimmed, trimmed)
 
 
-def _normalize_instrument(entry: Mapping[str, Any]) -> Optional[tuple[str, str, str]]:
-    base = _normalize_asset(str(entry.get("base") or ""), is_quote=False)
-    quote = _normalize_asset(str(entry.get("quote") or ""), is_quote=True)
 
-    native: Optional[str] = None
+def _sanitize_pair(value: str, entry: Mapping[str, Any]) -> str:
+    token = (value or "").strip().upper()
+    if not token:
+        return ""
+    if "/" in token:
+        base_part, quote_part = token.split("/", 1)
+        base = base_part.strip()
+        quote = quote_part.strip()
+        if base and quote:
+            return f"{base}/{quote}"
+        return ""
 
+    base = str(entry.get("base") or "").strip().upper()
+    quote = str(entry.get("quote") or "").strip().upper()
+    if base and quote and token == f"{base}{quote}":
+        return f"{base}/{quote}"
+
+    quote_candidates = [quote]
+    normalized_quote = _normalize_asset(quote, is_quote=True)
+    if normalized_quote and normalized_quote != quote:
+        quote_candidates.append(normalized_quote)
+
+    for candidate in quote_candidates:
+        if candidate and token.endswith(candidate) and len(token) > len(candidate):
+            base_part = token[: -len(candidate)]
+            if base_part:
+                return f"{base_part}/{candidate}"
+    return ""
+
+
+def _normalize_instrument(entry: Mapping[str, Any]) -> str:
     wsname = entry.get("wsname")
     if isinstance(wsname, str):
-        candidate = wsname.strip().upper()
-        if candidate:
-            native = candidate
-            if "/" in candidate:
-                base_part, quote_part = candidate.split("/", 1)
-                parsed_base = _normalize_asset(base_part, is_quote=False)
-                parsed_quote = _normalize_asset(quote_part, is_quote=True)
-                base = parsed_base or base
-                quote = parsed_quote or quote
+        pair = _sanitize_pair(wsname, entry)
+        if pair:
+            return pair
 
-    if native is None:
-        altname = entry.get("altname")
-        if isinstance(altname, str):
-            candidate = altname.strip().upper()
-            if candidate:
-                native = candidate
+    altname = entry.get("altname")
+    if isinstance(altname, str):
+        pair = _sanitize_pair(altname, entry)
+        if pair:
+            return pair
 
-    if native is None and base and quote:
-        native = f"{base}/{quote}"
+    base = str(entry.get("base") or "").strip().upper()
+    quote = str(entry.get("quote") or "").strip().upper()
+    if base and quote:
+        return f"{base}/{quote}"
+    return ""
 
-    if not native or not base or not quote:
-        return None
 
-    return native, base, quote
+
+def _alias_candidates(entry: Mapping[str, Any], native_pair: str) -> Tuple[str, ...]:
+    base_native, quote_native = native_pair.split("/", 1)
+
+    bases = {base_native}
+    quotes = {quote_native}
+
+    base_raw = str(entry.get("base") or "").strip().upper()
+    if base_raw:
+        bases.add(base_raw)
+        normalized_base = _normalize_asset(base_raw, is_quote=False)
+        if normalized_base:
+            bases.add(normalized_base)
+
+    quote_raw = str(entry.get("quote") or "").strip().upper()
+    if quote_raw:
+        quotes.add(quote_raw)
+        normalized_quote = _normalize_asset(quote_raw, is_quote=True)
+        if normalized_quote:
+            quotes.add(normalized_quote)
+
+    altname = entry.get("altname")
+    if isinstance(altname, str):
+        cleaned = altname.strip().upper()
+        if "/" in cleaned:
+            alt_base, alt_quote = cleaned.split("/", 1)
+            if alt_base:
+                bases.add(alt_base)
+                normalized = _normalize_asset(alt_base, is_quote=False)
+                if normalized:
+                    bases.add(normalized)
+            if alt_quote:
+                quotes.add(alt_quote)
+                normalized = _normalize_asset(alt_quote, is_quote=True)
+                if normalized:
+                    quotes.add(normalized)
+        else:
+            for candidate in list(quotes):
+                if candidate and cleaned.endswith(candidate) and len(cleaned) > len(candidate):
+                    alt_base = cleaned[: -len(candidate)]
+                    if alt_base:
+                        bases.add(alt_base)
+                        normalized = _normalize_asset(alt_base, is_quote=False)
+                        if normalized:
+                            bases.add(normalized)
+
+    aliases = set()
+    for base in bases:
+        for quote in quotes:
+            if not base or not quote:
+                continue
+            aliases.add(f"{base}-{quote}")
+            aliases.add(f"{base}/{quote}")
+            aliases.add(f"{base}{quote}")
+
+    return tuple(sorted({alias for alias in aliases if alias}))
 
 
 def _step_from_metadata(
@@ -299,19 +395,21 @@ def _step_from_metadata(
     return None
 
 
-def _parse_asset_pairs(
-    payload: Mapping[str, Any]
-) -> tuple[Dict[str, Dict[str, float]], Dict[str, str]]:
+
+def _parse_asset_pairs(payload: Mapping[str, Any]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str]]:
     if isinstance(payload.get("result"), Mapping):
         payload = payload["result"]  # type: ignore[assignment]
 
-    parsed: Dict[str, Dict[str, float]] = {}
+    parsed: Dict[str, Dict[str, Any]] = {}
+
     aliases: Dict[str, str] = {}
     for entry in payload.values():
         if not isinstance(entry, Mapping):
             continue
-        normalized = _normalize_instrument(entry)
-        if not normalized:
+
+        native_pair = _normalize_instrument(entry)
+        if not native_pair:
+
             continue
         native, base, quote = normalized
         tick = _step_from_metadata(
@@ -326,29 +424,19 @@ def _parse_asset_pairs(
         )
         if tick is None or lot is None:
             continue
-        native_key = native.strip().upper()
-        parsed[native_key] = {"tick": float(tick), "lot": float(lot)}
 
-        alias_candidates = {
-            native_key,
-            native_key.replace("/", "-"),
-            f"{base}-{quote}",
-            f"{base}/{quote}",
-            f"{base}{quote}",
+        key = _normalize_symbol(native_pair)
+        metadata = {
+            "tick": float(tick),
+            "lot": float(lot),
+            "native_pair": native_pair,
         }
-
-        wsname = entry.get("wsname")
-        if isinstance(wsname, str):
-            alias_candidates.add(wsname.strip().upper())
-
-        altname = entry.get("altname")
-        if isinstance(altname, str):
-            alias_candidates.add(altname.strip().upper())
-
-        for candidate in alias_candidates:
-            normalized_alias = _normalize_symbol(candidate)
-            if normalized_alias:
-                aliases.setdefault(normalized_alias, native_key)
+        parsed[key] = metadata
+        aliases.setdefault(key, key)
+        for alias in _alias_candidates(entry, native_pair):
+            alias_key = _normalize_symbol(alias)
+            if alias_key and alias_key not in aliases:
+                aliases[alias_key] = key
 
     return parsed, aliases
 

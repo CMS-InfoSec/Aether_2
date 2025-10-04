@@ -422,49 +422,58 @@ if _class_validators is not None:
 
 
 def _precision_fixture_payload() -> Dict[str, Dict[str, str]]:
-    def _entry(
-        base: str,
-        quote: str,
-        tick: float,
-        lot: float,
-        *,
-        alt: str | None = None,
-        base_field: str | None = None,
-        quote_field: str | None = None,
-    ) -> Dict[str, str]:
-        return {
-            "wsname": f"{base}/{quote}",
-            "altname": alt or f"{base}{quote}",
-            "base": base_field or base,
-            "quote": quote_field or quote,
-            "tick_size": str(tick),
-            "lot_step": str(lot),
-        }
 
     return {
-        "BTCUSD": _entry("BTC", "USD", 0.1, 0.0001, base_field="XXBT", quote_field="ZUSD"),
-        "ETHUSD": _entry("ETH", "USD", 0.05, 0.001, base_field="XETH", quote_field="ZUSD"),
-        "SOLUSD": _entry("SOL", "USD", 0.01, 0.1),
-        "USDTUSD": _entry("USDT", "USD", 0.001, 1.0),
-        "ADAUSD": _entry("ADA", "USD", 0.0001, 0.1),
-        "TSTUSD": _entry("TST", "USD", 1e-08, 1e-08),
-        "ETHUSDT": _entry(
-            "ETH",
-            "USDT",
-            0.01,
-            0.001,
-            alt="ETHUSDT",
-            base_field="XETH",
-            quote_field="USDT",
-        ),
-        "ADAEUR": _entry(
-            "ADA",
-            "EUR",
-            0.0001,
-            0.1,
-            alt="ADAEUR",
-            quote_field="ZEUR",
-        ),
+        "XXBTZUSD": {
+            "wsname": "XBT/USD",
+            "base": "XXBT",
+            "quote": "ZUSD",
+            "tick_size": "0.1",
+            "lot_step": "0.0001",
+        },
+        "XXBTZEUR": {
+            "wsname": "XBT/EUR",
+            "base": "XXBT",
+            "quote": "ZEUR",
+            "tick_size": "0.5",
+            "lot_step": "0.0005",
+        },
+        "XETHZUSD": {
+            "wsname": "ETH/USD",
+            "base": "XETH",
+            "quote": "ZUSD",
+            "tick_size": "0.05",
+            "lot_step": "0.001",
+        },
+        "SOLUSD": {
+            "wsname": "SOL/USD",
+            "base": "SOL",
+            "quote": "ZUSD",
+            "tick_size": "0.01",
+            "lot_step": "0.1",
+        },
+        "USDTZUSD": {
+            "wsname": "USDT/USD",
+            "base": "USDT",
+            "quote": "ZUSD",
+            "tick_size": "0.001",
+            "lot_step": "1.0",
+        },
+        "ADAUSD": {
+            "wsname": "ADA/USD",
+            "base": "ADA",
+            "quote": "ZUSD",
+            "tick_size": "0.0001",
+            "lot_step": "0.1",
+        },
+        "TSTUSD": {
+            "wsname": "TST/USD",
+            "base": "TST",
+            "quote": "USD",
+            "tick_size": str(1e-08),
+            "lot_step": str(1e-08),
+        },
+
     }
 
 
