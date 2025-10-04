@@ -26,6 +26,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
+from services.common.security import require_admin_account
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -226,8 +228,23 @@ def get_service() -> VWAPAnalyticsService:
 
 @router.get("/divergence", response_model=VWAPDivergenceResponse)
 def vwap_divergence(
-    *, symbol: str = Query(..., description="Symbol to compute VWAP divergence for"), service: VWAPAnalyticsService = Depends(get_service)
+    *,
+    symbol: str = Query(..., description="Symbol to compute VWAP divergence for"),
+    account_id: str | None = Query(
+        None,
+        description="Account identifier the VWAP analytics are scoped to.",
+    ),
+    caller: str = Depends(require_admin_account),
+    service: VWAPAnalyticsService = Depends(get_service),
 ) -> VWAPDivergenceResponse:
+    if account_id:
+        requested = account_id.strip().lower()
+        if requested and requested != caller.strip().lower():
+            raise HTTPException(
+                status_code=403,
+                detail="Authenticated account is not authorized for requested scope.",
+            )
+
     try:
         return service.compute(symbol)
     except VWAPComputationError as exc:
