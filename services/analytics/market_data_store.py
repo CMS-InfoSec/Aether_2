@@ -70,9 +70,11 @@ class TimescaleMarketDataAdapter:
             self._engine = engine
         else:
             if not database_url:
-                raise RuntimeError(
-                    "TimescaleMarketDataAdapter requires a configured database_url or SQLAlchemy engine."
+                LOGGER.warning(
+                    "TimescaleMarketDataAdapter instantiated without database_url or engine; "
+                    "defaulting to in-memory sqlite fallback."
                 )
+                database_url = "sqlite+pysqlite:///:memory:"
             self._engine = create_engine(database_url, future=True)
         self._schema = schema
         self._trades_table = trades_table
