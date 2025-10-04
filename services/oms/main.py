@@ -66,6 +66,7 @@ except Exception:  # pragma: no cover - fallback for environments without websoc
 
 from metrics import (
     increment_trade_rejection,
+    metric_context,
     record_oms_latency,
     setup_metrics,
 )
@@ -1338,6 +1339,8 @@ async def place_order(
             detail="Market metadata unavailable; unable to quantize order safely.",
         )
 
+    metrics_ctx = metric_context(account_id=account_id, symbol=request.instrument)
+
     expire_time_iso: str | None = None
     if request.time_in_force == "GTD":
         if request.expire_time is None:
@@ -1438,7 +1441,11 @@ async def place_order(
         try:
             _ensure_credentials_valid(credentials)
         except KrakenCredentialExpired as exc:
-            increment_trade_rejection(account_id, request.instrument)
+            increment_trade_rejection(
+                account_id,
+                request.instrument,
+                context=metrics_ctx,
+            )
             logger.warning(
                 "Rejected order due to expired Kraken credentials",
                 extra={"account_id": account_id, "instrument": request.instrument},
@@ -1460,22 +1467,36 @@ async def place_order(
                 status.HTTP_502_BAD_GATEWAY,
                 status.HTTP_504_GATEWAY_TIMEOUT,
             ):
-                increment_trade_rejection(account_id, request.instrument)
+                increment_trade_rejection(
+                    account_id,
+                    request.instrument,
+                    context=metrics_ctx,
+                )
             raise
 
         ack_latency_ms = (time.perf_counter() - start_time) * 1000.0
+        latency_ctx = metric_context(
+            account_id=account_id,
+            symbol=request.instrument,
+            transport=transport,
+        )
         record_oms_latency(
             account_id,
             request.instrument,
             transport,
             ack_latency_ms,
+            context=latency_ctx,
         )
 
 
         try:
             _ensure_ack_success(ack, transport)
         except HTTPException as exc:
-            increment_trade_rejection(account_id, request.instrument)
+            increment_trade_rejection(
+                account_id,
+                request.instrument,
+                context=metrics_ctx,
+            )
             raise
 
 
@@ -1509,7 +1530,11 @@ async def place_order(
 
 
     if status_value and not accepted:
-        increment_trade_rejection(account_id, request.instrument)
+        increment_trade_rejection(
+            account_id,
+            request.instrument,
+            context=metrics_ctx,
+        )
 
     trades_snapshot = {"trades": trades}
 
@@ -1609,6 +1634,7 @@ async def cancel_order(
 
     kafka = KafkaNATSAdapter(account_id=request.account_id)
     timescale = TimescaleAdapter(account_id=request.account_id)
+    metrics_ctx = metric_context(account_id=request.account_id)
 
     async with _acquire_kraken_clients(request.account_id) as clients:
         credentials = await clients.credential_getter()
@@ -1650,7 +1676,11 @@ async def cancel_order(
     except HTTPException:
         timescale.record_event("oms.cancel", event_payload)
         kafka.publish(topic="oms.cancels", payload=event_payload)
-        increment_trade_rejection(request.account_id, "unknown")
+        increment_trade_rejection(
+            request.account_id,
+            "unknown",
+            context=metrics_ctx,
+        )
         raise
 
     event_payload.update(

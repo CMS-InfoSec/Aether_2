@@ -14,6 +14,7 @@ from services.risk.pretrade_sanity import PRETRADE_SANITY, router as pretrade_ro
 
 from metrics import (
     increment_trade_rejection,
+    metric_context,
     observe_risk_validation_latency,
     record_fees_nav_pct,
     setup_metrics,
@@ -58,13 +59,14 @@ def validate_risk(
         start = time.perf_counter()
         decision = engine.validate(request)
     observe_risk_validation_latency((time.perf_counter() - start) * 1000.0)
+    metrics_ctx = metric_context(account_id=account_id, symbol=symbol)
     if not decision.valid:
-        increment_trade_rejection(account_id, symbol)
+        increment_trade_rejection(account_id, symbol, context=metrics_ctx)
 
     nav = float(request.portfolio_state.nav) if request.portfolio_state.nav else 0.0
     fees = float(request.portfolio_state.fee_to_date) if request.portfolio_state.fee_to_date else 0.0
     fees_pct = (fees / nav * 100.0) if nav else 0.0
-    record_fees_nav_pct(account_id, symbol, fees_pct)
+    record_fees_nav_pct(account_id, symbol, fees_pct, context=metrics_ctx)
 
     return decision
 

@@ -17,7 +17,12 @@ from shared.models.registry import get_model_registry
 from services.policy.adaptive_horizon import get_horizon
 from services.policy.model_server import predict_intent
 
-from metrics import record_abstention_rate, record_drift_score, setup_metrics
+from metrics import (
+    metric_context,
+    record_abstention_rate,
+    record_drift_score,
+    setup_metrics,
+)
 
 app = FastAPI(title="Policy Service")
 setup_metrics(app, service_name="policy-service")
@@ -233,10 +238,21 @@ def decide_policy(
             drift_value = float(drift_source)
         except (TypeError, ValueError):
             drift_value = 0.0
-    record_drift_score(account_id, request.instrument, drift_value)
+    metrics_ctx = metric_context(account_id=account_id, symbol=request.instrument)
+    record_drift_score(
+        account_id,
+        request.instrument,
+        drift_value,
+        context=metrics_ctx,
+    )
 
     abstain = 0.0 if response.approved and response.selected_action != "abstain" else 1.0
-    record_abstention_rate(account_id, request.instrument, abstain)
+    record_abstention_rate(
+        account_id,
+        request.instrument,
+        abstain,
+        context=metrics_ctx,
+    )
 
     return response
 
