@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 
 import pytest
+from fastapi import status
 from fastapi.testclient import TestClient
 from sqlalchemy import (
     JSON,
@@ -40,7 +42,10 @@ def _load_module(module_name: str, relative_path: str):
     return module
 
 
+os.environ.setdefault("SESSION_REDIS_URL", "memory://signal-service-tests")
+
 _load_module("services", "services/__init__.py")
+_load_module("services.common", "services/common/__init__.py")
 _load_module("services.analytics", "services/analytics/__init__.py")
 _load_module("services.analytics.market_data_store", "services/analytics/market_data_store.py")
 
@@ -66,6 +71,17 @@ def _reload_signal_service():
 from services.analytics.market_data_store import TimescaleMarketDataAdapter
 
 FIXTURE_PATH = Path(__file__).resolve().parent.parent.parent / "fixtures" / "market_data" / "signal_service_fixture.json"
+
+SIGNAL_ENDPOINTS = (
+    ("/signals/orderflow/BTC-USD", {"window": 600}),
+    (
+        "/signals/crossasset",
+        {"base_symbol": "BTC-USD", "alt_symbol": "ETH-USD", "window": 60, "max_lag": 5},
+    ),
+    ("/signals/volatility/BTC-USD", {"window": 60, "horizon": 5}),
+    ("/signals/whales/BTC-USD", {"window": 900, "threshold_sigma": 2.0}),
+    ("/signals/stress/BTC-USD", {"window": 120}),
+)
 
 
 @pytest.fixture(scope="session")
@@ -204,6 +220,32 @@ def signal_client(signal_service_module) -> TestClient:
 
 
 @pytest.fixture()
+def signal_admin_headers() -> dict[str, str]:
+    session = signal_service.SESSION_STORE.create(admin_id="company")
+    return {"Authorization": f"Bearer {session.token}"}
+
+
+@pytest.mark.parametrize("path,params", SIGNAL_ENDPOINTS)
+def test_signal_routes_require_authentication(signal_client: TestClient, path: str, params: dict):
+    response = signal_client.get(path, params=params)
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+
+@pytest.mark.parametrize("path,params", SIGNAL_ENDPOINTS)
+def test_signal_routes_reject_non_admin(signal_client: TestClient, path: str, params: dict):
+    session = signal_service.SESSION_STORE.create(admin_id="visitor")
+    headers = {"Authorization": f"Bearer {session.token}"}
+    response = signal_client.get(path, params=params, headers=headers)
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+
+
+@pytest.mark.parametrize("path,params", SIGNAL_ENDPOINTS)
+def test_signal_routes_allow_admin(signal_client: TestClient, signal_admin_headers: dict[str, str], path: str, params: dict):
+    response = signal_client.get(path, params=params, headers=signal_admin_headers)
+    assert response.status_code == status.HTTP_200_OK
+
+
+@pytest.fixture()
 def crossasset_client(fixture_payload: dict):
     engine = create_engine(
         "sqlite://",
@@ -259,8 +301,8 @@ def test_timescale_adapter_price_history(timescale_adapter: TimescaleMarketDataA
     assert latest is not None
 
 
-def test_signal_order_flow_endpoint(signal_client: TestClient):
-    response = signal_client.get("/signals/orderflow/BTC-USD", params={"window": 600})
+def test_signal_order_flow_endpoint(signal_client: TestClient, signal_admin_headers: dict[str, str]):
+    response = signal_client.get("/signals/orderflow/BTC-USD", params={"window": 600}, headers=signal_admin_headers)
     assert response.status_code == 200
     payload = response.json()
     assert payload["symbol"] == "BTC-USD"
@@ -268,33 +310,46 @@ def test_signal_order_flow_endpoint(signal_client: TestClient):
     assert payload["sell_volume"] > 0
 
 
-def test_signal_volatility_endpoint(signal_client: TestClient):
-    response = signal_client.get("/signals/volatility/BTC-USD", params={"window": 60, "horizon": 5})
+def test_signal_volatility_endpoint(signal_client: TestClient, signal_admin_headers: dict[str, str]):
+    response = signal_client.get(
+        "/signals/volatility/BTC-USD",
+        params={"window": 60, "horizon": 5},
+        headers=signal_admin_headers,
+    )
     assert response.status_code == 200
     payload = response.json()
     assert payload["variance"] > 0
     assert len(payload["forecasts"]) == 5
 
 
-def test_signal_crossasset_endpoint(signal_client: TestClient):
+def test_signal_crossasset_endpoint(signal_client: TestClient, signal_admin_headers: dict[str, str]):
     response = signal_client.get(
         "/signals/crossasset",
         params={"base_symbol": "BTC-USD", "alt_symbol": "ETH-USD", "window": 60, "max_lag": 5},
+        headers=signal_admin_headers,
     )
     assert response.status_code == 200
     payload = response.json()
     assert payload["correlation"] > 0
 
 
-def test_signal_whales_endpoint(signal_client: TestClient):
-    response = signal_client.get("/signals/whales/BTC-USD", params={"window": 900, "threshold_sigma": 2.0})
+def test_signal_whales_endpoint(signal_client: TestClient, signal_admin_headers: dict[str, str]):
+    response = signal_client.get(
+        "/signals/whales/BTC-USD",
+        params={"window": 900, "threshold_sigma": 2.0},
+        headers=signal_admin_headers,
+    )
     assert response.status_code == 200
     payload = response.json()
     assert payload["count"] >= 0
 
 
-def test_signal_stress_endpoint(signal_client: TestClient):
-    response = signal_client.get("/signals/stress/BTC-USD", params={"window": 120})
+def test_signal_stress_endpoint(signal_client: TestClient, signal_admin_headers: dict[str, str]):
+    response = signal_client.get(
+        "/signals/stress/BTC-USD",
+        params={"window": 120},
+        headers=signal_admin_headers,
+    )
     assert response.status_code == 200
     payload = response.json()
     assert "flash_crash" in payload

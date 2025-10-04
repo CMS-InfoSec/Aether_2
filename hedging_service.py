@@ -19,17 +19,21 @@ with the deployed OMS HTTP or websocket interface.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import math
 import statistics
 import time
 import uuid
+from collections.abc import Iterable as IterableABC
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
-from typing import Any, Iterable, List, Mapping, Optional, Protocol, Sequence
+from typing import Any, Awaitable, Callable, Iterable, List, Mapping, Optional, Protocol, Sequence
 
 from services.common.adapters import TimescaleAdapter
+from services.common.precision import _parse_asset_pairs
+from services.oms.kraken_rest import KrakenRESTClient, KrakenRESTError
 
 
 logger = logging.getLogger(__name__)
@@ -114,58 +118,140 @@ class PrecisionProvider(Protocol):
 
 
 class MarketMetadataPrecisionProvider:
-    """Fetch precision data from the Kraken market metadata cache."""
+    """Fetch precision data directly from Kraken REST metadata."""
 
-    def __init__(self, metadata: Optional[Mapping[str, Mapping[str, Any]]] = None) -> None:
+    def __init__(
+        self,
+        metadata: Optional[Mapping[str, Mapping[str, Any]]] = None,
+        *,
+        fetcher: Optional[Callable[[], Awaitable[Mapping[str, Any]]]] = None,
+        refresh_interval: float = 900.0,
+    ) -> None:
+        self._precision: dict[str, InstrumentPrecision] = {}
+        self._aliases: dict[str, str] = {}
+        self._last_refresh: float = 0.0
+        self._lock = asyncio.Lock()
+        self._refresh_interval = max(float(refresh_interval), 0.0)
+
         if metadata is not None:
-            self._metadata_getter = lambda: metadata
+            self._metadata_fetcher: Optional[Callable[[], Awaitable[Mapping[str, Any]]]] = None
+            self._ingest_metadata(metadata)
         else:
-            self._metadata_getter = self._default_metadata_getter
+            self._metadata_fetcher = self._wrap_fetcher(fetcher or self._default_fetcher)
 
-    @staticmethod
-    def _default_metadata_getter() -> Mapping[str, Mapping[str, Any]]:
-        try:
-            from services.oms import main as oms_main  # Local import to avoid circular deps
-        except Exception:  # pragma: no cover - metadata unavailable in limited envs
-            return {}
-        return getattr(oms_main, "MARKET_METADATA", {})
+        self._refresh_lock = asyncio.Lock()
+
+    @property
+    def refresh_interval(self) -> float:
+        return self._refresh_interval
+
+    async def ensure_symbols(
+        self, symbols: Iterable[str], *, force: bool = False
+    ) -> None:
+        if not self._metadata_fetcher:
+            return
+
+        needs_refresh = force
+        now = time.time()
+
+        if not needs_refresh:
+            async with self._lock:
+                for symbol in symbols:
+                    normalized = self._normalize_symbol(symbol)
+                    key = self._aliases.get(normalized, normalized)
+                    if key not in self._precision:
+                        needs_refresh = True
+                        break
+                else:
+                    if (
+                        self._refresh_interval > 0
+                        and now - self._last_refresh >= self._refresh_interval
+                    ):
+                        needs_refresh = True
+
+        if not needs_refresh:
+            return
+
+        await self.refresh()
+
+    async def refresh(self) -> None:
+        if not self._metadata_fetcher:
+            return
+
+        async with self._refresh_lock:
+            try:
+                payload = await self._metadata_fetcher()
+            except Exception as exc:  # pragma: no cover - network/runtime guard
+                logger.warning("Failed to fetch Kraken precision metadata: %s", exc)
+                return
+
+            parsed, aliases = _parse_asset_pairs(payload)
+            if not parsed:
+                logger.warning("Received empty Kraken precision metadata payload")
+                return
+
+            data: dict[str, InstrumentPrecision] = {}
+            alias_map: dict[str, str] = {}
+
+            for symbol, entry in parsed.items():
+                precision = self._entry_to_precision(entry)
+                if precision is None:
+                    continue
+                normalized = self._normalize_symbol(symbol)
+                data[normalized] = precision
+
+            for alias, target in aliases.items():
+                normalized_alias = self._normalize_symbol(alias)
+                canonical = self._normalize_symbol(target)
+                if canonical in data:
+                    alias_map[normalized_alias] = canonical
+
+            for canonical in data:
+                alias_map.setdefault(canonical, canonical)
+
+            if not data:
+                logger.warning("Parsed Kraken precision metadata contained no usable entries")
+                return
+
+            async with self._lock:
+                self._precision = data
+                self._aliases = alias_map
+                self._last_refresh = time.time()
+
+    def get_precision(self, symbol: str) -> Optional[InstrumentPrecision]:
+        normalized = self._normalize_symbol(symbol)
+
+        # Use a synchronous snapshot of the cache to avoid awaiting in hot paths.
+        precision_map: dict[str, InstrumentPrecision]
+        alias_map: dict[str, str]
+        last_refresh: float
+
+        # Acquire lock synchronously using loop run_until? Instead, we rely on
+        # the assumption that refresh happens via ``ensure_symbols`` which owns
+        # the asynchronous lock.  Here we perform a non-blocking snapshot by
+        # leveraging ``asyncio.Lock``'s state via ``locked()``.  When the lock is
+        # held we optimistically read the previous snapshot since writers always
+        # replace references atomically.
+        precision_map = self._precision
+        alias_map = self._aliases
+        last_refresh = self._last_refresh
+
+        key = alias_map.get(normalized, normalized)
+        precision = precision_map.get(key)
+        if precision:
+            return precision
+
+        # If metadata has never been refreshed but static configuration was
+        # provided we may still return a result after normalising aliases.
+        if last_refresh == 0 and self._metadata_fetcher is None:
+            return precision_map.get(normalized)
+        return None
 
     @staticmethod
     def _normalize_symbol(symbol: str) -> str:
-        return symbol.replace("/", "-").upper()
+        return (symbol or "").replace("/", "-").upper()
 
-    def _resolve_entry(
-        self, metadata: Mapping[str, Mapping[str, Any]], symbol: str
-    ) -> Optional[Mapping[str, Any]]:
-        entry = metadata.get(symbol)
-        if isinstance(entry, Mapping):
-            return entry
-
-        for key, candidate in metadata.items():
-            if not isinstance(candidate, Mapping):
-                continue
-            candidates = {self._normalize_symbol(str(key))}
-            native_pair = candidate.get("native_pair")
-            if isinstance(native_pair, str):
-                candidates.add(self._normalize_symbol(native_pair))
-            aliases = candidate.get("aliases")
-            if isinstance(aliases, (list, tuple, set)):
-                for alias in aliases:
-                    try:
-                        alias_key = self._normalize_symbol(str(alias))
-                    except Exception:  # pragma: no cover - defensive
-                        continue
-                    candidates.add(alias_key)
-            if symbol in candidates:
-                return candidate
-        return None
-
-    def get_precision(self, symbol: str) -> Optional[InstrumentPrecision]:
-        metadata = self._metadata_getter()
-        normalized = self._normalize_symbol(symbol)
-        entry = self._resolve_entry(metadata, normalized)
-        if not isinstance(entry, Mapping):
-            return None
+    def _entry_to_precision(self, entry: Mapping[str, Any]) -> Optional[InstrumentPrecision]:
         tick = entry.get("tick")
         lot = entry.get("lot")
         if tick is None or lot is None:
@@ -178,6 +264,69 @@ class MarketMetadataPrecisionProvider:
         if tick_size <= 0 or lot_size <= 0:
             return None
         return InstrumentPrecision(tick_size=tick_size, lot_size=lot_size)
+
+    def _ingest_metadata(self, metadata: Mapping[str, Mapping[str, Any]]) -> None:
+        data: dict[str, InstrumentPrecision] = {}
+        alias_map: dict[str, str] = {}
+        for symbol, entry in metadata.items():
+            if not isinstance(entry, Mapping):
+                continue
+            precision = self._entry_to_precision(entry)
+            if precision is None:
+                continue
+            normalized = self._normalize_symbol(symbol)
+            data[normalized] = precision
+            aliases = entry.get("aliases")
+            if isinstance(aliases, IterableABC) and not isinstance(aliases, (str, bytes)):
+                for alias in aliases:
+                    alias_key = self._normalize_symbol(str(alias))
+                    if alias_key:
+                        alias_map.setdefault(alias_key, normalized)
+            alias_map.setdefault(normalized, normalized)
+
+        if data:
+            self._precision = data
+            self._aliases = alias_map or {key: key for key in data}
+            self._last_refresh = time.time()
+
+    @staticmethod
+    async def _default_fetcher() -> Mapping[str, Any]:
+        async def _anonymous_credentials() -> Mapping[str, Any]:
+            return {}
+
+        client = KrakenRESTClient(credential_getter=_anonymous_credentials)
+        try:
+            return await client.asset_pairs()
+        except KrakenRESTError as exc:
+            logger.warning("Failed to load Kraken asset metadata via REST: %s", exc)
+            return {}
+        finally:
+            await client.close()
+
+    def _wrap_fetcher(
+        self, fetcher: Callable[[], Awaitable[Mapping[str, Any]]]
+        | Callable[[], Mapping[str, Any]]
+        | Callable[[], Any]
+    ) -> Callable[[], Awaitable[Mapping[str, Any]]]:
+        if inspect.iscoroutinefunction(fetcher):
+
+            async def _call_async() -> Mapping[str, Any]:
+                result = await fetcher()
+                if isinstance(result, Mapping):
+                    return result
+                return {}
+
+            return _call_async
+
+        async def _call() -> Mapping[str, Any]:
+            result = fetcher()
+            if inspect.isawaitable(result):
+                result = await result
+            if isinstance(result, Mapping):
+                return result
+            return {}
+
+        return _call
 
 
 @dataclass
@@ -336,6 +485,9 @@ class HedgingService:
         self._precision_provider: PrecisionProvider = (
             precision_provider or MarketMetadataPrecisionProvider()
         )
+        self._precision_refresh_interval = self._precision_refresh_seconds()
+        self._next_precision_refresh: float = 0.0
+        self._initialize_precision_provider()
 
     # ------------------------------------------------------------------
     # Public orchestration
@@ -381,11 +533,13 @@ class HedgingService:
     async def run_forever(self, stop_event: Optional[asyncio.Event] = None) -> None:
         """Continuously evaluate risk until the optional stop event is set."""
 
+        await self._maybe_refresh_precision(force=True)
         while True:
             if stop_event and stop_event.is_set():
                 logger.info("Hedging service stopping due to stop event")
                 return
             try:
+                await self._maybe_refresh_precision()
                 self.evaluate_once()
             except Exception:  # pragma: no cover - protective catch
                 logger.exception("Unhandled exception during hedging evaluation")
@@ -439,15 +593,13 @@ class HedgingService:
         raw_quantity = delta_usd.copy_abs() / raw_price
 
         precision = self._precision_provider.get_precision(self.config.hedge_symbol)
-
-        if precision:
-            price_dec = self._apply_price_precision(raw_price, precision.tick_size, side)
-            quantity_dec = self._apply_quantity_precision(
-                raw_quantity, precision.lot_size
+        if precision is None:
+            raise RuntimeError(
+                f"Precision metadata unavailable for {self.config.hedge_symbol}"
             )
-        else:
-            price_dec = raw_price
-            quantity_dec = raw_quantity
+
+        price_dec = self._apply_price_precision(raw_price, precision.tick_size, side)
+        quantity_dec = self._apply_quantity_precision(raw_quantity, precision.lot_size)
 
         if quantity_dec <= 0:
             return
@@ -511,6 +663,73 @@ class HedgingService:
         if snapped <= 0:
             return tick_size
         return snapped
+
+    def _precision_refresh_seconds(self) -> float:
+        interval = getattr(self._precision_provider, "refresh_interval", 900.0)
+        try:
+            return max(float(interval), 0.0)
+        except (TypeError, ValueError):
+            return 900.0
+
+    def _initialize_precision_provider(self) -> None:
+        ensure_symbols = getattr(self._precision_provider, "ensure_symbols", None)
+        if not callable(ensure_symbols):
+            return
+
+        symbols = [self.config.hedge_symbol]
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                asyncio.run(ensure_symbols(symbols, force=True))
+            except Exception:  # pragma: no cover - defensive logging
+                logger.warning(
+                    "Failed to synchronously warm precision metadata for %s",
+                    self.config.hedge_symbol,
+                )
+                return
+            else:
+                if self._precision_refresh_interval > 0:
+                    self._next_precision_refresh = time.time() + self._precision_refresh_interval
+                return
+
+        task = loop.create_task(ensure_symbols(symbols, force=True))
+
+        def _on_complete(completed: asyncio.Task[None]) -> None:
+            try:
+                completed.result()
+            except Exception:  # pragma: no cover - defensive logging
+                logger.warning(
+                    "Failed to asynchronously warm precision metadata for %s",
+                    self.config.hedge_symbol,
+                )
+            else:
+                if self._precision_refresh_interval > 0:
+                    self._next_precision_refresh = time.time() + self._precision_refresh_interval
+
+        task.add_done_callback(_on_complete)
+
+    async def _maybe_refresh_precision(self, force: bool = False) -> None:
+        ensure_symbols = getattr(self._precision_provider, "ensure_symbols", None)
+        if not callable(ensure_symbols):
+            return
+
+        now = time.time()
+        if not force and self._precision_refresh_interval > 0:
+            if self._next_precision_refresh and now < self._next_precision_refresh:
+                return
+
+        try:
+            await ensure_symbols([self.config.hedge_symbol], force=force)
+        except Exception:  # pragma: no cover - defensive logging
+            logger.warning(
+                "Failed to refresh precision metadata for %s",
+                self.config.hedge_symbol,
+            )
+            return
+
+        if self._precision_refresh_interval > 0:
+            self._next_precision_refresh = now + self._precision_refresh_interval
 
     @staticmethod
     def _apply_quantity_precision(quantity: Decimal, lot_size: Decimal) -> Decimal:

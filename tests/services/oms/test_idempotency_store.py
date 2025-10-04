@@ -1,11 +1,51 @@
 from __future__ import annotations
 
 import asyncio
-import types
 import time
+from decimal import Decimal
+
+import pytest
 
 from services.oms.idempotency_backend import RedisIdempotencyBackend
 from services.oms.idempotency_store import _IdempotencyStore
+
+
+class _FakeResponse:
+    def __init__(
+        self,
+        *,
+        exchange_order_id: str,
+        status: str = "accepted",
+        filled_qty: Decimal | str = Decimal("0"),
+        avg_price: Decimal | str = Decimal("0"),
+        errors: list[str] | None = None,
+    ) -> None:
+        self.exchange_order_id = exchange_order_id
+        self.status = status
+        self.filled_qty = Decimal(str(filled_qty))
+        self.avg_price = Decimal(str(avg_price))
+        self.errors = errors
+
+    def model_dump(self, *, mode: str = "python") -> dict[str, object]:
+        if mode not in {"python", "json"}:
+            raise ValueError(f"Unsupported dump mode {mode}")
+        return {
+            "exchange_order_id": self.exchange_order_id,
+            "status": self.status,
+            "filled_qty": str(self.filled_qty) if mode == "json" else self.filled_qty,
+            "avg_price": str(self.avg_price) if mode == "json" else self.avg_price,
+            "errors": self.errors,
+        }
+
+    @classmethod
+    def model_validate(cls, payload: dict[str, object]) -> "_FakeResponse":
+        return cls(
+            exchange_order_id=str(payload.get("exchange_order_id", "")),
+            status=str(payload.get("status", "accepted")),
+            filled_qty=payload.get("filled_qty", Decimal("0")),
+            avg_price=payload.get("avg_price", Decimal("0")),
+            errors=payload.get("errors"),
+        )
 
 
 class _MemoryRedis:
@@ -65,13 +105,24 @@ class _MemoryRedis:
             return int(remaining)
 
 
-async def _create_response(order_id: str) -> types.SimpleNamespace:
-    return types.SimpleNamespace(exchange_order_id=order_id)
+async def _create_response(order_id: str) -> _FakeResponse:
+    return _FakeResponse(
+        exchange_order_id=order_id,
+        status="accepted",
+        filled_qty=Decimal("0"),
+        avg_price=Decimal("0"),
+        errors=None,
+    )
 
 
 def _create_store(ttl_seconds: float) -> _IdempotencyStore:
     backend = RedisIdempotencyBackend(_MemoryRedis(), poll_interval=0.01, minimum_ttl=0.01)
-    return _IdempotencyStore("acct", ttl_seconds=ttl_seconds, backend=backend)
+    return _IdempotencyStore(
+        "acct",
+        ttl_seconds=ttl_seconds,
+        backend=backend,
+        result_decoder=_FakeResponse.model_validate,
+    )
 
 
 def test_idempotency_store_evicts_entries_after_ttl() -> None:
@@ -91,6 +142,59 @@ def test_idempotency_store_evicts_entries_after_ttl() -> None:
 
         assert reused_second is False
         assert second_response.exchange_order_id == "second"
+
+    asyncio.run(scenario())
+
+
+def test_idempotency_backend_round_trip_serializes_ack_payload() -> None:
+    async def scenario() -> None:
+        redis = _MemoryRedis()
+        backend = RedisIdempotencyBackend(redis, poll_interval=0.01, minimum_ttl=0.01)
+
+        future, is_owner = await backend.reserve("acct", "order", ttl_seconds=5.0)
+        assert is_owner is True
+
+        payload = {
+            "status": "ack",
+            "exchange_order_id": "abc123",
+            "fills": [
+                {"price": 101.25, "quantity": 2},
+                {"price": 101.5, "quantity": 1},
+            ],
+        }
+
+        await backend.complete("acct", "order", payload, ttl_seconds=5.0)
+
+        result = await future
+        assert result == payload
+
+        reused_future, reused = await backend.reserve("acct", "order", ttl_seconds=5.0)
+        assert reused is False
+        assert await reused_future == payload
+
+        reader_backend = RedisIdempotencyBackend(redis, poll_interval=0.01, minimum_ttl=0.01)
+        cached_future, cached_reused = await reader_backend.reserve(
+            "acct", "order", ttl_seconds=5.0
+        )
+        assert cached_reused is False
+        assert await cached_future == payload
+
+    asyncio.run(scenario())
+
+
+def test_idempotency_backend_rejects_tampered_payload() -> None:
+    async def scenario() -> None:
+        redis = _MemoryRedis()
+        backend = RedisIdempotencyBackend(redis, poll_interval=0.01, minimum_ttl=0.01)
+
+        key = backend._key("acct", "order")
+        await redis.set(key, b"not-json")
+
+        future, reused = await backend.reserve("acct", "order", ttl_seconds=5.0)
+        assert reused is False
+
+        with pytest.raises(RuntimeError, match="Invalid idempotency payload"):
+            await future
 
     asyncio.run(scenario())
 

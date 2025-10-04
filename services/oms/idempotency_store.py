@@ -1,7 +1,7 @@
 """Shared idempotency store logic for the OMS."""
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Awaitable, Tuple
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Tuple
 
 from services.oms.idempotency_backend import IdempotencyBackend, get_idempotency_backend
 
@@ -20,10 +20,12 @@ class _IdempotencyStore:
         *,
         ttl_seconds: float = 300.0,
         backend: IdempotencyBackend | None = None,
+        result_decoder: Callable[[Any], OMSOrderStatusResponse] | None = None,
     ) -> None:
         self._account_id = account_id
         self._ttl_seconds = ttl_seconds
         self._backend = backend or get_idempotency_backend(account_id)
+        self._result_decoder = result_decoder
 
     async def get_or_create(
         self, key: str, factory: Awaitable[OMSOrderStatusResponse]
@@ -44,7 +46,22 @@ class _IdempotencyStore:
                 )
                 return result, False
 
-        return await future, True
+        cached = await future
+        return self._coerce_result(cached), True
+
+    @staticmethod
+    def _default_decoder(payload: dict[str, Any]) -> OMSOrderStatusResponse:
+        from services.oms.oms_service import OMSOrderStatusResponse as ResponseModel
+
+        return ResponseModel.model_validate(payload)
+
+    def _coerce_result(
+        self, result: OMSOrderStatusResponse | dict[str, Any]
+    ) -> OMSOrderStatusResponse:
+        if isinstance(result, dict):
+            decoder = self._result_decoder or self._default_decoder
+            return decoder(result)
+        return result
 
 
 __all__ = ["_IdempotencyStore"]

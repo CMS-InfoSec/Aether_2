@@ -18,16 +18,19 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Mapping, Sequence
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from prometheus_client import Gauge
 from pydantic import BaseModel
 
+from auth.service import InMemorySessionStore, RedisSessionStore, SessionStoreProtocol
 from services.analytics.market_data_store import (
     MarketDataAdapter,
     MarketDataUnavailable,
     TimescaleMarketDataAdapter,
     Trade,
 )
+from services.common import security
+from services.common.security import require_admin_account
 
 
 logger = logging.getLogger(__name__)
@@ -349,6 +352,7 @@ class StressTestResponse(BaseModel):
 app = FastAPI(title="Advanced Signal Service", version="1.0.0")
 
 
+
 _PRIMARY_DSN_ENV = "SIGNAL_DATABASE_URL"
 _FALLBACK_DSN_ENV = "TIMESCALE_DSN"
 _PRIMARY_SCHEMA_ENV = "SIGNAL_SCHEMA"
@@ -389,6 +393,7 @@ def _reset_market_data_adapter() -> None:
         app.state.market_data_adapter = None
 
 
+
 def _market_data_adapter() -> MarketDataAdapter:
     adapter = getattr(app.state, "market_data_adapter", None)
     if adapter is None:
@@ -397,7 +402,11 @@ def _market_data_adapter() -> MarketDataAdapter:
 
 
 @app.get("/signals/orderflow/{symbol}", response_model=OrderFlowResponse)
-def order_flow_signals(symbol: str, window: int = Query(300, ge=60, le=3600)) -> OrderFlowResponse:
+def order_flow_signals(
+    symbol: str,
+    window: int = Query(300, ge=60, le=3600),
+    _caller: str = Depends(require_admin_account),
+) -> OrderFlowResponse:
     adapter = _market_data_adapter()
     try:
         trades = adapter.recent_trades(symbol, window=window)
@@ -436,6 +445,7 @@ def cross_asset_signals(
     alt_symbol: str,
     window: int = Query(180, ge=30, le=720),
     max_lag: int = Query(10, ge=1, le=50),
+    _caller: str = Depends(require_admin_account),
 ) -> CrossAssetResponse:
     adapter = _market_data_adapter()
     try:
@@ -468,6 +478,7 @@ def volatility_signals(
     symbol: str,
     window: int = Query(240, ge=60, le=960),
     horizon: int = Query(12, ge=1, le=60),
+    _caller: str = Depends(require_admin_account),
 ) -> VolatilityResponse:
     adapter = _market_data_adapter()
     try:
@@ -494,6 +505,7 @@ def whale_signals(
     symbol: str,
     window: int = Query(900, ge=120, le=7200),
     threshold_sigma: float = Query(2.5, ge=1.0, le=6.0),
+    _caller: str = Depends(require_admin_account),
 ) -> WhaleResponse:
     adapter = _market_data_adapter()
     try:
@@ -517,7 +529,11 @@ def whale_signals(
 
 
 @app.get("/signals/stress/{symbol}", response_model=StressTestResponse)
-def stress_test_signals(symbol: str, window: int = Query(240, ge=60, le=960)) -> StressTestResponse:
+def stress_test_signals(
+    symbol: str,
+    window: int = Query(240, ge=60, le=960),
+    _caller: str = Depends(require_admin_account),
+) -> StressTestResponse:
     adapter = _market_data_adapter()
     try:
         prices = adapter.price_history(symbol, length=window)
