@@ -35,6 +35,7 @@ from services.oms.kraken_ws import (
 )
 
 from services.oms.rate_limit_guard import RateLimitGuard, rate_limit_guard as shared_rate_limit_guard
+from services.risk.stablecoin_monitor import format_depeg_alert, get_global_monitor
 
 from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
 from services.oms.oms_service import (  # type: ignore  # pragma: no cover - shared helpers
