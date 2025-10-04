@@ -830,7 +830,7 @@ async def get_position_size(
     )
 
     try:
-        result = sizer.suggest_max_position(
+        result = await sizer.suggest_max_position(
             symbol,
             nav=nav_value,
             available_balance=available_balance,
@@ -1063,7 +1063,7 @@ async def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
         nav_value = float(state.net_asset_value)
         exposure = float(state.notional_exposure or 0.0)
         available_balance = max(nav_value - exposure, 0.0)
-        sizing_result = sizer.suggest_max_position(
+        sizing_result = await sizer.suggest_max_position(
             normalized_instrument,
             nav=nav_value,
             available_balance=available_balance,

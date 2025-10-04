@@ -94,6 +94,14 @@ shutdown_manager = setup_graceful_shutdown(
 if TYPE_CHECKING:  # pragma: no cover - type checking only
     from services.models.model_server import Intent
 
+try:  # pragma: no cover - optional dependency during testing
+    from services.models.model_server import Intent as Intent
+except Exception:  # pragma: no cover - fallback for limited environments
+    class Intent:  # type: ignore[no-redef]
+        def __init__(self, **kwargs) -> None:
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
 
 def _predict_intent(**kwargs) -> "Intent":
     from services.models.model_server import predict_intent as _predict
@@ -311,9 +319,9 @@ def _reset_regime_state() -> None:
 
 
 
-def _resolve_precision(symbol: str) -> Dict[str, float]:
+async def _resolve_precision(symbol: str) -> Dict[str, float]:
     try:
-        return precision_provider.require(symbol)
+        return await precision_provider.require(symbol)
     except PrecisionMetadataUnavailable as exc:
         logger.error("Precision metadata unavailable for instrument %s", symbol)
         raise HTTPException(
@@ -657,7 +665,7 @@ async def decide_policy(
         request.order_id,
         request_account,
     )
-    precision = _resolve_precision(request.instrument)
+    precision = await _resolve_precision(request.instrument)
     snapped_price = _snap(request.price, precision["tick"])
     snapped_qty = _snap(request.quantity, precision["lot"])
 
@@ -962,7 +970,7 @@ async def _submit_execution(
 ) -> None:
     """Submit the execution payload to the configured OMS endpoint."""
 
-    precision = _resolve_precision(request.instrument)
+    precision = await _resolve_precision(request.instrument)
     snapped_price = _snap(request.price, precision["tick"])
     snapped_qty = _snap(request.quantity, precision["lot"])
 

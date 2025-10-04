@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
+from collections.abc import Awaitable, Callable, Mapping
 from decimal import Decimal, InvalidOperation
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import Any, Dict, Optional
 
 import httpx
+import inspect
 
 # Module-level logger for metadata refresh diagnostics.
 logger = logging.getLogger(__name__)
@@ -24,7 +27,9 @@ class PrecisionMetadataProvider:
     def __init__(
         self,
         *,
-        fetcher: Callable[[], Mapping[str, Any]] | None = None,
+        fetcher: Callable[[], Mapping[str, Any]]
+        | Callable[[], Awaitable[Mapping[str, Any]]]
+        | None = None,
         refresh_interval: float = 300.0,
         timeout: float = 2.5,
         time_source: Callable[[], float] = time.monotonic,
@@ -36,48 +41,52 @@ class PrecisionMetadataProvider:
         self._lock = threading.Lock()
         self._cache: Dict[str, Dict[str, float]] = {}
         self._last_refresh: float = 0.0
+        self._refresh_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def get(self, symbol: str) -> Optional[Dict[str, float]]:
+    async def get(self, symbol: str) -> Optional[Dict[str, float]]:
         """Return precision metadata for ``symbol`` if available."""
 
         normalized = _normalize_symbol(symbol)
         if not normalized:
             return None
-        self._maybe_refresh()
+        await self._maybe_refresh()
         with self._lock:
             entry = self._cache.get(normalized)
             return dict(entry) if entry else None
 
-    def require(self, symbol: str) -> Dict[str, float]:
+    async def require(self, symbol: str) -> Dict[str, float]:
         """Return precision metadata for ``symbol`` or raise."""
 
-        metadata = self.get(symbol)
+        metadata = await self.get(symbol)
         if metadata is None:
             raise PrecisionMetadataUnavailable(f"Precision metadata unavailable for {symbol}")
         return metadata
 
-    def refresh(self, *, force: bool = False) -> None:
+    async def refresh(self, *, force: bool = False) -> None:
         """Force a metadata refresh regardless of cache age if requested."""
 
         if not force and not self._needs_refresh():
             return
-        try:
-            payload = self._fetcher()
-        except Exception as exc:  # pragma: no cover - defensive logging
-            logger.warning("Failed to fetch Kraken precision metadata: %s", exc)
-            return
+        async with self._refresh_lock:
+            if not force and not self._needs_refresh():
+                return
+            try:
+                payload = await self._call_fetcher()
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.warning("Failed to fetch Kraken precision metadata: %s", exc)
+                return
 
-        parsed = _parse_asset_pairs(payload)
-        if not parsed:
-            logger.warning("Received empty Kraken precision metadata payload")
-            return
+            parsed = _parse_asset_pairs(payload)
+            if not parsed:
+                logger.warning("Received empty Kraken precision metadata payload")
+                return
 
-        with self._lock:
-            self._cache = parsed
-            self._last_refresh = self._time_source()
+            with self._lock:
+                self._cache = parsed
+                self._last_refresh = self._time_source()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -88,14 +97,24 @@ class PrecisionMetadataProvider:
         age = self._time_source() - self._last_refresh
         return age >= self._refresh_interval
 
-    def _maybe_refresh(self) -> None:
+    async def _maybe_refresh(self) -> None:
         if self._needs_refresh():
-            self.refresh(force=True)
+            await self.refresh(force=False)
 
-    def _default_fetcher(self) -> Mapping[str, Any]:
+    async def _call_fetcher(self) -> Mapping[str, Any]:
+        fetcher = self._fetcher
+        if inspect.iscoroutinefunction(fetcher):
+            result = await fetcher()
+        else:
+            result = await asyncio.to_thread(fetcher)
+        if isinstance(result, Mapping):
+            return result
+        return {}
+
+    async def _default_fetcher(self) -> Mapping[str, Any]:
         url = "https://api.kraken.com/0/public/AssetPairs"
-        with httpx.Client(timeout=self._timeout) as client:
-            response = client.get(url)
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            response = await client.get(url)
             response.raise_for_status()
             payload = response.json()
         if isinstance(payload, Mapping):

@@ -61,6 +61,9 @@ def _client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
 
     monkeypatch.setattr(policy_service, "_model_health_ok", _healthy)
 
+    policy_service.shutdown_manager._draining = False  # type: ignore[attr-defined]
+    policy_service.shutdown_manager._drain_started_at = None  # type: ignore[attr-defined]
+    policy_service.shutdown_manager._inflight = 0  # type: ignore[attr-defined]
     policy_service.app.dependency_overrides[policy_service.require_admin_account] = lambda: "company"
     with TestClient(policy_service.app) as client:
         yield client
@@ -329,8 +332,9 @@ def test_policy_decide_preserves_tick_precision(
     assert body.effective_fee.taker == pytest.approx(2.3456)
 
 
-def test_policy_resolves_precision_for_ada_pair() -> None:
-    precision = policy_service._resolve_precision("ADA-USD")
+@pytest.mark.asyncio
+async def test_policy_resolves_precision_for_ada_pair() -> None:
+    precision = await policy_service._resolve_precision("ADA-USD")
     assert precision["tick"] == pytest.approx(0.0001)
     assert precision["lot"] == pytest.approx(0.1)
 

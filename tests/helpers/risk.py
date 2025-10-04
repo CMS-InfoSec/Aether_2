@@ -72,6 +72,11 @@ def risk_service_instance(
 
     db_path = tmp_path / db_filename
     _configure_test_engine(monkeypatch, db_path)
+    monkeypatch.setattr(
+        "shared.graceful_shutdown.install_sigterm_handler",
+        lambda manager: None,
+        raising=False,
+    )
     sys.modules.pop("risk_service", None)
     module = importlib.import_module("risk_service")
     try:

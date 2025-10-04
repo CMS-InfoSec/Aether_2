@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import os
 import sys
@@ -446,17 +447,25 @@ def _seed_precision_cache(monkeypatch: pytest.MonkeyPatch):
         yield
         return
 
+    monkeypatch.setenv("MODEL_HEALTH_URL", "")
     payload = _precision_fixture_payload()
     provider = precision_module.PrecisionMetadataProvider(
         fetcher=lambda: payload,
         refresh_interval=0.0,
     )
-    provider.refresh(force=True)
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(provider.refresh(force=True))
+    finally:
+        loop.close()
     monkeypatch.setattr(precision_module, "precision_provider", provider)
 
     policy_module = sys.modules.get("policy_service")
     if policy_module is not None:
         monkeypatch.setattr(policy_module, "precision_provider", provider, raising=False)
+        async def _always_healthy() -> bool:
+            return True
+        monkeypatch.setattr(policy_module, "_model_health_ok", _always_healthy, raising=False)
 
     position_sizer_module = sys.modules.get("services.risk.position_sizer")
     if position_sizer_module is not None:
