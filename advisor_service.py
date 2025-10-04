@@ -30,6 +30,10 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, sessionmaker
 
+from auth.service import InMemorySessionStore, RedisSessionStore, SessionStoreProtocol
+from services.common import security
+from services.common.security import require_admin_account
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -390,6 +394,40 @@ class AdvisorQueryResponse(BaseModel):
 app = FastAPI(title="Advisor Service", version="1.0.0")
 
 
+def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
+    """Attach the shared session store so authentication can validate tokens."""
+
+    existing = getattr(application.state, "session_store", None)
+    if isinstance(existing, SessionStoreProtocol):
+        store = existing
+    else:
+        redis_url = os.getenv("SESSION_REDIS_URL")
+        if not redis_url:
+            raise RuntimeError(
+                "SESSION_REDIS_URL is not configured. Provide a shared session store DSN to enable advisor authentication.",
+            )
+
+        ttl_minutes = int(os.getenv("SESSION_TTL_MINUTES", "60"))
+        if redis_url.startswith("memory://"):
+            store = InMemorySessionStore(ttl_minutes=ttl_minutes)
+        else:
+            try:  # pragma: no cover - optional redis dependency for production deployments
+                import redis  # type: ignore[import-not-found]
+            except ImportError as exc:  # pragma: no cover - surfaced when redis missing locally
+                raise RuntimeError("redis package is required when SESSION_REDIS_URL is set") from exc
+
+            client = redis.Redis.from_url(redis_url)
+            store = RedisSessionStore(client, ttl_minutes=ttl_minutes)
+
+        application.state.session_store = store
+
+    security.set_default_session_store(store)
+    return store
+
+
+SESSION_STORE = _configure_session_store(app)
+
+
 @app.on_event("startup")
 def _create_tables() -> None:  # pragma: no cover - exercised via FastAPI runtime
     Base.metadata.create_all(bind=engine)
@@ -417,8 +455,16 @@ async def _gather_context() -> Dict[str, Any]:
 async def advisor_query(
     payload: AdvisorQueryRequest,
     db: Session = Depends(get_db),
+    caller_account: str = Depends(require_admin_account),
 ) -> AdvisorQueryResponse:
     """Respond to advisor queries with contextualised root cause analysis."""
+
+    normalized_user = payload.user_id.strip().lower()
+    if normalized_user != caller_account.strip().lower():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authenticated account is not authorized for the requested user.",
+        )
 
     context = await _gather_context()
 
