@@ -61,8 +61,8 @@ else:
 from services.oms import main
 
 
-def _issue_session_token(account_id: str) -> str:
-    store = getattr(main.app.state, "session_store", None)
+def _issue_session_token(app, account_id: str) -> str:
+    store = getattr(app.state, "session_store", None)
     if store is None:
         raise RuntimeError("OMS session store is not configured")
     session = store.create(account_id)
@@ -76,7 +76,8 @@ def test_memory_session_store_initialises(monkeypatch) -> None:
 
     reloaded = importlib.reload(main_module)
 
-    assert isinstance(reloaded.app.state.session_store, InMemorySessionStore)
+    with TestClient(reloaded.app):
+        assert isinstance(reloaded.app.state.session_store, InMemorySessionStore)
 
     monkeypatch.setenv("SESSION_REDIS_URL", "memory://oms-test")
     importlib.reload(main_module)
@@ -84,17 +85,17 @@ def test_memory_session_store_initialises(monkeypatch) -> None:
 
 def test_valid_session_token_allows_access(monkeypatch) -> None:
     monkeypatch.setattr("shared.graceful_shutdown.install_sigterm_handler", lambda manager: None)
-    monkeypatch.setattr(main.shutdown_manager, "start_draining", lambda *args, **kwargs: False)
-    monkeypatch.setattr(main.shutdown_manager, "_draining", False)
     monkeypatch.setattr(main.shadow_oms, "snapshot", lambda account_id: {"account_id": account_id})
 
-    token = _issue_session_token("company")
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "X-Account-ID": "company",
-    }
-
     with TestClient(main.app) as client:
+        monkeypatch.setattr(main.shutdown_manager, "start_draining", lambda *args, **kwargs: False)
+        monkeypatch.setattr(main.shutdown_manager, "_draining", False)
+
+        token = _issue_session_token(main.app, "company")
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "X-Account-ID": "company",
+        }
         response = client.get("/oms/shadow_pnl", params={"account_id": "company"}, headers=headers)
 
     assert response.status_code == 200
@@ -104,16 +105,16 @@ def test_valid_session_token_allows_access(monkeypatch) -> None:
 
 def test_invalid_session_token_returns_unauthorized(monkeypatch) -> None:
     monkeypatch.setattr("shared.graceful_shutdown.install_sigterm_handler", lambda manager: None)
-    monkeypatch.setattr(main.shutdown_manager, "start_draining", lambda *args, **kwargs: False)
-    monkeypatch.setattr(main.shutdown_manager, "_draining", False)
     monkeypatch.setattr(main.shadow_oms, "snapshot", lambda account_id: {"account_id": account_id})
 
-    headers = {
-        "Authorization": "Bearer invalid-token",
-        "X-Account-ID": "company",
-    }
-
     with TestClient(main.app) as client:
+        monkeypatch.setattr(main.shutdown_manager, "start_draining", lambda *args, **kwargs: False)
+        monkeypatch.setattr(main.shutdown_manager, "_draining", False)
+
+        headers = {
+            "Authorization": "Bearer invalid-token",
+            "X-Account-ID": "company",
+        }
         response = client.get("/oms/shadow_pnl", params={"account_id": "company"}, headers=headers)
 
     assert response.status_code == 401
@@ -153,17 +154,22 @@ def test_session_survives_new_app_instance(monkeypatch) -> None:
     monkeypatch.setattr(
         "shared.graceful_shutdown.install_sigterm_handler", lambda manager: None
     )
-    monkeypatch.setattr(main.shutdown_manager, "start_draining", lambda *a, **k: False)
-    monkeypatch.setattr(main.shutdown_manager, "_draining", False)
     monkeypatch.setattr(main.shadow_oms, "snapshot", lambda account_id: {"account_id": account_id})
 
-    token = main.app.state.session_store.create("company").token
+    with TestClient(main.app):
+        monkeypatch.setattr(main.shutdown_manager, "start_draining", lambda *a, **k: False)
+        monkeypatch.setattr(main.shutdown_manager, "_draining", False)
+        token = _issue_session_token(main.app, "company")
 
     main = importlib.reload(main)
-    session = main.app.state.session_store.get(token)
 
-    assert session is not None, "session token should remain valid across instances"
-    assert session.admin_id == "company"
+    with TestClient(main.app):
+        monkeypatch.setattr(main.shutdown_manager, "start_draining", lambda *a, **k: False)
+        monkeypatch.setattr(main.shutdown_manager, "_draining", False)
+        session = main.app.state.session_store.get(token)
+
+        assert session is not None, "session token should remain valid across instances"
+        assert session.admin_id == "company"
 
     # Restore the default in-memory configuration for the remainder of the suite.
     monkeypatch.setenv("SESSION_REDIS_URL", "memory://oms-test")
