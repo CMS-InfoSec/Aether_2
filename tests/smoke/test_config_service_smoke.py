@@ -29,7 +29,8 @@ def _sqlite_db(tmp_path, monkeypatch):
         monkeypatch.setenv("CONFIG_DATABASE_URL", f"sqlite+pysqlite:///{db_path}")
         module = _load_config_module(alias)
         if reset:
-            module.reset_state()
+            with TestClient(module.app):
+                module.reset_state()
         return module, db_path
 
     yield _factory
@@ -44,43 +45,59 @@ def test_config_update_visible_across_replicas(_sqlite_db, monkeypatch):
     primary, db_path = _sqlite_db("config_service_smoke_primary", reset=True)
 
     with TestClient(primary.app) as client:
-        response = client.post(
-            "/config/update",
-            json={"key": "features.latency", "value": {"enabled": True}, "author": "alice"},
-        )
-        assert response.status_code == 200
+        primary.app.dependency_overrides[primary.require_admin_account] = lambda: "alice"
+        try:
+            response = client.post(
+                "/config/update",
+                json={"key": "features.latency", "value": {"enabled": True}, "author": "alice"},
+            )
+            assert response.status_code == 200
+        finally:
+            primary.app.dependency_overrides.pop(primary.require_admin_account, None)
 
     monkeypatch.setenv("CONFIG_DATABASE_URL", f"sqlite+pysqlite:///{db_path}")
     replica, _ = _sqlite_db("config_service_smoke_replica", path=db_path)
 
     with TestClient(replica.app) as replica_client:
-        current = replica_client.get("/config/current").json()
+        replica.app.dependency_overrides[replica.require_admin_account] = lambda: "alice"
+        try:
+            current = replica_client.get("/config/current").json()
+        finally:
+            replica.app.dependency_overrides.pop(replica.require_admin_account, None)
 
     assert current["features.latency"]["value"] == {"enabled": True}
     assert current["features.latency"]["approvers"] == ["alice"]
 
-    primary.engine.dispose()
-    replica.engine.dispose()
+    primary.app.state.db_engine.dispose()
+    replica.app.state.db_engine.dispose()
 
 
 def test_config_versions_survive_module_reload(_sqlite_db, monkeypatch):
     initial, db_path = _sqlite_db("config_service_smoke_initial", reset=True)
 
     with TestClient(initial.app) as client:
-        response = client.post(
-            "/config/update",
-            json={"key": "limits.max_notional", "value": 42, "author": "bob"},
-        )
-        assert response.status_code == 200
+        initial.app.dependency_overrides[initial.require_admin_account] = lambda: "bob"
+        try:
+            response = client.post(
+                "/config/update",
+                json={"key": "limits.max_notional", "value": 42, "author": "bob"},
+            )
+            assert response.status_code == 200
+        finally:
+            initial.app.dependency_overrides.pop(initial.require_admin_account, None)
 
     monkeypatch.setenv("CONFIG_DATABASE_URL", f"sqlite+pysqlite:///{db_path}")
     restarted = _load_config_module("config_service_smoke_restarted")
 
     with TestClient(restarted.app) as client:
-        current = client.get("/config/current").json()
+        restarted.app.dependency_overrides[restarted.require_admin_account] = lambda: "bob"
+        try:
+            current = client.get("/config/current").json()
+        finally:
+            restarted.app.dependency_overrides.pop(restarted.require_admin_account, None)
 
     assert current["limits.max_notional"]["version"] == 1
     assert current["limits.max_notional"]["approvers"] == ["bob"]
 
-    initial.engine.dispose()
-    restarted.engine.dispose()
+    initial.app.state.db_engine.dispose()
+    restarted.app.state.db_engine.dispose()

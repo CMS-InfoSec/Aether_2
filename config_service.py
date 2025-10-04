@@ -9,12 +9,13 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Generator, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Generator, Iterable, List, Optional, Set, Tuple, cast
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import JSON, Column, DateTime, Integer, String, UniqueConstraint, create_engine, func, select
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -114,11 +115,47 @@ def _create_engine(database_url: str):
     return create_engine(database_url, **engine_kwargs)
 
 
-DATABASE_URL = _require_database_url()
-engine = _create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
-
 Base = declarative_base()
+
+
+def _get_config_engine(application: FastAPI) -> Engine:
+    engine = getattr(application.state, "db_engine", None)
+    if engine is None:
+        raise RuntimeError(
+            "Config service database engine is not initialised. "
+            "Ensure the FastAPI application startup has completed successfully."
+        )
+    return cast(Engine, engine)
+
+
+def _get_session_factory(application: FastAPI) -> sessionmaker:
+    session_factory = getattr(application.state, "db_sessionmaker", None)
+    if session_factory is None:
+        raise RuntimeError(
+            "Config service session factory is unavailable. "
+            "Ensure the FastAPI application startup has completed successfully."
+        )
+    return cast(sessionmaker, session_factory)
+
+
+def _initialise_database(application: FastAPI) -> None:
+    if hasattr(application.state, "db_engine") and hasattr(application.state, "db_sessionmaker"):
+        return
+
+    database_url = _require_database_url()
+    engine = _create_engine(database_url)
+    session_factory = sessionmaker(
+        bind=engine,
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+        future=True,
+    )
+
+    application.state.db_engine = engine
+    application.state.db_sessionmaker = session_factory
+
+    Base.metadata.create_all(bind=engine)
 
 
 class ConfigVersion(Base):
@@ -137,10 +174,6 @@ class ConfigVersion(Base):
     __table_args__ = (
         UniqueConstraint("account_id", "key", "version", name="uq_config_version"),
     )
-
-
-Base.metadata.create_all(bind=engine)
-
 
 # ---------------------------------------------------------------------------
 # Guarded key management
@@ -177,9 +210,10 @@ def guarded_keys() -> Set[str]:
     return set(GUARDED_KEYS)
 
 
-def reset_state() -> None:
+def reset_state(application: Optional[FastAPI] = None) -> None:
     """Reset in-memory and database state (used in tests)."""
 
+    engine = _get_config_engine(application or app)
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
     _pending_guarded.clear()
@@ -190,8 +224,9 @@ def reset_state() -> None:
 # ---------------------------------------------------------------------------
 
 
-def get_session() -> Generator[Session, None, None]:
-    session = SessionLocal()
+def get_session(request: Request) -> Generator[Session, None, None]:
+    session_factory = _get_session_factory(request.app)
+    session = session_factory()
     try:
         yield session
     finally:
@@ -285,6 +320,15 @@ class ConfigUpdateResponse(BaseModel):
 
 
 app = FastAPI(title="Config Service")
+
+
+@app.on_event("startup")
+def _on_startup() -> None:
+    try:
+        _initialise_database(app)
+    except RuntimeError as exc:  # pragma: no cover - defensive logging path
+        LOGGER.error("Failed to initialise config service database: %s", exc)
+        raise
 
 
 def _pending_key(account_id: str, key: str) -> PendingKey:

@@ -1,9 +1,37 @@
 from __future__ import annotations
 
 
+import importlib.util
 import os
+import sys
+from pathlib import Path
+from typing import Iterator
 
+import pytest
 from fastapi.testclient import TestClient
+
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+
+def _import_module(module_name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - defensive
+        raise ModuleNotFoundError(module_name)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules.setdefault(module_name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+try:
+    from auth.service import InMemorySessionStore
+except ModuleNotFoundError:  # pragma: no cover - fallback when auth module unavailable
+    auth_module = _import_module("config_service._auth", ROOT / "auth" / "service.py")
+    InMemorySessionStore = getattr(auth_module, "InMemorySessionStore")  # type: ignore[assignment]
+
 
 os.environ.setdefault("CONFIG_ALLOW_SQLITE_FOR_TESTS", "1")
 os.environ.setdefault("CONFIG_DATABASE_URL", "sqlite+pysqlite:///:memory:")
@@ -20,11 +48,6 @@ except ModuleNotFoundError:
     set_default_session_store = security_module.set_default_session_store  # type: ignore[attr-defined]
 
 
-def setup_function() -> None:
-    reset_state()
-    set_guarded_keys(set())
-
-
 @pytest.fixture
 def config_client() -> Iterator[tuple[TestClient, InMemorySessionStore]]:
     store = InMemorySessionStore()
@@ -33,8 +56,11 @@ def config_client() -> Iterator[tuple[TestClient, InMemorySessionStore]]:
 
     try:
         with TestClient(app) as client:
+            reset_state()
+            set_guarded_keys(set())
             yield client, store
     finally:
+        set_guarded_keys(set())
         set_default_session_store(None)
         if hasattr(app.state, "session_store"):
             delattr(app.state, "session_store")
