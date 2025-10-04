@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
 import threading
 import time
 from decimal import Decimal, InvalidOperation
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import Any, Awaitable, Callable, Dict, Mapping, Optional
 
 import httpx
 
@@ -24,12 +26,36 @@ class PrecisionMetadataProvider:
     def __init__(
         self,
         *,
-        fetcher: Callable[[], Mapping[str, Any]] | None = None,
+        fetcher: Callable[[], Mapping[str, Any]]
+        | Callable[[], Awaitable[Mapping[str, Any]]]
+        | None = None,
         refresh_interval: float = 300.0,
         timeout: float = 2.5,
         time_source: Callable[[], float] = time.monotonic,
     ) -> None:
-        self._fetcher = fetcher or self._default_fetcher
+        raw_fetcher = fetcher or self._default_fetcher
+        self._fetcher: Callable[[], Awaitable[Mapping[str, Any]]]
+        if inspect.iscoroutinefunction(raw_fetcher):
+
+            async def _async_fetcher() -> Mapping[str, Any]:
+                result = raw_fetcher()
+                if inspect.isawaitable(result):
+                    return await result
+                return result
+
+            self._fetcher = _async_fetcher
+        else:
+
+            def _call_fetcher() -> Mapping[str, Any] | Awaitable[Mapping[str, Any]]:
+                return raw_fetcher()
+
+            async def _threaded_fetcher() -> Mapping[str, Any]:
+                result = await asyncio.to_thread(_call_fetcher)
+                if inspect.isawaitable(result):
+                    return await result
+                return result
+
+            self._fetcher = _threaded_fetcher
         self._refresh_interval = max(float(refresh_interval), 0.0)
         self._timeout = max(float(timeout), 0.0)
         self._time_source = time_source
@@ -62,6 +88,7 @@ class PrecisionMetadataProvider:
             raise PrecisionMetadataUnavailable(f"Precision metadata unavailable for {symbol}")
         return metadata
 
+
     def resolve_native(self, symbol: str) -> Optional[str]:
         """Resolve a client-facing symbol to the cached native pair identifier."""
 
@@ -91,12 +118,13 @@ class PrecisionMetadataProvider:
         return metadata
 
     def refresh(self, *, force: bool = False) -> None:
+
         """Force a metadata refresh regardless of cache age if requested."""
 
         if not force and not self._needs_refresh():
             return
         try:
-            payload = self._fetcher()
+            payload = await self._fetcher()
         except Exception as exc:  # pragma: no cover - defensive logging
             logger.warning("Failed to fetch Kraken precision metadata: %s", exc)
             return
@@ -122,7 +150,24 @@ class PrecisionMetadataProvider:
 
     def _maybe_refresh(self) -> None:
         if self._needs_refresh():
-            self.refresh(force=True)
+            self._refresh_sync(force=True)
+
+    def _refresh_sync(self, *, force: bool) -> None:
+        try:
+            asyncio.run(self.refresh(force=force))
+        except RuntimeError as exc:  # pragma: no cover - defensive guard
+            if "asyncio.run()" in str(exc):
+                raise RuntimeError(
+                    "PrecisionMetadataProvider.refresh() cannot be called from an "
+                    "active event loop; await refresh() or call within asyncio.to_thread()."
+                ) from exc
+            raise
+
+    def refresh_sync(self, *, force: bool = False) -> None:
+        """Synchronously refresh metadata for callers without an event loop."""
+
+        self._refresh_sync(force=force)
+
 
     def _resolve_native_locked(self, symbol: str) -> Optional[str]:
         normalized = _normalize_symbol(symbol)
@@ -142,9 +187,10 @@ class PrecisionMetadataProvider:
         return None
 
     def _default_fetcher(self) -> Mapping[str, Any]:
+
         url = "https://api.kraken.com/0/public/AssetPairs"
-        with httpx.Client(timeout=self._timeout) as client:
-            response = client.get(url)
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            response = await client.get(url)
             response.raise_for_status()
             payload = response.json()
         if isinstance(payload, Mapping):
