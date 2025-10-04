@@ -1103,8 +1103,8 @@ def _extract_trades(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _snap(
-    value: float,
-    step: float,
+    value: float | Decimal,
+    step: float | Decimal,
     *,
     side: str,
     floor_quantity: bool = False,

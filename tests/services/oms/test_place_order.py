@@ -460,6 +460,11 @@ def test_snap_preserves_tick_multiples_for_non_decimal_steps() -> None:
     assert _snap(0.37, 0.25, side="sell", floor_quantity=True) == pytest.approx(0.25)
 
 
+def test_snap_preserves_satoshi_precision() -> None:
+    snapped = _snap(Decimal("0.123456789"), Decimal("0.00000001"), side="buy")
+    assert Decimal(str(snapped)) == Decimal("0.12345679")
+
+
 def test_place_order_snaps_take_profit_stop_loss_and_trailing(
     account_setup: Tuple[
         AccountContext,

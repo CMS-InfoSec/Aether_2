@@ -341,8 +341,8 @@ def test_policy_decide_preserves_tick_precision(
 @pytest.mark.asyncio
 async def test_policy_resolves_precision_for_ada_pair() -> None:
     precision = await policy_service._resolve_precision("ADA-USD")
-    assert precision["tick"] == pytest.approx(0.0001)
-    assert precision["lot"] == pytest.approx(0.1)
+    assert precision["tick"] == Decimal("0.0001")
+    assert precision["lot"] == Decimal("0.1")
     assert precision["native_pair"] == "ADA/USD"
 
     snapped_price = policy_service._snap(0.256789, precision["tick"])
@@ -350,14 +350,23 @@ async def test_policy_resolves_precision_for_ada_pair() -> None:
 
     assert snapped_price == pytest.approx(0.2568)
     assert snapped_qty == pytest.approx(12.3)
-
-
-
-def test_policy_resolves_precision_for_eur_pair() -> None:
-    precision = policy_service._resolve_precision("BTC-EUR")
-    assert precision["tick"] == pytest.approx(0.5)
-    assert precision["lot"] == pytest.approx(0.0005)
+@pytest.mark.asyncio
+async def test_policy_resolves_precision_for_eur_pair() -> None:
+    precision = await policy_service._resolve_precision("BTC-EUR")
+    assert precision["tick"] == Decimal("0.5")
+    assert precision["lot"] == Decimal("0.0005")
     assert precision["native_pair"] == "XBT/EUR"
+
+
+@pytest.mark.asyncio
+async def test_policy_preserves_sub_satoshi_precision() -> None:
+    precision = await policy_service._resolve_precision("TST-USD")
+
+    assert precision["tick"] == Decimal("0.00000001")
+    assert precision["lot"] == Decimal("0.00000001")
+
+    snapped_qty = policy_service._snap(Decimal("0.123456789"), precision["lot"])
+    assert Decimal(str(snapped_qty)) == Decimal("0.12345679")
 
 
 def test_policy_decide_returns_503_when_precision_unavailable(

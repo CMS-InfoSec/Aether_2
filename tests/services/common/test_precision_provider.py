@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+from decimal import Decimal
 from typing import Any, Dict, Mapping
 
 import pytest
@@ -52,8 +53,8 @@ async def test_precision_provider_refreshes_metadata() -> None:
 
     first = await provider.require("ADA-USD")
 
-    assert first["tick"] == pytest.approx(0.0001)
-    assert first["lot"] == pytest.approx(0.1)
+    assert first["tick"] == Decimal("0.0001")
+    assert first["lot"] == Decimal("0.1")
     assert first["native_pair"] == "ADA/USD"
 
     payload_ref["data"] = _payload(0.001, 5.0)
@@ -62,28 +63,30 @@ async def test_precision_provider_refreshes_metadata() -> None:
 
     updated = await provider.require("ADA-USD")
 
-    assert updated["tick"] == pytest.approx(0.001)
-    assert updated["lot"] == pytest.approx(5.0)
+    assert updated["tick"] == Decimal("0.001")
+    assert updated["lot"] == Decimal("5")
     assert updated["native_pair"] == "ADA/USD"
 
 
-def test_precision_provider_resolves_non_usd_pairs() -> None:
+@pytest.mark.asyncio
+async def test_precision_provider_resolves_non_usd_pairs() -> None:
     provider = PrecisionMetadataProvider(fetcher=lambda: _payload(0.001, 1.0), refresh_interval=0.0)
-    provider.refresh(force=True)
+    await provider.refresh(force=True)
 
-    eur_precision = provider.require("BTC-EUR")
-    assert eur_precision["tick"] == pytest.approx(0.1)
-    assert eur_precision["lot"] == pytest.approx(0.0001)
+    eur_precision = await provider.require("BTC-EUR")
+    assert eur_precision["tick"] == Decimal("0.1")
+    assert eur_precision["lot"] == Decimal("0.0001")
     assert eur_precision["native_pair"] == "XBT/EUR"
 
-    usdt_precision = provider.require("USDT-USD")
-    assert usdt_precision["tick"] == pytest.approx(0.0001)
-    assert usdt_precision["lot"] == pytest.approx(1.0)
+    usdt_precision = await provider.require("USDT-USD")
+    assert usdt_precision["tick"] == Decimal("0.0001")
+    assert usdt_precision["lot"] == Decimal("1")
     assert usdt_precision["native_pair"] == "USDT/USD"
 
 
 
-def test_precision_provider_handles_non_usd_pairs() -> None:
+@pytest.mark.asyncio
+async def test_precision_provider_handles_non_usd_pairs() -> None:
     payload = {
         "ETHUSDT": {
             "wsname": "ETH/USDT",
@@ -104,20 +107,17 @@ def test_precision_provider_handles_non_usd_pairs() -> None:
     }
 
     provider = PrecisionMetadataProvider(fetcher=lambda: payload, refresh_interval=0.0)
-    provider.refresh(force=True)
+    await provider.refresh(force=True)
 
-    native = provider.resolve_native("ETH-USDT")
-    assert native == "ETH/USDT"
+    metadata = await provider.require("ETH-USDT")
+    assert metadata["native_pair"] == "ETH/USDT"
+    assert metadata["tick"] == Decimal("0.01")
+    assert metadata["lot"] == Decimal("0.001")
 
-    metadata = provider.require_native(native)
-    assert metadata["tick"] == pytest.approx(0.01)
-    assert metadata["lot"] == pytest.approx(0.001)
-
-    ada_native = provider.resolve_native("ADA-EUR")
-    assert ada_native == "ADA/EUR"
-    ada_metadata = provider.require("ADA-EUR")
-    assert ada_metadata["tick"] == pytest.approx(0.0001)
-    assert ada_metadata["lot"] == pytest.approx(0.1)
+    ada_metadata = await provider.require("ADA-EUR")
+    assert ada_metadata["native_pair"] == "ADA/EUR"
+    assert ada_metadata["tick"] == Decimal("0.0001")
+    assert ada_metadata["lot"] == Decimal("0.1")
 
 
 @pytest.mark.asyncio
@@ -144,7 +144,7 @@ async def test_precision_provider_coalesces_concurrent_refreshes() -> None:
 
     provider = PrecisionMetadataProvider(fetcher=_fetch, refresh_interval=60.0)
 
-    async def _require() -> Dict[str, float]:
+    async def _require() -> Dict[str, Decimal | str]:
         return await provider.require("ADA-USD")
 
     tasks = [asyncio.create_task(_require()) for _ in range(5)]
@@ -153,8 +153,31 @@ async def test_precision_provider_coalesces_concurrent_refreshes() -> None:
     results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=1.0)
 
     assert len(call_order) == 1
-    assert all(result["tick"] == pytest.approx(0.01) for result in results)
-    assert all(result["lot"] == pytest.approx(0.1) for result in results)
+    assert all(result["tick"] == Decimal("0.01") for result in results)
+    assert all(result["lot"] == Decimal("0.1") for result in results)
+
+
+@pytest.mark.asyncio
+async def test_precision_provider_preserves_sub_satoshi_precision() -> None:
+    payload = {
+        "XXBTZUSD": {
+            "wsname": "XBT/USD",
+            "base": "XXBT",
+            "quote": "ZUSD",
+            "tick_size": "0.5",
+            "lot_step": "0.00000001",
+        }
+    }
+
+    provider = PrecisionMetadataProvider(fetcher=lambda: payload, refresh_interval=0.0)
+    await provider.refresh(force=True)
+
+    metadata = await provider.require("XBT-USD")
+
+    assert metadata["native_pair"] == "XBT/USD"
+    assert metadata["tick"] == Decimal("0.5")
+    assert metadata["lot"] == Decimal("0.00000001")
+    assert isinstance(metadata["lot"], Decimal)
 
 
 @pytest.mark.asyncio
@@ -162,7 +185,11 @@ async def test_precision_provider_get_normalizes_symbols() -> None:
     provider = PrecisionMetadataProvider(fetcher=lambda: {}, refresh_interval=0.0)
 
     provider._cache = {  # type: ignore[attr-defined]
-        "ADA-USD": {"tick": 0.1, "lot": 1.0, "native_pair": "ADA/USD"}
+        "ADA-USD": {
+            "tick": Decimal("0.1"),
+            "lot": Decimal("1"),
+            "native_pair": "ADA/USD",
+        }
     }
     provider._aliases = {"ADAUSD": "ADA-USD"}  # type: ignore[attr-defined]
     provider._refresh_interval = float("inf")  # type: ignore[attr-defined]
@@ -170,7 +197,11 @@ async def test_precision_provider_get_normalizes_symbols() -> None:
 
     result = await provider.get("adausd")
 
-    assert result == {"tick": 0.1, "lot": 1.0, "native_pair": "ADA/USD"}
+    assert result == {
+        "tick": Decimal("0.1"),
+        "lot": Decimal("1"),
+        "native_pair": "ADA/USD",
+    }
 
 
 def test_precision_module_import_and_instantiation() -> None:
