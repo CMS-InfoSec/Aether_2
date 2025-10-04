@@ -104,7 +104,7 @@ if "services.common.adapters" not in sys.modules:
             self.account_id = account_id
             self._event_store.setdefault(account_id, [])
 
-        def publish(self, topic: str, payload: Dict[str, Any]) -> None:
+        async def publish(self, topic: str, payload: Dict[str, Any]) -> None:
             self._event_store[self.account_id].append({
                 "topic": topic,
                 "payload": dict(payload),

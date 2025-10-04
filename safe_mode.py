@@ -515,9 +515,11 @@ class KafkaSafeModePublisher:
         try:  # pragma: no cover - adapter import may fail in lightweight environments
             from services.common.adapters import KafkaNATSAdapter  # type: ignore
 
-            KafkaNATSAdapter(account_id=self._account_id).publish(
-                topic=self._topic,
-                payload=payload,
+            asyncio.run(
+                KafkaNATSAdapter(account_id=self._account_id).publish(
+                    topic=self._topic,
+                    payload=payload,
+                )
             )
         except Exception:  # pragma: no cover - fall back to in-memory history
             pass

@@ -19,10 +19,11 @@ as they would from the real OMS.
 
 from __future__ import annotations
 
+import asyncio
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
-import json
 import logging
 from threading import Lock
 from typing import Any, Dict, Iterable, List, Mapping, Optional
@@ -293,7 +294,7 @@ class SimBroker:
         payload = event.model_dump(mode="json")
         payload["simulated"] = True
         payload["client_order_id"] = order.client_order_id
-        self._kafka.publish(topic="oms.simulated.orders", payload=payload)
+        asyncio.run(self._kafka.publish(topic="oms.simulated.orders", payload=payload))
 
     def _emit_fill_event(self, order: SimulatedOrder, fill: SimulatedFill) -> None:
         event = FillEvent(
@@ -309,7 +310,7 @@ class SimBroker:
         payload["simulated"] = True
         payload["order_id"] = order.order_id
         payload["client_order_id"] = order.client_order_id
-        self._kafka.publish(topic="oms.simulated.fills", payload=payload)
+        asyncio.run(self._kafka.publish(topic="oms.simulated.fills", payload=payload))
 
     def _persist_order(self, order: SimulatedOrder) -> None:
         record = {

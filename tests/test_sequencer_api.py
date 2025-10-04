@@ -55,7 +55,7 @@ if "services.common.adapters" not in sys.modules:
         def __init__(self, account_id: str) -> None:
             self.account_id = account_id
 
-        def publish(self, topic: str, payload: object) -> None:
+        async def publish(self, topic: str, payload: object) -> None:
             return None
 
     adapters_stub.KafkaNATSAdapter = KafkaNATSAdapter
