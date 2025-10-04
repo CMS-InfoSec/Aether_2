@@ -7,13 +7,17 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
-from typing import Dict, Iterable, List, Mapping, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
+from alembic import command
+from alembic.config import Config
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 from sqlalchemy import Column, DateTime, Integer, Numeric, String, create_engine, text
-from sqlalchemy.engine import Engine
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.engine import Engine, URL
+from sqlalchemy.engine.url import make_url
+from sqlalchemy.exc import ArgumentError, SQLAlchemyError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -27,30 +31,102 @@ logging.basicConfig(level=logging.INFO)
 Base = declarative_base()
 
 
-DEFAULT_DATABASE_URL = "sqlite:///./allocator.db"
+def _normalize_database_url(raw_url: str) -> str:
+    """Normalise *raw_url* so SQLAlchemy uses the psycopg2 driver."""
+
+    if raw_url.startswith("postgresql+psycopg://"):
+        return "postgresql+psycopg2://" + raw_url[len("postgresql+psycopg://") :]
+    if raw_url.startswith("postgresql://"):
+        return "postgresql+psycopg2://" + raw_url[len("postgresql://") :]
+    if raw_url.startswith("postgres://"):
+        return "postgresql+psycopg2://" + raw_url[len("postgres://") :]
+    if raw_url.startswith("timescale://"):
+        return "postgresql+psycopg2://" + raw_url[len("timescale://") :]
+    return raw_url
 
 
-def _database_url() -> str:
-    return (
-        os.getenv("CAPITAL_ALLOCATOR_DB_URL")
-        or os.getenv("TIMESCALE_DSN")
-        or os.getenv("DATABASE_URL")
-        or DEFAULT_DATABASE_URL
-    )
+def _database_url() -> URL:
+    """Return the managed Postgres/Timescale DSN for the allocator service."""
+
+    primary = os.getenv("CAPITAL_ALLOCATOR_DB_URL")
+    secondary = os.getenv("TIMESCALE_DSN")
+    tertiary = os.getenv("DATABASE_URL")
+    raw_url = primary or secondary or tertiary
+
+    if not raw_url:
+        raise RuntimeError(
+            "CAPITAL_ALLOCATOR_DB_URL (or legacy TIMESCALE_DSN/DATABASE_URL) must be set to a managed Postgres/Timescale DSN."
+        )
+
+    normalised = _normalize_database_url(raw_url)
+
+    try:
+        url = make_url(normalised)
+    except ArgumentError as exc:  # pragma: no cover - configuration error
+        raise RuntimeError(f"Invalid capital allocator database URL '{raw_url}': {exc}") from exc
+
+    driver = url.drivername.lower()
+    if not driver.startswith("postgresql"):
+        raise RuntimeError(
+            "Capital allocator requires a PostgreSQL/TimescaleDSN; "
+            f"received driver '{url.drivername}'."
+        )
+
+    return url
 
 
-def _engine_options(url: str) -> Dict[str, object]:
-    options: Dict[str, object] = {"future": True}
-    if url.startswith("sqlite://"):
-        options.setdefault("connect_args", {"check_same_thread": False})
-        if url == "sqlite:///:memory:" or url.endswith(":memory:"):
-            options["poolclass"] = StaticPool
+def _engine_options(url: URL) -> Dict[str, Any]:
+    options: Dict[str, Any] = {
+        "future": True,
+        "pool_pre_ping": True,
+        "pool_size": int(os.getenv("CAPITAL_ALLOCATOR_POOL_SIZE", "10")),
+        "max_overflow": int(os.getenv("CAPITAL_ALLOCATOR_MAX_OVERFLOW", "10")),
+        "pool_timeout": int(os.getenv("CAPITAL_ALLOCATOR_POOL_TIMEOUT", "30")),
+        "pool_recycle": int(os.getenv("CAPITAL_ALLOCATOR_POOL_RECYCLE", "1800")),
+    }
+
+    connect_args: Dict[str, Any] = {}
+
+    forced_sslmode = os.getenv("CAPITAL_ALLOCATOR_SSLMODE")
+    if forced_sslmode:
+        connect_args["sslmode"] = forced_sslmode
+    elif "sslmode" not in url.query and url.host not in {None, "localhost", "127.0.0.1"}:
+        connect_args["sslmode"] = "require"
+
+    app_name = os.getenv("CAPITAL_ALLOCATOR_APP_NAME", "capital-allocator")
+    if app_name:
+        connect_args["application_name"] = app_name
+
+    if url.drivername.startswith("sqlite"):
+        connect_args.setdefault("check_same_thread", False)
+        options.setdefault("poolclass", StaticPool)
+
+    if connect_args:
+        options["connect_args"] = connect_args
+
     return options
 
 
 _DB_URL = _database_url()
-ENGINE: Engine = create_engine(_DB_URL, **_engine_options(_DB_URL))
+ENGINE: Engine = create_engine(
+    _DB_URL.render_as_string(hide_password=False),
+    **_engine_options(_DB_URL),
+)
 SessionLocal = sessionmaker(bind=ENGINE, expire_on_commit=False, autoflush=False, future=True)
+
+_MIGRATIONS_PATH = Path(__file__).resolve().parent / "data" / "migrations"
+
+
+def run_allocator_migrations() -> None:
+    """Apply outstanding migrations for the capital allocator schema."""
+
+    config = Config()
+    config.set_main_option("script_location", str(_MIGRATIONS_PATH))
+    config.set_main_option("sqlalchemy.url", _DB_URL.render_as_string(hide_password=False))
+    config.attributes["configure_logger"] = False
+
+    LOGGER.info("Applying capital allocator migrations")
+    command.upgrade(config, "head")
 
 
 _ZERO = Decimal("0")
@@ -127,9 +203,6 @@ class CapitalAllocation(Base):
     account_id = Column(String, nullable=False, index=True)
     pct = Column(Numeric(18, _PCT_SCALE), nullable=False)
     ts = Column(DateTime(timezone=True), nullable=False, index=True)
-
-
-Base.metadata.create_all(bind=ENGINE)
 
 
 @dataclass(slots=True)
@@ -427,6 +500,12 @@ def _build_response(
 
 
 app = FastAPI(title="Capital Allocator Service", version="1.0.0")
+app.state.db_sessionmaker = SessionLocal
+
+
+@app.on_event("startup")
+def _on_startup() -> None:
+    run_allocator_migrations()
 
 
 @app.get("/allocator/status", response_model=AllocationResponse)
@@ -476,7 +555,7 @@ def rebalance_allocation(
     return _build_response(decisions, requested_total, unallocated)
 
 
-__all__ = ["app", "SessionLocal", "ENGINE", "CapitalAllocation"]
+__all__ = ["app", "SessionLocal", "ENGINE", "CapitalAllocation", "run_allocator_migrations"]
 
 _ALLOCATOR_PRIVILEGE_ENV = "CAPITAL_ALLOCATOR_ADMINS"
 

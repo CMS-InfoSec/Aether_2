@@ -8,6 +8,7 @@ resources:
   - deployment-strategy-orchestrator.yaml
 
   - deployment-policy.yaml
+  - deployment-capital-allocator.yaml
   - deployment-risk.yaml
   - deployment-oms.yaml
   - deployment-fees.yaml
@@ -17,6 +18,7 @@ resources:
   - service-auth.yaml
 
   - service-policy.yaml
+  - service-capital-allocator.yaml
   - service-risk.yaml
   - service-oms.yaml
   - service-fees.yaml
