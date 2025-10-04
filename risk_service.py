@@ -34,6 +34,7 @@ from alerts import push_exchange_adapter_failure
 from exchange_adapter import get_exchange_adapter
 from metrics import (
     increment_trade_rejection,
+    metric_context,
     observe_risk_validation_latency,
     record_fees_nav_pct,
     setup_metrics,
@@ -722,11 +723,14 @@ async def validate_risk(
         decision.pass_,
     )
 
+    metrics_ctx = metric_context(account_id=account_id, symbol=symbol)
+
     if not decision.pass_:
         _audit_failure(context, decision)
         increment_trade_rejection(
             account_id,
             symbol,
+            context=metrics_ctx,
         )
 
     state = context.request.portfolio_state
@@ -737,6 +741,7 @@ async def validate_risk(
         account_id,
         symbol,
         fees_pct,
+        context=metrics_ctx,
     )
 
     return decision.dict(by_alias=True)

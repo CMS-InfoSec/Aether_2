@@ -43,7 +43,12 @@ from ml.policy.fallback_policy import FallbackDecision, FallbackPolicy
 
 
 from exchange_adapter import get_exchange_adapter, get_exchange_adapters_status
-from metrics import record_abstention_rate, record_drift_score, setup_metrics
+from metrics import (
+    metric_context,
+    record_abstention_rate,
+    record_drift_score,
+    setup_metrics,
+)
 from services.common.security import ADMIN_ACCOUNTS, require_admin_account
 from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
 
@@ -902,9 +907,20 @@ async def decide_policy(
     except (TypeError, ValueError):
         drift_value = 0.0
 
-    record_drift_score(account_id, request.instrument, drift_value)
+    metrics_ctx = metric_context(account_id=account_id, symbol=request.instrument)
+    record_drift_score(
+        account_id,
+        request.instrument,
+        drift_value,
+        context=metrics_ctx,
+    )
     abstain_metric = 0.0 if approved and selected_action != "abstain" else 1.0
-    record_abstention_rate(account_id, request.instrument, abstain_metric)
+    record_abstention_rate(
+        account_id,
+        request.instrument,
+        abstain_metric,
+        context=metrics_ctx,
+    )
 
     response = PolicyDecisionResponse(
         approved=approved,
