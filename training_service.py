@@ -32,7 +32,9 @@ from sqlalchemy import (
     Text,
     create_engine,
 )
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from services.common.security import require_admin_account
 
@@ -97,7 +99,70 @@ except ModuleNotFoundError:  # pragma: no cover - graceful fallback.
 # ---------------------------------------------------------------------------
 
 
-DATABASE_URL = os.getenv("TRAINING_DATABASE_URL", "sqlite:///./training_service.db")
+_DATABASE_URL_ENV = "TRAINING_DATABASE_URL"
+_ALLOW_SQLITE_FLAG = "TRAINING_ALLOW_SQLITE_FOR_TESTS"
+
+
+def _database_url() -> str:
+    """Return the configured managed Timescale/Postgres database URL."""
+
+    url = os.getenv(_DATABASE_URL_ENV) or os.getenv("TIMESCALE_DSN")
+    if not url:
+        raise RuntimeError(
+            "TRAINING_DATABASE_URL or TIMESCALE_DSN must be configured with a "
+            "PostgreSQL/Timescale DSN for the training service."
+        )
+
+    normalized = url.strip()
+    if normalized.startswith("postgres://"):
+        normalized = "postgresql://" + normalized.split("://", 1)[1]
+
+    lowered = normalized.lower()
+    if lowered.startswith("postgresql://"):
+        normalized = normalized.replace("postgresql://", "postgresql+psycopg://", 1)
+    elif lowered.startswith(("postgresql+psycopg://", "postgresql+psycopg2://")):
+        pass
+    elif lowered.startswith("sqlite://") and os.getenv(_ALLOW_SQLITE_FLAG) == "1":
+        logger.warning(
+            "Allowing SQLite database URL for training service because %s=1. "
+            "Do not use this configuration outside of tests.",
+            _ALLOW_SQLITE_FLAG,
+        )
+        return normalized
+    else:
+        raise RuntimeError(
+            "Training service requires a PostgreSQL/Timescale DSN via "
+            "TRAINING_DATABASE_URL or TIMESCALE_DSN."
+        )
+
+    return normalized
+
+
+def _engine_options(url: str) -> Dict[str, object]:
+    options: Dict[str, object] = {"future": True, "pool_pre_ping": True}
+
+    if url.startswith("sqlite"):
+        connect_args: Dict[str, object] = {"check_same_thread": False}
+        options["connect_args"] = connect_args
+        if ":memory:" in url:
+            options["poolclass"] = StaticPool
+        return options
+
+    sslmode = os.getenv("TRAINING_DB_SSLMODE", "require").strip()
+    connect_args: Dict[str, object] = {}
+    if sslmode:
+        connect_args["sslmode"] = sslmode
+    options["connect_args"] = connect_args
+    options.update(
+        pool_size=int(os.getenv("TRAINING_DB_POOL_SIZE", "10")),
+        max_overflow=int(os.getenv("TRAINING_DB_MAX_OVERFLOW", "5")),
+        pool_timeout=int(os.getenv("TRAINING_DB_POOL_TIMEOUT", "30")),
+        pool_recycle=int(os.getenv("TRAINING_DB_POOL_RECYCLE", "1800")),
+    )
+    return options
+
+
+DATABASE_URL = _database_url()
 ARTIFACT_ROOT = Path(os.getenv("TRAINING_ARTIFACT_ROOT", "artifacts/training_runs"))
 ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -161,9 +226,14 @@ class ModelSwitchLogRecord(Base):
     details = Column(JSON, nullable=True)
 
 
-engine = create_engine(DATABASE_URL, future=True)
-SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
-Base.metadata.create_all(engine)
+ENGINE: Engine = create_engine(DATABASE_URL, **_engine_options(DATABASE_URL))
+SessionLocal = sessionmaker(
+    bind=ENGINE,
+    autoflush=False,
+    expire_on_commit=False,
+    future=True,
+)
+Base.metadata.create_all(bind=ENGINE)
 
 
 @contextmanager

@@ -1,3 +1,4 @@
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -12,6 +13,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 pytest.importorskip("fastapi", reason="fastapi is required for training service validation tests")
 pytest.importorskip("sqlalchemy", reason="sqlalchemy is required for training service validation tests")
+
+os.environ.setdefault("TRAINING_ALLOW_SQLITE_FOR_TESTS", "1")
+os.environ.setdefault("TRAINING_DATABASE_URL", "sqlite:///:memory:")
 
 from fastapi import Header, HTTPException, status
 

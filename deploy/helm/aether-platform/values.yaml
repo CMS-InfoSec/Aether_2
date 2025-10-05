@@ -397,7 +397,18 @@ backendServices:
       tag: latest
     replicaCount: 2
     containerPort: 8000
-    env: []
+    env:
+      - name: FEES_DATABASE_URL
+        valueFrom:
+          secretKeyRef:
+            name: fees-service-database
+            key: dsn
+      - name: FEES_DB_SSLMODE
+        valueFrom:
+          secretKeyRef:
+            name: fees-service-database
+            key: sslmode
+            optional: true
     usesKrakenSecrets: true
     extraVolumeMounts: []
     extraVolumes: []
@@ -786,6 +797,11 @@ backendServices:
           secretKeyRef:
             name: risk-service-database
             key: dsn
+      - name: DIVERSIFICATION_DATABASE_URL
+        valueFrom:
+          secretKeyRef:
+            name: risk-service-database
+            key: dsn
       - name: RISK_DB_SSLMODE
         valueFrom:
           secretKeyRef:
@@ -796,6 +812,11 @@ backendServices:
           secretKeyRef:
             name: risk-service-database
             key: dsn
+      - name: DIVERSIFICATION_DB_SSLMODE
+        valueFrom:
+          secretKeyRef:
+            name: risk-service-database
+            key: sslmode
       - name: ESG_DB_SSLMODE
         valueFrom:
           secretKeyRef:
@@ -891,6 +912,44 @@ backendServices:
     pdb:
       enabled: true
       maxUnavailable: 1
+  trainingService:
+    enabled: false
+    nameOverride: training-service
+    image:
+      repository: ghcr.io/aether/training-service
+      tag: latest
+    replicaCount: 1
+    containerPort: 8000
+    env:
+      - name: TRAINING_DATABASE_URL
+        valueFrom:
+          secretKeyRef:
+            name: training-service-database
+            key: dsn
+      - name: TRAINING_DB_SSLMODE
+        value: require
+    usesKrakenSecrets: false
+    extraVolumeMounts: []
+    extraVolumes: []
+    service:
+      port: 80
+      targetPort: http
+    ingress:
+      enabled: true
+      host: training.aether.example.com
+      tlsSecret: training-service-tls
+      annotations: {}
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+    hpa:
+      enabled: false
+    pdb:
+      enabled: false
   universe:
     enabled: true
     nameOverride: universe-service

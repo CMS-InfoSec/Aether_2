@@ -59,7 +59,18 @@ spec:
                 secretKeyRef:
                   name: risk-service-database
                   key: dsn
+            - name: DIVERSIFICATION_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: risk-service-database
+                  key: dsn
             - name: RISK_DB_SSLMODE
+              valueFrom:
+                secretKeyRef:
+                  name: risk-service-database
+                  key: sslmode
+                  optional: true
+            - name: DIVERSIFICATION_DB_SSLMODE
               valueFrom:
                 secretKeyRef:
                   name: risk-service-database

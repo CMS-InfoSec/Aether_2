@@ -1,25 +1,32 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, List
+import sys
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import pytest
 from fastapi.testclient import TestClient
 
-import services.fees.main as fees_main
 from services.common.adapters import RedisFeastAdapter
 from services.common.security import ADMIN_ACCOUNTS
-from services.fees.main import app
 
 
 @pytest.fixture(name="client")
-def client_fixture() -> TestClient:
-    return TestClient(app)
+def client_fixture(fees_app) -> TestClient:
+    return TestClient(fees_app)
 
 
 @pytest.mark.parametrize("account_id", sorted(ADMIN_ACCOUNTS))
 def test_get_effective_fees_returns_tiered_breakdown(
-    monkeypatch: pytest.MonkeyPatch, client: TestClient, account_id: str
+    monkeypatch: pytest.MonkeyPatch,
+    fee_service_module,
+    client: TestClient,
+    account_id: str,
 ) -> None:
     basis_ts = datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)
 
@@ -51,8 +58,8 @@ def test_get_effective_fees_returns_tiered_breakdown(
             assert pair == "BTC-USD"
             return {"notional": 150_000.0, "basis_ts": basis_ts}
 
-    monkeypatch.setattr(fees_main, "RedisFeastAdapter", StubRedisAdapter)
-    monkeypatch.setattr(fees_main, "TimescaleAdapter", StubTimescaleAdapter)
+    monkeypatch.setattr(fee_service_module, "RedisFeastAdapter", StubRedisAdapter)
+    monkeypatch.setattr(fee_service_module, "TimescaleAdapter", StubTimescaleAdapter)
 
     response = client.get(
         "/fees/effective",
@@ -87,7 +94,7 @@ def test_get_effective_fees_rejects_non_admin(client: TestClient) -> None:
 
 
 def test_get_effective_fees_transitions_between_tiers(
-    monkeypatch: pytest.MonkeyPatch, client: TestClient
+    monkeypatch: pytest.MonkeyPatch, fee_service_module, client: TestClient
 ) -> None:
     basis_ts = datetime(2024, 3, 1, 15, 0, tzinfo=timezone.utc)
 
@@ -123,8 +130,8 @@ def test_get_effective_fees_transitions_between_tiers(
         def rolling_volume(self, pair: str) -> Dict[str, float | datetime]:
             return {"notional": 900_000.0, "basis_ts": basis_ts}
 
-    monkeypatch.setattr(fees_main, "RedisFeastAdapter", StubRedisAdapter)
-    monkeypatch.setattr(fees_main, "TimescaleAdapter", StubTimescaleAdapter)
+    monkeypatch.setattr(fee_service_module, "RedisFeastAdapter", StubRedisAdapter)
+    monkeypatch.setattr(fee_service_module, "TimescaleAdapter", StubTimescaleAdapter)
 
     first = client.get(
         "/fees/effective",
@@ -164,7 +171,7 @@ def test_get_effective_fees_transitions_between_tiers(
 
 
 def test_get_effective_fees_uses_fallback_when_schedule_missing(
-    monkeypatch: pytest.MonkeyPatch, client: TestClient
+    monkeypatch: pytest.MonkeyPatch, fee_service_module, client: TestClient
 ) -> None:
     class StubRedisAdapter:
         def __init__(self, account_id: str) -> None:
@@ -185,8 +192,8 @@ def test_get_effective_fees_uses_fallback_when_schedule_missing(
         def rolling_volume(self, pair: str) -> Dict[str, float | datetime]:
             return {"notional": 0.0, "basis_ts": datetime.now(timezone.utc)}
 
-    monkeypatch.setattr(fees_main, "RedisFeastAdapter", StubRedisAdapter)
-    monkeypatch.setattr(fees_main, "TimescaleAdapter", StubTimescaleAdapter)
+    monkeypatch.setattr(fee_service_module, "RedisFeastAdapter", StubRedisAdapter)
+    monkeypatch.setattr(fee_service_module, "TimescaleAdapter", StubTimescaleAdapter)
 
     response = client.get(
         "/fees/effective",
@@ -211,7 +218,10 @@ def test_get_effective_fees_uses_fallback_when_schedule_missing(
 
 @pytest.mark.parametrize("account_id", sorted(ADMIN_ACCOUNTS))
 def test_get_effective_fees_uses_fallback_store_for_each_admin(
-    monkeypatch: pytest.MonkeyPatch, client: TestClient, account_id: str
+    monkeypatch: pytest.MonkeyPatch,
+    fee_service_module,
+    client: TestClient,
+    account_id: str,
 ) -> None:
     class EmptyUniverseRepository:
         def approved_universe(self) -> list[str]:
@@ -231,8 +241,8 @@ def test_get_effective_fees_uses_fallback_store_for_each_admin(
         def rolling_volume(self, pair: str) -> Dict[str, float | datetime]:
             return {"notional": 0.0, "basis_ts": datetime.now(timezone.utc)}
 
-    monkeypatch.setattr(fees_main, "RedisFeastAdapter", FallbackRedisAdapter)
-    monkeypatch.setattr(fees_main, "TimescaleAdapter", StubTimescaleAdapter)
+    monkeypatch.setattr(fee_service_module, "RedisFeastAdapter", FallbackRedisAdapter)
+    monkeypatch.setattr(fee_service_module, "TimescaleAdapter", StubTimescaleAdapter)
 
     baseline_adapter = RedisFeastAdapter(
         account_id=account_id, repository=EmptyUniverseRepository()

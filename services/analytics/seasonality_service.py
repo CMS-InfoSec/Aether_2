@@ -6,7 +6,7 @@ import calendar
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterator, List, Sequence
+from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -94,6 +94,7 @@ def _engine_options(url: URL) -> Dict[str, Any]:
         options["connect_args"] = connect_args
 
     return options
+
 
 
 OhlcvBase = declarative_base()
@@ -201,6 +202,7 @@ SESSION_WINDOWS: Dict[str, range] = {
 
 
 def get_session(request: Request) -> Iterator[Session]:
+
     session_factory = getattr(request.app.state, SESSIONMAKER_STATE_KEY, None)
     if session_factory is None:
         session_factory = SessionLocal
@@ -208,6 +210,7 @@ def get_session(request: Request) -> Iterator[Session]:
         raise RuntimeError(
             "Seasonality database session maker is not initialised. "
             "Ensure the application startup hook has run successfully."
+
         )
 
     session = session_factory()
@@ -437,6 +440,30 @@ def _assert_data_available(bars: Sequence[Bar], symbol: str) -> None:
 
 
 app = FastAPI(title="Seasonality Analytics Service")
+app.state.seasonality_database_url = None
+app.state.seasonality_engine = None
+app.state.seasonality_sessionmaker = None
+
+
+@app.on_event("startup")
+def _configure_database() -> None:
+    """Initialise database connectivity once the application starts."""
+
+    global DATABASE_URL, ENGINE, SessionFactory
+
+    url = _require_database_url()
+    engine = _create_engine(url)
+    session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True)
+
+    SeasonalityMetric.__table__.create(bind=engine, checkfirst=True)
+
+    DATABASE_URL = url
+    ENGINE = engine
+    SessionFactory = session_factory
+
+    app.state.seasonality_database_url = url
+    app.state.seasonality_engine = engine
+    app.state.seasonality_sessionmaker = session_factory
 
 
 def _resolve_session_store_dsn() -> str:
@@ -478,6 +505,7 @@ def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
     return store
 
 
+
 try:
     _configure_database(app)
 except RuntimeError:
@@ -499,6 +527,7 @@ def _on_startup() -> None:
 @app.on_event("shutdown")
 def _on_shutdown() -> None:
     _dispose_database(app)
+
 
 
 @app.get("/seasonality/dayofweek", response_model=DayOfWeekResponse)

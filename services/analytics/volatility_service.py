@@ -7,9 +7,11 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Generator, List, Sequence
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from typing import Any, Iterator, List, Optional, Sequence
+
+
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 from prometheus_client import Gauge
 from alembic import command
@@ -88,22 +90,35 @@ def _normalise_database_url(url: str) -> str:
     return url
 
 
-DATABASE_URL: URL = _require_database_url()
-ENGINE: Engine = create_engine(
-    DATABASE_URL.render_as_string(hide_password=False),
-    **_engine_options(DATABASE_URL),
-)
-SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
+DATABASE_URL: Optional[URL] = None
+ENGINE: Optional[Engine] = None
+
+SessionFactory: Optional[sessionmaker] = None
+
+
+def _create_engine(url: URL) -> Engine:
+    return create_engine(
+        url.render_as_string(hide_password=False),
+        **_engine_options(url),
+    )
+
 
 _MIGRATIONS_PATH = Path(__file__).resolve().parents[2] / "data" / "migrations"
 
 
-def run_migrations() -> None:
+
+def run_migrations(url: URL) -> None:
+
     """Apply all outstanding Timescale migrations for analytics data."""
+
+    _ensure_session_factory()
+
+    if DATABASE_URL is None:
+        raise RuntimeError("Analytics database URL not configured; ensure startup completed.")
 
     config = Config()
     config.set_main_option("script_location", str(_MIGRATIONS_PATH))
-    config.set_main_option("sqlalchemy.url", DATABASE_URL.render_as_string(hide_password=False))
+    config.set_main_option("sqlalchemy.url", url.render_as_string(hide_password=False))
     config.attributes["configure_logger"] = False
 
     command.upgrade(config, "head")
@@ -173,6 +188,9 @@ class VolatilityResponse(BaseModel):
 
 
 app = FastAPI(title="Volatility Analytics Service")
+app.state.analytics_database_url = None
+app.state.analytics_engine = None
+app.state.analytics_sessionmaker = None
 metrics.setup_metrics(app, service_name="volatility-service")
 
 
@@ -192,13 +210,57 @@ def _volatility_gauge() -> Gauge:
     return _VOLATILITY_INDEX
 
 
+def _initialise_database() -> sessionmaker:
+    """Initialise database connectivity once configuration is available."""
+
+    url = _require_database_url()
+    engine = create_engine(
+        url.render_as_string(hide_password=False),
+        **_engine_options(url),
+    )
+    session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True)
+
+    return _register_database(url, engine, session_factory)
+
+
 @app.on_event("startup")
 def _on_startup() -> None:
-    run_migrations()
+
+    """Initialise database connectivity and migrations when the app boots."""
+
+    global DATABASE_URL, ENGINE, SessionFactory
+
+    url = _require_database_url()
+    engine = _create_engine(url)
+    session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True)
+
+    VolatilityMetric.__table__.create(bind=engine, checkfirst=True)
+    run_migrations(url)
+
+    DATABASE_URL = url
+    ENGINE = engine
+    SessionFactory = session_factory
 
 
-def get_session() -> Generator[Session, None, None]:
-    session = SessionLocal()
+    app.state.analytics_database_url = url
+    app.state.analytics_engine = engine
+    app.state.analytics_sessionmaker = session_factory
+
+
+def get_session(request: Request) -> Iterator[Session]:
+    session_factory: Optional[sessionmaker] = getattr(request.app.state, "analytics_sessionmaker", None)
+
+    if session_factory is None:
+        session_factory = SessionFactory
+
+    if session_factory is None:
+        raise RuntimeError(
+            "Analytics database session factory is not initialised. Ensure the startup event has run and the "
+            "ANALYTICS_DATABASE_URL environment variable is configured."
+        )
+
+
+    session = session_factory()
     try:
         yield session
     finally:
