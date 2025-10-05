@@ -59,7 +59,6 @@ def _generate_random_mfa_secret() -> str:
 def _normalize_admin_repository_dsn(raw_dsn: str) -> str:
     """Coerce vendor-specific PostgreSQL URIs into a psycopg-compatible DSN."""
 
-
     stripped = raw_dsn.strip()
     if not stripped:
         raise RuntimeError(
@@ -67,7 +66,6 @@ def _normalize_admin_repository_dsn(raw_dsn: str) -> str:
         )
 
     scheme, separator, remainder = stripped.partition("://")
-
     if not separator:
         raise RuntimeError(
             "Admin repository requires a DSN with an explicit scheme; "
@@ -77,17 +75,13 @@ def _normalize_admin_repository_dsn(raw_dsn: str) -> str:
     scheme_lower = scheme.lower()
     if scheme_lower in {
         "postgres",
-
         "postgresql",
-
         "timescale",
         "postgresql+psycopg",
         "postgresql+psycopg2",
     }:
-
         normalized_scheme = "postgresql"
     else:
-
         raise RuntimeError(
             "Admin repository requires a Postgres/Timescale DSN; "
             f"received '{raw_dsn}'."
