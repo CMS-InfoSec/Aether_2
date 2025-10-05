@@ -37,6 +37,7 @@ from auth.service import (
     SessionStoreProtocol,
     build_session_store_from_url,
 )
+from shared.session_config import load_session_ttl_minutes
 from services.common.schemas import RiskValidationRequest, RiskValidationResponse
 from services.common.security import require_admin_account
 from strategy_bus import StrategySignalBus, ensure_signal_tables
@@ -325,14 +326,20 @@ def _create_engine(url: str) -> Engine:
 
 
 def _build_session_store_from_env() -> SessionStoreProtocol:
-    ttl_minutes = int(os.getenv("SESSION_TTL_MINUTES", "60"))
+    ttl_minutes = load_session_ttl_minutes()
     redis_url = os.getenv("SESSION_REDIS_URL")
     if not redis_url:
         raise RuntimeError(
             "SESSION_REDIS_URL is not configured. Provide a shared session store DSN to enable orchestrator authentication.",
         )
 
-    if redis_url.startswith("memory://"):
+    redis_url = redis_url.strip()
+    if not redis_url:
+        raise RuntimeError(
+            "SESSION_REDIS_URL is not configured. Provide a shared session store DSN to enable orchestrator authentication."
+        )
+
+    if redis_url.lower().startswith("memory://"):
         return InMemorySessionStore(ttl_minutes=ttl_minutes)
 
     return build_session_store_from_url(redis_url, ttl_minutes=ttl_minutes)

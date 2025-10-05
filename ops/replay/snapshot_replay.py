@@ -36,6 +36,7 @@ from auth.service import (
     build_session_store_from_url,
 )
 import services.common.security as security
+from shared.session_config import load_session_ttl_minutes
 from services.common.schemas import (
     BookSnapshot,
     ConfidenceMetrics,
@@ -665,8 +666,8 @@ if FastAPI is not None:  # pragma: no branch - simple module guard
     def _resolve_session_store_dsn() -> str:
         for env_var in _SESSION_DSN_ENV_VARS:
             value = os.getenv(env_var)
-            if value:
-                return value
+            if value and value.strip():
+                return value.strip()
         joined = ", ".join(_SESSION_DSN_ENV_VARS)
         raise RuntimeError(
             "Session store misconfigured: configure one of "
@@ -679,8 +680,8 @@ if FastAPI is not None:  # pragma: no branch - simple module guard
             store = existing
         else:
             dsn = _resolve_session_store_dsn()
-            ttl_minutes = int(os.getenv("SESSION_TTL_MINUTES", "60"))
-            if dsn.startswith("memory://"):
+            ttl_minutes = load_session_ttl_minutes()
+            if dsn.lower().startswith("memory://"):
                 store = InMemorySessionStore(ttl_minutes=ttl_minutes)
             else:
                 store = build_session_store_from_url(dsn, ttl_minutes=ttl_minutes)
