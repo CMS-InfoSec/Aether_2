@@ -13,16 +13,19 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable, Dict, Iterable, Iterator, Literal, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, Iterator, Literal, Mapping, Optional, Sequence
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy import Column, DateTime, Float, Integer, MetaData, String, create_engine
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Engine, URL
+from sqlalchemy.engine.url import make_url
+from sqlalchemy.exc import ArgumentError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 from services.common.adapters import RedisFeastAdapter, TimescaleAdapter
@@ -37,12 +40,85 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-DEFAULT_DATABASE_URL = "sqlite:///./diversification.db"
+_PRIMARY_DSN_ENV = "DIVERSIFICATION_DATABASE_URL"
 
 
-def _create_engine(url: str = DEFAULT_DATABASE_URL) -> Engine:
-    connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
-    return create_engine(url, future=True, connect_args=connect_args)
+def _normalise_database_url(url: str) -> str:
+    """Ensure SQLAlchemy uses the psycopg2 driver for PostgreSQL URLs."""
+
+    if url.startswith("postgresql+psycopg://"):
+        return "postgresql+psycopg2://" + url[len("postgresql+psycopg://") :]
+    if url.startswith("postgresql://"):
+        return "postgresql+psycopg2://" + url[len("postgresql://") :]
+    if url.startswith("postgres://"):
+        return "postgresql+psycopg2://" + url[len("postgres://") :]
+    return url
+
+
+def _require_database_url() -> URL:
+    """Return the configured PostgreSQL/Timescale DSN for diversification storage."""
+
+    candidates = (
+        os.getenv(_PRIMARY_DSN_ENV),
+        os.getenv("RISK_DATABASE_URL"),
+        os.getenv("TIMESCALE_DSN"),
+        os.getenv("DATABASE_URL"),
+    )
+
+    raw_url = next((value.strip() for value in candidates if value and value.strip()), None)
+    if not raw_url:
+        raise RuntimeError(
+            "DIVERSIFICATION_DATABASE_URL must be configured with a PostgreSQL/Timescale connection string."
+        )
+
+    normalised = _normalise_database_url(raw_url)
+
+    try:
+        url = make_url(normalised)
+    except ArgumentError as exc:  # pragma: no cover - configuration error
+        raise RuntimeError(f"Invalid diversification database URL '{raw_url}': {exc}") from exc
+
+    if not url.drivername.lower().startswith("postgresql"):
+        raise RuntimeError(
+            "Diversification allocator requires a PostgreSQL/Timescale DSN; "
+            f"received driver '{url.drivername}'."
+        )
+
+    return url
+
+
+def _engine_options(url: URL) -> dict[str, Any]:
+    options: dict[str, Any] = {
+        "future": True,
+        "pool_pre_ping": True,
+        "pool_size": int(os.getenv("DIVERSIFICATION_DB_POOL_SIZE", "10")),
+        "max_overflow": int(os.getenv("DIVERSIFICATION_DB_MAX_OVERFLOW", "20")),
+        "pool_timeout": int(os.getenv("DIVERSIFICATION_DB_POOL_TIMEOUT", "30")),
+        "pool_recycle": int(os.getenv("DIVERSIFICATION_DB_POOL_RECYCLE", "1800")),
+    }
+
+    connect_args: dict[str, Any] = {}
+    forced_sslmode = os.getenv("DIVERSIFICATION_DB_SSLMODE")
+    if forced_sslmode:
+        connect_args["sslmode"] = forced_sslmode
+    elif "sslmode" not in url.query and url.host not in {None, "localhost", "127.0.0.1"}:
+        connect_args["sslmode"] = "require"
+
+    if connect_args:
+        options["connect_args"] = connect_args
+
+    return options
+
+
+DATABASE_URL: URL = _require_database_url()
+
+
+def _create_engine(url: URL | None = None) -> Engine:
+    target = url or DATABASE_URL
+    return create_engine(
+        target.render_as_string(hide_password=False),
+        **_engine_options(target),
+    )
 
 
 ENGINE: Engine = _create_engine()
