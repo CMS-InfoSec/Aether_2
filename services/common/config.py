@@ -75,9 +75,57 @@ def get_nats_producer(account_id: str) -> NATSProducer:
     return NATSProducer(servers=servers, subject_prefix=subject_prefix)
 
 
+def _normalize_timescale_dsn(raw_dsn: str) -> str:
+    """Coerce supported PostgreSQL-compatible schemes to the psycopg default."""
+
+    stripped = raw_dsn.strip()
+    if not stripped:
+        raise RuntimeError("Timescale DSN cannot be empty once configured.")
+
+    scheme, separator, remainder = stripped.partition("://")
+    if not separator:
+        raise RuntimeError(
+            "Timescale DSN must include a URI scheme such as postgresql:// or sqlite://."
+        )
+
+    normalized_scheme = scheme.lower()
+    if normalized_scheme in {
+        "postgres",
+        "postgresql",
+        "timescale",
+        "postgresql+psycopg",
+        "postgresql+psycopg2",
+    }:
+        normalized_scheme = "postgresql"
+        return f"{normalized_scheme}://{remainder}"
+
+    return stripped
+
+
+def _resolve_timescale_dsn(account_id: str) -> str:
+    """Return a configured Timescale/PostgreSQL DSN for the given account."""
+
+    env_keys = [f"AETHER_{account_id.upper()}_TIMESCALE_DSN", "TIMESCALE_DSN"]
+    for key in env_keys:
+        raw = os.getenv(key)
+        if raw is None:
+            continue
+        stripped = raw.strip()
+        if not stripped:
+            raise RuntimeError(
+                f"{key} is set but empty; configure a valid Timescale/PostgreSQL DSN."
+            )
+        return _normalize_timescale_dsn(stripped)
+
+    raise RuntimeError(
+        "Timescale DSN is not configured. Set TIMESCALE_DSN or "
+        "AETHER_<ACCOUNT>_TIMESCALE_DSN for each trading account."
+    )
+
+
 @lru_cache(maxsize=None)
 def get_timescale_session(account_id: str) -> TimescaleSession:
-    dsn = _env(account_id, "TIMESCALE_DSN", "postgresql://timescale:password@localhost:5432/telemetry")
+    dsn = _resolve_timescale_dsn(account_id)
     schema = _env(account_id, "TIMESCALE_SCHEMA", f"acct_{account_id}")
     return TimescaleSession(dsn=dsn, account_schema=schema)
 
