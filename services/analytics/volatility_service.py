@@ -7,7 +7,9 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+
 from typing import Any, Iterator, List, Optional, Sequence
+
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
@@ -90,6 +92,7 @@ def _normalise_database_url(url: str) -> str:
 
 DATABASE_URL: Optional[URL] = None
 ENGINE: Optional[Engine] = None
+
 SessionFactory: Optional[sessionmaker] = None
 
 
@@ -99,11 +102,19 @@ def _create_engine(url: URL) -> Engine:
         **_engine_options(url),
     )
 
+
 _MIGRATIONS_PATH = Path(__file__).resolve().parents[2] / "data" / "migrations"
 
 
+
 def run_migrations(url: URL) -> None:
+
     """Apply all outstanding Timescale migrations for analytics data."""
+
+    _ensure_session_factory()
+
+    if DATABASE_URL is None:
+        raise RuntimeError("Analytics database URL not configured; ensure startup completed.")
 
     config = Config()
     config.set_main_option("script_location", str(_MIGRATIONS_PATH))
@@ -199,8 +210,22 @@ def _volatility_gauge() -> Gauge:
     return _VOLATILITY_INDEX
 
 
+def _initialise_database() -> sessionmaker:
+    """Initialise database connectivity once configuration is available."""
+
+    url = _require_database_url()
+    engine = create_engine(
+        url.render_as_string(hide_password=False),
+        **_engine_options(url),
+    )
+    session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True)
+
+    return _register_database(url, engine, session_factory)
+
+
 @app.on_event("startup")
 def _on_startup() -> None:
+
     """Initialise database connectivity and migrations when the app boots."""
 
     global DATABASE_URL, ENGINE, SessionFactory
@@ -215,6 +240,7 @@ def _on_startup() -> None:
     DATABASE_URL = url
     ENGINE = engine
     SessionFactory = session_factory
+
 
     app.state.analytics_database_url = url
     app.state.analytics_engine = engine
@@ -232,6 +258,7 @@ def get_session(request: Request) -> Iterator[Session]:
             "Analytics database session factory is not initialised. Ensure the startup event has run and the "
             "ANALYTICS_DATABASE_URL environment variable is configured."
         )
+
 
     session = session_factory()
     try:
