@@ -55,6 +55,40 @@ def _generate_random_mfa_secret() -> str:
     return base64.b32encode(raw).decode("ascii").rstrip("=")
 
 
+def _normalize_admin_repository_dsn(raw_dsn: str) -> str:
+    """Coerce vendor-specific PostgreSQL URIs into a psycopg-compatible DSN."""
+
+    stripped = raw_dsn.strip()
+    if not stripped:
+        raise RuntimeError(
+            "Admin repository requires a DSN with an explicit scheme; received an empty value."
+        )
+
+    scheme, separator, remainder = stripped.partition("://")
+    if not separator:
+        raise RuntimeError(
+            "Admin repository requires a DSN with an explicit scheme; "
+            f"received '{raw_dsn}'."
+        )
+
+    scheme_lower = scheme.lower()
+    if scheme_lower in {
+        "postgres",
+        "postgresql",
+        "timescale",
+        "postgresql+psycopg",
+        "postgresql+psycopg2",
+    }:
+        normalized_scheme = "postgresql"
+    else:
+        raise RuntimeError(
+            "Admin repository requires a Postgres/Timescale DSN; "
+            f"received '{raw_dsn}'."
+        )
+
+    return f"{normalized_scheme}://{remainder}"
+
+
 def _build_admin_repository_from_env() -> AdminRepositoryProtocol:
     dsn_env_vars = (
         "ADMIN_POSTGRES_DSN",
@@ -68,24 +102,9 @@ def _build_admin_repository_from_env() -> AdminRepositoryProtocol:
             "ADMIN_DATABASE_DSN, or ADMIN_DB_DSN."
         )
 
-    normalized = dsn.lower()
-    if normalized.startswith("postgres://"):
-        dsn = "postgresql://" + dsn.split("://", 1)[1]
-        normalized = dsn.lower()
+    normalized_dsn = _normalize_admin_repository_dsn(dsn)
 
-    allowed_prefixes = (
-        "postgresql://",
-        "postgresql+psycopg://",
-        "postgresql+psycopg2://",
-        "timescale://",
-    )
-    if not normalized.startswith(allowed_prefixes):
-        raise RuntimeError(
-            "Admin repository requires a Postgres/Timescale DSN; "
-            f"received '{dsn}'."
-        )
-
-    return PostgresAdminRepository(dsn)
+    return PostgresAdminRepository(normalized_dsn)
 
 
 def _verify_admin_repository(admin_repository: AdminRepositoryProtocol) -> None:
