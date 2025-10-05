@@ -20,9 +20,9 @@ import os
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Generator, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import JSON, Column, DateTime, Integer, String, create_engine, inspect
 from sqlalchemy.engine import Engine
@@ -131,13 +131,11 @@ def _ensure_schema(engine: Engine, schema: Optional[str]) -> None:
         logger.warning("Failed to create schema '%s'", schema, exc_info=True)
 
 
-DATABASE_URL = _require_database_url()
 DATABASE_SCHEMA = os.getenv("BEHAVIOR_DB_SCHEMA")
-
-ENGINE: Engine = _create_engine(DATABASE_URL)
-_ensure_schema(ENGINE, DATABASE_SCHEMA)
-SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
 Base = declarative_base()
+
+ENGINE: Engine | None = None
+SessionLocal: sessionmaker | None = None
 
 
 class BehaviorLog(Base):
@@ -152,9 +150,6 @@ class BehaviorLog(Base):
     anomaly_type = Column(String, nullable=False)
     details_json = Column(JSON, nullable=False, default=dict)
     ts = Column(DateTime(timezone=True), nullable=False, index=True)
-
-
-Base.metadata.create_all(bind=ENGINE, checkfirst=True)
 
 
 class ScanRequest(BaseModel):
@@ -430,6 +425,54 @@ app = FastAPI(title="Behavior Monitoring Service", version="1.0.0")
 detector = BehaviorDetector()
 
 
+@app.on_event("startup")
+def _initialize_database() -> None:
+    try:
+        database_url = _require_database_url()
+    except RuntimeError as exc:  # pragma: no cover - defensive wiring
+        raise RuntimeError(
+            f"Failed to initialize BEHAVIOR_DATABASE_URL during startup: {exc}"
+        ) from exc
+
+    global ENGINE, SessionLocal
+
+    if ENGINE is not None:
+        try:
+            ENGINE.dispose()
+        except Exception:  # pragma: no cover - best effort cleanup
+            logger.warning("Failed to dispose previous behavior engine", exc_info=True)
+
+    engine = _create_engine(database_url)
+    _ensure_schema(engine, DATABASE_SCHEMA)
+    Base.metadata.create_all(bind=engine, checkfirst=True)
+
+    session_factory = sessionmaker(
+        bind=engine,
+        autoflush=False,
+        expire_on_commit=False,
+        future=True,
+    )
+
+    ENGINE = engine
+    SessionLocal = session_factory
+    app.state.behavior_db_engine = engine
+    app.state.behavior_db_sessionmaker = session_factory
+
+
+def _get_session(request: Request) -> Generator[Session, None, None]:
+    session_factory = getattr(request.app.state, "behavior_db_sessionmaker", None)
+    if session_factory is None:
+        session_factory = SessionLocal
+    if session_factory is None:
+        raise RuntimeError("Database session factory is not initialized.")
+
+    session = session_factory()
+    try:
+        yield session
+    finally:
+        session.close()
+
+
 def _serialize_details(details: Mapping[str, Any]) -> Dict[str, Any]:
     serialized: Dict[str, Any] = {}
     for key, value in details.items():
@@ -481,6 +524,7 @@ def _emit_alert(incident: BehaviorIncident) -> None:
 def scan_behavior(
     request: ScanRequest,
     authorized_account: str = Depends(require_admin_account),
+    session: Session = Depends(_get_session),
 ) -> ScanResponse:
     if request.account_id.strip().lower() != authorized_account.strip().lower():
         raise HTTPException(
@@ -492,10 +536,9 @@ def scan_behavior(
     if not incidents:
         return ScanResponse(incidents=[])
 
-    with SessionLocal() as session:
-        for incident in incidents:
-            _persist_incident(session, incident)
-        session.commit()
+    for incident in incidents:
+        _persist_incident(session, incident)
+    session.commit()
 
     for incident in incidents:
         _emit_alert(incident)
@@ -508,6 +551,7 @@ def behavior_status(
     account_id: str = Query(..., min_length=1),
     limit: int = Query(50, ge=1, le=500),
     authorized_account: str = Depends(require_admin_account),
+    session: Session = Depends(_get_session),
 ) -> StatusResponse:
     if account_id.strip().lower() != authorized_account.strip().lower():
         raise HTTPException(
@@ -515,14 +559,13 @@ def behavior_status(
             detail="Authenticated account is not authorized for the requested account.",
         )
 
-    with SessionLocal() as session:
-        rows: List[BehaviorLog] = (
-            session.query(BehaviorLog)
-            .filter(BehaviorLog.account_id == account_id)
-            .order_by(BehaviorLog.ts.desc())
-            .limit(limit)
-            .all()
-        )
+    rows: List[BehaviorLog] = (
+        session.query(BehaviorLog)
+        .filter(BehaviorLog.account_id == account_id)
+        .order_by(BehaviorLog.ts.desc())
+        .limit(limit)
+        .all()
+    )
 
     incidents: List[BehaviorIncident] = []
     for row in rows:
