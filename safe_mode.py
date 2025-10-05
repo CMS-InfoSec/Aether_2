@@ -15,6 +15,7 @@ from fastapi import Body, Depends, FastAPI, HTTPException, Request, status
 
 from metrics import increment_safe_mode_triggers, setup_metrics
 from services.common.security import require_admin_account
+from common.utils.redis import create_redis_from_url
 
 
 try:  # pragma: no cover - optional audit dependency
@@ -133,11 +134,8 @@ class SafeModeStateStore:
     @staticmethod
     def _create_default_client() -> Any:
         redis_url = os.getenv("SAFE_MODE_REDIS_URL", "redis://localhost:6379/0")
-        try:  # pragma: no cover - optional dependency path
-            import redis  # type: ignore[import-not-found]
-        except Exception as exc:  # pragma: no cover - defensive fallback when Redis is unavailable
-            raise RuntimeError("redis package is required for SafeModeStateStore") from exc
-        return redis.Redis.from_url(redis_url, decode_responses=True)
+        client, _ = create_redis_from_url(redis_url, decode_responses=True, logger=LOGGER)
+        return client
 
     def load(self) -> SafeModePersistedState:
         with self._lock:

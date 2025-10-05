@@ -23,6 +23,8 @@ from kubernetes import client, config
 from kubernetes.client import CoreV1Api
 from kubernetes.config.config_exception import ConfigException
 
+from common.utils.redis import create_redis_from_url
+
 
 logger = logging.getLogger("self_healer")
 
@@ -200,11 +202,8 @@ class SelfHealer:
 
     @staticmethod
     def _create_redis_client(redis_url: str):
-        try:
-            import redis  # type: ignore[import-not-found]
-        except ImportError as exc:  # pragma: no cover - surfaced when redis missing
-            raise RuntimeError("redis package is required for self-healer persistence") from exc
-        return redis.Redis.from_url(redis_url, decode_responses=True)
+        client, _ = create_redis_from_url(redis_url, decode_responses=True, logger=logger)
+        return client
 
     async def start(self) -> None:
         if self._task is None or self._task.done():

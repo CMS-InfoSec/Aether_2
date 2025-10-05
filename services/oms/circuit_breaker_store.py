@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from threading import Lock
 from typing import Any, Dict, Optional
 
+from common.utils.redis import create_redis_from_url
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -70,11 +72,8 @@ class CircuitBreakerStateStore:
     @staticmethod
     def _create_default_client() -> Any:
         redis_url = os.getenv("OMS_CIRCUIT_BREAKER_REDIS_URL", "redis://localhost:6379/0")
-        try:  # pragma: no cover - dependency managed at runtime
-            import redis  # type: ignore[import-not-found]
-        except Exception as exc:  # pragma: no cover - defensive guard when Redis is unavailable
-            raise RuntimeError("redis package is required for circuit breaker persistence") from exc
-        return redis.Redis.from_url(redis_url, decode_responses=True)
+        client, _ = create_redis_from_url(redis_url, decode_responses=True, logger=LOGGER)
+        return client
 
     def _load_payload(self) -> Dict[str, Dict[str, object]]:
         try:

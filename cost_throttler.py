@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 try:  # pragma: no cover - SQLAlchemy is optional in some environments
     from sqlalchemy import Boolean, Column, DateTime, Float, Integer, MetaData, String, Table, create_engine, select
     from sqlalchemy.orm import Session, sessionmaker
+    from sqlalchemy.pool import StaticPool
 
     SQLALCHEMY_AVAILABLE = True
 except Exception:  # pragma: no cover - fall back gracefully when SQLAlchemy missing
@@ -27,6 +28,7 @@ except Exception:  # pragma: no cover - fall back gracefully when SQLAlchemy mis
     Boolean = Column = DateTime = Float = Integer = MetaData = String = Table = object  # type: ignore[assignment]
     Session = sessionmaker = object  # type: ignore[assignment]
     select = create_engine = None  # type: ignore[assignment]
+    StaticPool = object  # type: ignore[assignment]
 
 __all__ = [
     "CostThrottler",
@@ -142,10 +144,17 @@ class ThrottleRepository:
     def _default_session_factory() -> sessionmaker:
         database_url = os.getenv("COST_THROTTLE_DATABASE_URL")
         if not database_url:
-            raise RuntimeError(
-                "COST_THROTTLE_DATABASE_URL must be configured to persist throttle state",
+            logger.warning(
+                "COST_THROTTLE_DATABASE_URL not configured; using transient in-memory SQLite store"
             )
-        engine = create_engine(database_url, future=True)
+            engine = create_engine(
+                "sqlite+pysqlite:///:memory:",
+                future=True,
+                connect_args={"check_same_thread": False},
+                poolclass=StaticPool,
+            )
+        else:
+            engine = create_engine(database_url, future=True)
         return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True)
 
     @classmethod

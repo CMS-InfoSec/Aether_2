@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 try:  # pragma: no cover - support alternative namespace packages
     from services.common.security import require_admin_account
@@ -63,14 +64,12 @@ class OverrideDecision(str, Enum):
     REJECT = "reject"
 
 
-def _require_database_url() -> str:
-    """Return the configured Postgres/Timescale database URL."""
+def _require_database_url() -> str | None:
+    """Return the configured Postgres/Timescale database URL if provided."""
 
     raw_url = os.getenv(_DATABASE_URL_ENV)
     if not raw_url:
-        raise RuntimeError(
-            "OVERRIDE_DATABASE_URL must be set and point to the shared TimescaleDB cluster."
-        )
+        return None
 
     normalized = raw_url.lower()
     if normalized.startswith("postgres://"):
@@ -92,6 +91,16 @@ def _require_database_url() -> str:
 
 def _engine() -> Engine:
     url = _require_database_url()
+    if not url:
+        LOGGER.warning(
+            "OVERRIDE_DATABASE_URL not set; using ephemeral in-memory SQLite store for overrides"
+        )
+        return create_engine(
+            "sqlite+pysqlite:///:memory:",
+            future=True,
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
     connect_args: Dict[str, object] = {
         "sslmode": os.getenv(_SSL_MODE_ENV, "require"),
     }
