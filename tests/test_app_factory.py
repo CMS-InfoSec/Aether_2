@@ -296,6 +296,29 @@ def test_create_app_normalizes_timescale_scheme(monkeypatch: pytest.MonkeyPatch)
     assert captured["dsn"].startswith("postgresql://")
 
 
+
+def test_create_app_normalizes_sqlalchemy_style_scheme(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(
+        "ADMIN_POSTGRES_DSN",
+        "postgresql+psycopg://tenant:pass@example.com/admin",
+    )
+
+    captured: dict[str, str] = {}
+
+    class DummyPostgresRepository(app_module.InMemoryAdminRepository):
+        def __init__(self, dsn: str) -> None:
+            super().__init__()
+            captured["dsn"] = dsn
+
+    monkeypatch.setattr(app_module, "PostgresAdminRepository", DummyPostgresRepository)
+
+    session_store = InMemorySessionStore()
+    application = app_module.create_app(session_store=session_store)
+
+    assert isinstance(application.state.admin_repository, DummyPostgresRepository)
+    assert captured["dsn"].startswith("postgresql://")
+
+
 def test_create_app_requires_dsn_when_not_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("ADMIN_POSTGRES_DSN", raising=False)
     monkeypatch.delenv("ADMIN_DATABASE_DSN", raising=False)
@@ -305,6 +328,13 @@ def test_create_app_requires_dsn_when_not_explicit(monkeypatch: pytest.MonkeyPat
     application = app_module.create_app(session_store=InMemorySessionStore())
 
     assert isinstance(application.state.admin_repository, app_module.InMemoryAdminRepository)
+
+
+def test_create_app_rejects_unsupported_admin_dsn(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ADMIN_POSTGRES_DSN", "mysql://example.com/admin")
+
+    with pytest.raises(RuntimeError, match="requires a Postgres/Timescale DSN"):
+        app_module.create_app(session_store=InMemorySessionStore())
 
 
 def test_create_app_requires_session_store_dsn(monkeypatch: pytest.MonkeyPatch) -> None:
