@@ -72,6 +72,12 @@ def _build_admin_repository_from_env() -> AdminRepositoryProtocol:
     if normalized.startswith("postgres://"):
         dsn = "postgresql://" + dsn.split("://", 1)[1]
         normalized = dsn.lower()
+    elif normalized.startswith("timescale://"):
+        # Timescale Cloud historically advertises a ``timescale://`` scheme even though
+        # the underlying driver expects a standard PostgreSQL DSN.  Psycopg will reject
+        # the vendor specific prefix, so normalise it before instantiating the repository.
+        dsn = "postgresql://" + dsn.split("://", 1)[1]
+        normalized = dsn.lower()
 
     allowed_prefixes = (
         "postgresql://",
