@@ -12,8 +12,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Iterable, Mapping
+from typing import Dict, Iterable, Mapping, Set
 
 import numpy as np
 import pandas as pd
@@ -36,9 +37,11 @@ except Exception:  # pragma: no cover - executed when psycopg is unavailable
 
 LOGGER = logging.getLogger(__name__)
 
-ACCOUNT_ID = os.getenv("AETHER_ACCOUNT_ID", "default")
-TIMESCALE = get_timescale_session(ACCOUNT_ID)
 LOOKBACK_DAYS = int(os.getenv("SCENARIO_LOOKBACK_DAYS", "90"))
+
+_ENSURED_SCHEMAS: Set[str] = set()
+_ENSURE_LOCK = threading.Lock()
+_DEFAULT_ACCOUNT_ID = os.getenv("AETHER_ACCOUNT_ID")
 
 POSITIONS_QUERY = """
 WITH latest_positions AS (
@@ -113,36 +116,63 @@ def _ensure_driver() -> None:
         )
 
 
-def _get_conn() -> psycopg.Connection:
+def _open_conn(session: "TimescaleSession") -> psycopg.Connection:
     _ensure_driver()
     if sql is None:  # pragma: no cover - defensive guard
         raise HTTPException(status_code=500, detail="SQL helper unavailable")
 
-    conn = psycopg.connect(TIMESCALE.dsn, row_factory=dict_row)
-    conn.execute(sql.SQL("SET search_path TO {}, public").format(sql.Identifier(TIMESCALE.account_schema)))
+    try:
+        conn = psycopg.connect(session.dsn, row_factory=dict_row)
+    except Exception as exc:  # pragma: no cover - connection issues are operational faults
+        LOGGER.exception("Failed to connect to Timescale for account %s", session.account_schema)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Failed to connect to Timescale",
+        ) from exc
+
+    try:
+        conn.execute(
+            sql.SQL("SET search_path TO {}, public").format(sql.Identifier(session.account_schema))
+        )
+    except Exception as exc:
+        conn.close()
+        LOGGER.exception("Failed to set search_path for schema %s", session.account_schema)
+        raise HTTPException(status_code=500, detail="Failed to configure Timescale session") from exc
+
     return conn
 
 
-def _ensure_tables() -> None:
-    try:
-        with _get_conn() as conn:
-            conn.execute(CREATE_TABLE_SQL)
-            conn.commit()
-    except HTTPException:
-        raise
-    except Exception:  # pragma: no cover - defensive logging for startup issues
-        LOGGER.exception("Failed to ensure scenario_runs table exists")
-        raise HTTPException(status_code=500, detail="Failed to initialise scenario storage")
+def _ensure_tables_for_session(session: "TimescaleSession") -> None:
+    schema = session.account_schema
+    with _ENSURE_LOCK:
+        if schema in _ENSURED_SCHEMAS:
+            return
+        try:
+            with _open_conn(session) as conn:
+                conn.execute(CREATE_TABLE_SQL)
+                conn.commit()
+        except HTTPException:
+            raise
+        except Exception as exc:  # pragma: no cover - defensive logging for startup issues
+            LOGGER.exception("Failed to ensure scenario_runs table for schema %s", schema)
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to initialise scenario storage",
+            ) from exc
+        _ENSURED_SCHEMAS.add(schema)
 
 
 @app.on_event("startup")
 def startup_event() -> None:
-    _ensure_tables()
+    if not _DEFAULT_ACCOUNT_ID:
+        return
+    session = get_timescale_session(_DEFAULT_ACCOUNT_ID)
+    _ensure_tables_for_session(session)
 
 
-def _fetch_positions(conn: psycopg.Connection) -> pd.DataFrame:
+def _fetch_positions(conn: psycopg.Connection, account_id: str) -> pd.DataFrame:
     with conn.cursor() as cur:
-        cur.execute(POSITIONS_QUERY, {"account_id": ACCOUNT_ID})
+        cur.execute(POSITIONS_QUERY, {"account_id": account_id})
         rows = cur.fetchall()
     if not rows:
         return pd.DataFrame(columns=["market", "quantity", "entry_price"])
@@ -278,9 +308,12 @@ def run_scenario(
 ) -> ScenarioRunResponse:
     """Simulate the portfolio under a combined price shock and volatility shift."""
 
+    session = get_timescale_session(actor_account)
+    _ensure_tables_for_session(session)
+
     try:
-        with _get_conn() as conn:
-            positions = _fetch_positions(conn)
+        with _open_conn(session) as conn:
+            positions = _fetch_positions(conn, actor_account)
             price_history = _fetch_price_history(conn, positions["market"].tolist())
             prices = _latest_prices(price_history)
             exposures = _portfolio_exposures(positions, prices)
