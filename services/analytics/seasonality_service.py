@@ -6,9 +6,9 @@ import calendar
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterator, List, Sequence
+from typing import Any, Dict, Iterator, List, Optional, Sequence
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import Column, DateTime, Float, String, create_engine, func, select
 from sqlalchemy.engine import Engine, URL
@@ -88,12 +88,16 @@ def _engine_options(url: URL) -> Dict[str, Any]:
     return options
 
 
-DATABASE_URL: URL = _require_database_url()
-ENGINE: Engine = create_engine(
-    DATABASE_URL.render_as_string(hide_password=False),
-    **_engine_options(DATABASE_URL),
-)
-SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
+DATABASE_URL: Optional[URL] = None
+ENGINE: Optional[Engine] = None
+SessionFactory: Optional[sessionmaker] = None
+
+
+def _create_engine(url: URL) -> Engine:
+    return create_engine(
+        url.render_as_string(hide_password=False),
+        **_engine_options(url),
+    )
 
 
 OhlcvBase = declarative_base()
@@ -200,8 +204,19 @@ SESSION_WINDOWS: Dict[str, range] = {
 }
 
 
-def get_session() -> Iterator[Session]:
-    session = SessionLocal()
+def get_session(request: Request) -> Iterator[Session]:
+    session_factory: Optional[sessionmaker] = getattr(request.app.state, "seasonality_sessionmaker", None)
+
+    if session_factory is None:
+        session_factory = SessionFactory
+
+    if session_factory is None:
+        raise RuntimeError(
+            "Seasonality database session factory is not initialised. Ensure the startup event has run and the "
+            "SEASONALITY_DATABASE_URI (or TIMESCALE_DATABASE_URI) environment variable is configured."
+        )
+
+    session = session_factory()
     try:
         yield session
     finally:
@@ -388,6 +403,30 @@ def _assert_data_available(bars: Sequence[Bar], symbol: str) -> None:
 
 
 app = FastAPI(title="Seasonality Analytics Service")
+app.state.seasonality_database_url = None
+app.state.seasonality_engine = None
+app.state.seasonality_sessionmaker = None
+
+
+@app.on_event("startup")
+def _configure_database() -> None:
+    """Initialise database connectivity once the application starts."""
+
+    global DATABASE_URL, ENGINE, SessionFactory
+
+    url = _require_database_url()
+    engine = _create_engine(url)
+    session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True)
+
+    SeasonalityMetric.__table__.create(bind=engine, checkfirst=True)
+
+    DATABASE_URL = url
+    ENGINE = engine
+    SessionFactory = session_factory
+
+    app.state.seasonality_database_url = url
+    app.state.seasonality_engine = engine
+    app.state.seasonality_sessionmaker = session_factory
 
 
 def _resolve_session_store_dsn() -> str:
