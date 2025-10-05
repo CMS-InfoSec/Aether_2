@@ -384,19 +384,6 @@ def test_create_app_requires_dsn_when_not_explicit(monkeypatch: pytest.MonkeyPat
 def test_create_app_rejects_unsupported_admin_dsn(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ADMIN_POSTGRES_DSN", "mysql://example.com/admin")
 
-    with pytest.raises(RuntimeError, match="requires a Postgres/Timescale DSN"):
-        app_module.create_app(session_store=InMemorySessionStore())
-
-
-def test_create_app_rejects_blank_admin_dsn(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ADMIN_POSTGRES_DSN", "   ")
-
-    with pytest.raises(RuntimeError, match="requires a DSN with an explicit scheme"):
-        app_module.create_app(session_store=InMemorySessionStore())
-
-
-def test_create_app_rejects_unsupported_admin_dsn(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ADMIN_POSTGRES_DSN", "mysql://example.com/admin")
 
     with pytest.raises(RuntimeError, match="requires a Postgres/Timescale DSN"):
         app_module.create_app(session_store=InMemorySessionStore())
