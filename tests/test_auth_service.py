@@ -93,8 +93,11 @@ def test_auth_service_requires_jwt_secret(monkeypatch: pytest.MonkeyPatch, tmp_p
     _install_dependency_stubs(monkeypatch)
     _clear_auth_service_module()
 
+    module = importlib.import_module("auth_service")
+    app = module.get_application()
+
     with pytest.raises(RuntimeError):
-        importlib.import_module("auth_service")
+        asyncio.run(app.router.startup())
 
     _clear_auth_service_module()
 
@@ -189,6 +192,7 @@ def test_authenticate_emits_role_specific_token(
             providers=providers,
             mfa=DummyMFA(),
             sessions=DummySessions(),
+            jwt_secret="test-secret",
         )
     )
 
@@ -206,14 +210,20 @@ def test_auth_service_requires_database_url(monkeypatch: pytest.MonkeyPatch) -> 
     _install_dependency_stubs(monkeypatch)
     _clear_auth_service_module()
 
+    module = importlib.import_module("auth_service")
+    app = module.get_application()
+
     with pytest.raises(RuntimeError):
-        importlib.import_module("auth_service")
+        asyncio.run(app.router.startup())
 
     _clear_auth_service_module()
     monkeypatch.setenv("AUTH_DATABASE_URL", "sqlite:///./auth_sessions.db")
 
+    module = importlib.import_module("auth_service")
+    second_app = module.get_application()
+
     with pytest.raises(RuntimeError):
-        importlib.import_module("auth_service")
+        asyncio.run(second_app.router.startup())
 
     _clear_auth_service_module()
 

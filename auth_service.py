@@ -56,11 +56,11 @@ from typing import Any, Dict, Literal, Mapping, Optional
 
 import httpx
 import pyotp
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, HttpUrl
-from sqlalchemy import Boolean, Column, DateTime, MetaData, String, create_engine
+from sqlalchemy import Boolean, Column, DateTime, String, create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.engine.url import make_url
 from sqlalchemy.orm import Session as OrmSession
@@ -82,22 +82,22 @@ def _require_env(name: str) -> str:
     return value
 
 
-JWT_SECRET = _require_env("AUTH_JWT_SECRET")
-
-
 # ---------------------------------------------------------------------------
 # Database layer
 # ---------------------------------------------------------------------------
 
 
-def _load_database_url() -> str:
-    url = _require_env("AUTH_DATABASE_URL")
-    if url == "sqlite:///./auth_sessions.db":
-        raise RuntimeError(
-            "AUTH_DATABASE_URL must point at the shared Postgres/Timescale cluster instead of the"
-            " legacy SQLite default"
+def _resolve_database_url() -> tuple[Optional[str], Optional[RuntimeError]]:
+    url = os.getenv("AUTH_DATABASE_URL")
+    if not url:
+        return None, RuntimeError(
+            "AUTH_DATABASE_URL environment variable must be set before starting the auth service"
         )
-    return url
+    if url == "sqlite:///./auth_sessions.db":
+        return None, RuntimeError(
+            "AUTH_DATABASE_URL must point at the shared Postgres/Timescale cluster instead of the legacy SQLite default"
+        )
+    return url, None
 
 
 def _engine_options(url: str) -> Dict[str, Any]:
@@ -116,19 +116,78 @@ def _engine_options(url: str) -> Dict[str, Any]:
     return options
 
 
-def _metadata(url: str) -> MetaData:
+def _resolve_schema(url: str) -> Optional[str]:
     sa_url = make_url(url)
     if sa_url.get_backend_name().startswith("postgresql"):
         schema = os.getenv("AUTH_DATABASE_SCHEMA", "auth")
         if schema:
-            return MetaData(schema=schema)
-    return MetaData()
+            return schema
+    return None
 
 
-DATABASE_URL = _load_database_url()
-ENGINE: Engine = create_engine(DATABASE_URL, **_engine_options(DATABASE_URL))
-Base = declarative_base(metadata=_metadata(DATABASE_URL))
-SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
+ENGINE: Optional[Engine] = None
+SessionLocal: Optional[sessionmaker[OrmSession]] = None
+
+Base = declarative_base()
+
+
+def _initialise_database(*, require: bool = False) -> Optional[sessionmaker[OrmSession]]:
+    """Initialise the database engine and session factory if configuration is present."""
+
+    global ENGINE, SessionLocal
+
+    if SessionLocal is not None and ENGINE is not None:
+        return SessionLocal
+
+    url, error = _resolve_database_url()
+    if error is not None or url is None:
+        if require:
+            raise error
+        return None
+
+    engine = create_engine(url, **_engine_options(url))
+    schema = _resolve_schema(url)
+    if schema:
+        Base.metadata.schema = schema
+    else:
+        Base.metadata.schema = None
+
+    session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True)
+    Base.metadata.create_all(bind=engine)
+
+    ENGINE = engine
+    SessionLocal = session_factory
+    return session_factory
+
+
+_JWT_SECRET: Optional[str] = os.getenv("AUTH_JWT_SECRET") or None
+
+
+def _initialise_jwt_secret(*, require: bool = False) -> Optional[str]:
+    """Load the JWT signing secret from the environment."""
+
+    global _JWT_SECRET
+
+    secret = os.getenv("AUTH_JWT_SECRET")
+    if not secret:
+        if require:
+            raise RuntimeError("AUTH_JWT_SECRET environment variable must be set before starting the auth service")
+        _JWT_SECRET = None
+        return None
+
+    _JWT_SECRET = secret
+    return secret
+
+
+def _get_configured_jwt_secret() -> str:
+    """Return the configured JWT secret, raising when unavailable."""
+
+    secret = _JWT_SECRET or os.getenv("AUTH_JWT_SECRET")
+    if not secret:
+        raise RuntimeError("AUTH_JWT_SECRET environment variable must be set before issuing tokens")
+
+    _initialise_jwt_secret()
+    return secret
 
 
 class AuthSession(Base):
@@ -140,9 +199,6 @@ class AuthSession(Base):
     user_id = Column(String(320), nullable=False, index=True)
     mfa_verified = Column(Boolean, nullable=False)
     ts = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
-
-
-Base.metadata.create_all(bind=ENGINE)
 
 
 class SessionRepository:
@@ -164,6 +220,11 @@ class SessionRepository:
             session.commit()
             session.refresh(record)
         return record
+
+
+# Attempt to initialise configuration eagerly when the environment is already populated.
+_initialise_database()
+_initialise_jwt_secret()
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +385,9 @@ def _sign(data: bytes, secret: str) -> str:
     return _b64url(digest)
 
 
-def create_jwt(*, subject: str, role: str, ttl_seconds: Optional[int] = None) -> tuple[str, datetime]:
+def create_jwt(
+    *, subject: str, role: str, ttl_seconds: Optional[int] = None, secret: Optional[str] = None
+) -> tuple[str, datetime]:
     ttl = ttl_seconds or int(os.getenv("AUTH_JWT_TTL_SECONDS", "3600"))
     now = datetime.now(timezone.utc)
     payload = {
@@ -338,7 +401,8 @@ def create_jwt(*, subject: str, role: str, ttl_seconds: Optional[int] = None) ->
     header_b64 = _b64url(json.dumps(header, separators=(",", ":"), sort_keys=True).encode("utf-8"))
     payload_b64 = _b64url(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
     signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
-    signature = _sign(signing_input, JWT_SECRET)
+    signing_secret = secret or _get_configured_jwt_secret()
+    signature = _sign(signing_input, signing_secret)
     token = f"{header_b64}.{payload_b64}.{signature}"
     return token, now + timedelta(seconds=ttl)
 
@@ -436,6 +500,7 @@ async def authenticate(
     providers: Dict[str, OIDCProvider],
     mfa: MFAVerifier,
     sessions: SessionRepository,
+    jwt_secret: str,
 ) -> LoginResponse:
     provider = providers.get(payload.provider)
     if not provider:
@@ -459,7 +524,7 @@ async def authenticate(
 
     role = _resolve_role(userinfo)
 
-    token, expires_at = create_jwt(subject=user_id, role=role)
+    token, expires_at = create_jwt(subject=user_id, role=role, secret=jwt_secret)
     session = await _persist_session(sessions, user_id=user_id)
 
     builder_payload = BuilderFusionPayload(
@@ -495,15 +560,41 @@ def get_application() -> FastAPI:
 
     providers = _provider_registry()
     mfa = MFAVerifier()
-    sessions = SessionRepository(SessionLocal)
+
+    @app.on_event("startup")
+    async def _configure_runtime() -> None:
+        secret = _initialise_jwt_secret(require=True)
+        session_factory = _initialise_database(require=True)
+        if secret is None or session_factory is None:  # pragma: no cover - defensive guard
+            raise RuntimeError("Auth service configuration is incomplete; ensure environment variables are set")
+
+        app.state.jwt_secret = secret
+        app.state.session_repository = SessionRepository(session_factory)
+
+    def _session_repository_dependency(request: Request) -> SessionRepository:
+        repo = getattr(request.app.state, "session_repository", None)
+        if repo is None:
+            raise RuntimeError("Auth session repository is not initialised; ensure service startup has executed")
+        return repo
+
+    def _jwt_secret_dependency(request: Request) -> str:
+        secret = getattr(request.app.state, "jwt_secret", None)
+        if not secret:
+            raise RuntimeError("AUTH_JWT_SECRET environment variable must be configured before issuing tokens")
+        return secret
 
     @app.post("/auth/login", response_model=LoginResponse, tags=["auth"])
-    async def login_endpoint(payload: LoginRequest, repo: SessionRepository = Depends(lambda: sessions)) -> LoginResponse:
+    async def login_endpoint(
+        payload: LoginRequest,
+        repo: SessionRepository = Depends(_session_repository_dependency),
+        jwt_secret: str = Depends(_jwt_secret_dependency),
+    ) -> LoginResponse:
         return await authenticate(
             payload,
             providers=providers,
             mfa=mfa,
             sessions=repo,
+            jwt_secret=jwt_secret,
         )
 
     return app
