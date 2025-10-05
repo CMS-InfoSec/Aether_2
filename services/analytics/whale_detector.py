@@ -7,8 +7,10 @@ from datetime import datetime, timedelta, timezone
 from threading import Lock
 from typing import Deque, Dict, Iterable, Literal, Optional
 
-from fastapi import FastAPI, Query
+from fastapi import Depends, FastAPI, Query
 from pydantic import BaseModel, ConfigDict, Field
+
+from services.common.security import require_admin_account
 
 
 def _utcnow() -> datetime:
@@ -235,6 +237,7 @@ async def recent_whales(
         le=500,
         description="Maximum number of whale trades to return",
     ),
+    caller: str = Depends(require_admin_account),
 ) -> list[WhaleEventResponse]:
     """Return recently observed whale trades, optionally filtered by symbol."""
 
