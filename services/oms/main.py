@@ -54,6 +54,7 @@ from services.oms.order_ack_cache import get_order_ack_cache
 from services.oms.rate_limit_guard import rate_limit_guard
 from services.oms.shadow_oms import shadow_oms
 from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
+from shared.session_config import load_session_ttl_minutes
 
 from services.oms.circuit_breaker_store import CircuitBreakerStateStore, CircuitBreakerPersistedState
 
@@ -73,14 +74,19 @@ from metrics import (
 
 
 def _build_session_store_from_env() -> SessionStoreProtocol:
-    ttl_minutes = int(os.getenv("SESSION_TTL_MINUTES", "60"))
+    ttl_minutes = load_session_ttl_minutes()
     redis_url = os.getenv("SESSION_REDIS_URL")
     if not redis_url:
         raise RuntimeError(
 
             "SESSION_REDIS_URL environment variable is required to configure OMS sessions"
         )
-    if redis_url.startswith("memory://"):
+    redis_url = redis_url.strip()
+    if not redis_url:
+        raise RuntimeError(
+            "SESSION_REDIS_URL environment variable is required to configure OMS sessions"
+        )
+    if redis_url.lower().startswith("memory://"):
         return InMemorySessionStore(ttl_minutes=ttl_minutes)
 
     return build_session_store_from_url(redis_url, ttl_minutes=ttl_minutes)

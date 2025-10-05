@@ -29,6 +29,7 @@ from services.alert_manager import setup_alerting
 from services.alerts.alert_dedupe import router as alert_dedupe_router, setup_alert_dedupe
 from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
 from shared.correlation import CorrelationIdMiddleware
+from shared.session_config import load_session_ttl_minutes
 from scaling_controller import (
     build_scaling_controller_from_env,
     configure_scaling_controller,
@@ -55,6 +56,40 @@ def _generate_random_mfa_secret() -> str:
     return base64.b32encode(raw).decode("ascii").rstrip("=")
 
 
+def _normalize_admin_repository_dsn(raw_dsn: str) -> str:
+    """Coerce vendor-specific PostgreSQL URIs into a psycopg-compatible DSN."""
+
+    stripped = raw_dsn.strip()
+    if not stripped:
+        raise RuntimeError(
+            "Admin repository requires a DSN with an explicit scheme; received an empty value."
+        )
+
+    scheme, separator, remainder = stripped.partition("://")
+    if not separator:
+        raise RuntimeError(
+            "Admin repository requires a DSN with an explicit scheme; "
+            f"received '{raw_dsn}'."
+        )
+
+    scheme_lower = scheme.lower()
+    if scheme_lower in {
+        "postgres",
+        "postgresql",
+        "timescale",
+        "postgresql+psycopg",
+        "postgresql+psycopg2",
+    }:
+        normalized_scheme = "postgresql"
+    else:
+        raise RuntimeError(
+            "Admin repository requires a Postgres/Timescale DSN; "
+            f"received '{raw_dsn}'."
+        )
+
+    return f"{normalized_scheme}://{remainder}"
+
+
 def _build_admin_repository_from_env() -> AdminRepositoryProtocol:
     dsn_env_vars = (
         "ADMIN_POSTGRES_DSN",
@@ -68,24 +103,9 @@ def _build_admin_repository_from_env() -> AdminRepositoryProtocol:
             "ADMIN_DATABASE_DSN, or ADMIN_DB_DSN."
         )
 
-    normalized = dsn.lower()
-    if normalized.startswith("postgres://"):
-        dsn = "postgresql://" + dsn.split("://", 1)[1]
-        normalized = dsn.lower()
+    normalized_dsn = _normalize_admin_repository_dsn(dsn)
 
-    allowed_prefixes = (
-        "postgresql://",
-        "postgresql+psycopg://",
-        "postgresql+psycopg2://",
-        "timescale://",
-    )
-    if not normalized.startswith(allowed_prefixes):
-        raise RuntimeError(
-            "Admin repository requires a Postgres/Timescale DSN; "
-            f"received '{dsn}'."
-        )
-
-    return PostgresAdminRepository(dsn)
+    return PostgresAdminRepository(normalized_dsn)
 
 
 def _verify_admin_repository(admin_repository: AdminRepositoryProtocol) -> None:
@@ -106,7 +126,7 @@ def _verify_admin_repository(admin_repository: AdminRepositoryProtocol) -> None:
 
 
 def _build_session_store_from_env() -> SessionStoreProtocol:
-    ttl_minutes = int(os.getenv("SESSION_TTL_MINUTES", "60"))
+    ttl_minutes = load_session_ttl_minutes()
 
     dsn_env_vars = (
         "SESSION_REDIS_URL",
@@ -120,7 +140,14 @@ def _build_session_store_from_env() -> SessionStoreProtocol:
             "Session store misconfigured: set one of "
             f"{joined} so the API can use the shared Redis backend"
         )
-    if redis_url.startswith("memory://"):
+    redis_url = redis_url.strip()
+    if not redis_url:
+        joined = ", ".join(dsn_env_vars)
+        raise RuntimeError(
+            "Session store misconfigured: set one of "
+            f"{joined} so the API can use the shared Redis backend"
+        )
+    if redis_url.lower().startswith("memory://"):
         return InMemorySessionStore(ttl_minutes=ttl_minutes)
 
     return build_session_store_from_url(redis_url, ttl_minutes=ttl_minutes)

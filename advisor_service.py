@@ -39,6 +39,7 @@ from auth.service import (
 )
 from services.common import security
 from services.common.security import require_admin_account
+from shared.session_config import load_session_ttl_minutes
 
 LOGGER = logging.getLogger(__name__)
 
@@ -490,8 +491,14 @@ def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
                 "SESSION_REDIS_URL is not configured. Provide a shared session store DSN to enable advisor authentication.",
             )
 
-        ttl_minutes = int(os.getenv("SESSION_TTL_MINUTES", "60"))
-        if redis_url.startswith("memory://"):
+        redis_url = redis_url.strip()
+        if not redis_url:
+            raise RuntimeError(
+                "SESSION_REDIS_URL is not configured. Provide a shared session store DSN to enable advisor authentication."
+            )
+
+        ttl_minutes = load_session_ttl_minutes()
+        if redis_url.lower().startswith("memory://"):
             store = InMemorySessionStore(ttl_minutes=ttl_minutes)
         else:
             store = build_session_store_from_url(redis_url, ttl_minutes=ttl_minutes)
