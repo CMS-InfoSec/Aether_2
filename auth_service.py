@@ -67,6 +67,7 @@ from sqlalchemy.orm import Session as OrmSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from services.auth.jwt_tokens import create_jwt
+from shared.postgres import normalize_postgres_dsn
 
 
 logger = logging.getLogger("auth_service")
@@ -88,16 +89,27 @@ def _require_env(name: str) -> str:
 
 
 def _resolve_database_url() -> tuple[Optional[str], Optional[RuntimeError]]:
-    url = os.getenv("AUTH_DATABASE_URL")
+    raw_url = os.getenv("AUTH_DATABASE_URL")
+    if raw_url is None:
+        return None, RuntimeError(
+            "AUTH_DATABASE_URL environment variable must be set before starting the auth service"
+        )
+    url = raw_url.strip()
     if not url:
         return None, RuntimeError(
             "AUTH_DATABASE_URL environment variable must be set before starting the auth service"
         )
-    if url == "sqlite:///./auth_sessions.db":
+
+    try:
+        normalized = normalize_postgres_dsn(url, label="Auth database DSN")
+    except RuntimeError as exc:
+        return None, RuntimeError(str(exc))
+
+    if normalized == "sqlite:///./auth_sessions.db":
         return None, RuntimeError(
             "AUTH_DATABASE_URL must point at the shared Postgres/Timescale cluster instead of the legacy SQLite default"
         )
-    return url, None
+    return normalized, None
 
 
 def _engine_options(url: str) -> Dict[str, Any]:

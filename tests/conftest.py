@@ -34,6 +34,8 @@ os.environ.setdefault("AUTH_DATABASE_URL", "sqlite:////tmp/aether-auth-test.db")
 
 os.environ.setdefault("SESSION_REDIS_URL", "memory://oms-test")
 
+os.environ.setdefault("TIMESCALE_DSN", "postgresql://localhost:5432/aether_test")
+
 
 
 

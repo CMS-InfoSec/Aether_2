@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from threading import Lock
 from typing import Any, Dict, Optional
 
-from common.utils.redis import create_redis_from_url
+from common.utils.redis import InMemoryRedis, create_redis_from_url
 
 
 LOGGER = logging.getLogger(__name__)
@@ -71,8 +71,37 @@ class CircuitBreakerStateStore:
 
     @staticmethod
     def _create_default_client() -> Any:
-        redis_url = os.getenv("OMS_CIRCUIT_BREAKER_REDIS_URL", "redis://localhost:6379/0")
-        client, _ = create_redis_from_url(redis_url, decode_responses=True, logger=LOGGER)
+        candidates = (
+            "OMS_CIRCUIT_BREAKER_REDIS_URL",
+            "SESSION_REDIS_URL",
+            "SESSION_STORE_URL",
+            "SESSION_BACKEND_DSN",
+        )
+        redis_url = next((os.getenv(var) for var in candidates if os.getenv(var)), None)
+        if not redis_url:
+            joined = ", ".join(candidates)
+            raise RuntimeError(
+                "Circuit breaker state store requires a Redis URL. "
+                f"Set one of {joined} to a reachable redis:// endpoint or memory:// for tests."
+            )
+
+        redis_url = redis_url.strip()
+        if not redis_url:
+            joined = ", ".join(candidates)
+            raise RuntimeError(
+                "Circuit breaker state store requires a Redis URL. "
+                f"Set one of {joined} to a reachable redis:// endpoint or memory:// for tests."
+            )
+
+        if redis_url.lower().startswith("memory://"):
+            return InMemoryRedis(decode_responses=True)
+
+        client, used_stub = create_redis_from_url(redis_url, decode_responses=True, logger=LOGGER)
+        if used_stub:
+            raise RuntimeError(
+                "Circuit breaker state store could not connect to Redis. "
+                f"Verify {redis_url!r} points to an accessible Redis deployment."
+            )
         return client
 
     def _load_payload(self) -> Dict[str, Dict[str, object]]:

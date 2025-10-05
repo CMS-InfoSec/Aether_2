@@ -58,6 +58,7 @@ from metrics import (
     setup_metrics,
 )
 from services.common.security import ADMIN_ACCOUNTS, require_admin_account
+from shared.session_config import load_session_ttl_minutes
 from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
 
 
@@ -104,9 +105,15 @@ def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
     if isinstance(existing, SessionStoreProtocol):
         store = existing
     else:
-        redis_url = os.getenv("SESSION_REDIS_URL") or "memory://policy-service"
-        ttl_minutes = int(os.getenv("SESSION_TTL_MINUTES", "60"))
-        if redis_url.startswith("memory://"):
+        raw_url = os.getenv("SESSION_REDIS_URL")
+        redis_url = (raw_url if raw_url else "memory://policy-service").strip()
+        if not redis_url:
+            raise RuntimeError(
+                "SESSION_REDIS_URL resolved to an empty value; provide a Redis DSN or leave it unset for the in-memory default."
+            )
+
+        ttl_minutes = load_session_ttl_minutes()
+        if redis_url.lower().startswith("memory://"):
             store = InMemorySessionStore(ttl_minutes=ttl_minutes)
         else:
             store = build_session_store_from_url(redis_url, ttl_minutes=ttl_minutes)
