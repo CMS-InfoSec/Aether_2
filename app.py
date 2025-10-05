@@ -93,7 +93,6 @@ def _normalize_admin_repository_dsn(raw_dsn: str) -> str:
             f"received '{raw_dsn}'."
         )
 
-
     return f"{normalized_scheme}://{remainder}"
 
 
@@ -111,7 +110,6 @@ def _build_admin_repository_from_env() -> AdminRepositoryProtocol:
         )
 
     normalized_dsn = _normalize_admin_repository_dsn(dsn)
-
 
     return PostgresAdminRepository(normalized_dsn)
 

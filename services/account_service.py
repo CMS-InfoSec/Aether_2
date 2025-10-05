@@ -44,6 +44,7 @@ import yaml
 
 from services.k8s_sync_service import sync_account_secret
 from services.kraken_test_service import test_kraken_connection
+from shared.accounts_config import resolve_accounts_database_url
 
 LOGGER = logging.getLogger(__name__)
 
@@ -54,17 +55,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 def _database_url() -> str:
-    url = (
-        os.getenv("ACCOUNTS_DATABASE_URL")
-        or os.getenv("TIMESCALE_DSN")
-        or os.getenv("DATABASE_URL")
-        or "sqlite:///./accounts.db"
-    )
-    if url.startswith("postgresql://"):
-        return url.replace("postgresql://", "postgresql+psycopg2://", 1)
-    if url.startswith("postgres://"):
-        return url.replace("postgres://", "postgresql+psycopg2://", 1)
-    return url
+    return resolve_accounts_database_url()
 
 
 def _engine_options(url: str) -> dict[str, Any]:

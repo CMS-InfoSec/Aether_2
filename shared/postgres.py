@@ -55,4 +55,28 @@ def normalize_postgres_dsn(raw_dsn: str, *, allow_sqlite: bool = True, label: st
     )
 
 
-__all__ = ["normalize_postgres_dsn"]
+def normalize_sqlalchemy_dsn(
+    raw_dsn: str,
+    *,
+    driver: str = "psycopg2",
+    allow_sqlite: bool = True,
+    label: str = "Timescale DSN",
+) -> str:
+    """Normalize a PostgreSQL/Timescale DSN for SQLAlchemy engines.
+
+    ``normalize_postgres_dsn`` ensures the scheme is compatible with psycopg, but
+    SQLAlchemy requires the driver name to be embedded in the URI.  This helper
+    reuses the shared normaliser and, when targeting PostgreSQL, inserts the
+    configured driver while preserving sqlite URLs for test environments.
+    """
+
+    normalized = normalize_postgres_dsn(
+        raw_dsn, allow_sqlite=allow_sqlite, label=label
+    )
+    if normalized.startswith("postgresql://"):
+        driver_name = driver.strip() or "psycopg2"
+        return normalized.replace("postgresql://", f"postgresql+{driver_name}://", 1)
+    return normalized
+
+
+__all__ = ["normalize_postgres_dsn", "normalize_sqlalchemy_dsn"]

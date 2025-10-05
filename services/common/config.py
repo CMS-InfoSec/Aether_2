@@ -77,7 +77,6 @@ def get_nats_producer(account_id: str) -> NATSProducer:
     return NATSProducer(servers=servers, subject_prefix=subject_prefix)
 
 
-
 def _resolve_timescale_dsn(account_id: str) -> str:
     """Return a configured Timescale/PostgreSQL DSN for the given account."""
 
@@ -91,9 +90,7 @@ def _resolve_timescale_dsn(account_id: str) -> str:
             raise RuntimeError(
                 f"{key} is set but empty; configure a valid Timescale/PostgreSQL DSN."
             )
-
         return normalize_postgres_dsn(stripped, label="Timescale DSN")
-
 
     raise RuntimeError(
         "Timescale DSN is not configured. Set TIMESCALE_DSN or "
