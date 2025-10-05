@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import types
 
@@ -228,6 +229,31 @@ class CorrelationIdMiddleware:  # pragma: no cover - structural stub
 shared_correlation_module.CorrelationIdMiddleware = CorrelationIdMiddleware  # type: ignore[attr-defined]
 _install_module("shared.correlation", shared_correlation_module)
 
+shared_session_config_module = types.ModuleType("shared.session_config")
+
+
+def load_session_ttl_minutes(*, env=None, default: int = 60):  # pragma: no cover - helper stub
+    source = env or os.environ
+    raw = source.get("SESSION_TTL_MINUTES")
+    if raw is None:
+        if default <= 0:
+            raise RuntimeError("Session TTL default must be a positive integer.")
+        return default
+    value = str(raw).strip()
+    if not value:
+        raise RuntimeError("SESSION_TTL_MINUTES must be a positive integer representing minutes.")
+    try:
+        ttl = int(value)
+    except ValueError as exc:  # pragma: no cover - behaviour not under test
+        raise RuntimeError("SESSION_TTL_MINUTES must be a positive integer representing minutes.") from exc
+    if ttl <= 0:
+        raise RuntimeError("SESSION_TTL_MINUTES must be a positive integer representing minutes.")
+    return ttl
+
+
+shared_session_config_module.load_session_ttl_minutes = load_session_ttl_minutes  # type: ignore[attr-defined]
+_install_module("shared.session_config", shared_session_config_module)
+
 
 # Scaling controller infrastructure.
 scaling_controller_module = types.ModuleType("scaling_controller")
@@ -347,10 +373,26 @@ def test_create_app_requires_dsn_when_not_explicit(monkeypatch: pytest.MonkeyPat
     monkeypatch.delenv("ADMIN_DATABASE_DSN", raising=False)
     monkeypatch.delenv("ADMIN_DB_DSN", raising=False)
 
+    repository = app_module.InMemoryAdminRepository()
+    application = app_module.create_app(
+        admin_repository=repository, session_store=InMemorySessionStore()
+    )
 
-    application = app_module.create_app(session_store=InMemorySessionStore())
+    assert application.state.admin_repository is repository
 
-    assert isinstance(application.state.admin_repository, app_module.InMemoryAdminRepository)
+
+def test_create_app_rejects_unsupported_admin_dsn(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ADMIN_POSTGRES_DSN", "mysql://example.com/admin")
+
+    with pytest.raises(RuntimeError, match="requires a Postgres/Timescale DSN"):
+        app_module.create_app(session_store=InMemorySessionStore())
+
+
+def test_create_app_rejects_blank_admin_dsn(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ADMIN_POSTGRES_DSN", "   ")
+
+    with pytest.raises(RuntimeError, match="requires a DSN with an explicit scheme"):
+        app_module.create_app(session_store=InMemorySessionStore())
 
 
 def test_create_app_rejects_unsupported_admin_dsn(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -374,5 +416,28 @@ def test_create_app_requires_session_store_dsn(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.delenv("SESSION_BACKEND_DSN", raising=False)
 
     with pytest.raises(RuntimeError, match="Session store misconfigured"):
-        app_module.create_app()
+        app_module.create_app(admin_repository=app_module.InMemoryAdminRepository())
+
+
+def test_create_app_rejects_non_integer_session_ttl(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SESSION_REDIS_URL", "memory://admin-platform-test")
+    monkeypatch.setenv("SESSION_TTL_MINUTES", "not-a-number")
+
+    with pytest.raises(RuntimeError, match="SESSION_TTL_MINUTES must be a positive integer"):
+        app_module.create_app(admin_repository=app_module.InMemoryAdminRepository())
+
+
+def test_create_app_rejects_non_positive_session_ttl(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SESSION_REDIS_URL", "memory://admin-platform-test")
+    monkeypatch.setenv("SESSION_TTL_MINUTES", "0")
+
+    with pytest.raises(RuntimeError, match="SESSION_TTL_MINUTES must be a positive integer"):
+        app_module.create_app(admin_repository=app_module.InMemoryAdminRepository())
+
+
+def test_create_app_rejects_blank_session_store_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SESSION_REDIS_URL", "   ")
+
+    with pytest.raises(RuntimeError, match="Session store misconfigured"):
+        app_module.create_app(admin_repository=app_module.InMemoryAdminRepository())
 

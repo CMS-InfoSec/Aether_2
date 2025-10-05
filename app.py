@@ -29,6 +29,7 @@ from services.alert_manager import setup_alerting
 from services.alerts.alert_dedupe import router as alert_dedupe_router, setup_alert_dedupe
 from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
 from shared.correlation import CorrelationIdMiddleware
+from shared.session_config import load_session_ttl_minutes
 from scaling_controller import (
     build_scaling_controller_from_env,
     configure_scaling_controller,
@@ -134,7 +135,7 @@ def _verify_admin_repository(admin_repository: AdminRepositoryProtocol) -> None:
 
 
 def _build_session_store_from_env() -> SessionStoreProtocol:
-    ttl_minutes = int(os.getenv("SESSION_TTL_MINUTES", "60"))
+    ttl_minutes = load_session_ttl_minutes()
 
     dsn_env_vars = (
         "SESSION_REDIS_URL",
@@ -148,7 +149,14 @@ def _build_session_store_from_env() -> SessionStoreProtocol:
             "Session store misconfigured: set one of "
             f"{joined} so the API can use the shared Redis backend"
         )
-    if redis_url.startswith("memory://"):
+    redis_url = redis_url.strip()
+    if not redis_url:
+        joined = ", ".join(dsn_env_vars)
+        raise RuntimeError(
+            "Session store misconfigured: set one of "
+            f"{joined} so the API can use the shared Redis backend"
+        )
+    if redis_url.lower().startswith("memory://"):
         return InMemorySessionStore(ttl_minutes=ttl_minutes)
 
     return build_session_store_from_url(redis_url, ttl_minutes=ttl_minutes)
