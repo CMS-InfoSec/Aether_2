@@ -43,6 +43,17 @@ spec:
               value: /var/run/secrets/kraken/director-1/credentials.json
             - name: AETHER_DIRECTOR_2_KRAKEN_SECRET_PATH
               value: /var/run/secrets/kraken/director-2/credentials.json
+            - name: FEES_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: fees-service-database
+                  key: dsn
+            - name: FEES_DB_SSLMODE
+              valueFrom:
+                secretKeyRef:
+                  name: fees-service-database
+                  key: sslmode
+                  optional: true
           readinessProbe:
             httpGet:
               path: /metrics

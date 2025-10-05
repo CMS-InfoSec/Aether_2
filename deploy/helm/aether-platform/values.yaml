@@ -397,7 +397,18 @@ backendServices:
       tag: latest
     replicaCount: 2
     containerPort: 8000
-    env: []
+    env:
+      - name: FEES_DATABASE_URL
+        valueFrom:
+          secretKeyRef:
+            name: fees-service-database
+            key: dsn
+      - name: FEES_DB_SSLMODE
+        valueFrom:
+          secretKeyRef:
+            name: fees-service-database
+            key: sslmode
+            optional: true
     usesKrakenSecrets: true
     extraVolumeMounts: []
     extraVolumes: []

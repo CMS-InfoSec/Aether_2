@@ -5,7 +5,7 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Iterator, List, Sequence, Tuple
+from typing import Any, Iterator, List, Sequence, Tuple
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field
@@ -17,8 +17,6 @@ from services.common.security import require_admin_account
 from services.fees.fee_optimizer import FeeOptimizer
 from services.fees.models import AccountFill, AccountVolume30d, Base, FeeTier
 
-
-DEFAULT_DATABASE_URL = "sqlite:///./fees.db"
 POLICY_SERVICE_URL = os.getenv("POLICY_SERVICE_URL", "http://policy-service")
 POLICY_VOLUME_SIGNAL_PATH = os.getenv(
     "POLICY_VOLUME_SIGNAL_PATH", "/policy/opportunistic-volume"
@@ -51,15 +49,55 @@ if FEE_DRIFT_ALERT_THRESHOLD_RATIO < 0:
 
 FEE_ESTIMATE_QUANTIZE = Decimal("0.0001")
 
+_DATABASE_URL_ENV = "FEES_DATABASE_URL"
+
 
 def _database_url() -> str:
-    url = os.getenv("TIMESCALE_DSN") or os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
-    if url.startswith("postgresql://"):
-        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
-    return url
+    url = os.getenv(_DATABASE_URL_ENV) or os.getenv("TIMESCALE_DSN")
+    if not url:
+        raise RuntimeError(
+            "FEES_DATABASE_URL or TIMESCALE_DSN must be configured with a PostgreSQL/Timescale DSN"
+        )
+
+    normalized = url.strip()
+    if normalized.startswith("postgres://"):
+        normalized = "postgresql://" + normalized.split("://", 1)[1]
+
+    if normalized.startswith("postgresql://"):
+        normalized = normalized.replace("postgresql://", "postgresql+psycopg2://", 1)
+    elif normalized.startswith("postgresql+psycopg://"):
+        normalized = normalized.replace("postgresql+psycopg://", "postgresql+psycopg2://", 1)
+    elif normalized.startswith("postgresql+psycopg2://"):
+        pass
+    else:
+        raise RuntimeError(
+            "Fee service requires a PostgreSQL/Timescale DSN via FEES_DATABASE_URL or TIMESCALE_DSN"
+        )
+
+    return normalized
 
 
-ENGINE: Engine = create_engine(_database_url(), future=True)
+def _engine_options() -> dict[str, Any]:
+    options: dict[str, Any] = {
+        "future": True,
+        "pool_pre_ping": True,
+        "pool_size": int(os.getenv("FEES_DB_POOL_SIZE", "10")),
+        "max_overflow": int(os.getenv("FEES_DB_MAX_OVERFLOW", "20")),
+        "pool_timeout": int(os.getenv("FEES_DB_POOL_TIMEOUT", "30")),
+        "pool_recycle": int(os.getenv("FEES_DB_POOL_RECYCLE", "1800")),
+    }
+
+    sslmode = os.getenv("FEES_DB_SSLMODE", "require").strip()
+    connect_args: dict[str, Any] = {}
+    if sslmode:
+        connect_args["sslmode"] = sslmode
+    options["connect_args"] = connect_args
+
+    return options
+
+
+DATABASE_URL = _database_url()
+ENGINE: Engine = create_engine(DATABASE_URL, **_engine_options())
 SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
 
 
