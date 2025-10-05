@@ -1010,7 +1010,16 @@ ui:
     repository: ghcr.io/aether/aether-2-ui
     tag: latest
   containerPort: 8080
-  env: []
+  env:
+    # The UI consumes the public API endpoint during build/runtime. Keep the
+    # canonical URL in sync with the risk API ingress so the compiled assets
+    # point at the correct backend cluster.
+    - name: NEXT_PUBLIC_API_BASE_URL
+      value: https://risk.aether.example.com
+    # Some build variants still look for a Vite-style variable; surface the
+    # same value to simplify the production pipeline defaults.
+    - name: VITE_API_BASE_URL
+      value: https://risk.aether.example.com
   service:
     port: 80
     targetPort: http

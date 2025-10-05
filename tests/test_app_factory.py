@@ -296,6 +296,7 @@ def test_create_app_normalizes_timescale_scheme(monkeypatch: pytest.MonkeyPatch)
     assert captured["dsn"].startswith("postgresql://")
 
 
+
 def test_create_app_normalizes_sqlalchemy_style_scheme(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(
         "ADMIN_POSTGRES_DSN",

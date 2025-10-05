@@ -97,6 +97,7 @@ def _build_admin_repository_from_env() -> AdminRepositoryProtocol:
 
     normalized_dsn = _normalize_admin_repository_dsn(dsn)
 
+
     return PostgresAdminRepository(normalized_dsn)
 
 
