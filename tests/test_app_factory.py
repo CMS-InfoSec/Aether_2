@@ -125,6 +125,10 @@ class RedisSessionStore(SessionStoreProtocol):  # pragma: no cover - structural 
         self.ttl_minutes = ttl_minutes
 
 
+def build_session_store_from_url(redis_url: str, *, ttl_minutes: int = 60) -> RedisSessionStore:
+    return RedisSessionStore(client={"url": redis_url}, ttl_minutes=ttl_minutes)
+
+
 class PostgresAdminRepository(AdminRepositoryProtocol):
     def __init__(self, dsn: str) -> None:  # pragma: no cover - behaviour not under test
         self.dsn = dsn
@@ -149,6 +153,7 @@ auth_service_module.AuthService = AuthService  # type: ignore[attr-defined]
 auth_service_module.SessionStoreProtocol = SessionStoreProtocol  # type: ignore[attr-defined]
 auth_service_module.InMemorySessionStore = InMemorySessionStore  # type: ignore[attr-defined]
 auth_service_module.RedisSessionStore = RedisSessionStore  # type: ignore[attr-defined]
+auth_service_module.build_session_store_from_url = build_session_store_from_url  # type: ignore[attr-defined]
 auth_service_module.SessionStore = SessionStore  # type: ignore[attr-defined]
 _install_module("auth.service", auth_service_module)
 
@@ -270,6 +275,25 @@ def test_create_app_uses_postgres_repository_when_dsn(monkeypatch: pytest.Monkey
 
     assert isinstance(application.state.admin_repository, DummyPostgresRepository)
     assert created["dsn"] == "postgresql://example.com/admin"
+
+
+def test_create_app_normalizes_timescale_scheme(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ADMIN_POSTGRES_DSN", "timescale://tenant:pass@example.com/admin")
+
+    captured: dict[str, str] = {}
+
+    class DummyPostgresRepository(app_module.InMemoryAdminRepository):
+        def __init__(self, dsn: str) -> None:
+            super().__init__()
+            captured["dsn"] = dsn
+
+    monkeypatch.setattr(app_module, "PostgresAdminRepository", DummyPostgresRepository)
+
+    session_store = InMemorySessionStore()
+    application = app_module.create_app(session_store=session_store)
+
+    assert isinstance(application.state.admin_repository, DummyPostgresRepository)
+    assert captured["dsn"].startswith("postgresql://")
 
 
 def test_create_app_requires_dsn_when_not_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
