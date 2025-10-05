@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Sequence
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import Column, DateTime, Float, String, create_engine, func, select
 from sqlalchemy.engine import Engine, URL
@@ -21,6 +21,10 @@ from services.common import security
 from services.common.security import require_admin_account
 
 __all__ = ["app"]
+
+
+ENGINE_STATE_KEY = "seasonality_engine"
+SESSIONMAKER_STATE_KEY = "seasonality_sessionmaker"
 
 
 def _normalise_database_url(url: str) -> str:
@@ -86,14 +90,6 @@ def _engine_options(url: URL) -> Dict[str, Any]:
         options["connect_args"] = connect_args
 
     return options
-
-
-DATABASE_URL: URL = _require_database_url()
-ENGINE: Engine = create_engine(
-    DATABASE_URL.render_as_string(hide_password=False),
-    **_engine_options(DATABASE_URL),
-)
-SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
 
 
 OhlcvBase = declarative_base()
@@ -200,12 +196,48 @@ SESSION_WINDOWS: Dict[str, range] = {
 }
 
 
-def get_session() -> Iterator[Session]:
-    session = SessionLocal()
+def get_session(request: Request) -> Iterator[Session]:
+    session_factory = getattr(request.app.state, SESSIONMAKER_STATE_KEY, None)
+    if session_factory is None:
+        raise RuntimeError(
+            "Seasonality database session maker is not initialised. "
+            "Ensure the application startup hook has run successfully."
+        )
+
+    session = session_factory()
     try:
         yield session
     finally:
         session.close()
+
+
+def _configure_database(application: FastAPI) -> None:
+    try:
+        database_url = _require_database_url()
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Seasonality service startup failed: configure SEASONALITY_DATABASE_URI, "
+            "TIMESCALE_DATABASE_URI, or DATABASE_URL."
+        ) from exc
+
+    engine = create_engine(
+        database_url.render_as_string(hide_password=False),
+        **_engine_options(database_url),
+    )
+    session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True)
+
+    setattr(application.state, ENGINE_STATE_KEY, engine)
+    setattr(application.state, SESSIONMAKER_STATE_KEY, session_factory)
+
+
+def _dispose_database(application: FastAPI) -> None:
+    engine = getattr(application.state, ENGINE_STATE_KEY, None)
+    if isinstance(engine, Engine):
+        engine.dispose()
+
+    for key in (ENGINE_STATE_KEY, SESSIONMAKER_STATE_KEY):
+        if hasattr(application.state, key):
+            delattr(application.state, key)
 
 
 def _ensure_timezone(value: datetime) -> datetime:
@@ -427,7 +459,15 @@ def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
     return store
 
 
-SESSION_STORE = _configure_session_store(app)
+@app.on_event("startup")
+def _on_startup() -> None:
+    _configure_database(app)
+    _configure_session_store(app)
+
+
+@app.on_event("shutdown")
+def _on_shutdown() -> None:
+    _dispose_database(app)
 
 
 @app.get("/seasonality/dayofweek", response_model=DayOfWeekResponse)
