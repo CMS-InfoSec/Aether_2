@@ -7,7 +7,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Generator, List, Sequence
+from typing import Any, Generator, List, Optional, Sequence, cast
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field
@@ -88,18 +88,72 @@ def _normalise_database_url(url: str) -> str:
     return url
 
 
-DATABASE_URL: URL = _require_database_url()
-ENGINE: Engine = create_engine(
-    DATABASE_URL.render_as_string(hide_password=False),
-    **_engine_options(DATABASE_URL),
-)
-SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
+DATABASE_URL: Optional[URL] = None
+ENGINE: Optional[Engine] = None
+_SESSION_FACTORY: Optional[sessionmaker] = None
+
+
+class _SessionFactoryProxy:
+    """Proxy that lazily initialises the sessionmaker when invoked."""
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Session:
+        factory = _ensure_session_factory()
+        return factory(*args, **kwargs)
+
+    def __getattr__(self, item: str) -> Any:
+        factory = _ensure_session_factory()
+        return getattr(factory, item)
+
+
+SessionLocal: sessionmaker = cast(sessionmaker, _SessionFactoryProxy())
 
 _MIGRATIONS_PATH = Path(__file__).resolve().parents[2] / "data" / "migrations"
 
 
+def _register_database(url: URL, engine: Engine, session_factory: sessionmaker) -> sessionmaker:
+    """Store database connectivity objects globally and on the FastAPI app state."""
+
+    global DATABASE_URL, ENGINE, _SESSION_FACTORY
+
+    DATABASE_URL = url
+    ENGINE = engine
+    _SESSION_FACTORY = session_factory
+    globals()["SessionLocal"] = session_factory
+
+    app.state.analytics_database_url = url
+    app.state.analytics_engine = engine
+    app.state.analytics_sessionmaker = session_factory
+
+    return session_factory
+
+
+def _ensure_session_factory() -> sessionmaker:
+    """Return an initialised session factory, configuring it lazily if required."""
+
+    state_factory = getattr(app.state, "analytics_sessionmaker", None)
+    state_engine = getattr(app.state, "analytics_engine", None)
+    state_url = getattr(app.state, "analytics_database_url", None)
+
+    if state_factory is not None and isinstance(state_engine, Engine) and isinstance(state_url, URL):
+        return _register_database(state_url, state_engine, state_factory)
+
+    if _SESSION_FACTORY is not None and ENGINE is not None and DATABASE_URL is not None:
+        app.state.analytics_database_url = DATABASE_URL
+        app.state.analytics_engine = ENGINE
+        app.state.analytics_sessionmaker = _SESSION_FACTORY
+        return _SESSION_FACTORY
+
+    session_factory = _initialise_database()
+    return session_factory
+
+
 def run_migrations() -> None:
     """Apply all outstanding Timescale migrations for analytics data."""
+
+    _ensure_session_factory()
+
+    if DATABASE_URL is None:
+        raise RuntimeError("Analytics database URL not configured; ensure startup completed.")
 
     config = Config()
     config.set_main_option("script_location", str(_MIGRATIONS_PATH))
@@ -173,6 +227,9 @@ class VolatilityResponse(BaseModel):
 
 
 app = FastAPI(title="Volatility Analytics Service")
+app.state.analytics_database_url = None
+app.state.analytics_engine = None
+app.state.analytics_sessionmaker = None
 metrics.setup_metrics(app, service_name="volatility-service")
 
 
@@ -192,13 +249,31 @@ def _volatility_gauge() -> Gauge:
     return _VOLATILITY_INDEX
 
 
+def _initialise_database() -> sessionmaker:
+    """Initialise database connectivity once configuration is available."""
+
+    url = _require_database_url()
+    engine = create_engine(
+        url.render_as_string(hide_password=False),
+        **_engine_options(url),
+    )
+    session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True)
+
+    return _register_database(url, engine, session_factory)
+
+
 @app.on_event("startup")
 def _on_startup() -> None:
+    _initialise_database()
     run_migrations()
 
 
 def get_session() -> Generator[Session, None, None]:
-    session = SessionLocal()
+    session_factory = getattr(app.state, "analytics_sessionmaker", None)
+    if session_factory is None:
+        session_factory = _ensure_session_factory()
+
+    session = session_factory()
     try:
         yield session
     finally:
