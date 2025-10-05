@@ -75,6 +75,7 @@ def get_nats_producer(account_id: str) -> NATSProducer:
     return NATSProducer(servers=servers, subject_prefix=subject_prefix)
 
 
+
 _SUPPORTED_POSTGRES_SCHEMES = {
     "postgres",
     "postgresql",
@@ -103,6 +104,7 @@ def _normalize_timescale_dsn(raw_dsn: str) -> str:
         )
 
     normalized_scheme = scheme.lower()
+
     if normalized_scheme in _SUPPORTED_POSTGRES_SCHEMES:
         return f"postgresql://{remainder}"
 
@@ -112,6 +114,7 @@ def _normalize_timescale_dsn(raw_dsn: str) -> str:
     raise RuntimeError(
         "Timescale DSN must use a PostgreSQL/Timescale compatible scheme or sqlite:// for testing."
     )
+
 
 
 def _resolve_timescale_dsn(account_id: str) -> str:
