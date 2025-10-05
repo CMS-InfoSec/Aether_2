@@ -322,6 +322,7 @@ def test_create_app_normalizes_timescale_scheme(monkeypatch: pytest.MonkeyPatch)
     assert captured["dsn"].startswith("postgresql://")
 
 
+
 def test_create_app_normalizes_sqlalchemy_style_scheme(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(
         "ADMIN_POSTGRES_DSN",
@@ -342,6 +343,7 @@ def test_create_app_normalizes_sqlalchemy_style_scheme(monkeypatch: pytest.Monke
 
     assert isinstance(application.state.admin_repository, DummyPostgresRepository)
     assert captured["dsn"].startswith("postgresql://")
+
 
 
 def test_create_app_normalizes_postgresql_scheme_casing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -376,6 +378,7 @@ def test_create_app_requires_dsn_when_not_explicit(monkeypatch: pytest.MonkeyPat
         admin_repository=repository, session_store=InMemorySessionStore()
     )
 
+
     assert application.state.admin_repository is repository
 
 
@@ -384,6 +387,7 @@ def test_create_app_rejects_unsupported_admin_dsn(monkeypatch: pytest.MonkeyPatc
 
     with pytest.raises(RuntimeError, match="requires a Postgres/Timescale DSN"):
         app_module.create_app(session_store=InMemorySessionStore())
+
 
 
 def test_create_app_rejects_blank_admin_dsn(monkeypatch: pytest.MonkeyPatch) -> None:
