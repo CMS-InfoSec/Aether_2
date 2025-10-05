@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, Field, validator
 from sqlalchemy import JSON, Column, DateTime, Integer, String, create_engine
 from sqlalchemy.engine import Engine
@@ -114,8 +114,8 @@ def _create_engine(database_url: str) -> Engine:
     return create_engine(database_url, **engine_kwargs)
 
 
-ENGINE = _create_engine(_require_database_url())
-SessionLocal = sessionmaker(bind=ENGINE, autocommit=False, autoflush=False, future=True)
+ENGINE: Engine | None = None
+SessionLocal: sessionmaker | None = None
 Base = declarative_base()
 
 
@@ -134,10 +134,37 @@ class AdvisorQuery(Base):
     )
 
 
-def get_db() -> Iterable[Session]:
+def _init_database(application: FastAPI) -> None:
+    """Initialise the shared database engine and session factory."""
+
+    global ENGINE, SessionLocal
+
+    if getattr(application.state, "db_engine", None) is not None:
+        return
+
+    if ENGINE is None or SessionLocal is None:
+        database_url = _require_database_url()
+        engine = _create_engine(database_url)
+        SessionLocal = sessionmaker(
+            bind=engine, autocommit=False, autoflush=False, future=True
+        )
+        ENGINE = engine
+
+    application.state.db_engine = ENGINE
+    application.state.db_session_factory = SessionLocal
+
+
+def get_db(request: Request) -> Iterable[Session]:
     """Provide a database session dependency for FastAPI routes."""
 
-    db = SessionLocal()
+    session_factory = getattr(request.app.state, "db_session_factory", None)
+    if session_factory is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Database session factory is not initialised.",
+        )
+
+    db = session_factory()
     try:
         yield db
     finally:
@@ -443,6 +470,8 @@ class AdvisorQueryResponse(BaseModel):
 
 app = FastAPI(title="Advisor Service", version="1.0.0")
 
+SESSION_STORE: SessionStoreProtocol | None = None
+
 
 def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
     """Attach the shared session store so authentication can validate tokens."""
@@ -473,9 +502,6 @@ def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
 
     security.set_default_session_store(store)
     return store
-
-
-SESSION_STORE = _configure_session_store(app)
 
 
 async def _gather_context() -> Dict[str, Any]:
@@ -535,6 +561,16 @@ async def advisor_query(
         ) from exc
 
     return AdvisorQueryResponse(answer=answer, context=context)
+
+
+@app.on_event("startup")
+async def _on_startup() -> None:
+    """Configure shared dependencies once the application starts."""
+
+    global SESSION_STORE
+
+    SESSION_STORE = _configure_session_store(app)
+    _init_database(app)
 
 
 __all__ = [
