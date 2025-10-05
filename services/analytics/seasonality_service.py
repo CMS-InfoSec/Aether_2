@@ -20,11 +20,15 @@ from auth.service import InMemorySessionStore, RedisSessionStore, SessionStorePr
 from services.common import security
 from services.common.security import require_admin_account
 
-__all__ = ["app"]
+__all__ = ["app", "ENGINE", "SessionLocal", "SESSION_STORE"]
 
 
 ENGINE_STATE_KEY = "seasonality_engine"
 SESSIONMAKER_STATE_KEY = "seasonality_sessionmaker"
+
+ENGINE: Engine | None = None
+SessionLocal: sessionmaker[Session] | None = None
+SESSION_STORE: SessionStoreProtocol | None = None
 
 
 def _normalise_database_url(url: str) -> str:
@@ -199,6 +203,8 @@ SESSION_WINDOWS: Dict[str, range] = {
 def get_session(request: Request) -> Iterator[Session]:
     session_factory = getattr(request.app.state, SESSIONMAKER_STATE_KEY, None)
     if session_factory is None:
+        session_factory = SessionLocal
+    if session_factory is None:
         raise RuntimeError(
             "Seasonality database session maker is not initialised. "
             "Ensure the application startup hook has run successfully."
@@ -212,6 +218,8 @@ def get_session(request: Request) -> Iterator[Session]:
 
 
 def _configure_database(application: FastAPI) -> None:
+    global ENGINE
+    global SessionLocal
     try:
         database_url = _require_database_url()
     except RuntimeError as exc:
@@ -229,8 +237,14 @@ def _configure_database(application: FastAPI) -> None:
     setattr(application.state, ENGINE_STATE_KEY, engine)
     setattr(application.state, SESSIONMAKER_STATE_KEY, session_factory)
 
+    ENGINE = engine
+    SessionLocal = session_factory
+
 
 def _dispose_database(application: FastAPI) -> None:
+    global ENGINE
+    global SessionLocal
+
     engine = getattr(application.state, ENGINE_STATE_KEY, None)
     if isinstance(engine, Engine):
         engine.dispose()
@@ -238,6 +252,9 @@ def _dispose_database(application: FastAPI) -> None:
     for key in (ENGINE_STATE_KEY, SESSIONMAKER_STATE_KEY):
         if hasattr(application.state, key):
             delattr(application.state, key)
+
+    ENGINE = None
+    SessionLocal = None
 
 
 def _ensure_timezone(value: datetime) -> datetime:
@@ -434,6 +451,7 @@ def _resolve_session_store_dsn() -> str:
 
 
 def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
+    global SESSION_STORE
     existing = getattr(application.state, "session_store", None)
     if isinstance(existing, SessionStoreProtocol):
         store = existing
@@ -456,7 +474,20 @@ def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
         application.state.session_store = store
 
     security.set_default_session_store(store)
+    SESSION_STORE = store
     return store
+
+
+try:
+    _configure_database(app)
+except RuntimeError:
+    ENGINE = None
+    SessionLocal = None
+
+try:
+    _configure_session_store(app)
+except RuntimeError:
+    SESSION_STORE = None
 
 
 @app.on_event("startup")
