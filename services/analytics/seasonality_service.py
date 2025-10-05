@@ -427,7 +427,15 @@ def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
     return store
 
 
-SESSION_STORE = _configure_session_store(app)
+SESSION_STORE: SessionStoreProtocol | None = None
+
+
+@app.on_event("startup")
+def _initialise_session_store() -> None:
+    """Initialise the session backend once the FastAPI app starts."""
+
+    global SESSION_STORE
+    SESSION_STORE = _configure_session_store(app)
 
 
 @app.get("/seasonality/dayofweek", response_model=DayOfWeekResponse)
