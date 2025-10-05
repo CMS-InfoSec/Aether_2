@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Iterable, Mapping
 
@@ -8,6 +9,9 @@ from sqlalchemy.orm import sessionmaker
 
 from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
 from shared.correlation import CorrelationContext
+
+os.environ.setdefault("ACCOUNTS_ALLOW_SQLITE_FOR_TESTS", "1")
+os.environ.setdefault("ACCOUNTS_DATABASE_URL", "sqlite:///:memory:")
 
 from accounts.service import AccountsRepository, AccountsService, AdminProfile, Base
 

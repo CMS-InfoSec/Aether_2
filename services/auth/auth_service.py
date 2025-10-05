@@ -84,6 +84,20 @@ class AuthSettings(BaseModel):
     )
 
 
+def _require_env(name: str) -> str:
+    """Return a trimmed environment variable or raise a runtime error."""
+
+    value = os.getenv(name)
+    if value is None:
+        raise RuntimeError(f"{name} environment variable must be set before starting the auth service")
+
+    trimmed = value.strip()
+    if not trimmed:
+        raise RuntimeError(f"{name} environment variable cannot be blank")
+
+    return trimmed
+
+
 class AuthorizationURLResponse(BaseModel):
     authorization_url: str
 
@@ -405,8 +419,9 @@ def _load_default_auth_service() -> AuthService:
         for account in auditors_env.split(",")
         if account.strip()
     )
+    jwt_secret = _require_env("AUTH_JWT_SECRET")
     settings = AuthSettings(
-        jwt_secret=SecretStr(os.getenv("AUTH_JWT_SECRET", secrets.token_urlsafe(32))),
+        jwt_secret=SecretStr(jwt_secret),
         jwt_issuer=os.getenv("AUTH_JWT_ISSUER", "aether/auth"),
         auditor_accounts=auditor_accounts,
     )

@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 def account_module(monkeypatch):
     key = Fernet.generate_key().decode("ascii")
     monkeypatch.setenv("ACCOUNT_ENCRYPTION_KEY", key)
+    monkeypatch.setenv("ACCOUNTS_ALLOW_SQLITE_FOR_TESTS", "1")
     monkeypatch.setenv("ACCOUNTS_DATABASE_URL", "sqlite:///:memory:")
     root = Path(__file__).resolve().parents[2]
     root_str = str(root)
