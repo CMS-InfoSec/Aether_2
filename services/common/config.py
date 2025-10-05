@@ -75,6 +75,21 @@ def get_nats_producer(account_id: str) -> NATSProducer:
     return NATSProducer(servers=servers, subject_prefix=subject_prefix)
 
 
+
+_SUPPORTED_POSTGRES_SCHEMES = {
+    "postgres",
+    "postgresql",
+    "timescale",
+    "postgresql+psycopg",
+    "postgresql+psycopg2",
+}
+
+_SUPPORTED_SQLITE_SCHEMES = {
+    "sqlite",
+    "sqlite+pysqlite",
+}
+
+
 def _normalize_timescale_dsn(raw_dsn: str) -> str:
     """Coerce supported PostgreSQL-compatible schemes to the psycopg default."""
 
@@ -89,17 +104,17 @@ def _normalize_timescale_dsn(raw_dsn: str) -> str:
         )
 
     normalized_scheme = scheme.lower()
-    if normalized_scheme in {
-        "postgres",
-        "postgresql",
-        "timescale",
-        "postgresql+psycopg",
-        "postgresql+psycopg2",
-    }:
-        normalized_scheme = "postgresql"
+
+    if normalized_scheme in _SUPPORTED_POSTGRES_SCHEMES:
+        return f"postgresql://{remainder}"
+
+    if normalized_scheme in _SUPPORTED_SQLITE_SCHEMES:
         return f"{normalized_scheme}://{remainder}"
 
-    return stripped
+    raise RuntimeError(
+        "Timescale DSN must use a PostgreSQL/Timescale compatible scheme or sqlite:// for testing."
+    )
+
 
 
 def _resolve_timescale_dsn(account_id: str) -> str:

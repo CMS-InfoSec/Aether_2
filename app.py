@@ -97,7 +97,6 @@ def _normalize_admin_repository_dsn(raw_dsn: str) -> str:
     return f"{normalized_scheme}://{remainder}"
 
 
-
 def _build_admin_repository_from_env() -> AdminRepositoryProtocol:
     dsn_env_vars = (
         "ADMIN_POSTGRES_DSN",

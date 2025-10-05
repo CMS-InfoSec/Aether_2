@@ -65,3 +65,20 @@ def test_get_timescale_session_normalizes_postgres_scheme(monkeypatch: pytest.Mo
 
     session = config.get_timescale_session("company")
     assert session.dsn == "postgresql://user:pass@host:5432/db"
+
+
+
+def test_get_timescale_session_allows_sqlite_variants(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TIMESCALE_DSN", raising=False)
+    monkeypatch.setenv("AETHER_COMPANY_TIMESCALE_DSN", "SQLite+PySQLite:///:memory:")
+
+    session = config.get_timescale_session("company")
+    assert session.dsn == "sqlite+pysqlite:///:memory:"
+
+
+def test_get_timescale_session_rejects_unsupported_scheme(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TIMESCALE_DSN", "mysql://user:pass@host:3306/db")
+
+    with pytest.raises(RuntimeError, match="Timescale DSN must use a PostgreSQL/Timescale"):
+        config.get_timescale_session("company")
+

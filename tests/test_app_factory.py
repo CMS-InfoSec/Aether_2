@@ -378,12 +378,12 @@ def test_create_app_requires_dsn_when_not_explicit(monkeypatch: pytest.MonkeyPat
         admin_repository=repository, session_store=InMemorySessionStore()
     )
 
+
     assert application.state.admin_repository is repository
 
 
 def test_create_app_rejects_unsupported_admin_dsn(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ADMIN_POSTGRES_DSN", "mysql://example.com/admin")
-
 
     with pytest.raises(RuntimeError, match="requires a Postgres/Timescale DSN"):
         app_module.create_app(session_store=InMemorySessionStore())
