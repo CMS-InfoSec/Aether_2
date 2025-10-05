@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+from typing import Iterator
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from typing import Iterator
 
 import pytest
 from fastapi.testclient import TestClient
 
-from services.fees.main import app
-
 
 @pytest.fixture(name="client")
-def client_fixture() -> Iterator[TestClient]:
-    with TestClient(app) as client:
+def client_fixture(fees_app) -> Iterator[TestClient]:
+    with TestClient(fees_app) as client:
         yield client
 
 
