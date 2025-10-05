@@ -10,13 +10,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import httpx
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from sqlalchemy import delete
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from services.common.compliance import SanctionRecord, ensure_sanctions_schema
+from services.common.security import require_admin_account
 
 
 logger = logging.getLogger(__name__)
@@ -253,12 +254,16 @@ async def _on_shutdown() -> None:
 
 
 @app.get("/compliance/scan/status")
-async def get_scan_status() -> Dict[str, Optional[str]]:
+async def get_scan_status(
+    _actor: str = Depends(require_admin_account),
+) -> Dict[str, Optional[str | int]]:
     last_updated = _last_updated.isoformat() if _last_updated else None
     return {"symbols_checked": _symbols_checked, "last_updated": last_updated}
 
 
 @app.post("/compliance/scan/run")
-async def run_scan_now() -> Dict[str, Optional[str]]:
+async def run_scan_now(
+    _actor: str = Depends(require_admin_account),
+) -> Dict[str, Optional[str | int]]:
     await _refresh_watchlists()
     return await get_scan_status()
