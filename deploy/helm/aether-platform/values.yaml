@@ -901,6 +901,44 @@ backendServices:
     pdb:
       enabled: true
       maxUnavailable: 1
+  trainingService:
+    enabled: false
+    nameOverride: training-service
+    image:
+      repository: ghcr.io/aether/training-service
+      tag: latest
+    replicaCount: 1
+    containerPort: 8000
+    env:
+      - name: TRAINING_DATABASE_URL
+        valueFrom:
+          secretKeyRef:
+            name: training-service-database
+            key: dsn
+      - name: TRAINING_DB_SSLMODE
+        value: require
+    usesKrakenSecrets: false
+    extraVolumeMounts: []
+    extraVolumes: []
+    service:
+      port: 80
+      targetPort: http
+    ingress:
+      enabled: true
+      host: training.aether.example.com
+      tlsSecret: training-service-tls
+      annotations: {}
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+    hpa:
+      enabled: false
+    pdb:
+      enabled: false
   universe:
     enabled: true
     nameOverride: universe-service
