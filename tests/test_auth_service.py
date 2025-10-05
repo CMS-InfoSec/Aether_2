@@ -228,6 +228,47 @@ def test_auth_service_requires_database_url(monkeypatch: pytest.MonkeyPatch) -> 
     _clear_auth_service_module()
 
 
+def test_auth_database_url_normalizes_supported_schemes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Timescale-branded schemes should normalise to psycopg-compatible URIs."""
+
+    sqlite_url = f"sqlite:///{tmp_path/'auth.db'}"
+    monkeypatch.setenv("AUTH_DATABASE_URL", sqlite_url)
+    monkeypatch.setenv("AUTH_JWT_SECRET", "secret")
+    _install_dependency_stubs(monkeypatch)
+    _clear_auth_service_module()
+
+    module = importlib.import_module("auth_service")
+    monkeypatch.setenv("AUTH_DATABASE_URL", "  Timescale://user:pass@host:5432/auth  ")
+    resolved, error = module._resolve_database_url()
+    assert error is None
+    assert resolved == "postgresql://user:pass@host:5432/auth"
+
+    _clear_auth_service_module()
+
+
+def test_auth_database_url_rejects_blank_values(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Whitespace-only DSNs should fail fast instead of creating sqlite files."""
+
+    sqlite_url = f"sqlite:///{tmp_path/'auth.db'}"
+    monkeypatch.setenv("AUTH_DATABASE_URL", sqlite_url)
+    monkeypatch.setenv("AUTH_JWT_SECRET", "secret")
+    _install_dependency_stubs(monkeypatch)
+    _clear_auth_service_module()
+
+    module = importlib.import_module("auth_service")
+    monkeypatch.setenv("AUTH_DATABASE_URL", "   ")
+    resolved, error = module._resolve_database_url()
+    assert resolved is None
+    assert isinstance(error, RuntimeError)
+    assert "must be set" in str(error)
+
+    _clear_auth_service_module()
+
+
 def test_sessions_shared_across_replicas(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory) -> None:
     """Multiple replicas should persist sessions to the same database."""
 

@@ -8,6 +8,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict
 
+from shared.postgres import normalize_postgres_dsn
+
 
 @dataclass(frozen=True)
 class RedisClient:
@@ -75,9 +77,30 @@ def get_nats_producer(account_id: str) -> NATSProducer:
     return NATSProducer(servers=servers, subject_prefix=subject_prefix)
 
 
+def _resolve_timescale_dsn(account_id: str) -> str:
+    """Return a configured Timescale/PostgreSQL DSN for the given account."""
+
+    env_keys = [f"AETHER_{account_id.upper()}_TIMESCALE_DSN", "TIMESCALE_DSN"]
+    for key in env_keys:
+        raw = os.getenv(key)
+        if raw is None:
+            continue
+        stripped = raw.strip()
+        if not stripped:
+            raise RuntimeError(
+                f"{key} is set but empty; configure a valid Timescale/PostgreSQL DSN."
+            )
+        return normalize_postgres_dsn(stripped, label="Timescale DSN")
+
+    raise RuntimeError(
+        "Timescale DSN is not configured. Set TIMESCALE_DSN or "
+        "AETHER_<ACCOUNT>_TIMESCALE_DSN for each trading account."
+    )
+
+
 @lru_cache(maxsize=None)
 def get_timescale_session(account_id: str) -> TimescaleSession:
-    dsn = _env(account_id, "TIMESCALE_DSN", "postgresql://timescale:password@localhost:5432/telemetry")
+    dsn = _resolve_timescale_dsn(account_id)
     schema = _env(account_id, "TIMESCALE_SCHEMA", f"acct_{account_id}")
     return TimescaleSession(dsn=dsn, account_schema=schema)
 
