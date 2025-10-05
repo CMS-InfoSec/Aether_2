@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import math
-import statistics
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, Iterator, List, Mapping, Sequence, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -60,19 +59,56 @@ FROM latest_positions
 """
 
 
+DecimalLike = Decimal | float | int | str
+
+ZERO = Decimal("0")
+CONFIDENCE_Z_SCORE = Decimal("1.96")
+DEFAULT_QUANTIZATION = Decimal("0.00000001")
+
+
+def _as_decimal(value: DecimalLike) -> Decimal:
+    """Convert arbitrary numeric inputs to :class:`~decimal.Decimal`."""
+
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, str):
+        return Decimal(value)
+    if isinstance(value, int):
+        return Decimal(value)
+    return Decimal(str(value))
+
+
+def _population_std(values: Sequence[Decimal]) -> Decimal:
+    """Return the population standard deviation of *values* as a decimal."""
+
+    if len(values) <= 1:
+        return ZERO
+
+    mean = sum(values, ZERO) / Decimal(len(values))
+    variance = sum((value - mean) ** 2 for value in values) / Decimal(len(values))
+    return variance.sqrt()
+
+
 @dataclass(slots=True)
 class ForecastResult:
     """Structured response describing a forecast value and its confidence interval."""
 
-    value: float
-    lower: float
-    upper: float
+    value: Decimal
+    lower: Decimal
+    upper: Decimal
     horizon_days: int
+    quantization: Decimal = field(default=DEFAULT_QUANTIZATION)
+
+    def _quantize(self, value: Decimal) -> Decimal:
+        return value.quantize(self.quantization, rounding=ROUND_HALF_UP)
 
     def as_dict(self) -> Dict[str, Any]:
         return {
-            "value": self.value,
-            "confidence_interval": [self.lower, self.upper],
+            "value": float(self._quantize(self.value)),
+            "confidence_interval": [
+                float(self._quantize(self.lower)),
+                float(self._quantize(self.upper)),
+            ],
             "horizon_days": self.horizon_days,
         }
 
@@ -144,62 +180,83 @@ class ExposureForecaster:
         }
 
     def _forecast_nav_volatility(self, rows: Sequence[Mapping[str, Any]]) -> ForecastResult:
-        nav_values = [float(row.get("nav", 0.0)) for row in rows]
+        nav_values = [_as_decimal(row.get("nav", ZERO) or ZERO) for row in rows]
         if len(nav_values) < 2:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Not enough NAV observations to compute volatility",
             )
 
-        returns: List[float] = []
+        returns: List[Decimal] = []
         for previous, current in zip(nav_values, nav_values[1:]):
-            if previous:
+            if previous != ZERO:
                 returns.append((current - previous) / previous)
             else:
-                returns.append(0.0)
+                returns.append(ZERO)
 
         if not returns:
-            return ForecastResult(value=0.0, lower=0.0, upper=0.0, horizon_days=7)
+            return ForecastResult(value=ZERO, lower=ZERO, upper=ZERO, horizon_days=7)
 
         span = min(20, len(returns))
-        alpha = 2.0 / (span + 1)
+        alpha = Decimal(2) / Decimal(span + 1)
+        complement = Decimal(1) - alpha
         ewma_var = returns[0] ** 2
         for ret in returns[1:]:
-            ewma_var = alpha * (ret**2) + (1.0 - alpha) * ewma_var
+            ewma_var = alpha * (ret**2) + complement * ewma_var
 
-        daily_vol = math.sqrt(max(ewma_var, 0.0))
+        daily_vol = max(ewma_var, ZERO).sqrt()
         horizon_days = 7
-        horizon_vol = daily_vol * math.sqrt(horizon_days)
+        horizon_vol = daily_vol * Decimal(horizon_days).sqrt()
 
-        window_vols = self._rolling_window_vols(returns, window=span, horizon_days=horizon_days)
-        std_dev = statistics.pstdev(window_vols) if len(window_vols) > 1 else 0.0
-        lower, upper = self._confidence_interval(horizon_vol, std_dev, max(len(window_vols), 1))
+        window_vols = self._rolling_window_vols(
+            returns, window=span, horizon_days=horizon_days
+        )
+        std_dev = _population_std(window_vols)
+        lower, upper = self._confidence_interval(
+            horizon_vol, std_dev, max(len(window_vols), 1)
+        )
 
-        return ForecastResult(value=horizon_vol, lower=lower, upper=upper, horizon_days=horizon_days)
+        return ForecastResult(
+            value=horizon_vol,
+            lower=lower,
+            upper=upper,
+            horizon_days=horizon_days,
+            quantization=Decimal("0.00000001"),
+        )
 
     def _forecast_fee_spend(self, rows: Sequence[Mapping[str, Any]]) -> ForecastResult:
         if not rows:
-            return ForecastResult(value=0.0, lower=0.0, upper=0.0, horizon_days=7)
+            return ForecastResult(value=ZERO, lower=ZERO, upper=ZERO, horizon_days=7)
 
-        notional_totals = [float(row.get("notional", 0.0) or 0.0) for row in rows]
-        fee_totals = [float(row.get("fees", 0.0) or 0.0) for row in rows]
+        notional_totals = [_as_decimal(row.get("notional", ZERO) or ZERO) for row in rows]
+        fee_totals = [_as_decimal(row.get("fees", ZERO) or ZERO) for row in rows]
 
-        total_notional = sum(notional_totals)
-        total_fees = sum(fee_totals)
+        total_notional = sum(notional_totals, ZERO)
+        total_fees = sum(fee_totals, ZERO)
         observations = len(rows)
 
-        avg_daily_volume = total_notional / observations if observations else 0.0
-        avg_fee_rate = (total_fees / total_notional) if total_notional else 0.0
+        avg_daily_volume = (
+            total_notional / Decimal(observations) if observations else ZERO
+        )
+        avg_fee_rate = (total_fees / total_notional) if total_notional else ZERO
 
         horizon_days = 7
-        projected_volume = avg_daily_volume * horizon_days
+        horizon_decimal = Decimal(horizon_days)
+        projected_volume = avg_daily_volume * horizon_decimal
         projected_fees = projected_volume * avg_fee_rate
 
-        std_dev_daily = statistics.pstdev(fee_totals) if observations > 1 else 0.0
-        std_dev_horizon = std_dev_daily * math.sqrt(horizon_days)
-        lower, upper = self._confidence_interval(projected_fees, std_dev_horizon, max(observations, 1))
+        std_dev_daily = _population_std(fee_totals)
+        std_dev_horizon = std_dev_daily * horizon_decimal.sqrt()
+        lower, upper = self._confidence_interval(
+            projected_fees, std_dev_horizon, max(observations, 1)
+        )
 
-        return ForecastResult(value=projected_fees, lower=lower, upper=upper, horizon_days=horizon_days)
+        return ForecastResult(
+            value=projected_fees,
+            lower=lower,
+            upper=upper,
+            horizon_days=horizon_days,
+        )
 
     def _forecast_margin_usage(
         self,
@@ -207,19 +264,19 @@ class ExposureForecaster:
         nav_volatility: ForecastResult,
     ) -> ForecastResult:
         if not rows:
-            return ForecastResult(value=0.0, lower=0.0, upper=0.0, horizon_days=7)
+            return ForecastResult(value=ZERO, lower=ZERO, upper=ZERO, horizon_days=7)
 
-        exposure = 0.0
+        exposure = ZERO
         for row in rows:
-            quantity = float(row.get("quantity", 0.0) or 0.0)
-            entry_price = float(row.get("entry_price", 0.0) or 0.0)
+            quantity = _as_decimal(row.get("quantity", ZERO) or ZERO)
+            entry_price = _as_decimal(row.get("entry_price", ZERO) or ZERO)
             exposure += abs(quantity * entry_price)
 
         horizon_days = nav_volatility.horizon_days
-        projected_usage = exposure * (1.0 + nav_volatility.value)
+        projected_usage = exposure * (Decimal(1) + nav_volatility.value)
 
-        lower_usage = exposure * (1.0 + nav_volatility.lower)
-        upper_usage = exposure * (1.0 + nav_volatility.upper)
+        lower_usage = exposure * (Decimal(1) + nav_volatility.lower)
+        upper_usage = exposure * (Decimal(1) + nav_volatility.upper)
 
         return ForecastResult(
             value=projected_usage,
@@ -230,28 +287,34 @@ class ExposureForecaster:
 
     @staticmethod
     def _rolling_window_vols(
-        returns: Sequence[float], *, window: int, horizon_days: int
-    ) -> List[float]:
+        returns: Sequence[Decimal], *, window: int, horizon_days: int
+    ) -> List[Decimal]:
         if window <= 1:
-            return [abs(r) * math.sqrt(horizon_days) for r in returns]
+            horizon_factor = Decimal(horizon_days).sqrt()
+            return [abs(r) * horizon_factor for r in returns]
 
-        vols: List[float] = []
+        vols: List[Decimal] = []
+        horizon_factor = Decimal(horizon_days).sqrt()
         for idx in range(window, len(returns) + 1):
             window_slice = returns[idx - window : idx]
             if not window_slice:
                 continue
-            variance = sum(ret**2 for ret in window_slice) / len(window_slice)
-            vols.append(math.sqrt(max(variance, 0.0)) * math.sqrt(horizon_days))
-        return vols or [abs(r) * math.sqrt(horizon_days) for r in returns]
+            variance = sum(ret**2 for ret in window_slice) / Decimal(len(window_slice))
+            vols.append(max(variance, ZERO).sqrt() * horizon_factor)
+        return vols or [abs(r) * horizon_factor for r in returns]
 
     @staticmethod
-    def _confidence_interval(value: float, std_dev: float, samples: int) -> Tuple[float, float]:
-        if samples <= 1 or std_dev <= 0:
-            lower = upper = max(value, 0.0)
+    def _confidence_interval(
+        value: Decimal, std_dev: Decimal, samples: int
+    ) -> Tuple[Decimal, Decimal]:
+        if samples <= 1 or std_dev <= ZERO:
+            lower = upper = max(value, ZERO)
             return lower, upper
 
-        margin = 1.96 * (std_dev / math.sqrt(samples))
-        lower = max(value - margin, 0.0)
+        margin = CONFIDENCE_Z_SCORE * (
+            std_dev / Decimal(samples).sqrt()
+        )
+        lower = max(value - margin, ZERO)
         upper = value + margin
         return lower, upper
 
