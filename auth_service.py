@@ -149,8 +149,10 @@ def _initialise_database(*, require: bool = False) -> Optional[sessionmaker[OrmS
     schema = _resolve_schema(url)
     if schema:
         Base.metadata.schema = schema
+        AuthSession.__table__.schema = schema
     else:
         Base.metadata.schema = None
+        AuthSession.__table__.schema = None
 
     session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True)
     Base.metadata.create_all(bind=engine)
