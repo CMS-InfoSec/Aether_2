@@ -76,3 +76,13 @@ This runbook describes the day-2 operational workflows for the Aether risk platf
 - When coordinating incident mitigations, obtain an admin session from the authentication service
   and re-use that token across CLI `curl` probes or workflow automations interacting with the
   orchestrator.
+
+## 7. UI deployment coordination
+- Backend releases that alter API surfaces must be accompanied by a UI roll-out.
+  Follow the [UI deployment runbook](./ui-deployment.md) to build the
+  `ghcr.io/aether/aether-2-ui` image with the correct `NEXT_PUBLIC_API_BASE_URL`
+  and `VITE_API_BASE_URL` values (defaulting to
+  `https://risk.aether.example.com`).
+- After ArgoCD/Helm syncs, verify `https://ui.aether.example.com` hits the
+  expected backend ingress and that browser console/network traces remain free
+  from CORS or authentication errors.
