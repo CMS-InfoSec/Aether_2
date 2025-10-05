@@ -19,7 +19,11 @@ from typing import TYPE_CHECKING, Dict, List, MutableMapping, Sequence
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, status
 
-from auth.service import InMemorySessionStore, RedisSessionStore, SessionStoreProtocol
+from auth.service import (
+    InMemorySessionStore,
+    SessionStoreProtocol,
+    build_session_store_from_url,
+)
 
 from services.common import security
 
@@ -105,15 +109,7 @@ def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
         if redis_url.startswith("memory://"):
             store = InMemorySessionStore(ttl_minutes=ttl_minutes)
         else:
-            try:  # pragma: no cover - optional Redis dependency in some environments
-                import redis  # type: ignore[import-not-found]
-            except ImportError as exc:  # pragma: no cover - surfaced when redis missing locally
-                raise RuntimeError(
-                    "redis package is required when SESSION_REDIS_URL is set"
-                ) from exc
-
-            client = redis.Redis.from_url(redis_url)
-            store = RedisSessionStore(client, ttl_minutes=ttl_minutes)
+            store = build_session_store_from_url(redis_url, ttl_minutes=ttl_minutes)
 
         application.state.session_store = store
 

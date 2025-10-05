@@ -18,6 +18,7 @@ from typing import Dict, Optional, Protocol, Set, runtime_checkable
 import pyotp
 
 from shared.correlation import get_correlation_id
+from common.utils.redis import create_redis_from_url
 
 
 try:  # pragma: no cover - optional dependency in some test environments
@@ -429,6 +430,17 @@ class RedisSessionStore(SessionStoreProtocol):
         return session
 
 
+def build_session_store_from_url(redis_url: str, *, ttl_minutes: int = 60) -> SessionStoreProtocol:
+    """Create a session store backed by Redis or a deterministic in-memory stub."""
+
+    client, used_stub = create_redis_from_url(redis_url, decode_responses=True, logger=logger)
+    if used_stub:
+        logger.warning(
+            "Redis dependency unavailable; using in-memory session store stub for %s", redis_url
+        )
+    return RedisSessionStore(client, ttl_minutes=ttl_minutes)
+
+
 # Backwards-compatible aliases for legacy imports
 AdminRepository = InMemoryAdminRepository
 SessionStore = InMemorySessionStore
@@ -563,6 +575,7 @@ __all__ = [
     "SessionStoreProtocol",
     "InMemorySessionStore",
     "RedisSessionStore",
+    "build_session_store_from_url",
     "SessionStore",
     "AuthService",
     "hash_password",

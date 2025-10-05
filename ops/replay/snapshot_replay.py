@@ -30,7 +30,11 @@ else:  # pragma: no cover - FastAPI optional dependency
 
 from pydantic import BaseModel, Field
 
-from auth.service import InMemorySessionStore, RedisSessionStore, SessionStoreProtocol
+from auth.service import (
+    InMemorySessionStore,
+    SessionStoreProtocol,
+    build_session_store_from_url,
+)
 import services.common.security as security
 from services.common.schemas import (
     BookSnapshot,
@@ -679,15 +683,7 @@ if FastAPI is not None:  # pragma: no branch - simple module guard
             if dsn.startswith("memory://"):
                 store = InMemorySessionStore(ttl_minutes=ttl_minutes)
             else:
-                try:  # pragma: no cover - optional dependency for production deployments
-                    import redis  # type: ignore[import-not-found]
-                except ImportError as exc:  # pragma: no cover - surfaced when redis missing locally
-                    raise RuntimeError(
-                        "redis package is required when configuring the snapshot replay session store via SESSION_REDIS_URL.",
-                    ) from exc
-
-                client = redis.Redis.from_url(dsn)
-                store = RedisSessionStore(client, ttl_minutes=ttl_minutes)
+                store = build_session_store_from_url(dsn, ttl_minutes=ttl_minutes)
 
             application.state.session_store = store
 

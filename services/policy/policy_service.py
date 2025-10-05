@@ -10,6 +10,7 @@ from dataclasses import asdict, is_dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
+from auth.service import build_session_store_from_url, SessionStoreProtocol
 from pydantic import BaseModel, Field, field_validator
 
 try:  # pragma: no cover - optional dependency
@@ -276,7 +277,7 @@ def _to_float(value: Any, *, default: float = 0.0) -> float:
         return default
 
 
-from auth.service import RedisSessionStore, SessionStoreProtocol
+from auth.service import SessionStoreProtocol
 
 from metrics import (
     metric_context,
@@ -434,12 +435,7 @@ def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
                 "SESSION_REDIS_URL is not configured. Provide a shared session store DSN to enable policy service authentication.",
             )
 
-        try:  # pragma: no cover - optional dependency import for deployment environments
-            import redis
-        except ImportError as exc:  # pragma: no cover - surfaced when redis package missing at runtime
-            raise RuntimeError("redis package is required when SESSION_REDIS_URL is set") from exc
-
-        store = RedisSessionStore(redis.Redis.from_url(redis_url))
+        store = build_session_store_from_url(redis_url)
         application.state.session_store = store
     security.set_default_session_store(store)
     return store

@@ -18,9 +18,10 @@ from auth.service import (
     AdminRepositoryProtocol,
     AuthService,
     InMemoryAdminRepository,
+    InMemorySessionStore,
     PostgresAdminRepository,
-    RedisSessionStore,
     SessionStoreProtocol,
+    build_session_store_from_url,
     hash_password,
 )
 from metrics import setup_metrics
@@ -119,13 +120,10 @@ def _build_session_store_from_env() -> SessionStoreProtocol:
             "Session store misconfigured: set one of "
             f"{joined} so the API can use the shared Redis backend"
         )
-    try:  # pragma: no cover - import guarded for optional dependency resolution
-        import redis
-    except ImportError as exc:  # pragma: no cover - surfaced when dependency missing at runtime
-        raise RuntimeError("redis package is required when SESSION_REDIS_URL is configured") from exc
+    if redis_url.startswith("memory://"):
+        return InMemorySessionStore(ttl_minutes=ttl_minutes)
 
-    client = redis.Redis.from_url(redis_url)
-    return RedisSessionStore(client, ttl_minutes=ttl_minutes)
+    return build_session_store_from_url(redis_url, ttl_minutes=ttl_minutes)
 
 
 def _maybe_include_router(app: FastAPI, module: str, attribute: str) -> None:

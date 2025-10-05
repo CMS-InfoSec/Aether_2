@@ -22,7 +22,6 @@ from fastapi import Depends, FastAPI, HTTPException, Query
 from prometheus_client import Gauge
 from pydantic import BaseModel
 
-from auth.service import InMemorySessionStore, RedisSessionStore, SessionStoreProtocol
 from services.analytics.market_data_store import (
     MarketDataAdapter,
     MarketDataUnavailable,

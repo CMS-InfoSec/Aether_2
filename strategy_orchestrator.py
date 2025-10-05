@@ -32,7 +32,11 @@ from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import NullPool
 
-from auth.service import RedisSessionStore, SessionStoreProtocol
+from auth.service import (
+    InMemorySessionStore,
+    SessionStoreProtocol,
+    build_session_store_from_url,
+)
 from services.common.schemas import RiskValidationRequest, RiskValidationResponse
 from services.common.security import require_admin_account
 from strategy_bus import StrategySignalBus, ensure_signal_tables
@@ -328,13 +332,10 @@ def _build_session_store_from_env() -> SessionStoreProtocol:
             "SESSION_REDIS_URL is not configured. Provide a shared session store DSN to enable orchestrator authentication.",
         )
 
-    try:  # pragma: no cover - optional dependency for Redis-backed sessions
-        import redis  # type: ignore[import-not-found]
-    except ImportError as exc:  # pragma: no cover - surfaced when redis is missing at runtime
-        raise RuntimeError("redis package is required when SESSION_REDIS_URL is set") from exc
+    if redis_url.startswith("memory://"):
+        return InMemorySessionStore(ttl_minutes=ttl_minutes)
 
-    client = redis.Redis.from_url(redis_url)
-    return RedisSessionStore(client, ttl_minutes=ttl_minutes)
+    return build_session_store_from_url(redis_url, ttl_minutes=ttl_minutes)
 
 
 DATABASE_URL: Optional[str] = None
