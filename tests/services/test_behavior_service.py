@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 import types
 from pathlib import Path
@@ -15,6 +16,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 assert (ROOT / "behavior_service.py").exists()
+
+os.environ.setdefault("BEHAVIOR_ALLOW_SQLITE_FOR_TESTS", "1")
+os.environ.setdefault("BEHAVIOR_DATABASE_URL", "sqlite:///:memory:")
 
 services_init = ROOT / "services" / "__init__.py"
 spec = importlib.util.spec_from_file_location("services", services_init)
@@ -60,6 +64,7 @@ behavior_service = _load_behavior_service()
 
 
 def _make_client() -> tuple[TestClient, InMemorySessionStore]:
+    behavior_service._initialize_database()
     client = TestClient(behavior_service.app)
     store = InMemorySessionStore(ttl_minutes=60)
     client.app.state.session_store = store

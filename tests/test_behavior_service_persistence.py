@@ -8,6 +8,7 @@ from types import ModuleType
 
 import pytest
 from fastapi.testclient import TestClient
+from fastapi import Header, Request
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -73,6 +74,23 @@ def _ensure_timescale_stub(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(sys.modules, "services.common.adapters", adapters_module)
 
 
+def _ensure_security_stub(monkeypatch: pytest.MonkeyPatch) -> None:
+    _ensure_package(monkeypatch, "services")
+    _ensure_package(monkeypatch, "services.common")
+
+    security_module = ModuleType("services.common.security")
+
+    def _require_admin_account(
+        request: Request,
+        authorization: str | None = Header(None, alias="Authorization"),
+        x_account_id: str | None = Header(None, alias="X-Account-ID"),
+    ):  # pragma: no cover - lightweight stub
+        return (x_account_id or "test-account").strip() or "test-account"
+
+    security_module.require_admin_account = _require_admin_account  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "services.common.security", security_module)
+
+
 def _load_behavior_service(monkeypatch: pytest.MonkeyPatch, db_url: str):
     """Import ``behavior_service`` with a clean module state."""
 
@@ -81,6 +99,7 @@ def _load_behavior_service(monkeypatch: pytest.MonkeyPatch, db_url: str):
 
     _ensure_alert_manager_stub(monkeypatch)
     _ensure_timescale_stub(monkeypatch)
+    _ensure_security_stub(monkeypatch)
 
     existing = sys.modules.pop("behavior_service", None)
     if existing is not None:
@@ -89,6 +108,7 @@ def _load_behavior_service(monkeypatch: pytest.MonkeyPatch, db_url: str):
             engine.dispose()
 
     module = importlib.import_module("behavior_service")
+    module._initialize_database()
     return module
 
 
@@ -110,6 +130,10 @@ def test_incidents_persist_across_restarts_and_replicas(tmp_path, monkeypatch):
     account_id = "acct-test"
     timestamp = datetime.now(timezone.utc)
     expected_details = {"source": "unit", "z_score": 4.2}
+    auth_headers = {
+        "Authorization": "Bearer test-token",
+        "X-Account-ID": account_id,
+    }
 
     incident = module_one.BehaviorIncident(
         account_id=account_id,
@@ -129,13 +153,18 @@ def test_incidents_persist_across_restarts_and_replicas(tmp_path, monkeypatch):
     response = client_one.post(
         "/behavior/scan",
         json={"account_id": account_id, "lookback_minutes": 60},
+        headers=auth_headers,
     )
     assert response.status_code == 200
     client_one.close()
 
     module_two = _load_behavior_service(monkeypatch, db_url)
     client_two = TestClient(module_two.app)
-    status_response = client_two.get("/behavior/status", params={"account_id": account_id})
+    status_response = client_two.get(
+        "/behavior/status",
+        params={"account_id": account_id},
+        headers=auth_headers,
+    )
     assert status_response.status_code == 200
     payload_two = status_response.json()
     client_two.close()
@@ -149,7 +178,11 @@ def test_incidents_persist_across_restarts_and_replicas(tmp_path, monkeypatch):
 
     module_three = _load_behavior_service(monkeypatch, db_url)
     client_three = TestClient(module_three.app)
-    replica_status = client_three.get("/behavior/status", params={"account_id": account_id})
+    replica_status = client_three.get(
+        "/behavior/status",
+        params={"account_id": account_id},
+        headers=auth_headers,
+    )
     assert replica_status.status_code == 200
     payload_three = replica_status.json()
     client_three.close()
