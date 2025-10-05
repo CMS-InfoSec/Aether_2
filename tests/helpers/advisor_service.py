@@ -6,13 +6,8 @@ import importlib
 import sys
 from pathlib import Path
 from types import ModuleType
-from typing import Final
 
 import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-
-_DEFAULT_TEST_DSN: Final[str] = "postgresql://advisor.test/advisor"
 
 
 def bootstrap_advisor_service(
@@ -25,7 +20,13 @@ def bootstrap_advisor_service(
 ) -> ModuleType:
     """Import ``advisor_service`` backed by a persistent SQLite database for tests."""
 
-    database_url = dsn or _DEFAULT_TEST_DSN
+    db_path = tmp_path / db_filename
+
+    if reset and db_path.exists():
+        db_path.unlink()
+
+    database_url = dsn or f"sqlite:///{db_path}"
+    monkeypatch.setenv("ADVISOR_ALLOW_SQLITE_FOR_TESTS", "1")
     monkeypatch.setenv("ADVISOR_DATABASE_URL", database_url)
     monkeypatch.setenv("SESSION_REDIS_URL", "memory://advisor-tests")
 
@@ -38,20 +39,12 @@ def bootstrap_advisor_service(
     sys.modules.pop("advisor_service", None)
     module = importlib.import_module("advisor_service")
 
-    db_path = tmp_path / db_filename
-    engine = create_engine(
-        f"sqlite:///{db_path}",
-        future=True,
-        connect_args={"check_same_thread": False},
-    )
-    Session = sessionmaker(bind=engine, autocommit=False, autoflush=False, future=True)
-
-    module.ENGINE = engine  # type: ignore[attr-defined]
-    module.SessionLocal = Session  # type: ignore[attr-defined]
+    module._init_database(module.app)  # type: ignore[attr-defined]
 
     if reset:
-        module.Base.metadata.drop_all(bind=engine)  # type: ignore[attr-defined]
-    module.Base.metadata.create_all(bind=engine)  # type: ignore[attr-defined]
+        module.Base.metadata.drop_all(bind=module.ENGINE)  # type: ignore[attr-defined]
+
+    module.Base.metadata.create_all(bind=module.ENGINE)  # type: ignore[attr-defined]
 
     return module
 
