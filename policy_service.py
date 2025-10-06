@@ -61,6 +61,7 @@ from metrics import (
 from services.common.security import ADMIN_ACCOUNTS, require_admin_account
 from shared.session_config import load_session_ttl_minutes
 from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
+from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 
 FEES_SERVICE_URL = os.getenv("FEES_SERVICE_URL", "http://fees-service")
@@ -715,7 +716,14 @@ async def get_regime(
             detail="Authenticated account is not authorized for the requested account.",
         )
 
-    snapshot = regime_classifier.get_snapshot(symbol)
+    normalized_symbol = normalize_spot_symbol(symbol)
+    if not normalized_symbol or not is_spot_symbol(normalized_symbol):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Only spot market instruments are supported.",
+        )
+
+    snapshot = regime_classifier.get_snapshot(normalized_symbol)
     if snapshot is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
