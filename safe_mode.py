@@ -16,6 +16,7 @@ from fastapi import Body, Depends, FastAPI, HTTPException, Request, status
 from metrics import increment_safe_mode_triggers, setup_metrics
 from services.common.security import require_admin_account
 from common.utils.redis import create_redis_from_url
+from shared.async_utils import dispatch_async
 
 
 try:  # pragma: no cover - optional audit dependency
@@ -512,15 +513,22 @@ class KafkaSafeModePublisher:
         payload = event.to_payload()
         try:  # pragma: no cover - adapter import may fail in lightweight environments
             from services.common.adapters import KafkaNATSAdapter  # type: ignore
-
-            asyncio.run(
-                KafkaNATSAdapter(account_id=self._account_id).publish(
-                    topic=self._topic,
-                    payload=payload,
-                )
-            )
         except Exception:  # pragma: no cover - fall back to in-memory history
-            pass
+            LOGGER.debug(
+                "Kafka adapter unavailable for safe mode publish", exc_info=True
+            )
+        else:
+            try:
+                dispatch_async(
+                    KafkaNATSAdapter(account_id=self._account_id).publish(
+                        topic=self._topic,
+                        payload=payload,
+                    ),
+                    context="safe_mode.kafka_publish",
+                    logger=LOGGER,
+                )
+            except Exception:  # pragma: no cover - defensive scheduling guard
+                LOGGER.exception("Failed to schedule safe mode publish task")
 
         self._history.append({"topic": self._topic, "payload": payload})
 
