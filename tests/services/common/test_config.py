@@ -79,6 +79,21 @@ def test_get_redis_client_accepts_memory_scheme_for_tests(
     assert client.dsn == "memory://"
 
 
+def test_get_redis_client_rejects_memory_scheme_in_production(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AETHER_COMPANY_REDIS_DSN", "memory://")
+    original_pytest = sys.modules.get("pytest")
+    try:
+        if "pytest" in sys.modules:
+            del sys.modules["pytest"]
+        with pytest.raises(RuntimeError, match="must use a redis:// or rediss:// DSN outside pytest"):
+            config.get_redis_client("company")
+    finally:
+        if original_pytest is not None:
+            sys.modules["pytest"] = original_pytest
+
+
 def test_get_timescale_session_uses_account_specific_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TIMESCALE_DSN", "postgresql://global.example/aether")
     monkeypatch.setenv(

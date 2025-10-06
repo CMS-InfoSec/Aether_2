@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import os
-import re
+import sys
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -66,6 +66,11 @@ def _require_account_env(account_id: str, suffix: str, *, label: str) -> str:
     if not value:
         raise RuntimeError(
             f"{env_key} is set but empty; configure {label} with a redis:// or memory:// DSN."
+        )
+
+    if value.lower().startswith("memory://") and "pytest" not in sys.modules:
+        raise RuntimeError(
+            f"{env_key} must use a redis:// or rediss:// DSN outside pytest to persist {label.lower()}"
         )
     return value
 
