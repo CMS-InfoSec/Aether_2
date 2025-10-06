@@ -248,6 +248,28 @@ def test_auth_database_url_normalizes_supported_schemes(
     _clear_auth_service_module()
 
 
+def test_auth_database_url_rejects_sqlite_outside_pytest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """SQLite DSNs should be rejected when pytest is not present."""
+
+    sqlite_url = f"sqlite:///{tmp_path/'auth.db'}"
+    monkeypatch.setenv("AUTH_DATABASE_URL", sqlite_url)
+    monkeypatch.setenv("AUTH_JWT_SECRET", "secret")
+    _install_dependency_stubs(monkeypatch)
+    _clear_auth_service_module()
+
+    module = importlib.import_module("auth_service")
+    monkeypatch.delitem(module.sys.modules, "pytest", raising=False)
+
+    resolved, error = module._resolve_database_url()
+    assert resolved is None
+    assert isinstance(error, RuntimeError)
+    assert "PostgreSQL/Timescale" in str(error)
+
+    _clear_auth_service_module()
+
+
 def test_auth_database_url_rejects_blank_values(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
