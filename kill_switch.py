@@ -1,12 +1,10 @@
 """FastAPI endpoint for triggering an immediate trading kill switch."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import logging
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
-
-import asyncio
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
@@ -14,6 +12,7 @@ from fastapi.responses import JSONResponse
 from kill_alerts import NotificationDispatchError, dispatch_notifications
 from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
 from services.common.security import require_admin_account
+from shared.async_utils import dispatch_async
 
 try:  # pragma: no cover - optional audit dependency
     from common.utils.audit_logger import hash_ip, log_audit
@@ -76,7 +75,7 @@ def trigger_kill_switch(
     )
 
     kafka = KafkaNATSAdapter(account_id=normalized_account)
-    asyncio.run(
+    dispatch_async(
         kafka.publish(
             topic="risk.events",
             payload={
@@ -87,7 +86,9 @@ def trigger_kill_switch(
                 "actions": ["CANCEL_OPEN_ORDERS", "FLATTEN_POSITIONS"],
                 "reason_code": reason_code.value,
             },
-        )
+        ),
+        context="kill_switch.broadcast",
+        logger=LOGGER,
     )
 
     response_status = "ok"
