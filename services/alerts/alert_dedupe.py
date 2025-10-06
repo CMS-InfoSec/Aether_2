@@ -142,6 +142,7 @@ class AlertDedupeService:
         policy: Optional[AlertPolicy] = None,
         metrics: Optional[AlertDedupeMetrics] = None,
         fetcher: Optional[FetchCallable] = None,
+        http_timeout: float = 10.0,
     ) -> None:
         self.alertmanager_url = alertmanager_url.rstrip("/")
         self.policy = policy or AlertPolicy()
@@ -151,28 +152,48 @@ class AlertDedupeService:
         self._group_states: Dict[Tuple[str, str, str], AlertGroupState] = {}
         self._alert_index: Dict[str, Tuple[str, str, str]] = {}
         self._lock = asyncio.Lock()
+        self._http_timeout = float(http_timeout)
+        self._httpx_module: Optional[Any] = None
 
     # ------------------------------------------------------------------
     # HTTP helpers
     # ------------------------------------------------------------------
-    async def _get_client(self):
+    def _ensure_httpx(self):
+        if self._httpx_module is not None:
+            return self._httpx_module
+
         try:
             import httpx
         except ImportError as exc:  # pragma: no cover - optional dependency
             raise RuntimeError("httpx is required to fetch alerts from Alertmanager") from exc
 
+        self._httpx_module = httpx
+        return httpx
+
+    async def _get_client(self):
+        httpx = self._ensure_httpx()
+
         if self._client is None:
-            self._client = httpx.AsyncClient()
+            self._client = httpx.AsyncClient(timeout=self._http_timeout)
         return self._client
 
     async def _default_fetch(self) -> Sequence[Mapping[str, Any]]:
         client = await self._get_client()
         url = f"{self.alertmanager_url}{_ALERT_ENDPOINT}"
+        httpx = self._ensure_httpx()
+
         try:
             response = await client.get(url)
             response.raise_for_status()
+        except httpx.TimeoutException as exc:
+            raise HTTPException(
+                status_code=504,
+                detail=f"Alertmanager request timed out: {exc}",
+            ) from exc
         except httpx.HTTPStatusError as exc:  # pragma: no cover - defensive
             raise HTTPException(status_code=502, detail=f"Failed to fetch alerts: {exc}") from exc
+        except httpx.RequestError as exc:
+            raise HTTPException(status_code=502, detail=f"Alertmanager request failed: {exc}") from exc
 
         try:
             payload = response.json()
