@@ -38,6 +38,7 @@ from auth.service import (
     build_session_store_from_url,
 )
 from shared.session_config import load_session_ttl_minutes
+from shared.spot import is_spot_symbol, normalize_spot_symbol
 from services.common.schemas import RiskValidationRequest, RiskValidationResponse
 from services.common.security import require_admin_account
 from strategy_bus import StrategySignalBus, ensure_signal_tables
@@ -92,6 +93,10 @@ class StrategyNotFound(StrategyRegistryError):
 
 class StrategyAllocationError(StrategyRegistryError):
     """Raised when NAV allocations exceed the configured cap."""
+
+
+class StrategyIntentError(StrategyRegistryError):
+    """Raised when a strategy intent references non-spot instruments."""
 
 
 class StrategyRegistry:
@@ -210,6 +215,33 @@ class StrategyRegistry:
                     raise StrategyAllocationError(
                         f"Strategy '{strategy_name}' is disabled and cannot submit intents."
                     )
+
+        normalized_instrument = normalize_spot_symbol(request.instrument)
+        if not normalized_instrument or not is_spot_symbol(normalized_instrument):
+            raise StrategyIntentError("Strategy intents must target spot market instruments.")
+
+        request.instrument = normalized_instrument
+
+        policy_request = request.intent.policy_decision.request
+        normalized_policy_instrument = normalize_spot_symbol(policy_request.instrument)
+        if not normalized_policy_instrument or not is_spot_symbol(normalized_policy_instrument):
+            raise StrategyIntentError("Strategy intents must target spot market instruments.")
+
+        policy_request.instrument = normalized_policy_instrument
+
+        normalized_exposure: Dict[str, float] = {}
+        for symbol, exposure in request.portfolio_state.instrument_exposure.items():
+            canonical = normalize_spot_symbol(symbol)
+            if not canonical or not is_spot_symbol(canonical):
+                raise StrategyIntentError(
+                    "Strategy portfolio exposure must reference spot market instruments."
+                )
+
+            normalized_exposure[canonical] = normalized_exposure.get(canonical, 0.0) + float(
+                exposure
+            )
+
+        request.portfolio_state.instrument_exposure = normalized_exposure
 
         payload = request.model_dump(mode="json")
         portfolio_state = payload.setdefault("portfolio_state", {})
@@ -523,6 +555,8 @@ async def register_strategy(
 
     except StrategyAllocationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except StrategyIntentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return StrategyStatusResponse(**snapshot.__dict__)
 
 
@@ -576,6 +610,8 @@ async def route_intent(
     except StrategyNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except StrategyAllocationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except StrategyIntentError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import re
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, Iterable, Mapping
@@ -14,6 +15,10 @@ from pydantic import BaseModel, Field, ConfigDict
 
 from services.common.adapters import RedisFeastAdapter, TimescaleAdapter
 from services.common.security import require_admin_account
+from shared.spot import is_spot_symbol, normalize_spot_symbol
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 TRADING_DAYS_PER_YEAR = 252
@@ -131,7 +136,31 @@ class CVaRMonteCarloForecaster:
 
     def _load_positions(self) -> Dict[str, float]:
         positions = self.timescale.open_positions()
-        return {symbol: float(notional) for symbol, notional in positions.items() if abs(notional) > 0.0}
+        filtered: Dict[str, float] = {}
+        dropped: list[str] = []
+
+        for symbol, notional in positions.items():
+            normalized = normalize_spot_symbol(symbol)
+            if not normalized:
+                continue
+
+            if not is_spot_symbol(normalized):
+                dropped.append(str(symbol))
+                continue
+
+            filtered[normalized] = filtered.get(normalized, 0.0) + float(notional)
+
+        if dropped:
+            LOGGER.warning(
+                "Ignoring non-spot instruments in CVaR forecast: %s",
+                sorted({str(symbol) for symbol in dropped}),
+            )
+
+        return {
+            symbol: float(notional)
+            for symbol, notional in filtered.items()
+            if abs(float(notional)) > 0.0
+        }
 
     def _instrument_contexts(self, positions: Mapping[str, float]) -> Iterable[_InstrumentContext]:
         for symbol, notional in positions.items():
@@ -225,3 +254,5 @@ def get_cvar_forecast(
         return forecaster.forecast(horizon)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+

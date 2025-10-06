@@ -82,3 +82,15 @@ def test_decide_policy_mismatched_account(client: TestClient) -> None:
 
     assert response.status_code == 403
     assert response.json()["detail"] == "Account mismatch between header and payload."
+
+
+def test_decide_policy_rejects_non_spot_instrument(client: TestClient) -> None:
+    payload = _decision_payload("company")
+    payload["instrument"] = "BTC-PERP"
+
+    response = client.post("/policy/decide", json=payload, headers={"X-Account-ID": "company"})
+
+    assert response.status_code == 422
+    detail = response.json()
+    errors = detail.get("detail") if isinstance(detail, dict) else []
+    assert any("Only spot market instruments" in str(item) for item in errors)

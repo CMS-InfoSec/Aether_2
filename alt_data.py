@@ -21,6 +21,8 @@ import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
+from shared.spot import is_spot_symbol, normalize_spot_symbol
+
 try:  # pragma: no cover - optional dependency during unit tests
     from confluent_kafka import Producer
 except ImportError:  # pragma: no cover - kafka producer is optional
@@ -126,7 +128,12 @@ class SecondaryMarketDataClient:
     async def fetch_price(self, symbol: str) -> SecondaryPrice:
         """Fetch the latest quote for ``symbol`` with retries and timeouts."""
 
-        normalized = symbol.upper()
+        normalized = normalize_spot_symbol(symbol)
+        if not normalized or not is_spot_symbol(normalized):
+            raise SecondaryDataError(
+                f"Secondary market data only supports spot instruments: {symbol}"
+            )
+
         path, params = self._build_request(normalized)
         headers = self._build_headers()
         timeout = httpx.Timeout(self._config.timeout)
@@ -336,39 +343,55 @@ class AltDataMonitor:
     async def process_kraken_price(self, symbol: str, price: float) -> None:
         """Record a Kraken price update and compare it to the secondary feed."""
 
-        symbol_key = symbol.upper()
+        canonical = normalize_spot_symbol(symbol)
+        if not canonical or not is_spot_symbol(canonical):
+            LOGGER.warning(
+                "Ignoring non-spot instrument in alt-data monitor: %s", symbol
+            )
+            await self._handle_secondary_failure(
+                canonical or str(symbol or ""), "non_spot_symbol"
+            )
+            return
+
         async with self._lock:
             self._kraken_feed_ok = True
-            self._last_symbol = symbol_key
+            self._last_symbol = canonical
 
         try:
-            secondary_price = await self._secondary_client.fetch_price(symbol_key)
+            secondary_price = await self._secondary_client.fetch_price(canonical)
         except SecondaryDataError as exc:
             LOGGER.error(
-                "Secondary price retrieval failed for %s: %s", symbol_key, exc
+                "Secondary price retrieval failed for %s: %s", canonical, exc
             )
-            await self._handle_secondary_failure(symbol_key, "secondary_fetch_failed", str(exc))
+            await self._handle_secondary_failure(
+                canonical, "secondary_fetch_failed", str(exc)
+            )
             return
         except Exception:  # pragma: no cover - defensive catch
-            LOGGER.exception("Unexpected error fetching secondary price for symbol=%s", symbol_key)
-            await self._handle_secondary_failure(symbol_key, "secondary_fetch_exception")
+            LOGGER.exception(
+                "Unexpected error fetching secondary price for symbol=%s", canonical
+            )
+            await self._handle_secondary_failure(
+                canonical, "secondary_fetch_exception"
+            )
             return
 
         now = dt.datetime.now(tz=dt.timezone.utc)
         if secondary_price.observed_at < now - self._max_secondary_age:
             LOGGER.warning(
                 "Secondary price for %s is stale (age=%ss)",
-                symbol_key,
+                canonical,
                 (now - secondary_price.observed_at).total_seconds(),
             )
-            await self._handle_secondary_failure(symbol_key, "secondary_feed_stale")
+            await self._handle_secondary_failure(canonical, "secondary_feed_stale")
             return
 
         if secondary_price.price <= 0:
             LOGGER.warning(
-                "Ignoring comparison for symbol=%s due to non-positive secondary price", symbol_key
+                "Ignoring comparison for symbol=%s due to non-positive secondary price",
+                canonical,
             )
-            await self._handle_secondary_failure(symbol_key, "secondary_price_invalid")
+            await self._handle_secondary_failure(canonical, "secondary_price_invalid")
             return
 
         diff_bps = self._calculate_diff_bps(price, secondary_price.price)
@@ -378,7 +401,7 @@ class AltDataMonitor:
             self._last_diff_bps = diff_bps
 
         if abs(diff_bps) >= self._threshold_bps:
-            self._emit_anomaly(symbol_key, price, secondary_price, diff_bps)
+            self._emit_anomaly(canonical, price, secondary_price, diff_bps)
 
     async def get_status(self) -> IngestStatus:
         """Return the current ingestion status snapshot."""
