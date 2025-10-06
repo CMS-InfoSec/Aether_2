@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import sys
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -35,6 +36,7 @@ from sqlalchemy.pool import StaticPool
 
 from metrics import setup_metrics
 from services.common.security import require_admin_account
+from shared.postgres import normalize_sqlalchemy_dsn
 
 
 logger = logging.getLogger(__name__)
@@ -46,9 +48,44 @@ logging.basicConfig(level=logging.INFO)
 # ---------------------------------------------------------------------------
 
 
-DATABASE_URL = os.getenv(
-    "EXECUTION_ANOMALY_DATABASE_URL", "sqlite:///./execution_anomaly.db"
+# ---------------------------------------------------------------------------
+# Configuration helpers
+# ---------------------------------------------------------------------------
+
+
+_DB_ENV_VARS = (
+    "EXECUTION_ANOMALY_DATABASE_URL",
+    "ANALYTICS_DATABASE_URL",
+    "DATABASE_URL",
 )
+
+
+def _resolve_database_url() -> str:
+    """Resolve and normalise the database URL for the anomaly service."""
+
+    allow_sqlite = "pytest" in sys.modules
+    configured: Optional[str] = None
+    for var in _DB_ENV_VARS:
+        raw = os.getenv(var)
+        if raw:
+            configured = raw
+            break
+
+    if configured is None:
+        if allow_sqlite:
+            return "sqlite:///./execution_anomaly.db"
+        raise RuntimeError(
+            "Execution anomaly database DSN is not configured; set EXECUTION_ANOMALY_DATABASE_URL"
+        )
+
+    return normalize_sqlalchemy_dsn(
+        configured,
+        allow_sqlite=allow_sqlite,
+        label="Execution anomaly database DSN",
+    )
+
+
+DATABASE_URL = _resolve_database_url()
 WINDOW_SIZE = int(os.getenv("EXECUTION_ANOMALY_WINDOW", "60"))
 Z_THRESHOLD = float(os.getenv("EXECUTION_ANOMALY_Z_THRESHOLD", "3.0"))
 REQUIRED_CONSECUTIVE = int(os.getenv("EXECUTION_ANOMALY_CONSECUTIVE", "3"))
@@ -71,7 +108,7 @@ SAFE_MODE_TIMEOUT = float(os.getenv("EXECUTION_ANOMALY_SAFE_MODE_TIMEOUT", "2.0"
 
 def _engine_options(url: str) -> Dict[str, object]:
     options: Dict[str, object] = {"future": True}
-    if url.startswith("sqlite://"):
+    if url.startswith("sqlite://") or url.startswith("sqlite+pysqlite://"):
         options.setdefault("connect_args", {"check_same_thread": False})
         if url.endswith(":memory:"):
             options["poolclass"] = StaticPool
