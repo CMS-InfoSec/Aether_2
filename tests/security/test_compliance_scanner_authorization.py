@@ -22,6 +22,7 @@ from services.common.security import require_admin_account
 def compliance_scanner_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     """Create a test client for the compliance scanner admin endpoints."""
 
+    monkeypatch.setenv("COMPLIANCE_DATABASE_URL", "sqlite+pysqlite:///:memory:")
     module = importlib.import_module("compliance_scanner")
 
     async def fake_refresh_watchlists() -> None:

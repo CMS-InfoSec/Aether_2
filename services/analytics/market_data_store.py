@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, List, Mapping, MutableMapping, Protocol, Sequence
@@ -20,6 +21,9 @@ from typing import Iterable, List, Mapping, MutableMapping, Protocol, Sequence
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.pool import StaticPool
+
+from shared.postgres import normalize_sqlalchemy_dsn
 
 
 LOGGER = logging.getLogger(__name__)
@@ -69,13 +73,37 @@ class TimescaleMarketDataAdapter:
         if engine is not None:
             self._engine = engine
         else:
-            if not database_url:
-                LOGGER.warning(
-                    "TimescaleMarketDataAdapter instantiated without database_url or engine; "
-                    "defaulting to in-memory sqlite fallback."
+            allow_sqlite = "pytest" in sys.modules
+            resolved_url: str
+            if database_url is None:
+                if allow_sqlite:
+                    LOGGER.warning(
+                        "TimescaleMarketDataAdapter instantiated without database_url or engine; "
+                        "defaulting to in-memory sqlite fallback for tests."
+                    )
+                    resolved_url = "sqlite+pysqlite:///:memory:"
+                else:
+                    raise RuntimeError(
+                        "Timescale market data DSN must be configured with a PostgreSQL/Timescale URI."
+                    )
+            else:
+                candidate = database_url.strip()
+                if not candidate:
+                    raise RuntimeError(
+                        "Timescale market data DSN cannot be empty once configured."
+                    )
+                resolved_url = normalize_sqlalchemy_dsn(
+                    candidate,
+                    allow_sqlite=allow_sqlite,
+                    label="Timescale market data DSN",
                 )
-                database_url = "sqlite+pysqlite:///:memory:"
-            self._engine = create_engine(database_url, future=True)
+
+            engine_options: dict[str, object] = {"future": True}
+            if resolved_url.startswith(("sqlite://", "sqlite+pysqlite://")):
+                engine_options.setdefault("connect_args", {"check_same_thread": False})
+                if resolved_url.endswith(":memory:"):
+                    engine_options["poolclass"] = StaticPool
+            self._engine = create_engine(resolved_url, **engine_options)
         self._schema = schema
         self._trades_table = trades_table
         self._orderbook_table = orders_table

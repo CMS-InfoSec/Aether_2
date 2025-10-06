@@ -17,6 +17,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 from services.portfolio.balance_reader import BalanceReader, BalanceRetrievalError
+from shared.postgres import normalize_postgres_dsn
 try:
     from services.common.security import (
         AuthenticatedPrincipal,
@@ -71,9 +72,6 @@ except Exception:  # pragma: no cover - executed when psycopg is unavailable
     dict_row = None  # type: ignore[assignment]
 
 
-DEFAULT_DSN = "postgresql://timescale:password@localhost:5432/aether"
-
-
 LOGGER = logging.getLogger(__name__)
 
 _SPOT_KEYWORDS: tuple[str, ...] = ("symbol", "instrument", "pair", "market")
@@ -106,11 +104,26 @@ class AccountScopeMiddleware(BaseHTTPMiddleware):
 def _database_url() -> str:
     """Resolve the Timescale/Postgres connection string."""
 
-    return (
+    raw = (
         os.getenv("PORTFOLIO_DATABASE_URL")
         or os.getenv("TIMESCALE_DSN")
         or os.getenv("DATABASE_URL")
-        or DEFAULT_DSN
+    )
+
+    if raw is None:
+        raise RuntimeError(
+            "Portfolio database DSN is not configured. Set PORTFOLIO_DATABASE_URL or "
+            "TIMESCALE_DSN to a PostgreSQL/Timescale connection string."
+        )
+
+    candidate = raw.strip()
+    if not candidate:
+        raise RuntimeError("Portfolio database DSN cannot be empty once configured.")
+
+    return normalize_postgres_dsn(
+        candidate,
+        allow_sqlite=False,
+        label="Portfolio database DSN",
     )
 
 
