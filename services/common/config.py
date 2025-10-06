@@ -8,7 +8,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict
 
-from shared.postgres import normalize_postgres_dsn
+from shared.postgres import normalize_postgres_dsn, normalize_postgres_schema
 
 
 @dataclass(frozen=True)
@@ -101,7 +101,25 @@ def _resolve_timescale_dsn(account_id: str) -> str:
 @lru_cache(maxsize=None)
 def get_timescale_session(account_id: str) -> TimescaleSession:
     dsn = _resolve_timescale_dsn(account_id)
-    schema = _env(account_id, "TIMESCALE_SCHEMA", f"acct_{account_id}")
+    override = os.getenv(f"AETHER_{account_id.upper()}_TIMESCALE_SCHEMA")
+    if override is not None:
+        if not override.strip():
+            raise RuntimeError(
+                f"AETHER_{account_id.upper()}_TIMESCALE_SCHEMA is set but empty; "
+                "configure a valid schema identifier"
+            )
+        schema = normalize_postgres_schema(
+            override,
+            label="Timescale schema",
+            prefix_if_missing=None,
+        )
+    else:
+        schema = normalize_postgres_schema(
+            account_id,
+            label="Timescale schema",
+            prefix_if_missing="acct_",
+            allow_leading_digit_prefix=True,
+        )
     return TimescaleSession(dsn=dsn, account_schema=schema)
 
 
