@@ -1,4 +1,5 @@
 from decimal import Decimal, ROUND_HALF_EVEN
+import contextlib
 import sys
 import types
 from typing import Dict, List
@@ -94,6 +95,25 @@ if "metrics" not in sys.modules:
     metrics_stub.traced_span = traced_span
     metrics_stub.get_request_id = lambda: None
     metrics_stub._REGISTRY = object()
+
+    class _TransportMember:
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+        def __str__(self) -> str:
+            return self.value
+
+    class _TransportType:
+        UNKNOWN = _TransportMember("unknown")
+        INTERNAL = _TransportMember("internal")
+        REST = _TransportMember("rest")
+        WEBSOCKET = _TransportMember("websocket")
+        FIX = _TransportMember("fix")
+        BATCH = _TransportMember("batch")
+
+    metrics_stub.TransportType = _TransportType
+    metrics_stub.bind_metric_context = lambda *args, **kwargs: contextlib.nullcontext()
+    metrics_stub.metric_context = lambda *args, **kwargs: contextlib.nullcontext()
     sys.modules["metrics"] = metrics_stub
 
 if "services.oms.oms_service" not in sys.modules:

@@ -1,10 +1,13 @@
+import asyncio
+from datetime import datetime, timezone
+
+import sys
+
 import pytest
 
 pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
-
-import pytest
 
 import safe_mode
 from tests.fixtures.backends import MemoryRedis
@@ -166,3 +169,68 @@ def test_safe_mode_state_survives_controller_restart() -> None:
     assert status.reason == "ops_drill"
     assert restarted.intent_guard.allow_new_intents is False
     assert restarted.order_controls.hedging_only is True
+
+
+def test_kafka_publisher_handles_running_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    published: dict[str, object] = {}
+
+    class _StubAdapter:
+        def __init__(self, account_id: str) -> None:
+            published["account_id"] = account_id
+
+        async def publish(self, topic: str, payload: dict[str, object]) -> None:
+            published["topic"] = topic
+            published["payload"] = payload
+
+    import services.common.adapters as adapters
+
+    monkeypatch.setattr(adapters, "KafkaNATSAdapter", _StubAdapter)
+
+    publisher = safe_mode.KafkaSafeModePublisher(account_id="company", topic="ops.safe_mode")
+    event = safe_mode.SafeModeEvent(
+        reason="drill",
+        ts=datetime.now(timezone.utc),
+        state="entered",
+        actor="ops",
+    )
+
+    async def _exercise() -> None:
+        publisher.publish(event)
+        await asyncio.sleep(0)
+
+    asyncio.run(_exercise())
+
+    assert published["account_id"] == "company"
+    assert published["topic"] == "ops.safe_mode"
+    assert published["payload"]["state"] == "entered"
+
+
+def test_state_store_requires_configured_redis(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_pytest = sys.modules.get("pytest")
+    try:
+        monkeypatch.delitem(sys.modules, "pytest", raising=False)
+        monkeypatch.delenv("SAFE_MODE_REDIS_URL", raising=False)
+
+        with pytest.raises(RuntimeError, match="SAFE_MODE_REDIS_URL"):
+            safe_mode.SafeModeStateStore._create_default_client()
+    finally:
+        if original_pytest is not None:
+            sys.modules["pytest"] = original_pytest
+
+
+def test_state_store_rejects_stub_without_pytest(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_pytest = sys.modules.get("pytest")
+    try:
+        monkeypatch.delitem(sys.modules, "pytest", raising=False)
+        monkeypatch.setenv("SAFE_MODE_REDIS_URL", "redis://stub:6379/0")
+
+        def _fake_create(url: str, *, decode_responses: bool, logger: object | None = None) -> tuple[object, bool]:
+            return object(), True
+
+        monkeypatch.setattr(safe_mode, "create_redis_from_url", _fake_create)
+
+        with pytest.raises(RuntimeError, match="Failed to connect"):
+            safe_mode.SafeModeStateStore._create_default_client()
+    finally:
+        if original_pytest is not None:
+            sys.modules["pytest"] = original_pytest

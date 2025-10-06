@@ -9,6 +9,7 @@ import json
 import logging
 
 import os
+import sys
 from dataclasses import dataclass
 from typing import Any, Dict, List, Sequence
 
@@ -16,6 +17,8 @@ import aiohttp
 from sqlalchemy import BigInteger, Column, DateTime, JSON, MetaData, Numeric, String, Table
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Engine, create_engine
+
+from shared.postgres import normalize_sqlalchemy_dsn
 
 try:
     from confluent_kafka import Producer
@@ -33,7 +36,35 @@ logging.basicConfig(level=logging.INFO)
 KRAKEN_WS_URL = os.getenv("KRAKEN_WS_URL", "wss://ws.kraken.com")
 KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
 KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "kraken.marketdata")
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg2://localhost:5432/aether")
+_SQLITE_FALLBACK_FLAG = "KRAKEN_WS_ALLOW_SQLITE_FOR_TESTS"
+
+
+def _resolve_database_url() -> str:
+    """Return the configured Timescale/PostgreSQL DSN used for persistence."""
+
+    raw_url = os.getenv("DATABASE_URL", "")
+    if not raw_url.strip():
+        raise RuntimeError(
+            "Kraken ingest requires DATABASE_URL to be set to a PostgreSQL/Timescale DSN."
+        )
+
+    allow_sqlite = "pytest" in sys.modules or os.getenv(_SQLITE_FALLBACK_FLAG) == "1"
+    database_url = normalize_sqlalchemy_dsn(
+        raw_url.strip(),
+        allow_sqlite=allow_sqlite,
+        label="Kraken ingest database URL",
+    )
+
+    if database_url.startswith("sqlite"):
+        LOGGER.warning(
+            "Using SQLite database '%s' for Kraken ingest; allowed only for tests.",
+            database_url,
+        )
+
+    return database_url
+
+
+DATABASE_URL = _resolve_database_url()
 NATS_SERVERS = os.getenv("NATS_SERVERS", "nats://localhost:4222").split(",")
 NATS_SUBJECT = os.getenv("NATS_SUBJECT", "marketdata.kraken.orderbook")
 
