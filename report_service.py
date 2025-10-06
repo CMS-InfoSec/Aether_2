@@ -29,7 +29,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from reports.storage import ArtifactStorage, build_storage_from_env
 from services.common.security import require_admin_account
 from services.models.model_server import get_active_model
-from shared.spot import is_spot_symbol, normalize_spot_symbol
+from shared.postgres import normalize_postgres_dsn
+from shared.timezone import format_london_time
 
 try:  # pragma: no cover - psycopg is an optional dependency in tests
     import psycopg
