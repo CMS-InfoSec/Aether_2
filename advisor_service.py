@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
@@ -39,6 +40,7 @@ from auth.service import (
 )
 from services.common import security
 from services.common.security import require_admin_account
+from shared.postgres import normalize_sqlalchemy_dsn
 from shared.session_config import load_session_ttl_minutes
 
 LOGGER = logging.getLogger(__name__)
@@ -57,38 +59,37 @@ _POOL_TIMEOUT_ENV = "ADVISOR_DB_POOL_TIMEOUT"
 _POOL_RECYCLE_ENV = "ADVISOR_DB_POOL_RECYCLE"
 
 
+def _allow_sqlite_fallback() -> bool:
+    """Return whether sqlite DSNs are permitted (tests and explicit overrides only)."""
+
+    if "pytest" in sys.modules:
+        return True
+
+    if os.getenv(_SQLITE_FALLBACK_FLAG) == "1":
+        LOGGER.warning(
+            "%s=1 allows sqlite-backed advisor persistence; never enable in production.",
+            _SQLITE_FALLBACK_FLAG,
+        )
+        return True
+
+    return False
+
+
 def _require_database_url() -> str:
     """Return the managed Postgres/Timescale database URL for advisor history."""
 
     raw_url = os.getenv(_DATABASE_URL_ENV)
-    if not raw_url:
+    if raw_url is None:
         raise RuntimeError(
             "ADVISOR_DATABASE_URL must be set and point to the shared TimescaleDB cluster."
         )
 
-    normalized = raw_url.lower()
-    if normalized.startswith("postgres://"):
-        raw_url = "postgresql://" + raw_url.split("://", 1)[1]
-        normalized = raw_url.lower()
+    allow_sqlite = _allow_sqlite_fallback()
 
-    allowed_prefixes = (
-        "postgresql://",
-        "postgresql+psycopg://",
-        "postgresql+psycopg2://",
-    )
-    if normalized.startswith(allowed_prefixes):
-        return raw_url
-
-    if os.getenv(_SQLITE_FALLBACK_FLAG) == "1":
-        LOGGER.warning(
-            "Allowing non-Postgres ADVISOR_DATABASE_URL '%s' because %s=1.",
-            raw_url,
-            _SQLITE_FALLBACK_FLAG,
-        )
-        return raw_url
-
-    raise RuntimeError(
-        "ADVISOR_DATABASE_URL must use a PostgreSQL-compatible driver (e.g. postgresql://)."
+    return normalize_sqlalchemy_dsn(
+        raw_url,
+        allow_sqlite=allow_sqlite,
+        label="ADVISOR_DATABASE_URL",
     )
 
 

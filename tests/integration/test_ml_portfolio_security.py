@@ -151,6 +151,9 @@ def test_training_bootstrap_populates_all_backends(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(coingecko_ingest, "aggregate_daily_rows", _fake_aggregate_daily_rows)
     monkeypatch.setattr(coingecko_ingest, "upsert_ohlcv_rows", _fake_upsert)
 
+    monkeypatch.setenv("DATABASE_URL", "sqlite+pysqlite:///:memory:")
+    sys.modules.pop("data.ingest.feature_jobs", None)
+
     try:
         from data.ingest import feature_jobs as feature_jobs_module
     except ImportError as exc:  # pragma: no cover - highlight missing dependency explicitly

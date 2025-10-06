@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,16 +20,50 @@ from sqlalchemy.exc import NoSuchTableError, SQLAlchemyError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from shared.postgres import normalize_sqlalchemy_dsn
+
 try:
     import yaml  # type: ignore
 except ImportError:  # pragma: no cover - optional dependency
     yaml = None  # type: ignore
 
 
-DEFAULT_RELEASE_DB_URL = os.getenv("RELEASE_DATABASE_URL", "sqlite+pysqlite:////tmp/releases.db")
-
 LOGGER = logging.getLogger("ops.release_manifest")
 _SQLITE_FALLBACK_FLAG = "CONFIG_ALLOW_SQLITE_FOR_TESTS"
+_RELEASE_SQLITE_FLAG = "RELEASE_MANIFEST_ALLOW_SQLITE_FOR_TESTS"
+
+
+def _resolve_release_db_url() -> str:
+    """Return a PostgreSQL/Timescale DSN for release manifest storage."""
+
+    raw_url = os.getenv("RELEASE_MANIFEST_DATABASE_URL") or os.getenv("RELEASE_DATABASE_URL")
+    if not raw_url:
+        raise RuntimeError(
+            "RELEASE_MANIFEST_DATABASE_URL (or legacy RELEASE_DATABASE_URL) must be configured with a "
+            "PostgreSQL/Timescale connection URI."
+        )
+
+    allow_sqlite = os.getenv(_RELEASE_SQLITE_FLAG) == "1"
+    try:
+        normalized = normalize_sqlalchemy_dsn(
+            raw_url,
+            allow_sqlite=allow_sqlite,
+            label="Release manifest database URL",
+        )
+    except RuntimeError as exc:  # pragma: no cover - validation failures surface to callers
+        raise RuntimeError(str(exc)) from exc
+
+    if normalized.startswith("sqlite") and allow_sqlite:
+        LOGGER.warning(
+            "Allowing SQLite release manifest database URL '%s' because %s=1.",
+            raw_url,
+            _RELEASE_SQLITE_FLAG,
+        )
+
+    return normalized
+
+
+DEFAULT_RELEASE_DB_URL = _resolve_release_db_url()
 
 
 def _require_config_db_url() -> str:
