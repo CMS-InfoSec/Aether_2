@@ -1,7 +1,5 @@
 """Accounts service coordinating admin profiles and approval workflows."""
 from __future__ import annotations
-
-import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -15,6 +13,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, rela
 from sqlalchemy.pool import StaticPool
 from sqlalchemy.sql import func
 
+from shared.accounts_config import resolve_accounts_database_url
 from shared.audit import SensitiveActionRecorder
 
 
@@ -22,19 +21,8 @@ class Base(DeclarativeBase):
     """Base declarative class for the accounts service ORM models."""
 
 
-DEFAULT_DATABASE_URL = "sqlite:///./accounts.db"
-
-
 def _database_url() -> str:
-    url = (
-        os.getenv("ACCOUNTS_DATABASE_URL")
-        or os.getenv("TIMESCALE_DSN")
-        or os.getenv("DATABASE_URL")
-        or DEFAULT_DATABASE_URL
-    )
-    if url.startswith("postgresql://"):
-        return url.replace("postgresql://", "postgresql+psycopg2://", 1)
-    return url
+    return resolve_accounts_database_url()
 
 
 def _engine_options(url: str) -> dict[str, object]:

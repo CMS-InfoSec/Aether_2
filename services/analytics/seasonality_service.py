@@ -23,6 +23,7 @@ from auth.service import (
 )
 from services.common import security
 from services.common.security import require_admin_account
+from shared.session_config import load_session_ttl_minutes
 
 __all__ = ["app", "ENGINE", "SessionLocal", "SESSION_STORE"]
 
@@ -473,8 +474,8 @@ def _configure_database() -> None:
 def _resolve_session_store_dsn() -> str:
     for env_var in ("SESSION_REDIS_URL", "SESSION_STORE_URL", "SESSION_BACKEND_DSN"):
         value = os.getenv(env_var)
-        if value:
-            return value
+        if value and value.strip():
+            return value.strip()
     raise RuntimeError(
         "Session store misconfigured: set SESSION_REDIS_URL, SESSION_STORE_URL, or SESSION_BACKEND_DSN "
         "so the seasonality service can validate administrator tokens."
@@ -488,8 +489,8 @@ def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
         store = existing
     else:
         dsn = _resolve_session_store_dsn()
-        ttl_minutes = int(os.getenv("SESSION_TTL_MINUTES", "60"))
-        if dsn.startswith("memory://"):
+        ttl_minutes = load_session_ttl_minutes()
+        if dsn.lower().startswith("memory://"):
             store = InMemorySessionStore(ttl_minutes=ttl_minutes)
         else:
             store = build_session_store_from_url(dsn, ttl_minutes=ttl_minutes)

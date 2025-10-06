@@ -37,6 +37,7 @@ from services.analytics.market_data_store import (
 from services.common.config import get_timescale_session
 from services.common import security
 from services.common.security import require_admin_account
+from shared.session_config import load_session_ttl_minutes
 
 try:  # pragma: no cover - optional dependency during CI
     import psycopg
@@ -514,12 +515,12 @@ def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
         return existing
 
     redis_url = (os.getenv("SESSION_REDIS_URL") or "").strip()
-    ttl_minutes = int(os.getenv("SESSION_TTL_MINUTES", "60"))
+    ttl_minutes = load_session_ttl_minutes()
 
     if not redis_url:
         LOGGER.info("SESSION_REDIS_URL not configured. Using in-memory session store.")
         store: SessionStoreProtocol = InMemorySessionStore(ttl_minutes=ttl_minutes)
-    elif redis_url.startswith("memory://"):
+    elif redis_url.lower().startswith("memory://"):
         store = InMemorySessionStore(ttl_minutes=ttl_minutes)
     else:
         store = build_session_store_from_url(redis_url, ttl_minutes=ttl_minutes)
