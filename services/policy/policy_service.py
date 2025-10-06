@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import threading
 import time
 from dataclasses import asdict, is_dataclass
@@ -11,6 +12,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from auth.service import build_session_store_from_url, SessionStoreProtocol
+from shared.session_config import load_session_ttl_minutes
 from pydantic import BaseModel, Field, field_validator
 
 try:  # pragma: no cover - optional dependency
@@ -141,32 +143,75 @@ class SlippageEstimator:
         self._cache: Dict[tuple[str, str], tuple[float, List[Dict[str, float]]]] = {}
         self._lock = threading.Lock()
 
-    def _fetch_curve(self, account_id: str, symbol: str) -> List[Dict[str, float]]:
-        cache_key = (account_id.lower(), symbol.upper())
-        now = time.monotonic()
+    def _cache_lookup(
+        self, cache_key: tuple[str, str], now: float
+    ) -> List[Dict[str, float]] | None:
         with self._lock:
             cached = self._cache.get(cache_key)
             if cached and cached[0] > now:
                 return [dict(entry) for entry in cached[1]]
+        return None
+
+    def _cache_store(
+        self,
+        cache_key: tuple[str, str],
+        expires_at: float,
+        points: Sequence[Mapping[str, float]],
+    ) -> None:
+        with self._lock:
+            self._cache[cache_key] = (
+                expires_at,
+                [dict(entry) for entry in points],
+            )
+
+    async def _fetch_curve_async(
+        self, account_id: str, symbol: str
+    ) -> List[Dict[str, float]]:
+        cache_key = (account_id.lower(), symbol.upper())
+        now = time.monotonic()
+        cached = self._cache_lookup(cache_key, now)
+        if cached is not None:
+            return cached
 
         try:
-            coroutine = self._impact_store.impact_curve(account_id=account_id, symbol=symbol)
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
-
-            if loop and loop.is_running():
-                future = asyncio.run_coroutine_threadsafe(coroutine, loop)
-                points = future.result(timeout=self._async_timeout)
-            else:
-                points = asyncio.run(coroutine)
-        except Exception:
+            coroutine = self._impact_store.impact_curve(
+                account_id=account_id, symbol=symbol
+            )
+            points = await asyncio.wait_for(
+                coroutine, timeout=self._async_timeout
+            )
+        except (asyncio.TimeoutError, Exception):
             points = []
 
         if points:
-            with self._lock:
-                self._cache[cache_key] = (now + self._cache_ttl, [dict(entry) for entry in points])
+            self._cache_store(cache_key, now + self._cache_ttl, points)
+        return [dict(entry) for entry in points]
+
+    def _fetch_curve(self, account_id: str, symbol: str) -> List[Dict[str, float]]:
+        cache_key = (account_id.lower(), symbol.upper())
+        now = time.monotonic()
+        cached = self._cache_lookup(cache_key, now)
+        if cached is not None:
+            return cached
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            raise RuntimeError(
+                "SlippageEstimator.estimate_slippage_bps must not be called from an active event loop; "
+                "use await estimate_slippage_bps_async instead.",
+            )
+
+        try:
+            points = asyncio.run(
+                self._fetch_curve_async(account_id, symbol)
+            )
+        except Exception:
+            points = []
+
         return [dict(entry) for entry in points]
 
     @staticmethod
@@ -206,6 +251,23 @@ class SlippageEstimator:
             previous = current
 
         return abs(sorted_points[-1]["impact"])
+
+    async def estimate_slippage_bps_async(
+        self,
+        *,
+        account_id: str,
+        symbol: str,
+        side: str | None,
+        size: float | None = None,
+    ) -> float:
+        del side  # direction currently unused because impact data is signed
+
+        points = await self._fetch_curve_async(account_id, symbol)
+        if not points:
+            return 0.0
+
+        target_size = abs(float(size)) if size is not None else 0.0
+        return self._interpolate(points, target_size)
 
     def estimate_slippage_bps(
         self,
@@ -429,13 +491,31 @@ def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
     if isinstance(existing, SessionStoreProtocol):
         store = existing
     else:
-        redis_url = os.getenv("SESSION_REDIS_URL")
-        if not redis_url:
+        raw_url = os.getenv("SESSION_REDIS_URL")
+        if raw_url is None:
             raise RuntimeError(
-                "SESSION_REDIS_URL is not configured. Provide a shared session store DSN to enable policy service authentication.",
+                "SESSION_REDIS_URL is not configured. Provide a redis:// DSN to enable policy service authentication.",
             )
 
-        store = build_session_store_from_url(redis_url)
+        redis_url = raw_url.strip()
+        if not redis_url:
+            raise RuntimeError(
+                "SESSION_REDIS_URL is set but empty; configure a redis:// or rediss:// DSN.",
+            )
+
+        normalized = redis_url.lower()
+        if normalized.startswith("memory://") and "pytest" not in sys.modules:
+            raise RuntimeError(
+                "SESSION_REDIS_URL must use a redis:// or rediss:// DSN outside pytest so policy sessions persist across restarts.",
+            )
+
+        ttl_minutes = load_session_ttl_minutes()
+        if normalized.startswith("memory://"):
+            from auth.service import InMemorySessionStore  # local import to avoid optional dependency
+
+            store = InMemorySessionStore(ttl_minutes=ttl_minutes)
+        else:
+            store = build_session_store_from_url(redis_url, ttl_minutes=ttl_minutes)
         application.state.session_store = store
     security.set_default_session_store(store)
     return store
