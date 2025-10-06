@@ -1,4 +1,5 @@
 import importlib.util
+import importlib
 import sys
 from pathlib import Path
 
@@ -33,12 +34,14 @@ import services.common.config as config
 
 
 @pytest.fixture(autouse=True)
-def _clear_timescale_cache():
+def _clear_config_cache():
     config.get_timescale_session.cache_clear()
+    config.get_redis_client.cache_clear()
     try:
         yield
     finally:
         config.get_timescale_session.cache_clear()
+        config.get_redis_client.cache_clear()
 
 
 def test_get_timescale_session_requires_config(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -47,6 +50,33 @@ def test_get_timescale_session_requires_config(monkeypatch: pytest.MonkeyPatch) 
 
     with pytest.raises(RuntimeError, match="Timescale DSN is not configured"):
         config.get_timescale_session("company")
+
+
+def test_get_redis_client_requires_explicit_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("AETHER_COMPANY_REDIS_DSN", raising=False)
+
+    with pytest.raises(RuntimeError, match="Redis DSN is not configured"):
+        config.get_redis_client("company")
+
+
+def test_get_redis_client_rejects_blank_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AETHER_COMPANY_REDIS_DSN", "   ")
+
+    with pytest.raises(RuntimeError, match="is set but empty"):
+        config.get_redis_client("company")
+
+
+def test_get_redis_client_accepts_memory_scheme_for_tests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AETHER_COMPANY_REDIS_DSN", "memory://")
+
+    client = config.get_redis_client("company")
+    assert client.dsn == "memory://"
 
 
 def test_get_timescale_session_uses_account_specific_env(monkeypatch: pytest.MonkeyPatch) -> None:

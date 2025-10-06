@@ -52,9 +52,30 @@ def _env(account_id: str, suffix: str, default: str) -> str:
     return os.getenv(env_key, default)
 
 
+def _require_account_env(account_id: str, suffix: str, *, label: str) -> str:
+    """Return a required account-scoped environment variable."""
+
+    env_key = f"AETHER_{account_id.upper()}_{suffix}"
+    raw_value = os.getenv(env_key)
+    if raw_value is None:
+        raise RuntimeError(
+            f"{label} is not configured. Set {env_key} to a redis:// or memory:// DSN."
+        )
+
+    value = raw_value.strip()
+    if not value:
+        raise RuntimeError(
+            f"{env_key} is set but empty; configure {label} with a redis:// or memory:// DSN."
+        )
+    return value
+
+
 @lru_cache(maxsize=None)
 def get_redis_client(account_id: str) -> RedisClient:
-    return RedisClient(dsn=_env(account_id, "REDIS_DSN", "redis://localhost:6379/0"))
+    """Return the configured Redis client settings for an account."""
+
+    dsn = _require_account_env(account_id, "REDIS_DSN", label="Redis DSN")
+    return RedisClient(dsn=dsn)
 
 
 @lru_cache(maxsize=None)
