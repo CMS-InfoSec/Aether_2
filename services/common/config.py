@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict
 
-from shared.postgres import normalize_postgres_dsn
+from shared.postgres import normalize_postgres_dsn, normalize_postgres_schema
 
 
 @dataclass(frozen=True)
@@ -51,9 +52,35 @@ def _env(account_id: str, suffix: str, default: str) -> str:
     return os.getenv(env_key, default)
 
 
+def _require_account_env(account_id: str, suffix: str, *, label: str) -> str:
+    """Return a required account-scoped environment variable."""
+
+    env_key = f"AETHER_{account_id.upper()}_{suffix}"
+    raw_value = os.getenv(env_key)
+    if raw_value is None:
+        raise RuntimeError(
+            f"{label} is not configured. Set {env_key} to a redis:// or memory:// DSN."
+        )
+
+    value = raw_value.strip()
+    if not value:
+        raise RuntimeError(
+            f"{env_key} is set but empty; configure {label} with a redis:// or memory:// DSN."
+        )
+
+    if value.lower().startswith("memory://") and "pytest" not in sys.modules:
+        raise RuntimeError(
+            f"{env_key} must use a redis:// or rediss:// DSN outside pytest to persist {label.lower()}"
+        )
+    return value
+
+
 @lru_cache(maxsize=None)
 def get_redis_client(account_id: str) -> RedisClient:
-    return RedisClient(dsn=_env(account_id, "REDIS_DSN", "redis://localhost:6379/0"))
+    """Return the configured Redis client settings for an account."""
+
+    dsn = _require_account_env(account_id, "REDIS_DSN", label="Redis DSN")
+    return RedisClient(dsn=dsn)
 
 
 @lru_cache(maxsize=None)
@@ -101,7 +128,25 @@ def _resolve_timescale_dsn(account_id: str) -> str:
 @lru_cache(maxsize=None)
 def get_timescale_session(account_id: str) -> TimescaleSession:
     dsn = _resolve_timescale_dsn(account_id)
-    schema = _env(account_id, "TIMESCALE_SCHEMA", f"acct_{account_id}")
+    override = os.getenv(f"AETHER_{account_id.upper()}_TIMESCALE_SCHEMA")
+    if override is not None:
+        if not override.strip():
+            raise RuntimeError(
+                f"AETHER_{account_id.upper()}_TIMESCALE_SCHEMA is set but empty; "
+                "configure a valid schema identifier"
+            )
+        schema = normalize_postgres_schema(
+            override,
+            label="Timescale schema",
+            prefix_if_missing=None,
+        )
+    else:
+        schema = normalize_postgres_schema(
+            account_id,
+            label="Timescale schema",
+            prefix_if_missing="acct_",
+            allow_leading_digit_prefix=True,
+        )
     return TimescaleSession(dsn=dsn, account_schema=schema)
 
 

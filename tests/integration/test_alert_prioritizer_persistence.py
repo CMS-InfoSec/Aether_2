@@ -214,3 +214,17 @@ async def test_alert_classifications_visible_across_instances() -> None:
 
     await service_a.close()
     await service_b.close()
+
+
+def test_alert_prioritizer_rejects_sqlite_dsn(monkeypatch: pytest.MonkeyPatch) -> None:
+    from alert_prioritizer import AlertPrioritizerService
+
+    monkeypatch.delenv("ALERT_PRIORITIZER_DATABASE_URL", raising=False)
+
+    with pytest.raises(RuntimeError, match="PostgreSQL/Timescale"):
+        AlertPrioritizerService(
+            database_url="sqlite:///tmp/test.db",
+            psycopg_module=_MemoryPsycopg(),
+            model=_StubModel(),
+            label_encoder=_StubLabelEncoder(),
+        )
