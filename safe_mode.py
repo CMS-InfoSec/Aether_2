@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -460,29 +459,26 @@ class OrderControls:
         if adapter is None:
             return
         try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            asyncio.run(
-                adapter.cancel_order(
-                    account_id,
-                    order.client_id,
-                    exchange_order_id=order.exchange_order_id,
-                )
+            coroutine = adapter.cancel_order(
+                account_id,
+                order.client_id,
+                exchange_order_id=order.exchange_order_id,
             )
-        else:
-            loop = asyncio.new_event_loop()
-            try:
-                asyncio.set_event_loop(loop)
-                loop.run_until_complete(
-                    adapter.cancel_order(
-                        account_id,
-                        order.client_id,
-                        exchange_order_id=order.exchange_order_id,
-                    )
-                )
-            finally:
-                asyncio.set_event_loop(None)
-                loop.close()
+        except Exception:
+            self._logger.exception(
+                "Failed to prepare safe mode cancel coroutine",
+                extra={
+                    "account_id": account_id,
+                    "client_id": order.client_id,
+                    "exchange_order_id": order.exchange_order_id,
+                },
+            )
+            return
+        dispatch_async(
+            coroutine,
+            context="safe_mode.cancel_order",
+            logger=self._logger,
+        )
 
     def _set_safe_mode_state(
         self, engaged: bool, *, reason: Optional[str], actor: Optional[str]
