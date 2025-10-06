@@ -1,7 +1,12 @@
 
 from __future__ import annotations
 
-import asyncio
+import logging
+import math
+from collections.abc import Mapping, Sequence
+
+import math
+from collections.abc import Mapping, Sequence
 
 from fastapi import Depends, FastAPI, HTTPException, status
 
@@ -18,6 +23,7 @@ from services.common.security import require_admin_account
 from shared.models.registry import get_model_registry
 from services.policy.adaptive_horizon import get_horizon
 from services.policy.model_server import predict_intent
+from shared.async_utils import dispatch_async
 
 from metrics import (
     metric_context,
@@ -26,9 +32,32 @@ from metrics import (
     setup_metrics,
 )
 
+LOGGER = logging.getLogger(__name__)
+
 app = FastAPI(title="Policy Service")
 setup_metrics(app, service_name="policy-service")
 
+
+def _normalise_feature_vector(raw: object) -> list[float]:
+    """Coerce feature payloads to a numeric vector for responses and telemetry."""
+
+    if isinstance(raw, Mapping):
+        iterable = raw.values()
+    elif isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, bytearray)):
+        iterable = raw
+    else:
+        return []
+
+    vector: list[float] = []
+    for value in iterable:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isnan(numeric) or math.isinf(numeric):
+            continue
+        vector.append(numeric)
+    return vector
 
 
 @app.post("/policy/decide", response_model=PolicyDecisionResponse)
@@ -187,7 +216,7 @@ def decide_policy(
         fee_adjusted_edge = min(preferred_template.edge_bps, 0.0)
 
     kafka = KafkaNATSAdapter(account_id=account_id)
-    asyncio.run(
+    dispatch_async(
         kafka.publish(
             topic="policy.decisions",
             payload={
@@ -200,11 +229,15 @@ def decide_policy(
                 "confidence": confidence.model_dump(),
                 "selected_action": selected_action,
                 "action_templates": [template.model_dump() for template in action_templates],
-        },
-        )
+            },
+        ),
+        context="publish policy.decisions",
+        logger=LOGGER,
     )
 
     timescale = TimescaleAdapter(account_id=account_id)
+    feature_vector = _normalise_feature_vector(features)
+
     timescale.record_decision(
         order_id=request.order_id,
         payload={
@@ -213,7 +246,7 @@ def decide_policy(
             "fee_adjusted_edge_bps": fee_adjusted_edge,
             "confidence": confidence.model_dump(),
             "approved": approved,
-            "features": features,
+            "features": feature_vector,
         },
     )
 
@@ -226,7 +259,7 @@ def decide_policy(
         selected_action=selected_action,
         action_templates=action_templates,
         confidence=confidence,
-        features=list(features),
+        features=feature_vector,
         book_snapshot=book_snapshot_model,
         state=state_model,
         take_profit_bps=round(take_profit_bps, 4),
