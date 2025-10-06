@@ -426,6 +426,125 @@ def test_policy_decide_normalises_feature_mapping(monkeypatch: pytest.MonkeyPatc
     assert dispatched_contexts == ["publish policy.decisions"]
 
 
+def test_policy_decide_respects_explicit_zero_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded: list[dict[str, object]] = []
+
+    class _Registry:
+        def get_latest_ensemble(self, account_id: str, symbol: str) -> object:
+            class _Ensemble:
+                confidence_threshold = 0.5
+
+            return _Ensemble()
+
+    intent = Intent(
+        edge_bps=18.0,
+        confidence=ConfidenceMetrics(
+            model_confidence=0.9,
+            state_confidence=0.8,
+            execution_confidence=0.85,
+            overall_confidence=0.88,
+        ),
+        take_profit_bps=22.0,
+        stop_loss_bps=11.0,
+        selected_action="maker",
+        action_templates=[
+            ActionTemplate(
+                name="maker",
+                venue_type="maker",
+                edge_bps=18.0,
+                fee_bps=0.0,
+                confidence=0.85,
+            )
+        ],
+        approved=True,
+    )
+
+    class _KafkaStub:
+        def __init__(self, *_: object, **__: object) -> None:
+            pass
+
+        async def publish(self, *args: object, **kwargs: object) -> None:
+            return None
+
+    class _RedisStub:
+        def __init__(self, *_: object, **__: object) -> None:
+            pass
+
+        def fetch_online_features(self, instrument: str) -> dict[str, object]:
+            return {
+                "features": [9.0, 1.0],
+                "book_snapshot": {
+                    "mid_price": 101.0,
+                    "spread_bps": 1.0,
+                    "imbalance": 0.0,
+                },
+                "state": {
+                    "regime": "flat",
+                    "volatility": 0.1,
+                    "liquidity_score": 0.5,
+                    "conviction": 0.2,
+                },
+                "expected_edge_bps": 7.5,
+                "take_profit_bps": 14.0,
+                "stop_loss_bps": 6.0,
+            }
+
+    class _TimescaleStub:
+        def __init__(self, *_: object, **__: object) -> None:
+            pass
+
+        def record_decision(self, *, order_id: str, payload: dict[str, object]) -> None:
+            recorded.append({"order_id": order_id, **payload})
+
+    def _run_dispatch(
+        coro: object,
+        *,
+        context: str,
+        logger: object | None = None,
+    ) -> None:
+        del logger
+        asyncio.run(coro)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(policy_main, "get_model_registry", lambda: _Registry())
+    monkeypatch.setattr(policy_main, "predict_intent", lambda **_: intent)
+    monkeypatch.setattr(policy_main, "KafkaNATSAdapter", _KafkaStub)
+    monkeypatch.setattr(policy_main, "RedisFeastAdapter", _RedisStub)
+    monkeypatch.setattr(policy_main, "TimescaleAdapter", _TimescaleStub)
+    monkeypatch.setattr(policy_main, "dispatch_async", _run_dispatch)
+
+    payload = _decision_request_payload("company")
+    payload.update(
+        {
+            "features": [],
+            "expected_edge_bps": 0.0,
+            "take_profit_bps": 0.0,
+            "stop_loss_bps": 0.0,
+            "state": {
+                "regime": "neutral",
+                "volatility": 0.0,
+                "liquidity_score": 0.0,
+                "conviction": 0.0,
+            },
+        }
+    )
+
+    policy_main.app.dependency_overrides[policy_main.require_admin_account] = lambda: "company"
+    try:
+        with TestClient(policy_main.app) as client:
+            response = client.post("/policy/decide", json=payload)
+            assert response.status_code == status.HTTP_200_OK, response.text
+            body = PolicyDecisionResponse.model_validate(response.json())
+    finally:
+        policy_main.app.dependency_overrides.pop(policy_main.require_admin_account, None)
+
+    assert body.features == []
+    assert body.take_profit_bps == pytest.approx(0.0)
+    assert body.stop_loss_bps == pytest.approx(0.0)
+    assert recorded and recorded[-1]["features"] == []
+
+
 def test_policy_decide_preserves_tick_precision(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:

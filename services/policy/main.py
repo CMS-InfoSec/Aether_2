@@ -5,9 +5,6 @@ import logging
 import math
 from collections.abc import Mapping, Sequence
 
-import math
-from collections.abc import Mapping, Sequence
-
 from fastapi import Depends, FastAPI, HTTPException, status
 
 from services.common.adapters import KafkaNATSAdapter, RedisFeastAdapter, TimescaleAdapter
@@ -78,10 +75,38 @@ def decide_policy(
     redis = RedisFeastAdapter(account_id=account_id)
     online_features = redis.fetch_online_features(request.instrument)
 
-    features = request.features or online_features.get("features", [])
-    book_snapshot_payload = request.book_snapshot or online_features.get("book_snapshot")
-    state_payload = request.state or online_features.get("state")
-    expected_edge = request.expected_edge_bps or online_features.get("expected_edge_bps") or 0.0
+    online_payload = online_features if isinstance(online_features, Mapping) else {}
+    provided_fields = getattr(request, "model_fields_set", set())
+
+    if "features" in provided_fields:
+        features = request.features
+    else:
+        features = online_payload.get("features", [])
+
+    book_snapshot_payload = (
+        request.book_snapshot
+        if request.book_snapshot is not None
+        else online_payload.get("book_snapshot")
+    )
+    state_payload = (
+        request.state if request.state is not None else online_payload.get("state")
+    )
+
+    def _coerce_edge(value: object, default: float) -> float:
+        if value is None:
+            return default
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return default
+        if math.isnan(numeric) or math.isinf(numeric):
+            return default
+        return numeric
+
+    expected_edge = _coerce_edge(
+        request.expected_edge_bps,
+        _coerce_edge(online_payload.get("expected_edge_bps"), 0.0),
+    )
 
     if book_snapshot_payload is None or state_payload is None:
         raise HTTPException(
@@ -160,15 +185,17 @@ def decide_policy(
         ),
     )
 
-    take_profit_bps = (
-        request.take_profit_bps
-        or online_features.get("take_profit_bps")
-        or intent.take_profit_bps
+    take_profit_bps = _coerce_edge(
+        request.take_profit_bps,
+        _coerce_edge(
+            online_payload.get("take_profit_bps"), intent.take_profit_bps
+        ),
     )
-    stop_loss_bps = (
-        request.stop_loss_bps
-        or online_features.get("stop_loss_bps")
-        or intent.stop_loss_bps
+    stop_loss_bps = _coerce_edge(
+        request.stop_loss_bps,
+        _coerce_edge(
+            online_payload.get("stop_loss_bps"), intent.stop_loss_bps
+        ),
     )
 
     expected_edge = intent.edge_bps if intent.edge_bps is not None else expected_edge
