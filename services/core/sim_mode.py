@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import datetime
 from typing import Optional
@@ -54,10 +53,13 @@ class SimModeTransitionResponse(SimModeStatusResponse):
         return cls.model_validate(payload)
 
 
-def _publish_event(status: SimModeStatus, actor: str) -> None:
+async def _publish_event(status: SimModeStatus, actor: str) -> None:
     adapter = KafkaNATSAdapter(account_id="platform")
     event = SimModeEvent(active=status.active, reason=status.reason, ts=status.ts, actor=actor)
-    asyncio.run(adapter.publish("platform.sim_mode", event.model_dump(mode="json")))
+    try:
+        await adapter.publish("platform.sim_mode", event.model_dump(mode="json"))
+    except Exception:
+        LOGGER.exception("Failed to publish simulation mode event", extra={"actor": actor})
 
 
 async def _sync_runtime_state(active: bool) -> None:
@@ -126,7 +128,7 @@ async def enter_simulation_mode(
 
     after = await sim_mode_repository.set_status_async(True, payload.reason)
     await _sync_runtime_state(True)
-    _publish_event(after, actor)
+    await _publish_event(after, actor)
     _audit_transition(before, after, actor, request)
     return SimModeTransitionResponse.from_status(after, actor)
 
@@ -151,7 +153,7 @@ async def exit_simulation_mode(
 
     after = await sim_mode_repository.set_status_async(False, None)
     await _sync_runtime_state(False)
-    _publish_event(after, actor)
+    await _publish_event(after, actor)
     _audit_transition(before, after, actor, request)
     return SimModeTransitionResponse.from_status(after, actor)
 
