@@ -16,20 +16,23 @@ import math
 import os
 import time
 from contextlib import contextmanager
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from functools import partial
 from threading import Lock
-from typing import Dict, Iterator, Optional, Tuple
+from typing import Awaitable, Dict, Iterator, Optional, Tuple
 
 from sqlalchemy import Boolean, Column, DateTime, Integer, Numeric, String, Text, create_engine, select, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.engine.url import make_url
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from common.schemas.contracts import FillEvent
 from services.common.adapters import KafkaNATSAdapter
+from shared.postgres import normalize_sqlalchemy_dsn
 
 
 LOGGER = logging.getLogger(__name__)
@@ -39,29 +42,71 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+_TEST_DSN_ENV = "AETHER_SIM_MODE_TEST_DSN"
+_IN_MEMORY_SQLITE_URL = "sqlite+pysqlite:///:memory:"
+
+
 def _database_url() -> str:
-    candidates = [os.getenv("SIM_MODE_DATABASE_URL"), os.getenv("DATABASE_URL")]
+    candidates = [os.getenv("SIM_MODE_DATABASE_URL"), os.getenv("DATABASE_URL"), os.getenv(_TEST_DSN_ENV)]
+    if "pytest" in sys.modules:
+        candidates.append(_IN_MEMORY_SQLITE_URL)
+
     for candidate in candidates:
         if not candidate:
             continue
-        normalized = candidate
-        if normalized.startswith("postgres://"):
-            normalized = "postgresql://" + normalized.split("://", 1)[1]
+
+        try:
+            normalized = normalize_sqlalchemy_dsn(
+                candidate,
+                allow_sqlite=True,
+                label="Simulation mode DSN",
+            )
+        except RuntimeError as exc:  # pragma: no cover - defensive validation
+            raise RuntimeError("Invalid simulation mode database URL") from exc
+
         try:
             url_obj = make_url(normalized)
         except Exception as exc:  # pragma: no cover - defensive validation
             raise RuntimeError("Invalid simulation mode database URL") from exc
 
         driver = url_obj.drivername.lower()
-        if driver.startswith("postgresql") or driver.startswith("timescale"):
-            return str(url_obj)
+        if driver.startswith("postgresql"):
+            return normalized
+
+        if driver.startswith("sqlite"):
+            if candidate == _IN_MEMORY_SQLITE_URL:
+                LOGGER.warning("Simulation mode DSN missing; using in-memory SQLite for tests")
+                return normalized
+            if candidate == os.getenv(_TEST_DSN_ENV):
+                LOGGER.warning("Simulation mode DSN missing; using %s for tests", _TEST_DSN_ENV)
+                return normalized
+            raise RuntimeError(
+                "Simulation mode requires a PostgreSQL/TimescaleDB DSN; received sqlite://"
+            )
+
         raise RuntimeError(
             "Simulation mode requires a PostgreSQL/TimescaleDB DSN; "
             f"received driver '{url_obj.drivername}'."
         )
+
     raise RuntimeError(
         "SIM_MODE_DATABASE_URL (or DATABASE_URL) must be set to a PostgreSQL/TimescaleDB DSN."
     )
+
+
+def _dispatch_async(coro: Awaitable[None], *, context: str) -> None:
+    async def _run() -> None:
+        try:
+            await coro
+        except Exception:  # pragma: no cover - defensive logging
+            LOGGER.exception("Failed to publish %s", context)
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.run(_run())
+    else:
+        loop.create_task(_run())
 
 
 def _engine() -> Engine:
@@ -81,7 +126,10 @@ def _engine() -> Engine:
             pool_timeout=int(os.getenv("SIM_MODE_DB_POOL_TIMEOUT", "30")),
             pool_recycle=int(os.getenv("SIM_MODE_DB_POOL_RECYCLE", "1800")),
         )
-    else:  # pragma: no cover - only exercised in tests with alternative engines
+    elif driver.startswith("sqlite"):  # pragma: no cover - only exercised in tests with alternative engines
+        connect_args["check_same_thread"] = False
+        engine_kwargs["poolclass"] = StaticPool
+    else:  # pragma: no cover - defensive guard for unexpected drivers
         connect_args["check_same_thread"] = False
 
     if connect_args:
@@ -474,7 +522,10 @@ class SimBroker:
                 liquidity=execution.liquidity,
                 ts=_utcnow(),
             )
-            asyncio.run(adapter.publish("oms.fills.simulated", event.model_dump(mode="json")))
+            _dispatch_async(
+                adapter.publish("oms.fills.simulated", event.model_dump(mode="json")),
+                context="simulated fill event",
+            )
         return execution
 
     def cancel_order(self, account_id: str, client_id: str) -> Optional[SimulatedOrderSnapshot]:
