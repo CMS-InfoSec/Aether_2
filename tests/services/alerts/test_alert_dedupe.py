@@ -9,7 +9,12 @@ from types import SimpleNamespace
 import pytest
 from prometheus_client import CollectorRegistry
 
-from services.alerts.alert_dedupe import AlertDedupeMetrics, AlertDedupeService, AlertPolicy
+from services.alerts.alert_dedupe import (
+    AlertDedupeMetrics,
+    AlertDedupeService,
+    AlertPolicy,
+    HTTPException,
+)
 
 
 def _metric_value(metric: object) -> float:
@@ -166,3 +171,87 @@ async def test_alert_dedupe_uses_configured_http_timeout(monkeypatch: pytest.Mon
 
     assert isinstance(client, DummyAsyncClient)
     assert created["timeout"] == 7.5
+
+
+@pytest.mark.asyncio
+async def test_default_fetch_converts_request_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    class DummyRequestError(Exception):
+        pass
+
+    class DummyTimeout(DummyRequestError):
+        pass
+
+    class DummyHTTPStatusError(Exception):
+        pass
+
+    class DummyClient:
+        async def get(self, url: str) -> None:  # pragma: no cover - runtime path
+            raise DummyRequestError("boom")
+
+    fake_httpx = SimpleNamespace(
+        AsyncClient=lambda *args, **kwargs: DummyClient(),
+        RequestError=DummyRequestError,
+        TimeoutException=DummyTimeout,
+        HTTPStatusError=DummyHTTPStatusError,
+    )
+
+    original = sys.modules.get("httpx")
+    monkeypatch.setitem(sys.modules, "httpx", fake_httpx)
+
+    try:
+        metrics = AlertDedupeMetrics(registry=CollectorRegistry())
+        service = AlertDedupeService(metrics=metrics)
+        service._client = DummyClient()
+
+        with pytest.raises(HTTPException) as excinfo:
+            await service._default_fetch()
+    finally:
+        if original is None:
+            monkeypatch.delitem(sys.modules, "httpx", raising=False)
+        else:
+            monkeypatch.setitem(sys.modules, "httpx", original)
+
+    assert excinfo.value.status_code == 502
+    assert "Alertmanager request failed" in excinfo.value.detail
+
+
+@pytest.mark.asyncio
+async def test_default_fetch_converts_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    class DummyRequestError(Exception):
+        pass
+
+    class DummyTimeout(DummyRequestError):
+        pass
+
+    class DummyHTTPStatusError(Exception):
+        pass
+
+    class DummyClient:
+        async def get(self, url: str) -> None:  # pragma: no cover - runtime path
+            raise DummyTimeout("boom")
+
+    fake_httpx = SimpleNamespace(
+        AsyncClient=lambda *args, **kwargs: DummyClient(),
+        RequestError=DummyRequestError,
+        TimeoutException=DummyTimeout,
+        HTTPStatusError=DummyHTTPStatusError,
+    )
+
+    original = sys.modules.get("httpx")
+    monkeypatch.setitem(sys.modules, "httpx", fake_httpx)
+
+    try:
+        metrics = AlertDedupeMetrics(registry=CollectorRegistry())
+        service = AlertDedupeService(metrics=metrics)
+        service._client = DummyClient()
+
+        with pytest.raises(HTTPException) as excinfo:
+            await service._default_fetch()
+    finally:
+        if original is None:
+            monkeypatch.delitem(sys.modules, "httpx", raising=False)
+        else:
+            monkeypatch.setitem(sys.modules, "httpx", original)
+
+    assert excinfo.value.status_code == 504
+    assert "timed out" in excinfo.value.detail
