@@ -1,11 +1,13 @@
-"""Advanced market microstructure and risk signal service.
+"""Advanced USD spot-market microstructure and risk signal service.
 
 This FastAPI application bundles together a selection of advanced
-microstructure analytics that we rely on for monitoring derivatives and
-spot venues.  The handlers source market data directly from the
-authoritative TimescaleDB-backed market-data store via pluggable adapters
-so results reflect the latest production context while remaining fully
-testable using recorded fixtures.
+microstructure analytics for our **spot-only** trading programme.  The
+handlers source market data directly from the authoritative
+TimescaleDB-backed market-data store via pluggable adapters so results
+reflect the latest production context while remaining fully testable using
+recorded fixtures.  Every endpoint validates requested instruments to
+guarantee we never operate on derivatives, margin markets, or non-USD
+pairs.
 """
 
 from __future__ import annotations
@@ -39,6 +41,7 @@ from services.common import security
 from services.common.security import require_admin_account
 from shared.postgres import normalize_postgres_schema, normalize_sqlalchemy_dsn
 from shared.session_config import load_session_ttl_minutes
+from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 
 logger = logging.getLogger(__name__)
@@ -492,12 +495,31 @@ def _market_data_adapter() -> MarketDataAdapter:
     return adapter
 
 
+def _require_spot_symbol(symbol: str, *, param_name: str) -> str:
+    """Validate *symbol* as a USD spot trading pair.
+
+    Any derivatives, leveraged tokens, or non-USD quotes are rejected with a
+    ``422`` error so downstream analytics are guaranteed to run on compliant
+    data only.
+    """
+
+    normalized = normalize_spot_symbol(symbol)
+    if not normalized or not is_spot_symbol(normalized):
+        logger.warning("Rejecting non-spot symbol for %s: %s", param_name, symbol)
+        raise HTTPException(
+            status_code=422,
+            detail=f"{param_name} must reference a USD spot trading pair",
+        )
+    return normalized
+
+
 @app.get("/signals/orderflow/{symbol}", response_model=OrderFlowResponse)
 def order_flow_signals(
     symbol: str,
     window: int = Query(300, ge=60, le=3600),
     _caller: str = Depends(require_admin_account),
 ) -> OrderFlowResponse:
+    symbol = _require_spot_symbol(symbol, param_name="symbol")
     adapter = _market_data_adapter()
     try:
         trades = adapter.recent_trades(symbol, window=window)
@@ -538,6 +560,8 @@ def cross_asset_signals(
     max_lag: int = Query(10, ge=1, le=50),
     _caller: str = Depends(require_admin_account),
 ) -> CrossAssetResponse:
+    base_symbol = _require_spot_symbol(base_symbol, param_name="base_symbol")
+    alt_symbol = _require_spot_symbol(alt_symbol, param_name="alt_symbol")
     adapter = _market_data_adapter()
     try:
         base_series = adapter.price_history(base_symbol, length=window)
@@ -571,6 +595,7 @@ def volatility_signals(
     horizon: int = Query(12, ge=1, le=60),
     _caller: str = Depends(require_admin_account),
 ) -> VolatilityResponse:
+    symbol = _require_spot_symbol(symbol, param_name="symbol")
     adapter = _market_data_adapter()
     try:
         prices = adapter.price_history(symbol, length=window)
@@ -598,6 +623,7 @@ def whale_signals(
     threshold_sigma: float = Query(2.5, ge=1.0, le=6.0),
     _caller: str = Depends(require_admin_account),
 ) -> WhaleResponse:
+    symbol = _require_spot_symbol(symbol, param_name="symbol")
     adapter = _market_data_adapter()
     try:
         trades = adapter.recent_trades(symbol, window=window)
@@ -625,6 +651,7 @@ def stress_test_signals(
     window: int = Query(240, ge=60, le=960),
     _caller: str = Depends(require_admin_account),
 ) -> StressTestResponse:
+    symbol = _require_spot_symbol(symbol, param_name="symbol")
     adapter = _market_data_adapter()
     try:
         prices = adapter.price_history(symbol, length=window)

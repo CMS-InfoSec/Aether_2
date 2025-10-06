@@ -304,7 +304,7 @@ def test_timescale_adapter_price_history(timescale_adapter: TimescaleMarketDataA
 
 
 def test_signal_order_flow_endpoint(signal_client: TestClient, signal_admin_headers: dict[str, str]):
-    response = signal_client.get("/signals/orderflow/BTC-USD", params={"window": 600}, headers=signal_admin_headers)
+    response = signal_client.get("/signals/orderflow/btc-usd", params={"window": 600}, headers=signal_admin_headers)
     assert response.status_code == 200
     payload = response.json()
     assert payload["symbol"] == "BTC-USD"
@@ -314,12 +314,13 @@ def test_signal_order_flow_endpoint(signal_client: TestClient, signal_admin_head
 
 def test_signal_volatility_endpoint(signal_client: TestClient, signal_admin_headers: dict[str, str]):
     response = signal_client.get(
-        "/signals/volatility/BTC-USD",
+        "/signals/volatility/ETH-USD",
         params={"window": 60, "horizon": 5},
         headers=signal_admin_headers,
     )
     assert response.status_code == 200
     payload = response.json()
+    assert payload["symbol"] == "ETH-USD"
     assert payload["variance"] > 0
     assert len(payload["forecasts"]) == 5
 
@@ -327,11 +328,13 @@ def test_signal_volatility_endpoint(signal_client: TestClient, signal_admin_head
 def test_signal_crossasset_endpoint(signal_client: TestClient, signal_admin_headers: dict[str, str]):
     response = signal_client.get(
         "/signals/crossasset",
-        params={"base_symbol": "BTC-USD", "alt_symbol": "ETH-USD", "window": 60, "max_lag": 5},
+        params={"base_symbol": "btc-usd", "alt_symbol": "eth-usd", "window": 60, "max_lag": 5},
         headers=signal_admin_headers,
     )
     assert response.status_code == 200
     payload = response.json()
+    assert payload["base_symbol"] == "BTC-USD"
+    assert payload["alt_symbol"] == "ETH-USD"
     assert payload["correlation"] > 0
 
 
@@ -356,6 +359,26 @@ def test_signal_stress_endpoint(signal_client: TestClient, signal_admin_headers:
     payload = response.json()
     assert "flash_crash" in payload
     assert "spread_widening" in payload
+
+
+def test_signal_order_flow_rejects_derivative(signal_client: TestClient, signal_admin_headers: dict[str, str]):
+    response = signal_client.get(
+        "/signals/orderflow/BTC-PERP",
+        params={"window": 600},
+        headers=signal_admin_headers,
+    )
+    assert response.status_code == status.HTTP_422_UNPROCESSABLE_CONTENT
+    assert "USD spot" in response.json()["detail"]
+
+
+def test_signal_crossasset_rejects_non_spot(signal_client: TestClient, signal_admin_headers: dict[str, str]):
+    response = signal_client.get(
+        "/signals/crossasset",
+        params={"base_symbol": "BTC-USD", "alt_symbol": "ETH-PERP", "window": 60, "max_lag": 5},
+        headers=signal_admin_headers,
+    )
+    assert response.status_code == status.HTTP_422_UNPROCESSABLE_CONTENT
+    assert "USD spot" in response.json()["detail"]
 
 
 def test_signal_service_requires_dsn(monkeypatch: pytest.MonkeyPatch):
