@@ -8,6 +8,7 @@ import importlib
 import json
 import logging
 import os
+import sys
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Deque, Iterable, List, Mapping, MutableMapping, Optional
@@ -34,16 +35,44 @@ from sqlalchemy import Column, DateTime, Float, MetaData, String, Table, Text, c
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Engine
 
+from shared.postgres import normalize_sqlalchemy_dsn
+
 from services.ingest import EventOrderingBuffer, OrderedEvent
 
 LOGGER = logging.getLogger(__name__)
 
+_SQLITE_FALLBACK_FLAG = "FEATURE_JOBS_ALLOW_SQLITE_FOR_TESTS"
+
+
+def _resolve_database_url() -> str:
+    """Return the managed Timescale/PostgreSQL DSN required for ingestion."""
+
+    raw_url = os.getenv("DATABASE_URL", "")
+    if not raw_url.strip():
+        raise RuntimeError(
+            "Feature jobs ingestion requires DATABASE_URL to be set to a PostgreSQL/Timescale DSN."
+        )
+
+    allow_sqlite = "pytest" in sys.modules or os.getenv(_SQLITE_FALLBACK_FLAG) == "1"
+    database_url = normalize_sqlalchemy_dsn(
+        raw_url.strip(),
+        allow_sqlite=allow_sqlite,
+        label="Feature jobs database URL",
+    )
+
+    if database_url.startswith("sqlite"):
+        LOGGER.warning(
+            "Using SQLite database '%s' for feature jobs ingestion; allowed only for tests.",
+            database_url,
+        )
+
+    return database_url
+
+
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 KAFKA_CONSUMER_GROUP = os.getenv("FEATURE_JOB_CONSUMER_GROUP", "aether-feature-jobs")
 FEATURE_REPO_PATH = os.getenv("FEATURE_REPO_PATH", os.path.join("data", "feast"))
-DATABASE_URL = os.getenv(
-    "DATABASE_URL", "postgresql+psycopg2://aether:aether@localhost:5432/aether"
-)
+DATABASE_URL = _resolve_database_url()
 FEATURE_VIEW_NAME = os.getenv(
     "FEATURE_VIEW_NAME", "market_microstructure_features"
 )

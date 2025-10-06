@@ -8,6 +8,7 @@ import logging
 import os
 
 import math
+import re
 
 import time
 from contextlib import contextmanager
@@ -487,6 +488,48 @@ _STUB_FILLS: List[Dict[str, object]] = [
         "fee": 125.0,
     }
 ]
+
+
+_SPOT_PAIR_PATTERN = re.compile(r"^[A-Z0-9]{2,}[-/][A-Z0-9]{2,}$")
+_NON_SPOT_KEYWORDS = ("PERP", "FUT", "FUTURE", "MARGIN", "SWAP", "OPTION", "DERIV")
+_LEVERAGE_SUFFIXES = ("UP", "DOWN")
+_LEVERAGE_PATTERN = re.compile(r"\d+(?:X|L|S)$")
+
+
+def _is_spot_instrument(symbol: str) -> bool:
+    """Return ``True`` when *symbol* appears to represent a spot market pair."""
+
+    normalized = str(symbol or "").strip().upper()
+    if not normalized:
+        return False
+    if any(keyword in normalized for keyword in _NON_SPOT_KEYWORDS):
+        return False
+    if not _SPOT_PAIR_PATTERN.match(normalized):
+        return False
+    base, _ = re.split(r"[-/]", normalized, maxsplit=1)
+    if any(base.endswith(suffix) for suffix in _LEVERAGE_SUFFIXES):
+        return False
+    if _LEVERAGE_PATTERN.search(base):
+        return False
+    return True
+
+
+def _filter_spot_instruments(symbols: Iterable[str]) -> List[str]:
+    """Return normalized spot symbols, discarding non-spot entries."""
+
+    filtered: List[str] = []
+    seen: Set[str] = set()
+    for symbol in symbols:
+        normalized = str(symbol or "").strip().upper()
+        if not normalized:
+            continue
+        if not _is_spot_instrument(normalized):
+            logger.warning("Ignoring non-spot instrument '%s' in spot-only context", symbol)
+            continue
+        if normalized not in seen:
+            filtered.append(normalized)
+            seen.add(normalized)
+    return filtered
 
 
 class TradeIntent(BaseModel):
