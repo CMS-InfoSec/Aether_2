@@ -22,6 +22,7 @@ from auth.session_client import AdminSessionManager, get_default_session_manager
 from common.utils import tracing
 from exchange_adapter import get_exchange_adapter
 from services.common.adapters import KafkaNATSAdapter
+from services.common.schemas import FeeBreakdown, PolicyDecisionRequest, PolicyDecisionResponse
 
 from services.common.security import require_admin_account
 
@@ -41,6 +42,8 @@ from metrics import (
     get_request_id,
 )
 
+from shared.spot import is_spot_symbol, normalize_spot_symbol
+
 
 LOGGER = logging.getLogger("sequencer")
 
@@ -55,6 +58,12 @@ DEFAULT_PUBLISH_TIMEOUT = float(os.getenv("SEQUENCER_PUBLISH_TIMEOUT", "1.0"))
 
 POLICY_SERVICE_URL = os.getenv("POLICY_SERVICE_URL", "http://policy-service").strip()
 POLICY_DECISION_ENDPOINT = os.getenv("POLICY_DECISION_ENDPOINT", "/policy/decide").strip()
+
+
+RISK_SERVICE_URL = os.getenv("RISK_SERVICE_URL", "http://risk-service").strip()
+RISK_SERVICE_TIMEOUT = float(os.getenv("RISK_SERVICE_TIMEOUT", str(DEFAULT_RISK_TIMEOUT)))
+RISK_SERVICE_MAX_RETRIES = int(os.getenv("RISK_SERVICE_MAX_RETRIES", "2"))
+RISK_SERVICE_BACKOFF_SECONDS = float(os.getenv("RISK_SERVICE_BACKOFF_SECONDS", "0.25"))
 
 
 RECENT_RUN_CAPACITY = int(os.getenv("SEQUENCER_HISTORY_SIZE", "200"))
@@ -236,6 +245,33 @@ class StageTimeoutError(StageError):
 
 class StageFailedError(StageError):
     """Raised when a stage fails for reasons other than timeout."""
+
+
+def _normalize_intent_for_spot(intent: Mapping[str, Any]) -> Dict[str, Any]:
+    """Validate and normalise the instrument on *intent* for spot trading."""
+
+    instrument_raw = str(intent.get("instrument") or intent.get("symbol") or "").strip()
+    if not instrument_raw:
+        raise StageFailedError(
+            "policy",
+            "Intent instrument is required for policy evaluation",
+            details={"instrument": instrument_raw},
+        )
+
+    normalized = normalize_spot_symbol(instrument_raw)
+    if not normalized or not is_spot_symbol(normalized):
+        raise StageFailedError(
+            "policy",
+            f"Instrument '{instrument_raw}' is not a supported spot market pair.",
+            details={"instrument": instrument_raw},
+        )
+
+    normalized_intent = dict(intent)
+    normalized_intent["instrument"] = normalized
+    if "symbol" in normalized_intent:
+        normalized_intent["symbol"] = normalized
+
+    return normalized_intent
 
 
 @dataclass
@@ -424,20 +460,10 @@ class SequencerPipeline:
         fill_event: Optional[Dict[str, Any]] = None
         total_latency: float = 0.0
 
+        pipeline_started = False
+        payload: Dict[str, Any] = {"intent": intent_payload}
+
         with tracing.correlation_scope(correlation_hint) as correlation_id:
-            tracing.attach_correlation(intent_payload, mutate=True)
-            payload: Dict[str, Any] = {"intent": intent_payload}
-            tracing.attach_correlation(payload, mutate=True)
-
-            await publisher.publish_event(
-                "pipeline",
-                "start",
-                run_id=run_id,
-                intent_id=intent_id,
-                account_id=normalized_account,
-                data={"intent": intent_payload},
-            )
-
             try:
                 with traced_span(
                     "sequencer.pipeline",
@@ -445,6 +471,22 @@ class SequencerPipeline:
                     account_id=normalized_account,
                     intent_id=intent_id,
                 ):
+                    normalized_intent = _normalize_intent_for_spot(intent_payload)
+                    intent_payload = normalized_intent
+                    payload = {"intent": intent_payload}
+                    tracing.attach_correlation(intent_payload, mutate=True)
+                    tracing.attach_correlation(payload, mutate=True)
+
+                    await publisher.publish_event(
+                        "pipeline",
+                        "start",
+                        run_id=run_id,
+                        intent_id=intent_id,
+                        account_id=normalized_account,
+                        data={"intent": intent_payload},
+                    )
+                    pipeline_started = True
+
                     for stage in self._stages:
                         await publisher.publish_event(
                             stage.name,
@@ -522,6 +564,17 @@ class SequencerPipeline:
                         data=completion_payload,
                     )
             except StageError as exc:
+                if not pipeline_started:
+                    tracing.attach_correlation(intent_payload, mutate=True)
+                    await publisher.publish_event(
+                        "pipeline",
+                        "start",
+                        run_id=run_id,
+                        intent_id=intent_id,
+                        account_id=normalized_account,
+                        data={"intent": intent_payload},
+                    )
+                    pipeline_started = True
                 status_value = "failed"
                 error_message = f"{exc.stage}: {exc.message}"
                 increment_rejected_intents(exc.stage, exc.message)
@@ -725,18 +778,17 @@ def _build_policy_request(intent: Mapping[str, Any], ctx: PipelineContext) -> Po
         raise StageFailedError("policy", "Intent payload is missing for policy evaluation")
 
     order_id = str(intent.get("order_id") or intent.get("intent_id") or ctx.intent_id)
-    instrument = str(intent.get("instrument") or intent.get("symbol") or "").strip()
-    if not instrument:
-        raise StageFailedError("policy", "Intent instrument is required for policy evaluation")
+    normalized_intent = _normalize_intent_for_spot(intent)
+    instrument = normalized_intent["instrument"]
 
-    side = _normalize_side(intent.get("side") or intent.get("direction"))
-    quantity = _require_positive_float(intent, ("quantity", "qty"), field="quantity")
+    side = _normalize_side(normalized_intent.get("side") or normalized_intent.get("direction"))
+    quantity = _require_positive_float(normalized_intent, ("quantity", "qty"), field="quantity")
     price = _require_positive_float(
-        intent,
+        normalized_intent,
         ("price", "limit_px", "mid_price"),
         field="price",
     )
-    fee_breakdown = _resolve_fee(intent)
+    fee_breakdown = _resolve_fee(normalized_intent)
 
     request_kwargs: Dict[str, Any] = {
         "account_id": ctx.account_id,
@@ -749,14 +801,14 @@ def _build_policy_request(intent: Mapping[str, Any], ctx: PipelineContext) -> Po
     }
 
     optional_fields = {
-        "features": intent.get("features"),
-        "book_snapshot": intent.get("book_snapshot"),
-        "state": intent.get("state"),
-        "expected_edge_bps": _optional_float(intent.get("expected_edge_bps")),
-        "slippage_bps": _optional_float(intent.get("slippage_bps")),
-        "take_profit_bps": _optional_float(intent.get("take_profit_bps")),
-        "stop_loss_bps": _optional_float(intent.get("stop_loss_bps")),
-        "confidence": intent.get("confidence"),
+        "features": normalized_intent.get("features"),
+        "book_snapshot": normalized_intent.get("book_snapshot"),
+        "state": normalized_intent.get("state"),
+        "expected_edge_bps": _optional_float(normalized_intent.get("expected_edge_bps")),
+        "slippage_bps": _optional_float(normalized_intent.get("slippage_bps")),
+        "take_profit_bps": _optional_float(normalized_intent.get("take_profit_bps")),
+        "stop_loss_bps": _optional_float(normalized_intent.get("stop_loss_bps")),
+        "confidence": normalized_intent.get("confidence"),
     }
     for key, value in optional_fields.items():
         if value is not None:
@@ -959,6 +1011,19 @@ async def oms_handler(payload: Dict[str, Any], ctx: PipelineContext) -> StageRes
         raise StageFailedError("oms", "Risk validation failed")
 
     intent = payload.get("intent", {})
+
+    ack_payload = payload.get("oms_ack")
+    if isinstance(ack_payload, Mapping):
+        ack = dict(ack_payload)
+    else:
+        ack = {}
+
+    fills = list(ack.get("fills") or [])
+    error_values = ack.get("rejection_reasons") or ack.get("errors") or []
+    if isinstance(error_values, Mapping):
+        error_values = error_values.values()
+    errors = [str(reason) for reason in error_values]
+    accepted = bool(ack.get("accepted", True))
 
     client_order_id = intent.get("order_id") or str(uuid.uuid4())
     exchange_order_id = intent.get("exchange_order_id") or f"SIM-{uuid.uuid4().hex[:12]}"
