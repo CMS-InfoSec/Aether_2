@@ -8,7 +8,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, AsyncIterator, Dict, List, Mapping, Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
@@ -426,10 +426,16 @@ async def prioritized_alerts(_: str = Depends(require_admin_account)) -> List[Di
     return await _service.get_prioritized_alerts()
 
 
-@router.on_event("shutdown")
-async def shutdown_prioritizer() -> None:
-    if _service is not None:
-        await _service.close()
+@asynccontextmanager
+async def _lifespan(_: Any) -> AsyncIterator[None]:
+    try:
+        yield
+    finally:
+        if _service is not None:
+            await _service.close()
+
+
+router.lifespan_context = _lifespan  # type: ignore[attr-defined]
 
 
 __all__ = ["router", "AlertPrioritizerService"]
