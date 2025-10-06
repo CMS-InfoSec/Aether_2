@@ -33,6 +33,7 @@ from config.simulation import SimulationConfig, get_simulation_config
 from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
 from services.common.config import get_timescale_session
 from shared.async_utils import dispatch_async
+from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 try:  # pragma: no cover - optional dependency during CI
     import psycopg
@@ -114,6 +115,10 @@ class SimBroker:
     ) -> Dict[str, Any]:
         """Place a simulated order and return the resulting execution summary."""
 
+        normalized_symbol = normalize_spot_symbol(symbol)
+        if not normalized_symbol or not is_spot_symbol(normalized_symbol):
+            raise ValueError(f"SimBroker only supports spot instruments; received {symbol!r}")
+
         normalized_side = self._normalize_side(side)
         normalized_type = self._normalize_type(order_type)
 
@@ -123,7 +128,7 @@ class SimBroker:
         order = SimulatedOrder(
             order_id=str(uuid4()),
             client_order_id=client_order_id,
-            symbol=symbol,
+            symbol=normalized_symbol,
             side=normalized_side,
             order_type=normalized_type,
             quantity=quantity_decimal,
