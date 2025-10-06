@@ -251,6 +251,22 @@ class PortfolioState(BaseModel):
         description="Optional additional portfolio metadata for auditing",
     )
 
+    @model_validator(mode="after")
+    def _normalize_spot_exposures(self) -> "PortfolioState":  # type: ignore[override]
+        if not self.instrument_exposure:
+            return self
+
+        normalized: Dict[str, float] = {}
+        for symbol, exposure in self.instrument_exposure.items():
+            canonical = normalize_spot_symbol(symbol)
+            if not canonical or not is_spot_symbol(canonical):
+                raise ValueError("instrument_exposure must only contain spot market symbols.")
+
+            normalized[canonical] = normalized.get(canonical, 0.0) + float(exposure)
+
+        self.instrument_exposure = normalized
+        return self
+
 
 class RiskValidationRequest(BaseModel):
     account_id: str = Field(..., description="Trading account identifier")

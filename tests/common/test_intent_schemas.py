@@ -8,6 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from common.schemas.intents import Fill, Order
+from services.common.schemas import PortfolioState
 
 
 def _timestamp() -> datetime:
@@ -63,4 +64,32 @@ def test_fill_rejects_non_spot_symbol() -> None:
             fee=1.0,
             liquidity="TAKER",
             ts=_timestamp(),
+        )
+
+
+def test_portfolio_state_normalizes_spot_exposures() -> None:
+    state = PortfolioState(
+        nav=1_000_000.0,
+        loss_to_date=0.0,
+        fee_to_date=0.0,
+        instrument_exposure={
+            "eth/usd": 125_000.0,
+            "ETH-USD": 5_000.0,
+            "btc-usd": 250_000.0,
+        },
+    )
+
+    assert state.instrument_exposure == {
+        "ETH-USD": pytest.approx(130_000.0),
+        "BTC-USD": pytest.approx(250_000.0),
+    }
+
+
+def test_portfolio_state_rejects_derivative_exposures() -> None:
+    with pytest.raises(ValidationError, match="spot market symbols"):
+        PortfolioState(
+            nav=1_000_000.0,
+            loss_to_date=0.0,
+            fee_to_date=0.0,
+            instrument_exposure={"BTC-PERP": 125_000.0},
         )
