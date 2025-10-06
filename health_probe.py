@@ -22,7 +22,7 @@ from prometheus_client import Gauge, start_http_server
 
 
 DEFAULT_ACCOUNT_ID = "ACC-DEFAULT"
-DEFAULT_SYMBOL = "AAPL"
+DEFAULT_SYMBOL = "BTC-USD"
 DEFAULT_INTERVAL = 300.0
 DEFAULT_ALERTMANAGER_URL = os.getenv("ALERTMANAGER_URL", "http://alertmanager:9093")
 DEFAULT_WS_BOOK_HEALTH_URL = os.getenv("WS_BOOK_HEALTH_URL")
