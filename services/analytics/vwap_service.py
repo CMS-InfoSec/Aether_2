@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from functools import lru_cache
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -25,14 +26,31 @@ from sqlalchemy import (
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.pool import StaticPool
 
 from services.common.security import require_admin_account
+from shared.postgres import normalize_postgres_schema, normalize_sqlalchemy_dsn
 
 
 LOGGER = logging.getLogger(__name__)
 
-DEFAULT_DATABASE_URL = "sqlite:///./analytics.db"
 DEFAULT_WINDOW_SECONDS = int(os.getenv("VWAP_WINDOW_SECONDS", "300"))
+_SQLITE_FALLBACK = "sqlite+pysqlite:///:memory:"
+_DATABASE_ENV_KEYS = (
+    "VWAP_DATABASE_URL",
+    "TIMESCALE_DATABASE_URI",
+    "TIMESCALE_DSN",
+    "DATABASE_URL",
+)
+
+
+def _engine_options(url: str) -> dict[str, object]:
+    options: dict[str, object] = {"future": True, "pool_pre_ping": True}
+    if url.startswith("sqlite"):
+        options.setdefault("connect_args", {"check_same_thread": False})
+        if ":memory:" in url:
+            options["poolclass"] = StaticPool
+    return options
 
 
 class VWAPComputationError(RuntimeError):
@@ -83,7 +101,8 @@ class VWAPAnalyticsService:
         window_seconds: int = DEFAULT_WINDOW_SECONDS,
         schema: str | None = None,
     ) -> None:
-        self._engine = engine or create_engine(self._database_url(), future=True, pool_pre_ping=True)
+        database_url = self._database_url()
+        self._engine = engine or create_engine(database_url, **_engine_options(database_url))
         self._schema = self._resolve_schema(self._engine, schema)
         self._window = timedelta(seconds=max(1, window_seconds))
 
@@ -111,20 +130,50 @@ class VWAPAnalyticsService:
 
     @staticmethod
     def _database_url() -> str:
-        url = os.getenv("TIMESCALE_DATABASE_URI") or os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
-        if url.startswith("postgresql://"):
-            url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
-        if url.startswith("postgres://"):
-            url = url.replace("postgres://", "postgresql+psycopg2://", 1)
-        return url
+        allow_sqlite = "pytest" in sys.modules
+        label = "VWAP analytics database DSN"
+
+        for key in _DATABASE_ENV_KEYS:
+            raw = os.getenv(key)
+            if raw is None:
+                continue
+            candidate = raw.strip()
+            if not candidate:
+                continue
+            return normalize_sqlalchemy_dsn(
+                candidate,
+                allow_sqlite=allow_sqlite,
+                label=label,
+            )
+
+        if allow_sqlite:
+            return normalize_sqlalchemy_dsn(
+                _SQLITE_FALLBACK,
+                allow_sqlite=True,
+                label=label,
+            )
+
+        raise RuntimeError(
+            "VWAP analytics database DSN is not configured. Set VWAP_DATABASE_URL "
+            "or TIMESCALE_DATABASE_URI to a PostgreSQL/Timescale connection string."
+        )
 
     @staticmethod
     def _resolve_schema(engine: Engine, requested: str | None) -> str | None:
-        if requested:
-            return requested
         if engine.dialect.name == "sqlite":
             return None
-        return os.getenv("VWAP_SCHEMA") or os.getenv("TIMESCALE_SCHEMA") or "public"
+        label = "VWAP schema"
+        if requested:
+            return normalize_postgres_schema(requested, label=label)
+        for key in ("VWAP_SCHEMA", "TIMESCALE_SCHEMA"):
+            raw = os.getenv(key)
+            if raw is None:
+                continue
+            candidate = raw.strip()
+            if not candidate:
+                continue
+            return normalize_postgres_schema(candidate, label=label)
+        return "public"
 
     def compute(self, symbol: str) -> VWAPDivergenceResponse:
         if not symbol:
