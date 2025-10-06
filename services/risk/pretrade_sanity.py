@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from threading import Lock
 from typing import TYPE_CHECKING, Deque, Dict, MutableMapping, Protocol
@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
 from services.common.security import require_admin_account
+from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 __all__ = [
     "OrderContext",
@@ -247,6 +248,7 @@ class PretradeSanityChecker:
     SPREAD_LIMIT = "spread_limit"
     CIRCUIT_BREAKER = "circuit_breaker"
     RATE_LIMIT = "rate_limit"
+    SPOT_ELIGIBILITY = "spot_eligibility"
 
     def __init__(
         self,
@@ -322,6 +324,22 @@ class PretradeSanityChecker:
         evaluation_time = now or datetime.now(timezone.utc)
         action = "proceed"
         reasons: list[str] = []
+
+        original_symbol = str(context.symbol)
+        normalized_symbol = normalize_spot_symbol(original_symbol)
+        if not normalized_symbol or not is_spot_symbol(normalized_symbol):
+            reason = (
+                f"Instrument {original_symbol} is not eligible for spot trading. Rejecting order."
+            )
+            self._record_failure(
+                context,
+                invariant=self.SPOT_ELIGIBILITY,
+                action="reject",
+                reason=reason,
+            )
+            return SanityDecision(action="reject", reasons=[reason], timestamp=evaluation_time)
+
+        context = replace(context, symbol=normalized_symbol)
 
         spread_bps = observed_spread_bps
         snapshot: MarketSnapshot | None = None
@@ -403,17 +421,30 @@ class PretradeSanityChecker:
         """Convenience wrapper that extracts context from a validation request."""
 
         policy_request = request.intent.policy_decision.request
-        symbol = request.instrument or policy_request.instrument
+        raw_symbol = request.instrument or policy_request.instrument
+        normalized_symbol = normalize_spot_symbol(raw_symbol)
         notional = request.gross_notional
         if notional is None:
             notional = request.intent.metrics.gross_notional
         context = OrderContext(
             account_id=request.account_id,
-            symbol=str(symbol),
+            symbol=normalized_symbol or str(raw_symbol),
             side=str(policy_request.side),
             notional=float(notional or 0.0),
             is_hedge=self._is_hedge_request(request),
         )
+
+        if not normalized_symbol or not is_spot_symbol(normalized_symbol):
+            reason = (
+                f"Instrument {raw_symbol} is not eligible for spot trading. Rejecting order."
+            )
+            self._record_failure(
+                context,
+                invariant=self.SPOT_ELIGIBILITY,
+                action="reject",
+                reason=reason,
+            )
+            return SanityDecision(action="reject", reasons=[reason], timestamp=datetime.now(timezone.utc))
 
         spread = request.spread_bps
         if spread is None and request.intent.book_snapshot is not None:
