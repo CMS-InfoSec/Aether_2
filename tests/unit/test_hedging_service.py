@@ -45,7 +45,7 @@ class _StubTimescale:
 def hedging_config() -> hs.HedgeConfig:
     return hs.HedgeConfig(
         account_id="acct-1",
-        hedge_symbol="ETHBTC",
+        hedge_symbol="eth/btc",
         base_allocation_usd=1_000.0,
         max_allocation_usd=10_000.0,
         rebalance_tolerance_usd=0.0,
@@ -146,3 +146,13 @@ def test_rebalance_requires_precision_metadata(
             price=0.065,
             risk_score=1.2,
         )
+
+
+def test_hedge_config_normalizes_spot_symbol() -> None:
+    config = hs.HedgeConfig(account_id="acct-2", hedge_symbol="  btc_usdt  ")
+    assert config.hedge_symbol == "BTC-USDT"
+
+
+def test_hedge_config_rejects_derivative_symbols() -> None:
+    with pytest.raises(ValueError, match="spot market pair"):
+        hs.HedgeConfig(account_id="acct-3", hedge_symbol="BTC-PERP")
