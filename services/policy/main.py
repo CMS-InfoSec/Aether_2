@@ -1,7 +1,9 @@
 
 from __future__ import annotations
 
-import asyncio
+import logging
+import math
+from collections.abc import Mapping, Sequence
 
 import math
 from collections.abc import Mapping, Sequence
@@ -21,6 +23,7 @@ from services.common.security import require_admin_account
 from shared.models.registry import get_model_registry
 from services.policy.adaptive_horizon import get_horizon
 from services.policy.model_server import predict_intent
+from shared.async_utils import dispatch_async
 
 from metrics import (
     metric_context,
@@ -28,6 +31,8 @@ from metrics import (
     record_drift_score,
     setup_metrics,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 app = FastAPI(title="Policy Service")
 setup_metrics(app, service_name="policy-service")
@@ -211,7 +216,7 @@ def decide_policy(
         fee_adjusted_edge = min(preferred_template.edge_bps, 0.0)
 
     kafka = KafkaNATSAdapter(account_id=account_id)
-    asyncio.run(
+    dispatch_async(
         kafka.publish(
             topic="policy.decisions",
             payload={
@@ -224,8 +229,10 @@ def decide_policy(
                 "confidence": confidence.model_dump(),
                 "selected_action": selected_action,
                 "action_templates": [template.model_dump() for template in action_templates],
-        },
-        )
+            },
+        ),
+        context="publish policy.decisions",
+        logger=LOGGER,
     )
 
     timescale = TimescaleAdapter(account_id=account_id)

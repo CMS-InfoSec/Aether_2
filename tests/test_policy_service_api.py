@@ -391,6 +391,19 @@ def test_policy_decide_normalises_feature_mapping(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(policy_main, "get_model_registry", _fake_registry)
     monkeypatch.setattr(policy_main, "predict_intent", lambda **_: _Intent())
+    dispatched_contexts: list[str] = []
+
+    def _run_dispatch(
+        coro: object,
+        *,
+        context: str,
+        logger: object | None = None,
+    ) -> None:
+        del logger
+        dispatched_contexts.append(context)
+        asyncio.run(coro)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(policy_main, "dispatch_async", _run_dispatch)
     monkeypatch.setattr(policy_main, "KafkaNATSAdapter", _KafkaStub)
     monkeypatch.setattr(policy_main, "RedisFeastAdapter", _RedisStub)
     monkeypatch.setattr(policy_main, "TimescaleAdapter", _TimescaleStub)
@@ -410,6 +423,7 @@ def test_policy_decide_normalises_feature_mapping(monkeypatch: pytest.MonkeyPatc
 
     assert body.features == pytest.approx([0.5, 1.75])
     assert recorded and recorded[-1]["features"] == pytest.approx([0.5, 1.75])
+    assert dispatched_contexts == ["publish policy.decisions"]
 
 
 def test_policy_decide_preserves_tick_precision(
