@@ -13,6 +13,7 @@ from services.common.precision import (
     PrecisionMetadataUnavailable,
     precision_provider,
 )
+from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +110,15 @@ class PositionSizer:
         regime: str | None = None,
     ) -> PositionSizeResult:
         """Return the suggested maximum notional for ``symbol`` with diagnostics."""
+
+        normalized_symbol = normalize_spot_symbol(symbol)
+        if not normalized_symbol or not is_spot_symbol(normalized_symbol):
+            logger.warning(
+                "Rejecting non-spot instrument during position sizing", extra={"symbol": symbol}
+            )
+            raise ValueError("Position sizing only supports spot market instruments.")
+
+        symbol = normalized_symbol
 
         config = self._load_sizing_config()
         resolved_nav = self._resolve_nav(nav)

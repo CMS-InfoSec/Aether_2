@@ -12,6 +12,7 @@ from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence
 
 from reports.storage import ArtifactStorage, TimescaleSession, build_storage_from_env
+from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 LOGGER = logging.getLogger(__name__)
 
@@ -47,6 +48,32 @@ FROM orders AS o
 WHERE o.submitted_at >= %(start)s AND o.submitted_at < %(end)s
 {account_filter}
 """
+
+
+def _canonical_spot_instrument(
+    candidate: Any,
+    *,
+    context: str,
+    details: Mapping[str, object] | None = None,
+) -> str | None:
+    """Return a canonical spot instrument when *candidate* is valid."""
+
+    normalized = normalize_spot_symbol(candidate)
+    if not normalized:
+        return None
+
+    if not is_spot_symbol(normalized):
+        extra = dict(details or {})
+        extra.setdefault("instrument", normalized)
+        LOGGER.warning(
+            "Ignoring non-spot instrument '%s' while processing %s",
+            candidate,
+            context,
+            extra=extra or None,
+        )
+        return None
+
+    return normalized
 
 
 @dataclass
@@ -161,14 +188,27 @@ def fetch_daily_orders(
     order_to_instrument: Dict[str, str] = {}
     for order in orders:
         order_id = str(order["order_id"])
-
-        instrument = (
-            order.get("instrument")
-            or order.get("symbol")
-            or order.get("market")
-            or "UNKNOWN"
+        account_id = str(order.get("account_id", ""))
+        candidates = (
+            order.get("instrument"),
+            order.get("symbol"),
+            order.get("market"),
         )
-        order_to_instrument[order_id] = str(instrument)
+
+        normalized: str | None = None
+        for candidate in candidates:
+            normalized = _canonical_spot_instrument(
+                candidate,
+                context="daily PnL order lookup",
+                details={"order_id": order_id, "account_id": account_id},
+            )
+            if normalized:
+                break
+
+        if not normalized:
+            continue
+
+        order_to_instrument[order_id] = normalized
 
     LOGGER.debug("Fetched %d orders between %s and %s", len(orders), start, end)
     return order_to_instrument
@@ -194,14 +234,31 @@ def compute_daily_pnl(
     for fill in fills:
         account_id = str(fill["account_id"])
         order_id = str(fill["order_id"])
-        instrument = str(
 
-            fill.get("instrument") or order_instruments.get(order_id, "UNKNOWN")
-
+        normalized = _canonical_spot_instrument(
+            fill.get("instrument"),
+            context="daily PnL fill aggregation",
+            details={"order_id": order_id, "account_id": account_id},
         )
-        side = str(fill["side"]).upper()
-        quantity = _to_decimal(fill["size"])
-        price = _to_decimal(fill["price"])
+
+        if not normalized and order_id in order_instruments:
+            normalized = _canonical_spot_instrument(
+                order_instruments[order_id],
+                context="daily PnL order reference",
+                details={"order_id": order_id, "account_id": account_id},
+            )
+
+        if not normalized:
+            LOGGER.debug(
+                "Skipping fill without a canonical spot instrument",
+                extra={"order_id": order_id, "account_id": account_id},
+            )
+            continue
+
+        instrument = normalized
+        side = str(fill.get("side", "")).upper()
+        quantity = _to_decimal(fill.get("size"))
+        price = _to_decimal(fill.get("price"))
         fee = _to_decimal(fill.get("fee", ZERO))
         notional = quantity * price
         signed_notional = notional if side == "SELL" else -notional
