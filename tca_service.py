@@ -40,7 +40,7 @@ from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from services.common.security import require_admin_account
-from shared.postgres import normalize_sqlalchemy_dsn
+from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 try:  # pragma: no cover - optional audit dependency
     from common.utils.audit_logger import hash_ip, log_audit
@@ -926,6 +926,7 @@ def get_tca_report(
     date_str: str | None = Query(None, alias="date", description="Trading day in ISO format"),
     actor_account: str = Depends(require_admin_account),
 ):
+    symbol = _require_spot_symbol(symbol)
     target_date = date.fromisoformat(date_str) if date_str else datetime.now(UTC).date()
     start, end = _daterange_bounds(target_date)
 
@@ -995,6 +996,7 @@ def generate_daily_reports(target_date: date | None = None) -> list[TCAReportMod
     target = target_date or (datetime.now(UTC) - timedelta(days=1)).date()
     start, end = _daterange_bounds(target)
     reports: list[TCAReportModel] = []
+    seen_pairs: set[tuple[str, str]] = set()
 
     with SessionLocal() as session:
         try:
@@ -1016,18 +1018,33 @@ def generate_daily_reports(target_date: date | None = None) -> list[TCAReportMod
             LOGGER.exception("Failed to enumerate executions for TCA report job")
             raise
 
-        for account_id, symbol in pairs_result:
+        for account_id, raw_symbol in pairs_result:
+            normalized_symbol = normalize_spot_symbol(raw_symbol)
+            if not normalized_symbol or not is_spot_symbol(normalized_symbol):
+                LOGGER.warning(
+                    "Skipping non-spot instrument during TCA report generation",
+                    extra={"symbol": raw_symbol, "account_id": account_id},
+                )
+                continue
+
+            pair_key = (account_id, normalized_symbol)
+            if pair_key in seen_pairs:
+                continue
+            seen_pairs.add(pair_key)
+
             try:
                 rows = _fetch_execution_rows(
                     session,
                     account_id=account_id,
-                    symbol=symbol,
+                    symbol=normalized_symbol,
                     start=start,
                     end=end,
                 )
             except SQLAlchemyError as exc:  # pragma: no cover - defensive guard
                 LOGGER.exception(
-                    "Failed to fetch execution rows for account=%s symbol=%s", account_id, symbol
+                    "Failed to fetch execution rows for account=%s symbol=%s",
+                    account_id,
+                    normalized_symbol,
                 )
                 continue
 
@@ -1041,7 +1058,7 @@ def generate_daily_reports(target_date: date | None = None) -> list[TCAReportMod
             _persist_report(
                 session,
                 account_id=account_id,
-                symbol=symbol,
+                symbol=normalized_symbol,
                 expected_cost=metrics.expected_cost,
                 realized_cost=metrics.realized_cost,
                 slippage_bps=metrics.slippage_bps,
@@ -1049,7 +1066,7 @@ def generate_daily_reports(target_date: date | None = None) -> list[TCAReportMod
             reports.append(
                 _build_report_response(
                     account_id=account_id,
-                    symbol=symbol,
+                    symbol=normalized_symbol,
                     target_date=target,
                     metrics=metrics,
                 )
@@ -1061,4 +1078,20 @@ def generate_daily_reports(target_date: date | None = None) -> list[TCAReportMod
 
 
 __all__ = ["app", "generate_daily_reports"]
+
+def _require_spot_symbol(symbol: object) -> str:
+    """Normalise *symbol* and ensure it references a supported spot market."""
+
+    normalized = normalize_spot_symbol(symbol)
+    if not normalized:
+        raise HTTPException(status_code=422, detail="Symbol must be provided")
+
+    if not is_spot_symbol(normalized):
+        LOGGER.warning("Rejected non-spot symbol for TCA report", extra={"symbol": symbol})
+        raise HTTPException(
+            status_code=422,
+            detail=f"Symbol '{symbol}' is not a supported spot market instrument",
+        )
+
+    return normalized
 

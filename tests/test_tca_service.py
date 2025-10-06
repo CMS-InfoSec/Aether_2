@@ -195,9 +195,21 @@ def test_tca_report_returns_payload_for_admin(
         trade_count=2,
     )
 
-    monkeypatch.setattr(module, "_fetch_execution_rows", lambda *_, **__: [object()])
+    captured_symbols: list[str] = []
+
+    def _capture_fetch(session, *, account_id, symbol, start, end):
+        captured_symbols.append(symbol)
+        return [object()]
+
+    monkeypatch.setattr(module, "_fetch_execution_rows", _capture_fetch)
     monkeypatch.setattr(module, "_compare_expected_realised", lambda *_: metrics)
-    monkeypatch.setattr(module, "_persist_report", lambda *args, **kwargs: None)
+
+    persisted_symbols: list[str] = []
+
+    def _capture_persist(session, *, account_id, symbol, expected_cost, realized_cost, slippage_bps):
+        persisted_symbols.append(symbol)
+
+    monkeypatch.setattr(module, "_persist_report", _capture_persist)
 
     audit_calls: list[dict[str, object]] = []
     monkeypatch.setattr(module, "log_audit", lambda **kwargs: audit_calls.append(kwargs))
@@ -209,7 +221,7 @@ def test_tca_report_returns_payload_for_admin(
             "/tca/report",
             params={
                 "account_id": "OPS-1",
-                "symbol": "BTC-USD",
+                "symbol": "eth/usd",
                 "date": "2024-01-03",
             },
         )
@@ -219,9 +231,29 @@ def test_tca_report_returns_payload_for_admin(
     assert response.status_code == 200
     payload = response.json()
     assert payload["account_id"] == "OPS-1"
-    assert payload["symbol"] == "BTC-USD"
+    assert payload["symbol"] == "ETH-USD"
     assert payload["trade_count"] == 2
     assert audit_calls and audit_calls[0]["actor"] == "ops-admin"
+    assert captured_symbols == ["ETH-USD"]
+    assert persisted_symbols == ["ETH-USD"]
+
+
+def test_tca_report_rejects_non_spot_symbol(
+    tca_client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, module = tca_client
+
+    client.app.dependency_overrides[module.require_admin_account] = lambda: "ops-admin"
+    try:
+        response = client.get(
+            "/tca/report",
+            params={"account_id": "OPS-1", "symbol": "BTC-PERP"},
+        )
+    finally:
+        client.app.dependency_overrides.pop(module.require_admin_account, None)
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Symbol 'BTC-PERP' is not a supported spot market instrument"
 
 
 def test_trade_report_persists_high_precision_fills(
@@ -364,3 +396,66 @@ def test_tca_report_preserves_decimal_precision(
     assert report_record.expected_cost == expected_metrics.expected_cost.quantize(TWELVE_DP)
     assert report_record.realized_cost == expected_metrics.realized_cost.quantize(TWELVE_DP)
     assert report_record.slippage_bps == expected_metrics.slippage_bps.quantize(TWELVE_DP)
+
+
+def test_generate_daily_reports_filters_non_spot_symbols(
+    tca_client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, module = tca_client
+
+    class DummySession:
+        def __init__(self) -> None:
+            self.committed = False
+
+        def __enter__(self) -> "DummySession":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[override]
+            return None
+
+        def execute(self, query, params):  # noqa: D401 - SQLAlchemy stub
+            return [
+                ("OPS-1", "btc-usd"),
+                ("OPS-1", "BTC-PERP"),
+                ("OPS-2", "ETHDOWN-USD"),
+            ]
+
+        def commit(self) -> None:
+            self.committed = True
+
+    session_instance = DummySession()
+    monkeypatch.setattr(module, "SessionLocal", lambda: session_instance)
+
+    captured_symbols: list[str] = []
+
+    def _capture_fetch(session, *, account_id, symbol, start, end):
+        captured_symbols.append(symbol)
+        return [object()]
+
+    monkeypatch.setattr(module, "_fetch_execution_rows", _capture_fetch)
+
+    metrics = module.ExpectedVsRealised(
+        expected_cost=Decimal("1.00000000"),
+        realized_cost=Decimal("1.00000000"),
+        slippage_bps=Decimal("0.1000"),
+        slippage_cost_usd=Decimal("0.10000000"),
+        fill_quality_bps=Decimal("0.0500"),
+        fee_impact_usd=Decimal("0.01000000"),
+        trade_count=1,
+    )
+
+    monkeypatch.setattr(module, "_compare_expected_realised", lambda *_: metrics)
+
+    persisted_symbols: list[str] = []
+
+    def _capture_persist(session, *, account_id, symbol, expected_cost, realized_cost, slippage_bps):
+        persisted_symbols.append(symbol)
+
+    monkeypatch.setattr(module, "_persist_report", _capture_persist)
+
+    reports = module.generate_daily_reports(target_date=date(2024, 1, 3))
+
+    assert captured_symbols == ["BTC-USD"]
+    assert persisted_symbols == ["BTC-USD"]
+    assert reports and reports[0].symbol == "BTC-USD"
+    assert session_instance.committed is True
