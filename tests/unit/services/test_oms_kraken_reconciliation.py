@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import contextlib
 import sys
 import types
 from decimal import Decimal
@@ -169,6 +170,28 @@ metrics_stub.record_scaling_state = _noop
 metrics_stub.observe_scaling_evaluation = _noop
 metrics_stub.get_request_id = lambda: None
 metrics_stub._REGISTRY = object()
+
+
+class _TransportMember:
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+    def __str__(self) -> str:
+        return self.value
+
+
+class _TransportType:
+    UNKNOWN = _TransportMember("unknown")
+    INTERNAL = _TransportMember("internal")
+    REST = _TransportMember("rest")
+    WEBSOCKET = _TransportMember("websocket")
+    FIX = _TransportMember("fix")
+    BATCH = _TransportMember("batch")
+
+
+metrics_stub.TransportType = _TransportType
+metrics_stub.bind_metric_context = lambda *args, **kwargs: contextlib.nullcontext()
+metrics_stub.metric_context = lambda *args, **kwargs: contextlib.nullcontext()
 sys.modules['metrics'] = metrics_stub
 
 
