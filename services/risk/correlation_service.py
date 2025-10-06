@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -27,8 +28,10 @@ from sqlalchemy import (
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from services.alert_manager import AlertManager, RiskEvent, get_alert_metrics
+from shared.postgres import normalize_sqlalchemy_dsn
 
 
 logger = logging.getLogger(__name__)
@@ -43,12 +46,44 @@ _DEFAULT_CORRELATION_DB_URL = "sqlite:///./risk_correlations.db"
 
 
 def _database_url() -> str:
-    """Return the configured database URL using SQLite as a default."""
+    """Resolve the correlation service database connection string."""
 
-    return os.getenv("RISK_CORRELATION_DATABASE_URL", _DEFAULT_CORRELATION_DB_URL)
+    allow_sqlite = "pytest" in sys.modules
+    raw = (
+        os.getenv("RISK_CORRELATION_DATABASE_URL")
+        or os.getenv("TIMESCALE_DSN")
+        or os.getenv("DATABASE_URL")
+        or (_DEFAULT_CORRELATION_DB_URL if allow_sqlite else None)
+    )
+
+    if raw is None:
+        raise RuntimeError(
+            "Risk correlation database DSN is not configured. "
+            "Set RISK_CORRELATION_DATABASE_URL or TIMESCALE_DSN to a PostgreSQL/Timescale URI.",
+        )
+
+    candidate = raw.strip()
+    if not candidate:
+        raise RuntimeError("Risk correlation database DSN cannot be empty once configured.")
+
+    return normalize_sqlalchemy_dsn(
+        candidate,
+        allow_sqlite=allow_sqlite,
+        label="Risk correlation database DSN",
+    )
 
 
-ENGINE: Engine = create_engine(_database_url(), future=True)
+def _engine_options(url: str) -> dict[str, object]:
+    options: dict[str, object] = {"future": True, "pool_pre_ping": True}
+    if url.startswith("sqlite://"):
+        options.setdefault("connect_args", {"check_same_thread": False})
+        if url.endswith(":memory:"):
+            options["poolclass"] = StaticPool
+    return options
+
+
+_DB_URL = _database_url()
+ENGINE: Engine = create_engine(_DB_URL, **_engine_options(_DB_URL))
 SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
 
 Base = declarative_base()
@@ -99,18 +134,27 @@ _MARKETDATA_ENGINE: Engine | None = None
 
 
 def _marketdata_url() -> str:
+    allow_sqlite = "pytest" in sys.modules
     candidates = (
         os.getenv("RISK_MARKETDATA_URL"),
         os.getenv("RISK_MARKETDATA_DATABASE_URL"),
         os.getenv("TIMESCALE_DATABASE_URI"),
         os.getenv("DATABASE_URL"),
     )
-    for candidate in candidates:
-        if candidate:
-            return candidate
+    for raw in candidates:
+        if not raw:
+            continue
+        candidate = raw.strip()
+        if not candidate:
+            continue
+        return normalize_sqlalchemy_dsn(
+            candidate,
+            allow_sqlite=allow_sqlite,
+            label="Risk market data DSN",
+        )
     raise RuntimeError(
         "Risk correlation service requires RISK_MARKETDATA_URL (or TIMESCALE_DATABASE_URI) "
-        "to load OHLCV history from the market data warehouse."
+        "to load OHLCV history from the market data warehouse.",
     )
 
 
@@ -120,10 +164,7 @@ def _marketdata_engine() -> Engine:
         return _MARKETDATA_ENGINE
 
     url = _marketdata_url()
-    options: dict[str, object] = {"future": True, "pool_pre_ping": True}
-    if url.startswith("sqlite://"):
-        options.setdefault("connect_args", {"check_same_thread": False})
-    _MARKETDATA_ENGINE = create_engine(url, **options)
+    _MARKETDATA_ENGINE = create_engine(url, **_engine_options(url))
     return _MARKETDATA_ENGINE
 
 

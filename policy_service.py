@@ -7,6 +7,7 @@ import asyncio
 import logging
 import math
 import os
+import sys
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, replace
@@ -106,14 +107,25 @@ def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
         store = existing
     else:
         raw_url = os.getenv("SESSION_REDIS_URL")
-        redis_url = (raw_url if raw_url else "memory://policy-service").strip()
+        if raw_url is None:
+            raise RuntimeError(
+                "SESSION_REDIS_URL is not configured. Provide a redis:// DSN for the shared session store."
+            )
+
+        redis_url = raw_url.strip()
         if not redis_url:
             raise RuntimeError(
-                "SESSION_REDIS_URL resolved to an empty value; provide a Redis DSN or leave it unset for the in-memory default."
+                "SESSION_REDIS_URL is set but empty; configure a redis:// or rediss:// DSN."
+            )
+
+        normalized = redis_url.lower()
+        if normalized.startswith("memory://") and "pytest" not in sys.modules:
+            raise RuntimeError(
+                "SESSION_REDIS_URL must use a redis:// or rediss:// DSN outside pytest so policy sessions persist across restarts."
             )
 
         ttl_minutes = load_session_ttl_minutes()
-        if redis_url.lower().startswith("memory://"):
+        if normalized.startswith("memory://"):
             store = InMemorySessionStore(ttl_minutes=ttl_minutes)
         else:
             store = build_session_store_from_url(redis_url, ttl_minutes=ttl_minutes)
