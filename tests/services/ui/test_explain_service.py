@@ -9,6 +9,7 @@ import pytest
 pytest.importorskip("fastapi", reason="fastapi is required for explain service tests")
 
 from fastapi.testclient import TestClient
+from fastapi import HTTPException
 
 from auth.service import InMemorySessionStore
 from services.common import security
@@ -85,3 +86,30 @@ def test_trade_explanation_allows_admin_identity(
     assert payload["regime"] == "bull"
     assert payload["model_used"] == "StubModel"
     assert payload["top_features"][0]["feature"] == "alpha"
+
+
+def test_database_url_requires_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in ("REPORT_DATABASE_URL", "TIMESCALE_DSN", "DATABASE_URL"):
+        monkeypatch.delenv(key, raising=False)
+
+    with pytest.raises(HTTPException) as exc_info:
+        explain_service._database_url()
+
+    assert exc_info.value.status_code == 500
+
+
+def test_database_url_normalizes_timescale_scheme(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("REPORT_DATABASE_URL", "timescale://user:pass@host:5432/db")
+
+    resolved = explain_service._database_url()
+
+    assert resolved == "postgresql://user:pass@host:5432/db"
+
+
+def test_database_url_rejects_sqlite(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("REPORT_DATABASE_URL", "sqlite:///tmp/test.db")
+
+    with pytest.raises(HTTPException) as exc_info:
+        explain_service._database_url()
+
+    assert exc_info.value.status_code == 500

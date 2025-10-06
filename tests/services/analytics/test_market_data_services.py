@@ -201,6 +201,7 @@ def timescale_adapter(market_data_dsn: str):
 def signal_service_module(monkeypatch: pytest.MonkeyPatch, market_data_dsn: str):
     monkeypatch.setenv("SIGNAL_DATABASE_URL", market_data_dsn)
     module = _reload_signal_service()
+    globals()["signal_service"] = module
     yield module
     module.app.dependency_overrides.clear()
     module.app.state.market_data_adapter = None
@@ -211,6 +212,7 @@ def signal_service_module(monkeypatch: pytest.MonkeyPatch, market_data_dsn: str)
         except KeyError:
             pass
     sys.modules.pop("services.analytics.signal_service", None)
+    globals().pop("signal_service", None)
 
 
 @pytest.fixture()
@@ -363,6 +365,61 @@ def test_signal_service_requires_dsn(monkeypatch: pytest.MonkeyPatch):
     with pytest.raises(RuntimeError, match="SIGNAL_DATABASE_URL or TIMESCALE_DSN"):
         with TestClient(module.app):
             pass
+    gauge = getattr(module, "DATA_STALENESS_GAUGE", None)
+    if gauge is not None:
+        try:
+            REGISTRY.unregister(gauge)
+        except KeyError:
+            pass
+    sys.modules.pop("services.analytics.signal_service", None)
+
+
+def test_signal_service_requires_session_store(monkeypatch: pytest.MonkeyPatch):
+    for env_var in ("SESSION_REDIS_URL", "SESSION_STORE_URL", "SESSION_BACKEND_DSN"):
+        monkeypatch.delenv(env_var, raising=False)
+
+    module = _reload_signal_service()
+    with pytest.raises(RuntimeError, match="Session store misconfigured"):
+        with TestClient(module.app):
+            pass
+
+    gauge = getattr(module, "DATA_STALENESS_GAUGE", None)
+    if gauge is not None:
+        try:
+            REGISTRY.unregister(gauge)
+        except KeyError:
+            pass
+    sys.modules.pop("services.analytics.signal_service", None)
+
+
+def test_signal_service_rejects_memory_session_store_without_pytest(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    for env_var in ("SESSION_REDIS_URL", "SESSION_STORE_URL", "SESSION_BACKEND_DSN"):
+        monkeypatch.delenv(env_var, raising=False)
+    monkeypatch.setenv("SESSION_REDIS_URL", "memory://ephemeral-signal-store")
+    monkeypatch.delitem(sys.modules, "pytest", raising=False)
+
+    module = _reload_signal_service()
+    with pytest.raises(RuntimeError, match="memory:// DSNs are only supported"):
+        with TestClient(module.app):
+            pass
+
+    gauge = getattr(module, "DATA_STALENESS_GAUGE", None)
+    if gauge is not None:
+        try:
+            REGISTRY.unregister(gauge)
+        except KeyError:
+            pass
+    sys.modules.pop("services.analytics.signal_service", None)
+
+
+def test_signal_service_normalises_timescale_dsn(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("SIGNAL_DATABASE_URL", "timescale://user:pass@localhost:5432/analytics")
+    module = _reload_signal_service()
+    resolved = module._resolve_market_data_dsn()
+    assert resolved.startswith("postgresql+psycopg2://")
+
     gauge = getattr(module, "DATA_STALENESS_GAUGE", None)
     if gauge is not None:
         try:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import calendar
 import os
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Optional, Sequence
@@ -225,7 +226,7 @@ def get_session(request: Request) -> Iterator[Session]:
         session.close()
 
 
-def _configure_database(application: FastAPI) -> None:
+def _configure_database_for_app(application: FastAPI) -> None:
     global ENGINE
     global SessionLocal
     try:
@@ -473,9 +474,15 @@ def _configure_database() -> None:
 
 def _resolve_session_store_dsn() -> str:
     for env_var in ("SESSION_REDIS_URL", "SESSION_STORE_URL", "SESSION_BACKEND_DSN"):
-        value = os.getenv(env_var)
-        if value and value.strip():
-            return value.strip()
+        raw = os.getenv(env_var)
+        if raw is None:
+            continue
+        value = raw.strip()
+        if not value:
+            raise RuntimeError(
+                f"{env_var} is set but empty; configure a redis:// DSN for the seasonality session store."
+            )
+        return value
     raise RuntimeError(
         "Session store misconfigured: set SESSION_REDIS_URL, SESSION_STORE_URL, or SESSION_BACKEND_DSN "
         "so the seasonality service can validate administrator tokens."
@@ -491,6 +498,10 @@ def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
         dsn = _resolve_session_store_dsn()
         ttl_minutes = load_session_ttl_minutes()
         if dsn.lower().startswith("memory://"):
+            if "pytest" not in sys.modules:
+                raise RuntimeError(
+                    "Session store misconfigured: memory:// DSNs are only supported when running tests."
+                )
             store = InMemorySessionStore(ttl_minutes=ttl_minutes)
         else:
             store = build_session_store_from_url(dsn, ttl_minutes=ttl_minutes)
@@ -504,7 +515,7 @@ def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
 
 
 try:
-    _configure_database(app)
+    _configure_database_for_app(app)
 except RuntimeError:
     ENGINE = None
     SessionLocal = None
@@ -517,7 +528,7 @@ except RuntimeError:
 
 @app.on_event("startup")
 def _on_startup() -> None:
-    _configure_database(app)
+    _configure_database_for_app(app)
     _configure_session_store(app)
 
 
