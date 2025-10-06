@@ -80,3 +80,53 @@ def test_get_timescale_session_rejects_unsupported_scheme(monkeypatch: pytest.Mo
 
     with pytest.raises(RuntimeError, match="Timescale DSN must use a PostgreSQL/Timescale"):
         config.get_timescale_session("company")
+
+
+def test_get_timescale_session_sanitizes_default_schema(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TIMESCALE_DSN", "postgresql://user:pass@host:5432/db")
+
+    session = config.get_timescale_session("Director-1")
+
+    assert session.account_schema == "acct_director_1"
+
+
+def test_get_timescale_session_sanitizes_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TIMESCALE_DSN", "postgresql://user:pass@host:5432/db")
+    monkeypatch.setenv("AETHER_COMPANY_TIMESCALE_SCHEMA", " Trading-Agg \n")
+
+    session = config.get_timescale_session("company")
+
+    assert session.account_schema == "trading_agg"
+
+
+def test_get_timescale_session_rejects_invalid_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TIMESCALE_DSN", "postgresql://user:pass@host:5432/db")
+    monkeypatch.setenv("AETHER_COMPANY_TIMESCALE_SCHEMA", "123bad")
+
+    with pytest.raises(RuntimeError, match="Timescale schema must not start with a digit"):
+        config.get_timescale_session("company")
+
+
+def test_get_timescale_session_rejects_blank_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TIMESCALE_DSN", "postgresql://user:pass@host:5432/db")
+    monkeypatch.setenv("AETHER_COMPANY_TIMESCALE_SCHEMA", "  \t  ")
+
+    with pytest.raises(RuntimeError, match="is set but empty; configure a valid schema"):
+        config.get_timescale_session("company")
+
+
+def test_get_timescale_session_rejects_overlong_default_schema(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TIMESCALE_DSN", "postgresql://user:pass@host:5432/db")
+
+    overlong_account = "director" + "x" * 70
+
+    with pytest.raises(RuntimeError, match="63 characters or fewer"):
+        config.get_timescale_session(overlong_account)
+
+
+def test_get_timescale_session_rejects_overlong_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TIMESCALE_DSN", "postgresql://user:pass@host:5432/db")
+    monkeypatch.setenv("AETHER_COMPANY_TIMESCALE_SCHEMA", "schema" + "y" * 70)
+
+    with pytest.raises(RuntimeError, match="63 characters or fewer"):
+        config.get_timescale_session("company")

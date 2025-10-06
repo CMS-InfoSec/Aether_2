@@ -1,12 +1,11 @@
 """FastAPI endpoint for triggering an immediate trading kill switch."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import asyncio
 import logging
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
-
-import asyncio
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
