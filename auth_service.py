@@ -44,7 +44,6 @@ encoder to avoid adding new packages to the environment.
 """
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import os
@@ -67,7 +66,7 @@ from sqlalchemy.engine.url import make_url
 from sqlalchemy.orm import Session as OrmSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-from services.auth.jwt_tokens import create_jwt
+from services.auth import jwt_tokens
 from shared.postgres import normalize_postgres_dsn, normalize_postgres_schema
 
 
@@ -411,38 +410,30 @@ class MFAVerifier:
 
 
 
-def _b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
-
-
-def _sign(data: bytes, secret: str) -> str:
-    import hmac
-    import hashlib
-
-    digest = hmac.new(secret.encode("utf-8"), data, hashlib.sha256).digest()
-    return _b64url(digest)
-
-
 def create_jwt(
-    *, subject: str, role: str, ttl_seconds: Optional[int] = None, secret: Optional[str] = None
+    *,
+    subject: str,
+    role: str,
+    ttl_seconds: Optional[int] = None,
+    secret: Optional[str] = None,
+    claims: Optional[Mapping[str, Any]] = None,
 ) -> tuple[str, datetime]:
-    ttl = ttl_seconds or int(os.getenv("AUTH_JWT_TTL_SECONDS", "3600"))
-    now = datetime.now(timezone.utc)
-    payload = {
-        "sub": subject,
-        "role": role,
-        "iat": int(now.timestamp()),
-        "exp": int((now + timedelta(seconds=ttl)).timestamp()),
-    }
-    header = {"alg": "HS256", "typ": "JWT"}
+    """Compatibility wrapper around ``services.auth.jwt_tokens.create_jwt``.
 
-    header_b64 = _b64url(json.dumps(header, separators=(",", ":"), sort_keys=True).encode("utf-8"))
-    payload_b64 = _b64url(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
-    signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
-    signing_secret = secret or _get_configured_jwt_secret()
-    signature = _sign(signing_input, signing_secret)
-    token = f"{header_b64}.{payload_b64}.{signature}"
-    return token, now + timedelta(seconds=ttl)
+    The auth service initialises and stores the JWT signing secret during
+    application startup.  Downstream tests import ``auth_service.create_jwt`` to
+    mint tokens without directly depending on the internal module structure, so
+    this wrapper forwards to the shared helper while allowing an explicit secret
+    override (used in unit tests) and optional custom claims.
+    """
+
+    return jwt_tokens.create_jwt(
+        subject=subject,
+        role=role,
+        ttl_seconds=ttl_seconds,
+        secret=secret or _get_configured_jwt_secret(),
+        claims=claims,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -562,7 +553,11 @@ async def authenticate(
 
     role = _resolve_role(userinfo)
 
-    token, expires_at = create_jwt(subject=user_id, role=role, secret=jwt_secret)
+    token, expires_at = jwt_tokens.create_jwt(
+        subject=user_id,
+        role=role,
+        secret=jwt_secret,
+    )
     session = await _persist_session(sessions, user_id=user_id)
 
     builder_payload = BuilderFusionPayload(
@@ -645,6 +640,7 @@ __all__ = [
     "app",
     "authenticate",
     "AuthSession",
+    "create_jwt",
     "BuilderFusionPayload",
     "LoginRequest",
     "LoginResponse",
