@@ -111,17 +111,28 @@ def _build_admin_repository_from_env() -> AdminRepositoryProtocol:
 def _verify_admin_repository(admin_repository: AdminRepositoryProtocol) -> None:
     """Persist and validate a sentinel admin record for startup verification."""
 
-
     sentinel = AdminAccount(
         admin_id=_ADMIN_REPOSITORY_HEALTHCHECK_ID,
         email=_ADMIN_REPOSITORY_HEALTHCHECK_EMAIL,
         password_hash=hash_password(_generate_random_password()),
         mfa_secret=_generate_random_mfa_secret(),
     )
-    admin_repository.add(sentinel)
-    stored = admin_repository.get_by_email(_ADMIN_REPOSITORY_HEALTHCHECK_EMAIL)
-    if not stored or stored.admin_id != _ADMIN_REPOSITORY_HEALTHCHECK_ID:
-        raise RuntimeError("Admin repository is not writable; startup verification failed.")
+
+    try:
+        admin_repository.add(sentinel)
+        stored = admin_repository.get_by_email(_ADMIN_REPOSITORY_HEALTHCHECK_EMAIL)
+        if not stored or stored.admin_id != _ADMIN_REPOSITORY_HEALTHCHECK_ID:
+            raise RuntimeError(
+                "Admin repository is not writable; startup verification failed."
+            )
+    finally:
+        try:
+            admin_repository.delete(_ADMIN_REPOSITORY_HEALTHCHECK_EMAIL)
+        except Exception:  # pragma: no cover - best effort cleanup
+            logger.warning(
+                "Failed to remove admin repository sentinel account after verification",
+                exc_info=True,
+            )
 
 
 
