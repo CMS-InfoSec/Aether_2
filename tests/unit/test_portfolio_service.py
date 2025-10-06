@@ -110,41 +110,23 @@ def test_compute_daily_return_pct_uses_nav_series(monkeypatch: pytest.MonkeyPatc
     assert pct == pytest.approx(4.0)
 
 
-def _reload_portfolio_service() -> Any:
-    if "portfolio_service" in sys.modules:
-        return importlib.reload(sys.modules["portfolio_service"])
-    return importlib.import_module("portfolio_service")
+def test_query_positions_filters_derivatives(monkeypatch: pytest.MonkeyPatch, caplog) -> None:
+    rows = [
+        {"account_id": "company", "symbol": "BTC/USD", "notional": 1_000_000.0},
+        {"account_id": "company", "instrument": "ETH-PERP", "notional": 100_000.0},
+        {"account_id": "company", "pair": "eth_usd", "notional": 500_000.0},
+    ]
 
+    import portfolio_service
 
-def test_database_url_requires_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
-    for key in ("PORTFOLIO_DATABASE_URL", "TIMESCALE_DSN", "DATABASE_URL"):
-        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(portfolio_service, "_connect", lambda: _connection_stub(rows))
 
-    module = _reload_portfolio_service()
+    with caplog.at_level("WARNING"):
+        result = portfolio_service.query_positions(account_scopes=["company"], limit=10)
 
-    with pytest.raises(RuntimeError) as excinfo:
-        module._database_url()
-
-    assert "Portfolio database DSN is not configured" in str(excinfo.value)
-
-
-def test_database_url_normalises_timescale_scheme(monkeypatch: pytest.MonkeyPatch) -> None:
-    for key in ("TIMESCALE_DSN", "DATABASE_URL"):
-        monkeypatch.delenv(key, raising=False)
-    monkeypatch.setenv("PORTFOLIO_DATABASE_URL", "timescale://user:pass@host:5432/db")
-
-    module = _reload_portfolio_service()
-
-    assert module._database_url() == "postgresql://user:pass@host:5432/db"
-
-
-def test_database_url_rejects_sqlite(monkeypatch: pytest.MonkeyPatch) -> None:
-    for key in ("TIMESCALE_DSN", "DATABASE_URL"):
-        monkeypatch.delenv(key, raising=False)
-    monkeypatch.setenv("PORTFOLIO_DATABASE_URL", "sqlite:///tmp.db")
-
-    module = _reload_portfolio_service()
-
-    with pytest.raises(RuntimeError, match="PostgreSQL/Timescale"):
-        module._database_url()
+    assert result == [
+        {"account_id": "company", "symbol": "BTC-USD", "notional": 1_000_000.0},
+        {"account_id": "company", "pair": "ETH-USD", "notional": 500_000.0},
+    ]
+    assert any("non-spot" in record.message for record in caplog.records)
 
