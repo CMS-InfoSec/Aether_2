@@ -28,6 +28,7 @@ def create_jwt(
     role: Optional[str] = None,
     claims: Optional[Mapping[str, Any]] = None,
     ttl_seconds: Optional[int] = None,
+    secret: Optional[str] = None,
 ) -> Tuple[str, datetime]:
     """Create a signed JWT for the given subject.
 
@@ -38,8 +39,8 @@ def create_jwt(
     ``AUTH_JWT_TTL_SECONDS`` environment variable.
     """
 
-    secret = os.getenv("AUTH_JWT_SECRET")
-    if not secret:
+    signing_secret = secret or os.getenv("AUTH_JWT_SECRET")
+    if not signing_secret:
         raise ValueError("AUTH_JWT_SECRET environment variable must be set")
 
     ttl = ttl_seconds or int(os.getenv("AUTH_JWT_TTL_SECONDS", "3600"))
@@ -66,6 +67,6 @@ def create_jwt(
     header_b64 = _b64url(json.dumps(header, separators=(",", ":"), sort_keys=True).encode("utf-8"))
     payload_b64 = _b64url(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
     signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
-    signature = _sign(signing_input, secret)
+    signature = _sign(signing_input, signing_secret)
     token = f"{header_b64}.{payload_b64}.{signature}"
     return token, now + timedelta(seconds=ttl)

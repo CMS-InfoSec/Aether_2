@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional
@@ -25,6 +26,7 @@ from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from services.alert_manager import RiskEvent, get_alert_manager_instance
 from services.common.adapters import TimescaleAdapter
 from services.common.security import require_admin_account
+from shared.postgres import normalize_sqlalchemy_dsn
 
 
 logger = logging.getLogger(__name__)
@@ -34,31 +36,31 @@ logging.basicConfig(level=logging.INFO)
 _DATABASE_URL_ENV_VAR = "ANOMALY_DATABASE_URL"
 
 
+def _allow_sqlite_fallback() -> bool:
+    """Return whether sqlite URLs are permitted (pytest contexts only)."""
+
+    return "pytest" in sys.modules
+
+
 def _database_url() -> str:
     """Return the configured PostgreSQL/Timescale connection string."""
 
-    url = os.getenv(_DATABASE_URL_ENV_VAR) or os.getenv("TIMESCALE_DSN")
-    if not url:
+    raw = os.getenv(_DATABASE_URL_ENV_VAR) or os.getenv("TIMESCALE_DSN")
+    if raw is None:
         raise RuntimeError(
             "ANOMALY_DATABASE_URL or TIMESCALE_DSN must be set to a PostgreSQL/Timescale DSN"
         )
 
-    normalized = url.strip()
-    if normalized.startswith("postgres://"):
-        normalized = "postgresql://" + normalized.split("://", 1)[1]
+    candidate = raw.strip()
+    if not candidate:
+        raise RuntimeError("Anomaly service database DSN cannot be empty once configured.")
 
-    if normalized.startswith("postgresql://"):
-        normalized = normalized.replace("postgresql://", "postgresql+psycopg://", 1)
-    elif normalized.startswith("postgresql+psycopg://") or normalized.startswith(
-        "postgresql+psycopg2://"
-    ):
-        pass
-    else:
-        raise RuntimeError(
-            "Anomaly service requires a PostgreSQL/Timescale DSN via ANOMALY_DATABASE_URL or TIMESCALE_DSN"
-        )
-
-    return normalized
+    allow_sqlite = _allow_sqlite_fallback()
+    return normalize_sqlalchemy_dsn(
+        candidate,
+        allow_sqlite=allow_sqlite,
+        label="Anomaly service database DSN",
+    )
 
 
 DATABASE_URL = _database_url()

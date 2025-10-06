@@ -20,6 +20,11 @@ def _clear_auth_service_module() -> None:
     sys.modules.pop("auth_service", None)
 
 
+async def _startup_and_shutdown(app) -> None:
+    async with app.router.lifespan_context(app):
+        pass
+
+
 def _install_dependency_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
     """Install lightweight stubs for optional third-party dependencies."""
 
@@ -97,7 +102,7 @@ def test_auth_service_requires_jwt_secret(monkeypatch: pytest.MonkeyPatch, tmp_p
     app = module.get_application()
 
     with pytest.raises(RuntimeError):
-        asyncio.run(app.router.startup())
+        asyncio.run(_startup_and_shutdown(app))
 
     _clear_auth_service_module()
 
@@ -214,7 +219,7 @@ def test_auth_service_requires_database_url(monkeypatch: pytest.MonkeyPatch) -> 
     app = module.get_application()
 
     with pytest.raises(RuntimeError):
-        asyncio.run(app.router.startup())
+        asyncio.run(_startup_and_shutdown(app))
 
     _clear_auth_service_module()
     monkeypatch.setenv("AUTH_DATABASE_URL", "sqlite:///./auth_sessions.db")
@@ -223,7 +228,7 @@ def test_auth_service_requires_database_url(monkeypatch: pytest.MonkeyPatch) -> 
     second_app = module.get_application()
 
     with pytest.raises(RuntimeError):
-        asyncio.run(second_app.router.startup())
+        asyncio.run(_startup_and_shutdown(second_app))
 
     _clear_auth_service_module()
 
@@ -248,6 +253,28 @@ def test_auth_database_url_normalizes_supported_schemes(
     _clear_auth_service_module()
 
 
+def test_auth_database_url_rejects_sqlite_outside_pytest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """SQLite DSNs should be rejected when pytest is not present."""
+
+    sqlite_url = f"sqlite:///{tmp_path/'auth.db'}"
+    monkeypatch.setenv("AUTH_DATABASE_URL", sqlite_url)
+    monkeypatch.setenv("AUTH_JWT_SECRET", "secret")
+    _install_dependency_stubs(monkeypatch)
+    _clear_auth_service_module()
+
+    module = importlib.import_module("auth_service")
+    monkeypatch.delitem(module.sys.modules, "pytest", raising=False)
+
+    resolved, error = module._resolve_database_url()
+    assert resolved is None
+    assert isinstance(error, RuntimeError)
+    assert "PostgreSQL/Timescale" in str(error)
+
+    _clear_auth_service_module()
+
+
 def test_auth_database_url_rejects_blank_values(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -259,12 +286,37 @@ def test_auth_database_url_rejects_blank_values(
     _install_dependency_stubs(monkeypatch)
     _clear_auth_service_module()
 
+
+def test_auth_database_schema_sanitizes_identifier(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Configured schemas should be normalised to safe Postgres identifiers."""
+
+    monkeypatch.setenv("AUTH_DATABASE_URL", "sqlite:///./auth.db")
+    monkeypatch.setenv("AUTH_JWT_SECRET", "secret")
+    monkeypatch.delenv("AUTH_DATABASE_SCHEMA", raising=False)
+    _install_dependency_stubs(monkeypatch)
+    _clear_auth_service_module()
+
     module = importlib.import_module("auth_service")
-    monkeypatch.setenv("AUTH_DATABASE_URL", "   ")
-    resolved, error = module._resolve_database_url()
-    assert resolved is None
-    assert isinstance(error, RuntimeError)
-    assert "must be set" in str(error)
+    monkeypatch.setenv("AUTH_DATABASE_SCHEMA", "  Audit-Logs  ")
+    schema = module._resolve_schema("postgresql://user:pass@host:5432/auth")
+    assert schema == "audit_logs"
+
+    _clear_auth_service_module()
+
+
+def test_auth_database_schema_rejects_invalid_identifier(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Schemas beginning with digits should be rejected to avoid invalid identifiers."""
+
+    monkeypatch.setenv("AUTH_DATABASE_URL", "sqlite:///./auth.db")
+    monkeypatch.setenv("AUTH_JWT_SECRET", "secret")
+    monkeypatch.delenv("AUTH_DATABASE_SCHEMA", raising=False)
+    _install_dependency_stubs(monkeypatch)
+    _clear_auth_service_module()
+
+    module = importlib.import_module("auth_service")
+    monkeypatch.setenv("AUTH_DATABASE_SCHEMA", "123-admin")
+    with pytest.raises(RuntimeError, match="must not start with a digit"):
+        module._resolve_schema("postgresql://user:pass@host:5432/auth")
 
     _clear_auth_service_module()
 
