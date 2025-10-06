@@ -155,6 +155,28 @@ def test_oms_place_authorized_accounts(client: TestClient) -> None:
         assert data["errors"] is None
 
 
+def test_oms_place_rejects_non_spot_instrument(client: TestClient) -> None:
+    payload = {
+        "account_id": ADMIN_ACCOUNTS[0],
+        "order_id": "non-spot",
+        "instrument": "ETH-PERP",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 10.0,
+        "fee": {"currency": "USD", "maker": 0.1, "taker": 0.2},
+    }
+
+    response = client.post(
+        "/oms/place",
+        json=payload,
+        headers={"X-Account-ID": payload["account_id"]},
+    )
+
+    assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+    detail = response.json().get("detail", [])
+    assert any("Only spot market instruments" in str(item.get("msg", item)) for item in detail)
+
+
 def test_oms_place_rejects_non_admin_account(client: TestClient) -> None:
     payload = {
         "account_id": "shadow",

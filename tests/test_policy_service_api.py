@@ -387,6 +387,13 @@ async def test_policy_preserves_sub_satoshi_precision() -> None:
     assert Decimal(str(snapped_qty)) == Decimal("0.12345679")
 
 
+def test_get_regime_rejects_non_spot_symbol(client: TestClient) -> None:
+    response = client.get("/policy/regime", params={"symbol": "ETH-PERP"})
+
+    assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+    assert response.json()["detail"] == "Only spot market instruments are supported."
+
+
 def test_policy_decide_returns_503_when_precision_unavailable(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:

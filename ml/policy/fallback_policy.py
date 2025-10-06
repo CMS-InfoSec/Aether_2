@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 from typing import Iterable, List, Sequence
 
@@ -15,6 +15,7 @@ from services.common.schemas import (
     PolicyDecisionResponse,
     PolicyState,
 )
+from shared.spot import filter_spot_symbols, is_spot_symbol, normalize_spot_symbol
 
 
 fallback_log = logging.getLogger("fallback_log")
@@ -74,10 +75,17 @@ class FallbackPolicy:
     size_fraction: float = 0.35
     momentum_threshold: float = 0.6
     max_risk_band_bps: float = 25.0
+    _top_symbol_set: set[str] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        if not self.top_symbols:
-            raise ValueError("FallbackPolicy requires at least one top liquidity symbol")
+        canonical_symbols = filter_spot_symbols(self.top_symbols, logger=fallback_log)
+        if not canonical_symbols:
+            raise ValueError(
+                "FallbackPolicy requires at least one top liquidity spot symbol"
+            )
+
+        self.top_symbols = tuple(canonical_symbols)
+        self._top_symbol_set = set(self.top_symbols)
         self.size_fraction = _clamp(float(self.size_fraction), lower=0.05, upper=1.0)
         self.momentum_threshold = _clamp(float(self.momentum_threshold), lower=0.0, upper=1.0)
         self.max_risk_band_bps = max(float(self.max_risk_band_bps), 1.0)
@@ -89,10 +97,19 @@ class FallbackPolicy:
         book_snapshot: BookSnapshot,
         reason: str,
     ) -> FallbackDecision:
-        symbol = request.instrument.upper()
+        symbol = normalize_spot_symbol(request.instrument)
         state = request.state or _default_state()
 
-        if symbol not in {value.upper() for value in self.top_symbols}:
+        if not symbol or not is_spot_symbol(symbol):
+            response = self._abstain_response(
+                request=request,
+                state=state,
+                book_snapshot=book_snapshot,
+                reason="Instrument is not a supported spot market pair",
+            )
+            return FallbackDecision(request=request, response=response, reason=reason)
+
+        if symbol not in self._top_symbol_set:
             response = self._abstain_response(
                 request=request,
                 state=state,

@@ -7,6 +7,7 @@ import pytest
 
 from alt_data import (
     AltDataMonitor,
+    SecondaryDataError,
     SecondaryClientConfig,
     SecondaryMarketDataClient,
 )
@@ -38,9 +39,41 @@ async def test_secondary_client_fetches_live_price() -> None:
 
     price = await client.fetch_price("BTC/USD")
 
-    assert price.symbol == "BTC/USD"
+    assert price.symbol == "BTC-USD"
     assert price.price == pytest.approx(12345.67)
     assert price.observed_at == observed_at
+
+
+@pytest.mark.asyncio
+async def test_secondary_client_rejects_derivative_symbol() -> None:
+    client = SecondaryMarketDataClient(SecondaryClientConfig(max_retries=0))
+
+    with pytest.raises(SecondaryDataError) as excinfo:
+        await client.fetch_price("BTC-PERP")
+
+    assert "spot instruments" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_monitor_rejects_non_spot_symbols() -> None:
+    client = SecondaryMarketDataClient(SecondaryClientConfig(max_retries=0))
+    triggered: List[str] = []
+
+    async def safe_mode_hook(reason: str) -> None:
+        triggered.append(reason)
+
+    monitor = AltDataMonitor(
+        client,
+        deviation_threshold_bps=10,
+        max_secondary_age_seconds=30,
+        safe_mode_hook=safe_mode_hook,
+    )
+
+    await monitor.process_kraken_price("BTC-PERP", 100.0)
+    status = await monitor.get_status()
+
+    assert status.secondary_feed_ok is False
+    assert triggered == ["non_spot_symbol"]
 
 
 @pytest.mark.asyncio
