@@ -106,3 +106,24 @@ def test_compute_daily_return_pct_uses_nav_series(monkeypatch: pytest.MonkeyPatc
     )
     assert pct == pytest.approx(4.0)
 
+
+def test_query_positions_filters_derivatives(monkeypatch: pytest.MonkeyPatch, caplog) -> None:
+    rows = [
+        {"account_id": "company", "symbol": "BTC/USD", "notional": 1_000_000.0},
+        {"account_id": "company", "instrument": "ETH-PERP", "notional": 100_000.0},
+        {"account_id": "company", "pair": "eth_usd", "notional": 500_000.0},
+    ]
+
+    import portfolio_service
+
+    monkeypatch.setattr(portfolio_service, "_connect", lambda: _connection_stub(rows))
+
+    with caplog.at_level("WARNING"):
+        result = portfolio_service.query_positions(account_scopes=["company"], limit=10)
+
+    assert result == [
+        {"account_id": "company", "symbol": "BTC-USD", "notional": 1_000_000.0},
+        {"account_id": "company", "pair": "ETH-USD", "notional": 500_000.0},
+    ]
+    assert any("non-spot" in record.message for record in caplog.records)
+
