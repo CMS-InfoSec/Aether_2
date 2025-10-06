@@ -19,6 +19,8 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from shared.postgres import normalize_sqlalchemy_dsn
+
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -67,27 +69,21 @@ def _require_database_url() -> str:
             "CONFIG_DATABASE_URL environment variable is required for the config service."
         )
 
-    normalized = raw_url.lower()
-    allowed_prefixes = ("postgresql://", "postgresql+psycopg://", "postgresql+psycopg2://")
-    if normalized.startswith("postgres://"):
-        raw_url = "postgresql://" + raw_url.split("://", 1)[1]
-        normalized = raw_url.lower()
+    allow_sqlite = os.getenv(_SQLITE_FALLBACK_FLAG) == "1"
+    normalized = normalize_sqlalchemy_dsn(
+        raw_url,
+        allow_sqlite=allow_sqlite,
+        label="Config service database URL",
+    )
 
-    if normalized.startswith(allowed_prefixes):
-        return raw_url
-
-    if os.getenv(_SQLITE_FALLBACK_FLAG) == "1":
+    if allow_sqlite and normalized.startswith("sqlite"):
         LOGGER.warning(
             "Non-Postgres CONFIG_DATABASE_URL '%s' permitted because %s=1.",
             raw_url,
             _SQLITE_FALLBACK_FLAG,
         )
-        return raw_url
 
-    raise RuntimeError(
-        "CONFIG_DATABASE_URL must point to a PostgreSQL/TimescaleDB instance; "
-        f"received '{raw_url}'. Set {_SQLITE_FALLBACK_FLAG}=1 to allow alternative URLs in tests."
-    )
+    return normalized
 
 
 def _create_engine(database_url: str):

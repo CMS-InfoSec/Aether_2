@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,22 +18,53 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from shared.postgres import normalize_sqlalchemy_dsn
+
 DATA_PATH = Path("data/capital_opt_runs.json")
+_SQLITE_FALLBACK = "sqlite+pysqlite:///:memory:"
 
 
 def _database_url() -> str:
-    return (
-        os.getenv("CAPITAL_OPTIMIZER_DB_URL")
-        or os.getenv("CAPITAL_OPTIMIZER_DATABASE_URL")
-        or os.getenv("TIMESCALE_DSN")
-        or os.getenv("DATABASE_URL")
-        or "sqlite:///./capital_optimizer.db"
+    """Return the configured database URL, normalising supported schemes."""
+
+    allow_sqlite = "pytest" in sys.modules
+    label = "Capital optimizer database DSN"
+
+    for key in (
+        "CAPITAL_OPTIMIZER_DB_URL",
+        "CAPITAL_OPTIMIZER_DATABASE_URL",
+        "TIMESCALE_DSN",
+        "DATABASE_URL",
+    ):
+        raw = os.getenv(key)
+        if raw is None:
+            continue
+        candidate = raw.strip()
+        if not candidate:
+            continue
+        return normalize_sqlalchemy_dsn(
+            candidate,
+            allow_sqlite=allow_sqlite,
+            label=label,
+        )
+
+    if allow_sqlite:
+        return normalize_sqlalchemy_dsn(
+            _SQLITE_FALLBACK,
+            allow_sqlite=True,
+            label=label,
+        )
+
+    raise RuntimeError(
+        "Capital optimizer database DSN is not configured. Set "
+        "CAPITAL_OPTIMIZER_DB_URL or TIMESCALE_DSN to a PostgreSQL/Timescale "
+        "connection string."
     )
 
 
 def _engine_options(url: str) -> Dict[str, object]:
     options: Dict[str, object] = {"future": True, "pool_pre_ping": True}
-    if url.startswith("sqlite://"):
+    if url.startswith("sqlite"):
         options.setdefault("connect_args", {"check_same_thread": False})
         if ":memory:" in url:
             options["poolclass"] = StaticPool

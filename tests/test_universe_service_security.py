@@ -32,6 +32,29 @@ from services.common import security  # noqa: E402  # pylint: disable=wrong-impo
 from auth.service import InMemorySessionStore  # noqa: E402  # pylint: disable=wrong-import-position
 
 
+def test_universe_service_requires_configured_dsn(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Production deployments must not fall back to SQLite automatically."""
+
+    global universe_service  # pylint: disable=global-statement
+
+    module_name = "universe_service"
+    monkeypatch.delenv("UNIVERSE_DATABASE_URL", raising=False)
+    monkeypatch.delenv("TIMESCALE_DSN", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    sys.modules.pop(module_name, None)
+
+    original_pytest = sys.modules.pop("pytest", None)
+    try:
+        with pytest.raises(RuntimeError, match="Universe database DSN"):
+            importlib.import_module(module_name)
+    finally:
+        if original_pytest is not None:
+            sys.modules["pytest"] = original_pytest
+
+    monkeypatch.setenv("DATABASE_URL", "sqlite:///./universe_service_auth_test.db")
+    universe_service = importlib.import_module(module_name)
+
+
 @pytest.fixture
 def universe_client(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
