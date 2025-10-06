@@ -5,9 +5,11 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 
-from pydantic import BaseModel, Field, model_serializer, model_validator
+from pydantic import BaseModel, Field, field_validator, model_serializer, model_validator
 
 from fastapi import HTTPException, status
+
+from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 
 
@@ -141,6 +143,14 @@ class PolicyDecisionRequest(BaseModel):
     confidence: Optional[ConfidenceMetrics] = Field(
         None, description="Caller confidence metrics aligned with Soloing spec"
     )
+
+    @field_validator("instrument")
+    @classmethod
+    def _validate_instrument(cls, value: str) -> str:
+        normalized = normalize_spot_symbol(value)
+        if not is_spot_symbol(normalized):
+            raise ValueError("Only spot market instruments are supported.")
+        return normalized
 
 
 class PolicyDecisionResponse(BaseModel):

@@ -8,6 +8,7 @@ import logging
 import os
 
 import math
+import re
 
 import time
 from contextlib import contextmanager
@@ -53,6 +54,7 @@ from cost_throttler import CostThrottler
 from services.risk.position_sizer import PositionSizer
 from services.common.adapters import RedisFeastAdapter, TimescaleAdapter
 from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
+from shared.spot import filter_spot_symbols, is_spot_symbol, normalize_spot_symbol
 
 
 logger = logging.getLogger(__name__)
@@ -221,7 +223,7 @@ class AccountRiskLimit(Base):
     def whitelist(self) -> List[str]:
         if not self.instrument_whitelist:
             return []
-        return [token.strip() for token in self.instrument_whitelist.split(",") if token.strip()]
+        return filter_spot_symbols(self.instrument_whitelist.split(","), logger=logger)
 
     @property
     def cluster_limits(self) -> Dict[str, float]:
@@ -356,7 +358,9 @@ _DEFAULT_LIMITS: List[Dict[str, object]] = [
 def _seed_default_limits(session: Session) -> None:
     for payload in _DEFAULT_LIMITS:
         record = session.get(AccountRiskLimit, payload["account_id"])
-        whitelist = payload.get("instrument_whitelist", [])
+        whitelist = filter_spot_symbols(
+            payload.get("instrument_whitelist", []), logger=logger
+        )
         whitelist_blob = ",".join(sorted(whitelist)) if whitelist else None
         if record is None:
             record = AccountRiskLimit(
@@ -430,9 +434,9 @@ def _log_position_size(
 
 
 _STUB_MARKET_TELEMETRY: Dict[str, Dict[str, float]] = {
-    "AAPL": {
-        "spread_bps": 5.0,
-        "latency_seconds": 0.8,
+    "BTC-USD": {
+        "spread_bps": 4.0,
+        "latency_seconds": 0.6,
         "exchange_outage": 0,
     }
 }
@@ -444,29 +448,29 @@ _STUB_PROM_METRICS: Dict[str, float] = {
 
 
 _STUB_PRICE_HISTORY: Dict[str, List[Dict[str, float]]] = {
-    "AAPL": [
-        {"high": 178.5, "low": 174.4, "close": 176.3},
-        {"high": 179.1, "low": 175.2, "close": 178.7},
-        {"high": 181.2, "low": 176.8, "close": 180.3},
-        {"high": 180.9, "low": 177.6, "close": 179.4},
-        {"high": 182.4, "low": 178.9, "close": 181.7},
-        {"high": 183.2, "low": 179.7, "close": 182.1},
-        {"high": 184.0, "low": 180.1, "close": 183.5},
-        {"high": 185.6, "low": 181.4, "close": 184.2},
-        {"high": 186.2, "low": 182.7, "close": 185.3},
-        {"high": 187.3, "low": 183.5, "close": 186.8},
-        {"high": 188.8, "low": 184.6, "close": 187.1},
-        {"high": 189.5, "low": 185.2, "close": 188.6},
-        {"high": 190.7, "low": 186.1, "close": 189.4},
-        {"high": 191.2, "low": 187.5, "close": 190.8},
-        {"high": 192.3, "low": 188.4, "close": 191.5},
+    "BTC-USD": [
+        {"high": 30250.0, "low": 29780.0, "close": 30010.0},
+        {"high": 30310.0, "low": 29820.0, "close": 30055.0},
+        {"high": 30440.0, "low": 29960.0, "close": 30180.0},
+        {"high": 30510.0, "low": 30010.0, "close": 30245.0},
+        {"high": 30620.0, "low": 30120.0, "close": 30360.0},
+        {"high": 30740.0, "low": 30200.0, "close": 30480.0},
+        {"high": 30830.0, "low": 30290.0, "close": 30570.0},
+        {"high": 30920.0, "low": 30380.0, "close": 30640.0},
+        {"high": 31010.0, "low": 30460.0, "close": 30735.0},
+        {"high": 31120.0, "low": 30540.0, "close": 30810.0},
+        {"high": 31200.0, "low": 30600.0, "close": 30900.0},
+        {"high": 31310.0, "low": 30690.0, "close": 30980.0},
+        {"high": 31420.0, "low": 30780.0, "close": 31070.0},
+        {"high": 31510.0, "low": 30860.0, "close": 31140.0},
+        {"high": 31600.0, "low": 30930.0, "close": 31220.0},
     ]
 }
 
 
 _STUB_ACCOUNT_RETURNS: Dict[str, List[float]] = {
-    "ACC-DEFAULT": [-1500.0 + (i % 5) * 100 for i in range(260)],
-    "ACC-AGGR": [-4500.0 + (i % 7) * 250 for i in range(260)],
+    "company": [-1500.0 + (i % 5) * 100 for i in range(260)],
+    "director-1": [-4500.0 + (i % 7) * 250 for i in range(260)],
 }
 
 
@@ -478,12 +482,54 @@ _STUB_ACCOUNT_USAGE: Dict[str, Dict[str, Decimal]] = {}
 
 _STUB_FILLS: List[Dict[str, object]] = [
     {
-        "account_id": "ACC-DEFAULT",
+        "account_id": "company",
         "timestamp": datetime.utcnow().isoformat(),
         "pnl": -2500.0,
         "fee": 125.0,
     }
 ]
+
+
+_SPOT_PAIR_PATTERN = re.compile(r"^[A-Z0-9]{2,}[-/][A-Z0-9]{2,}$")
+_NON_SPOT_KEYWORDS = ("PERP", "FUT", "FUTURE", "MARGIN", "SWAP", "OPTION", "DERIV")
+_LEVERAGE_SUFFIXES = ("UP", "DOWN")
+_LEVERAGE_PATTERN = re.compile(r"\d+(?:X|L|S)$")
+
+
+def _is_spot_instrument(symbol: str) -> bool:
+    """Return ``True`` when *symbol* appears to represent a spot market pair."""
+
+    normalized = str(symbol or "").strip().upper()
+    if not normalized:
+        return False
+    if any(keyword in normalized for keyword in _NON_SPOT_KEYWORDS):
+        return False
+    if not _SPOT_PAIR_PATTERN.match(normalized):
+        return False
+    base, _ = re.split(r"[-/]", normalized, maxsplit=1)
+    if any(base.endswith(suffix) for suffix in _LEVERAGE_SUFFIXES):
+        return False
+    if _LEVERAGE_PATTERN.search(base):
+        return False
+    return True
+
+
+def _filter_spot_instruments(symbols: Iterable[str]) -> List[str]:
+    """Return normalized spot symbols, discarding non-spot entries."""
+
+    filtered: List[str] = []
+    seen: Set[str] = set()
+    for symbol in symbols:
+        normalized = str(symbol or "").strip().upper()
+        if not normalized:
+            continue
+        if not _is_spot_instrument(normalized):
+            logger.warning("Ignoring non-spot instrument '%s' in spot-only context", symbol)
+            continue
+        if normalized not in seen:
+            filtered.append(normalized)
+            seen.add(normalized)
+    return filtered
 
 
 class TradeIntent(BaseModel):
@@ -762,6 +808,8 @@ async def get_risk_limits(
 
     await _refresh_usage_from_balance(account_id)
     usage = _load_account_usage(account_id)
+    whitelist = limits.whitelist
+
     limit_model = AccountRiskLimitModel(
         account_id=limits.account_id,
         max_daily_loss=limits.max_daily_loss,
@@ -769,7 +817,7 @@ async def get_risk_limits(
         max_nav_pct_per_trade=limits.max_nav_pct_per_trade,
         notional_cap=limits.notional_cap,
         cooldown_minutes=limits.cooldown_minutes,
-        instrument_whitelist=limits.whitelist,
+        instrument_whitelist=whitelist,
         var_95_limit=limits.var_95_limit,
         var_99_limit=limits.var_99_limit,
         spread_threshold_bps=limits.spread_threshold_bps,
@@ -793,6 +841,15 @@ async def get_position_size(
     symbol: str = Query(..., min_length=1, description="Instrument symbol to size"),
     account_id: str = Depends(require_admin_account),
 ) -> Dict[str, Any]:
+    normalized_symbol = normalize_spot_symbol(symbol)
+    if not is_spot_symbol(normalized_symbol):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only spot market symbols are supported for position sizing.",
+        )
+
+    symbol = normalized_symbol
+
     try:
         limits = _load_account_limits(account_id)
     except ConfigError as exc:
@@ -945,9 +1002,20 @@ async def _get_approved_universe() -> UniverseSnapshot:
     except ValueError as exc:  # pragma: no cover - defensive
         raise UniverseServiceError("Universe service returned invalid JSON") from exc
 
-    symbols = {str(symbol).upper() for symbol in payload.get("symbols", []) if symbol}
+    raw_symbols: List[str] = []
+    for symbol in payload.get("symbols", []):
+        normalized = normalize_spot_symbol(symbol)
+        if normalized:
+            raw_symbols.append(normalized)
+
+    symbols = {symbol for symbol in raw_symbols if is_spot_symbol(symbol)}
+    dropped = set(raw_symbols) - symbols
+    if dropped:
+        logger.warning(
+            "Dropping non-spot instruments from approved universe", extra={"symbols": sorted(dropped)}
+        )
     if not symbols:
-        raise UniverseServiceError("Universe service returned an empty universe")
+        raise UniverseServiceError("Universe service did not return any spot instruments")
 
     generated_raw = payload.get("generated_at")
     generated_at = now
@@ -982,7 +1050,7 @@ async def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
     await _refresh_usage_from_fills(context.request.account_id, state)
     intent = context.request.intent
     trade_notional = context.intended_notional
-    normalized_instrument = str(intent.instrument_id).upper()
+    normalized_instrument = normalize_spot_symbol(intent.instrument_id)
 
     def _register_violation(
         message: str, *, cooldown: bool = False, details: Optional[Dict[str, object]] = None
@@ -1005,6 +1073,13 @@ async def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
             nonlocal cooldown_until
             cooldown_until = cooldown_until or _determine_cooldown(limits)
         _audit_violation(context, message, details)
+
+    if not is_spot_symbol(normalized_instrument):
+        _register_violation(
+            "Instrument not eligible for spot trading",
+            cooldown=True,
+            details={"instrument": normalized_instrument},
+        )
 
     universe_snapshot: Optional[UniverseSnapshot]
     try:
@@ -1100,11 +1175,15 @@ async def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
         )
 
     whitelist = limits.whitelist
-    if whitelist and intent.instrument_id not in whitelist:
+    whitelist_set = {symbol.upper() for symbol in whitelist}
+    if whitelist_set and normalized_instrument not in whitelist_set:
         _register_violation(
             "Instrument not whitelisted for account",
             cooldown=True,
-            details={"instrument": intent.instrument_id, "whitelist": whitelist},
+            details={
+                "instrument": normalized_instrument,
+                "whitelist": sorted(whitelist_set),
+            },
         )
 
     if sizing_result is not None and trade_notional > sizing_result.max_position:
