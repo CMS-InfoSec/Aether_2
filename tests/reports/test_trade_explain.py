@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Dict
 
 import pytest
@@ -8,6 +9,7 @@ from fastapi.testclient import TestClient
 
 pytest.importorskip("pandas", exc_type=ImportError)
 
+import pandas as pd
 import report_service
 from services.common.security import require_admin_account
 
@@ -124,3 +126,61 @@ def test_trade_explain_missing_features_returns_422(monkeypatch) -> None:
         client.app.dependency_overrides.pop(require_admin_account, None)
     assert response.status_code == 422
     assert response.json()["detail"] == "Trade is missing feature metadata"
+
+
+def test_trade_explain_rejects_non_spot_instrument(monkeypatch) -> None:
+    trade_record = {"fill_id": "fill-spot-422", "account_id": "alpha", "instrument": "BTC-PERP"}
+
+    monkeypatch.setattr(report_service, "_load_trade_record", lambda trade_id: trade_record)
+
+    client = TestClient(report_service.app)
+    client.app.dependency_overrides[require_admin_account] = lambda: "alpha"
+    try:
+        response = client.get("/reports/trade_explain", params={"trade_id": "fill-spot-422"})
+    finally:
+        client.app.dependency_overrides.pop(require_admin_account, None)
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Trade references non-spot instrument"
+
+
+def test_trade_explain_normalises_instrument(monkeypatch) -> None:
+    trade_record = {
+        "fill_id": "fill-spot-normalise",
+        "account_id": "alpha",
+        "instrument": "eth/usd",
+        "order_metadata": {"features": {"alpha": 1.0}},
+    }
+
+    shap_values = {"alpha": 0.5}
+
+    monkeypatch.setattr(report_service, "_load_trade_record", lambda trade_id: trade_record)
+    monkeypatch.setattr(report_service, "get_active_model", lambda account_id, instrument: StubModel(shap_values))
+
+    client = TestClient(report_service.app)
+    client.app.dependency_overrides[require_admin_account] = lambda: "alpha"
+    try:
+        response = client.get("/reports/trade_explain", params={"trade_id": "fill-spot-normalise"})
+    finally:
+        client.app.dependency_overrides.pop(require_admin_account, None)
+
+    assert response.status_code == 200
+    assert response.json()["instrument"] == "ETH-USD"
+
+
+def test_filter_spot_instruments_drops_derivatives(caplog) -> None:
+    frame = pd.DataFrame(
+        {
+            "instrument": ["BTC-USD", "ETH-PERP", "eth_usd", "ADAUP-USDT", None],
+            "size": [1, 2, 3, 4, 5],
+            "price": [10, 20, 30, 40, 50],
+            "fee": [0, 0, 0, 0, 0],
+            "side": ["buy"] * 5,
+        }
+    )
+
+    with caplog.at_level(logging.WARNING):
+        filtered = report_service._filter_spot_instruments(frame, context="unit-test")
+
+    assert filtered["instrument"].tolist() == ["BTC-USD", "ETH-USD"]
+    assert "Dropping non-spot instruments" in caplog.text

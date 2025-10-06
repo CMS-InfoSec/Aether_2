@@ -37,6 +37,7 @@ from auth.service import (
 )
 import services.common.security as security
 from shared.session_config import load_session_ttl_minutes
+from shared.spot import is_spot_symbol, normalize_spot_symbol
 from services.common.schemas import (
     BookSnapshot,
     ConfidenceMetrics,
@@ -109,6 +110,14 @@ class ReplayEvent:
     expected_edge_bps: Optional[float]
     actual_mid_price: float
     actual_volume: float
+
+    def __post_init__(self) -> None:
+        normalized = normalize_spot_symbol(self.instrument)
+        if not normalized or not is_spot_symbol(normalized):
+            raise ValueError(
+                f"Replay events require spot instruments; received {self.instrument!r}"
+            )
+        object.__setattr__(self, "instrument", normalized)
 
     def to_policy_request(self, account_id: str) -> PolicyDecisionRequest:
         return PolicyDecisionRequest(
@@ -213,6 +222,15 @@ class HistoricalDataLoader:
             timestamp = _coerce_datetime(payload.get("timestamp"))
             if not (self._config.start <= timestamp <= self._config.end):
                 return None
+            instrument_raw = payload.get("instrument") or "BTC-USD"
+            normalized_instrument = normalize_spot_symbol(instrument_raw)
+            if not normalized_instrument or not is_spot_symbol(normalized_instrument):
+                LOG.warning(
+                    "Skipping non-spot instrument '%s' in snapshot replay inputs",
+                    instrument_raw,
+                )
+                return None
+
             fee_payload = payload.get("fee") or {"currency": "USD", "maker": 0.1, "taker": 0.2}
             fee = FeeBreakdown(**fee_payload)
             book_snapshot_payload = payload.get("book_snapshot") or {
@@ -247,7 +265,7 @@ class HistoricalDataLoader:
             return ReplayEvent(
                 timestamp=timestamp,
                 order_id=str(payload.get("order_id") or uuid.uuid4()),
-                instrument=str(payload.get("instrument") or "BTC-USD"),
+                instrument=normalized_instrument,
                 side=str(payload.get("side") or "BUY").upper(),
                 quantity=float(payload.get("quantity") or 0.1),
                 price=float(payload.get("price") or book_snapshot.mid_price),

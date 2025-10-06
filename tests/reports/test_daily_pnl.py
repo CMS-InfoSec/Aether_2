@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import csv
 import json
-from datetime import date
+import logging
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping
 
 import pytest
 
-from reports.daily_pnl import generate_daily_pnl
+from reports.daily_pnl import (
+    DailyPnlRow,
+    compute_daily_pnl,
+    fetch_daily_orders,
+    generate_daily_pnl,
+)
 from reports.storage import ArtifactStorage
 
 
@@ -382,4 +388,97 @@ def test_generate_daily_pnl_high_precision_serialization(tmp_path: Path) -> None
     assert Decimal(str(parquet_row["gross_pnl"])) == gross.quantize(reporting_scale)
     assert Decimal(str(parquet_row["fees"])) == fee
     assert Decimal(str(parquet_row["net_pnl"])) == net.quantize(reporting_scale)
+
+
+class _StubResult:
+    def __init__(self, rows: Iterable[Dict[str, Any]]) -> None:
+        self._rows = list(rows)
+
+    def mappings(self) -> List[Dict[str, Any]]:
+        return list(self._rows)
+
+
+class _StubSession:
+    def __init__(self, rows: Iterable[Dict[str, Any]]) -> None:
+        self._rows = list(rows)
+
+    def execute(
+        self, query: str, params: Mapping[str, Any] | None = None
+    ) -> _StubResult:
+        return _StubResult(self._rows)
+
+
+def _fill(
+    *,
+    account_id: str = "acct-1",
+    order_id: str = "order-1",
+    instrument: Any = "BTC-USD",
+    side: str = "SELL",
+    size: Any = "1",
+    price: Any = "100",
+    fee: Any = "0",
+) -> Dict[str, Any]:
+    return {
+        "account_id": account_id,
+        "order_id": order_id,
+        "instrument": instrument,
+        "side": side,
+        "size": size,
+        "price": price,
+        "fee": fee,
+    }
+
+
+def test_fetch_daily_orders_filters_non_spot_symbols(caplog: pytest.LogCaptureFixture) -> None:
+    session = _StubSession(
+        [
+            {"order_id": 1, "account_id": 42, "instrument": "btc-perp"},
+            {"order_id": 2, "account_id": 42, "instrument": "eth_usd"},
+            {"order_id": 3, "account_id": 99, "market": "ltcup-usdt"},
+            {"order_id": 4, "account_id": 77, "symbol": "ada-usd"},
+        ]
+    )
+
+    with caplog.at_level(logging.WARNING):
+        instruments = fetch_daily_orders(
+            session,
+            start=datetime(2024, 5, 2, tzinfo=timezone.utc),
+            end=datetime(2024, 5, 3, tzinfo=timezone.utc),
+        )
+
+    assert instruments == {"2": "ETH-USD", "4": "ADA-USD"}
+    assert "Ignoring non-spot instrument" in caplog.text
+
+
+def test_compute_daily_pnl_normalizes_instruments() -> None:
+    rows = compute_daily_pnl(
+        [_fill(instrument="btc/usd", side="SELL", size="2", price="10", fee="0")],
+        {},
+    )
+
+    assert rows == [
+        DailyPnlRow(
+            account_id="acct-1",
+            instrument="BTC-USD",
+            executed_quantity=Decimal("2"),
+            gross_pnl=Decimal("20"),
+            fees=Decimal("0"),
+            net_pnl=Decimal("20"),
+        )
+    ]
+
+
+def test_compute_daily_pnl_skips_derivative_fills(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.DEBUG):
+        rows = compute_daily_pnl([_fill(instrument="btc-perp")], {})
+
+    assert rows == []
+    assert "Skipping fill without a canonical spot instrument" in caplog.text
+
+
+def test_compute_daily_pnl_uses_order_mapping_for_missing_instrument() -> None:
+    rows = compute_daily_pnl([_fill(order_id="order-2", instrument=None)], {"order-2": "eth-usd"})
+
+    assert len(rows) == 1
+    assert rows[0].instrument == "ETH-USD"
 

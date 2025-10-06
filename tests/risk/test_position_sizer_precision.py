@@ -24,9 +24,10 @@ class _StaticTimescale:
 
 class _StaticFeatures:
     def __init__(self, *args, **kwargs) -> None:
-        pass
+        self.requested: list[str] = []
 
     def fetch_online_features(self, symbol: str) -> dict[str, float]:
+        self.requested.append(symbol)
         return {}
 
     def fee_override(self, symbol: str):  # pragma: no cover - simple stub
@@ -95,4 +96,48 @@ async def test_position_sizer_halts_when_precision_missing(
     assert result.reason == "precision_metadata_missing"
     assert result.max_size_usd == pytest.approx(0.0)
     assert result.size_units == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_position_sizer_normalizes_spot_instrument() -> None:
+    features = _StaticFeatures()
+    sizer = PositionSizer(
+        "acct-spot",
+        limits=_Limits(),
+        timescale=_StaticTimescale(),
+        feature_store=features,
+    )
+
+    result = await sizer.suggest_max_position(
+        "eth/usd",
+        nav=1500.0,
+        available_balance=1500.0,
+        volatility=0.3,
+        expected_edge_bps=25.0,
+        fee_bps_estimate=1.0,
+        price=1500.0,
+    )
+
+    assert result.symbol == "ETH-USD"
+    assert features.requested == ["ETH-USD"]
+
+
+@pytest.mark.asyncio
+async def test_position_sizer_rejects_non_spot_instrument() -> None:
+    sizer = PositionSizer(
+        "acct-derivative",
+        limits=_Limits(),
+        timescale=_StaticTimescale(),
+        feature_store=_StaticFeatures(),
+    )
+
+    with pytest.raises(ValueError, match="spot market instruments"):
+        await sizer.suggest_max_position(
+            "ETH-PERP",
+            nav=1000.0,
+            available_balance=1000.0,
+            volatility=0.2,
+            expected_edge_bps=20.0,
+            fee_bps_estimate=1.0,
+        )
 

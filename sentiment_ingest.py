@@ -55,6 +55,8 @@ try:  # pragma: no cover - optional dependency for HTTP clients
 except Exception:  # pragma: no cover - keep runtime light during tests
     httpx = None  # type: ignore
 
+from shared.spot import filter_spot_symbols, is_spot_symbol, normalize_spot_symbol
+
 def _resolve_security_dependency() -> Callable[..., str]:
     module_names = ("services.common.security", "aether.services.common.security")
     for module_name in module_names:
@@ -478,8 +480,14 @@ class SentimentRepository:
             raise
 
     async def insert(self, observation: SocialPost, label: str) -> None:
+        normalized_symbol = normalize_spot_symbol(observation.symbol)
+        if not normalized_symbol or not is_spot_symbol(normalized_symbol):
+            raise ValueError(
+                f"SentimentRepository only accepts spot symbols (got {observation.symbol!r})"
+            )
+
         values = {
-            "symbol": observation.symbol.upper(),
+            "symbol": normalized_symbol,
             "score": label,
             "source": observation.source,
             "ts": observation.created_at.astimezone(dt.timezone.utc),
@@ -491,6 +499,10 @@ class SentimentRepository:
             connection.execute(insert(_SENTIMENT_TABLE).values(**values))
 
     async def latest(self, symbol: str) -> Optional[Tuple[str, str, str, dt.datetime]]:
+        normalized_symbol = normalize_spot_symbol(symbol)
+        if not normalized_symbol or not is_spot_symbol(normalized_symbol):
+            raise ValueError(f"Symbol '{symbol}' is not a supported spot market")
+
         stmt = (
             select(
                 _SENTIMENT_TABLE.c.symbol,
@@ -498,7 +510,7 @@ class SentimentRepository:
                 _SENTIMENT_TABLE.c.source,
                 _SENTIMENT_TABLE.c.ts,
             )
-            .where(func.upper(_SENTIMENT_TABLE.c.symbol) == symbol.upper())
+            .where(_SENTIMENT_TABLE.c.symbol == normalized_symbol)
             .order_by(_SENTIMENT_TABLE.c.ts.desc())
             .limit(1)
         )
@@ -542,7 +554,12 @@ class FeastSentimentWriter:
             LOGGER.debug("Unable to access Feast store for sentiment updates")
             return
 
-        instrument_store = store.setdefault(symbol.upper(), {})
+        normalized_symbol = normalize_spot_symbol(symbol)
+        if not normalized_symbol or not is_spot_symbol(normalized_symbol):
+            LOGGER.debug("Skipping non-spot sentiment update for symbol %s", symbol)
+            return
+
+        instrument_store = store.setdefault(normalized_symbol, {})
         sentiment_payload = instrument_store.setdefault("sentiment", {})
         sentiment_payload.update({
             "label": label,
@@ -568,7 +585,11 @@ class SentimentIngestService:
         self._feast_writer = feast_writer
 
     async def ingest_symbol(self, symbol: str) -> None:
-        tasks = [source.fetch(symbol) for source in self._sources]
+        normalized_symbol = normalize_spot_symbol(symbol)
+        if not normalized_symbol or not is_spot_symbol(normalized_symbol):
+            raise ValueError(f"Symbol '{symbol}' is not a supported spot market")
+
+        tasks = [source.fetch(normalized_symbol) for source in self._sources]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         for source, result in zip(self._sources, results):
@@ -576,10 +597,19 @@ class SentimentIngestService:
                 LOGGER.exception("Source %s failed for symbol %s", source.name, symbol)
                 continue
             for post in result:
+                post_symbol = normalize_spot_symbol(getattr(post, "symbol", "") or normalized_symbol)
+                if not post_symbol or not is_spot_symbol(post_symbol):
+                    LOGGER.debug(
+                        "Skipping non-spot sentiment observation from %s: %s",
+                        source.name,
+                        getattr(post, "symbol", ""),
+                    )
+                    continue
+                canonical_post = dataclasses.replace(post, symbol=post_symbol)
                 label, score = self._model.classify(post.text)
-                await self._repository.insert(post, label)
+                await self._repository.insert(canonical_post, label)
                 if self._feast_writer is not None:
-                    self._feast_writer.write(post.symbol, label, score)
+                    self._feast_writer.write(post_symbol, label, score)
 
     async def ingest_many(self, symbols: Sequence[str]) -> None:
         for symbol in symbols:
@@ -608,15 +638,40 @@ class SentimentAPI:
             symbol: str = Query(..., description="Symbol ticker, e.g. BTC-USD"),
             _: str = Depends(require_admin_account),
         ) -> SentimentResponse:
-            record = await self._repository.latest(symbol)
+            normalized_symbol = normalize_spot_symbol(symbol)
+            if not normalized_symbol or not is_spot_symbol(normalized_symbol):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Symbol '{symbol}' is not a supported spot market",
+                )
+            try:
+                record = await self._repository.latest(normalized_symbol)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
             if record is None:
-                raise HTTPException(status_code=404, detail=f"No sentiment found for {symbol.upper()}")
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No sentiment found for {normalized_symbol}",
+                )
             return SentimentResponse(symbol=record[0], score=record[1], source=record[2], ts=record[3])
 
         @self.router.post("/refresh")
         async def refresh(symbols: List[str], _: str = Depends(require_admin_account)) -> dict[str, str]:
-            await self._service.ingest_many(symbols)
-            return {"status": "ok", "symbols": ",".join(symbols)}
+            normalized_symbols: List[str] = []
+            for raw_symbol in symbols:
+                normalized_symbol = normalize_spot_symbol(raw_symbol)
+                if not normalized_symbol or not is_spot_symbol(normalized_symbol):
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"Symbol '{raw_symbol}' is not a supported spot market",
+                    )
+                normalized_symbols.append(normalized_symbol)
+
+            try:
+                await self._service.ingest_many(normalized_symbols)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            return {"status": "ok", "symbols": ",".join(normalized_symbols)}
 
 
 def bootstrap_service(
@@ -670,7 +725,11 @@ def create_app(
 
 async def run_once(symbols: Sequence[str], *, database_url: Path | str | None = None) -> None:
     service, _ = bootstrap_service(database_url=database_url)
-    await service.ingest_many(symbols)
+    spot_symbols = filter_spot_symbols(symbols, logger=LOGGER)
+    if not spot_symbols:
+        LOGGER.warning("No spot symbols supplied for sentiment ingestion; skipping run")
+        return
+    await service.ingest_many(spot_symbols)
 
 
 def _default_symbols() -> List[str]:
