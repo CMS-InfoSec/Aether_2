@@ -315,6 +315,25 @@ def test_place_order_allows_admin_accounts(client: TestClient, account_id: str) 
     }
 
 
+def test_place_order_rejects_non_spot_instrument(client: TestClient) -> None:
+    account_id = ADMIN_ACCOUNTS[0]
+    payload = {
+        "account_id": account_id,
+        "order_id": "ord-spot-guard",
+        "instrument": "BTC-PERP",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 101.5,
+        "fee": {"currency": "USD", "maker": 0.1, "taker": 0.2},
+    }
+
+    response = client.post("/oms/place", json=payload, headers={"X-Account-ID": account_id})
+
+    assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+    detail = response.json().get("detail", [])
+    assert any("Only spot market instruments" in str(item.get("msg", item)) for item in detail)
+
+
 def test_place_order_rejects_non_admin(client: TestClient) -> None:
     payload = {
         "account_id": "admin-alpha",
