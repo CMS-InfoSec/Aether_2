@@ -8,11 +8,13 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, MutableMapping, Sequence
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.middleware.base import BaseHTTPMiddleware
+
+from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 from services.portfolio.balance_reader import BalanceReader, BalanceRetrievalError
 try:
@@ -73,6 +75,8 @@ DEFAULT_DSN = "postgresql://timescale:password@localhost:5432/aether"
 
 
 LOGGER = logging.getLogger(__name__)
+
+_SPOT_KEYWORDS: tuple[str, ...] = ("symbol", "instrument", "pair", "market")
 
 
 class AccountScopeMiddleware(BaseHTTPMiddleware):
@@ -155,8 +159,10 @@ def _query_records(
         query += " ORDER BY 1 DESC"
 
     query += " LIMIT %(limit)s OFFSET %(offset)s"
-    rows = _execute_scoped_query(_scopes_from_request(request), query, params)
-    return list(rows)
+    rows = _execute_scoped_query(
+        _scopes_from_request(request), query, params, table=table
+    )
+    return rows
 
 
 def _to_csv(rows: Iterable[Mapping[str, Any]]) -> io.StringIO:
@@ -444,6 +450,8 @@ def _execute_scoped_query(
     account_scopes: Sequence[str],
     query: str,
     params: Mapping[str, Any],
+    *,
+    table: str | None = None,
 ) -> list[Mapping[str, Any]]:
     normalized = _normalize_account_scopes(account_scopes)
     if not normalized:
@@ -454,7 +462,7 @@ def _execute_scoped_query(
             _set_account_scopes(cursor, normalized)
             cursor.execute(query, params)
             rows = cursor.fetchall()
-    return list(rows)
+    return _filter_spot_rows(rows, table=table)
 
 
 def query_positions(
@@ -463,7 +471,9 @@ def query_positions(
     """Return recent position rows scoped by *account_scopes*."""
 
     query = "SELECT * FROM positions ORDER BY as_of DESC LIMIT %(limit)s"
-    return _execute_scoped_query(account_scopes, query, {"limit": limit})
+    return _execute_scoped_query(
+        account_scopes, query, {"limit": limit}, table="positions"
+    )
 
 
 def query_pnl_curves(
@@ -472,7 +482,9 @@ def query_pnl_curves(
     """Return recent PnL curve rows scoped by *account_scopes*."""
 
     query = "SELECT * FROM pnl_curves ORDER BY curve_ts DESC LIMIT %(limit)s"
-    return _execute_scoped_query(account_scopes, query, {"limit": limit})
+    return _execute_scoped_query(
+        account_scopes, query, {"limit": limit}, table="pnl_curves"
+    )
 
 
 def query_orders(
@@ -481,7 +493,9 @@ def query_orders(
     """Return recent order rows scoped by *account_scopes*."""
 
     query = "SELECT * FROM orders ORDER BY submitted_at DESC LIMIT %(limit)s"
-    return _execute_scoped_query(account_scopes, query, {"limit": limit})
+    return _execute_scoped_query(
+        account_scopes, query, {"limit": limit}, table="orders"
+    )
 
 
 def query_fills(
@@ -490,7 +504,51 @@ def query_fills(
     """Return recent fill rows scoped by *account_scopes*."""
 
     query = "SELECT * FROM fills ORDER BY fill_time DESC LIMIT %(limit)s"
-    return _execute_scoped_query(account_scopes, query, {"limit": limit})
+    return _execute_scoped_query(
+        account_scopes, query, {"limit": limit}, table="fills"
+    )
+
+
+def _filter_spot_rows(
+    rows: Iterable[Mapping[str, Any]], *, table: str | None
+) -> list[Mapping[str, Any]]:
+    """Return rows restricted to spot instruments, normalizing canonical symbols."""
+
+    filtered: list[Mapping[str, Any]] = []
+
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+
+        normalized_row: MutableMapping[str, Any] = dict(row)
+        drop_row = False
+
+        for key, value in list(normalized_row.items()):
+            if not isinstance(key, str):
+                continue
+
+            lowered = key.lower()
+            if not any(keyword in lowered for keyword in _SPOT_KEYWORDS):
+                continue
+
+            normalized_symbol = normalize_spot_symbol(value)
+            if not normalized_symbol or not is_spot_symbol(normalized_symbol):
+                LOGGER.warning(
+                    "Dropping non-spot instrument '%s' from %s results",
+                    value,
+                    table or "portfolio",
+                )
+                drop_row = True
+                break
+
+            normalized_row[key] = normalized_symbol
+
+        if drop_row:
+            continue
+
+        filtered.append(dict(normalized_row))
+
+    return filtered
 
 
 def _as_utc(value: datetime) -> datetime:
