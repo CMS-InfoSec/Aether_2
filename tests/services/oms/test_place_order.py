@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import importlib.util
 import sys
 import types
-import importlib.util
-from pathlib import Path
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
@@ -16,6 +17,7 @@ class _FastAPIStub:
         self.state = types.SimpleNamespace()
         self.user_middleware: List[Any] = []
         self.routes: List[Any] = []
+        self.router = types.SimpleNamespace(lifespan_context=None)
         return None
 
     def on_event(self, event: str) -> Any:
@@ -33,6 +35,12 @@ class _FastAPIStub:
 
     def add_middleware(self, middleware_cls: Any, **kwargs: Any) -> None:
         self.user_middleware.append(types.SimpleNamespace(cls=middleware_cls, **kwargs))
+
+    def exception_handler(self, *args: Any, **kwargs: Any) -> Any:
+        def decorator(func: Any) -> Any:
+            return func
+
+        return decorator
 
     def post(self, path: str, **_: Any) -> Any:
         def decorator(func: Any) -> Any:
@@ -89,6 +97,7 @@ fastapi_stub.HTTPException = _HTTPException
 fastapi_stub.Request = _Request
 fastapi_stub.Response = object
 fastapi_stub.Header = lambda *args, **kwargs: None
+fastapi_stub.Query = lambda *args, **kwargs: None
 fastapi_stub.status = _status
 sys.modules["fastapi"] = fastapi_stub
 
@@ -174,6 +183,23 @@ def _noop(*args: Any, **kwargs: Any) -> None:
     return None
 
 
+class _TransportMember:
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+    def __str__(self) -> str:
+        return self.value
+
+
+class _TransportType:
+    UNKNOWN = _TransportMember("unknown")
+    INTERNAL = _TransportMember("internal")
+    REST = _TransportMember("rest")
+    WEBSOCKET = _TransportMember("websocket")
+    FIX = _TransportMember("fix")
+    BATCH = _TransportMember("batch")
+
+
 metrics_stub = types.ModuleType("metrics")
 metrics_stub.increment_oms_child_orders_total = _noop
 metrics_stub.increment_oms_error_count = _noop
@@ -185,6 +211,9 @@ metrics_stub.record_oms_submit_ack = _noop
 metrics_stub.record_ws_latency = _noop
 metrics_stub.setup_metrics = _noop
 metrics_stub.get_request_id = lambda: None
+metrics_stub.TransportType = _TransportType
+metrics_stub.bind_metric_context = lambda *args, **kwargs: contextlib.nullcontext()
+metrics_stub.metric_context = lambda *args, **kwargs: contextlib.nullcontext()
 
 class _RegistryStub:
     def register(self, *args: Any, **kwargs: Any) -> None:

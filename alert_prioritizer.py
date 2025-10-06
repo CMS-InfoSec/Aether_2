@@ -8,10 +8,11 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, AsyncIterator, Dict, List, Mapping, Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
+from shared.postgres import normalize_postgres_dsn
 
 try:  # pragma: no cover - optional heavy dependency
     from sklearn.ensemble import GradientBoostingClassifier
@@ -53,13 +54,14 @@ def _now_utc() -> datetime:
 
 
 def _normalize_database_url(url: str) -> str:
-    normalized = url.strip()
-    lowered = normalized.lower()
-    if lowered.startswith("postgres://"):
-        normalized = "postgresql://" + normalized.split("://", 1)[1]
-    if lowered.startswith("timescaledb://"):
-        normalized = "postgresql://" + normalized.split("://", 1)[1]
-    return normalized
+    try:
+        return normalize_postgres_dsn(
+            url,
+            allow_sqlite=False,
+            label="Alert prioritizer database DSN",
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(str(exc))
 
 
 class AlertPrioritizerService:
@@ -424,10 +426,16 @@ async def prioritized_alerts(_: str = Depends(require_admin_account)) -> List[Di
     return await _service.get_prioritized_alerts()
 
 
-@router.on_event("shutdown")
-async def shutdown_prioritizer() -> None:
-    if _service is not None:
-        await _service.close()
+@asynccontextmanager
+async def _lifespan(_: Any) -> AsyncIterator[None]:
+    try:
+        yield
+    finally:
+        if _service is not None:
+            await _service.close()
+
+
+router.lifespan_context = _lifespan  # type: ignore[attr-defined]
 
 
 __all__ = ["router", "AlertPrioritizerService"]
