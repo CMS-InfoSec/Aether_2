@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import sys
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
+import pytest
 from prometheus_client import CollectorRegistry
 
 from services.alerts.alert_dedupe import AlertDedupeMetrics, AlertDedupeService, AlertPolicy
@@ -137,3 +140,29 @@ def test_alerts_escalate_after_threshold() -> None:
     policies = service.policies()
     assert policies["suppression_window_seconds"] == int(timedelta(minutes=10).total_seconds())
     assert policies["escalation_threshold"] == 3
+
+
+@pytest.mark.asyncio
+async def test_alert_dedupe_uses_configured_http_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    created: dict[str, object] = {}
+
+    class DummyAsyncClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            created["timeout"] = kwargs.get("timeout")
+
+    fake_httpx = SimpleNamespace(AsyncClient=DummyAsyncClient)
+
+    original = sys.modules.get("httpx")
+    monkeypatch.setitem(sys.modules, "httpx", fake_httpx)
+
+    try:
+        service = AlertDedupeService(http_timeout=7.5)
+        client = await service._get_client()
+    finally:
+        if original is None:
+            monkeypatch.delitem(sys.modules, "httpx", raising=False)
+        else:
+            monkeypatch.setitem(sys.modules, "httpx", original)
+
+    assert isinstance(client, DummyAsyncClient)
+    assert created["timeout"] == 7.5

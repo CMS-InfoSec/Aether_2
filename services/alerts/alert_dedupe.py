@@ -142,6 +142,7 @@ class AlertDedupeService:
         policy: Optional[AlertPolicy] = None,
         metrics: Optional[AlertDedupeMetrics] = None,
         fetcher: Optional[FetchCallable] = None,
+        http_timeout: float = 10.0,
     ) -> None:
         self.alertmanager_url = alertmanager_url.rstrip("/")
         self.policy = policy or AlertPolicy()
@@ -151,6 +152,7 @@ class AlertDedupeService:
         self._group_states: Dict[Tuple[str, str, str], AlertGroupState] = {}
         self._alert_index: Dict[str, Tuple[str, str, str]] = {}
         self._lock = asyncio.Lock()
+        self._http_timeout = float(http_timeout)
 
     # ------------------------------------------------------------------
     # HTTP helpers
@@ -162,7 +164,7 @@ class AlertDedupeService:
             raise RuntimeError("httpx is required to fetch alerts from Alertmanager") from exc
 
         if self._client is None:
-            self._client = httpx.AsyncClient()
+            self._client = httpx.AsyncClient(timeout=self._http_timeout)
         return self._client
 
     async def _default_fetch(self) -> Sequence[Mapping[str, Any]]:
