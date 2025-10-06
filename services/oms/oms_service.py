@@ -65,6 +65,7 @@ from shared.simulation import (
     sim_broker as simulation_broker,
     sim_mode_state,
 )
+from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 
 
@@ -125,6 +126,14 @@ class OMSPlaceRequest(BaseModel):
         description="Observed mid price immediately before order placement",
 
     )
+
+    @field_validator("symbol")
+    @classmethod
+    def _validate_symbol(cls, value: str) -> str:
+        normalized = normalize_spot_symbol(value)
+        if not is_spot_symbol(normalized):
+            raise ValueError("Only spot market symbols are supported.")
+        return normalized
 
     @field_validator("side")
     @classmethod
