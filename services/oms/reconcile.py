@@ -59,7 +59,14 @@ class ReconcileLogStore:
                 )
             return
 
-        self._ensure_schema()
+        try:
+            self._ensure_schema()
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            logger.warning(
+                "ReconcileLogStore unable to connect to Timescale; operating in-memory",
+                extra={"error": str(exc)},
+            )
+            self._dsn = None
 
     def _ensure_schema(self) -> None:
         assert self._dsn is not None
