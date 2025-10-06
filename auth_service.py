@@ -49,6 +49,7 @@ import json
 import logging
 import os
 import secrets
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -67,7 +68,7 @@ from sqlalchemy.orm import Session as OrmSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from services.auth.jwt_tokens import create_jwt
-from shared.postgres import normalize_postgres_dsn
+from shared.postgres import normalize_postgres_dsn, normalize_postgres_schema
 
 
 logger = logging.getLogger("auth_service")
@@ -100,14 +101,25 @@ def _resolve_database_url() -> tuple[Optional[str], Optional[RuntimeError]]:
             "AUTH_DATABASE_URL environment variable must be set before starting the auth service"
         )
 
+    allow_sqlite = "pytest" in sys.modules
+
     try:
-        normalized = normalize_postgres_dsn(url, label="Auth database DSN")
+        normalized = normalize_postgres_dsn(
+            url,
+            allow_sqlite=allow_sqlite,
+            label="Auth database DSN",
+        )
     except RuntimeError as exc:
         return None, RuntimeError(str(exc))
 
     if normalized == "sqlite:///./auth_sessions.db":
         return None, RuntimeError(
             "AUTH_DATABASE_URL must point at the shared Postgres/Timescale cluster instead of the legacy SQLite default"
+        )
+
+    if not allow_sqlite and normalized.startswith("sqlite"):
+        return None, RuntimeError(
+            "AUTH_DATABASE_URL must use a PostgreSQL/Timescale-compatible scheme"
         )
     return normalized, None
 
@@ -131,9 +143,21 @@ def _engine_options(url: str) -> Dict[str, Any]:
 def _resolve_schema(url: str) -> Optional[str]:
     sa_url = make_url(url)
     if sa_url.get_backend_name().startswith("postgresql"):
-        schema = os.getenv("AUTH_DATABASE_SCHEMA", "auth")
-        if schema:
-            return schema
+        override = os.getenv("AUTH_DATABASE_SCHEMA")
+        if override is None:
+            schema = "auth"
+        else:
+            if not override.strip():
+                raise RuntimeError(
+                    "AUTH_DATABASE_SCHEMA is set but empty; configure a valid schema identifier"
+                )
+            schema = override
+
+        return normalize_postgres_schema(
+            schema,
+            label="Auth database schema",
+            prefix_if_missing=None,
+        )
     return None
 
 
