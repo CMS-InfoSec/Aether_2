@@ -41,7 +41,7 @@ from services.common import security
 from services.common.security import require_admin_account
 from shared.postgres import normalize_postgres_schema, normalize_sqlalchemy_dsn
 from shared.session_config import load_session_ttl_minutes
-from shared.spot import is_spot_symbol, normalize_spot_symbol
+from shared.spot import require_spot_symbol
 
 
 logger = logging.getLogger(__name__)
@@ -503,14 +503,14 @@ def _require_spot_symbol(symbol: str, *, param_name: str) -> str:
     data only.
     """
 
-    normalized = normalize_spot_symbol(symbol)
-    if not normalized or not is_spot_symbol(normalized):
+    try:
+        return require_spot_symbol(symbol)
+    except ValueError as exc:
         logger.warning("Rejecting non-spot symbol for %s: %s", param_name, symbol)
         raise HTTPException(
             status_code=422,
             detail=f"{param_name} must reference a USD spot trading pair",
-        )
-    return normalized
+        ) from exc
 
 
 @app.get("/signals/orderflow/{symbol}", response_model=OrderFlowResponse)

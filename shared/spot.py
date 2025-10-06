@@ -10,6 +10,7 @@ __all__ = [
     "normalize_spot_symbol",
     "is_spot_symbol",
     "filter_spot_symbols",
+    "require_spot_symbol",
 ]
 
 
@@ -98,3 +99,17 @@ def filter_spot_symbols(
         seen.add(normalized)
 
     return filtered
+
+
+def require_spot_symbol(symbol: object, *, message: str | None = None) -> str:
+    """Return *symbol* normalised when it represents a USD spot market pair.
+
+    ``ValueError`` is raised when the supplied *symbol* is missing or does not
+    correspond to an allowed spot instrument.  A custom *message* may be
+    provided to tailor the error for different call sites.
+    """
+
+    normalized = normalize_spot_symbol(symbol)
+    if not normalized or not is_spot_symbol(normalized):
+        raise ValueError(message or "Only spot market instruments are supported.")
+    return normalized
