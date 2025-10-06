@@ -29,6 +29,7 @@ from reports.storage import ArtifactStorage, build_storage_from_env
 from services.common.security import require_admin_account
 from shared.timezone import format_london_time
 from services.models.model_server import get_active_model
+from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 try:  # pragma: no cover - psycopg is an optional dependency in tests
     import psycopg
@@ -122,6 +123,45 @@ def _maybe_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _filter_spot_instruments(
+    frame: pd.DataFrame,
+    *,
+    column: str = "instrument",
+    context: str,
+) -> pd.DataFrame:
+    """Return *frame* with only canonical spot instruments preserved."""
+
+    if frame.empty or column not in frame.columns:
+        return frame
+
+    mask: list[bool] = []
+    normalized_values: list[str] = []
+    dropped: set[str] = set()
+
+    for raw in frame[column]:
+        normalized = normalize_spot_symbol(raw)
+        if normalized and is_spot_symbol(normalized):
+            mask.append(True)
+            normalized_values.append(normalized)
+        else:
+            mask.append(False)
+            if raw not in (None, ""):
+                dropped.add(str(raw))
+
+    filtered = frame.loc[mask].copy()
+    if not filtered.empty:
+        filtered.loc[:, column] = normalized_values
+
+    if dropped:
+        LOGGER.warning(
+            "Dropping non-spot instruments from %s",
+            context,
+            extra={"non_spot_instruments": sorted(dropped)},
+        )
+
+    return filtered
 
 
 def _normalise_feature_payload(raw: Any) -> dict[str, float]:
@@ -290,6 +330,7 @@ def _daily_fill_summary(
           AND f.fill_time < %(end)s
     """
     frame = _query_dataframe(conn, query, {"account_id": account_id, "start": start, "end": end})
+    frame = _filter_spot_instruments(frame, context="daily fill summary")
     if frame.empty:
         return pd.DataFrame(
             columns=[
@@ -582,6 +623,9 @@ def _instrument_breakdown(frame: pd.DataFrame) -> list[dict[str, Any]]:
     if frame.empty:
         return []
     frame = frame.copy()
+    frame = _filter_spot_instruments(frame, context="instrument breakdown")
+    if frame.empty:
+        return []
     frame["notional"] = frame.get("size", 0).astype(float) * frame.get("price", 0).astype(float)
     grouped = (
         frame.groupby("instrument", dropna=False)
@@ -663,9 +707,12 @@ def get_trade_explanation(
     instrument = trade.get("instrument") or trade.get("symbol")
     if not instrument:
         raise HTTPException(status_code=422, detail="Trade is missing instrument context")
+    normalized_instrument = normalize_spot_symbol(instrument)
+    if not normalized_instrument or not is_spot_symbol(normalized_instrument):
+        raise HTTPException(status_code=422, detail="Trade references non-spot instrument")
 
     features = _extract_feature_mapping(trade)
-    model = get_active_model(str(account_id), str(instrument))
+    model = get_active_model(str(account_id), normalized_instrument)
     raw_importance = model.explain(features)
 
     ordered = sorted(
@@ -688,7 +735,7 @@ def get_trade_explanation(
     payload = {
         "trade_id": trade_id,
         "account_id": str(account_id),
-        "instrument": str(instrument),
+        "instrument": normalized_instrument,
         "executed_at": executed_at,
         "price": _maybe_float(trade.get("price")),
         "size": _maybe_float(trade.get("size")),
@@ -873,6 +920,9 @@ def get_xai_report(
             ORDER BY f.fill_time ASC
             """,
             {"account_id": account_id, "start": start, "end": end},
+        )
+        detailed_trades = _filter_spot_instruments(
+            detailed_trades, context="XAI report trades"
         )
         pnl = _daily_pnl_summary(
             conn, account_id=account_id, start=start, end=end, report_date=resolved_date

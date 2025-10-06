@@ -5,7 +5,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import List, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 
 class Intent(BaseModel):
@@ -110,6 +112,14 @@ class Order(BaseModel):
     )
     ts: datetime = Field(..., description="Timestamp of the latest status change")
 
+    @field_validator("symbol", mode="before")
+    @classmethod
+    def _ensure_spot_symbol(cls, value: object) -> str:
+        normalized = normalize_spot_symbol(value)
+        if not normalized or not is_spot_symbol(normalized):
+            raise ValueError("Only spot market symbols are supported.")
+        return normalized
+
 
 class Fill(BaseModel):
     """Details of an execution fill received from an exchange."""
@@ -146,6 +156,14 @@ class Fill(BaseModel):
         description="Indicates maker or taker side of the fill",
     )
     ts: datetime = Field(..., description="Timestamp when the fill occurred")
+
+    @field_validator("symbol", mode="before")
+    @classmethod
+    def _ensure_spot_symbol(cls, value: object) -> str:
+        normalized = normalize_spot_symbol(value)
+        if not normalized or not is_spot_symbol(normalized):
+            raise ValueError("Only spot market symbols are supported.")
+        return normalized
 
 
 class RiskResult(BaseModel):
