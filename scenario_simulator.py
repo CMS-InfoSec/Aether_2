@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 from services.common.config import get_timescale_session
 from services.common.security import require_admin_account
 from shared.correlation import CorrelationIdMiddleware
+from shared.spot import filter_spot_symbols, is_spot_symbol, normalize_spot_symbol
 
 try:  # pragma: no cover - psycopg is an optional dependency in some environments
     import psycopg
@@ -174,13 +175,12 @@ def _fetch_positions(conn: psycopg.Connection, account_id: str) -> pd.DataFrame:
     with conn.cursor() as cur:
         cur.execute(POSITIONS_QUERY, {"account_id": account_id})
         rows = cur.fetchall()
-    if not rows:
-        return pd.DataFrame(columns=["market", "quantity", "entry_price"])
-    return pd.DataFrame(rows)
+    frame = pd.DataFrame(rows, columns=["market", "quantity", "entry_price"])
+    return _normalize_spot_positions(frame)
 
 
 def _fetch_price_history(conn: psycopg.Connection, markets: Iterable[str]) -> pd.DataFrame:
-    symbols = list({market for market in markets if market})
+    symbols = _canonical_spot_markets(markets)
     if not symbols:
         return pd.DataFrame(columns=["market", "bucket_start", "close"])
 
@@ -194,8 +194,52 @@ def _fetch_price_history(conn: psycopg.Connection, markets: Iterable[str]) -> pd
     if not rows:
         return pd.DataFrame(columns=["market", "bucket_start", "close"])
     frame = pd.DataFrame(rows)
+    if not frame.empty:
+        frame["market"] = [normalize_spot_symbol(market) for market in frame["market"]]
     frame["bucket_start"] = pd.to_datetime(frame["bucket_start"], utc=True)
     return frame
+
+
+def _canonical_spot_markets(markets: Iterable[object]) -> list[str]:
+    return filter_spot_symbols(markets, logger=LOGGER)
+
+
+def _normalize_spot_positions(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame(columns=["market", "quantity", "entry_price"])
+
+    normalized_rows = []
+    for record in frame.to_dict("records"):
+        raw_market = record.get("market")
+        canonical = normalize_spot_symbol(raw_market)
+        if not canonical or not is_spot_symbol(canonical):
+            LOGGER.warning(
+                "Dropping non-spot position '%s' during scenario simulation", raw_market
+            )
+            continue
+
+        normalized_rows.append(
+            {
+                "market": canonical,
+                "quantity": record.get("quantity"),
+                "entry_price": record.get("entry_price"),
+            }
+        )
+
+    if not normalized_rows:
+        return pd.DataFrame(columns=["market", "quantity", "entry_price"])
+
+    normalized = pd.DataFrame(normalized_rows)
+    normalized["quantity"] = pd.to_numeric(normalized["quantity"], errors="coerce").fillna(0.0)
+    normalized["entry_price"] = pd.to_numeric(normalized["entry_price"], errors="coerce").fillna(0.0)
+
+    aggregated = (
+        normalized.groupby("market", as_index=False)
+        .agg(quantity=("quantity", "sum"), entry_price=("entry_price", "last"))
+        .reindex(columns=["market", "quantity", "entry_price"])
+    )
+
+    return aggregated.astype({"quantity": float, "entry_price": float})
 
 
 def _latest_prices(price_frame: pd.DataFrame) -> Mapping[str, float]:

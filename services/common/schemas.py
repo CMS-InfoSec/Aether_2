@@ -5,9 +5,11 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 
-from pydantic import BaseModel, Field, model_serializer, model_validator
+from pydantic import BaseModel, Field, field_validator, model_serializer, model_validator
 
 from fastapi import HTTPException, status
+
+from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 
 
@@ -142,6 +144,14 @@ class PolicyDecisionRequest(BaseModel):
         None, description="Caller confidence metrics aligned with Soloing spec"
     )
 
+    @field_validator("instrument")
+    @classmethod
+    def _validate_instrument(cls, value: str) -> str:
+        normalized = normalize_spot_symbol(value)
+        if not is_spot_symbol(normalized):
+            raise ValueError("Only spot market instruments are supported.")
+        return normalized
+
 
 class PolicyDecisionResponse(BaseModel):
     approved: bool = Field(..., description="Whether the order is approved")
@@ -240,6 +250,22 @@ class PortfolioState(BaseModel):
         default_factory=dict,
         description="Optional additional portfolio metadata for auditing",
     )
+
+    @model_validator(mode="after")
+    def _normalize_spot_exposures(self) -> "PortfolioState":  # type: ignore[override]
+        if not self.instrument_exposure:
+            return self
+
+        normalized: Dict[str, float] = {}
+        for symbol, exposure in self.instrument_exposure.items():
+            canonical = normalize_spot_symbol(symbol)
+            if not canonical or not is_spot_symbol(canonical):
+                raise ValueError("instrument_exposure must only contain spot market symbols.")
+
+            normalized[canonical] = normalized.get(canonical, 0.0) + float(exposure)
+
+        self.instrument_exposure = normalized
+        return self
 
 
 class RiskValidationRequest(BaseModel):
@@ -352,36 +378,34 @@ class OrderPlacementRequest(BaseModel):
         gt=0.0,
         description="Take profit trigger price",
     )
-
-    @model_validator(mode="after")
-    def _validate_expire_time(self) -> "OrderPlacementRequest":  # type: ignore[override]
-        if self.expire_time is not None:
-            if self.expire_time.tzinfo is None:
-                raise ValueError("expire_time must include timezone information.")
-            self.expire_time = self.expire_time.astimezone(timezone.utc)
-        if self.time_in_force == "GTD" and self.expire_time is None:
-            raise ValueError(GTD_EXPIRE_TIME_REQUIRED)
-        return self
     stop_loss: float | None = Field(
         default=None,
         gt=0.0,
         description="Stop loss trigger price",
     )
 
+    @field_validator("instrument")
+    @classmethod
+    def _validate_instrument(cls, value: str) -> str:
+        normalized = normalize_spot_symbol(value)
+        if not is_spot_symbol(normalized):
+            raise ValueError("Only spot market instruments are supported.")
+        return normalized
+
     @model_validator(mode="after")
     def _validate_expire_time(self) -> "OrderPlacementRequest":  # type: ignore[override]
-        if self.time_in_force == "GTD":
-            if self.expire_time is None:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="expire_time is required when time_in_force is GTD",
-                )
+        if self.expire_time is not None:
             if self.expire_time.tzinfo is None:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="expire_time must include timezone information",
                 )
             self.expire_time = self.expire_time.astimezone(timezone.utc)
+        if self.time_in_force == "GTD" and self.expire_time is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=GTD_EXPIRE_TIME_REQUIRED,
+            )
         return self
 
 

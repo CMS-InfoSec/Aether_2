@@ -4,6 +4,7 @@ import os
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.dialects.postgresql import JSONB
@@ -23,10 +24,10 @@ from services.universe.universe_service import (
     OhlcvBar,
     OverrideRequest,
     UniverseWhitelist,
+    _evaluate_universe,
     _kraken_volume_24h,
     _latest_manual_overrides,
     _normalize_market,
-    _evaluate_universe,
     app,
 )
 
@@ -58,6 +59,12 @@ def test_normalize_market_handles_kraken_aliases() -> None:
     assert _normalize_market("xbt/usd") == "BTC-USD"
     assert _normalize_market("btc") == "BTC-USD"
     assert _normalize_market("BTC-USD") == "BTC-USD"
+
+
+def test_normalize_market_rejects_derivatives() -> None:
+    assert _normalize_market("xbtusd.p") is None
+    assert _normalize_market("btc-usd-perp") is None
+    assert _normalize_market("btc/usdt") is None
 
 
 def test_universe_api_returns_canonical_symbols_for_kraken_pairs(session: Session) -> None:
@@ -134,6 +141,44 @@ def test_universe_api_returns_canonical_symbols_for_kraken_pairs(session: Sessio
     assert all(symbol.endswith("-USD") for symbol in payload["symbols"])
 
 
+def test_evaluate_universe_ignores_derivative_markets(session: Session) -> None:
+    now = datetime.now(timezone.utc)
+
+    session.add_all(
+        [
+            Feature(
+                feature_name="coingecko.market_cap",
+                entity_id="xbtusd.p",
+                event_timestamp=now,
+                value=2_500_000_000.0,
+                attributes={},
+            ),
+            Feature(
+                feature_name="coingecko.volatility_30d",
+                entity_id="xbtusd.p",
+                event_timestamp=now,
+                value=0.5,
+                attributes={},
+            ),
+        ]
+    )
+    session.add(
+        OhlcvBar(
+            market="XBTUSD.P",
+            bucket_start=now - timedelta(hours=1),
+            open=1.0,
+            high=1.0,
+            low=1.0,
+            close=1.0,
+            volume=150_000_000.0,
+        )
+    )
+    session.commit()
+
+    assert _kraken_volume_24h(session) == {}
+    assert _evaluate_universe(session) == []
+
+
 def test_manual_override_migrates_legacy_symbols(session: Session) -> None:
     legacy_time = datetime.now(timezone.utc) - timedelta(days=1)
 
@@ -163,6 +208,16 @@ def test_manual_override_migrates_legacy_symbols(session: Session) -> None:
     audit_entries = session.query(AuditLog).all()
     assert audit_entries
     assert audit_entries[-1].entity_id == "BTC-USD"
+
+
+def test_manual_override_rejects_non_spot_symbols(session: Session) -> None:
+    request = OverrideRequest(symbol="xbtusd.p", enabled=True, reason="Enable trading")
+
+    with pytest.raises(HTTPException) as excinfo:
+        universe_service.override_symbol(request, session=session, actor_account="ops-admin")
+
+    assert excinfo.value.status_code == 400
+    assert excinfo.value.detail == "Symbol must be a USD-quoted spot market"
 @compiles(JSONB, "sqlite")
 def _compile_jsonb_sqlite(type_: JSONB, compiler, **kw) -> str:  # pragma: no cover - SQLAlchemy hook
     return "JSON"
