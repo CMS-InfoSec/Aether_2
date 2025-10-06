@@ -41,7 +41,7 @@ from services.common import security
 from services.common.security import require_admin_account
 from shared.postgres import normalize_postgres_schema, normalize_sqlalchemy_dsn
 from shared.session_config import load_session_ttl_minutes
-from shared.spot import require_spot_symbol
+from services.common.spot import require_spot_http
 
 
 logger = logging.getLogger(__name__)
@@ -498,19 +498,12 @@ def _market_data_adapter() -> MarketDataAdapter:
 def _require_spot_symbol(symbol: str, *, param_name: str) -> str:
     """Validate *symbol* as a USD spot trading pair.
 
-    Any derivatives, leveraged tokens, or non-USD quotes are rejected with a
-    ``422`` error so downstream analytics are guaranteed to run on compliant
-    data only.
+    The helper delegates to :func:`services.common.spot.require_spot_http` so
+    HTTP responses and audit logging remain consistent with the rest of the
+    platform.
     """
 
-    try:
-        return require_spot_symbol(symbol)
-    except ValueError as exc:
-        logger.warning("Rejecting non-spot symbol for %s: %s", param_name, symbol)
-        raise HTTPException(
-            status_code=422,
-            detail=f"{param_name} must reference a USD spot trading pair",
-        ) from exc
+    return require_spot_http(symbol, param=param_name, logger=logger)
 
 
 @app.get("/signals/orderflow/{symbol}", response_model=OrderFlowResponse)
