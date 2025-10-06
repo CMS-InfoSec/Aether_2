@@ -55,6 +55,7 @@ from services.oms.rate_limit_guard import rate_limit_guard
 from services.oms.shadow_oms import shadow_oms
 from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
 from shared.session_config import load_session_ttl_minutes
+from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 from services.oms.circuit_breaker_store import CircuitBreakerStateStore, CircuitBreakerPersistedState
 
@@ -1315,6 +1316,15 @@ async def place_order(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account mismatch between header and payload.",
         )
+
+    normalized_instrument = normalize_spot_symbol(request.instrument)
+    if not normalized_instrument or not is_spot_symbol(normalized_instrument):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Only spot market instruments are supported.",
+        )
+
+    request.instrument = normalized_instrument
 
     if not request.instrument.endswith("USD"):
         raise HTTPException(
