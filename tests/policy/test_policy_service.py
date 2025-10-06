@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import importlib
 import os
 import sys
 import types
@@ -387,4 +388,42 @@ def test_regime_endpoint_allows_authenticated_access(
     )
 
     assert response.status_code == status.HTTP_200_OK
+
+
+def test_policy_service_requires_session_store_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "policy_service"
+    cached_module = sys.modules.pop(module_name, None)
+    monkeypatch.delenv("SESSION_REDIS_URL", raising=False)
+
+    with pytest.raises(RuntimeError, match="SESSION_REDIS_URL is not configured"):
+        importlib.import_module(module_name)
+
+    sys.modules.pop(module_name, None)
+    if cached_module is not None:
+        sys.modules[module_name] = cached_module
+    else:
+        monkeypatch.setenv("SESSION_REDIS_URL", "memory://policy-tests")
+        importlib.import_module(module_name)
+
+
+def test_policy_service_rejects_memory_session_store_outside_pytest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    monkeypatch.setenv("SESSION_REDIS_URL", "memory://policy-prod")
+    cached_pytest = sys.modules.get("pytest")
+    if cached_pytest is not None:
+        sys.modules.pop("pytest")
+
+    try:
+        with pytest.raises(RuntimeError, match="must use a redis:// or rediss:// DSN outside pytest"):
+            policy_service._configure_session_store(app)
+    finally:
+        if cached_pytest is not None:
+            sys.modules["pytest"] = cached_pytest
+
 

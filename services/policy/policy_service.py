@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import threading
 import time
 from dataclasses import asdict, is_dataclass
@@ -11,6 +12,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from auth.service import build_session_store_from_url, SessionStoreProtocol
+from shared.session_config import load_session_ttl_minutes
 from pydantic import BaseModel, Field, field_validator
 
 try:  # pragma: no cover - optional dependency
@@ -429,13 +431,31 @@ def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
     if isinstance(existing, SessionStoreProtocol):
         store = existing
     else:
-        redis_url = os.getenv("SESSION_REDIS_URL")
-        if not redis_url:
+        raw_url = os.getenv("SESSION_REDIS_URL")
+        if raw_url is None:
             raise RuntimeError(
-                "SESSION_REDIS_URL is not configured. Provide a shared session store DSN to enable policy service authentication.",
+                "SESSION_REDIS_URL is not configured. Provide a redis:// DSN to enable policy service authentication.",
             )
 
-        store = build_session_store_from_url(redis_url)
+        redis_url = raw_url.strip()
+        if not redis_url:
+            raise RuntimeError(
+                "SESSION_REDIS_URL is set but empty; configure a redis:// or rediss:// DSN.",
+            )
+
+        normalized = redis_url.lower()
+        if normalized.startswith("memory://") and "pytest" not in sys.modules:
+            raise RuntimeError(
+                "SESSION_REDIS_URL must use a redis:// or rediss:// DSN outside pytest so policy sessions persist across restarts.",
+            )
+
+        ttl_minutes = load_session_ttl_minutes()
+        if normalized.startswith("memory://"):
+            from auth.service import InMemorySessionStore  # local import to avoid optional dependency
+
+            store = InMemorySessionStore(ttl_minutes=ttl_minutes)
+        else:
+            store = build_session_store_from_url(redis_url, ttl_minutes=ttl_minutes)
         application.state.session_store = store
     security.set_default_session_store(store)
     return store
