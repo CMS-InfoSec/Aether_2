@@ -5,6 +5,7 @@ import csv
 import datetime as dt
 import io
 import json
+import logging
 import os
 import uuid
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
 
 from audit_mode import AuditorPrincipal, require_auditor_identity
+from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 try:  # pragma: no cover - optional dependency during unit tests.
     import boto3
@@ -30,6 +32,8 @@ except Exception:  # pragma: no cover
     dict_row = None  # type: ignore
     psycopg_errors = None  # type: ignore
 
+
+LOGGER = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/compliance", tags=["compliance"])
 
@@ -187,7 +191,14 @@ class CompliancePackExporter:
     ) -> Dict[str, List[Dict[str, Any]]]:
         payload: Dict[str, List[Dict[str, Any]]] = {}
         for name, (table, ts_column) in self._DATA_SOURCES.items():
-            payload[name] = self._fetch_table(conn, table, ts_column, start, end)
+            rows = self._fetch_table(conn, table, ts_column, start, end)
+            if name == "trades":
+                payload[name] = self._normalise_trades(rows)
+                continue
+            if name == "fills":
+                payload[name] = self._normalise_fills(rows)
+                continue
+            payload[name] = rows
         return payload
 
     def _fetch_table(
@@ -348,7 +359,14 @@ class CompliancePackExporter:
         latest_config = self._latest_config_version(records.get("configs", []))
 
         for trade in records.get("trades", []):
-            normalized = self._normalise_trade(trade)
+            try:
+                normalized = self._normalise_trade(trade)
+            except ValueError:
+                LOGGER.warning(
+                    "Skipping trade record with non-spot instrument during rendering: %s",
+                    trade,
+                )
+                continue
             trade_id = normalized.get("trade_id")
             decision_id = normalized.get("decision_id")
 
@@ -422,6 +440,39 @@ class CompliancePackExporter:
             row[key] = self._normalise_value(value)
         return row
 
+    def _normalise_trades(self, trades: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+        filtered: List[Dict[str, Any]] = []
+        for trade in trades:
+            try:
+                filtered.append(self._normalise_trade(trade))
+            except ValueError:
+                LOGGER.warning(
+                    "Skipping trade record with non-spot instrument: %s",
+                    trade,
+                )
+        return filtered
+
+    def _normalise_fills(self, fills: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+        filtered: List[Dict[str, Any]] = []
+        for fill in fills:
+            try:
+                filtered.append(self._normalise_fill(fill))
+            except ValueError:
+                LOGGER.warning(
+                    "Skipping fill record with non-spot instrument: %s",
+                    fill,
+                )
+        return filtered
+
+    @staticmethod
+    def _canonical_spot_symbol(values: Mapping[str, Any]) -> str:
+        for key in ("instrument", "symbol", "pair", "market", "ticker"):
+            candidate = values.get(key)
+            normalized = normalize_spot_symbol(candidate)
+            if normalized and is_spot_symbol(normalized):
+                return normalized
+        return ""
+
     def _normalise_value(self, value: Any) -> Any:
         if isinstance(value, dt.datetime):
             if value.tzinfo is None:
@@ -460,6 +511,22 @@ class CompliancePackExporter:
             or normalized.get("risk_decision")
         )
         normalized.setdefault("decision_id", decision)
+        canonical = self._canonical_spot_symbol(normalized)
+        if not canonical:
+            raise ValueError("Trade references non-spot instrument")
+        normalized["instrument"] = canonical
+        normalized["symbol"] = canonical
+        return {key: self._normalise_value(value) for key, value in normalized.items()}
+
+    def _normalise_fill(self, fill: Mapping[str, Any]) -> Dict[str, Any]:
+        normalized = dict(fill)
+        normalized.setdefault("instrument", normalized.get("symbol"))
+        normalized.setdefault("symbol", normalized.get("instrument"))
+        canonical = self._canonical_spot_symbol(normalized)
+        if not canonical:
+            raise ValueError("Fill references non-spot instrument")
+        normalized["instrument"] = canonical
+        normalized["symbol"] = canonical
         return {key: self._normalise_value(value) for key, value in normalized.items()}
 
     def _latest_config_version(self, configs: Sequence[Mapping[str, Any]]) -> str | None:

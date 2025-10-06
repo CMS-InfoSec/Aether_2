@@ -30,6 +30,7 @@ except Exception:  # pragma: no cover - gracefully degrade if mlflow missing.
         """Fallback placeholder used when mlflow is absent."""
 
 from services.common.schemas import ActionTemplate, BookSnapshot, ConfidenceMetrics
+from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -404,9 +405,17 @@ def _augment_metadata(
     return payload
 
 
+def _require_spot_symbol(symbol: object) -> str:
+    normalized = normalize_spot_symbol(symbol)
+    if not normalized or not is_spot_symbol(normalized):
+        raise ValueError("Only spot market instruments are supported.")
+    return normalized
+
+
 def _model_name(account_id: str, symbol: str, variant: str | None = None) -> str:
+    canonical_symbol = _require_spot_symbol(symbol)
     suffix = f"::{variant}" if variant else ""
-    return f"policy-intent::{account_id}::{symbol}{suffix}".lower()
+    return f"policy-intent::{account_id}::{canonical_symbol}{suffix}".lower()
 
 
 def _initialise_registry() -> PolicyModelRegistry:
@@ -436,6 +445,7 @@ def predict_intent(
     """Run inference against the latest MLflow model and return an intent."""
 
     metadata: Dict[str, Any] | None = None
+    canonical_symbol = _require_spot_symbol(symbol)
 
     try:
         snapshot = (
@@ -444,7 +454,7 @@ def predict_intent(
             else BookSnapshot(**book_snapshot)
         )
 
-        model_key = _model_name(account_id, symbol, model_variant)
+        model_key = _model_name(account_id, canonical_symbol, model_variant)
         cached_model = _MODEL_REGISTRY.load(model_key)
 
         metadata = {
@@ -473,7 +483,7 @@ def predict_intent(
         logger.warning(
             "Feature validation failed for account=%s symbol=%s: %s",
             account_id,
-            symbol,
+            canonical_symbol,
             exc,
         )
         failure_metadata = _augment_metadata(metadata, error=str(exc))
@@ -482,7 +492,7 @@ def predict_intent(
         logger.error(
             "Unable to load policy model for account=%s symbol=%s: %s",
             account_id,
-            symbol,
+            canonical_symbol,
             exc,
         )
         failure_metadata = _augment_metadata(metadata, error=str(exc))
@@ -491,7 +501,7 @@ def predict_intent(
         logger.error(
             "Model inference failed for account=%s symbol=%s: %s",
             account_id,
-            symbol,
+            canonical_symbol,
             exc,
         )
         failure_metadata = _augment_metadata(metadata, error=str(exc))
@@ -500,7 +510,7 @@ def predict_intent(
         logger.exception(
             "Unexpected failure during intent prediction for account=%s symbol=%s",
             account_id,
-            symbol,
+            canonical_symbol,
         )
         failure_metadata = _augment_metadata(metadata, error=str(exc))
         return Intent.null(metadata=failure_metadata)

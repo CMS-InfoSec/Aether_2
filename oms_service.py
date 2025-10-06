@@ -38,6 +38,7 @@ from services.oms.rate_limit_guard import RateLimitGuard, rate_limit_guard as sh
 from services.risk.stablecoin_monitor import format_depeg_alert, get_global_monitor
 
 from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
+from shared.spot import is_spot_symbol, normalize_spot_symbol
 from services.oms.oms_service import (  # type: ignore  # pragma: no cover - shared helpers
     _PrecisionValidator,
     _normalize_symbol,
@@ -192,6 +193,14 @@ class PlaceOrderRequest(BaseModel):
         ge=Decimal("0"),
         description="Slippage estimate in basis points provided by the caller",
     )
+
+    @field_validator("symbol")
+    @classmethod
+    def _validate_symbol(cls, value: str) -> str:
+        normalized = normalize_spot_symbol(value)
+        if not is_spot_symbol(normalized):
+            raise ValueError("Only spot market symbols are supported.")
+        return normalized
 
     @field_validator("side")
     @classmethod

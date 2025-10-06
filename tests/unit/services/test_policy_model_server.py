@@ -185,3 +185,30 @@ def test_predict_intent_schema_mismatch(monkeypatch, signature):
     assert intent.metadata["model_version"] == "7"
     assert "error" in intent.metadata
     assert not stub_model.calls
+
+
+def test_predict_intent_normalizes_symbol(monkeypatch, signature):
+    cached_model, stub_model = _cached_model(signature)
+    registry = _RegistryStub(cached_model)
+    monkeypatch.setattr(model_server, "_MODEL_REGISTRY", registry)
+
+    intent = model_server.predict_intent(
+        account_id="ACCT",
+        symbol="btc/usd",
+        features=[0.4, -0.2],
+        book_snapshot={"mid_price": 9_500.0, "spread_bps": 4.0, "imbalance": 0.05},
+    )
+
+    assert intent.approved is True
+    assert registry.calls == [model_server._model_name("ACCT", "BTC-USD")]
+    assert stub_model.calls, "Model should have been invoked for normalized symbol"
+
+
+def test_predict_intent_rejects_derivative_symbol():
+    with pytest.raises(ValueError, match="spot market instruments"):
+        model_server.predict_intent(
+            account_id="ACCT",
+            symbol="BTC-PERP",
+            features=[0.1, 0.2],
+            book_snapshot={"mid_price": 10_000.0, "spread_bps": 5.0, "imbalance": 0.1},
+        )
