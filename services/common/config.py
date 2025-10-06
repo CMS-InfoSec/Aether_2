@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 from dataclasses import dataclass
 from functools import lru_cache
