@@ -6,6 +6,7 @@ import datetime as dt
 import json
 import logging
 import os
+import sys
 from dataclasses import dataclass
 from typing import Iterable, List, Mapping
 
@@ -13,6 +14,8 @@ import requests
 from sqlalchemy import Boolean, Column, DateTime, JSON, MetaData, Numeric, String, Table
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Engine, create_engine
+
+from shared.postgres import normalize_sqlalchemy_dsn
 
 try:
     from nats.aio.client import Client as NATS
@@ -23,7 +26,35 @@ logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger(__name__)
 
 COINGECKO_API = os.getenv("COINGECKO_API", "https://api.coingecko.com/api/v3")
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg2://localhost:5432/aether")
+_SQLITE_FALLBACK_FLAG = "COINGECKO_ALLOW_SQLITE_FOR_TESTS"
+
+
+def _resolve_database_url() -> str:
+    """Return the configured Timescale/PostgreSQL DSN for persistence."""
+
+    raw_url = os.getenv("DATABASE_URL", "")
+    if not raw_url.strip():
+        raise RuntimeError(
+            "CoinGecko ingest requires DATABASE_URL to be set to a PostgreSQL/Timescale DSN."
+        )
+
+    allow_sqlite = "pytest" in sys.modules or os.getenv(_SQLITE_FALLBACK_FLAG) == "1"
+    database_url = normalize_sqlalchemy_dsn(
+        raw_url.strip(),
+        allow_sqlite=allow_sqlite,
+        label="CoinGecko ingest database URL",
+    )
+
+    if database_url.startswith("sqlite"):
+        LOGGER.warning(
+            "Using SQLite database '%s' for CoinGecko ingest; allowed only for tests.",
+            database_url,
+        )
+
+    return database_url
+
+
+DATABASE_URL = _resolve_database_url()
 WHITELIST_TOPIC = os.getenv("WHITELIST_TOPIC", "universe.whitelist")
 NATS_SERVERS = os.getenv("NATS_SERVERS", "nats://localhost:4222").split(",")
 
