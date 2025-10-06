@@ -14,9 +14,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-import sys
-
 import statistics
+import sys
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from threading import Lock
@@ -39,6 +38,7 @@ from services.common.config import get_timescale_session
 from services.common import security
 from services.common.security import require_admin_account
 from shared.session_config import load_session_ttl_minutes
+from shared.postgres import normalize_sqlalchemy_dsn
 
 try:  # pragma: no cover - optional dependency during CI
     import psycopg
@@ -49,6 +49,50 @@ except Exception:  # pragma: no cover - gracefully degrade without psycopg
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+_MARKET_DATA_DSN_VARS = (
+    "ORDERFLOW_MARKET_DATA_URL",
+    "ANALYTICS_MARKET_DATA_URL",
+    "MARKET_DATA_DATABASE_URL",
+    "ANALYTICS_DATABASE_URL",
+    "DATABASE_URL",
+)
+
+
+def _resolve_market_data_dsn() -> str:
+    """Return the configured Timescale connection string for market data."""
+
+    allow_sqlite = "pytest" in sys.modules
+
+    raw = next(
+        (
+            os.getenv(var)
+            for var in _MARKET_DATA_DSN_VARS
+            if os.getenv(var) is not None
+        ),
+        None,
+    )
+
+    if raw is None:
+        if allow_sqlite:
+            return "sqlite+pysqlite:///:memory:"
+        raise RuntimeError(
+            "Orderflow market data DSN is not configured. Set ORDERFLOW_MARKET_DATA_URL "
+            "to a PostgreSQL/Timescale connection string."
+        )
+
+    candidate = raw.strip()
+    if not candidate:
+        raise RuntimeError(
+            "Orderflow market data DSN cannot be empty once configured."
+        )
+
+    return normalize_sqlalchemy_dsn(
+        candidate,
+        allow_sqlite=allow_sqlite,
+        label="Orderflow market data DSN",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +109,9 @@ class MarketDataProvider:
         adapter: MarketDataAdapter | None = None,
         order_book_depth: int = 10,
     ) -> None:
-        self._adapter = adapter or TimescaleMarketDataAdapter()
+        self._adapter = adapter or TimescaleMarketDataAdapter(
+            database_url=_resolve_market_data_dsn()
+        )
         self._depth = max(1, order_book_depth)
 
     def get_recent_trades(self, symbol: str, window: int) -> List[Dict[str, float]]:
