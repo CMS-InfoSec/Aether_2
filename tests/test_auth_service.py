@@ -20,6 +20,11 @@ def _clear_auth_service_module() -> None:
     sys.modules.pop("auth_service", None)
 
 
+async def _startup_and_shutdown(app) -> None:
+    async with app.router.lifespan_context(app):
+        pass
+
+
 def _install_dependency_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
     """Install lightweight stubs for optional third-party dependencies."""
 
@@ -97,7 +102,7 @@ def test_auth_service_requires_jwt_secret(monkeypatch: pytest.MonkeyPatch, tmp_p
     app = module.get_application()
 
     with pytest.raises(RuntimeError):
-        asyncio.run(app.router.startup())
+        asyncio.run(_startup_and_shutdown(app))
 
     _clear_auth_service_module()
 
@@ -214,7 +219,7 @@ def test_auth_service_requires_database_url(monkeypatch: pytest.MonkeyPatch) -> 
     app = module.get_application()
 
     with pytest.raises(RuntimeError):
-        asyncio.run(app.router.startup())
+        asyncio.run(_startup_and_shutdown(app))
 
     _clear_auth_service_module()
     monkeypatch.setenv("AUTH_DATABASE_URL", "sqlite:///./auth_sessions.db")
@@ -223,7 +228,7 @@ def test_auth_service_requires_database_url(monkeypatch: pytest.MonkeyPatch) -> 
     second_app = module.get_application()
 
     with pytest.raises(RuntimeError):
-        asyncio.run(second_app.router.startup())
+        asyncio.run(_startup_and_shutdown(second_app))
 
     _clear_auth_service_module()
 

@@ -24,6 +24,7 @@ import importlib
 import importlib.util
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
@@ -45,6 +46,9 @@ from sqlalchemy import (
     select,
 )
 from sqlalchemy.engine import Engine
+from sqlalchemy.engine.url import make_url
+
+from shared.postgres import normalize_sqlalchemy_dsn
 
 try:  # pragma: no cover - optional dependency for HTTP clients
     import httpx
@@ -381,6 +385,9 @@ def _try_parse_iso8601(value: str) -> dt.datetime:
 
 _METADATA = MetaData()
 
+_SQLITE_FALLBACK_FLAG = "SENTIMENT_ALLOW_SQLITE"
+_SQLITE_MEMORY_FALLBACK = "sqlite+pysqlite:///:memory:"
+
 
 _SENTIMENT_ID_TYPE = BigInteger().with_variant(Integer, "sqlite")
 
@@ -400,19 +407,53 @@ Index("ix_sentiment_scores_symbol_ts", _SENTIMENT_TABLE.c.symbol, _SENTIMENT_TAB
 Index("ix_sentiment_scores_ts", _SENTIMENT_TABLE.c.ts)
 
 
-def _default_database_url() -> str:
-    candidates = [
+def _resolve_database_url(candidate: str | None = None) -> str:
+    """Resolve and normalise the sentiment repository database URL."""
+
+    allow_sqlite = "pytest" in sys.modules or os.getenv(_SQLITE_FALLBACK_FLAG) == "1"
+
+    sources: Tuple[str | None, ...] = (
+        candidate,
         os.getenv("SENTIMENT_DATABASE_URL"),
         os.getenv("TIMESCALE_DATABASE_URL"),
         os.getenv("TIMESCALE_URI"),
         os.getenv("DATABASE_URL"),
-    ]
-    for candidate in candidates:
-        if candidate:
-            return candidate
-    default_path = Path("data/sentiment/sentiment.db")
-    default_path.parent.mkdir(parents=True, exist_ok=True)
-    return f"sqlite:///{default_path}"
+        (_SQLITE_MEMORY_FALLBACK if allow_sqlite else None),
+    )
+
+    for raw in sources:
+        if raw is None:
+            continue
+
+        value = str(raw).strip()
+        if not value:
+            continue
+
+        normalised = normalize_sqlalchemy_dsn(
+            value,
+            allow_sqlite=allow_sqlite,
+            label="Sentiment repository database URL",
+        )
+
+        if normalised.startswith("sqlite"):
+            try:
+                url = make_url(normalised)
+            except Exception:  # pragma: no cover - defensive guard
+                return normalised
+
+            database = url.database or ""
+            if database and database != ":memory:":
+                path = Path(database).expanduser()
+                if not path.is_absolute():
+                    path = Path.cwd() / path
+                path.parent.mkdir(parents=True, exist_ok=True)
+
+        return normalised
+
+    raise RuntimeError(
+        "Sentiment repository database URL is not configured. "
+        "Set SENTIMENT_DATABASE_URL (or TIMESCALE_DATABASE_URL) to a managed PostgreSQL/Timescale URI.",
+    )
 
 
 def _create_engine(url: str) -> Engine:
@@ -426,7 +467,8 @@ class SentimentRepository:
     """SQLAlchemy-backed storage for sentiment scores."""
 
     def __init__(self, database_url: str | None = None, *, engine: Engine | None = None) -> None:
-        url = str(database_url) if database_url is not None else _default_database_url()
+        url = _resolve_database_url(database_url)
+        self._database_url = url
         self._engine: Engine = engine or _create_engine(url)
         self._ensure_schema()
 

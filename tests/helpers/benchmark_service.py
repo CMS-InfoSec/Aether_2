@@ -9,10 +9,10 @@ from types import ModuleType
 from typing import Final
 
 import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
 
-_DEFAULT_TEST_DSN: Final[str] = "postgresql://benchmark.test/benchmark"
+_ALLOW_SQLITE_FLAG: Final[str] = "BENCHMARK_ALLOW_SQLITE"
+_DATABASE_ENV: Final[str] = "BENCHMARK_DATABASE_URL"
+_DEFAULT_TEST_DSN: Final[str] = "sqlite:///benchmark.db"
 
 
 def bootstrap_benchmark_service(
@@ -26,7 +26,8 @@ def bootstrap_benchmark_service(
     """Import ``benchmark_service`` with a persistent SQLite database for tests."""
 
     database_url = dsn or _DEFAULT_TEST_DSN
-    monkeypatch.setenv("BENCHMARK_DATABASE_URL", database_url)
+    monkeypatch.setenv(_DATABASE_ENV, database_url)
+    monkeypatch.setenv(_ALLOW_SQLITE_FLAG, "1")
     # Ensure optional fallbacks do not interfere with the configured DSN.
     monkeypatch.delenv("TIMESCALE_DSN", raising=False)
     monkeypatch.delenv("DATABASE_URL", raising=False)
@@ -42,16 +43,11 @@ def bootstrap_benchmark_service(
     module = importlib.import_module("benchmark_service")
 
     db_path = tmp_path / db_filename
-    engine = create_engine(
-        f"sqlite:///{db_path}",
-        future=True,
-        connect_args={"check_same_thread": False},
-    )
-    Session = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True)
-
-    module.ENGINE = engine  # type: ignore[attr-defined]
-    module.SessionLocal = Session  # type: ignore[attr-defined]
-    module.app.state.db_sessionmaker = Session  # type: ignore[attr-defined]
+    resolved_dsn = f"sqlite:///{db_path}" if database_url.startswith("sqlite") else database_url
+    if resolved_dsn != module.DATABASE_URL:  # type: ignore[attr-defined]
+        monkeypatch.setenv(_DATABASE_ENV, resolved_dsn)
+        sys.modules.pop("benchmark_service", None)
+        module = importlib.import_module("benchmark_service")
 
     try:
         from fastapi import HTTPException, Request, status
@@ -73,8 +69,8 @@ def bootstrap_benchmark_service(
         module.app.dependency_overrides[module.require_admin_account] = _test_require_admin_account  # type: ignore[attr-defined]
 
     if reset:
-        module.Base.metadata.drop_all(bind=engine)  # type: ignore[attr-defined]
-    module.Base.metadata.create_all(bind=engine)  # type: ignore[attr-defined]
+        module.Base.metadata.drop_all(bind=module.ENGINE)  # type: ignore[attr-defined]
+    module.Base.metadata.create_all(bind=module.ENGINE)  # type: ignore[attr-defined]
 
     return module
 

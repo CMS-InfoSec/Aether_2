@@ -44,6 +44,41 @@ def tca_client(tmp_path, monkeypatch: pytest.MonkeyPatch):
         sys.modules.pop("tca_service", None)
 
 
+def _reload_tca_service() -> None:
+    sys.modules.pop("tca_service", None)
+    importlib.import_module("tca_service")
+
+
+def test_tca_service_requires_postgres_dsn_in_production(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("TCA_DATABASE_URL", raising=False)
+    monkeypatch.delenv("TIMESCALE_DSN", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+
+    original_pytest = sys.modules.pop("pytest", None)
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            _reload_tca_service()
+        assert "PostgreSQL" in str(excinfo.value)
+    finally:
+        if original_pytest is not None:
+            sys.modules["pytest"] = original_pytest
+        sys.modules.pop("tca_service", None)
+
+
+def test_tca_service_rejects_sqlite_dsn_in_production(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("TCA_DATABASE_URL", "sqlite:///./tca.db")
+
+    original_pytest = sys.modules.pop("pytest", None)
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            _reload_tca_service()
+        assert "PostgreSQL" in str(excinfo.value)
+    finally:
+        if original_pytest is not None:
+            sys.modules["pytest"] = original_pytest
+        sys.modules.pop("tca_service", None)
+
+
 def test_trade_report_requires_admin_account(tca_client):
     client, _ = tca_client
 

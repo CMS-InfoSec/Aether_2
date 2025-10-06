@@ -5,6 +5,7 @@ import base64
 import importlib
 import logging
 import os
+import sys
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -159,6 +160,10 @@ def _build_session_store_from_env() -> SessionStoreProtocol:
             f"{joined} so the API can use the shared Redis backend"
         )
     if redis_url.lower().startswith("memory://"):
+        if "pytest" not in sys.modules:
+            raise RuntimeError(
+                "Session store misconfigured: memory:// DSNs are only supported when running tests."
+            )
         return InMemorySessionStore(ttl_minutes=ttl_minutes)
 
     return build_session_store_from_url(redis_url, ttl_minutes=ttl_minutes)

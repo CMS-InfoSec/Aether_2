@@ -6,6 +6,7 @@ import asyncio
 import csv
 import logging
 import os
+import sys
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -16,6 +17,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from shared.postgres import normalize_sqlalchemy_dsn
+
 from services.common.compliance import SanctionRecord, ensure_sanctions_schema
 from services.common.security import require_admin_account
 
@@ -24,9 +27,15 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
-DEFAULT_DATABASE_URL = "sqlite:///./risk.db"
 _REFRESH_INTERVAL = timedelta(days=1)
 _REQUEST_TIMEOUT = float(os.getenv("COMPLIANCE_FETCH_TIMEOUT", "10"))
+
+_DATABASE_ENV_KEYS = (
+    "COMPLIANCE_DATABASE_URL",
+    "RISK_DATABASE_URL",
+    "TIMESCALE_DSN",
+    "DATABASE_URL",
+)
 
 _DEFAULT_SOURCE_DATA: Dict[str, Dict[str, str]] = {
     "OFAC": {
@@ -41,17 +50,37 @@ _DEFAULT_SOURCE_DATA: Dict[str, Dict[str, str]] = {
 }
 
 
+def _allow_sqlite() -> bool:
+    """Return whether sqlite DSNs are permitted (pytest contexts only)."""
+
+    return "pytest" in sys.modules
+
+
 def _database_url() -> str:
-    url = (
-        os.getenv("COMPLIANCE_DATABASE_URL")
-        or os.getenv("RISK_DATABASE_URL")
-        or os.getenv("TIMESCALE_DSN")
-        or os.getenv("DATABASE_URL")
-        or DEFAULT_DATABASE_URL
+    """Resolve the configured compliance database connection string."""
+
+    allow_sqlite = _allow_sqlite()
+    for env_key in _DATABASE_ENV_KEYS:
+        raw_value = os.getenv(env_key)
+        if not raw_value:
+            continue
+        return normalize_sqlalchemy_dsn(
+            raw_value,
+            allow_sqlite=allow_sqlite,
+            label="Compliance scanner database URL",
+        )
+
+    if allow_sqlite:
+        raise RuntimeError(
+            "Compliance scanner database URL must be configured even under pytest; "
+            "set COMPLIANCE_DATABASE_URL to a PostgreSQL/Timescale DSN or explicit "
+            "sqlite URL for tests.",
+        )
+
+    raise RuntimeError(
+        "Compliance scanner requires COMPLIANCE_DATABASE_URL or TIMESCALE_DSN "
+        "to be configured with a PostgreSQL/Timescale DSN.",
     )
-    if url.startswith("postgresql://"):
-        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
-    return url
 
 
 def _engine_options(url: str) -> Dict[str, object]:
