@@ -21,6 +21,8 @@ spec.loader.exec_module(auth_module)
 
 
 def test_default_loader_requires_configured_jwt_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AZURE_AD_CLIENT_ID", "client-id")
+    monkeypatch.setenv("AZURE_AD_CLIENT_SECRET", "client-secret")
     monkeypatch.delenv("AUTH_JWT_SECRET", raising=False)
 
     with pytest.raises(RuntimeError):
@@ -28,6 +30,8 @@ def test_default_loader_requires_configured_jwt_secret(monkeypatch: pytest.Monke
 
 
 def test_default_loader_rejects_blank_jwt_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AZURE_AD_CLIENT_ID", "client-id")
+    monkeypatch.setenv("AZURE_AD_CLIENT_SECRET", "client-secret")
     monkeypatch.setenv("AUTH_JWT_SECRET", "   ")
 
     with pytest.raises(RuntimeError):
@@ -35,8 +39,46 @@ def test_default_loader_rejects_blank_jwt_secret(monkeypatch: pytest.MonkeyPatch
 
 
 def test_default_loader_uses_explicit_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AZURE_AD_CLIENT_ID", "client-id")
+    monkeypatch.setenv("AZURE_AD_CLIENT_SECRET", "client-secret")
     monkeypatch.setenv("AUTH_JWT_SECRET", "prod-secret")
 
     service = auth_module._load_default_auth_service()
 
     assert service.settings.jwt_secret.get_secret_value() == "prod-secret"
+
+
+def test_default_loader_requires_configured_azure_client_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AZURE_AD_CLIENT_ID", "client-id")
+    monkeypatch.delenv("AZURE_AD_CLIENT_SECRET", raising=False)
+    monkeypatch.setenv("AUTH_JWT_SECRET", "prod-secret")
+
+    with pytest.raises(RuntimeError):
+        auth_module._load_default_auth_service()
+
+
+def test_default_loader_rejects_blank_azure_client_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AZURE_AD_CLIENT_ID", "client-id")
+    monkeypatch.setenv("AZURE_AD_CLIENT_SECRET", "   ")
+    monkeypatch.setenv("AUTH_JWT_SECRET", "prod-secret")
+
+    with pytest.raises(RuntimeError):
+        auth_module._load_default_auth_service()
+
+
+def test_default_loader_requires_configured_azure_client_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AZURE_AD_CLIENT_ID", raising=False)
+    monkeypatch.setenv("AZURE_AD_CLIENT_SECRET", "client-secret")
+    monkeypatch.setenv("AUTH_JWT_SECRET", "prod-secret")
+
+    with pytest.raises(RuntimeError):
+        auth_module._load_default_auth_service()
+
+
+def test_default_loader_rejects_blank_azure_client_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AZURE_AD_CLIENT_ID", "   ")
+    monkeypatch.setenv("AZURE_AD_CLIENT_SECRET", "client-secret")
+    monkeypatch.setenv("AUTH_JWT_SECRET", "prod-secret")
+
+    with pytest.raises(RuntimeError):
+        auth_module._load_default_auth_service()

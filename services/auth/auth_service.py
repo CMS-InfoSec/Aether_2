@@ -409,8 +409,8 @@ class AuthService:
 def _load_default_auth_service() -> AuthService:
     oidc = AzureOIDCSettings(
         tenant_id=os.getenv("AZURE_AD_TENANT_ID", "common"),
-        client_id=os.getenv("AZURE_AD_CLIENT_ID", "YOUR_CLIENT_ID"),
-        client_secret=SecretStr(os.getenv("AZURE_AD_CLIENT_SECRET", "development-secret")),
+        client_id=_require_env("AZURE_AD_CLIENT_ID"),
+        client_secret=SecretStr(_require_env("AZURE_AD_CLIENT_SECRET")),
         redirect_uri=os.getenv("AZURE_AD_REDIRECT_URI", "http://localhost:8000/auth/callback"),
     )
     auditors_env = os.getenv("AUTH_AUDITOR_ACCOUNTS", "")

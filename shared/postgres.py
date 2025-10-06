@@ -40,7 +40,11 @@ def normalize_postgres_dsn(raw_dsn: str, *, allow_sqlite: bool = True, label: st
         )
 
     normalized_scheme = scheme.lower()
+    base_scheme, plus, driver = normalized_scheme.partition("+")
     if normalized_scheme in _SUPPORTED_POSTGRES_SCHEMES:
+        return f"postgresql://{remainder}"
+
+    if plus and driver and base_scheme in {"postgres", "postgresql", "timescale"}:
         return f"postgresql://{remainder}"
 
     if allow_sqlite and normalized_scheme in _SUPPORTED_SQLITE_SCHEMES:

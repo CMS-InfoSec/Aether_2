@@ -44,3 +44,10 @@ def test_accounts_database_url_uses_configured_driver() -> None:
         }
     )
     assert url == "postgresql+psycopg://example.com/aether"
+
+
+def test_accounts_database_url_preserves_driver_from_url() -> None:
+    url = resolve_accounts_database_url(
+        env={"ACCOUNTS_DATABASE_URL": "postgresql+asyncpg://example.com/aether"}
+    )
+    assert url == "postgresql+asyncpg://example.com/aether"
