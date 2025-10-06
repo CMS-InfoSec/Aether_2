@@ -424,3 +424,15 @@ def test_create_app_rejects_blank_session_store_url(monkeypatch: pytest.MonkeyPa
     with pytest.raises(RuntimeError, match="Session store misconfigured"):
         app_module.create_app(admin_repository=app_module.InMemoryAdminRepository())
 
+
+def test_create_app_rejects_memory_session_store_outside_tests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SESSION_REDIS_URL", "memory://admin-platform-test")
+    monkeypatch.delitem(sys.modules, "pytest", raising=False)
+
+    with pytest.raises(
+        RuntimeError, match="memory:// DSNs are only supported when running tests"
+    ):
+        app_module.create_app(admin_repository=app_module.InMemoryAdminRepository())
+
