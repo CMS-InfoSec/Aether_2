@@ -18,12 +18,34 @@ def _coerce_env(env: Mapping[str, str] | None) -> Mapping[str, str]:
     return env
 
 
+def _extract_driver_from_dsn(raw_dsn: str) -> str | None:
+    """Return the explicit SQLAlchemy driver embedded in a DSN, if present."""
+
+    stripped = raw_dsn.strip()
+    scheme, separator, _ = stripped.partition("://")
+    if not separator:
+        return None
+
+    base_scheme, plus, driver = scheme.partition("+")
+    if not plus:
+        return None
+
+    driver_name = driver.strip()
+    if not driver_name:
+        return None
+
+    if base_scheme.lower() not in {"postgresql", "postgres", "timescale"}:
+        return None
+
+    return driver_name
+
+
 def resolve_accounts_database_url(*, env: Mapping[str, str] | None = None) -> str:
     """Return a normalised SQLAlchemy DSN for the accounts persistence layer."""
 
     source = _coerce_env(env)
     allow_sqlite = source.get(_SQLITE_FLAG) == "1"
-    driver = (source.get(_DRIVER_ENV) or "psycopg2").strip() or "psycopg2"
+    configured_driver = (source.get(_DRIVER_ENV) or "").strip()
 
     for key in _DSN_ENV_KEYS:
         raw = source.get(key)
@@ -35,9 +57,12 @@ def resolve_accounts_database_url(*, env: Mapping[str, str] | None = None) -> st
                 f"{key} is set but empty; configure a valid PostgreSQL/Timescale DSN."
             )
         label = "Accounts database DSN" if key == "ACCOUNTS_DATABASE_URL" else f"{key} DSN"
+        driver_override = _extract_driver_from_dsn(value)
+        effective_driver = configured_driver or driver_override or "psycopg2"
+
         return normalize_sqlalchemy_dsn(
             value,
-            driver=driver,
+            driver=effective_driver,
             allow_sqlite=allow_sqlite,
             label=label,
         )
@@ -49,4 +74,3 @@ def resolve_accounts_database_url(*, env: Mapping[str, str] | None = None) -> st
 
 
 __all__ = ["resolve_accounts_database_url"]
-
