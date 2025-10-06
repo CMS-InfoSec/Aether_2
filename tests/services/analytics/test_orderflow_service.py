@@ -96,3 +96,17 @@ def test_orderflow_metrics_available_to_admins(orderflow_client) -> None:
     assert "liquidity_holes" in payload
     assert "impact_estimates" in payload
 
+
+def test_orderflow_rejects_derivative_symbols(orderflow_client) -> None:
+    client, module = orderflow_client
+    session = module.SESSION_STORE.create("company")
+
+    response = client.get(
+        "/orderflow/imbalance",
+        params={"symbol": "ETH-PERP"},
+        headers={"Authorization": f"Bearer {session.token}"},
+    )
+
+    assert response.status_code == 422
+    assert "not a supported" in response.json()["detail"]
+
