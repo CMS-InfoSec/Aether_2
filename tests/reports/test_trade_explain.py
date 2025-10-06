@@ -141,7 +141,10 @@ def test_trade_explain_rejects_non_spot_instrument(monkeypatch) -> None:
         client.app.dependency_overrides.pop(require_admin_account, None)
 
     assert response.status_code == 422
-    assert response.json()["detail"] == "Trade references non-spot instrument"
+    assert (
+        response.json()["detail"]
+        == "instrument 'BTC-PERP' is not a supported USD spot market instrument"
+    )
 
 
 def test_trade_explain_normalises_instrument(monkeypatch) -> None:
