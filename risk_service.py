@@ -47,6 +47,7 @@ from services.common.compliance import (
     is_blocking_status,
 )
 from services.common.security import require_admin_account
+from services.common.spot import require_spot_http
 from battle_mode import BattleModeController, create_battle_mode_tables
 
 from cost_throttler import CostThrottler
@@ -804,14 +805,7 @@ async def get_position_size(
     symbol: str = Query(..., min_length=1, description="Instrument symbol to size"),
     account_id: str = Depends(require_admin_account),
 ) -> Dict[str, Any]:
-    normalized_symbol = normalize_spot_symbol(symbol)
-    if not is_spot_symbol(normalized_symbol):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only spot market symbols are supported for position sizing.",
-        )
-
-    symbol = normalized_symbol
+    symbol = require_spot_http(symbol, logger=logger)
 
     try:
         limits = _load_account_limits(account_id)

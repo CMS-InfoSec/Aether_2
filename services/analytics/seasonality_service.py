@@ -24,6 +24,7 @@ from auth.service import (
 )
 from services.common import security
 from services.common.security import require_admin_account
+from services.common.spot import require_spot_http
 from shared.session_config import load_session_ttl_minutes
 
 __all__ = ["app", "ENGINE", "SessionLocal", "SESSION_STORE"]
@@ -430,10 +431,7 @@ def _persist_metric(
 
 
 def _validate_symbol(symbol: str) -> str:
-    symbol_key = symbol.strip().upper()
-    if not symbol_key:
-        raise HTTPException(status_code=422, detail="Symbol must be provided")
-    return symbol_key
+    return require_spot_http(symbol)
 
 
 def _assert_data_available(bars: Sequence[Bar], symbol: str) -> None:
