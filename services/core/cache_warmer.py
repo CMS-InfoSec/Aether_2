@@ -11,6 +11,7 @@ from typing import Callable, Deque, DefaultDict, Dict, Iterable, List, Optional,
 from fastapi import APIRouter, FastAPI, HTTPException
 
 from services.common.adapters import RedisFeastAdapter, TimescaleAdapter
+from shared.spot import is_spot_symbol, normalize_spot_symbol
 from services.models.model_zoo import ModelZoo, get_model_zoo
 
 LOGGER = logging.getLogger(__name__)
@@ -298,10 +299,21 @@ class CacheWarmer:
         seen = set()
 
         def _append(symbol: str) -> None:
-            normalized = symbol.strip().upper()
-            if normalized and normalized not in seen:
-                seen.add(normalized)
-                candidates.append(normalized)
+            normalized = normalize_spot_symbol(symbol)
+            if not normalized:
+                return
+
+            if not is_spot_symbol(normalized):
+                LOGGER.warning(
+                    "Ignoring non-spot instrument '%s' in cache warmup", symbol
+                )
+                return
+
+            if normalized in seen:
+                return
+
+            seen.add(normalized)
+            candidates.append(normalized)
 
         for symbol in self._most_used_instruments:
             _append(symbol)
