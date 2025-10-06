@@ -52,7 +52,7 @@ async def test_place_order_includes_authorization_header(monkeypatch: pytest.Mon
     manager = _StubSessionManager()
     adapter = exchange_adapter.KrakenAdapter(primary_url="http://oms", session_manager=manager)
 
-    result = await adapter.place_order("alpha", {"order": "payload"})
+    result = await adapter.place_order("alpha", {"order": "payload", "symbol": "eth/usd"})
 
     assert result == {"status": "ok"}
     assert manager.calls == ["alpha"]
@@ -63,6 +63,15 @@ async def test_place_order_includes_authorization_header(monkeypatch: pytest.Mon
     assert headers["Authorization"] == "Bearer session-token"
     assert headers["X-Account-ID"] == "alpha"
     assert "X-Request-ID" in headers
+    assert payload["symbol"] == "ETH-USD"
+
+
+@pytest.mark.asyncio
+async def test_place_order_rejects_non_spot_symbol() -> None:
+    adapter = exchange_adapter.KrakenAdapter(primary_url="http://oms")
+
+    with pytest.raises(ValueError, match="spot market"):
+        await adapter.place_order("alpha", {"symbol": "BTC-PERP"})
 
 
 @pytest.mark.asyncio

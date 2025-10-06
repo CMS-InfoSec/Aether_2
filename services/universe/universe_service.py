@@ -27,6 +27,7 @@ from sqlalchemy.exc import ArgumentError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 from services.common.security import require_admin_account
+from shared.spot import filter_spot_symbols, is_spot_symbol, normalize_spot_symbol
 
 LOGGER = logging.getLogger(__name__)
 
@@ -404,7 +405,7 @@ def _normalize_market(market: str) -> Optional[str]:
             return None
         if base.endswith(_UNSUPPORTED_QUOTE_SUFFIXES):
             return None
-        return f"{base}-USD"
+        return _finalize_spot_symbol(base)
 
     base = _normalize_asset_symbol(base_token, is_quote=False)
     quote = _normalize_asset_symbol(quote_token, is_quote=True)
@@ -412,7 +413,7 @@ def _normalize_market(market: str) -> Optional[str]:
     if not base or quote != "USD":
         return None
 
-    return f"{base}-USD"
+    return _finalize_spot_symbol(base)
 
 
 def _normalize_asset_symbol(symbol: str, *, is_quote: bool) -> str:
@@ -436,6 +437,24 @@ def _normalize_asset_symbol(symbol: str, *, is_quote: bool) -> str:
         trimmed = trimmed[1:]
 
     return aliases.get(trimmed, trimmed)
+
+
+def _finalize_spot_symbol(base_asset: str) -> Optional[str]:
+    """Return a canonical USD spot symbol for *base_asset* if eligible."""
+
+    candidate = f"{base_asset}-USD"
+    normalized = normalize_spot_symbol(candidate)
+    if not normalized or not normalized.endswith("-USD"):
+        return None
+
+    if not is_spot_symbol(normalized):
+        LOGGER.warning(
+            "Dropping non-spot instrument from universe evaluation",
+            extra={"symbol": candidate},
+        )
+        return None
+
+    return normalized
 
 
 def _latest_manual_overrides(session: Session, *, migrate: bool = False) -> Dict[str, UniverseWhitelist]:
@@ -503,7 +522,8 @@ def _evaluate_universe(session: Session) -> List[str]:
         else:
             approved.discard(canonical_pair)
 
-    return sorted(approved)
+    spot_symbols = filter_spot_symbols(sorted(approved), logger=LOGGER)
+    return [symbol for symbol in spot_symbols if symbol.endswith("-USD")]
 
 
 @app.get("/universe/approved", response_model=UniverseResponse)
@@ -527,7 +547,7 @@ def override_symbol(
 
     canonical_symbol = _normalize_market(raw_symbol)
     if canonical_symbol is None:
-        raise HTTPException(status_code=400, detail="Symbol must be a USD-quoted market")
+        raise HTTPException(status_code=400, detail="Symbol must be a USD-quoted spot market")
 
     latest_overrides = _latest_manual_overrides(session, migrate=True)
     previous = latest_overrides.get(canonical_symbol)
