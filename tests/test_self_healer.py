@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Dict, List
 
 import pytest
+
+
+@contextmanager
+def _without_pytest_module():
+    original = sys.modules.pop("pytest", None)
+    try:
+        yield
+    finally:
+        if original is not None:
+            sys.modules["pytest"] = original
 
 
 def _install_kubernetes_stub() -> None:
@@ -52,6 +63,7 @@ import sys
 
 _install_kubernetes_stub()
 
+import self_healer
 from self_healer import RedisRestartLogStore, SelfHealer, ServiceConfig
 
 
@@ -187,6 +199,27 @@ def _make_store(backend: InMemoryRedis) -> RedisRestartLogStore:
         retention=50,
         per_service_retention_seconds=3600,
     )
+
+
+def test_self_healer_requires_explicit_redis_url_in_production(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SELF_HEALER_REDIS_URL", raising=False)
+
+    with _without_pytest_module():
+        with pytest.raises(RuntimeError, match="SELF_HEALER_REDIS_URL must be configured"):
+            SelfHealer([])
+
+
+def test_self_healer_rejects_stubbed_redis_in_production(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SELF_HEALER_REDIS_URL", "redis://redis:6379/0")
+
+    def _fake_create(url: str, *, decode_responses: bool, logger):  # type: ignore[override]
+        assert decode_responses is True
+        return object(), True
+
+    with _without_pytest_module():
+        monkeypatch.setattr(self_healer, "create_redis_from_url", _fake_create)
+        with pytest.raises(RuntimeError, match="Failed to connect to Redis"):
+            SelfHealer([])
 
 
 def test_restart_log_persists_across_instances(redis_backend: InMemoryRedis) -> None:

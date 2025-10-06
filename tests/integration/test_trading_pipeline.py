@@ -112,6 +112,21 @@ class Sequencer:
 def test_trading_pipeline_emits_fill_event(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
+    class _TransportMember:
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+        def __str__(self) -> str:
+            return self.value
+
+    class _TransportType:
+        UNKNOWN = _TransportMember("unknown")
+        INTERNAL = _TransportMember("internal")
+        REST = _TransportMember("rest")
+        WEBSOCKET = _TransportMember("websocket")
+        FIX = _TransportMember("fix")
+        BATCH = _TransportMember("batch")
+
     metrics_stub = types.SimpleNamespace(
         setup_metrics=lambda *args, **kwargs: None,
         record_abstention_rate=lambda *args, **kwargs: None,
@@ -128,7 +143,10 @@ def test_trading_pipeline_emits_fill_event(
         observe_risk_validation_latency=lambda *args, **kwargs: None,
         traced_span=lambda *args, **kwargs: contextlib.nullcontext(),
         get_request_id=lambda: None,
+        TransportType=_TransportType,
     )
+    metrics_stub.bind_metric_context = lambda *args, **kwargs: contextlib.nullcontext()
+    metrics_stub.metric_context = lambda *args, **kwargs: contextlib.nullcontext()
     sys.modules["metrics"] = metrics_stub
 
     monkeypatch.setenv("ENABLE_SHADOW_EXECUTION", "false")
