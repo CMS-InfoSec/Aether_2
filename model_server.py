@@ -9,9 +9,10 @@ from typing import Any, Dict, Optional
 
 from fastapi import Depends, FastAPI, Query
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from services.common.security import require_admin_account
+from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 try:  # pragma: no cover - mlflow is optional for local tests.
     import mlflow
@@ -44,11 +45,23 @@ if mlflow is not None:
         mlflow.set_registry_uri(registry_uri)
 
 
+def _require_spot_symbol(symbol: object) -> str:
+    normalized = normalize_spot_symbol(symbol)
+    if not normalized or not is_spot_symbol(normalized):
+        raise ValueError("Only spot market instruments are supported.")
+    return normalized
+
+
 class PredictRequest(BaseModel):
     account_id: str = Field(..., description="Trading account identifier")
     symbol: str = Field(..., description="Instrument symbol")
     features: Dict[str, float] = Field(default_factory=dict)
     book_snapshot: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("symbol")
+    @classmethod
+    def _validate_symbol(cls, value: str) -> str:
+        return _require_spot_symbol(value)
 
 
 class IntentResponse(BaseModel):
@@ -170,15 +183,16 @@ def _load_mlflow_model(symbol: str) -> Optional[CachedModel]:
 
 
 def get_model(symbol: str) -> CachedModel:
-    cached = model_cache.get(symbol)
+    canonical_symbol = _require_spot_symbol(symbol)
+    cached = model_cache.get(canonical_symbol)
     if cached is not None:
         return cached
 
-    loaded = _load_mlflow_model(symbol)
+    loaded = _load_mlflow_model(canonical_symbol)
     if loaded is None:
         # Fabricate baseline entry to satisfy downstream callers.
         return CachedModel(
-            symbol=symbol,
+            symbol=canonical_symbol,
             model_id="baseline",
             stage="baseline",
             source="baseline",
@@ -186,7 +200,7 @@ def get_model(symbol: str) -> CachedModel:
             loaded_at=time.time(),
         )
 
-    model_cache.set(symbol, loaded)
+    model_cache.set(canonical_symbol, loaded)
     return loaded
 
 
