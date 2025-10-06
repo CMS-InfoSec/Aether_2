@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -75,6 +76,43 @@ def get_nats_producer(account_id: str) -> NATSProducer:
     servers = _env(account_id, "NATS_SERVERS", "nats://localhost:4222")
     subject_prefix = _env(account_id, "NATS_SUBJECT_PREFIX", account_id)
     return NATSProducer(servers=servers, subject_prefix=subject_prefix)
+
+
+_SCHEMA_INVALID_CHARS = re.compile(r"[^a-z0-9_]")
+
+
+def _sanitize_schema_name(raw: str, *, default: bool) -> str:
+    """Return a Postgres-safe schema identifier.
+
+    Identifiers may only contain ``[a-z0-9_]`` once normalised and must not
+    begin with a digit.  For defaults we prefix ``acct_`` when not already
+    present so each account receives an isolated namespace.
+    """
+
+    candidate = raw.strip().lower().replace("-", "_")
+    candidate = _SCHEMA_INVALID_CHARS.sub("", candidate)
+    candidate = re.sub(r"_+", "_", candidate).strip("_")
+
+    if not candidate:
+        raise RuntimeError("Timescale schema cannot be empty once configured")
+
+    if candidate[0].isdigit():
+        if default:
+            candidate = f"acct_{candidate}"
+        else:
+            raise RuntimeError(
+                "Timescale schema must not start with a digit; adjust the configured value"
+            )
+
+    if default and not candidate.startswith("acct_"):
+        candidate = f"acct_{candidate}"
+
+    if len(candidate) > 63:
+        raise RuntimeError(
+            "Timescale schema must be 63 characters or fewer once normalised"
+        )
+
+    return candidate
 
 
 def _resolve_timescale_dsn(account_id: str) -> str:
