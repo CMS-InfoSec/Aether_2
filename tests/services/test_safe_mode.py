@@ -1,10 +1,11 @@
+import asyncio
+from datetime import datetime, timezone
+
 import pytest
 
 pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
-
-import pytest
 
 import safe_mode
 from tests.fixtures.backends import MemoryRedis
@@ -166,3 +167,37 @@ def test_safe_mode_state_survives_controller_restart() -> None:
     assert status.reason == "ops_drill"
     assert restarted.intent_guard.allow_new_intents is False
     assert restarted.order_controls.hedging_only is True
+
+
+def test_kafka_publisher_handles_running_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    published: dict[str, object] = {}
+
+    class _StubAdapter:
+        def __init__(self, account_id: str) -> None:
+            published["account_id"] = account_id
+
+        async def publish(self, topic: str, payload: dict[str, object]) -> None:
+            published["topic"] = topic
+            published["payload"] = payload
+
+    import services.common.adapters as adapters
+
+    monkeypatch.setattr(adapters, "KafkaNATSAdapter", _StubAdapter)
+
+    publisher = safe_mode.KafkaSafeModePublisher(account_id="company", topic="ops.safe_mode")
+    event = safe_mode.SafeModeEvent(
+        reason="drill",
+        ts=datetime.now(timezone.utc),
+        state="entered",
+        actor="ops",
+    )
+
+    async def _exercise() -> None:
+        publisher.publish(event)
+        await asyncio.sleep(0)
+
+    asyncio.run(_exercise())
+
+    assert published["account_id"] == "company"
+    assert published["topic"] == "ops.safe_mode"
+    assert published["payload"]["state"] == "entered"

@@ -30,6 +30,24 @@ if "metrics" not in sys.modules:
     metrics_stub.metric_context = lambda *args, **kwargs: contextlib.nullcontext()
     metrics_stub.get_request_id = lambda: None
 
+    class _TransportMember:
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+        def __str__(self) -> str:
+            return self.value
+
+    class _TransportType:
+        UNKNOWN = _TransportMember("unknown")
+        INTERNAL = _TransportMember("internal")
+        REST = _TransportMember("rest")
+        WEBSOCKET = _TransportMember("websocket")
+        FIX = _TransportMember("fix")
+        BATCH = _TransportMember("batch")
+
+    metrics_stub.TransportType = _TransportType
+    metrics_stub.bind_metric_context = lambda *args, **kwargs: contextlib.nullcontext()
+
     sys.modules["metrics"] = metrics_stub
 
 import policy_service
