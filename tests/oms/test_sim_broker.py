@@ -9,13 +9,36 @@ from services.oms.sim_broker import SimBroker
 
 
 @pytest.fixture(autouse=True)
-def _reset_adapters() -> None:
+def _stub_timescale_adapter(monkeypatch: pytest.MonkeyPatch) -> type[TimescaleAdapter]:
+    class _StubTimescaleAdapter:
+        _fills: list[dict[str, object]] = []
+
+        def __init__(self, *, account_id: str) -> None:  # type: ignore[no-untyped-def]
+            self.account_id = account_id
+
+        @classmethod
+        def reset(cls) -> None:
+            cls._fills = []
+
+        def record_fill(self, payload: dict[str, object]) -> None:
+            type(self)._fills.append(dict(payload))
+
+        def events(self) -> dict[str, list[dict[str, object]]]:
+            return {"fills": list(type(self)._fills)}
+
+    monkeypatch.setattr("services.oms.sim_broker.TimescaleAdapter", _StubTimescaleAdapter)
+    monkeypatch.setattr("tests.oms.test_sim_broker.TimescaleAdapter", _StubTimescaleAdapter)
+    return _StubTimescaleAdapter
+
+
+@pytest.fixture(autouse=True)
+def _reset_adapters(_stub_timescale_adapter: type[TimescaleAdapter]) -> None:
     KafkaNATSAdapter.reset()
-    TimescaleAdapter.reset()
+    _stub_timescale_adapter.reset()
 
 
-def test_market_order_immediate_fill() -> None:
-    broker = SimBroker("ACC-DEFAULT")
+def test_market_order_immediate_fill(_stub_timescale_adapter: type[TimescaleAdapter]) -> None:
+    broker = SimBroker("ACC-DEFAULT", timescale_factory=_stub_timescale_adapter)
 
     result = broker.place_order(
         client_order_id="test-market",
@@ -45,8 +68,8 @@ def test_market_order_immediate_fill() -> None:
     assert fills[-1]["simulated"] is True
 
 
-def test_limit_order_partial_fill() -> None:
-    broker = SimBroker("ACC-DEFAULT")
+def test_limit_order_partial_fill(_stub_timescale_adapter: type[TimescaleAdapter]) -> None:
+    broker = SimBroker("ACC-DEFAULT", timescale_factory=_stub_timescale_adapter)
 
     result = broker.place_order(
         client_order_id="limit-partial",
@@ -73,8 +96,8 @@ def test_limit_order_partial_fill() -> None:
     assert open_orders[0]["remaining_qty"] == pytest.approx(3.0)
 
 
-def test_cancel_open_order() -> None:
-    broker = SimBroker("ACC-DEFAULT")
+def test_cancel_open_order(_stub_timescale_adapter: type[TimescaleAdapter]) -> None:
+    broker = SimBroker("ACC-DEFAULT", timescale_factory=_stub_timescale_adapter)
 
     result = broker.place_order(
         client_order_id="limit-cancel",
@@ -97,3 +120,39 @@ def test_cancel_open_order() -> None:
     events = KafkaNATSAdapter(account_id="ACC-DEFAULT").history()
     statuses = [event["payload"]["status"] for event in events if event["topic"] == "oms.simulated.orders"]
     assert "cancelled" in statuses
+
+
+def test_place_order_normalizes_symbol_variants(
+    _stub_timescale_adapter: type[TimescaleAdapter],
+) -> None:
+    broker = SimBroker("ACC-DEFAULT", timescale_factory=_stub_timescale_adapter)
+
+    result = broker.place_order(
+        client_order_id="case-normalize",
+        symbol="eth/usd",
+        side="buy",
+        quantity=1.0,
+        order_type="market",
+        market_data={"last_price": 1500.0},
+    )
+
+    assert result["symbol"] == "ETH-USD"
+    events = KafkaNATSAdapter(account_id="ACC-DEFAULT").history()
+    symbols = [event["payload"].get("symbol") for event in events]
+    assert "ETH-USD" in symbols
+
+
+def test_place_order_rejects_non_spot_symbol(
+    _stub_timescale_adapter: type[TimescaleAdapter],
+) -> None:
+    broker = SimBroker("ACC-DEFAULT", timescale_factory=_stub_timescale_adapter)
+
+    with pytest.raises(ValueError):
+        broker.place_order(
+            client_order_id="reject-derivative",
+            symbol="BTC-PERP",
+            side="buy",
+            quantity=1.0,
+            order_type="market",
+            market_data={"last_price": 100.0},
+        )
