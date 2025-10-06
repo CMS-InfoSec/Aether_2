@@ -22,6 +22,8 @@ from sqlalchemy import Column, DateTime, Integer, Text, create_engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from shared.postgres import normalize_sqlalchemy_dsn
+
 from backtests.reporting import compute_max_drawdown, compute_sharpe
 try:  # pragma: no cover - support alternative namespace packages
     from services.common.security import get_director_accounts, require_admin_account
@@ -60,8 +62,31 @@ class SandboxRun(Base):
     ts = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
 
+_DATABASE_ENV_KEY = "CONFIG_SANDBOX_DATABASE_URL"
+_ALLOW_SQLITE_FLAG = "CONFIG_SANDBOX_ALLOW_SQLITE"
+
+
+def _allow_sqlite_fallback() -> bool:
+    """Return whether sqlite URLs are permitted (tests and explicit overrides only)."""
+
+    if "pytest" in sys.modules:
+        return True
+    return os.getenv(_ALLOW_SQLITE_FLAG) == "1"
+
+
 def _database_url() -> str:
-    return os.getenv("CONFIG_SANDBOX_DATABASE_URL", "sqlite+pysqlite:////tmp/config_sandbox.db")
+    raw_value = os.getenv(_DATABASE_ENV_KEY, "")
+    if not raw_value.strip():
+        raise RuntimeError(
+            "Config sandbox database URL must be provided via CONFIG_SANDBOX_DATABASE_URL."
+        )
+
+    allow_sqlite = _allow_sqlite_fallback()
+    return normalize_sqlalchemy_dsn(
+        raw_value,
+        allow_sqlite=allow_sqlite,
+        label="Config sandbox database URL",
+    )
 
 
 def _create_engine(database_url: str):

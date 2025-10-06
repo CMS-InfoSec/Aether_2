@@ -14,14 +14,21 @@ import logging
 import math
 import os
 import statistics
+import sys
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Iterable, List, Mapping, Sequence
+from typing import AsyncIterator, Dict, Iterable, List, Mapping, Sequence
 
 import numpy as np
 from fastapi import Depends, FastAPI, HTTPException, Query
 from prometheus_client import Gauge
 from pydantic import BaseModel
 
+from auth.service import (
+    InMemorySessionStore,
+    SessionStoreProtocol,
+    build_session_store_from_url,
+)
 from services.analytics.market_data_store import (
     MarketDataAdapter,
     MarketDataUnavailable,
@@ -30,6 +37,8 @@ from services.analytics.market_data_store import (
 )
 from services.common import security
 from services.common.security import require_admin_account
+from shared.postgres import normalize_postgres_schema, normalize_sqlalchemy_dsn
+from shared.session_config import load_session_ttl_minutes
 
 
 logger = logging.getLogger(__name__)
@@ -348,7 +357,19 @@ class StressTestResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-app = FastAPI(title="Advanced Signal Service", version="1.0.0")
+@asynccontextmanager
+async def _lifespan(application: FastAPI) -> AsyncIterator[None]:
+    adapter: TimescaleMarketDataAdapter | None = None
+    try:
+        adapter = _configure_market_data_adapter(application)
+        _configure_session_store(application)
+        yield
+    finally:
+        if adapter is not None:
+            _reset_market_data_adapter(application)
+
+
+app = FastAPI(title="Advanced Signal Service", version="1.0.0", lifespan=_lifespan)
 
 
 
@@ -356,32 +377,55 @@ _PRIMARY_DSN_ENV = "SIGNAL_DATABASE_URL"
 _FALLBACK_DSN_ENV = "TIMESCALE_DSN"
 _PRIMARY_SCHEMA_ENV = "SIGNAL_SCHEMA"
 _FALLBACK_SCHEMA_ENV = "TIMESCALE_SCHEMA"
+_SESSION_DSN_ENV_VARS = ("SESSION_REDIS_URL", "SESSION_STORE_URL", "SESSION_BACKEND_DSN")
+
+SESSION_STORE: SessionStoreProtocol | None = None
 
 
 def _resolve_market_data_dsn() -> str:
-    dsn = os.getenv(_PRIMARY_DSN_ENV) or os.getenv(_FALLBACK_DSN_ENV)
-    if not dsn:
-        raise RuntimeError(
-            "SIGNAL_DATABASE_URL or TIMESCALE_DSN must be configured with a PostgreSQL/Timescale DSN for the signal service."
+    allow_sqlite = "pytest" in sys.modules
+    for env_var in (_PRIMARY_DSN_ENV, _FALLBACK_DSN_ENV):
+        raw = os.getenv(env_var)
+        if raw is None:
+            continue
+        candidate = raw.strip()
+        if not candidate:
+            raise RuntimeError(
+                f"{env_var} is set but empty; configure a PostgreSQL/Timescale DSN for the signal service."
+            )
+        return normalize_sqlalchemy_dsn(
+            candidate,
+            allow_sqlite=allow_sqlite,
+            label="Signal service market data DSN",
         )
-    return dsn
+    raise RuntimeError(
+        "SIGNAL_DATABASE_URL or TIMESCALE_DSN must be configured with a PostgreSQL/Timescale DSN for the signal service."
+    )
 
 
 def _resolve_market_data_schema() -> str | None:
-    return os.getenv(_PRIMARY_SCHEMA_ENV) or os.getenv(_FALLBACK_SCHEMA_ENV)
+    raw = os.getenv(_PRIMARY_SCHEMA_ENV) or os.getenv(_FALLBACK_SCHEMA_ENV)
+    if raw is None:
+        return None
+    return normalize_postgres_schema(
+        raw,
+        label="Signal service schema",
+        prefix_if_missing="signal_",
+        allow_leading_digit_prefix=True,
+    )
 
 
-@app.on_event("startup")
-def _configure_market_data_adapter() -> None:
+def _configure_market_data_adapter(application: FastAPI) -> TimescaleMarketDataAdapter:
     dsn = _resolve_market_data_dsn()
     schema = _resolve_market_data_schema()
-    app.state.market_data_adapter = TimescaleMarketDataAdapter(database_url=dsn, schema=schema)
+    adapter = TimescaleMarketDataAdapter(database_url=dsn, schema=schema)
+    application.state.market_data_adapter = adapter
+    return adapter
 
 
-@app.on_event("shutdown")
-def _reset_market_data_adapter() -> None:
-    if hasattr(app.state, "market_data_adapter"):
-        adapter = getattr(app.state, "market_data_adapter", None)
+def _reset_market_data_adapter(application: FastAPI) -> None:
+    if hasattr(application.state, "market_data_adapter"):
+        adapter = getattr(application.state, "market_data_adapter", None)
         if adapter is not None:
             engine = getattr(adapter, "_engine", None)
             if engine is not None:
@@ -389,8 +433,56 @@ def _reset_market_data_adapter() -> None:
                     engine.dispose()
                 except Exception:  # pragma: no cover - defensive cleanup
                     logger.debug("Failed to dispose Timescale engine during shutdown", exc_info=True)
-        app.state.market_data_adapter = None
+        application.state.market_data_adapter = None
 
+
+
+def _resolve_session_store_dsn() -> str:
+    for env_var in _SESSION_DSN_ENV_VARS:
+        raw = os.getenv(env_var)
+        if raw is None:
+            continue
+        candidate = raw.strip()
+        if not candidate:
+            raise RuntimeError(
+                f"{env_var} is set but empty; configure a redis:// DSN for the signal service session store."
+            )
+        return candidate
+    raise RuntimeError(
+        "Session store misconfigured: set SESSION_REDIS_URL, SESSION_STORE_URL, or SESSION_BACKEND_DSN "
+        "so the signal service can validate administrator tokens."
+    )
+
+
+def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
+    global SESSION_STORE
+
+    existing = getattr(application.state, "session_store", None)
+    if isinstance(existing, SessionStoreProtocol):
+        store = existing
+    else:
+        dsn = _resolve_session_store_dsn()
+        ttl_minutes = load_session_ttl_minutes()
+        if dsn.lower().startswith("memory://"):
+            if "pytest" not in sys.modules:
+                raise RuntimeError(
+                    "Session store misconfigured: memory:// DSNs are only supported when running tests."
+                )
+            store = InMemorySessionStore(ttl_minutes=ttl_minutes)
+        else:
+            store = build_session_store_from_url(dsn, ttl_minutes=ttl_minutes)
+        application.state.session_store = store
+
+    security.set_default_session_store(store)
+    SESSION_STORE = store
+    return store
+
+
+app.state.market_data_adapter = None
+try:
+    SESSION_STORE = _configure_session_store(app)
+except RuntimeError:
+    SESSION_STORE = None
 
 
 def _market_data_adapter() -> MarketDataAdapter:
@@ -557,6 +649,7 @@ def stress_test_signals(
 
 __all__ = [
     "app",
+    "SESSION_STORE",
     "order_flow_signals",
     "cross_asset_signals",
     "volatility_signals",
