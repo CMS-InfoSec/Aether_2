@@ -303,6 +303,22 @@ def test_timescale_adapter_price_history(timescale_adapter: TimescaleMarketDataA
     assert latest is not None
 
 
+def test_timescale_adapter_rejects_derivative_symbol(
+    timescale_adapter: TimescaleMarketDataAdapter,
+) -> None:
+    with pytest.raises(ValueError):
+        timescale_adapter.recent_trades("BTC-PERP", window=60)
+
+    with pytest.raises(ValueError):
+        timescale_adapter.order_book_snapshot("BTC-PERP")
+
+    with pytest.raises(ValueError):
+        timescale_adapter.price_history("BTC-PERP", length=10)
+
+    with pytest.raises(ValueError):
+        timescale_adapter.latest_price_timestamp("BTC-PERP")
+
+
 def test_signal_order_flow_endpoint(signal_client: TestClient, signal_admin_headers: dict[str, str]):
     response = signal_client.get("/signals/orderflow/btc-usd", params={"window": 600}, headers=signal_admin_headers)
     assert response.status_code == 200
