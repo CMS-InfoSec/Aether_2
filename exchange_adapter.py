@@ -29,6 +29,7 @@ import httpx
 from auth.session_client import AdminSessionManager, get_default_session_manager
 
 from metrics import get_request_id
+from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -161,12 +162,25 @@ class KrakenAdapter(ExchangeAdapter):
             )
             return {}
 
+        symbol_candidate = (
+            payload.get("symbol")
+            or payload.get("instrument")
+            or payload.get("instrument_id")
+            or payload.get("pair")
+        )
+        normalized_symbol = normalize_spot_symbol(symbol_candidate)
+        if not normalized_symbol or not is_spot_symbol(normalized_symbol):
+            raise ValueError("KrakenAdapter only supports spot market instruments")
+
+        normalized_payload = dict(payload)
+        normalized_payload["symbol"] = normalized_symbol
+
         url = _join_url(base_url, "/oms/place")
         headers = await self._request_headers(account_id)
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             response = await client.post(
                 url,
-                json=dict(payload),
+                json=normalized_payload,
                 headers=headers,
             )
             response.raise_for_status()

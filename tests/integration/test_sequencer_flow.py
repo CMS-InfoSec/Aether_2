@@ -14,6 +14,7 @@ from sequencer import StageFailedError, pipeline
 from services.common.adapters import KafkaNATSAdapter
 from services.common.schemas import PolicyDecisionRequest, PolicyDecisionResponse
 from tests.factories import policy_decision_response
+import httpx
 
 
 class _StubPolicyClient:
@@ -37,7 +38,46 @@ async def test_sequencer_flow_emits_complete_audit_trail(monkeypatch: pytest.Mon
     KafkaNATSAdapter.reset()
 
     # ``latest_override`` consults a SQLite store; stub it out so we remain in-memory.
-    monkeypatch.setattr("override_service.latest_override", lambda intent_id: None)
+    monkeypatch.setattr("sequencer.latest_override", lambda intent_id: None)
+
+    class _RiskClient:
+        def __init__(self) -> None:
+            self.requests: List[Dict[str, Any]] = []
+
+        async def __aenter__(self) -> "_RiskClient":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def post(
+            self,
+            url: str,
+            *,
+            json: Dict[str, Any] | None = None,
+            headers: Dict[str, str] | None = None,
+        ) -> httpx.Response:
+            self.requests.append({"url": url, "json": json, "headers": headers})
+            request = httpx.Request("POST", url)
+            payload = {"valid": True, "reasons": [], "limits": {}}
+            return httpx.Response(200, json=payload, request=request)
+
+        async def get(
+            self,
+            url: str,
+            *,
+            params: Dict[str, Any] | None = None,
+            headers: Dict[str, str] | None = None,
+        ) -> httpx.Response:
+            request = httpx.Request("GET", url)
+            return httpx.Response(200, json={"status": "ok"}, request=request)
+
+        async def aclose(self) -> None:
+            return None
+
+    risk_client = _RiskClient()
+    monkeypatch.setattr("sequencer.httpx.AsyncClient", lambda *args, **kwargs: risk_client)
+    monkeypatch.setattr("sequencer.RISK_SERVICE_URL", "http://risk.test")
 
 
     decision = policy_decision_response()
@@ -118,6 +158,8 @@ async def test_sequencer_flow_emits_complete_audit_trail(monkeypatch: pytest.Mon
     lifecycle_artifacts = result.fill_event["stage_artifacts"]
     assert lifecycle_artifacts.keys() == {"policy", "risk", "override", "oms"}
 
+    assert risk_client.requests, "Risk validation request should be issued"
+
     # Ensure the policy client was invoked with the normalized account and intent metadata.
     assert policy_stub.requests[0].account_id == intent["account_id"].lower()
     assert policy_stub.requests[0].order_id == intent["order_id"]
@@ -129,7 +171,7 @@ async def test_sequencer_halts_when_policy_rejects(monkeypatch: pytest.MonkeyPat
     """Policy rejections should terminate the pipeline with a descriptive error."""
 
     KafkaNATSAdapter.reset()
-    monkeypatch.setattr("override_service.latest_override", lambda intent_id: None)
+    monkeypatch.setattr("sequencer.latest_override", lambda intent_id: None)
 
     rejection = policy_decision_response(approved=False, reason="Risk limit exceeded")
     policy_stub = _StubPolicyClient([rejection])
@@ -152,3 +194,33 @@ async def test_sequencer_halts_when_policy_rejects(monkeypatch: pytest.MonkeyPat
     assert "Risk limit exceeded" in exc.value.message
     # The request should have been submitted once and captured for inspection.
     assert len(policy_stub.requests) == 1
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_sequencer_rejects_non_spot_instruments(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Intents referencing derivative markets are rejected before stage execution."""
+
+    KafkaNATSAdapter.reset()
+    monkeypatch.setattr("sequencer.latest_override", lambda intent_id: None)
+
+    intent: Dict[str, Any] = {
+        "account_id": "AlphaDesk",
+        "order_id": "ORD-PERP-1",
+        "instrument": "BTC-PERP",
+        "side": "buy",
+        "quantity": 1.0,
+        "price": 30_000.0,
+    }
+
+    with pytest.raises(StageFailedError) as exc:
+        await pipeline.submit(intent)
+
+    assert exc.value.stage == "policy"
+    assert "spot market" in exc.value.message.lower()
+
+    history = list(KafkaNATSAdapter(account_id="alphadesk").history())
+    topics = [entry["topic"] for entry in history]
+    assert "sequencer.pipeline.start" in topics
+    assert "sequencer.policy.failed" in topics
+    assert "sequencer.policy.start" not in topics

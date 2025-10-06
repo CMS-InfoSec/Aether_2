@@ -79,6 +79,8 @@ from sqlalchemy.pool import StaticPool
 from sqlalchemy.exc import OperationalError
 
 import strategy_orchestrator
+
+StrategyIntentError = strategy_orchestrator.StrategyIntentError
 class _DummyResponse:
     def __init__(self, payload: Dict[str, Any] | None = None) -> None:
         self._payload = payload or {
@@ -181,6 +183,49 @@ async def test_route_trade_intent_forwards_account_header(
 
     assert response.valid is True
     assert captured["headers"] == {"X-Account-ID": request.account_id}
+
+
+@pytest.mark.asyncio
+async def test_route_trade_intent_normalizes_instruments(
+    registry: tuple[strategy_orchestrator.StrategyRegistry, Dict[str, Any]]
+) -> None:
+    orchestrator, captured = registry
+    request = _make_request()
+    request.instrument = "eth/usd"
+    request.intent.policy_decision.request.instrument = "eth/usd"
+
+    await orchestrator.route_trade_intent("alpha", request)
+
+    assert captured["json"]["instrument"] == "ETH-USD"
+    assert (
+        captured["json"]["intent"]["policy_decision"]["request"]["instrument"]
+        == "ETH-USD"
+    )
+
+
+@pytest.mark.asyncio
+async def test_route_trade_intent_rejects_non_spot_instrument(
+    registry: tuple[strategy_orchestrator.StrategyRegistry, Dict[str, Any]]
+) -> None:
+    orchestrator, _ = registry
+    request = _make_request()
+    request.instrument = "ETH-PERP"
+    request.intent.policy_decision.request.instrument = "ETH-PERP"
+
+    with pytest.raises(StrategyIntentError):
+        await orchestrator.route_trade_intent("alpha", request)
+
+
+@pytest.mark.asyncio
+async def test_route_trade_intent_rejects_non_spot_exposure(
+    registry: tuple[strategy_orchestrator.StrategyRegistry, Dict[str, Any]]
+) -> None:
+    orchestrator, _ = registry
+    request = _make_request()
+    request.portfolio_state.instrument_exposure["BTC-PERP"] = 5.0
+
+    with pytest.raises(StrategyIntentError):
+        await orchestrator.route_trade_intent("alpha", request)
 
 
 @pytest.mark.asyncio

@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends, Query
 from services.common.security import require_admin_account
 from services.reports.report_service import compute_daily_return_pct
 from services.risk import portfolio_risk
+from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 
 LOGGER = logging.getLogger(__name__)
@@ -55,6 +56,34 @@ def _normalize_flags(breaches: Sequence[Any]) -> Sequence[Dict[str, Any]]:
     return normalized
 
 
+def _canonical_spot_exposures(exposures: Mapping[str, Any]) -> Dict[str, float]:
+    """Return canonical spot exposures aggregated by symbol."""
+
+    normalized: Dict[str, float] = {}
+    dropped: set[str] = set()
+
+    for instrument, raw_value in exposures.items():
+        normalized_symbol = normalize_spot_symbol(instrument)
+        if not normalized_symbol or not is_spot_symbol(normalized_symbol):
+            dropped.add(str(instrument))
+            continue
+
+        try:
+            exposure_value = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+
+        normalized[normalized_symbol] = normalized.get(normalized_symbol, 0.0) + exposure_value
+
+    if dropped:
+        LOGGER.warning(
+            "Dropping non-spot instruments from system health exposures",
+            extra={"symbols": sorted(dropped)},
+        )
+
+    return normalized
+
+
 def _top_exposures(exposures: Mapping[str, Any], *, limit: int = 5) -> Sequence[Dict[str, Any]]:
     sortable = []
     for instrument, raw_value in exposures.items():
@@ -86,7 +115,7 @@ def _diversification_summary() -> Dict[str, Any]:
     if totals is not None:
         raw_exposures = getattr(totals, "instrument_exposure", {})
         if isinstance(raw_exposures, Mapping):
-            exposures = raw_exposures
+            exposures = _canonical_spot_exposures(raw_exposures)
         max_correlation = float(getattr(totals, "max_correlation", 0.0) or 0.0)
     summary["top_assets"] = _top_exposures(exposures)
 
