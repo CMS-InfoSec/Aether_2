@@ -5,9 +5,11 @@ from __future__ import annotations
 import enum
 import logging
 import os
+import sys
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Iterable, Mapping, Optional
+from typing import AsyncIterator, Iterable, Mapping, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -15,8 +17,10 @@ from sqlalchemy import Column, DateTime, Float, String, create_engine, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from services.common.security import require_admin_account
+from shared.postgres import normalize_sqlalchemy_dsn
 
 LOGGER = logging.getLogger(__name__)
 
@@ -109,6 +113,7 @@ _DATABASE_ENV_VARS: tuple[str, ...] = (
     "TIMESCALE_DSN",
     "DATABASE_URL",
 )
+_ALLOW_SQLITE_ENV = "BENCHMARK_ALLOW_SQLITE"
 _SSL_MODE_ENV = "BENCHMARK_DB_SSLMODE"
 _POOL_SIZE_ENV = "BENCHMARK_DB_POOL_SIZE"
 _MAX_OVERFLOW_ENV = "BENCHMARK_DB_MAX_OVERFLOW"
@@ -119,30 +124,21 @@ _POOL_RECYCLE_ENV = "BENCHMARK_DB_POOL_RECYCLE"
 def _database_url() -> str:
     """Return the configured PostgreSQL/Timescale connection string."""
 
-    raw_url = next((os.getenv(name) for name in _DATABASE_ENV_VARS if os.getenv(name)), None)
-    if not raw_url:
+    raw_url = next((os.getenv(name) for name in _DATABASE_ENV_VARS if os.getenv(name)), "")
+    stripped = raw_url.strip()
+    if not stripped:
         raise RuntimeError(
-            "BENCHMARK_DATABASE_URL (or TIMESCALE_DSN/DATABASE_URL) must be set to a "
-            "PostgreSQL/Timescale DSN"
+            "Benchmark service requires BENCHMARK_DATABASE_URL (or TIMESCALE_DSN/DATABASE_URL) "
+            "to be set."
         )
 
-    url = raw_url.strip()
-    if url.startswith("postgres://"):
-        url = "postgresql://" + url.split("://", 1)[1]
-
-    normalized = url.lower()
-    if normalized.startswith("postgresql://"):
-        url = url.replace("postgresql://", "postgresql+psycopg://", 1)
-        normalized = url.lower()
-
-    allowed_prefixes = ("postgresql+psycopg://", "postgresql+psycopg2://")
-    if not normalized.startswith(allowed_prefixes):
-        raise RuntimeError(
-            "Benchmark service requires a PostgreSQL/Timescale DSN via BENCHMARK_DATABASE_URL "
-            "(or TIMESCALE_DSN/DATABASE_URL)."
-        )
-
-    return url
+    allow_sqlite = "pytest" in sys.modules or os.getenv(_ALLOW_SQLITE_ENV) == "1"
+    return normalize_sqlalchemy_dsn(
+        stripped,
+        driver="psycopg",
+        allow_sqlite=allow_sqlite,
+        label="Benchmark database URL",
+    )
 
 
 def _engine_options(url: str) -> Mapping[str, object]:
@@ -152,6 +148,13 @@ def _engine_options(url: str) -> Mapping[str, object]:
     }
 
     connect_args: dict[str, object] = {}
+    if url.startswith("sqlite"):
+        connect_args["check_same_thread"] = False
+        options["connect_args"] = connect_args
+        if ":memory:" in url:
+            options["poolclass"] = StaticPool
+        return options
+
     if url.startswith("postgresql"):
         connect_args["sslmode"] = os.getenv(_SSL_MODE_ENV, "require")
         options.update(
@@ -169,19 +172,22 @@ DATABASE_URL = _database_url()
 ENGINE: Engine = create_engine(DATABASE_URL, **_engine_options(DATABASE_URL))
 SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
 
-app = FastAPI(title="Benchmark Service", version="1.0.0")
-app.state.db_sessionmaker = SessionLocal
 
-
-@app.on_event("startup")
-def _create_tables() -> None:
-    """Ensure the benchmark table exists before serving requests."""
-
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         Base.metadata.create_all(ENGINE)
     except SQLAlchemyError as exc:  # pragma: no cover - defensive logging
         LOGGER.exception("Failed to initialise benchmark tables: %s", exc)
         raise
+    try:
+        yield
+    finally:
+        pass
+
+
+app = FastAPI(title="Benchmark Service", version="1.0.0", lifespan=_lifespan)
+app.state.db_sessionmaker = SessionLocal
 
 
 def _parse_date(date_str: str | None) -> datetime:
