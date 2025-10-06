@@ -5,7 +5,7 @@ import base64
 import importlib
 import logging
 import os
-import uuid
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI
@@ -179,10 +179,6 @@ def create_app(
     admin_repository: Optional[AdminRepositoryProtocol] = None,
     session_store: Optional[SessionStoreProtocol] = None,
 ) -> FastAPI:
-    app = FastAPI(title="Aether Admin Platform")
-    setup_metrics(app, service_name="admin-platform")
-    app.add_middleware(CorrelationIdMiddleware)
-
     audit_store = AuditLogStore()
     audit_logger = TimescaleAuditLogger(audit_store)
     recorder = SensitiveActionRecorder(audit_logger)
@@ -192,6 +188,21 @@ def create_app(
     session_store = session_store or _build_session_store_from_env()
     auth_service = AuthService(admin_repository, session_store)
     accounts_service = AccountsService(recorder)
+
+    scaling_controller = build_scaling_controller_from_env()
+    configure_scaling_controller(scaling_controller)
+
+    @asynccontextmanager
+    async def _lifespan(app: FastAPI):
+        await scaling_controller.start()
+        try:
+            yield
+        finally:
+            await scaling_controller.stop()
+
+    app = FastAPI(title="Aether Admin Platform", lifespan=_lifespan)
+    setup_metrics(app, service_name="admin-platform")
+    app.add_middleware(CorrelationIdMiddleware)
 
     def _get_auth_service() -> AuthService:
         return auth_service
@@ -212,8 +223,6 @@ def create_app(
     _maybe_include_router(app, "services.hedge.hedge_service", "router")
 
 
-    scaling_controller = build_scaling_controller_from_env()
-    configure_scaling_controller(scaling_controller)
     app.include_router(scaling_router)
 
 
@@ -227,14 +236,6 @@ def create_app(
     app.state.scaling_controller = scaling_controller
 
     configure_audit_mode(app)
-
-    @app.on_event("startup")
-    async def _start_scaling_controller() -> None:  # pragma: no cover - FastAPI lifecycle
-        await scaling_controller.start()
-
-    @app.on_event("shutdown")
-    async def _stop_scaling_controller() -> None:  # pragma: no cover - FastAPI lifecycle
-        await scaling_controller.stop()
 
     alertmanager_url = os.getenv("ALERTMANAGER_URL")
     setup_alerting(app, alertmanager_url=alertmanager_url)
