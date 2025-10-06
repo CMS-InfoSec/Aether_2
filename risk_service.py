@@ -54,6 +54,7 @@ from cost_throttler import CostThrottler
 from services.risk.position_sizer import PositionSizer
 from services.common.adapters import RedisFeastAdapter, TimescaleAdapter
 from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
+from shared.spot import filter_spot_symbols, is_spot_symbol, normalize_spot_symbol
 
 
 logger = logging.getLogger(__name__)
@@ -222,7 +223,7 @@ class AccountRiskLimit(Base):
     def whitelist(self) -> List[str]:
         if not self.instrument_whitelist:
             return []
-        return _filter_spot_instruments(self.instrument_whitelist.split(","))
+        return filter_spot_symbols(self.instrument_whitelist.split(","), logger=logger)
 
     @property
     def cluster_limits(self) -> Dict[str, float]:
@@ -357,7 +358,9 @@ _DEFAULT_LIMITS: List[Dict[str, object]] = [
 def _seed_default_limits(session: Session) -> None:
     for payload in _DEFAULT_LIMITS:
         record = session.get(AccountRiskLimit, payload["account_id"])
-        whitelist = _filter_spot_instruments(payload.get("instrument_whitelist", []))
+        whitelist = filter_spot_symbols(
+            payload.get("instrument_whitelist", []), logger=logger
+        )
         whitelist_blob = ",".join(sorted(whitelist)) if whitelist else None
         if record is None:
             record = AccountRiskLimit(
@@ -838,8 +841,8 @@ async def get_position_size(
     symbol: str = Query(..., min_length=1, description="Instrument symbol to size"),
     account_id: str = Depends(require_admin_account),
 ) -> Dict[str, Any]:
-    normalized_symbol = str(symbol or "").strip().upper()
-    if not _is_spot_instrument(normalized_symbol):
+    normalized_symbol = normalize_spot_symbol(symbol)
+    if not is_spot_symbol(normalized_symbol):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Only spot market symbols are supported for position sizing.",
@@ -999,8 +1002,13 @@ async def _get_approved_universe() -> UniverseSnapshot:
     except ValueError as exc:  # pragma: no cover - defensive
         raise UniverseServiceError("Universe service returned invalid JSON") from exc
 
-    raw_symbols = [str(symbol).upper() for symbol in payload.get("symbols", []) if symbol]
-    symbols = {symbol for symbol in raw_symbols if _is_spot_instrument(symbol)}
+    raw_symbols: List[str] = []
+    for symbol in payload.get("symbols", []):
+        normalized = normalize_spot_symbol(symbol)
+        if normalized:
+            raw_symbols.append(normalized)
+
+    symbols = {symbol for symbol in raw_symbols if is_spot_symbol(symbol)}
     dropped = set(raw_symbols) - symbols
     if dropped:
         logger.warning(
@@ -1042,7 +1050,7 @@ async def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
     await _refresh_usage_from_fills(context.request.account_id, state)
     intent = context.request.intent
     trade_notional = context.intended_notional
-    normalized_instrument = str(intent.instrument_id).upper()
+    normalized_instrument = normalize_spot_symbol(intent.instrument_id)
 
     def _register_violation(
         message: str, *, cooldown: bool = False, details: Optional[Dict[str, object]] = None
@@ -1066,7 +1074,7 @@ async def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
             cooldown_until = cooldown_until or _determine_cooldown(limits)
         _audit_violation(context, message, details)
 
-    if not _is_spot_instrument(normalized_instrument):
+    if not is_spot_symbol(normalized_instrument):
         _register_violation(
             "Instrument not eligible for spot trading",
             cooldown=True,

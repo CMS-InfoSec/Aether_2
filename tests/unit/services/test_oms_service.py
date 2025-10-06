@@ -193,6 +193,25 @@ def test_place_order_succeeds_with_matching_account(oms_client: TestClient) -> N
     assert body["reused"] is False
 
 
+def test_place_order_rejects_non_spot_symbol(oms_client: TestClient) -> None:
+    payload = {
+        "account_id": "ACC1",
+        "client_id": "CID-spot-guard",
+        "symbol": "BTC-PERP",
+        "side": "buy",
+        "type": "limit",
+        "qty": "1",
+        "limit_px": "50000",
+    }
+    headers = _auth_headers("ACC1")
+
+    response = oms_client.post("/oms/place", json=payload, headers=headers)
+
+    assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+    detail = response.json().get("detail", [])
+    assert any("Only spot market symbols" in str(item) for item in detail)
+
+
 def test_place_order_blocked_when_stablecoin_depegged(
     monkeypatch: pytest.MonkeyPatch, oms_client: TestClient
 ) -> None:
