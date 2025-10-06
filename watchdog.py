@@ -31,6 +31,7 @@ from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from common.schemas.contracts import IntentEvent
 from services.common.adapters import KafkaNATSAdapter
 from services.common.security import require_admin_account
+from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 try:  # pragma: no cover - LightGBM is optional in many environments
     import lightgbm as lgb  # type: ignore
@@ -652,6 +653,15 @@ class WatchdogCoordinator:
         quantity = _to_float(_first_present(intent_payload, ("quantity", "qty", "size")))
         symbol_value = intent_payload.get("instrument") or intent_payload.get("symbol") or payload.get("symbol")
         symbol = str(symbol_value).strip() if isinstance(symbol_value, str) else None
+        if symbol:
+            normalized_symbol = normalize_spot_symbol(symbol)
+            if not is_spot_symbol(normalized_symbol):
+                LOGGER.warning(
+                    "Ignoring non-spot instrument in intent event",
+                    extra={"instrument": symbol, "intent_id": intent_id},
+                )
+                return None
+            symbol = normalized_symbol
         book_snapshot = _extract_book(intent_payload)
         spread_bps = _to_float(intent_payload.get("spread_bps"))
         if spread_bps is None and book_snapshot is not None:
@@ -684,10 +694,21 @@ class WatchdogCoordinator:
             LOGGER.warning("Policy decision event missing order identifier: %s", payload)
             return None
 
+        instrument = event.instrument.strip() if isinstance(event.instrument, str) else None
+        if instrument:
+            normalized_instrument = normalize_spot_symbol(instrument)
+            if not is_spot_symbol(normalized_instrument):
+                LOGGER.warning(
+                    "Ignoring non-spot instrument in policy decision",
+                    extra={"instrument": instrument, "intent_id": intent_id},
+                )
+                return None
+            instrument = normalized_instrument
+
         return PolicyDecisionEnvelope(
             account_id=_normalize_account(account_id),
             intent_id=str(intent_id),
-            instrument=event.instrument,
+            instrument=instrument,
             approved=bool(event.approved),
             reason=event.reason,
             edge_bps=_to_float(event.edge_bps),
