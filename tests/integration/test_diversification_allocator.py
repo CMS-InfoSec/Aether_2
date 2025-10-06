@@ -187,6 +187,57 @@ def test_correlation_cap_enforces_highly_correlated_exposures(adapter_factory) -
     assert response.risk_adjustment == pytest.approx(expected_adjustment, rel=1e-6)
 
 
+def test_correlation_matrix_entries_are_normalised(adapter_factory, caplog) -> None:
+    register, factory = adapter_factory
+
+    correlation_matrix = {
+        "btc_usd": {"WBTC-USD": 0.88, "ETH-PERP": 0.4},
+        "ETH-USD": {"BTCUSD": 0.77},
+    }
+
+    register(
+        "theta",
+        _StubTimescaleAdapter(
+            exposures={
+                "BTC-USD": 125_000.0,
+                "WBTC-USD": 100_000.0,
+                "ETH-USD": 75_000.0,
+            },
+            correlation_matrix=correlation_matrix,
+            var95=95_000.0,
+            cvar95=120_000.0,
+        ),
+    )
+
+    allocator = PortfolioRiskAggregator(
+        accounts=("theta",),
+        cluster_limits={"BTC": 1_000_000.0, "ETH": 1_000_000.0},
+        instrument_clusters={
+            "BTC-USD": "BTC",
+            "WBTC-USD": "BTC",
+            "ETH-USD": "ETH",
+        },
+        instrument_betas={
+            "BTC-USD": 1.0,
+            "WBTC-USD": 1.0,
+            "ETH-USD": 0.8,
+        },
+        beta_limit=2.0,
+        correlation_limit=0.9,
+        adapter_factory=factory,
+    )
+
+    with caplog.at_level("WARNING"):
+        response = allocator.portfolio_status()
+
+    # Non-spot correlation entries are discarded and do not influence the result.
+    assert response.totals.max_correlation == pytest.approx(0.88, rel=1e-6)
+
+    # Ensure we emitted warnings when stripping derivative entries from the matrix.
+    warning_messages = [record.message for record in caplog.records]
+    assert any("Skipping non-spot correlation counterpart" in message for message in warning_messages)
+
+
 def test_cluster_and_beta_maps_ignore_non_spot(monkeypatch) -> None:
     monkeypatch.setenv(
         "PORTFOLIO_CLUSTER_MAP",

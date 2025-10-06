@@ -289,10 +289,28 @@ class PortfolioRiskAggregator:
             for instrument, row in matrix.items():
                 if not isinstance(row, Mapping):
                     continue
+
+                normalized_instrument = normalize_spot_symbol(instrument)
+                if not normalized_instrument or not is_spot_symbol(normalized_instrument):
+                    PORTFOLIO_LOGGER.warning(
+                        "Skipping non-spot correlation instrument",
+                        extra={"instrument": instrument},
+                    )
+                    continue
+
                 for other, value in row.items():
-                    key = tuple(sorted((str(instrument), str(other))))
+                    normalized_other = normalize_spot_symbol(other)
+                    if not normalized_other or not is_spot_symbol(normalized_other):
+                        PORTFOLIO_LOGGER.warning(
+                            "Skipping non-spot correlation counterpart",
+                            extra={"instrument": instrument, "other": other},
+                        )
+                        continue
+
+                    key = tuple(sorted((normalized_instrument, normalized_other)))
                     combined[key] = combined.get(key, 0.0) + float(value)
                     counts[key] = counts.get(key, 0) + 1
+
         averaged: Dict[Tuple[str, str], float] = {}
         for key, total in combined.items():
             averaged[key] = total / counts[key]
