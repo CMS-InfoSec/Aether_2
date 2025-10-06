@@ -1,4 +1,4 @@
-"""Utilities for validating and normalising spot trading instruments."""
+"""Utilities for validating and normalising USD spot trading instruments."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ _SPOT_PAIR_PATTERN = re.compile(r"^[A-Z0-9]{2,}-[A-Z0-9]{2,}$")
 _NON_SPOT_KEYWORDS: Sequence[str] = ("PERP", "FUT", "FUTURE", "MARGIN", "SWAP", "OPTION", "DERIV")
 _LEVERAGE_SUFFIXES: Sequence[str] = ("UP", "DOWN")
 _LEVERAGE_PATTERN = re.compile(r"\d+(?:X|L|S)$")
+_ALLOWED_QUOTES: Sequence[str] = ("USD",)
 
 
 def normalize_spot_symbol(symbol: object) -> str:
@@ -39,7 +40,7 @@ def normalize_spot_symbol(symbol: object) -> str:
 
 
 def is_spot_symbol(symbol: object) -> bool:
-    """Return ``True`` when *symbol* represents a spot market trading pair."""
+    """Return ``True`` when *symbol* represents a USD-quoted spot market pair."""
 
     normalized = normalize_spot_symbol(symbol)
     if not normalized:
@@ -51,7 +52,10 @@ def is_spot_symbol(symbol: object) -> bool:
     if not _SPOT_PAIR_PATTERN.match(normalized):
         return False
 
-    base, _ = normalized.split("-", maxsplit=1)
+    base, quote = normalized.split("-", maxsplit=1)
+
+    if quote not in _ALLOWED_QUOTES:
+        return False
 
     if any(base.endswith(suffix) for suffix in _LEVERAGE_SUFFIXES):
         return False
