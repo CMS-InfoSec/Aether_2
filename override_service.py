@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -15,6 +16,8 @@ from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, s
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
+
+from shared.postgres import normalize_sqlalchemy_dsn
 
 try:  # pragma: no cover - support alternative namespace packages
     from services.common.security import require_admin_account
@@ -49,6 +52,7 @@ except Exception:  # pragma: no cover - degrade gracefully if audit logger unava
 LOGGER = logging.getLogger("override_service")
 
 _DATABASE_URL_ENV = "OVERRIDE_DATABASE_URL"
+_SQLITE_FALLBACK_FLAG = "OVERRIDE_ALLOW_SQLITE_FOR_TESTS"
 _SSL_MODE_ENV = "OVERRIDE_DB_SSLMODE"
 _POOL_SIZE_ENV = "OVERRIDE_DB_POOL_SIZE"
 _MAX_OVERFLOW_ENV = "OVERRIDE_DB_MAX_OVERFLOW"
@@ -64,55 +68,60 @@ class OverrideDecision(str, Enum):
     REJECT = "reject"
 
 
-def _require_database_url() -> str | None:
-    """Return the configured Postgres/Timescale database URL if provided."""
+def _resolve_database_url() -> str:
+    """Return the configured database URL, enforcing Postgres in production."""
 
-    raw_url = os.getenv(_DATABASE_URL_ENV)
-    if not raw_url:
-        return None
-
-    normalized = raw_url.lower()
-    if normalized.startswith("postgres://"):
-        raw_url = "postgresql://" + raw_url.split("://", 1)[1]
-        normalized = raw_url.lower()
-
-    allowed_prefixes = (
-        "postgresql://",
-        "postgresql+psycopg://",
-        "postgresql+psycopg2://",
-    )
-    if not normalized.startswith(allowed_prefixes):
+    raw_value = os.getenv(_DATABASE_URL_ENV, "")
+    if not raw_value.strip():
         raise RuntimeError(
-            "OVERRIDE_DATABASE_URL must use a PostgreSQL-compatible driver (e.g. postgresql://)."
+            "OVERRIDE_DATABASE_URL must be configured with a PostgreSQL/Timescale DSN for the override service."
         )
 
-    return raw_url
+    allow_sqlite = "pytest" in sys.modules or os.getenv(_SQLITE_FALLBACK_FLAG) == "1"
+    database_url = normalize_sqlalchemy_dsn(
+        raw_value.strip(),
+        allow_sqlite=allow_sqlite,
+        label="Override service database URL",
+    )
+
+    if database_url.startswith("sqlite"):
+        reason = (
+            f"{_SQLITE_FALLBACK_FLAG}=1"
+            if os.getenv(_SQLITE_FALLBACK_FLAG) == "1"
+            else "pytest detected"
+        )
+        LOGGER.warning(
+            "Using SQLite override store '%s'; allowed because %s. Do not enable outside tests.",
+            database_url,
+            reason,
+        )
+
+    return database_url
 
 
 def _engine() -> Engine:
-    url = _require_database_url()
-    if not url:
-        LOGGER.warning(
-            "OVERRIDE_DATABASE_URL not set; using ephemeral in-memory SQLite store for overrides"
+    url = _resolve_database_url()
+    connect_args: Dict[str, object] = {}
+    engine_kwargs: Dict[str, object] = {"future": True, "pool_pre_ping": True}
+
+    if url.startswith("sqlite"):
+        connect_args["check_same_thread"] = False
+        if ":memory:" in url:
+            engine_kwargs["poolclass"] = StaticPool
+    else:
+        sslmode = os.getenv(_SSL_MODE_ENV, "require").strip()
+        if sslmode:
+            connect_args["sslmode"] = sslmode
+        engine_kwargs.update(
+            pool_size=int(os.getenv(_POOL_SIZE_ENV, "10")),
+            max_overflow=int(os.getenv(_MAX_OVERFLOW_ENV, "5")),
+            pool_timeout=int(os.getenv(_POOL_TIMEOUT_ENV, "30")),
+            pool_recycle=int(os.getenv(_POOL_RECYCLE_ENV, "1800")),
         )
-        return create_engine(
-            "sqlite+pysqlite:///:memory:",
-            future=True,
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
-        )
-    connect_args: Dict[str, object] = {
-        "sslmode": os.getenv(_SSL_MODE_ENV, "require"),
-    }
-    engine_kwargs: Dict[str, object] = {
-        "future": True,
-        "pool_pre_ping": True,
-        "pool_size": int(os.getenv(_POOL_SIZE_ENV, "10")),
-        "max_overflow": int(os.getenv(_MAX_OVERFLOW_ENV, "5")),
-        "pool_timeout": int(os.getenv(_POOL_TIMEOUT_ENV, "30")),
-        "pool_recycle": int(os.getenv(_POOL_RECYCLE_ENV, "1800")),
-        "connect_args": connect_args,
-    }
+
+    if connect_args:
+        engine_kwargs["connect_args"] = connect_args
+
     return create_engine(url, **engine_kwargs)
 
 
