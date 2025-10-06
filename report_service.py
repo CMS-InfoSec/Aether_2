@@ -17,6 +17,7 @@ import io
 import json
 import logging
 import os
+import sys
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, MutableMapping, Sequence
@@ -27,8 +28,9 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from reports.storage import ArtifactStorage, build_storage_from_env
 from services.common.security import require_admin_account
-from shared.timezone import format_london_time
 from services.models.model_server import get_active_model
+from shared.postgres import normalize_postgres_dsn
+from shared.timezone import format_london_time
 
 try:  # pragma: no cover - psycopg is an optional dependency in tests
     import psycopg
@@ -43,7 +45,11 @@ except Exception:  # pragma: no cover - executed on environments without psycopg
 LOGGER = logging.getLogger(__name__)
 
 
-DEFAULT_DSN = "postgresql://timescale:password@localhost:5432/aether"
+_DATABASE_ENV_KEYS = (
+    "REPORT_DATABASE_URL",
+    "TIMESCALE_DSN",
+    "DATABASE_URL",
+)
 
 
 def _normalize_account_id(value: str) -> str:
@@ -58,14 +64,43 @@ def _ensure_caller_matches_account(caller: str, account_id: str) -> None:
         )
 
 
+def _allow_sqlite() -> bool:
+    """Return whether sqlite URLs are permitted for configuration tests."""
+
+    return "pytest" in sys.modules
+
+
 def _database_url() -> str:
     """Resolve the TimescaleDB connection string from environment variables."""
 
-    return (
-        os.getenv("REPORT_DATABASE_URL")
-        or os.getenv("TIMESCALE_DSN")
-        or os.getenv("DATABASE_URL")
-        or DEFAULT_DSN
+    for env_key in _DATABASE_ENV_KEYS:
+        raw_value = os.getenv(env_key)
+        if not raw_value:
+            continue
+        try:
+            return normalize_postgres_dsn(
+                raw_value,
+                allow_sqlite=False,
+                label="Report service database URL",
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if _allow_sqlite():
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Report service database URL is required even under pytest; "
+                "set REPORT_DATABASE_URL to a PostgreSQL/Timescale DSN."
+            ),
+        )
+
+    raise HTTPException(
+        status_code=503,
+        detail=(
+            "Report service database URL is not configured. Set REPORT_DATABASE_URL "
+            "or TIMESCALE_DSN to a PostgreSQL/Timescale connection string."
+        ),
     )
 
 

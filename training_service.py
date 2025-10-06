@@ -37,6 +37,7 @@ from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from services.common.security import require_admin_account
+from shared.postgres import normalize_sqlalchemy_dsn
 
 try:  # pragma: no cover - optional dependency in minimal environments.
     import mlflow
@@ -113,26 +114,18 @@ def _database_url() -> str:
             "PostgreSQL/Timescale DSN for the training service."
         )
 
-    normalized = url.strip()
-    if normalized.startswith("postgres://"):
-        normalized = "postgresql://" + normalized.split("://", 1)[1]
+    allow_sqlite = os.getenv(_ALLOW_SQLITE_FLAG) == "1"
+    normalized = normalize_sqlalchemy_dsn(
+        url,
+        allow_sqlite=allow_sqlite,
+        label="Training service database URL",
+    )
 
-    lowered = normalized.lower()
-    if lowered.startswith("postgresql://"):
-        normalized = normalized.replace("postgresql://", "postgresql+psycopg://", 1)
-    elif lowered.startswith(("postgresql+psycopg://", "postgresql+psycopg2://")):
-        pass
-    elif lowered.startswith("sqlite://") and os.getenv(_ALLOW_SQLITE_FLAG) == "1":
+    if normalized.startswith("sqlite") and allow_sqlite:
         logger.warning(
             "Allowing SQLite database URL for training service because %s=1. "
             "Do not use this configuration outside of tests.",
             _ALLOW_SQLITE_FLAG,
-        )
-        return normalized
-    else:
-        raise RuntimeError(
-            "Training service requires a PostgreSQL/Timescale DSN via "
-            "TRAINING_DATABASE_URL or TIMESCALE_DSN."
         )
 
     return normalized

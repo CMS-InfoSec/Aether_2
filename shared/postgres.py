@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 _SUPPORTED_POSTGRES_SCHEMES = {
     "postgres",
     "postgresql",
@@ -14,6 +16,8 @@ _SUPPORTED_SQLITE_SCHEMES = {
     "sqlite",
     "sqlite+pysqlite",
 }
+
+_SCHEMA_INVALID_CHARS = re.compile(r"[^a-z0-9_]")
 
 
 def normalize_postgres_dsn(raw_dsn: str, *, allow_sqlite: bool = True, label: str = "Timescale DSN") -> str:
@@ -83,4 +87,41 @@ def normalize_sqlalchemy_dsn(
     return normalized
 
 
-__all__ = ["normalize_postgres_dsn", "normalize_sqlalchemy_dsn"]
+def normalize_postgres_schema(
+    raw: str,
+    *,
+    label: str = "Postgres schema",
+    prefix_if_missing: str | None = None,
+    allow_leading_digit_prefix: bool = False,
+) -> str:
+    """Return a PostgreSQL-safe schema identifier."""
+
+    candidate = raw.strip().lower().replace("-", "_")
+    candidate = _SCHEMA_INVALID_CHARS.sub("", candidate)
+    candidate = re.sub(r"_+", "_", candidate).strip("_")
+
+    if not candidate:
+        raise RuntimeError(f"{label} cannot be empty once configured")
+
+    if candidate[0].isdigit():
+        if prefix_if_missing and allow_leading_digit_prefix:
+            candidate = f"{prefix_if_missing}{candidate}"
+        else:
+            raise RuntimeError(
+                f"{label} must not start with a digit; adjust the configured value"
+            )
+
+    if prefix_if_missing and not candidate.startswith(prefix_if_missing):
+        candidate = f"{prefix_if_missing}{candidate}"
+
+    if len(candidate) > 63:
+        raise RuntimeError(f"{label} must be 63 characters or fewer once normalised")
+
+    return candidate
+
+
+__all__ = [
+    "normalize_postgres_dsn",
+    "normalize_sqlalchemy_dsn",
+    "normalize_postgres_schema",
+]
