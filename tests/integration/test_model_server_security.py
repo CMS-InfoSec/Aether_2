@@ -48,6 +48,41 @@ def test_predict_rejects_missing_credentials(client: TestClient) -> None:
     assert response.status_code == 401
 
 
+def test_predict_normalizes_spot_symbol(client: TestClient, caplog: pytest.LogCaptureFixture) -> None:
+    payload = {
+        "account_id": "ACC-1",
+        "symbol": "btc/usd",
+        "features": {"momentum": 1.5},
+        "book_snapshot": {"spread": 5.0, "mid": 19_500.0},
+    }
+    headers = {"X-Account-ID": "company"}
+
+    with caplog.at_level(logging.INFO, logger="model_server"):
+        response = client.post("/models/predict", json=payload, headers=headers)
+
+    assert response.status_code == 200
+    audit_records = [record for record in caplog.records if record.getMessage() == "inference_log"]
+    assert audit_records, "Expected inference audit log entry"
+    assert audit_records[-1].symbol == "BTC-USD"
+
+
+def test_predict_rejects_non_spot_symbol(client: TestClient) -> None:
+    payload = {
+        "account_id": "ACC-1",
+        "symbol": "BTC-PERP",
+        "features": {"momentum": 1.0},
+        "book_snapshot": {},
+    }
+    headers = {"X-Account-ID": "company"}
+
+    response = client.post("/models/predict", json=payload, headers=headers)
+
+    assert response.status_code == 422
+    detail = response.json().get("detail")
+    assert isinstance(detail, list)
+    assert any("spot market" in str(item) for item in detail)
+
+
 def test_active_model_requires_admin_identity(
     client: TestClient, caplog: pytest.LogCaptureFixture
 ) -> None:
