@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -21,14 +22,53 @@ from sqlalchemy import JSON, Boolean, Column, DateTime, Integer, String, create_
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from services.common.security import require_admin_account
+from shared.postgres import normalize_sqlalchemy_dsn
 
 
 LOGGER = logging.getLogger("universe.service")
 
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./universe.db")
+DEFAULT_DATABASE_URL = "sqlite:///./universe.db"
+
+
+def _database_url() -> str:
+    """Resolve the Timescale/Postgres connection string."""
+
+    allow_sqlite = "pytest" in sys.modules
+    raw = (
+        os.getenv("UNIVERSE_DATABASE_URL")
+        or os.getenv("DATABASE_URL")
+        or os.getenv("TIMESCALE_DSN")
+        or (DEFAULT_DATABASE_URL if allow_sqlite else None)
+    )
+
+    if raw is None:
+        raise RuntimeError(
+            "Universe database DSN is not configured. Set UNIVERSE_DATABASE_URL or "
+            "TIMESCALE_DSN to a PostgreSQL/Timescale connection string.",
+        )
+
+    candidate = raw.strip()
+    if not candidate:
+        raise RuntimeError("Universe database DSN cannot be empty once configured.")
+
+    return normalize_sqlalchemy_dsn(
+        candidate,
+        allow_sqlite=allow_sqlite,
+        label="Universe database DSN",
+    )
+
+
+def _engine_options(url: str) -> dict[str, object]:
+    options: dict[str, object] = {"future": True}
+    if url.startswith("sqlite://"):
+        options.setdefault("connect_args", {"check_same_thread": False})
+        if url.endswith(":memory:"):
+            options["poolclass"] = StaticPool
+    return options
 
 
 Base = declarative_base()
@@ -61,8 +101,11 @@ class AuditLog(Base):
     )
 
 
+_DB_URL = _database_url()
+
+
 def _create_engine() -> Engine:
-    return create_engine(DATABASE_URL, future=True)
+    return create_engine(_DB_URL, **_engine_options(_DB_URL))
 
 
 ENGINE = _create_engine()

@@ -44,11 +44,11 @@ encoder to avoid adding new packages to the environment.
 """
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import os
 import secrets
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -56,6 +56,8 @@ from typing import Any, Dict, Literal, Mapping, Optional
 
 import httpx
 import pyotp
+from contextlib import asynccontextmanager
+
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
@@ -66,8 +68,8 @@ from sqlalchemy.engine.url import make_url
 from sqlalchemy.orm import Session as OrmSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-from services.auth.jwt_tokens import create_jwt
-from shared.postgres import normalize_postgres_dsn
+from services.auth import jwt_tokens
+from shared.postgres import normalize_postgres_dsn, normalize_postgres_schema
 
 
 logger = logging.getLogger("auth_service")
@@ -100,14 +102,25 @@ def _resolve_database_url() -> tuple[Optional[str], Optional[RuntimeError]]:
             "AUTH_DATABASE_URL environment variable must be set before starting the auth service"
         )
 
+    allow_sqlite = "pytest" in sys.modules
+
     try:
-        normalized = normalize_postgres_dsn(url, label="Auth database DSN")
+        normalized = normalize_postgres_dsn(
+            url,
+            allow_sqlite=allow_sqlite,
+            label="Auth database DSN",
+        )
     except RuntimeError as exc:
         return None, RuntimeError(str(exc))
 
     if normalized == "sqlite:///./auth_sessions.db":
         return None, RuntimeError(
             "AUTH_DATABASE_URL must point at the shared Postgres/Timescale cluster instead of the legacy SQLite default"
+        )
+
+    if not allow_sqlite and normalized.startswith("sqlite"):
+        return None, RuntimeError(
+            "AUTH_DATABASE_URL must use a PostgreSQL/Timescale-compatible scheme"
         )
     return normalized, None
 
@@ -131,9 +144,21 @@ def _engine_options(url: str) -> Dict[str, Any]:
 def _resolve_schema(url: str) -> Optional[str]:
     sa_url = make_url(url)
     if sa_url.get_backend_name().startswith("postgresql"):
-        schema = os.getenv("AUTH_DATABASE_SCHEMA", "auth")
-        if schema:
-            return schema
+        override = os.getenv("AUTH_DATABASE_SCHEMA")
+        if override is None:
+            schema = "auth"
+        else:
+            if not override.strip():
+                raise RuntimeError(
+                    "AUTH_DATABASE_SCHEMA is set but empty; configure a valid schema identifier"
+                )
+            schema = override
+
+        return normalize_postgres_schema(
+            schema,
+            label="Auth database schema",
+            prefix_if_missing=None,
+        )
     return None
 
 
@@ -387,38 +412,30 @@ class MFAVerifier:
 
 
 
-def _b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
-
-
-def _sign(data: bytes, secret: str) -> str:
-    import hmac
-    import hashlib
-
-    digest = hmac.new(secret.encode("utf-8"), data, hashlib.sha256).digest()
-    return _b64url(digest)
-
-
 def create_jwt(
-    *, subject: str, role: str, ttl_seconds: Optional[int] = None, secret: Optional[str] = None
+    *,
+    subject: str,
+    role: str,
+    ttl_seconds: Optional[int] = None,
+    secret: Optional[str] = None,
+    claims: Optional[Mapping[str, Any]] = None,
 ) -> tuple[str, datetime]:
-    ttl = ttl_seconds or int(os.getenv("AUTH_JWT_TTL_SECONDS", "3600"))
-    now = datetime.now(timezone.utc)
-    payload = {
-        "sub": subject,
-        "role": role,
-        "iat": int(now.timestamp()),
-        "exp": int((now + timedelta(seconds=ttl)).timestamp()),
-    }
-    header = {"alg": "HS256", "typ": "JWT"}
+    """Compatibility wrapper around ``services.auth.jwt_tokens.create_jwt``.
 
-    header_b64 = _b64url(json.dumps(header, separators=(",", ":"), sort_keys=True).encode("utf-8"))
-    payload_b64 = _b64url(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
-    signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
-    signing_secret = secret or _get_configured_jwt_secret()
-    signature = _sign(signing_input, signing_secret)
-    token = f"{header_b64}.{payload_b64}.{signature}"
-    return token, now + timedelta(seconds=ttl)
+    The auth service initialises and stores the JWT signing secret during
+    application startup.  Downstream tests import ``auth_service.create_jwt`` to
+    mint tokens without directly depending on the internal module structure, so
+    this wrapper forwards to the shared helper while allowing an explicit secret
+    override (used in unit tests) and optional custom claims.
+    """
+
+    return jwt_tokens.create_jwt(
+        subject=subject,
+        role=role,
+        ttl_seconds=ttl_seconds,
+        secret=secret or _get_configured_jwt_secret(),
+        claims=claims,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -538,7 +555,11 @@ async def authenticate(
 
     role = _resolve_role(userinfo)
 
-    token, expires_at = create_jwt(subject=user_id, role=role, secret=jwt_secret)
+    token, expires_at = jwt_tokens.create_jwt(
+        subject=user_id,
+        role=role,
+        secret=jwt_secret,
+    )
     session = await _persist_session(sessions, user_id=user_id)
 
     builder_payload = BuilderFusionPayload(
@@ -558,7 +579,43 @@ async def authenticate(
 
 
 def get_application() -> FastAPI:
-    app = FastAPI(title="Aether Auth Service", version="1.0.0")
+    providers = _provider_registry()
+    mfa = MFAVerifier()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        global SessionLocal, ENGINE
+        session_factory: Optional[sessionmaker[OrmSession]] = None
+        try:
+            secret = _initialise_jwt_secret(require=True)
+            session_factory = _initialise_database(require=True)
+        except Exception:
+            # Ensure partially initialised globals don't leak between startup attempts.
+            SessionLocal = None
+            if ENGINE is not None:
+                ENGINE.dispose()
+            ENGINE = None
+            raise
+
+        app.state.jwt_secret = secret
+        app.state.session_repository = SessionRepository(session_factory)
+
+        try:
+            yield
+        finally:
+            app.state.__dict__.pop("session_repository", None)
+            app.state.__dict__.pop("jwt_secret", None)
+
+            close_all = getattr(session_factory, "close_all", None)
+            if callable(close_all):
+                close_all()
+
+            SessionLocal = None
+            if ENGINE is not None:
+                ENGINE.dispose()
+                ENGINE = None
+
+    app = FastAPI(title="Aether Auth Service", version="1.0.0", lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[
@@ -571,19 +628,6 @@ def get_application() -> FastAPI:
         allow_methods=["POST", "OPTIONS"],
         allow_headers=["*"],
     )
-
-    providers = _provider_registry()
-    mfa = MFAVerifier()
-
-    @app.on_event("startup")
-    async def _configure_runtime() -> None:
-        secret = _initialise_jwt_secret(require=True)
-        session_factory = _initialise_database(require=True)
-        if secret is None or session_factory is None:  # pragma: no cover - defensive guard
-            raise RuntimeError("Auth service configuration is incomplete; ensure environment variables are set")
-
-        app.state.jwt_secret = secret
-        app.state.session_repository = SessionRepository(session_factory)
 
     def _session_repository_dependency(request: Request) -> SessionRepository:
         repo = getattr(request.app.state, "session_repository", None)
@@ -621,6 +665,7 @@ __all__ = [
     "app",
     "authenticate",
     "AuthSession",
+    "create_jwt",
     "BuilderFusionPayload",
     "LoginRequest",
     "LoginResponse",
