@@ -143,3 +143,91 @@ def test_replay_run_allows_admin_session(
 
     payload = response.json()
     assert payload["run_id"] == "test-run"
+
+
+def test_replay_event_normalizes_spot_symbol(
+    replay_client: Tuple[TestClient, InMemorySessionStore, object]
+) -> None:
+    _client, _store, snapshot_replay = replay_client
+    now = datetime.now(timezone.utc)
+    event = snapshot_replay.ReplayEvent(
+        timestamp=now,
+        order_id="evt-1",
+        instrument="eth_usd",
+        side="buy",
+        quantity=1.0,
+        price=1500.0,
+        fee=snapshot_replay.FeeBreakdown(currency="USD", maker=0.1, taker=0.2),
+        features=[0.1, 0.2],
+        book_snapshot=snapshot_replay.BookSnapshot(
+            mid_price=1500.0, spread_bps=10.0, imbalance=0.0
+        ),
+        state=snapshot_replay.PolicyState(
+            regime="neutral", volatility=0.2, liquidity_score=0.5, conviction=0.6
+        ),
+        confidence=None,
+        expected_edge_bps=None,
+        actual_mid_price=1501.0,
+        actual_volume=10.0,
+    )
+
+    assert event.instrument == "ETH-USD"
+
+
+def test_replay_event_rejects_non_spot_symbol(
+    replay_client: Tuple[TestClient, InMemorySessionStore, object]
+) -> None:
+    _client, _store, snapshot_replay = replay_client
+    now = datetime.now(timezone.utc)
+
+    with pytest.raises(ValueError):
+        snapshot_replay.ReplayEvent(
+            timestamp=now,
+            order_id="evt-2",
+            instrument="ETH-PERP",
+            side="buy",
+            quantity=1.0,
+            price=1500.0,
+            fee=snapshot_replay.FeeBreakdown(currency="USD", maker=0.1, taker=0.2),
+            features=[0.1],
+            book_snapshot=snapshot_replay.BookSnapshot(
+                mid_price=1500.0, spread_bps=10.0, imbalance=0.0
+            ),
+            state=snapshot_replay.PolicyState(
+                regime="neutral", volatility=0.2, liquidity_score=0.5, conviction=0.6
+            ),
+            confidence=None,
+            expected_edge_bps=None,
+            actual_mid_price=1501.0,
+            actual_volume=10.0,
+        )
+
+
+def test_snapshot_loader_skips_non_spot_payload(
+    replay_client: Tuple[TestClient, InMemorySessionStore, object]
+) -> None:
+    _client, _store, snapshot_replay = replay_client
+    start = datetime.now(timezone.utc) - timedelta(minutes=1)
+    end = datetime.now(timezone.utc) + timedelta(minutes=1)
+    config = snapshot_replay.SnapshotReplayConfig(
+        start=start,
+        end=end,
+        account_id="company",
+    )
+    loader = snapshot_replay.HistoricalDataLoader(config)
+
+    payload_spot = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "instrument": "btc_usd",
+        "price": 100.0,
+    }
+    event = loader._event_from_payload(payload_spot)
+    assert event is not None
+    assert event.instrument == "BTC-USD"
+
+    payload_derivative = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "instrument": "BTC-PERP",
+        "price": 100.0,
+    }
+    assert loader._event_from_payload(payload_derivative) is None

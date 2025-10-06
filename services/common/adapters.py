@@ -25,6 +25,7 @@ import httpx
 
 from common.utils.tracing import attach_correlation, current_correlation_id
 from shared.k8s import ANNOTATION_ROTATED_AT as K8S_ROTATED_AT, KrakenSecretStore
+from shared.spot import filter_spot_symbols, is_spot_symbol, normalize_spot_symbol
 from services.secrets.secure_secrets import (
     EncryptedSecretEnvelope,
     EnvelopeEncryptor,
@@ -1624,17 +1625,19 @@ class RedisFeastAdapter:
             window_minutes=60,
         )
 
-        approved = {
-            str(record["instrument"]): record
+        approved_candidates = [
+            record.get("instrument")
             for record in records
             if record.get("approved")
-        }
-        if not approved:
+        ]
+        instruments = sorted(
+            filter_spot_symbols(approved_candidates, logger=logger)
+        )
+        if not instruments:
             raise RuntimeError(
-                "Feast returned no approved instruments for account '%s'" % self.account_id
+                "Feast returned no approved spot instruments for account '%s'"
+                % self.account_id
             )
-
-        instruments = sorted(approved.keys())
         payload = self._features.setdefault(self.account_id, {})
         payload["approved"] = instruments
         self._feature_expirations[self.account_id] = datetime.now(timezone.utc).replace(
@@ -1643,7 +1646,13 @@ class RedisFeastAdapter:
         return instruments
 
     def fee_override(self, instrument: str) -> Dict[str, Any] | None:
-        cache_key = instrument.upper()
+        normalized_instrument = normalize_spot_symbol(instrument)
+        if not normalized_instrument or not is_spot_symbol(normalized_instrument):
+            raise ValueError(
+                f"Fee overrides are only available for spot instruments: {instrument}"
+            )
+
+        cache_key = normalized_instrument
         cached_account = self._features.setdefault(self.account_id, {})
         cached_fees = cached_account.setdefault("fees", {})
         expires = self._feature_expirations.get(self.account_id)
@@ -1664,7 +1673,8 @@ class RedisFeastAdapter:
             key=lambda item: item.get("event_timestamp", datetime.min),
             reverse=True,
         ):
-            if str(record.get("instrument", "")).upper() == cache_key:
+            record_symbol = normalize_spot_symbol(record.get("instrument", ""))
+            if record_symbol == cache_key:
                 matched = record
                 break
 
@@ -1684,11 +1694,17 @@ class RedisFeastAdapter:
 
     def fee_tiers(self, pair: str) -> List[Dict[str, Any]]:
         account_cache = self._fee_tiers.setdefault(self.account_id, {})
+        normalized_pair = normalize_spot_symbol(pair)
+        if not normalized_pair or not is_spot_symbol(normalized_pair):
+            raise ValueError(
+                f"Fee tiers are only available for spot pairs: {pair}"
+            )
+
         expires = self._fee_tier_expirations.get(self.account_id)
-        if pair in account_cache and (
+        if normalized_pair in account_cache and (
             expires is None or not self._cache_expired(expires)
         ):
-            return [dict(entry) for entry in account_cache[pair]]
+            return [dict(entry) for entry in account_cache[normalized_pair]]
 
         records = self._load_historical_records(
             view_suffix="fee_tiers",
@@ -1698,8 +1714,8 @@ class RedisFeastAdapter:
 
         tiers: List[Dict[str, Any]] = []
         for record in records:
-            record_pair = str(record.get("pair", "")).upper()
-            if record_pair not in {pair.upper(), "DEFAULT"}:
+            record_pair = normalize_spot_symbol(record.get("pair", ""))
+            if record_pair not in {normalized_pair, "DEFAULT"}:
                 continue
             tiers.append(
                 {
@@ -1714,7 +1730,7 @@ class RedisFeastAdapter:
             raise RuntimeError(f"Feast returned no fee tiers for {pair}")
 
         tiers.sort(key=lambda item: item.get("notional_threshold", 0.0))
-        account_cache[pair] = [dict(entry) for entry in tiers]
+        account_cache[normalized_pair] = [dict(entry) for entry in tiers]
         self._fee_tier_expirations[self.account_id] = datetime.now(timezone.utc).replace(
             microsecond=0
         ) + timedelta(seconds=self.cache_ttl)
@@ -1724,18 +1740,31 @@ class RedisFeastAdapter:
     def seed_fee_tiers(
         cls, tiers: Mapping[str, Mapping[str, Iterable[Mapping[str, Any]]]]
     ) -> None:
-        cls._fee_tiers = {
-            account: {
-                pair: [dict(entry) for entry in entries]
-                for pair, entries in account_tiers.items()
-            }
-            for account, account_tiers in tiers.items()
-        }
+        normalized: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+        for account, account_tiers in tiers.items():
+            account_bucket: Dict[str, List[Dict[str, Any]]] = {}
+            for pair, entries in account_tiers.items():
+                normalized_pair = normalize_spot_symbol(pair)
+                if normalized_pair == "DEFAULT":
+                    account_bucket[normalized_pair] = [dict(entry) for entry in entries]
+                    continue
+                if not normalized_pair or not is_spot_symbol(normalized_pair):
+                    continue
+                account_bucket[normalized_pair] = [dict(entry) for entry in entries]
+            if account_bucket:
+                normalized[account] = account_bucket
+        cls._fee_tiers = normalized
         cls._fee_tier_expirations.clear()
 
     def fetch_online_features(self, instrument: str) -> Dict[str, Any]:
         account_cache = self._online_feature_store.setdefault(self.account_id, {})
-        instrument_key = instrument.upper()
+        normalized_instrument = normalize_spot_symbol(instrument)
+        if not normalized_instrument or not is_spot_symbol(normalized_instrument):
+            raise ValueError(
+                f"Online features are only available for spot instruments: {instrument}"
+            )
+
+        instrument_key = normalized_instrument
         expires = self._online_feature_expirations.setdefault(self.account_id, {})
         cached = account_cache.get(instrument_key)
         if cached:
@@ -1747,7 +1776,7 @@ class RedisFeastAdapter:
         entity_rows = [
             {
                 "account_id": self._feast_client.account_namespace,
-                "instrument": instrument,
+                "instrument": instrument_key,
             }
         ]
         try:

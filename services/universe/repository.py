@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, ClassVar, Dict, Iterator, List, Mapping, Optional, Tuple
 
 from shared.audit import AuditLogEntry, AuditLogStore, TimescaleAuditLogger
+from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 try:  # pragma: no cover - exercised in integration tests when SQLAlchemy installed
     from sqlalchemy import JSON, Column, DateTime, Float, Integer, MetaData, String, Table, insert, select
@@ -123,7 +124,14 @@ class UniverseRepository:
         record = self._latest_config_record(session)
         if record is None:
             return {}, None
-        payload = {symbol: dict(values) for symbol, values in (record.payload or {}).items()}
+
+        payload = {}
+        for symbol, values in (record.payload or {}).items():
+            normalized = normalize_spot_symbol(symbol)
+            if not normalized or not is_spot_symbol(normalized):
+                continue
+            payload[normalized] = dict(values)
+
         return payload, record.applied_at
 
     def _next_version(self, session: Session) -> int:
@@ -147,6 +155,10 @@ class UniverseRepository:
     ) -> None:
         """Persist a manual override into ``config_versions``."""
 
+        canonical = normalize_spot_symbol(instrument)
+        if not canonical or not is_spot_symbol(canonical):
+            raise ValueError("Manual overrides must target spot trading pairs")
+
         with self._session_scope() as session:
             before, _ = self._current_overrides(session)
             after = dict(before)
@@ -154,7 +166,7 @@ class UniverseRepository:
             if reason:
                 override_payload["reason"] = reason
             override_payload["updated_at"] = self._now().isoformat()
-            after[instrument] = override_payload
+            after[canonical] = override_payload
 
             version = self._next_version(session)
             applied_at = self._now()
@@ -372,12 +384,16 @@ class UniverseRepository:
             observed_at = self._coerce_datetime(row.observed_at)
             if observed_at is None or now - observed_at > self.MARKET_SNAPSHOT_MAX_AGE:
                 continue
-            symbol = f"{row.base_asset}-{row.quote_asset}"
-            if symbol in snapshots:
+            raw_symbol = f"{row.base_asset}-{row.quote_asset}"
+            normalized_symbol = normalize_spot_symbol(raw_symbol)
+            if not normalized_symbol or not is_spot_symbol(normalized_symbol):
                 continue
-            snapshots[symbol] = MarketSnapshot(
-                base_asset=row.base_asset,
-                quote_asset=row.quote_asset,
+            if normalized_symbol in snapshots:
+                continue
+            base_asset, quote_asset = normalized_symbol.split("-", 1)
+            snapshots[normalized_symbol] = MarketSnapshot(
+                base_asset=base_asset,
+                quote_asset=quote_asset,
                 market_cap=float(row.market_cap),
                 global_volume_24h=float(row.global_volume_24h),
                 kraken_volume_24h=float(row.kraken_volume_24h),
@@ -408,10 +424,12 @@ class UniverseRepository:
             updated_at = self._coerce_datetime(row.updated_at)
             if updated_at is None or now - updated_at > self.FEE_OVERRIDE_MAX_AGE:
                 continue
-            symbol = str(row.instrument)
-            if symbol in overrides:
+            normalized = normalize_spot_symbol(row.instrument)
+            if not normalized or not is_spot_symbol(normalized):
                 continue
-            overrides[symbol] = {
+            if normalized in overrides:
+                continue
+            overrides[normalized] = {
                 "currency": row.currency,
                 "maker": float(row.maker),
                 "taker": float(row.taker),
