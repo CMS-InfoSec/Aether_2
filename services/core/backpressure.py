@@ -72,12 +72,12 @@ class BackpressureEvent(BaseModel):
         return data
 
 
-def _default_publisher(account_id: str, dropped_count: int, ts: datetime) -> None:
+async def _default_publisher(account_id: str, dropped_count: int, ts: datetime) -> None:
     """Publish a backpressure event using the in-memory Kafka/NATS adapter."""
 
     adapter = KafkaNATSAdapter(account_id=account_id)
     event = BackpressureEvent(account_id=account_id, dropped_count=dropped_count, ts=ts)
-    asyncio.run(adapter.publish(_BACKPRESSURE_TOPIC, event.to_payload()))
+    await adapter.publish(_BACKPRESSURE_TOPIC, event.to_payload())
 
 
 class BackpressureStatus(BaseModel):

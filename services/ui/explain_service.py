@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from typing import Any, Iterable, Mapping, MutableMapping, Sequence
 
 from fastapi import Depends, FastAPI, HTTPException, Query
@@ -11,6 +12,7 @@ from fastapi.responses import JSONResponse
 
 from services.common.security import require_admin_account
 from services.models.model_server import get_active_model
+from shared.postgres import normalize_postgres_dsn
 
 try:  # pragma: no cover - optional dependency in some environments
     import psycopg
@@ -22,17 +24,44 @@ except Exception:  # pragma: no cover - graceful degradation without psycopg
 
 LOGGER = logging.getLogger(__name__)
 
-DEFAULT_DSN = "postgresql://timescale:password@localhost:5432/aether"
+_DATABASE_ENV_KEYS = (
+    "REPORT_DATABASE_URL",
+    "TIMESCALE_DSN",
+    "DATABASE_URL",
+)
 
 
 def _database_url() -> str:
     """Resolve the TimescaleDB connection string from the environment."""
 
-    return (
-        os.getenv("REPORT_DATABASE_URL")
-        or os.getenv("TIMESCALE_DSN")
-        or os.getenv("DATABASE_URL")
-        or DEFAULT_DSN
+    for env_key in _DATABASE_ENV_KEYS:
+        raw_value = os.getenv(env_key)
+        if not raw_value:
+            continue
+        try:
+            return normalize_postgres_dsn(
+                raw_value,
+                allow_sqlite=False,
+                label="Explain service database URL",
+            )
+        except RuntimeError as exc:  # pragma: no cover - configuration error paths
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if "pytest" in sys.modules:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Explain service database URL is required even under pytest; "
+                "set REPORT_DATABASE_URL to a PostgreSQL/Timescale DSN."
+            ),
+        )
+
+    raise HTTPException(
+        status_code=503,
+        detail=(
+            "Explain service database URL is not configured. Set REPORT_DATABASE_URL "
+            "or TIMESCALE_DSN to a PostgreSQL/Timescale connection string."
+        ),
     )
 
 
