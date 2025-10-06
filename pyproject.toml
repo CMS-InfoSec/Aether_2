@@ -66,11 +66,25 @@ dev = [
 ]
 
 [tool.setuptools]
-package-dir = {"" = "src"}
+package-dir = {"" = "."}
 
 [tool.setuptools.packages.find]
-where = ["src"]
-namespaces = false
+where = [".", "src"]
+include = [
+    "aether*",
+    "services*",
+    "shared*",
+    "common*",
+]
+exclude = [
+    "tests*",
+    "docs*",
+    "deploy*",
+    "frontend*",
+    "argo*",
+    "pipelines*",
+]
+namespaces = true
 
 [tool.pytest.ini_options]
 minversion = "7.0"

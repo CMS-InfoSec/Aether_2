@@ -9,7 +9,7 @@ import signal
 import sys
 import threading
 import time
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from typing import Awaitable, Callable, Iterable, List, Optional, Sequence, Set
 
@@ -268,6 +268,10 @@ def setup_graceful_shutdown(
 ) -> GracefulShutdownManager:
     """Configure graceful shutdown middleware, endpoints, and signal handling."""
 
+    existing_manager = getattr(app.state, "_graceful_shutdown_manager", None)
+    if existing_manager is not None:
+        return existing_manager
+
     manager = GracefulShutdownManager(
         service_name,
         allowed_paths=allowed_paths,
@@ -310,15 +314,37 @@ def setup_graceful_shutdown(
     async def drain_status():
         return manager.status()
 
-    @app.on_event("startup")
-    async def _on_startup() -> None:
+    async def _startup_actions() -> None:
         manager.reset()
         manager.bind_event_loop(asyncio.get_running_loop())
-        install_sigterm_handler(manager)
+        if threading.current_thread() is threading.main_thread():
+            install_sigterm_handler(manager)
+        else:  # pragma: no cover - thread-local path used in test harnesses
+            service_logger.debug("Skipping SIGTERM handler install outside main thread")
 
-    @app.on_event("shutdown")
-    async def _on_shutdown() -> None:
+    async def _shutdown_actions() -> None:
         await manager.start_draining_async(reason="shutdown_event")
         await manager.wait_for_inflight_async(timeout=manager.shutdown_timeout)
+
+    previous_lifespan = getattr(app.router, "lifespan_context", None)
+
+    @asynccontextmanager
+    async def _graceful_lifespan(app: FastAPI):
+        if previous_lifespan is None:
+            await _startup_actions()
+            try:
+                yield
+            finally:
+                await _shutdown_actions()
+        else:
+            async with previous_lifespan(app):
+                await _startup_actions()
+                try:
+                    yield
+                finally:
+                    await _shutdown_actions()
+
+    app.router.lifespan_context = _graceful_lifespan
+    setattr(app.state, "_graceful_shutdown_manager", manager)
 
     return manager
