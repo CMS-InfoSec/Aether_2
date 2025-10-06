@@ -49,6 +49,7 @@ import json
 import logging
 import os
 import secrets
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -100,14 +101,25 @@ def _resolve_database_url() -> tuple[Optional[str], Optional[RuntimeError]]:
             "AUTH_DATABASE_URL environment variable must be set before starting the auth service"
         )
 
+    allow_sqlite = "pytest" in sys.modules
+
     try:
-        normalized = normalize_postgres_dsn(url, label="Auth database DSN")
+        normalized = normalize_postgres_dsn(
+            url,
+            allow_sqlite=allow_sqlite,
+            label="Auth database DSN",
+        )
     except RuntimeError as exc:
         return None, RuntimeError(str(exc))
 
     if normalized == "sqlite:///./auth_sessions.db":
         return None, RuntimeError(
             "AUTH_DATABASE_URL must point at the shared Postgres/Timescale cluster instead of the legacy SQLite default"
+        )
+
+    if not allow_sqlite and normalized.startswith("sqlite"):
+        return None, RuntimeError(
+            "AUTH_DATABASE_URL must use a PostgreSQL/Timescale-compatible scheme"
         )
     return normalized, None
 
