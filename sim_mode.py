@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-import asyncio
 import logging
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Request, status
@@ -58,10 +57,13 @@ class SimModeTransitionResponse(SimModeStatusResponse):
         return cls.model_validate(payload)
 
 
-def _publish_event(status: SimModeStatus, actor: str) -> None:
+async def _publish_event(status: SimModeStatus, actor: str) -> None:
     adapter = KafkaNATSAdapter(account_id="platform")
     event = SimModeEvent(active=status.active, reason=status.reason, ts=status.ts, actor=actor)
-    asyncio.run(adapter.publish("platform.sim_mode", event.model_dump(mode="json")))
+    try:
+        await adapter.publish("platform.sim_mode", event.model_dump(mode="json"))
+    except Exception:
+        LOGGER.exception("Failed to publish simulation mode event", extra={"actor": actor})
 
 
 def _log_audit_transition(before: SimModeStatus, after: SimModeStatus, actor: str, request: Request) -> None:
@@ -101,7 +103,7 @@ async def enter_simulation_mode(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Simulation mode already active")
 
     after = await sim_mode_repository.set_status_async(True, payload.reason)
-    _publish_event(after, actor)
+    await _publish_event(after, actor)
     _log_audit_transition(before, after, actor, request)
     return SimModeTransitionResponse.from_status(after, actor)
 
@@ -119,7 +121,7 @@ async def exit_simulation_mode(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Simulation mode already inactive")
 
     after = await sim_mode_repository.set_status_async(False, None)
-    _publish_event(after, actor)
+    await _publish_event(after, actor)
     _log_audit_transition(before, after, actor, request)
     return SimModeTransitionResponse.from_status(after, actor)
 
