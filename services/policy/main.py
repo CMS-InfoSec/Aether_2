@@ -5,6 +5,9 @@ import logging
 import math
 from collections.abc import Mapping, Sequence
 
+import math
+from collections.abc import Mapping, Sequence
+
 from fastapi import Depends, FastAPI, HTTPException, status
 
 from services.common.adapters import KafkaNATSAdapter, RedisFeastAdapter, TimescaleAdapter
