@@ -16,6 +16,7 @@ from ml.features import build_features
 from ml.features.build_features import FeatureBuildConfig
 from ml.training import workflow
 from ml.training.data_loader_coingecko import fetch_ohlcv, upsert_timescale
+from shared.postgres import normalize_sqlalchemy_dsn
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -24,7 +25,40 @@ logging.basicConfig(level=logging.INFO)
 APP_TITLE = "Aether ML Training"
 APP_VERSION = "1.0.0"
 
-DEFAULT_TIMESCALE_URI = os.getenv("TRAINING_TIMESCALE_URI", os.getenv("DATABASE_URL", "postgresql+psycopg://localhost:5432/aether"))
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+
+_SQLITE_FALLBACK_FLAG = "TRAINING_ALLOW_SQLITE_FOR_TESTS"
+
+
+def _resolve_timescale_uri() -> str:
+    raw_dsn = os.getenv("TRAINING_TIMESCALE_URI") or os.getenv("DATABASE_URL")
+    if not raw_dsn:
+        raise RuntimeError(
+            "TRAINING_TIMESCALE_URI or DATABASE_URL must be configured with a "
+            "PostgreSQL/Timescale DSN for the training service."
+        )
+
+    allow_sqlite = os.getenv(_SQLITE_FALLBACK_FLAG) == "1"
+    normalized = normalize_sqlalchemy_dsn(
+        raw_dsn,
+        allow_sqlite=allow_sqlite,
+        label="Training service database URL",
+    )
+
+    if normalized.startswith("sqlite") and allow_sqlite:
+        logger.warning(
+            "Allowing sqlite database URL for training service because %s=1. "
+            "Do not enable this flag outside test environments.",
+            _SQLITE_FALLBACK_FLAG,
+        )
+
+    return normalized
+
+
+DEFAULT_TIMESCALE_URI = _resolve_timescale_uri()
 DEFAULT_ARTIFACT_ROOT = os.getenv("TRAINING_ARTIFACT_ROOT", "/tmp/aether-training")
 MLFLOW_TRACKING_URI = os.getenv("TRAINING_MLFLOW_TRACKING_URI", os.getenv("MLFLOW_TRACKING_URI"))
 MLFLOW_EXPERIMENT = os.getenv("TRAINING_MLFLOW_EXPERIMENT", os.getenv("MLFLOW_EXPERIMENT_NAME", "training-service"))
