@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -176,15 +177,34 @@ class SelfHealer:
             ),
         )
 
-        redis_url = redis_url or os.getenv("SELF_HEALER_REDIS_URL", "redis://localhost:6379/0")
-        self._restart_store: RestartLogStore = restart_store or RedisRestartLogStore(
-            self._create_redis_client(redis_url),
-            log_key=os.getenv("SELF_HEALER_REDIS_LOG_KEY", "self_healer:restart_log"),
-            service_index_prefix=os.getenv(
-                "SELF_HEALER_REDIS_SERVICE_PREFIX", "self_healer:service:"),
-            retention=log_retention,
-            per_service_retention_seconds=service_log_retention_seconds,
-        )
+        allow_stub = "pytest" in sys.modules
+
+        if restart_store is None:
+            resolved_redis_url = redis_url or os.getenv("SELF_HEALER_REDIS_URL")
+
+            if resolved_redis_url is None or not resolved_redis_url.strip():
+                if allow_stub:
+                    resolved_redis_url = "redis://localhost:6379/0"
+                else:
+                    raise RuntimeError(
+                        "SELF_HEALER_REDIS_URL must be configured before starting the self-healer service"
+                    )
+
+            redis_client = self._create_redis_client(
+                resolved_redis_url.strip(), allow_stub=allow_stub
+            )
+
+            self._restart_store = RedisRestartLogStore(
+                redis_client,
+                log_key=os.getenv("SELF_HEALER_REDIS_LOG_KEY", "self_healer:restart_log"),
+                service_index_prefix=os.getenv(
+                    "SELF_HEALER_REDIS_SERVICE_PREFIX", "self_healer:service:"
+                ),
+                retention=log_retention,
+                per_service_retention_seconds=service_log_retention_seconds,
+            )
+        else:
+            self._restart_store = restart_store
 
     @staticmethod
     def _load_kubernetes_api() -> Optional[CoreV1Api]:
@@ -201,8 +221,14 @@ class SelfHealer:
         return CoreV1Api()
 
     @staticmethod
-    def _create_redis_client(redis_url: str):
-        client, _ = create_redis_from_url(redis_url, decode_responses=True, logger=logger)
+    def _create_redis_client(redis_url: str, *, allow_stub: bool):
+        client, used_stub = create_redis_from_url(
+            redis_url, decode_responses=True, logger=logger
+        )
+        if used_stub and not allow_stub:
+            raise RuntimeError(
+                "Failed to connect to Redis at SELF_HEALER_REDIS_URL; a reachable Redis instance is required"
+            )
         return client
 
     async def start(self) -> None:
