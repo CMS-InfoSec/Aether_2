@@ -33,6 +33,7 @@ from config.simulation import SimulationConfig, get_simulation_config
 from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
 from services.common.config import get_timescale_session
 from shared.async_utils import dispatch_async
+from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 try:  # pragma: no cover - optional dependency during CI
     import psycopg
