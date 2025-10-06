@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Dict, Mapping
 
+import json
+
 import pytest
 
 from services.risk.portfolio_risk import PortfolioRiskAggregator
@@ -64,6 +66,46 @@ def adapter_factory():
             raise AssertionError(f"Unexpected account requested: {account_id}") from exc
 
     return register, factory
+
+
+def test_portfolio_status_filters_non_spot(adapter_factory) -> None:
+    register, factory = adapter_factory
+
+    register(
+        "delta",
+        _StubTimescaleAdapter(
+            exposures={
+                "BTC-PERP": 250_000.0,
+                "ETH-USD": 125_000.0,
+                "adaup-usd": 10_000.0,
+                "WBTC-USD": -50_000.0,
+            },
+            correlation_matrix={},
+            var95=90_000.0,
+            cvar95=120_000.0,
+        ),
+    )
+
+    allocator = PortfolioRiskAggregator(
+        accounts=("delta",),
+        cluster_limits={"ETH": 500_000.0, "BTC": 500_000.0},
+        instrument_clusters={"ETH-USD": "ETH", "WBTC-USD": "BTC"},
+        instrument_betas={"ETH-USD": 0.8, "WBTC-USD": 1.0},
+        beta_limit=2.0,
+        correlation_limit=0.99,
+        adapter_factory=factory,
+    )
+
+    response = allocator.portfolio_status()
+
+    assert response.accounts[0].instrument_exposure == {
+        "ETH-USD": pytest.approx(125_000.0),
+        "WBTC-USD": pytest.approx(50_000.0),
+    }
+    assert set(response.totals.instrument_exposure) == {"ETH-USD", "WBTC-USD"}
+    assert response.totals.gross_exposure == pytest.approx(175_000.0)
+    # Cluster exposure only tracks instruments that survived the spot filter.
+    assert response.totals.cluster_exposure == {"ETH": 125_000.0, "BTC": 50_000.0}
 
 
 def test_overweight_btc_triggers_cluster_downscale(adapter_factory) -> None:
@@ -143,3 +185,31 @@ def test_correlation_cap_enforces_highly_correlated_exposures(adapter_factory) -
 
     expected_adjustment = 0.8 / 0.95
     assert response.risk_adjustment == pytest.approx(expected_adjustment, rel=1e-6)
+
+
+def test_cluster_and_beta_maps_ignore_non_spot(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "PORTFOLIO_CLUSTER_MAP",
+        json.dumps({"BTC-PERP": "PERP", "eth-usd": "ETH", "ADAUP-USD": "ALT"}),
+    )
+    monkeypatch.setenv(
+        "PORTFOLIO_BETA_MAP",
+        json.dumps({"BTC-PERP": 2.0, "ETH-USD": 0.9, "WBTC-USD": 1.1}),
+    )
+
+    # Reload module-level caches by re-importing the helpers.
+    from importlib import reload
+
+    import services.risk.portfolio_risk as portfolio_risk
+
+    reload(portfolio_risk)
+
+    cluster_map = portfolio_risk._load_cluster_map()
+    beta_map = portfolio_risk._load_beta_map()
+
+    assert cluster_map == {"ETH-USD": "ETH"}
+    assert beta_map == {"ETH-USD": 0.9, "WBTC-USD": 1.1}
+
+    # Clean up environment variables for future tests.
+    monkeypatch.delenv("PORTFOLIO_CLUSTER_MAP", raising=False)
+    monkeypatch.delenv("PORTFOLIO_BETA_MAP", raising=False)
