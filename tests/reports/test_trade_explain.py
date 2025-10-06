@@ -171,7 +171,7 @@ def test_trade_explain_normalises_instrument(monkeypatch) -> None:
 def test_filter_spot_instruments_drops_derivatives(caplog) -> None:
     frame = pd.DataFrame(
         {
-            "instrument": ["BTC-USD", "ETH-PERP", "eth_usd", "ADAUP-USDT", None],
+            "instrument": ["BTC-USD", "ETH-PERP", "eth_usd", "ADAUP-USD", None],
             "size": [1, 2, 3, 4, 5],
             "price": [10, 20, 30, 40, 50],
             "fee": [0, 0, 0, 0, 0],
