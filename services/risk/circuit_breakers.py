@@ -22,6 +22,7 @@ from shared.audit import (
     SensitiveActionRecorder,
     TimescaleAuditLogger,
 )
+from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 
 LOGGER = logging.getLogger(__name__)
@@ -35,8 +36,15 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _normalize_symbol(symbol: str) -> str:
-    return symbol.strip().upper()
+def _normalize_symbol(symbol: object) -> str:
+    normalized = normalize_spot_symbol(symbol)
+    if not normalized:
+        raise ValueError("Symbol must be provided for spot-only circuit breakers.")
+    if not is_spot_symbol(normalized):
+        raise ValueError(
+            f"Symbol '{symbol}' is not a supported spot market instrument."
+        )
+    return normalized
 
 
 def _realized_volatility(prices: Iterable[float]) -> float:
@@ -163,7 +171,14 @@ class CircuitBreakerConfigStore:
 
     def threshold_for(self, symbol: str) -> Optional[SymbolThresholds]:
         _, bucket = self._load_bucket()
-        entry = bucket.get(_normalize_symbol(symbol))
+        try:
+            normalized = _normalize_symbol(symbol)
+        except ValueError:
+            LOGGER.warning(
+                "Ignoring non-spot instrument '%s' during circuit breaker lookup", symbol
+            )
+            return None
+        entry = bucket.get(normalized)
         if entry is None:
             return None
         return self._deserialize(entry)
@@ -273,7 +288,14 @@ class CircuitBreakerMonitor:
         spread_bps: Optional[float] = None,
         timestamp: Optional[datetime] = None,
     ) -> None:
-        normalized = _normalize_symbol(symbol)
+        try:
+            normalized = _normalize_symbol(symbol)
+        except ValueError:
+            LOGGER.warning(
+                "Dropping quote for non-spot instrument '%s' in circuit breaker monitor",
+                symbol,
+            )
+            return
         quote = self._quotes.setdefault(
             normalized, _QuoteWindow(lookback=self._lookback)
         )
@@ -309,7 +331,14 @@ class CircuitBreakerMonitor:
 
     def evaluate(self, request: RiskValidationRequest) -> Optional[CircuitBreakerDecision]:
         self.observe_request(request)
-        symbol = _normalize_symbol(request.instrument)
+        try:
+            symbol = _normalize_symbol(request.instrument)
+        except ValueError:
+            LOGGER.warning(
+                "Skipping circuit breaker evaluation for non-spot instrument '%s'", 
+                request.instrument,
+            )
+            return None
         record = self._blocked.get(symbol)
         if record is None:
             return None
@@ -413,7 +442,7 @@ class CircuitBreakerMonitor:
             metadata.get("hedge"),
             metadata.get("is_hedge"),
             metadata.get("hedging"),
-            decision_request.reduce_only,
+            getattr(decision_request, "reduce_only", None),
         )
         if any(isinstance(flag, bool) and flag for flag in bool_flags):
             return True
