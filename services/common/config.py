@@ -9,7 +9,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict
 
-from shared.postgres import normalize_postgres_dsn
+from shared.postgres import normalize_postgres_dsn, normalize_postgres_schema
 
 
 @dataclass(frozen=True)
@@ -146,9 +146,18 @@ def get_timescale_session(account_id: str) -> TimescaleSession:
                 f"AETHER_{account_id.upper()}_TIMESCALE_SCHEMA is set but empty; "
                 "configure a valid schema identifier"
             )
-        schema = _sanitize_schema_name(override, default=False)
+        schema = normalize_postgres_schema(
+            override,
+            label="Timescale schema",
+            prefix_if_missing=None,
+        )
     else:
-        schema = _sanitize_schema_name(account_id, default=True)
+        schema = normalize_postgres_schema(
+            account_id,
+            label="Timescale schema",
+            prefix_if_missing="acct_",
+            allow_leading_digit_prefix=True,
+        )
     return TimescaleSession(dsn=dsn, account_schema=schema)
 
 

@@ -281,12 +281,37 @@ def test_auth_database_url_rejects_blank_values(
     _install_dependency_stubs(monkeypatch)
     _clear_auth_service_module()
 
+
+def test_auth_database_schema_sanitizes_identifier(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Configured schemas should be normalised to safe Postgres identifiers."""
+
+    monkeypatch.setenv("AUTH_DATABASE_URL", "sqlite:///./auth.db")
+    monkeypatch.setenv("AUTH_JWT_SECRET", "secret")
+    monkeypatch.delenv("AUTH_DATABASE_SCHEMA", raising=False)
+    _install_dependency_stubs(monkeypatch)
+    _clear_auth_service_module()
+
     module = importlib.import_module("auth_service")
-    monkeypatch.setenv("AUTH_DATABASE_URL", "   ")
-    resolved, error = module._resolve_database_url()
-    assert resolved is None
-    assert isinstance(error, RuntimeError)
-    assert "must be set" in str(error)
+    monkeypatch.setenv("AUTH_DATABASE_SCHEMA", "  Audit-Logs  ")
+    schema = module._resolve_schema("postgresql://user:pass@host:5432/auth")
+    assert schema == "audit_logs"
+
+    _clear_auth_service_module()
+
+
+def test_auth_database_schema_rejects_invalid_identifier(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Schemas beginning with digits should be rejected to avoid invalid identifiers."""
+
+    monkeypatch.setenv("AUTH_DATABASE_URL", "sqlite:///./auth.db")
+    monkeypatch.setenv("AUTH_JWT_SECRET", "secret")
+    monkeypatch.delenv("AUTH_DATABASE_SCHEMA", raising=False)
+    _install_dependency_stubs(monkeypatch)
+    _clear_auth_service_module()
+
+    module = importlib.import_module("auth_service")
+    monkeypatch.setenv("AUTH_DATABASE_SCHEMA", "123-admin")
+    with pytest.raises(RuntimeError, match="must not start with a digit"):
+        module._resolve_schema("postgresql://user:pass@host:5432/auth")
 
     _clear_auth_service_module()
 

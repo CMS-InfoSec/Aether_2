@@ -68,7 +68,7 @@ from sqlalchemy.orm import Session as OrmSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from services.auth.jwt_tokens import create_jwt
-from shared.postgres import normalize_postgres_dsn
+from shared.postgres import normalize_postgres_dsn, normalize_postgres_schema
 
 
 logger = logging.getLogger("auth_service")
@@ -143,9 +143,21 @@ def _engine_options(url: str) -> Dict[str, Any]:
 def _resolve_schema(url: str) -> Optional[str]:
     sa_url = make_url(url)
     if sa_url.get_backend_name().startswith("postgresql"):
-        schema = os.getenv("AUTH_DATABASE_SCHEMA", "auth")
-        if schema:
-            return schema
+        override = os.getenv("AUTH_DATABASE_SCHEMA")
+        if override is None:
+            schema = "auth"
+        else:
+            if not override.strip():
+                raise RuntimeError(
+                    "AUTH_DATABASE_SCHEMA is set but empty; configure a valid schema identifier"
+                )
+            schema = override
+
+        return normalize_postgres_schema(
+            schema,
+            label="Auth database schema",
+            prefix_if_missing=None,
+        )
     return None
 
 
