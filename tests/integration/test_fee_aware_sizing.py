@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 import types
@@ -20,12 +21,30 @@ from tests import factories
 
 
 if "metrics" not in sys.modules:
+    class _TransportMember:
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+        def __str__(self) -> str:
+            return self.value
+
+    class _TransportType:
+        UNKNOWN = _TransportMember("unknown")
+        INTERNAL = _TransportMember("internal")
+        REST = _TransportMember("rest")
+        WEBSOCKET = _TransportMember("websocket")
+        FIX = _TransportMember("fix")
+        BATCH = _TransportMember("batch")
+
     metrics_stub = types.SimpleNamespace(
         record_abstention_rate=lambda *args, **kwargs: None,
         record_drift_score=lambda *args, **kwargs: None,
         setup_metrics=lambda *args, **kwargs: None,
         get_request_id=lambda *args, **kwargs: "test-request",
+        TransportType=_TransportType,
     )
+    metrics_stub.bind_metric_context = lambda *args, **kwargs: contextlib.nullcontext()
+    metrics_stub.metric_context = lambda *args, **kwargs: contextlib.nullcontext()
     sys.modules["metrics"] = metrics_stub
 
 import policy_service
