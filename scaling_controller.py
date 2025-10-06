@@ -424,7 +424,20 @@ class ScalingController:
                     if span:
                         span.set_attribute("scaling.oms_replicas_before", replicas)
 
+                    if replicas < self._min_replicas:
+                        desired = self._min_replicas
+                        logger.warning(
+                            "OMS replicas %s below configured floor %s; scaling up to floor",
+                            replicas,
+                            desired,
+                        )
+                        await self._oms_scaler.scale_to(desired)
+                        replicas = desired
+                        if span:
+                            span.set_attribute("scaling.oms_replica_floor_enforced", desired)
+
                     if throughput > self._threshold:
+                        self._low_throughput_since = None
                         desired = replicas + 1
 
                         logger.info(
@@ -436,6 +449,40 @@ class ScalingController:
                         )
                         await self._oms_scaler.scale_to(desired)
                         replicas = desired
+                    else:
+                        if throughput <= self._downscale_threshold and pending_jobs == 0:
+                            if self._low_throughput_since is None:
+                                self._low_throughput_since = now
+                                logger.debug(
+                                    "Throughput %.2f orders/min below downscale threshold %.2f; starting stabilization window",
+                                    throughput,
+                                    self._downscale_threshold,
+                                )
+                            low_duration = now - self._low_throughput_since
+                            if span:
+                                span.set_attribute(
+                                    "scaling.low_throughput_duration_seconds",
+                                    low_duration.total_seconds(),
+                                )
+                            if low_duration >= self._downscale_stabilization and replicas > self._min_replicas:
+                                desired = max(replicas - 1, self._min_replicas)
+                                if desired < replicas:
+                                    logger.info(
+                                        "OMS throughput %.2f orders/min below downscale threshold %.2f for %s; scaling replicas %s -> %s",
+                                        throughput,
+                                        self._downscale_threshold,
+                                        low_duration,
+                                        replicas,
+                                        desired,
+                                    )
+                                    await self._oms_scaler.scale_to(desired)
+                                    replicas = desired
+                                if replicas <= self._min_replicas:
+                                    self._low_throughput_since = None
+                                else:
+                                    self._low_throughput_since = now
+                        else:
+                            self._low_throughput_since = None
 
                     gpu_nodes = list(await self._gpu_manager.list_gpu_nodes())
                     if pending_jobs > 0:

@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, InvalidOperation
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, InvalidOperation
 
 import time
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
@@ -1109,18 +1109,27 @@ def _snap(
     side: str,
     floor_quantity: bool = False,
 ) -> float:
+    """Quantise *value* to the nearest allowed increment for Kraken orders.
+
+    ``side`` controls the rounding bias.  Quantities always round down to avoid
+    exceeding the requested exposure, sell prices round up to honour the
+    caller's minimum price, and buy prices use half-up rounding so precision
+    beyond the exchange tick does not disappear when converting back to floats.
+    """
+
     try:
-        quant = Decimal(str(step))
-        decimal_value = Decimal(str(value))
+        quant = step if isinstance(step, Decimal) else Decimal(str(step))
+        decimal_value = value if isinstance(value, Decimal) else Decimal(str(value))
     except Exception:
         return value
 
     if quant <= 0:
         return value
 
-    rounding = ROUND_FLOOR
-    if not floor_quantity and side.upper() == "SELL":
-        rounding = ROUND_CEILING
+    if floor_quantity:
+        rounding = ROUND_FLOOR
+    else:
+        rounding = ROUND_CEILING if str(side).upper() == "SELL" else ROUND_HALF_UP
 
     try:
         snapped_ratio = (decimal_value / quant).to_integral_value(rounding=rounding)

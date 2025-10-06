@@ -3,6 +3,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 
+import importlib
+import sys
+
 import pytest
 
 
@@ -105,4 +108,43 @@ def test_compute_daily_return_pct_uses_nav_series(monkeypatch: pytest.MonkeyPatc
         "acct-789", datetime(2024, 1, 1, 23, 59, tzinfo=timezone.utc)
     )
     assert pct == pytest.approx(4.0)
+
+
+def _reload_portfolio_service() -> Any:
+    if "portfolio_service" in sys.modules:
+        return importlib.reload(sys.modules["portfolio_service"])
+    return importlib.import_module("portfolio_service")
+
+
+def test_database_url_requires_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in ("PORTFOLIO_DATABASE_URL", "TIMESCALE_DSN", "DATABASE_URL"):
+        monkeypatch.delenv(key, raising=False)
+
+    module = _reload_portfolio_service()
+
+    with pytest.raises(RuntimeError) as excinfo:
+        module._database_url()
+
+    assert "Portfolio database DSN is not configured" in str(excinfo.value)
+
+
+def test_database_url_normalises_timescale_scheme(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in ("TIMESCALE_DSN", "DATABASE_URL"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("PORTFOLIO_DATABASE_URL", "timescale://user:pass@host:5432/db")
+
+    module = _reload_portfolio_service()
+
+    assert module._database_url() == "postgresql://user:pass@host:5432/db"
+
+
+def test_database_url_rejects_sqlite(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in ("TIMESCALE_DSN", "DATABASE_URL"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("PORTFOLIO_DATABASE_URL", "sqlite:///tmp.db")
+
+    module = _reload_portfolio_service()
+
+    with pytest.raises(RuntimeError, match="PostgreSQL/Timescale"):
+        module._database_url()
 
