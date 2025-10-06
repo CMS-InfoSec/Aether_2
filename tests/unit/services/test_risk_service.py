@@ -189,3 +189,43 @@ def test_risk_validation_rejects_non_spot_instrument(risk_client: TestClient) ->
         reason.startswith("Instrument not eligible for spot trading")
         for reason in body["reasons"]
     )
+
+
+def test_position_size_rejects_non_spot_symbol(risk_client: TestClient) -> None:
+    with override_admin_auth(
+        risk_client.app, require_admin_account, "company"
+    ) as headers:
+        response = risk_client.get(
+            "/risk/size",
+            params={"symbol": "BTC-PERP"},
+            headers={**headers, "X-Account-ID": "company"},
+        )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["detail"] == "Only spot market symbols are supported for position sizing."
+
+
+def test_risk_limits_filters_non_spot_whitelist(risk_client: TestClient) -> None:
+    with risk_module.get_session() as session:
+        record = session.get(risk_module.AccountRiskLimit, "company")
+        assert record is not None
+        original_whitelist = record.instrument_whitelist
+        record.instrument_whitelist = "BTC-USD,BTC-PERP,ETH-USD"
+
+    try:
+        with override_admin_auth(
+            risk_client.app, require_admin_account, "company"
+        ) as headers:
+            response = risk_client.get(
+                "/risk/limits",
+                headers={**headers, "X-Account-ID": "company"},
+            )
+    finally:
+        with risk_module.get_session() as session:
+            record = session.get(risk_module.AccountRiskLimit, "company")
+            assert record is not None
+            record.instrument_whitelist = original_whitelist
+
+    assert response.status_code == 200
+    whitelist = response.json()["limits"]["instrument_whitelist"]
+    assert whitelist == ["BTC-USD", "ETH-USD"]

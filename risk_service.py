@@ -222,7 +222,7 @@ class AccountRiskLimit(Base):
     def whitelist(self) -> List[str]:
         if not self.instrument_whitelist:
             return []
-        return [token.strip() for token in self.instrument_whitelist.split(",") if token.strip()]
+        return _filter_spot_instruments(self.instrument_whitelist.split(","))
 
     @property
     def cluster_limits(self) -> Dict[str, float]:
@@ -357,7 +357,7 @@ _DEFAULT_LIMITS: List[Dict[str, object]] = [
 def _seed_default_limits(session: Session) -> None:
     for payload in _DEFAULT_LIMITS:
         record = session.get(AccountRiskLimit, payload["account_id"])
-        whitelist = payload.get("instrument_whitelist", [])
+        whitelist = _filter_spot_instruments(payload.get("instrument_whitelist", []))
         whitelist_blob = ",".join(sorted(whitelist)) if whitelist else None
         if record is None:
             record = AccountRiskLimit(
@@ -509,6 +509,24 @@ def _is_spot_instrument(symbol: str) -> bool:
     if _LEVERAGE_PATTERN.search(base):
         return False
     return True
+
+
+def _filter_spot_instruments(symbols: Iterable[str]) -> List[str]:
+    """Return normalized spot symbols, discarding non-spot entries."""
+
+    filtered: List[str] = []
+    seen: Set[str] = set()
+    for symbol in symbols:
+        normalized = str(symbol or "").strip().upper()
+        if not normalized:
+            continue
+        if not _is_spot_instrument(normalized):
+            logger.warning("Ignoring non-spot instrument '%s' in spot-only context", symbol)
+            continue
+        if normalized not in seen:
+            filtered.append(normalized)
+            seen.add(normalized)
+    return filtered
 
 
 class TradeIntent(BaseModel):
@@ -787,6 +805,8 @@ async def get_risk_limits(
 
     await _refresh_usage_from_balance(account_id)
     usage = _load_account_usage(account_id)
+    whitelist = limits.whitelist
+
     limit_model = AccountRiskLimitModel(
         account_id=limits.account_id,
         max_daily_loss=limits.max_daily_loss,
@@ -794,7 +814,7 @@ async def get_risk_limits(
         max_nav_pct_per_trade=limits.max_nav_pct_per_trade,
         notional_cap=limits.notional_cap,
         cooldown_minutes=limits.cooldown_minutes,
-        instrument_whitelist=limits.whitelist,
+        instrument_whitelist=whitelist,
         var_95_limit=limits.var_95_limit,
         var_99_limit=limits.var_99_limit,
         spread_threshold_bps=limits.spread_threshold_bps,
@@ -818,6 +838,15 @@ async def get_position_size(
     symbol: str = Query(..., min_length=1, description="Instrument symbol to size"),
     account_id: str = Depends(require_admin_account),
 ) -> Dict[str, Any]:
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not _is_spot_instrument(normalized_symbol):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only spot market symbols are supported for position sizing.",
+        )
+
+    symbol = normalized_symbol
+
     try:
         limits = _load_account_limits(account_id)
     except ConfigError as exc:
@@ -970,9 +999,15 @@ async def _get_approved_universe() -> UniverseSnapshot:
     except ValueError as exc:  # pragma: no cover - defensive
         raise UniverseServiceError("Universe service returned invalid JSON") from exc
 
-    symbols = {str(symbol).upper() for symbol in payload.get("symbols", []) if symbol}
+    raw_symbols = [str(symbol).upper() for symbol in payload.get("symbols", []) if symbol]
+    symbols = {symbol for symbol in raw_symbols if _is_spot_instrument(symbol)}
+    dropped = set(raw_symbols) - symbols
+    if dropped:
+        logger.warning(
+            "Dropping non-spot instruments from approved universe", extra={"symbols": sorted(dropped)}
+        )
     if not symbols:
-        raise UniverseServiceError("Universe service returned an empty universe")
+        raise UniverseServiceError("Universe service did not return any spot instruments")
 
     generated_raw = payload.get("generated_at")
     generated_at = now
@@ -1132,11 +1167,15 @@ async def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
         )
 
     whitelist = limits.whitelist
-    if whitelist and intent.instrument_id not in whitelist:
+    whitelist_set = {symbol.upper() for symbol in whitelist}
+    if whitelist_set and normalized_instrument not in whitelist_set:
         _register_violation(
             "Instrument not whitelisted for account",
             cooldown=True,
-            details={"instrument": intent.instrument_id, "whitelist": whitelist},
+            details={
+                "instrument": normalized_instrument,
+                "whitelist": sorted(whitelist_set),
+            },
         )
 
     if sizing_result is not None and trade_notional > sizing_result.max_position:
