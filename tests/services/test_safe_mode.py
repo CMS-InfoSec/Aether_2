@@ -1,6 +1,8 @@
 import asyncio
 from datetime import datetime, timezone
 
+import sys
+
 import pytest
 
 pytest.importorskip("fastapi")
@@ -201,3 +203,34 @@ def test_kafka_publisher_handles_running_loop(monkeypatch: pytest.MonkeyPatch) -
     assert published["account_id"] == "company"
     assert published["topic"] == "ops.safe_mode"
     assert published["payload"]["state"] == "entered"
+
+
+def test_state_store_requires_configured_redis(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_pytest = sys.modules.get("pytest")
+    try:
+        monkeypatch.delitem(sys.modules, "pytest", raising=False)
+        monkeypatch.delenv("SAFE_MODE_REDIS_URL", raising=False)
+
+        with pytest.raises(RuntimeError, match="SAFE_MODE_REDIS_URL"):
+            safe_mode.SafeModeStateStore._create_default_client()
+    finally:
+        if original_pytest is not None:
+            sys.modules["pytest"] = original_pytest
+
+
+def test_state_store_rejects_stub_without_pytest(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_pytest = sys.modules.get("pytest")
+    try:
+        monkeypatch.delitem(sys.modules, "pytest", raising=False)
+        monkeypatch.setenv("SAFE_MODE_REDIS_URL", "redis://stub:6379/0")
+
+        def _fake_create(url: str, *, decode_responses: bool, logger: object | None = None) -> tuple[object, bool]:
+            return object(), True
+
+        monkeypatch.setattr(safe_mode, "create_redis_from_url", _fake_create)
+
+        with pytest.raises(RuntimeError, match="Failed to connect"):
+            safe_mode.SafeModeStateStore._create_default_client()
+    finally:
+        if original_pytest is not None:
+            sys.modules["pytest"] = original_pytest

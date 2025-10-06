@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from threading import Lock
 import logging
 import os
+import sys
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Request, status
@@ -134,8 +135,25 @@ class SafeModeStateStore:
 
     @staticmethod
     def _create_default_client() -> Any:
-        redis_url = os.getenv("SAFE_MODE_REDIS_URL", "redis://localhost:6379/0")
-        client, _ = create_redis_from_url(redis_url, decode_responses=True, logger=LOGGER)
+        allow_stub = "pytest" in sys.modules
+
+        raw_url = os.getenv("SAFE_MODE_REDIS_URL")
+        if raw_url is None or not raw_url.strip():
+            if allow_stub:
+                raw_url = "redis://localhost:6379/0"
+            else:
+                raise RuntimeError(
+                    "SAFE_MODE_REDIS_URL environment variable must be set before starting the safe mode service"
+                )
+
+        redis_url = raw_url.strip()
+        client, used_stub = create_redis_from_url(redis_url, decode_responses=True, logger=LOGGER)
+
+        if used_stub and not allow_stub:
+            raise RuntimeError(
+                "Failed to connect to Redis at SAFE_MODE_REDIS_URL; safe mode requires a reachable Redis instance"
+            )
+
         return client
 
     def load(self) -> SafeModePersistedState:
