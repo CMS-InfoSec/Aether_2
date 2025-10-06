@@ -32,6 +32,7 @@ from sqlalchemy.pool import StaticPool
 
 from common.schemas.contracts import FillEvent
 from services.common.adapters import KafkaNATSAdapter
+from shared.postgres import normalize_sqlalchemy_dsn
 
 
 LOGGER = logging.getLogger(__name__)
@@ -54,9 +55,14 @@ def _database_url() -> str:
         if not candidate:
             continue
 
-        normalized = candidate
-        if normalized.startswith("postgres://"):
-            normalized = "postgresql://" + normalized.split("://", 1)[1]
+        try:
+            normalized = normalize_sqlalchemy_dsn(
+                candidate,
+                allow_sqlite=True,
+                label="Simulation mode DSN",
+            )
+        except RuntimeError as exc:  # pragma: no cover - defensive validation
+            raise RuntimeError("Invalid simulation mode database URL") from exc
 
         try:
             url_obj = make_url(normalized)
@@ -64,8 +70,8 @@ def _database_url() -> str:
             raise RuntimeError("Invalid simulation mode database URL") from exc
 
         driver = url_obj.drivername.lower()
-        if driver.startswith("postgresql") or driver.startswith("timescale"):
-            return str(url_obj)
+        if driver.startswith("postgresql"):
+            return normalized
 
         if driver.startswith("sqlite"):
             if candidate == _IN_MEMORY_SQLITE_URL:
@@ -74,6 +80,9 @@ def _database_url() -> str:
             if candidate == os.getenv(_TEST_DSN_ENV):
                 LOGGER.warning("Simulation mode DSN missing; using %s for tests", _TEST_DSN_ENV)
                 return normalized
+            raise RuntimeError(
+                "Simulation mode requires a PostgreSQL/TimescaleDB DSN; received sqlite://"
+            )
 
         raise RuntimeError(
             "Simulation mode requires a PostgreSQL/TimescaleDB DSN; "
