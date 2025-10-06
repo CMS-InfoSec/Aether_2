@@ -5,8 +5,7 @@ from __future__ import annotations
 from decimal import Decimal
 from types import SimpleNamespace
 
-from typing import Any, Dict, List
-from types import SimpleNamespace
+from typing import Any, Dict, List, Tuple
 
 
 import pytest
@@ -279,7 +278,9 @@ def test_policy_intent_cost_estimators_return_non_zero(monkeypatch: pytest.Monke
     )
 
     request = intent_service.PolicyDecisionRequest(account_id="company", symbol="BTC-USD")
-    response = intent_service.decide_policy_intent(request)
+    response = intent_service.decide_policy_intent(
+        request, caller_account="company"
+    )
 
     diagnostics = response.diagnostics
     assert diagnostics["fee_bps"] > 0.0
@@ -328,3 +329,39 @@ def test_slippage_estimator_falls_back_to_zero_when_unavailable() -> None:
         account_id="company", symbol="BTC-USD", side="buy", size=5.0
     )
     assert slippage == 0.0
+
+
+@pytest.mark.asyncio
+async def test_slippage_estimator_async_interface_returns_slippage() -> None:
+    class FakeStore:
+        async def impact_curve(self, **_: Any) -> List[Dict[str, float]]:
+            return [
+                {"size": 1.0, "impact_bps": 1.25},
+                {"size": 10.0, "impact_bps": 2.0},
+            ]
+
+    estimator = intent_service.SlippageEstimator(
+        impact_store=FakeStore(), cache_ttl_seconds=1.0, async_timeout=0.5
+    )
+
+    result = await estimator.estimate_slippage_bps_async(
+        account_id="company", symbol="BTC-USD", side="sell", size=5.0
+    )
+
+    assert result == pytest.approx(1.5833333333, rel=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_slippage_estimator_sync_raises_when_called_in_event_loop() -> None:
+    class FakeStore:
+        async def impact_curve(self, **_: Any) -> List[Dict[str, float]]:
+            return []
+
+    estimator = intent_service.SlippageEstimator(
+        impact_store=FakeStore(), cache_ttl_seconds=1.0, async_timeout=0.5
+    )
+
+    with pytest.raises(RuntimeError):
+        estimator.estimate_slippage_bps(
+            account_id="company", symbol="BTC-USD", side="buy", size=1.0
+        )

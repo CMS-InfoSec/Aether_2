@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Mapping, Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
+from shared.postgres import normalize_postgres_dsn
 
 try:  # pragma: no cover - optional heavy dependency
     from sklearn.ensemble import GradientBoostingClassifier
@@ -53,13 +54,14 @@ def _now_utc() -> datetime:
 
 
 def _normalize_database_url(url: str) -> str:
-    normalized = url.strip()
-    lowered = normalized.lower()
-    if lowered.startswith("postgres://"):
-        normalized = "postgresql://" + normalized.split("://", 1)[1]
-    if lowered.startswith("timescaledb://"):
-        normalized = "postgresql://" + normalized.split("://", 1)[1]
-    return normalized
+    try:
+        return normalize_postgres_dsn(
+            url,
+            allow_sqlite=False,
+            label="Alert prioritizer database DSN",
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(str(exc))
 
 
 class AlertPrioritizerService:
