@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
@@ -39,6 +40,7 @@ from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from services.common.security import require_admin_account
+from shared.postgres import normalize_sqlalchemy_dsn
 
 try:  # pragma: no cover - optional audit dependency
     from common.utils.audit_logger import hash_ip, log_audit
@@ -73,16 +75,29 @@ BPS_FACTOR = Decimal("10000")
 def _database_url() -> str:
     """Resolve the database connection string used by the service."""
 
-    url = (
+    allow_sqlite = "pytest" in sys.modules
+    raw = (
         os.getenv("TCA_DATABASE_URL")
         or os.getenv("TIMESCALE_DSN")
         or os.getenv("DATABASE_URL")
-        or DEFAULT_DATABASE_URL
+        or (DEFAULT_DATABASE_URL if allow_sqlite else None)
     )
-    if url.startswith("postgresql://"):
-        # SQLAlchemy expects the ``psycopg2`` driver for historic reasons.
-        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
-    return url
+
+    if raw is None:
+        raise RuntimeError(
+            "TCA database DSN is not configured. Set TCA_DATABASE_URL or TIMESCALE_DSN "
+            "to a PostgreSQL/Timescale connection string.",
+        )
+
+    candidate = raw.strip()
+    if not candidate:
+        raise RuntimeError("TCA database DSN cannot be empty once configured.")
+
+    return normalize_sqlalchemy_dsn(
+        candidate,
+        allow_sqlite=allow_sqlite,
+        label="TCA database DSN",
+    )
 
 
 def _engine_options(url: str) -> dict[str, Any]:

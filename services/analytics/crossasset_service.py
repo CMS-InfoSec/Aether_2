@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import statistics
+import sys
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Sequence
 
@@ -24,6 +25,8 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
+
+from shared.postgres import normalize_sqlalchemy_dsn
 
 LOGGER = logging.getLogger(__name__)
 
@@ -93,23 +96,48 @@ class StablecoinResponse(BaseModel):
     ts: datetime = Field(..., description="Timestamp the metric was generated")
 
 
-DATABASE_URL = (
-    os.getenv("CROSSASSET_DATABASE_URL")
-    or os.getenv("ANALYTICS_DATABASE_URL")
-    or os.getenv("DATABASE_URL")
-    or "sqlite:///./crossasset.db"
-)
+_SQLITE_FALLBACK = "sqlite+pysqlite:///:memory:"
+
+
+def _resolve_database_url() -> str:
+    """Return the configured database URL, enforcing PostgreSQL in production."""
+
+    allow_sqlite = "pytest" in sys.modules
+
+    raw = (
+        os.getenv("CROSSASSET_DATABASE_URL")
+        or os.getenv("ANALYTICS_DATABASE_URL")
+        or os.getenv("DATABASE_URL")
+        or (_SQLITE_FALLBACK if allow_sqlite else None)
+    )
+
+    if raw is None:
+        raise RuntimeError(
+            "Cross-asset analytics database DSN is not configured. Set CROSSASSET_DATABASE_URL "
+            "or ANALYTICS_DATABASE_URL to a PostgreSQL/Timescale connection string."
+        )
+
+    candidate = raw.strip()
+    if not candidate:
+        raise RuntimeError("Cross-asset analytics database DSN cannot be empty once configured.")
+
+    return normalize_sqlalchemy_dsn(
+        candidate,
+        allow_sqlite=allow_sqlite,
+        label="Cross-asset analytics database DSN",
+    )
 
 
 def _engine_options(url: str) -> dict[str, object]:
     options: dict[str, object] = {"future": True}
-    if url.startswith("sqlite://"):
+    if url.startswith("sqlite://") or url.startswith("sqlite+pysqlite://"):
         options.setdefault("connect_args", {"check_same_thread": False})
         if url.endswith(":memory:"):
             options["poolclass"] = StaticPool
     return options
 
 
+DATABASE_URL = _resolve_database_url()
 ENGINE: Engine = create_engine(DATABASE_URL, **_engine_options(DATABASE_URL))
 SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
 
