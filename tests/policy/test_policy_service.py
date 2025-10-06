@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 import types
@@ -28,6 +29,25 @@ if "metrics" not in sys.modules:
     metrics_stub.record_scaling_state = lambda *args, **kwargs: None
     metrics_stub.observe_scaling_evaluation = lambda *args, **kwargs: None
     metrics_stub.get_request_id = lambda: None
+
+    class _TransportMember:
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+        def __str__(self) -> str:
+            return self.value
+
+    class _TransportType:
+        UNKNOWN = _TransportMember("unknown")
+        INTERNAL = _TransportMember("internal")
+        REST = _TransportMember("rest")
+        WEBSOCKET = _TransportMember("websocket")
+        FIX = _TransportMember("fix")
+        BATCH = _TransportMember("batch")
+
+    metrics_stub.TransportType = _TransportType
+    metrics_stub.bind_metric_context = lambda *args, **kwargs: contextlib.nullcontext()
+    metrics_stub.metric_context = lambda *args, **kwargs: contextlib.nullcontext()
     sys.modules["metrics"] = metrics_stub
 
 os.environ.setdefault("SESSION_REDIS_URL", "memory://policy-tests")

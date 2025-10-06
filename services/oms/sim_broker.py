@@ -19,7 +19,6 @@ as they would from the real OMS.
 
 from __future__ import annotations
 
-import asyncio
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -33,6 +32,7 @@ from common.schemas.contracts import FillEvent, OrderEvent
 from config.simulation import SimulationConfig, get_simulation_config
 from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
 from services.common.config import get_timescale_session
+from shared.async_utils import dispatch_async
 
 try:  # pragma: no cover - optional dependency during CI
     import psycopg
@@ -294,7 +294,11 @@ class SimBroker:
         payload = event.model_dump(mode="json")
         payload["simulated"] = True
         payload["client_order_id"] = order.client_order_id
-        asyncio.run(self._kafka.publish(topic="oms.simulated.orders", payload=payload))
+        dispatch_async(
+            self._kafka.publish(topic="oms.simulated.orders", payload=payload),
+            context="simulated order event",
+            logger=LOGGER,
+        )
 
     def _emit_fill_event(self, order: SimulatedOrder, fill: SimulatedFill) -> None:
         event = FillEvent(
@@ -310,7 +314,11 @@ class SimBroker:
         payload["simulated"] = True
         payload["order_id"] = order.order_id
         payload["client_order_id"] = order.client_order_id
-        asyncio.run(self._kafka.publish(topic="oms.simulated.fills", payload=payload))
+        dispatch_async(
+            self._kafka.publish(topic="oms.simulated.fills", payload=payload),
+            context="simulated fill event",
+            logger=LOGGER,
+        )
 
     def _persist_order(self, order: SimulatedOrder) -> None:
         record = {

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from importlib import import_module, util
-from pathlib import Path
+import contextlib
 import sys
 import types
+from importlib import import_module, util
+from pathlib import Path
 from types import ModuleType
 
 import pytest
@@ -45,6 +46,25 @@ if "metrics" not in sys.modules:
         return _Span()
 
     metrics_stub.traced_span = _span_factory
+    metrics_stub.bind_metric_context = lambda *args, **kwargs: contextlib.nullcontext()
+    metrics_stub.metric_context = lambda *args, **kwargs: contextlib.nullcontext()
+
+    class _TransportMember:
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+        def __str__(self) -> str:
+            return self.value
+
+    class _TransportType:
+        UNKNOWN = _TransportMember("unknown")
+        INTERNAL = _TransportMember("internal")
+        REST = _TransportMember("rest")
+        WEBSOCKET = _TransportMember("websocket")
+        FIX = _TransportMember("fix")
+        BATCH = _TransportMember("batch")
+
+    metrics_stub.TransportType = _TransportType
 
     sys.modules["metrics"] = metrics_stub
 
