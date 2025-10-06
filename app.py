@@ -5,7 +5,7 @@ import base64
 import importlib
 import logging
 import os
-import uuid
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI
@@ -111,17 +111,28 @@ def _build_admin_repository_from_env() -> AdminRepositoryProtocol:
 def _verify_admin_repository(admin_repository: AdminRepositoryProtocol) -> None:
     """Persist and validate a sentinel admin record for startup verification."""
 
-
     sentinel = AdminAccount(
         admin_id=_ADMIN_REPOSITORY_HEALTHCHECK_ID,
         email=_ADMIN_REPOSITORY_HEALTHCHECK_EMAIL,
         password_hash=hash_password(_generate_random_password()),
         mfa_secret=_generate_random_mfa_secret(),
     )
-    admin_repository.add(sentinel)
-    stored = admin_repository.get_by_email(_ADMIN_REPOSITORY_HEALTHCHECK_EMAIL)
-    if not stored or stored.admin_id != _ADMIN_REPOSITORY_HEALTHCHECK_ID:
-        raise RuntimeError("Admin repository is not writable; startup verification failed.")
+
+    try:
+        admin_repository.add(sentinel)
+        stored = admin_repository.get_by_email(_ADMIN_REPOSITORY_HEALTHCHECK_EMAIL)
+        if not stored or stored.admin_id != _ADMIN_REPOSITORY_HEALTHCHECK_ID:
+            raise RuntimeError(
+                "Admin repository is not writable; startup verification failed."
+            )
+    finally:
+        try:
+            admin_repository.delete(_ADMIN_REPOSITORY_HEALTHCHECK_EMAIL)
+        except Exception:  # pragma: no cover - best effort cleanup
+            logger.warning(
+                "Failed to remove admin repository sentinel account after verification",
+                exc_info=True,
+            )
 
 
 
@@ -168,10 +179,6 @@ def create_app(
     admin_repository: Optional[AdminRepositoryProtocol] = None,
     session_store: Optional[SessionStoreProtocol] = None,
 ) -> FastAPI:
-    app = FastAPI(title="Aether Admin Platform")
-    setup_metrics(app, service_name="admin-platform")
-    app.add_middleware(CorrelationIdMiddleware)
-
     audit_store = AuditLogStore()
     audit_logger = TimescaleAuditLogger(audit_store)
     recorder = SensitiveActionRecorder(audit_logger)
@@ -181,6 +188,21 @@ def create_app(
     session_store = session_store or _build_session_store_from_env()
     auth_service = AuthService(admin_repository, session_store)
     accounts_service = AccountsService(recorder)
+
+    scaling_controller = build_scaling_controller_from_env()
+    configure_scaling_controller(scaling_controller)
+
+    @asynccontextmanager
+    async def _lifespan(app: FastAPI):
+        await scaling_controller.start()
+        try:
+            yield
+        finally:
+            await scaling_controller.stop()
+
+    app = FastAPI(title="Aether Admin Platform", lifespan=_lifespan)
+    setup_metrics(app, service_name="admin-platform")
+    app.add_middleware(CorrelationIdMiddleware)
 
     def _get_auth_service() -> AuthService:
         return auth_service
@@ -201,8 +223,6 @@ def create_app(
     _maybe_include_router(app, "services.hedge.hedge_service", "router")
 
 
-    scaling_controller = build_scaling_controller_from_env()
-    configure_scaling_controller(scaling_controller)
     app.include_router(scaling_router)
 
 
@@ -216,14 +236,6 @@ def create_app(
     app.state.scaling_controller = scaling_controller
 
     configure_audit_mode(app)
-
-    @app.on_event("startup")
-    async def _start_scaling_controller() -> None:  # pragma: no cover - FastAPI lifecycle
-        await scaling_controller.start()
-
-    @app.on_event("shutdown")
-    async def _stop_scaling_controller() -> None:  # pragma: no cover - FastAPI lifecycle
-        await scaling_controller.stop()
 
     alertmanager_url = os.getenv("ALERTMANAGER_URL")
     setup_alerting(app, alertmanager_url=alertmanager_url)
