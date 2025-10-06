@@ -401,7 +401,10 @@ def get_effective_fee(
     session: Session = Depends(get_session),
     account_id: str = Depends(require_admin_account),
 ) -> EffectiveFeeResponse:
-    del pair  # the current schedule is global and does not vary by pair
+    canonical_pair = require_spot_http(pair, param="pair", logger=logger)
+    logger.debug(
+        "Calculating effective fee", extra={"pair": canonical_pair, "account_id": account_id}
+    )
 
     normalized_liquidity = liquidity.lower()
     tiers = _ordered_tiers(session)
