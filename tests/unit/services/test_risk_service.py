@@ -210,7 +210,7 @@ def test_risk_limits_filters_non_spot_whitelist(risk_client: TestClient) -> None
         record = session.get(risk_module.AccountRiskLimit, "company")
         assert record is not None
         original_whitelist = record.instrument_whitelist
-        record.instrument_whitelist = "BTC-USD,BTC-PERP,ETH-USD"
+        record.instrument_whitelist = "BTC-USD,BTC-PERP,ETH-USD,ETH-USDT"
 
     try:
         with override_admin_auth(
