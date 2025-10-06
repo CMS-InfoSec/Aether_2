@@ -56,6 +56,8 @@ from typing import Any, Dict, Literal, Mapping, Optional
 
 import httpx
 import pyotp
+from contextlib import asynccontextmanager
+
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
@@ -577,7 +579,43 @@ async def authenticate(
 
 
 def get_application() -> FastAPI:
-    app = FastAPI(title="Aether Auth Service", version="1.0.0")
+    providers = _provider_registry()
+    mfa = MFAVerifier()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        global SessionLocal, ENGINE
+        session_factory: Optional[sessionmaker[OrmSession]] = None
+        try:
+            secret = _initialise_jwt_secret(require=True)
+            session_factory = _initialise_database(require=True)
+        except Exception:
+            # Ensure partially initialised globals don't leak between startup attempts.
+            SessionLocal = None
+            if ENGINE is not None:
+                ENGINE.dispose()
+            ENGINE = None
+            raise
+
+        app.state.jwt_secret = secret
+        app.state.session_repository = SessionRepository(session_factory)
+
+        try:
+            yield
+        finally:
+            app.state.__dict__.pop("session_repository", None)
+            app.state.__dict__.pop("jwt_secret", None)
+
+            close_all = getattr(session_factory, "close_all", None)
+            if callable(close_all):
+                close_all()
+
+            SessionLocal = None
+            if ENGINE is not None:
+                ENGINE.dispose()
+                ENGINE = None
+
+    app = FastAPI(title="Aether Auth Service", version="1.0.0", lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[
@@ -590,19 +628,6 @@ def get_application() -> FastAPI:
         allow_methods=["POST", "OPTIONS"],
         allow_headers=["*"],
     )
-
-    providers = _provider_registry()
-    mfa = MFAVerifier()
-
-    @app.on_event("startup")
-    async def _configure_runtime() -> None:
-        secret = _initialise_jwt_secret(require=True)
-        session_factory = _initialise_database(require=True)
-        if secret is None or session_factory is None:  # pragma: no cover - defensive guard
-            raise RuntimeError("Auth service configuration is incomplete; ensure environment variables are set")
-
-        app.state.jwt_secret = secret
-        app.state.session_repository = SessionRepository(session_factory)
 
     def _session_repository_dependency(request: Request) -> SessionRepository:
         repo = getattr(request.app.state, "session_repository", None)
