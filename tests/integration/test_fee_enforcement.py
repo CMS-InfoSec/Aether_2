@@ -16,6 +16,21 @@ import pytest
 def test_fee_enforcement_blocks_negative_edge(monkeypatch: pytest.MonkeyPatch) -> None:
     """Ensure intents with insufficient edge are rejected before reaching the OMS."""
 
+    class _TransportMember:
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+        def __str__(self) -> str:
+            return self.value
+
+    class _TransportType:
+        UNKNOWN = _TransportMember("unknown")
+        INTERNAL = _TransportMember("internal")
+        REST = _TransportMember("rest")
+        WEBSOCKET = _TransportMember("websocket")
+        FIX = _TransportMember("fix")
+        BATCH = _TransportMember("batch")
+
     metrics_stub = types.SimpleNamespace(
         increment_rejected_intents=lambda *args, **kwargs: None,
         increment_trades_submitted=lambda *args, **kwargs: None,
@@ -28,7 +43,10 @@ def test_fee_enforcement_blocks_negative_edge(monkeypatch: pytest.MonkeyPatch) -
         record_scaling_state=lambda *args, **kwargs: None,
         observe_scaling_evaluation=lambda *args, **kwargs: None,
         get_request_id=lambda: None,
+        TransportType=_TransportType,
     )
+    metrics_stub.bind_metric_context = lambda *args, **kwargs: contextlib.nullcontext()
+    metrics_stub.metric_context = lambda *args, **kwargs: contextlib.nullcontext()
     monkeypatch.setitem(sys.modules, "metrics", metrics_stub)
 
     fastapi_stub = types.ModuleType("fastapi")
