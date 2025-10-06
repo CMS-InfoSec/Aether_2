@@ -37,14 +37,12 @@ DEFAULT_CLUSTER_LIMITS: Dict[str, float] = {
 }
 DEFAULT_CLUSTER_MAP: Dict[str, str] = {
     "BTC-USD": "BTC",
-    "BTC-USDT": "BTC",
     "ETH-USD": "ETH",
     "SOL-USD": "ALT",
     "ADA-USD": "ALT",
 }
 DEFAULT_BETA_MAP: Dict[str, float] = {
     "BTC-USD": 1.0,
-    "BTC-USDT": 1.0,
     "ETH-USD": 0.8,
     "SOL-USD": 1.4,
     "ADA-USD": 1.2,
