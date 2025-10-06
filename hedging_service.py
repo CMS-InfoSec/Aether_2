@@ -34,6 +34,7 @@ from typing import Any, Awaitable, Callable, Iterable, List, Mapping, Optional, 
 from services.common.adapters import TimescaleAdapter
 from services.common.precision import _parse_asset_pairs
 from services.oms.kraken_rest import KrakenRESTClient, KrakenRESTError
+from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 
 logger = logging.getLogger(__name__)
@@ -363,7 +364,7 @@ class HedgeConfig:
     """Risk thresholds and hedge sizing configuration."""
 
     account_id: str
-    hedge_symbol: str = "USDUSDT"
+    hedge_symbol: str = "USDT-USD"
     base_allocation_usd: float = 50_000.0
     max_allocation_usd: float = 250_000.0
     atr_threshold: float = 15.0
@@ -386,6 +387,11 @@ class HedgeConfig:
             raise ValueError("volatility thresholds must be positive")
         if self.max_drawdown_pct <= 0:
             raise ValueError("max_drawdown_pct must be positive")
+
+        normalized_symbol = normalize_spot_symbol(self.hedge_symbol)
+        if not normalized_symbol or not is_spot_symbol(normalized_symbol):
+            raise ValueError("hedge_symbol must be a spot market pair")
+        self.hedge_symbol = normalized_symbol
 
 
 @dataclass

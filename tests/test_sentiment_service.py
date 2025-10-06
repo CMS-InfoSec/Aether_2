@@ -58,3 +58,31 @@ async def test_repository_persists_across_instances(tmp_path: Path) -> None:
     assert stored_label == "positive"
     assert stored_source == "twitter"
     assert stored_ts.tzinfo is not None
+
+
+@pytest.mark.asyncio
+async def test_repository_rejects_non_spot_symbol(tmp_path: Path) -> None:
+    database_url = f"sqlite:///{tmp_path/'sentiment_guard.db'}"
+    repository = SentimentRepository(database_url)
+    derivative_post = SocialPost(
+        symbol="btc-perp",
+        text="BTC perp sentiment",
+        source="twitter",
+        created_at=dt.datetime.now(dt.timezone.utc),
+    )
+
+    with pytest.raises(ValueError):
+        await repository.insert(derivative_post, "positive")
+
+    with pytest.raises(ValueError):
+        await repository.latest("btc-perp")
+
+
+@pytest.mark.asyncio
+async def test_service_rejects_non_spot_symbol(tmp_path: Path) -> None:
+    database_url = f"sqlite:///{tmp_path/'sentiment_service_guard.db'}"
+    repository = SentimentRepository(database_url)
+    service = SentimentIngestService(repository=repository, model=_StaticSentimentModel(), sources=[])
+
+    with pytest.raises(ValueError):
+        await service.ingest_symbol("eth-perp")
