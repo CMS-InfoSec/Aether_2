@@ -147,6 +147,7 @@ def test_adapter_queries_feast_and_caches_results() -> None:
         historical={
             approved_key: [
                 {"instrument": "BTC-USD", "approved": True, "event_timestamp": now},
+                {"instrument": "BTC-PERP", "approved": True, "event_timestamp": now},
                 {"instrument": "ETH-USD", "approved": False, "event_timestamp": now},
             ],
             fee_override_key: [
@@ -209,6 +210,7 @@ def test_adapter_queries_feast_and_caches_results() -> None:
     assert online["expected_edge_bps"] == 14.0
     assert online["book_snapshot"]["mid_price"] == 25_000.0
     assert len(store.online_calls) == 1
+    assert store.online_calls[0]["entity_rows"][0]["instrument"] == "BTC-USD"
 
     # Cached results should avoid additional Feast calls.
     adapter.approved_instruments()
@@ -294,3 +296,102 @@ def test_adapter_propagates_feast_failures() -> None:
 
     with pytest.raises(RuntimeError):
         adapter.fetch_online_features("BTC-USD")
+
+
+def test_adapter_normalizes_inputs_and_rejects_derivatives() -> None:
+    now = datetime.now(timezone.utc)
+    namespace = "acct"
+    approved_key = (
+        f"{namespace}__approved_instruments:approved",
+        f"{namespace}__approved_instruments:instrument",
+    )
+    fee_override_key = (
+        f"{namespace}__fee_overrides:currency",
+        f"{namespace}__fee_overrides:instrument",
+        f"{namespace}__fee_overrides:maker_bps",
+        f"{namespace}__fee_overrides:taker_bps",
+    )
+    fee_tier_key = (
+        f"{namespace}__fee_tiers:maker_bps",
+        f"{namespace}__fee_tiers:notional_threshold",
+        f"{namespace}__fee_tiers:pair",
+        f"{namespace}__fee_tiers:taker_bps",
+        f"{namespace}__fee_tiers:tier",
+    )
+    online_key = tuple(
+        sorted(
+            f"{namespace}__instrument_features:{field}"
+            for field in RedisFeastAdapter._ONLINE_FIELDS
+        )
+    )
+
+    store = StubFeastStore(
+        historical={
+            approved_key: [
+                {"instrument": "eth/usd", "approved": True, "event_timestamp": now},
+                {"instrument": "ETH-PERP", "approved": True, "event_timestamp": now},
+            ],
+            fee_override_key: [
+                {
+                    "instrument": "eth/usd",
+                    "maker_bps": 5.0,
+                    "taker_bps": 7.0,
+                    "currency": "USD",
+                    "event_timestamp": now,
+                }
+            ],
+            fee_tier_key: [
+                {
+                    "pair": "eth_usd",
+                    "tier": "base",
+                    "maker_bps": 10.0,
+                    "taker_bps": 15.0,
+                    "notional_threshold": 0.0,
+                    "event_timestamp": now,
+                }
+            ],
+        },
+        online={
+            online_key: {
+                f"{namespace}__instrument_features:features": [0.2, 0.5],
+                f"{namespace}__instrument_features:expected_edge_bps": 8.0,
+                f"{namespace}__instrument_features:book_snapshot": {"mid_price": 1_850.0},
+                f"{namespace}__instrument_features:state": {"regime": "neutral"},
+            }
+        },
+    )
+
+    adapter = _make_adapter(store)
+
+    assert adapter.approved_instruments() == ["ETH-USD"]
+    override = adapter.fee_override("eth/usd")
+    assert override == {"currency": "USD", "maker": 5.0, "taker": 7.0}
+    tiers = adapter.fee_tiers("eth_usd")
+    assert tiers[0]["tier"] == "base"
+    online = adapter.fetch_online_features("Eth-Usd")
+    assert online["expected_edge_bps"] == 8.0
+
+    with pytest.raises(ValueError):
+        adapter.fee_override("eth-perp")
+    with pytest.raises(ValueError):
+        adapter.fee_tiers("eth-perp")
+    with pytest.raises(ValueError):
+        adapter.fetch_online_features("eth-perp")
+
+
+def test_seed_fee_tiers_filters_non_spot_pairs() -> None:
+    tiers = {
+        "company": {
+            "btc-usd": [{"tier": "vip"}],
+            "btc-perp": [{"tier": "invalid"}],
+            "DEFAULT": [{"tier": "fallback"}],
+        }
+    }
+
+    RedisFeastAdapter.seed_fee_tiers(tiers)
+
+    company_cache = RedisFeastAdapter._fee_tiers.get("company")
+    assert company_cache is not None
+    assert "BTC-USD" in company_cache
+    assert "BTC-PERP" not in company_cache
+    assert company_cache["DEFAULT"][0]["tier"] == "fallback"
