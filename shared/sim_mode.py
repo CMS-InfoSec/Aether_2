@@ -32,6 +32,7 @@ from sqlalchemy.pool import StaticPool
 
 from common.schemas.contracts import FillEvent
 from services.common.adapters import KafkaNATSAdapter
+from shared.async_utils import dispatch_async
 from shared.postgres import normalize_sqlalchemy_dsn
 
 
@@ -522,9 +523,10 @@ class SimBroker:
                 liquidity=execution.liquidity,
                 ts=_utcnow(),
             )
-            _dispatch_async(
+            dispatch_async(
                 adapter.publish("oms.fills.simulated", event.model_dump(mode="json")),
                 context="simulated fill event",
+                logger=LOGGER,
             )
         return execution
 

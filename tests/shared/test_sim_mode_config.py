@@ -1,4 +1,3 @@
-import asyncio
 import importlib
 import sys
 
@@ -21,27 +20,3 @@ def test_database_url_normalizes_timescale_scheme(monkeypatch, sim_mode_module):
     scheme, _, remainder = normalized.partition("://")
     assert scheme.startswith("postgresql+")
     assert remainder == "user:secret@db.example/sim"
-
-
-def test_dispatch_async_without_running_loop(sim_mode_module):
-    invoked = False
-
-    async def _stub():
-        nonlocal invoked
-        invoked = True
-
-    sim_mode_module._dispatch_async(_stub(), context="test")
-    assert invoked
-
-
-@pytest.mark.asyncio
-async def test_dispatch_async_with_running_loop(sim_mode_module):
-    invoked = False
-
-    async def _stub():
-        nonlocal invoked
-        invoked = True
-
-    sim_mode_module._dispatch_async(_stub(), context="test")
-    await asyncio.sleep(0)
-    assert invoked
