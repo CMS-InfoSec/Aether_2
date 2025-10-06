@@ -30,9 +30,28 @@ if "metrics" not in sys.modules:
     metrics_stub.metric_context = lambda *args, **kwargs: contextlib.nullcontext()
     metrics_stub.get_request_id = lambda: None
 
+    class _TransportMember:
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+        def __str__(self) -> str:
+            return self.value
+
+    class _TransportType:
+        UNKNOWN = _TransportMember("unknown")
+        INTERNAL = _TransportMember("internal")
+        REST = _TransportMember("rest")
+        WEBSOCKET = _TransportMember("websocket")
+        FIX = _TransportMember("fix")
+        BATCH = _TransportMember("batch")
+
+    metrics_stub.TransportType = _TransportType
+    metrics_stub.bind_metric_context = lambda *args, **kwargs: contextlib.nullcontext()
+
     sys.modules["metrics"] = metrics_stub
 
 import policy_service
+from services.policy import main as policy_main
 
 from services.common.precision import PrecisionMetadataUnavailable
 from services.common.schemas import (
@@ -300,6 +319,111 @@ def test_policy_decide_approves_when_edge_beats_costs(
     assert dispatched == [
         {"order_id": "abc-123", "approved": True, "actor": "company"}
     ]
+
+
+def test_policy_decide_normalises_feature_mapping(monkeypatch: pytest.MonkeyPatch) -> None:
+    recorded: list[dict[str, object]] = []
+
+    class _Intent:
+        approved = True
+        edge_bps = 18.0
+        reason = None
+        take_profit_bps = 20.0
+        stop_loss_bps = 10.0
+        is_null = False
+        confidence = ConfidenceMetrics(
+            model_confidence=0.8,
+            state_confidence=0.8,
+            execution_confidence=0.8,
+            overall_confidence=0.8,
+        )
+
+    def _fake_registry() -> object:
+        class _Registry:
+            def get_latest_ensemble(self, account_id: str, symbol: str) -> object:
+                class _Ensemble:
+                    confidence_threshold = 0.6
+
+                return _Ensemble()
+
+        return _Registry()
+
+    async def _noop_publish(*_: object, **__: object) -> None:
+        return None
+
+    class _KafkaStub:
+        def __init__(self, *_: object, **__: object) -> None:
+            pass
+
+        async def publish(self, *args: object, **kwargs: object) -> None:
+            await _noop_publish(*args, **kwargs)
+
+    class _RedisStub:
+        def __init__(self, *_: object, **__: object) -> None:
+            pass
+
+        def fetch_online_features(self, instrument: str) -> dict[str, object]:
+            return {
+                "features": {
+                    "alpha": "0.5",
+                    "beta": 1.75,
+                    "ignored": "not-a-number",
+                },
+                "book_snapshot": {
+                    "mid_price": 30125.4,
+                    "spread_bps": 2.4,
+                    "imbalance": 0.05,
+                },
+                "state": {
+                    "regime": "range",
+                    "volatility": 0.2,
+                    "liquidity_score": 0.4,
+                    "conviction": 0.6,
+                },
+            }
+
+    class _TimescaleStub:
+        def __init__(self, *_: object, **__: object) -> None:
+            pass
+
+        def record_decision(self, *, order_id: str, payload: dict[str, object]) -> None:
+            recorded.append({"order_id": order_id, **payload})
+
+    monkeypatch.setattr(policy_main, "get_model_registry", _fake_registry)
+    monkeypatch.setattr(policy_main, "predict_intent", lambda **_: _Intent())
+    dispatched_contexts: list[str] = []
+
+    def _run_dispatch(
+        coro: object,
+        *,
+        context: str,
+        logger: object | None = None,
+    ) -> None:
+        del logger
+        dispatched_contexts.append(context)
+        asyncio.run(coro)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(policy_main, "dispatch_async", _run_dispatch)
+    monkeypatch.setattr(policy_main, "KafkaNATSAdapter", _KafkaStub)
+    monkeypatch.setattr(policy_main, "RedisFeastAdapter", _RedisStub)
+    monkeypatch.setattr(policy_main, "TimescaleAdapter", _TimescaleStub)
+
+    payload = _decision_request_payload("company")
+    payload.pop("features", None)
+    payload.pop("book_snapshot", None)
+
+    policy_main.app.dependency_overrides[policy_main.require_admin_account] = lambda: "company"
+    try:
+        with TestClient(policy_main.app) as client:
+            response = client.post("/policy/decide", json=payload)
+            assert response.status_code == status.HTTP_200_OK, response.text
+            body = PolicyDecisionResponse.model_validate(response.json())
+    finally:
+        policy_main.app.dependency_overrides.pop(policy_main.require_admin_account, None)
+
+    assert body.features == pytest.approx([0.5, 1.75])
+    assert recorded and recorded[-1]["features"] == pytest.approx([0.5, 1.75])
+    assert dispatched_contexts == ["publish policy.decisions"]
 
 
 def test_policy_decide_preserves_tick_precision(
