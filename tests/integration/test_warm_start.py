@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import sys
 import types
@@ -186,6 +187,21 @@ if "metrics" not in sys.modules:
     def _noop(*args: Any, **kwargs: Any) -> None:
         return None
 
+    class _TransportMember:
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+        def __str__(self) -> str:
+            return self.value
+
+    class _TransportType:
+        UNKNOWN = _TransportMember("unknown")
+        INTERNAL = _TransportMember("internal")
+        REST = _TransportMember("rest")
+        WEBSOCKET = _TransportMember("websocket")
+        FIX = _TransportMember("fix")
+        BATCH = _TransportMember("batch")
+
     metrics_stub.increment_oms_child_orders_total = _noop
     metrics_stub.increment_oms_error_count = _noop
     metrics_stub.record_oms_latency = _noop
@@ -197,6 +213,9 @@ if "metrics" not in sys.modules:
     metrics_stub.record_scaling_state = _noop
     metrics_stub.observe_scaling_evaluation = _noop
     metrics_stub.get_request_id = lambda: None
+    metrics_stub.TransportType = _TransportType
+    metrics_stub.bind_metric_context = lambda *args, **kwargs: contextlib.nullcontext()
+    metrics_stub.metric_context = lambda *args, **kwargs: contextlib.nullcontext()
     sys.modules["metrics"] = metrics_stub
 
 from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter

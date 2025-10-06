@@ -46,6 +46,20 @@ def test_create_jwt_missing_secret(monkeypatch):
         create_jwt(subject="user-456", role="auditor")
 
 
+def test_create_jwt_accepts_explicit_secret(monkeypatch):
+    monkeypatch.delenv("AUTH_JWT_SECRET", raising=False)
+
+    token, expires_at = create_jwt(subject="user-654", role="admin", secret="inline-secret")
+
+    parts = token.split(".")
+    assert len(parts) == 3
+
+    payload = _decode_segment(parts[1])
+    assert payload["sub"] == "user-654"
+    assert payload["role"] == "admin"
+    assert expires_at.tzinfo is timezone.utc
+
+
 def test_create_jwt_accepts_claim_mapping(monkeypatch):
     monkeypatch.setenv("AUTH_JWT_SECRET", "super-secret-key")
     extra_claims = {"role": "auditor", "permissions": ["read"]}
