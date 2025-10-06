@@ -18,6 +18,8 @@ from typing import Any, Deque, Dict, Iterable, Iterator, List, Optional, Protoco
 import numpy as np
 import pandas as pd
 
+from shared.spot import is_spot_symbol, normalize_spot_symbol
+
 
 class Policy(Protocol):
     """Minimal protocol expected from a strategy intent generator."""
@@ -1071,12 +1073,28 @@ def _run_cli(args: argparse.Namespace) -> None:
     print(json.dumps(_serialise_for_json(metrics), indent=2))
 
 
+def _spot_symbol(value: str) -> str:
+    """argparse type hook enforcing canonical spot symbols."""
+
+    normalized = normalize_spot_symbol(value)
+    if not normalized or not is_spot_symbol(normalized):
+        raise argparse.ArgumentTypeError(
+            "Backtest engine only supports canonical spot market symbols."
+        )
+    return normalized
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="Backtest engine CLI")
     subparsers = parser.add_subparsers(dest="command")
 
     run_parser = subparsers.add_parser("run", help="Execute a demo backtest")
-    run_parser.add_argument("--symbol", required=True, help="Symbol to simulate, e.g. BTC/USD")
+    run_parser.add_argument(
+        "--symbol",
+        required=True,
+        type=_spot_symbol,
+        help="Symbol to simulate, e.g. BTC-USD",
+    )
     run_parser.add_argument("--years", type=int, default=1, help="Number of years of hourly data to simulate")
     run_parser.add_argument("--seed", type=int, default=7, help="Random seed for reproducibility")
     run_parser.set_defaults(func=_run_cli)

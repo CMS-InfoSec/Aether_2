@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from functools import partial
 from threading import Lock
-from typing import Dict, Iterator, Optional, Tuple
+from typing import Awaitable, Dict, Iterator, Optional, Tuple
 
 from sqlalchemy import Boolean, Column, DateTime, Integer, Numeric, String, Text, create_engine, select, text
 from sqlalchemy.engine import Engine
@@ -93,6 +93,21 @@ def _database_url() -> str:
     raise RuntimeError(
         "SIM_MODE_DATABASE_URL (or DATABASE_URL) must be set to a PostgreSQL/TimescaleDB DSN."
     )
+
+
+def _dispatch_async(coro: Awaitable[None], *, context: str) -> None:
+    async def _run() -> None:
+        try:
+            await coro
+        except Exception:  # pragma: no cover - defensive logging
+            LOGGER.exception("Failed to publish %s", context)
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.run(_run())
+    else:
+        loop.create_task(_run())
 
 
 def _engine() -> Engine:
