@@ -107,6 +107,11 @@ def _sanitize_schema_name(raw: str, *, default: bool) -> str:
     if default and not candidate.startswith("acct_"):
         candidate = f"acct_{candidate}"
 
+    if len(candidate) > 63:
+        raise RuntimeError(
+            "Timescale schema must be 63 characters or fewer once normalised"
+        )
+
     return candidate
 
 
