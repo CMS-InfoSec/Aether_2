@@ -223,6 +223,29 @@ def test_resolve_inputs_rejects_paths_outside_root(
     assert "must reside within" in str(excinfo.value)
 
 
+def test_resolve_inputs_rejects_symlinks_within_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    _prepare_default_artifacts(root)
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "secrets.json"
+    secret.write_text("{}")
+
+    link = root / "artifacts" / "model_weights" / "leak.json"
+    link.symlink_to(secret)
+
+    monkeypatch.setenv("KNOWLEDGE_PACK_ROOT", str(root))
+
+    with pytest.raises(pack_exporter.MissingArtifactError) as excinfo:
+        pack_exporter.resolve_inputs()
+
+    assert "must not contain symlinks" in str(excinfo.value)
+
+
 def test_resolve_inputs_rejects_symlink_targets(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

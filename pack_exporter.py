@@ -164,6 +164,30 @@ def _ensure_within_base(base: Path, target: Path, *, context: str) -> None:
         ) from exc
 
 
+def _ensure_safe_tree(path: Path, *, base: Path, context: str) -> None:
+    """Ensure that *path* and its descendants are safe to package."""
+
+    stack = [path]
+    while stack:
+        current = stack.pop()
+        if current.is_symlink():
+            raise MissingArtifactError(
+                f"{context} must not contain symlinks (found {current})"
+            )
+
+        resolved = current.resolve(strict=True)
+        _ensure_within_base(base, resolved, context=context)
+
+        if resolved.is_dir():
+            stack.extend(resolved.iterdir())
+            continue
+
+        if not resolved.is_file():
+            raise MissingArtifactError(
+                f"{context} must contain only regular files and directories"
+            )
+
+
 def _resolve_base_path() -> Path:
     raw_base = Path(os.getenv("KNOWLEDGE_PACK_ROOT", ".")).expanduser()
     try:
@@ -201,6 +225,7 @@ def _resolve_path(env_name: str, *, default: Path | None = None, base: Path) -> 
 
     resolved = candidate.resolve(strict=True)
     _ensure_within_base(base, resolved, context=context)
+    _ensure_safe_tree(resolved, base=base, context=context)
     return resolved
 
 
