@@ -209,8 +209,29 @@ def test_training_service_rejects_artifact_root_symlink(
     monkeypatch.setenv("TRAINING_ARTIFACT_ROOT", str(link))
 
     module_name = "tests.ml.training.training_service_artifact_root_symlink"
-    with pytest.raises(ValueError, match="must not reference symlinks"):
+    with pytest.raises(ValueError, match="must not be a symlink"):
         _load_training_module(module_name)
+
+
+def test_training_service_allows_symlink_parent_for_artifact_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TRAINING_TIMESCALE_URI", "postgresql://user:pass@localhost/db")
+    real_root = tmp_path / "real"
+    real_root.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real_root, target_is_directory=True)
+    artifact_root = link / "artifacts"
+    monkeypatch.setenv("TRAINING_ARTIFACT_ROOT", str(artifact_root))
+
+    module_name = "tests.ml.training.training_service_artifact_root_symlink_parent"
+    module = _load_training_module(module_name)
+    try:
+        expected = (real_root / "artifacts").resolve()
+        assert module.DEFAULT_ARTIFACT_ROOT == expected  # type: ignore[attr-defined]
+        assert expected.exists()
+    finally:
+        _dispose_training_module(module_name)
 
 
 def test_training_service_normalises_relative_artifact_root(

@@ -695,14 +695,26 @@ def _normalise_local_artifact_base_path(base_path: str | os.PathLike[str]) -> Pa
     if not candidate.is_absolute():
         candidate = Path.cwd() / candidate
 
-    for ancestor in (candidate,) + tuple(candidate.parents):
-        if ancestor.exists() and ancestor.is_symlink():
-            raise ValueError("Artifact base path must not reference symlinks")
+    resolved_candidate = candidate.resolve(strict=False)
 
-    if candidate.exists() and not candidate.is_dir():
+    if candidate.exists() and candidate.is_symlink():
+        raise ValueError("Artifact base path must not be a symlink")
+
+    for ancestor in candidate.parents:
+        if ancestor.exists() and ancestor.is_symlink():
+            try:
+                resolved_ancestor = ancestor.resolve(strict=False)
+            except OSError as exc:  # pragma: no cover - extremely unlikely on supported platforms
+                raise ValueError("Artifact base path symlink could not be resolved") from exc
+            try:
+                resolved_candidate.relative_to(resolved_ancestor)
+            except ValueError:
+                raise ValueError("Artifact base path must not escape via symlinked ancestors")
+
+    if resolved_candidate.exists() and not resolved_candidate.is_dir():
         raise ValueError("Artifact base path must reference a directory")
 
-    return candidate
+    return resolved_candidate
 
 
 def _normalise_artifact_name(name: str) -> Tuple[str, ...]:

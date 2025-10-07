@@ -48,15 +48,27 @@ def _resolve_artifact_root(raw: str | None, *, default: Path) -> Path:
     if not candidate.is_absolute():
         candidate = Path.cwd() / candidate
 
-    for ancestor in (candidate,) + tuple(candidate.parents):
-        if ancestor.exists() and ancestor.is_symlink():
-            raise ValueError("TRAINING_ARTIFACT_ROOT must not reference symlinks")
+    resolved_candidate = candidate.resolve(strict=False)
 
-    if candidate.exists() and not candidate.is_dir():
+    if candidate.exists() and candidate.is_symlink():
+        raise ValueError("TRAINING_ARTIFACT_ROOT must not be a symlink")
+
+    for ancestor in candidate.parents:
+        if ancestor.exists() and ancestor.is_symlink():
+            try:
+                resolved_ancestor = ancestor.resolve(strict=False)
+            except OSError as exc:  # pragma: no cover - extremely unlikely on supported platforms
+                raise ValueError("TRAINING_ARTIFACT_ROOT symlink target could not be resolved") from exc
+            try:
+                resolved_candidate.relative_to(resolved_ancestor)
+            except ValueError:
+                raise ValueError("TRAINING_ARTIFACT_ROOT must not escape via symlinked ancestors")
+
+    if resolved_candidate.exists() and not resolved_candidate.is_dir():
         raise ValueError("TRAINING_ARTIFACT_ROOT must reference a directory")
 
-    candidate.mkdir(parents=True, exist_ok=True)
-    return candidate.resolve(strict=False)
+    resolved_candidate.mkdir(parents=True, exist_ok=True)
+    return resolved_candidate
 
 
 def _resolve_timescale_uri() -> str:

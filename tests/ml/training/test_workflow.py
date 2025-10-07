@@ -214,6 +214,23 @@ def test_write_artifacts_rejects_symlink_base_path(tmp_path: Path) -> None:
         ObjectStorageConfig(base_path=str(link))
 
 
+def test_write_artifacts_allows_symlink_parent(tmp_path: Path) -> None:
+    real_root = tmp_path / "real"
+    real_root.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real_root, target_is_directory=True)
+
+    config = ObjectStorageConfig(base_path=str(link / "output"))
+
+    result = _write_artifacts({"metrics.json": b"{}"}, config)
+
+    expected_root = (real_root / "output").resolve()
+    expected_path = expected_root / "metrics.json"
+    assert Path(config.base_path) == expected_root
+    assert Path(result["metrics.json"]) == expected_path
+    assert expected_path.exists()
+
+
 def test_write_artifacts_s3_prefix_normalised(monkeypatch: pytest.MonkeyPatch) -> None:
     class _StubClient:
         def __init__(self) -> None:
