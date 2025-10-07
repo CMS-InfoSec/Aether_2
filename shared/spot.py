@@ -1,4 +1,4 @@
-"""Utilities for validating and normalising spot trading instruments."""
+"""Utilities for validating and normalising USD spot trading instruments."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ __all__ = [
     "normalize_spot_symbol",
     "is_spot_symbol",
     "filter_spot_symbols",
+    "require_spot_symbol",
 ]
 
 
@@ -17,6 +18,7 @@ _SPOT_PAIR_PATTERN = re.compile(r"^[A-Z0-9]{2,}-[A-Z0-9]{2,}$")
 _NON_SPOT_KEYWORDS: Sequence[str] = ("PERP", "FUT", "FUTURE", "MARGIN", "SWAP", "OPTION", "DERIV")
 _LEVERAGE_SUFFIXES: Sequence[str] = ("UP", "DOWN")
 _LEVERAGE_PATTERN = re.compile(r"\d+(?:X|L|S)$")
+_ALLOWED_QUOTES: Sequence[str] = ("USD",)
 
 
 def normalize_spot_symbol(symbol: object) -> str:
@@ -39,7 +41,7 @@ def normalize_spot_symbol(symbol: object) -> str:
 
 
 def is_spot_symbol(symbol: object) -> bool:
-    """Return ``True`` when *symbol* represents a spot market trading pair."""
+    """Return ``True`` when *symbol* represents a USD-quoted spot market pair."""
 
     normalized = normalize_spot_symbol(symbol)
     if not normalized:
@@ -51,7 +53,10 @@ def is_spot_symbol(symbol: object) -> bool:
     if not _SPOT_PAIR_PATTERN.match(normalized):
         return False
 
-    base, _ = normalized.split("-", maxsplit=1)
+    base, quote = normalized.split("-", maxsplit=1)
+
+    if quote not in _ALLOWED_QUOTES:
+        return False
 
     if any(base.endswith(suffix) for suffix in _LEVERAGE_SUFFIXES):
         return False
@@ -94,3 +99,17 @@ def filter_spot_symbols(
         seen.add(normalized)
 
     return filtered
+
+
+def require_spot_symbol(symbol: object, *, message: str | None = None) -> str:
+    """Return *symbol* normalised when it represents a USD spot market pair.
+
+    ``ValueError`` is raised when the supplied *symbol* is missing or does not
+    correspond to an allowed spot instrument.  A custom *message* may be
+    provided to tailor the error for different call sites.
+    """
+
+    normalized = normalize_spot_symbol(symbol)
+    if not normalized or not is_spot_symbol(normalized):
+        raise ValueError(message or "Only spot market instruments are supported.")
+    return normalized

@@ -231,3 +231,77 @@ def test_snapshot_loader_skips_non_spot_payload(
         "price": 100.0,
     }
     assert loader._event_from_payload(payload_derivative) is None
+
+
+def test_snapshot_config_rejects_symlinked_output_dir(
+    replay_client: Tuple[TestClient, InMemorySessionStore, object],
+    tmp_path: Path,
+) -> None:
+    _client, _store, snapshot_replay = replay_client
+    start = datetime.now(timezone.utc) - timedelta(minutes=1)
+    end = datetime.now(timezone.utc) + timedelta(minutes=1)
+
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    link_dir = tmp_path / "link"
+    link_dir.symlink_to(real_dir, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="output directory must not reference symlinks"):
+        snapshot_replay.SnapshotReplayConfig(
+            start=start,
+            end=end,
+            account_id="company",
+            output_dir=link_dir,
+            storage_path=tmp_path / "storage",
+        )
+
+
+def test_snapshot_config_rejects_symlinked_storage_file(
+    replay_client: Tuple[TestClient, InMemorySessionStore, object],
+    tmp_path: Path,
+) -> None:
+    _client, _store, snapshot_replay = replay_client
+    start = datetime.now(timezone.utc) - timedelta(minutes=1)
+    end = datetime.now(timezone.utc) + timedelta(minutes=1)
+
+    storage_target = tmp_path / "events.json"
+    storage_target.write_text("[]", encoding="utf-8")
+    link_file = tmp_path / "events-link.json"
+    link_file.symlink_to(storage_target)
+
+    with pytest.raises(ValueError, match="storage path must not reference symlinks"):
+        snapshot_replay.SnapshotReplayConfig(
+            start=start,
+            end=end,
+            account_id="company",
+            output_dir=tmp_path / "output",
+            storage_path=link_file,
+        )
+
+
+def test_snapshot_loader_rejects_symlinked_storage_inputs(
+    replay_client: Tuple[TestClient, InMemorySessionStore, object],
+    tmp_path: Path,
+) -> None:
+    _client, _store, snapshot_replay = replay_client
+    start = datetime.now(timezone.utc) - timedelta(minutes=1)
+    end = datetime.now(timezone.utc) + timedelta(minutes=1)
+
+    storage_dir = tmp_path / "storage"
+    storage_dir.mkdir()
+    target_file = tmp_path / "source.json"
+    target_file.write_text("[]", encoding="utf-8")
+    link = storage_dir / "linked.json"
+    link.symlink_to(target_file)
+
+    config = snapshot_replay.SnapshotReplayConfig(
+        start=start,
+        end=end,
+        account_id="company",
+        output_dir=tmp_path / "output",
+        storage_path=storage_dir,
+    )
+    loader = snapshot_replay.HistoricalDataLoader(config)
+
+    with pytest.raises(ValueError, match="must not contain symlinked files"):
+        list(loader._load_from_object_storage())

@@ -19,7 +19,7 @@ import os
 import subprocess
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -121,6 +121,15 @@ class ObjectStorageConfig:
 
     def is_s3(self) -> bool:
         return bool(self.s3_bucket)
+
+    def __post_init__(self) -> None:
+        """Normalise filesystem and S3 settings during initialisation."""
+
+        normalised_base = _normalise_local_artifact_base_path(self.base_path)
+        object.__setattr__(self, "base_path", str(normalised_base))
+
+        normalised_prefix = _normalise_s3_prefix(self.s3_prefix)
+        object.__setattr__(self, "s3_prefix", normalised_prefix)
 
 
 @dataclass
@@ -668,26 +677,128 @@ def _predict(model: nn.Module, data_loader: DataLoader, device: torch.device) ->
 # Artifact persistence
 
 
+def _normalise_local_artifact_base_path(base_path: str | os.PathLike[str]) -> Path:
+    """Validate and normalise the local artifact directory."""
+
+    raw_text = os.fspath(base_path)
+    if isinstance(base_path, str):
+        raw_text = raw_text.strip()
+
+    if not raw_text:
+        raise ValueError("Artifact base path must not be empty")
+    if any(ord(char) < 32 for char in raw_text):
+        raise ValueError("Artifact base path must not contain control characters")
+
+    candidate = Path(raw_text).expanduser()
+    if any(part == ".." for part in candidate.parts):
+        raise ValueError("Artifact base path must not include parent directory references")
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+
+    resolved_candidate = candidate.resolve(strict=False)
+
+    if candidate.is_symlink():
+        raise ValueError("Artifact base path must not be a symlink")
+
+    for ancestor in candidate.parents:
+        if ancestor.is_symlink():
+            try:
+                resolved_ancestor = ancestor.resolve(strict=False)
+            except OSError as exc:  # pragma: no cover - extremely unlikely on supported platforms
+                raise ValueError("Artifact base path symlink could not be resolved") from exc
+            if resolved_ancestor.exists() and not resolved_ancestor.is_dir():
+                raise ValueError("Artifact base path symlink targets must resolve to directories")
+            try:
+                resolved_candidate.relative_to(resolved_ancestor)
+            except ValueError:
+                raise ValueError("Artifact base path must not escape via symlinked ancestors")
+
+    if resolved_candidate.exists() and not resolved_candidate.is_dir():
+        raise ValueError("Artifact base path must reference a directory")
+
+    return resolved_candidate
+
+
+def _normalise_artifact_name(name: str) -> Tuple[str, ...]:
+    """Return a traversal-free tuple of path segments for an artifact name."""
+
+    sanitised = name.replace("\\", "/").strip("/")
+    if not sanitised:
+        raise ValueError("Artifact names must not be empty")
+    if any(ord(char) < 32 for char in sanitised):
+        raise ValueError("Artifact names must not contain control characters")
+
+    path = PurePosixPath(sanitised)
+    parts: List[str] = []
+    for segment in path.parts:
+        if segment in {"", "."}:
+            continue
+        if segment == "..":
+            raise ValueError("Artifact names must not contain parent directory references")
+        parts.append(segment)
+
+    if not parts:
+        raise ValueError("Artifact names must not be empty")
+
+    return tuple(parts)
+
+
+def _normalise_s3_prefix(prefix: Optional[str]) -> str:
+    """Return a traversal-free S3 prefix suitable for object keys."""
+
+    if not prefix:
+        return ""
+
+    if isinstance(prefix, str):
+        candidate = prefix.strip()
+    else:
+        candidate = str(prefix)
+
+    if not candidate:
+        return ""
+
+    candidate = candidate.replace("\\", "/")
+    if any(ord(char) < 32 for char in candidate):
+        raise ValueError("S3 prefix must not contain control characters")
+
+    parts: List[str] = []
+    for segment in candidate.split("/"):
+        if segment in {"", "."}:
+            continue
+        if segment == "..":
+            raise ValueError("S3 prefix must not contain parent directory references")
+        parts.append(segment)
+
+    return "/".join(parts)
+
+
 def _write_artifacts(artifacts: Mapping[str, bytes], config: ObjectStorageConfig) -> Dict[str, str]:
     """Persist artifacts to either the filesystem or S3."""
 
     output_locations: Dict[str, str] = {}
-    base_path = Path(config.base_path)
+    base_path: Optional[Path] = None
+    prefix: str = ""
     if not config.is_s3():
+        base_path = _normalise_local_artifact_base_path(config.base_path)
         base_path.mkdir(parents=True, exist_ok=True)
+    else:
+        prefix = _normalise_s3_prefix(config.s3_prefix)
 
     for name, payload in artifacts.items():
+        segments = _normalise_artifact_name(name)
         if config.is_s3():
             if boto3 is None:
                 raise RuntimeError("boto3 is required for S3 artifact uploads but is not installed")
             client = boto3.client("s3")
-            key_parts = [part.strip("/") for part in (config.s3_prefix, name) if part]
+            key_body = "/".join(segments)
+            key_parts = [part.strip("/") for part in (prefix, key_body) if part]
             key = "/".join(key_parts)
             LOGGER.debug("Uploading artifact %s to s3://%s/%s", name, config.s3_bucket, key)
             client.put_object(Bucket=config.s3_bucket, Key=key, Body=payload)
             output_locations[name] = f"s3://{config.s3_bucket}/{key}"
         else:
-            target_path = base_path / name
+            assert base_path is not None  # for type-checkers
+            target_path = base_path.joinpath(*segments)
             target_path.parent.mkdir(parents=True, exist_ok=True)
             target_path.write_bytes(payload)
             output_locations[name] = str(target_path)

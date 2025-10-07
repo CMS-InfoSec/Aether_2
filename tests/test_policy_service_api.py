@@ -616,7 +616,10 @@ def test_get_regime_rejects_non_spot_symbol(client: TestClient) -> None:
     response = client.get("/policy/regime", params={"symbol": "ETH-PERP"})
 
     assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
-    assert response.json()["detail"] == "Only spot market instruments are supported."
+    assert (
+        response.json()["detail"]
+        == "symbol 'ETH-PERP' is not a supported USD spot market instrument"
+    )
 
 
 def test_policy_decide_returns_503_when_precision_unavailable(

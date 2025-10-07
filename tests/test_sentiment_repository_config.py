@@ -85,3 +85,39 @@ def test_resolve_database_url_allows_sqlite_with_flag(
 
     assert url.startswith("sqlite")
     assert target.parent.exists()
+
+
+def test_resolve_database_url_rejects_symlink_sqlite_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target_dir = tmp_path / "real"
+    target_dir.mkdir()
+    symlink_dir = tmp_path / "alias"
+    symlink_dir.symlink_to(target_dir, target_is_directory=True)
+    db_path = symlink_dir / "sentiment.db"
+
+    monkeypatch.setenv("SENTIMENT_DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("SENTIMENT_ALLOW_SQLITE", "1")
+
+    removed = _without_pytest()
+    try:
+        with pytest.raises(RuntimeError, match="must not reference symlinks"):
+            sentiment_ingest._resolve_database_url(None)
+    finally:
+        _restore_modules(removed)
+
+
+def test_resolve_database_url_rejects_directory_target(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    directory = tmp_path / "sentiment"
+    directory.mkdir()
+    monkeypatch.setenv("SENTIMENT_DATABASE_URL", f"sqlite:///{directory}")
+    monkeypatch.setenv("SENTIMENT_ALLOW_SQLITE", "1")
+
+    removed = _without_pytest()
+    try:
+        with pytest.raises(RuntimeError, match="must reference a regular file path"):
+            sentiment_ingest._resolve_database_url(None)
+    finally:
+        _restore_modules(removed)
