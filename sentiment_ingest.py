@@ -408,6 +408,37 @@ Index("ix_sentiment_scores_symbol_ts", _SENTIMENT_TABLE.c.symbol, _SENTIMENT_TAB
 Index("ix_sentiment_scores_ts", _SENTIMENT_TABLE.c.ts)
 
 
+def _ensure_safe_sqlite_path(path: Path) -> None:
+    """Ensure SQLite database files reside on a safe, regular filesystem path."""
+
+    if not path.is_absolute():
+        raise RuntimeError(
+            "Sentiment repository database URL must resolve to an absolute filesystem path"
+        )
+
+    if path.exists():
+        if path.is_symlink():
+            raise RuntimeError(
+                "Sentiment repository database URL must not reference symlinks"
+            )
+        if path.is_dir():
+            raise RuntimeError(
+                "Sentiment repository database URL must reference a regular file path"
+            )
+
+    for ancestor in path.parents:
+        if not ancestor.exists():
+            continue
+        if ancestor.is_symlink():
+            raise RuntimeError(
+                "Sentiment repository database URL must not reference symlinks"
+            )
+        if not ancestor.is_dir():
+            raise RuntimeError(
+                "Sentiment repository database URL must reside within a directory"
+            )
+
+
 def _resolve_database_url(candidate: str | None = None) -> str:
     """Resolve and normalise the sentiment repository database URL."""
 
@@ -447,6 +478,7 @@ def _resolve_database_url(candidate: str | None = None) -> str:
                 path = Path(database).expanduser()
                 if not path.is_absolute():
                     path = Path.cwd() / path
+                _ensure_safe_sqlite_path(path)
                 path.parent.mkdir(parents=True, exist_ok=True)
 
         return normalised
