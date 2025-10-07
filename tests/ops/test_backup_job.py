@@ -9,11 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from ops.backup.backup_job import (
-    BackupConfig,
-    BackupJob,
-    _safe_extract_tar,
-)
+from common.utils.tar import safe_extract_tar
+from ops.backup.backup_job import BackupConfig, BackupJob
 
 
 def _build_archive(path: Path, members: dict[str, bytes]) -> None:
@@ -51,7 +48,7 @@ def test_safe_extract_tar_rejects_traversal(tmp_path: Path) -> None:
 
     with tarfile.open(archive_path, "r:gz") as archive:
         with pytest.raises(ValueError, match="traversal"):
-            _safe_extract_tar(archive, destination)
+            safe_extract_tar(archive, destination)
 
     assert not any(destination.rglob("evil.txt"))
 
@@ -69,7 +66,7 @@ def test_safe_extract_tar_rejects_symlinks(tmp_path: Path) -> None:
 
     with tarfile.open(archive_path, "r:gz") as archive:
         with pytest.raises(ValueError, match="regular files or directories"):
-            _safe_extract_tar(archive, destination)
+            safe_extract_tar(archive, destination)
 
     assert not any(destination.rglob("link"))
 
@@ -81,7 +78,7 @@ def test_safe_extract_tar_writes_expected_payload(tmp_path: Path) -> None:
     destination.mkdir()
 
     with tarfile.open(archive_path, "r:gz") as archive:
-        _safe_extract_tar(archive, destination)
+        safe_extract_tar(archive, destination)
 
     extracted = destination / "mlruns" / "metrics.json"
     assert extracted.read_bytes() == b"{}"

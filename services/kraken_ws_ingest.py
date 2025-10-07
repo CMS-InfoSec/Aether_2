@@ -47,9 +47,9 @@ class KrakenConfig:
     heartbeat_check_interval: float = HEARTBEAT_CHECK_INTERVAL_SECONDS
 
     def __post_init__(self) -> None:
-        """Validate Kraken trading pairs while preserving subscription formatting."""
+        """Normalise and validate Kraken trading pairs for USD spot-only usage."""
 
-        validated_pairs: List[str] = []
+        normalized_pairs: List[str] = []
         seen: set[str] = set()
         invalid: List[str] = []
 
@@ -62,7 +62,7 @@ class KrakenConfig:
             if normalized in seen:
                 continue
 
-            validated_pairs.append(normalized.replace("-", "/"))
+            normalized_pairs.append(normalized)
             seen.add(normalized)
 
         if invalid:
@@ -71,10 +71,10 @@ class KrakenConfig:
                 f"KrakenConfig pairs must be USD spot instruments; rejected: {invalid_list}"
             )
 
-        if not validated_pairs:
+        if not normalized_pairs:
             raise ValueError("At least one USD spot trading pair must be provided.")
 
-        self.pairs = validated_pairs
+        self.pairs = normalized_pairs
 
 
 class KrakenIngestor:

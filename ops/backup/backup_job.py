@@ -555,7 +555,7 @@ class BackupJob:
         if parent_dir.exists() and parent_dir.is_symlink():
             raise ValueError("MLflow artifact parent directory must not be a symlink")
         with tarfile.open(archive_path, "r:gz") as archive:
-            _safe_extract_tar(archive, parent_dir)
+            safe_extract_tar(archive, parent_dir)
         # tarball contains original directory name; move contents to target
         extracted_root = target_dir.parent / target_dir.name
         if extracted_root.exists() and extracted_root != target_dir:
