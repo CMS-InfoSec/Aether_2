@@ -9,7 +9,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
-from fastapi import APIRouter, Depends, Query
+try:  # pragma: no cover - FastAPI is optional in some unit tests
+    from fastapi import APIRouter, Depends, Query
+except ImportError:  # pragma: no cover - fallback when FastAPI is stubbed out
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        APIRouter,
+        Depends,
+        Query,
+    )
 
 from services.common.security import require_admin_account
 from services.reports.report_service import compute_daily_return_pct
