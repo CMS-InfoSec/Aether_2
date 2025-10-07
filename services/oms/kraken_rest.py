@@ -117,8 +117,11 @@ class KrakenRESTClient:
         return await self._request("/private/TradesHistory", payload)
 
     async def open_positions(self, *, docalcs: bool = True) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {"docalcs": bool(docalcs)}
-        return await self._request("/private/OpenPositions", payload)
+        """Deprecated margin-only helper retained for backwards compatibility."""
+
+        raise KrakenRESTError(
+            "OpenPositions is not available in the spot-only deployment."
+        )
 
     async def websocket_token(self) -> Tuple[str, Optional[float]]:
         """Fetch a websocket authentication token for the current credentials."""

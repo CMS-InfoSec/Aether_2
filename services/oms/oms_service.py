@@ -1015,19 +1015,14 @@ class AccountContext:
         if self.rest_client is None:
             return 0
 
-        try:
-            await self._throttle_rest("/private/OpenPositions")
-            payload = await self.rest_client.open_positions()
-        except KrakenRESTError as exc:
-            logger.warning(
-                "Warm start failed to fetch open positions for account %s: %s",
-                self.account_id,
-                exc,
-            )
-            return 0
-
-        positions = self._parse_rest_open_positions(payload)
-        return await self._apply_open_positions_snapshot(positions)
+        # Kraken's ``OpenPositions`` endpoint only surfaces margin/futures state and
+        # is not applicable for the spot-only deployment.  Calling it can leak
+        # credentials to an unnecessary API surface and triggers compliance noise,
+        # so we explicitly bypass the request and clear any cached margin state.
+        logger.debug(
+            "Skipping OpenPositions resync for spot-only account %s", self.account_id
+        )
+        return await self._apply_open_positions_snapshot([])
 
     async def resync_trades(self) -> int:
         await self.start()
