@@ -1003,7 +1003,7 @@ async def get_daily_return_pct(
 
 @router.post("/export")
 async def export_daily_report(
-    format: str = Query(..., regex="^(?i)(pdf|csv|json)$"),
+    format: str = Query(..., pattern="^(?i)(pdf|csv|json)$"),
     account_id: str | None = Query(default=None),
     report_date: date | None = Query(default=None),
     _: str = Depends(require_admin_account),
