@@ -42,13 +42,11 @@ except ModuleNotFoundError:  # pragma: no cover - fallback when installed under 
         spec.loader.exec_module(security_module)
         require_admin_account = getattr(security_module, "require_admin_account")
 
-try:  # pragma: no cover - optional audit dependency
-    from common.utils.audit_logger import hash_ip, log_audit
-except Exception:  # pragma: no cover - degrade gracefully
-    log_audit: Callable[..., None] | None = None
+from shared.audit_hooks import load_audit_hooks
 
-    def _hash_ip_passthrough(value: Optional[str]) -> Optional[str]:
-        return None
+_AUDIT_HOOKS = load_audit_hooks()
+log_audit = _AUDIT_HOOKS.log
+hash_ip = _AUDIT_HOOKS.hash_ip
 
     hash_ip = _hash_ip_passthrough
 
