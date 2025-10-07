@@ -363,23 +363,29 @@ def log_event_with_fallback(
             ip_hash=ip_hash,
         )
 
-    log_extra = _build_audit_log_extra(
-        actor=actor,
-        action=action,
-        entity=entity,
-        before=before,
-        after=after,
-        ip_address=ip_address,
-        ip_hash=resolved.value,
-        context=context,
-        hash_fallback=resolved.fallback,
-        hash_error=resolved.error,
-    )
+    log_extra: dict[str, Any] | None = None
+
+    def ensure_log_extra() -> Mapping[str, Any]:
+        nonlocal log_extra
+        if log_extra is None:
+            log_extra = _build_audit_log_extra(
+                actor=actor,
+                action=action,
+                entity=entity,
+                before=before,
+                after=after,
+                ip_address=ip_address,
+                ip_hash=resolved.value,
+                context=context,
+                hash_fallback=resolved.fallback,
+                hash_error=resolved.error,
+            )
+        return log_extra
 
     if resolved.error is not None:
         logger.error(
             "Audit hash_ip callable failed; using fallback hash.",
-            extra=log_extra,
+            extra=ensure_log_extra(),
             exc_info=(
                 type(resolved.error),
                 resolved.error,
@@ -399,7 +405,7 @@ def log_event_with_fallback(
             resolved_ip_hash=resolved,
         )
     except Exception as exc:
-        logger.exception(failure_message, extra=log_extra)
+        logger.exception(failure_message, extra=ensure_log_extra())
         return AuditLogResult(
             handled=False,
             ip_hash=resolved.value,
@@ -409,7 +415,7 @@ def log_event_with_fallback(
         )
 
     if not result.handled and disabled_message is not None:
-        logger.log(disabled_level, disabled_message, extra=log_extra)
+        logger.log(disabled_level, disabled_message, extra=ensure_log_extra())
 
     combined_hash_fallback = resolved.fallback or result.hash_fallback
     combined_hash_error = resolved.error or result.hash_error

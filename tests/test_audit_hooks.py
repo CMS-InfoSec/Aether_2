@@ -2,7 +2,7 @@ import builtins
 import hashlib
 import logging
 
-from typing import Optional
+from typing import Iterator, Mapping, Optional
 
 import pytest
 
@@ -453,6 +453,65 @@ def test_log_event_with_fallback_allows_custom_context(caplog: pytest.LogCapture
     record = next(record for record in caplog.records if record.message == "audit disabled")
     assert record.audit == context["audit"]
     assert record.extra_field == "value"
+
+
+class _TrackingMapping(Mapping[str, object]):
+    """Mapping that records whether it has been iterated."""
+
+    def __init__(self) -> None:
+        self.accessed = False
+
+    def __getitem__(self, key: str) -> object:
+        self.accessed = True
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        self.accessed = True
+        return iter(())
+
+    def __len__(self) -> int:
+        self.accessed = True
+        return 0
+
+
+def test_log_event_with_fallback_defers_extra_until_needed(caplog: pytest.LogCaptureFixture):
+    captured: list[Mapping[str, object]] = []
+
+    def fake_log(**payload: object) -> None:
+        captured.append(payload)
+
+    hooks = audit_hooks.AuditHooks(log=fake_log, hash_ip=lambda value: value)
+    logger = logging.getLogger("test.audit.defer")
+    context = _TrackingMapping()
+
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        result = audit_hooks.log_event_with_fallback(
+            hooks,
+            logger,
+            actor="casey",
+            action="demo.defer",
+            entity="resource",
+            before={"before": True},
+            after={"after": True},
+            ip_address="203.0.113.5",
+            failure_message="should not trigger",
+            context=context,
+        )
+
+    assert result.handled is True
+    assert result.ip_hash == "203.0.113.5"
+    assert captured == [
+        {
+            "actor": "casey",
+            "action": "demo.defer",
+            "entity": "resource",
+            "before": {"before": True},
+            "after": {"after": True},
+            "ip_hash": "203.0.113.5",
+        }
+    ]
+    assert context.accessed is False
+    assert not caplog.records
 
 
 def test_resolve_ip_hash_prefers_explicit_hash():
