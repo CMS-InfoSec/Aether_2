@@ -29,7 +29,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from typing import Any, Iterable, Mapping, MutableMapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, MutableMapping, Sequence
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -41,16 +41,11 @@ from sqlalchemy.pool import StaticPool
 
 from services.common.security import require_admin_account
 from services.common.spot import require_spot_http
+from shared.audit_hooks import load_audit_hooks, log_event_with_fallback
 from shared.postgres import normalize_sqlalchemy_dsn
 from shared.spot import is_spot_symbol, normalize_spot_symbol
 
-try:  # pragma: no cover - optional audit dependency
-    from common.utils.audit_logger import hash_ip, log_audit
-except Exception:  # pragma: no cover - degrade gracefully
-    log_audit = None  # type: ignore[assignment]
-
-    def hash_ip(_: str | None) -> str | None:  # type: ignore[override]
-        return None
+_AUDIT_HOOKS = load_audit_hooks()
 
 
 LOGGER = logging.getLogger(__name__)
@@ -157,23 +152,19 @@ def _audit_access(
 ) -> None:
     """Record audit information for report access using the verified identity."""
 
-    if log_audit is None:
-        return
-
-    try:
-        ip_address = request.client.host if request.client else None
-        log_audit(
-            actor=actor,
-            action=action,
-            entity=entity,
-            before={},
-            after=dict(metadata or {}),
-            ip_hash=hash_ip(ip_address),
-        )
-    except Exception:  # pragma: no cover - defensive best effort
-        AUDIT_LOGGER.exception(
-            "Failed to write audit log for action=%s entity=%s", action, entity
-        )
+    ip_address = request.client.host if request.client else None
+    log_event_with_fallback(
+        _AUDIT_HOOKS,
+        AUDIT_LOGGER,
+        actor=actor,
+        action=action,
+        entity=entity,
+        before={},
+        after=dict(metadata or {}),
+        ip_address=ip_address,
+        failure_message=f"Failed to write audit log for action={action} entity={entity}",
+        disabled_message=f"Audit logging disabled; skipping {action} for {entity}",
+    )
 
 
 def _ensure_datetime(value: datetime | None) -> datetime | None:
