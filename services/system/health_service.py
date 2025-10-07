@@ -34,7 +34,7 @@ def _ensure_safe_state_path(path: Path, *, env_var: str) -> Path:
         raise ValueError(f"{env_var} must not contain path traversal sequences")
 
     for ancestor in (path,) + tuple(path.parents):
-        if ancestor.exists() and ancestor.is_symlink():
+        if ancestor.is_symlink():
             raise ValueError(f"{env_var} must not reference symlinks")
 
     return path

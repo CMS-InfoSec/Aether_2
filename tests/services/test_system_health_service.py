@@ -95,6 +95,16 @@ def test_resolve_sim_mode_state_path_rejects_symlink(monkeypatch, tmp_path):
         health_service._resolve_sim_mode_state_path()
 
 
+def test_resolve_sim_mode_state_path_rejects_broken_symlink(monkeypatch, tmp_path):
+    target = tmp_path / "missing.json"
+    link = tmp_path / "link.json"
+    link.symlink_to(target)
+    monkeypatch.setenv("SIM_MODE_STATE_PATH", str(link))
+
+    with pytest.raises(ValueError):
+        health_service._resolve_sim_mode_state_path()
+
+
 def test_load_sim_mode_file_skips_symlink(monkeypatch, tmp_path, caplog):
     target = tmp_path / "state.json"
     target.write_text("{}", encoding="utf-8")
