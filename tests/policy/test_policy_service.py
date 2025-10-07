@@ -8,8 +8,6 @@ import types
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Callable, Iterator
-from uuid import uuid4
-
 import pytest
 from fastapi import status
 from fastapi.testclient import TestClient
