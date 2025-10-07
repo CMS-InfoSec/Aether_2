@@ -37,6 +37,48 @@ DEFAULT_OMS_LOG_DIR = Path("/var/log/aether/oms_log")
 DEFAULT_TCA_REPORT_DIR = Path("/var/log/aether/tca_reports")
 
 
+def _ensure_safe_directory(path: Path, env_var: str) -> Path:
+    """Validate that *path* is an absolute, traversal-free directory reference.
+
+    Paths supplied via environment variables participate directly in filesystem
+    archival routines.  Guard against directory escape by requiring absolute
+    paths, prohibiting ".." segments, and rejecting symlink-backed ancestors.
+    """
+
+    if not path.is_absolute():
+        raise ValueError(f"{env_var} must be an absolute path")
+    if any(part == ".." for part in path.parts):
+        raise ValueError(f"{env_var} must not contain parent directory references")
+
+    for ancestor in (path,) + tuple(path.parents):
+        # ``Path.is_symlink`` safely handles non-existent elements and raises no
+        # exceptions when intermediate directories are missing.
+        if ancestor.is_symlink():
+            raise ValueError(f"{env_var} must not reference symlinked directories")
+
+    return path
+
+
+def _normalise_s3_prefix(prefix: str) -> str:
+    """Return a sanitised S3 prefix free from traversal or control chars."""
+
+    if not prefix:
+        return ""
+
+    segments: list[str] = []
+    for raw_segment in prefix.replace("\\", "/").split("/"):
+        segment = raw_segment.strip()
+        if not segment:
+            continue
+        if segment in {".", ".."}:
+            raise ValueError("RETENTION_PREFIX must not contain path traversal sequences")
+        if any(ord(char) < 32 for char in segment):
+            raise ValueError("RETENTION_PREFIX must not contain control characters")
+        segments.append(segment)
+
+    return "/".join(segments)
+
+
 @dataclass(frozen=True)
 class ArchiveRecord:
     """Metadata recorded for each log archive exported to object storage."""
@@ -109,14 +151,26 @@ class RetentionConfig:
         if not logs_days:
             raise RuntimeError("LOG_RETENTION_DAYS environment variable is required")
 
-        prefix = os.getenv("RETENTION_PREFIX", DEFAULT_PREFIX)
+        prefix = _normalise_s3_prefix(os.getenv("RETENTION_PREFIX", DEFAULT_PREFIX))
         endpoint_url = os.getenv("RETENTION_ENDPOINT")
         storage_class = os.getenv("RETENTION_STORAGE_CLASS")
 
-        snapshot_dir = Path(os.getenv("PROMETHEUS_SNAPSHOT_DIR", str(DEFAULT_PROMETHEUS_SNAPSHOT_DIR)))
-        audit_dir = Path(os.getenv("AUDIT_LOG_DIR", str(DEFAULT_AUDIT_LOG_DIR)))
-        oms_dir = Path(os.getenv("OMS_LOG_DIR", str(DEFAULT_OMS_LOG_DIR)))
-        tca_dir = Path(os.getenv("TCA_REPORT_DIR", str(DEFAULT_TCA_REPORT_DIR)))
+        snapshot_dir = _ensure_safe_directory(
+            Path(os.getenv("PROMETHEUS_SNAPSHOT_DIR", str(DEFAULT_PROMETHEUS_SNAPSHOT_DIR))),
+            "PROMETHEUS_SNAPSHOT_DIR",
+        )
+        audit_dir = _ensure_safe_directory(
+            Path(os.getenv("AUDIT_LOG_DIR", str(DEFAULT_AUDIT_LOG_DIR))),
+            "AUDIT_LOG_DIR",
+        )
+        oms_dir = _ensure_safe_directory(
+            Path(os.getenv("OMS_LOG_DIR", str(DEFAULT_OMS_LOG_DIR))),
+            "OMS_LOG_DIR",
+        )
+        tca_dir = _ensure_safe_directory(
+            Path(os.getenv("TCA_REPORT_DIR", str(DEFAULT_TCA_REPORT_DIR))),
+            "TCA_REPORT_DIR",
+        )
 
         return cls(
             prometheus_url=prometheus_url,
@@ -282,12 +336,54 @@ class RetentionArchiver:
                 LOGGER.debug("Failed to remove temporary archive %s", temp_path, exc_info=True)
 
     def _select_files(self, directory: Path, cutoff: dt.datetime) -> Iterable[Path]:
-        for path in directory.rglob("*"):
-            if not path.is_file():
-                continue
-            modified = dt.datetime.fromtimestamp(path.stat().st_mtime, tz=dt.timezone.utc)
-            if modified <= cutoff:
-                yield path
+        """Yield files under *directory* that are older than *cutoff*.
+
+        The walk intentionally refuses to follow or archive symlinked entries so
+        that attackers cannot smuggle arbitrary filesystem contents (for
+        example, ``/etc/passwd``) into the retention bundle by dropping
+        symlinks into the log directory.  Any file that ultimately resolves
+        outside the directory tree is ignored with an audit log warning.
+        """
+
+        root = directory.resolve()
+        for current_root, _, files in os.walk(directory, followlinks=False):
+            current_path = Path(current_root)
+            for name in files:
+                path = current_path / name
+                if path.is_symlink():
+                    LOGGER.warning(
+                        "Skipping symlinked file %s while archiving %s", path, directory
+                    )
+                    continue
+
+                try:
+                    resolved = path.resolve(strict=True)
+                except FileNotFoundError:
+                    LOGGER.warning(
+                        "Skipping %s because it disappeared during retention scan", path
+                    )
+                    continue
+
+                try:
+                    resolved.relative_to(root)
+                except ValueError:
+                    LOGGER.warning(
+                        "Skipping %s because it resolves outside of %s", path, directory
+                    )
+                    continue
+
+                try:
+                    modified = dt.datetime.fromtimestamp(
+                        resolved.stat().st_mtime, tz=dt.timezone.utc
+                    )
+                except FileNotFoundError:
+                    LOGGER.warning(
+                        "Skipping %s because it disappeared during retention scan", path
+                    )
+                    continue
+
+                if modified <= cutoff:
+                    yield path
 
     def _create_archive(self, destination: Path, root: Path, files: Iterable[Path]) -> int:
         size_bytes = 0
@@ -307,13 +403,13 @@ class RetentionArchiver:
         return digest.hexdigest()
 
     def _build_s3_key(self, now: dt.datetime, filename: str) -> str:
-        return "/".join(
-            [
-                self.config.prefix.rstrip("/"),
-                f"{now:%Y/%m/%d}",
-                filename,
-            ]
-        )
+        parts = []
+        prefix = self.config.prefix.strip("/")
+        if prefix:
+            parts.append(prefix)
+        parts.append(f"{now:%Y/%m/%d}")
+        parts.append(filename)
+        return "/".join(parts)
 
     def _upload_file(self, path: Path, key: str) -> None:
         extra_args: Dict[str, object] = {}
@@ -398,3 +494,4 @@ __all__ = [
     "configure_retention_archiver",
     "router",
 ]
+

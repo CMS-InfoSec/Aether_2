@@ -40,6 +40,8 @@ from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from services.common.security import require_admin_account
+from services.common.spot import require_spot_http
+from shared.postgres import normalize_sqlalchemy_dsn
 from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 try:  # pragma: no cover - optional audit dependency
@@ -1080,18 +1082,7 @@ def generate_daily_reports(target_date: date | None = None) -> list[TCAReportMod
 __all__ = ["app", "generate_daily_reports"]
 
 def _require_spot_symbol(symbol: object) -> str:
-    """Normalise *symbol* and ensure it references a supported spot market."""
+    """Normalise *symbol* and ensure it references a supported USD spot market."""
 
-    normalized = normalize_spot_symbol(symbol)
-    if not normalized:
-        raise HTTPException(status_code=422, detail="Symbol must be provided")
-
-    if not is_spot_symbol(normalized):
-        LOGGER.warning("Rejected non-spot symbol for TCA report", extra={"symbol": symbol})
-        raise HTTPException(
-            status_code=422,
-            detail=f"Symbol '{symbol}' is not a supported spot market instrument",
-        )
-
-    return normalized
+    return require_spot_http(symbol, logger=LOGGER)
 
