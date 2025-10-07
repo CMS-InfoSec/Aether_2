@@ -251,6 +251,15 @@ def test_normalise_local_artifact_base_path_rejects_file_symlink_parent(tmp_path
         _normalise_local_artifact_base_path(link / "artifacts")
 
 
+def test_normalise_local_artifact_base_path_rejects_missing_symlink_parent(tmp_path: Path) -> None:
+    missing = tmp_path / "missing"
+    link = tmp_path / "link"
+    link.symlink_to(missing, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="must exist"):
+        _normalise_local_artifact_base_path(link / "artifacts")
+
+
 def test_write_artifacts_s3_prefix_normalised(monkeypatch: pytest.MonkeyPatch) -> None:
     class _StubClient:
         def __init__(self) -> None:

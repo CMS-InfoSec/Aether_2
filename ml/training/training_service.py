@@ -59,7 +59,9 @@ def _resolve_artifact_root(raw: str | None, *, default: Path) -> Path:
                 resolved_ancestor = ancestor.resolve(strict=False)
             except OSError as exc:  # pragma: no cover - extremely unlikely on supported platforms
                 raise ValueError("TRAINING_ARTIFACT_ROOT symlink target could not be resolved") from exc
-            if resolved_ancestor.exists() and not resolved_ancestor.is_dir():
+            if not resolved_ancestor.exists():
+                raise ValueError("TRAINING_ARTIFACT_ROOT symlink targets must exist")
+            if not resolved_ancestor.is_dir():
                 raise ValueError("TRAINING_ARTIFACT_ROOT symlink targets must resolve to directories")
             try:
                 resolved_candidate.relative_to(resolved_ancestor)

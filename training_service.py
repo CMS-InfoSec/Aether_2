@@ -64,15 +64,28 @@ def _resolve_artifact_root(raw: str | None, *, default: Path) -> Path:
     if not candidate.is_absolute():
         candidate = Path.cwd() / candidate
 
-    for ancestor in (candidate,) + tuple(candidate.parents):
-        if ancestor.exists() and ancestor.is_symlink():
-            raise ValueError("TRAINING_ARTIFACT_ROOT must not reference symlinks")
+    resolved_candidate = candidate.resolve(strict=False)
 
-    if candidate.exists() and not candidate.is_dir():
+    if candidate.is_symlink():
+        raise ValueError("TRAINING_ARTIFACT_ROOT must not be a symlink")
+
+    for ancestor in candidate.parents:
+        if ancestor.is_symlink():
+            resolved = ancestor.resolve(strict=False)
+            if not resolved.exists():
+                raise ValueError("TRAINING_ARTIFACT_ROOT symlink targets must exist")
+            if not resolved.is_dir():
+                raise ValueError("TRAINING_ARTIFACT_ROOT symlink targets must resolve to directories")
+            try:
+                resolved_candidate.relative_to(resolved)
+            except ValueError:
+                raise ValueError("TRAINING_ARTIFACT_ROOT must not escape via symlinked ancestors")
+
+    if resolved_candidate.exists() and not resolved_candidate.is_dir():
         raise ValueError("TRAINING_ARTIFACT_ROOT must reference a directory")
 
-    candidate.mkdir(parents=True, exist_ok=True)
-    return candidate.resolve(strict=False)
+    resolved_candidate.mkdir(parents=True, exist_ok=True)
+    return resolved_candidate
 
 
 ARTIFACT_ROOT = _resolve_artifact_root(
