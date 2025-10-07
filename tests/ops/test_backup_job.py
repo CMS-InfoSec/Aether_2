@@ -40,6 +40,40 @@ def _make_config(artifact_dir: Path) -> BackupConfig:
     )
 
 
+def test_backup_config_normalises_bucket_prefix(tmp_path: Path) -> None:
+    config = BackupConfig(
+        pg_dsn="postgresql://localhost/postgres",
+        mlflow_artifact_dir=tmp_path,
+        bucket_name="dummy",
+        bucket_prefix=" backups//2024 / ",
+        encryption_key=b"\x00" * 16,
+    )
+
+    assert config.bucket_prefix == "backups/2024"
+
+
+def test_backup_config_rejects_traversal_in_bucket_prefix(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="path traversal"):
+        BackupConfig(
+            pg_dsn="postgresql://localhost/postgres",
+            mlflow_artifact_dir=tmp_path,
+            bucket_name="dummy",
+            bucket_prefix="../escape",
+            encryption_key=b"\x00" * 16,
+        )
+
+
+def test_backup_config_rejects_control_chars_in_bucket_prefix(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="control characters"):
+        BackupConfig(
+            pg_dsn="postgresql://localhost/postgres",
+            mlflow_artifact_dir=tmp_path,
+            bucket_name="dummy",
+            bucket_prefix="bad\x01prefix",
+            encryption_key=b"\x00" * 16,
+        )
+
+
 def test_safe_extract_tar_rejects_traversal(tmp_path: Path) -> None:
     archive_path = tmp_path / "malicious.tar.gz"
     _build_archive(archive_path, {"../evil.txt": b"malicious"})
