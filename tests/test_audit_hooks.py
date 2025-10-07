@@ -20,7 +20,7 @@ def test_hash_ip_fallback_produces_stable_hash(value, expected):
 
 
 def test_load_audit_hooks_degrades_when_dependency_missing(monkeypatch):
-    audit_hooks.load_audit_hooks.cache_clear()
+    audit_hooks.reset_audit_hooks_cache()
     original_import = builtins.__import__
 
     def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
@@ -37,11 +37,11 @@ def test_load_audit_hooks_degrades_when_dependency_missing(monkeypatch):
     assert hooks.hash_ip(" ") is None
     assert hooks.hash_ip("127.0.0.1") == hashlib.sha256("127.0.0.1".encode("utf-8")).hexdigest()
 
-    audit_hooks.load_audit_hooks.cache_clear()
+    audit_hooks.reset_audit_hooks_cache()
 
 
 def test_load_audit_hooks_caches_optional_import(monkeypatch):
-    audit_hooks.load_audit_hooks.cache_clear()
+    audit_hooks.reset_audit_hooks_cache()
     original_import = builtins.__import__
     import_counter = {"calls": 0}
 
@@ -58,7 +58,7 @@ def test_load_audit_hooks_caches_optional_import(monkeypatch):
     assert first is second
     assert import_counter["calls"] == 1
 
-    audit_hooks.load_audit_hooks.cache_clear()
+    audit_hooks.reset_audit_hooks_cache()
 
 
 def test_log_event_skips_when_logger_missing():
@@ -172,3 +172,35 @@ def test_log_event_with_fallback_handles_exceptions(caplog: pytest.LogCaptureFix
         record.levelno == logging.ERROR and "failed to record" in record.message
         for record in caplog.records
     )
+
+
+def test_temporary_audit_hooks_override_and_restore():
+    audit_hooks.reset_audit_hooks_cache()
+    sentinel = audit_hooks.AuditHooks(log=lambda **kwargs: None, hash_ip=lambda value: "sentinel")
+
+    with audit_hooks.temporary_audit_hooks(sentinel):
+        assert audit_hooks.load_audit_hooks() is sentinel
+        # The override should be returned on repeated calls without re-entering the context.
+        assert audit_hooks.load_audit_hooks() is sentinel
+
+    # Once the context exits the cached dependency-backed hooks are restored.
+    restored = audit_hooks.load_audit_hooks()
+    assert restored is not sentinel
+
+
+def test_temporary_audit_hooks_nest_cleanly():
+    audit_hooks.reset_audit_hooks_cache()
+    outer = audit_hooks.AuditHooks(log=lambda **kwargs: None, hash_ip=lambda value: "outer")
+    inner = audit_hooks.AuditHooks(log=lambda **kwargs: None, hash_ip=lambda value: "inner")
+
+    with audit_hooks.temporary_audit_hooks(outer):
+        assert audit_hooks.load_audit_hooks() is outer
+        with audit_hooks.temporary_audit_hooks(inner):
+            assert audit_hooks.load_audit_hooks() is inner
+        # After the inner context the outer override should still be active.
+        assert audit_hooks.load_audit_hooks() is outer
+
+    # After both contexts exit the dependency-backed hooks should be available again.
+    reset = audit_hooks.load_audit_hooks()
+    assert reset is not inner
+    assert reset is not outer

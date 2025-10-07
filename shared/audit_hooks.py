@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, Callable, Mapping, Optional, Protocol
+from typing import Any, Callable, Iterator, Mapping, Optional, Protocol
 
 
 class AuditCallable(Protocol):
@@ -85,7 +86,21 @@ class AuditHooks:
         return True
 
 
+_AUDIT_HOOK_OVERRIDE: AuditHooks | None = None
+
+
 @lru_cache(maxsize=1)
+def _load_audit_hooks_from_dependency() -> AuditHooks:
+    """Resolve the optional audit logging helpers from the shared module."""
+
+    try:  # pragma: no cover - import guarded for optional dependency
+        from common.utils.audit_logger import hash_ip, log_audit
+    except Exception:  # pragma: no cover - degrade gracefully when unavailable
+        return AuditHooks(log=None, hash_ip=_hash_ip_fallback)
+
+    return AuditHooks(log=log_audit, hash_ip=hash_ip)
+
+
 def load_audit_hooks() -> AuditHooks:
     """Return the configured audit logging helpers if available.
 
@@ -96,15 +111,44 @@ def load_audit_hooks() -> AuditHooks:
     encapsulates that import guard while retaining type information for
     downstream modules.  The resolved hooks are cached so repeated callers
     avoid importing the optional dependency multiple times; test suites can
-    force a reload by invoking :func:`load_audit_hooks.cache_clear`.
+    force a reload by invoking :func:`reset_audit_hooks_cache` (or the legacy
+    :func:`load_audit_hooks.cache_clear`).  During tests callers can override
+    the resolved hooks temporarily via :func:`temporary_audit_hooks`.
     """
 
-    try:  # pragma: no cover - import guarded for optional dependency
-        from common.utils.audit_logger import hash_ip, log_audit
-    except Exception:  # pragma: no cover - degrade gracefully when unavailable
-        return AuditHooks(log=None, hash_ip=_hash_ip_fallback)
+    override = _AUDIT_HOOK_OVERRIDE
+    if override is not None:
+        return override
 
-    return AuditHooks(log=log_audit, hash_ip=hash_ip)
+    return _load_audit_hooks_from_dependency()
+
+
+def reset_audit_hooks_cache() -> None:
+    """Clear cached audit hooks and remove any active overrides."""
+
+    global _AUDIT_HOOK_OVERRIDE
+    _AUDIT_HOOK_OVERRIDE = None
+    _load_audit_hooks_from_dependency.cache_clear()
+
+
+@contextmanager
+def temporary_audit_hooks(hooks: AuditHooks) -> Iterator[None]:
+    """Temporarily override the resolved audit hooks.
+
+    The override applies to subsequent :func:`load_audit_hooks` calls within
+    the ``with`` block, allowing tests to simulate the optional dependency
+    being present or absent without mutating import state globally.  Nested
+    overrides restore the previous hooks when exiting their respective
+    contexts.
+    """
+
+    global _AUDIT_HOOK_OVERRIDE
+    previous = _AUDIT_HOOK_OVERRIDE
+    _AUDIT_HOOK_OVERRIDE = hooks
+    try:
+        yield
+    finally:
+        _AUDIT_HOOK_OVERRIDE = previous
 
 
 def log_event_with_fallback(
@@ -158,5 +202,19 @@ __all__ = [
     "HashIpCallable",
     "load_audit_hooks",
     "log_event_with_fallback",
+    "reset_audit_hooks_cache",
+    "temporary_audit_hooks",
 ]
+
+
+def _cache_clear_wrapper() -> None:
+    reset_audit_hooks_cache()
+
+
+def _cache_info_wrapper() -> Any:
+    return _load_audit_hooks_from_dependency.cache_info()
+
+
+load_audit_hooks.cache_clear = _cache_clear_wrapper  # type: ignore[attr-defined]
+load_audit_hooks.cache_info = _cache_info_wrapper  # type: ignore[attr-defined]
 
