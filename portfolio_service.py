@@ -271,7 +271,7 @@ async def get_positions(
     _: str = Depends(require_admin_account),
     limit: int = Query(100, ge=1, le=10_000),
     offset: int = Query(0, ge=0),
-    format: str | None = Query(None, regex="^(json|csv)$"),
+    format: str | None = Query(None, pattern="^(json|csv)$"),
 ):
     rows = _query_records(
         request,
@@ -302,7 +302,7 @@ async def get_pnl(
     to_ts: str | None = Query(None, alias="to"),
     limit: int = Query(500, ge=1, le=50_000),
     offset: int = Query(0, ge=0),
-    format: str | None = Query(None, regex="^(json|csv)$"),
+    format: str | None = Query(None, pattern="^(json|csv)$"),
 ):
     start = _parse_datetime(from_ts)
     end = _parse_datetime(to_ts)
@@ -335,7 +335,7 @@ async def get_orders(
     to_ts: str | None = Query(None, alias="to"),
     limit: int = Query(500, ge=1, le=50_000),
     offset: int = Query(0, ge=0),
-    format: str | None = Query(None, regex="^(json|csv)$"),
+    format: str | None = Query(None, pattern="^(json|csv)$"),
 ):
     start = _parse_datetime(from_ts)
     end = _parse_datetime(to_ts)
@@ -368,7 +368,7 @@ async def get_fills(
     to_ts: str | None = Query(None, alias="to"),
     limit: int = Query(500, ge=1, le=50_000),
     offset: int = Query(0, ge=0),
-    format: str | None = Query(None, regex="^(json|csv)$"),
+    format: str | None = Query(None, pattern="^(json|csv)$"),
 ):
     start = _parse_datetime(from_ts)
     end = _parse_datetime(to_ts)
