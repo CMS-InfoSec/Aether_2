@@ -450,11 +450,14 @@ def validate_kraken_credentials(
 ) -> bool:
     account_reference = account_id or _mask_identifier(api_key)
     if not _looks_base64(api_secret):
-        LOGGER.info(
-            "Skipping Kraken credential validation for %s because secret is not base64 encoded",
+        LOGGER.warning(
+            "Kraken credential validation rejected for %s: secret is not base64 encoded",
             account_reference,
         )
-        return True
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Kraken API secret must be base64 encoded.",
+        )
     try:
         return _run_validation(api_key, api_secret, account_reference)
     except HTTPException:
