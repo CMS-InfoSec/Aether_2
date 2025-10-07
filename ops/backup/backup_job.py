@@ -54,6 +54,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
+from common.utils.tar import safe_extract_tar
+
 try:  # pragma: no cover - optional dependency for operational runtime
     import boto3
 except Exception:  # pragma: no cover - boto3 not required for static analysis
@@ -82,6 +84,26 @@ DEFAULT_NONCE_SIZE = 12
 MANIFEST_NAME = "manifest.json"
 
 
+def _normalise_bucket_prefix(prefix: str | None) -> str:
+    """Return a sanitised S3 prefix for backup archives."""
+
+    if not prefix:
+        return ""
+
+    segments: list[str] = []
+    for raw_segment in prefix.replace("\\", "/").split("/"):
+        segment = raw_segment.strip()
+        if not segment:
+            continue
+        if segment in {".", ".."}:
+            raise ValueError("LINODE_PREFIX must not contain path traversal sequences")
+        if any(ord(char) < 32 for char in segment):
+            raise ValueError("LINODE_PREFIX must not contain control characters")
+        segments.append(segment)
+
+    return "/".join(segments)
+
+
 @dataclass
 class BackupConfig:
     """Configuration for the backup job."""
@@ -99,6 +121,9 @@ class BackupConfig:
     pg_database: Optional[str] = None
     retention_days: Optional[int] = None
     encryption_key: bytes = b""
+
+    def __post_init__(self) -> None:
+        self.bucket_prefix = _normalise_bucket_prefix(self.bucket_prefix)
 
     @classmethod
     def from_env(cls) -> "BackupConfig":
@@ -158,8 +183,8 @@ class BackupArtifact:
     sha256: str
     size_bytes: int
     nonce_b64: str
-    encryption: str = "AESGCM"
     type: str
+    encryption: str = "AESGCM"
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -499,15 +524,29 @@ class BackupJob:
 
     def _restore_mlflow_artifacts(self, archive_path: Path) -> None:
         target_dir = self.config.mlflow_artifact_dir
+        if not target_dir.is_absolute():
+            raise ValueError("MLflow artifact directory must be absolute")
+
+        for ancestor in (target_dir,) + tuple(target_dir.parents):
+            if ancestor.exists() and ancestor.is_symlink():
+                raise ValueError("MLflow artifact directory must not reference symlinks")
+
         LOGGER.info("Restoring MLflow artifacts to %s", target_dir)
         backup_dir = target_dir.with_suffix(".bak")
         if target_dir.exists():
+            if target_dir.is_symlink():
+                raise ValueError("MLflow artifact directory must not be a symlink")
             if backup_dir.exists():
+                if backup_dir.is_symlink():
+                    raise ValueError("MLflow artifact backup path must not be a symlink")
                 shutil.rmtree(backup_dir)
             target_dir.rename(backup_dir)
         target_dir.mkdir(parents=True, exist_ok=True)
+        parent_dir = target_dir.parent
+        if parent_dir.exists() and parent_dir.is_symlink():
+            raise ValueError("MLflow artifact parent directory must not be a symlink")
         with tarfile.open(archive_path, "r:gz") as archive:
-            archive.extractall(path=target_dir.parent)
+            safe_extract_tar(archive, parent_dir)
         # tarball contains original directory name; move contents to target
         extracted_root = target_dir.parent / target_dir.name
         if extracted_root.exists() and extracted_root != target_dir:

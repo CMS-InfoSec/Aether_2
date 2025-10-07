@@ -354,7 +354,8 @@ from services.common.security import ADMIN_ACCOUNTS, require_admin_account
 from services.policy.trade_intensity_controller import (
     controller as trade_intensity_controller,
 )
-from shared.spot import is_spot_symbol, normalize_spot_symbol
+from services.common.spot import require_spot_http
+from shared.spot import require_spot_symbol
 
 
 class PolicyDecisionRequest(BaseModel):
@@ -384,10 +385,7 @@ class PolicyDecisionRequest(BaseModel):
     @field_validator("symbol")
     @classmethod
     def _validate_symbol(cls, value: str) -> str:
-        normalized = normalize_spot_symbol(value)
-        if not is_spot_symbol(normalized):
-            raise ValueError("Only spot market instruments are supported.")
-        return normalized
+        return require_spot_symbol(value)
 
 
 class PolicyIntent(BaseModel):
@@ -788,6 +786,8 @@ def get_trade_intensity(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account must be an authorized admin.",
         )
+
+    symbol = require_spot_http(symbol)
 
     payload = trade_intensity_controller.evaluate(
         account_id=account_id,
