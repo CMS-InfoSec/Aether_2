@@ -24,6 +24,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.pool import StaticPool
 
 from shared.postgres import normalize_sqlalchemy_dsn
+from shared.spot import require_spot_symbol
 
 
 LOGGER = logging.getLogger(__name__)
@@ -115,7 +116,7 @@ class TimescaleMarketDataAdapter:
     # Public API
     # ------------------------------------------------------------------
     def recent_trades(self, symbol: str, window: int) -> Sequence[Trade]:
-        normalized = symbol.strip().upper()
+        normalized = require_spot_symbol(symbol)
         start = datetime.now(timezone.utc) - timedelta(seconds=max(1, window))
         limit = max(50, min(1000, window // 2))
 
@@ -137,7 +138,10 @@ class TimescaleMarketDataAdapter:
 
         try:
             with self._engine.connect() as conn:
-                rows = conn.execute(stmt, {"symbol": normalized, "start": start, "limit": limit}).all()
+                rows = conn.execute(
+                    stmt,
+                    {"symbol": normalized, "start": start, "limit": limit},
+                ).all()
         except SQLAlchemyError as exc:
             LOGGER.exception("Failed to load trades for %s", normalized)
             raise MarketDataUnavailable(f"Unable to load trades for {normalized}") from exc
@@ -160,7 +164,7 @@ class TimescaleMarketDataAdapter:
         return trades
 
     def order_book_snapshot(self, symbol: str, depth: int = 10) -> Mapping[str, Sequence[Sequence[float]]]:
-        normalized = symbol.strip().upper()
+        normalized = require_spot_symbol(symbol)
         stmt = text(
             f"""
             SELECT bids, asks, as_of
@@ -191,7 +195,7 @@ class TimescaleMarketDataAdapter:
         return {"bids": bids, "asks": asks, "as_of": as_of}
 
     def price_history(self, symbol: str, length: int) -> Sequence[float]:
-        normalized = symbol.strip().upper()
+        normalized = require_spot_symbol(symbol)
         stmt = text(
             f"""
             SELECT close, bucket_start
@@ -229,7 +233,8 @@ class TimescaleMarketDataAdapter:
     def latest_price_timestamp(self, symbol: str) -> datetime | None:
         """Return the timestamp of the last price observation for ``symbol``."""
 
-        return self._price_timestamps.get(symbol.strip().upper())
+        normalized = require_spot_symbol(symbol)
+        return self._price_timestamps.get(normalized)
 
     @staticmethod
     def _coerce_datetime(value: object) -> datetime | None:
