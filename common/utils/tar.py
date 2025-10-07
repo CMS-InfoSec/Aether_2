@@ -33,40 +33,6 @@ def safe_extract_tar(archive: tarfile.TarFile, destination: Path) -> None:
     destination_resolved = destination.resolve(strict=True)
     members = archive.getmembers()
 
-    def _sanitise_metadata(member: tarfile.TarInfo) -> tarfile.TarInfo:
-        """Emulate the Python 3.12 ``filter="data"`` behaviour for metadata."""
-
-        replacements = {}
-
-        if member.mode is not None:
-            safe_mode = member.mode & 0o755
-
-            if member.isfile():
-                if not safe_mode & 0o100:
-                    safe_mode &= ~0o111
-                safe_mode |= 0o600
-            elif member.isdir():
-                safe_mode = None
-            else:  # pragma: no cover - defensive programming
-                raise ValueError("Tar archive entries must be regular files or directories")
-
-            if safe_mode != member.mode:
-                replacements["mode"] = safe_mode
-
-        if member.uid is not None:
-            replacements["uid"] = None
-        if member.gid is not None:
-            replacements["gid"] = None
-        if member.uname is not None:
-            replacements["uname"] = None
-        if member.gname is not None:
-            replacements["gname"] = None
-
-        if replacements:
-            member = member.replace(**replacements)
-
-        return member
-
     for member in members:
         if not (member.isfile() or member.isdir()):
             raise ValueError("Tar archive entries must be regular files or directories")
@@ -84,9 +50,7 @@ def safe_extract_tar(archive: tarfile.TarFile, destination: Path) -> None:
         except ValueError as exc:  # pragma: no cover - defensive programming
             raise ValueError("Tar archive entry escapes extraction directory") from exc
 
-    sanitised_members = [_sanitise_metadata(member) for member in members]
-
-    archive.extractall(path=destination_resolved, members=sanitised_members)
+    archive.extractall(path=destination_resolved, filter="data")
 
 
 __all__ = ["safe_extract_tar"]
