@@ -83,7 +83,7 @@ def _audit_transition(
 
     try:
         client = request.client.host if request.client else None
-        ip_hash = _HASH_IP(client) if _HASH_IP is not None else None
+        ip_hash = _HASH_IP(client)
         _LOG_AUDIT(
             actor=actor,
             action="sim_mode.transition",

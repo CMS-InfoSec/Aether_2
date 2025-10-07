@@ -88,12 +88,7 @@ from shared.audit_hooks import load_audit_hooks
 
 _AUDIT_HOOKS = load_audit_hooks()
 chain_log_audit = _AUDIT_HOOKS.log
-if _AUDIT_HOOKS.hash_ip is not None:
-    audit_chain_hash_ip = _AUDIT_HOOKS.hash_ip
-else:
-
-    def audit_chain_hash_ip(_: Optional[str]) -> Optional[str]:  # type: ignore[override]
-        return None
+audit_chain_hash_ip = _AUDIT_HOOKS.hash_ip
 
 try:  # pragma: no cover - OMS watcher is optional in some runtimes
     from services.oms.oms_kraken import KrakenCredentialWatcher
