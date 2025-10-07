@@ -23,7 +23,36 @@ router = APIRouter(prefix="/system", tags=["system"])
 
 portfolio_aggregator = portfolio_risk.aggregator
 
-_SIM_MODE_STATE_PATH = Path(os.getenv("SIM_MODE_STATE_PATH", "simulation_mode_state.json"))
+
+def _ensure_safe_state_path(path: Path, *, env_var: str) -> Path:
+    """Validate and return a filesystem path for simulation state tracking."""
+
+    if not path.is_absolute():
+        raise ValueError(f"{env_var} must be an absolute path")
+
+    if any(part in {".", ".."} for part in path.parts[1:]):
+        raise ValueError(f"{env_var} must not contain path traversal sequences")
+
+    for ancestor in (path,) + tuple(path.parents):
+        if ancestor.is_symlink():
+            raise ValueError(f"{env_var} must not reference symlinks")
+
+    return path
+
+
+def _resolve_sim_mode_state_path() -> Path:
+    """Return a sanitized path for the simulation mode state file."""
+
+    raw = os.getenv("SIM_MODE_STATE_PATH")
+    if raw:
+        candidate = Path(raw).expanduser()
+        return _ensure_safe_state_path(candidate, env_var="SIM_MODE_STATE_PATH")
+
+    default_path = Path.cwd() / "simulation_mode_state.json"
+    return _ensure_safe_state_path(default_path, env_var="SIM_MODE_STATE_PATH default")
+
+
+_SIM_MODE_STATE_PATH = _resolve_sim_mode_state_path()
 
 
 def _coerce_mapping(value: Any) -> Mapping[str, Any]:
@@ -129,6 +158,12 @@ def _diversification_summary() -> Dict[str, Any]:
 
 def _load_sim_mode_file() -> Optional[Dict[str, Any]]:
     if not _SIM_MODE_STATE_PATH.exists():
+        return None
+    if _SIM_MODE_STATE_PATH.is_symlink():
+        LOGGER.warning(
+            "Refusing to read simulation mode state from symlink",
+            extra={"path": str(_SIM_MODE_STATE_PATH)},
+        )
         return None
     try:
         payload = json.loads(_SIM_MODE_STATE_PATH.read_text())
