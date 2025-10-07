@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import datetime as dt
 import io
 import json
@@ -11,7 +12,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping
 
 import markdown2
-import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
 from reportlab.lib import colors
@@ -254,17 +254,24 @@ class LogExporter:
         return artifacts
 
     def _render_csv_bytes(self, combined: Mapping[str, List[Dict[str, Any]]]) -> bytes:
-        frames = []
+        headers: list[str] = []
+        seen: set[str] = set()
+        for rows in combined.values():
+            for row in rows:
+                for key in row.keys():
+                    if key not in seen:
+                        seen.add(key)
+                        headers.append(key)
+
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator="\n")
+        writer.writerow(["log_type", *headers])
         for name, rows in combined.items():
-            frame = pd.DataFrame(rows)
-            frame.insert(0, "log_type", name)
-            frames.append(frame)
-        if frames:
-            df = pd.concat(frames, ignore_index=True, sort=False)
-        else:
-            df = pd.DataFrame(columns=["log_type"])
-        df = df.fillna("")
-        return df.to_csv(index=False).encode("utf-8")
+            for row in rows:
+                record = [row.get(header, "") for header in headers]
+                values = ["" if value is None else str(value) for value in record]
+                writer.writerow([name, *values])
+        return buffer.getvalue().encode("utf-8")
 
     def _render_markdown_bytes(
         self,

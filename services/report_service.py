@@ -13,13 +13,13 @@ from datetime import date, datetime, timedelta, timezone
 from statistics import mean
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, MutableMapping, Optional, Sequence
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from psycopg2 import sql
 from psycopg2.extras import RealDictCursor
 
 from reports.storage import ArtifactStorage, StoredArtifact, TimescaleSession as StorageSession, build_storage_from_env
 from services.common.config import TimescaleSession, get_timescale_session
-from services.common.security import require_admin_account
+from services.common.security import ensure_admin_access
 
 
 DAILY_ACCOUNT_PNL_QUERY = """
@@ -368,12 +368,13 @@ def get_report_service() -> ReportService:
 
 @router.get("/xai")
 async def recent_xai(
+    request: Request,
     account_id: Optional[str] = Query(default=None),
-    _: str = Depends(require_admin_account),
+    service: ReportService = Depends(get_report_service),
 ) -> Dict[str, Any]:
     """Return aggregated SHAP explanations for recent trades."""
 
-    service = get_report_service()
+    await ensure_admin_access(request, forbid_on_missing_token=True)
     try:
         payload = service.recent_feature_attribution(account_id=account_id)
     except ValueError as exc:  # No data available for requested account
