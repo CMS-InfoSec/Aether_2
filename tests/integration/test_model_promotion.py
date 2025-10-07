@@ -182,7 +182,7 @@ def test_model_promotion_and_rollback(monkeypatch) -> None:
             model_variant=variant,
         )
 
-    baseline_intent = infer()
+    infer()
     baseline_model_name = client_stub.last_loaded_name(model_key)
     baseline_version = client_stub.current_version(model_key)
 
