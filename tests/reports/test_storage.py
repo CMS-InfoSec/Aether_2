@@ -135,3 +135,40 @@ def test_store_artifact_logs_target_descriptor_on_audit_failure_s3(
         in message
         for message in messages
     )
+
+
+def test_store_artifact_rejects_object_key_traversal(tmp_path: Path) -> None:
+    storage = ArtifactStorage(tmp_path)
+    session = StubSession()
+
+    with pytest.raises(ValueError) as excinfo:
+        storage.store_artifact(
+            session,
+            account_id="acct-123",
+            object_key="../secrets.txt",
+            data=b"payload",
+            content_type="text/plain",
+        )
+
+    assert "path traversal" in str(excinfo.value)
+    # Ensure nothing was written to disk and no audit record attempted.
+    assert not any(tmp_path.iterdir())
+    assert not session.executions
+
+
+def test_store_artifact_rejects_account_traversal(tmp_path: Path) -> None:
+    storage = ArtifactStorage(tmp_path)
+    session = StubSession()
+
+    with pytest.raises(ValueError) as excinfo:
+        storage.store_artifact(
+            session,
+            account_id="../../acct-123",
+            object_key="reports/output.csv",
+            data=b"payload",
+            content_type="text/csv",
+        )
+
+    assert "path traversal" in str(excinfo.value)
+    assert not any(tmp_path.iterdir())
+    assert not session.executions
