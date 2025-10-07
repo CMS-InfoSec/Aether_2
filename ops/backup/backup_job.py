@@ -51,7 +51,7 @@ import tarfile
 import tempfile
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Dict, Iterable, List, Optional
 
 from common.utils.tar import safe_extract_tar
@@ -84,6 +84,26 @@ DEFAULT_NONCE_SIZE = 12
 MANIFEST_NAME = "manifest.json"
 
 
+def _normalise_bucket_prefix(prefix: str | None) -> str:
+    """Return a sanitised S3 prefix for backup archives."""
+
+    if not prefix:
+        return ""
+
+    segments: list[str] = []
+    for raw_segment in prefix.replace("\\", "/").split("/"):
+        segment = raw_segment.strip()
+        if not segment:
+            continue
+        if segment in {".", ".."}:
+            raise ValueError("LINODE_PREFIX must not contain path traversal sequences")
+        if any(ord(char) < 32 for char in segment):
+            raise ValueError("LINODE_PREFIX must not contain control characters")
+        segments.append(segment)
+
+    return "/".join(segments)
+
+
 @dataclass
 class BackupConfig:
     """Configuration for the backup job."""
@@ -101,6 +121,9 @@ class BackupConfig:
     pg_database: Optional[str] = None
     retention_days: Optional[int] = None
     encryption_key: bytes = b""
+
+    def __post_init__(self) -> None:
+        self.bucket_prefix = _normalise_bucket_prefix(self.bucket_prefix)
 
     @classmethod
     def from_env(cls) -> "BackupConfig":
@@ -173,6 +196,38 @@ class BackupArtifact:
             "nonce": self.nonce_b64,
             "encryption": self.encryption,
         }
+
+
+def _safe_extract_tar(archive: tarfile.TarFile, destination: Path) -> None:
+    """Safely extract ``archive`` into ``destination``.
+
+    Each archive member is validated to ensure it is a relative path located
+    within ``destination``.  Absolute paths, traversal sequences, and entries
+    that would resolve outside of the destination directory raise
+    ``ValueError`` and prevent any extraction.
+    """
+
+    destination_resolved = destination.resolve()
+    members = archive.getmembers()
+
+    for member in members:
+        if not (member.isfile() or member.isdir()):
+            raise ValueError("Tar archive entries must be regular files or directories")
+
+        member_path = PurePosixPath(member.name)
+        if member_path.is_absolute():
+            raise ValueError("Tar archive entries must be relative paths")
+        if any(part == ".." for part in member_path.parts):
+            raise ValueError("Tar archive entries must not contain traversal sequences")
+
+        candidate = destination_resolved.joinpath(Path(*member_path.parts))
+        resolved_candidate = candidate.resolve(strict=False)
+        try:
+            resolved_candidate.relative_to(destination_resolved)
+        except ValueError as exc:
+            raise ValueError("Tar archive entry escapes extraction directory") from exc
+
+    archive.extractall(path=destination_resolved, filter="data")
 
 
 class BackupJob:
