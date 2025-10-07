@@ -293,6 +293,50 @@ def test_log_event_with_fallback_uses_fallback_hash_on_error(caplog: pytest.LogC
     }
 
 
+def test_log_event_with_fallback_reuses_resolved_hash(caplog: pytest.LogCaptureFixture):
+    hash_calls = {"count": 0}
+
+    def tracking_hash(value: Optional[str]) -> Optional[str]:
+        hash_calls["count"] += 1
+        return f"hash:{value}"
+
+    captured = []
+
+    def fake_log(**payload):
+        captured.append(payload)
+
+    hooks = audit_hooks.AuditHooks(log=fake_log, hash_ip=tracking_hash)
+    logger = logging.getLogger("test.audit.single_hash")
+
+    with caplog.at_level(logging.ERROR, logger="shared.audit_hooks"):
+        result = audit_hooks.log_event_with_fallback(
+            hooks,
+            logger,
+            actor="kelly",
+            action="demo.single",
+            entity="resource",
+            before={"before": True},
+            after={"after": True},
+            ip_address="203.0.113.5",
+            failure_message="should not trigger",
+        )
+
+    assert result.handled is True
+    assert result.ip_hash == "hash:203.0.113.5"
+    assert hash_calls["count"] == 1
+    assert captured == [
+        {
+            "actor": "kelly",
+            "action": "demo.single",
+            "entity": "resource",
+            "before": {"before": True},
+            "after": {"after": True},
+            "ip_hash": "hash:203.0.113.5",
+        }
+    ]
+    assert not [record for record in caplog.records if record.name == "shared.audit_hooks"]
+
+
 def test_log_event_falls_back_when_hash_raises(caplog: pytest.LogCaptureFixture):
     captured = {}
 

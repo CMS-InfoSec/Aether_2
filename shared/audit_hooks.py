@@ -108,30 +108,45 @@ class AuditHooks:
         after: Mapping[str, Any],
         ip_address: Optional[str] = None,
         ip_hash: Optional[str] = None,
+        resolved_ip_hash: ResolvedIpHash | None = None,
     ) -> AuditLogResult:
         """Record an audit entry when the optional logger is available.
 
         The helper mirrors :func:`common.utils.audit_logger.log_audit` while
         deferring hashing logic to the configured :func:`hash_ip` callback.  It
         returns an :class:`AuditLogResult` describing whether the optional
-        dependency handled the event and capturing any fallback metadata.
+        dependency handled the event and capturing any fallback metadata.  When
+        ``resolved_ip_hash`` is supplied the method will reuse the precomputed
+        hash outcome instead of invoking :meth:`resolve_ip_hash` again, allowing
+        callers to avoid duplicate hashing or double-logging of failures.
         """
 
         log_callable = self.log
         if log_callable is None:
+            resolved = resolved_ip_hash
+            if resolved is None:
+                resolved = ResolvedIpHash(
+                    value=ip_hash,
+                    fallback=False,
+                    error=None,
+                )
             return AuditLogResult(
                 handled=False,
-                ip_hash=ip_hash,
-                hash_fallback=False,
-                hash_error=None,
+                ip_hash=resolved.value,
+                hash_fallback=resolved.fallback,
+                hash_error=resolved.error,
             )
 
-        resolved = self.resolve_ip_hash(
-            ip_address=ip_address,
-            ip_hash=ip_hash,
-        )
+        computed_resolved = False
+        resolved = resolved_ip_hash
+        if resolved is None:
+            computed_resolved = True
+            resolved = self.resolve_ip_hash(
+                ip_address=ip_address,
+                ip_hash=ip_hash,
+            )
 
-        if resolved.error is not None:
+        if resolved.error is not None and computed_resolved:
             LOGGER.error(
                 "Audit hash_ip callable failed; using fallback hash.",
                 extra=_build_audit_log_extra(
@@ -372,6 +387,7 @@ def log_event_with_fallback(
             after=after,
             ip_address=ip_address,
             ip_hash=resolved.value,
+            resolved_ip_hash=resolved,
         )
     except Exception as exc:
         logger.exception(failure_message, extra=log_extra)
