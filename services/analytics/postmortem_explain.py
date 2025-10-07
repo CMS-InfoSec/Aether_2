@@ -16,9 +16,11 @@ in offline environments and during unit tests.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import logging
+import os
 import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -102,12 +104,99 @@ class FeatureVector:
         }
 
 
-def _ensure_artifact_root() -> None:
+def _ensure_artifact_root() -> Path:
+    """Ensure the artifact root exists without relying on symlinks."""
+
     try:
         ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
     except Exception as exc:  # pragma: no cover - filesystem failure is unlikely
         LOGGER.error("Failed to ensure artifact directory %s: %s", ARTIFACT_ROOT, exc)
         raise HTTPException(status_code=500, detail="Unable to prepare artifact directory") from exc
+
+    candidate = ARTIFACT_ROOT
+    while True:
+        if candidate.is_symlink():
+            LOGGER.error("Artifact storage path %s must not be a symlink", candidate)
+            raise HTTPException(
+                status_code=500,
+                detail="Artifact storage path must not contain symlinks",
+            )
+        parent = candidate.parent
+        if parent == candidate:
+            break
+        candidate = parent
+
+    try:
+        resolved = ARTIFACT_ROOT.resolve(strict=True)
+    except FileNotFoundError as exc:  # pragma: no cover - race during teardown
+        LOGGER.error("Artifact directory vanished while resolving: %s", ARTIFACT_ROOT)
+        raise HTTPException(status_code=500, detail="Artifact storage is unavailable") from exc
+
+    return resolved
+
+
+def _assert_within_root(root: Path, candidate: Path) -> None:
+    root_path = str(root)
+    candidate_path = str(candidate)
+    if os.path.commonpath([candidate_path, root_path]) != root_path:
+        LOGGER.error("Resolved artifact path %s escapes root %s", candidate, root)
+        raise HTTPException(
+            status_code=500,
+            detail="Artifact storage path escaped base directory",
+        )
+
+
+def _ensure_safe_directory(root: Path, *parts: str) -> Path:
+    current = root
+    for part in parts:
+        if not part:
+            continue
+        current = current / part
+        if current.exists() and current.is_symlink():
+            LOGGER.error("Refusing to traverse symlinked directory %s", current)
+            raise HTTPException(
+                status_code=500,
+                detail="Artifact storage path must not contain symlinks",
+            )
+        if not current.exists():
+            current.mkdir()
+        _assert_within_root(root, current.resolve(strict=True))
+    return current
+
+
+def _ensure_file_target_safe(root: Path, path: Path) -> None:
+    parent = path.parent
+    _assert_within_root(root, parent.resolve(strict=True))
+    if path.exists() and path.is_symlink():
+        LOGGER.error("Refusing to write artifact to symlinked path %s", path)
+        raise HTTPException(
+            status_code=500,
+            detail="Artifact storage path must not contain symlinks",
+        )
+
+
+def _write_bytes_secure(path: Path, payload: bytes) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    mode = 0o600
+
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW  # pragma: no cover - platform specific branch
+
+    try:
+        fd = os.open(path, flags, mode)
+    except AttributeError:  # pragma: no cover - Windows / limited platforms
+        path.write_bytes(payload)
+        return
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.EPERM}:
+            raise HTTPException(
+                status_code=500,
+                detail="Artifact storage path must not contain symlinks",
+            ) from exc
+        raise
+
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(payload)
 
 
 def _seed_from_identifier(identifier: str) -> int:
@@ -218,18 +307,20 @@ def _html_report(vector: FeatureVector, shap_values: Mapping[str, float], rankin
 
 
 def _persist_artifacts(payload: Mapping[str, object], html_report: str) -> Dict[str, str]:
-    _ensure_artifact_root()
+    root = _ensure_artifact_root()
 
     serialized = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
     digest = hashlib.sha256(serialized).hexdigest()
-    shard_dir = ARTIFACT_ROOT / digest[:2] / digest[2:4]
-    shard_dir.mkdir(parents=True, exist_ok=True)
+    shard_dir = _ensure_safe_directory(root, digest[:2], digest[2:4])
 
     json_path = shard_dir / f"{digest}.json"
     html_path = shard_dir / f"{digest}.html"
 
-    json_path.write_bytes(serialized)
-    html_path.write_text(html_report, encoding="utf-8")
+    _ensure_file_target_safe(root, json_path)
+    _ensure_file_target_safe(root, html_path)
+
+    _write_bytes_secure(json_path, serialized)
+    _write_bytes_secure(html_path, html_report.encode("utf-8"))
 
     return {"json": str(json_path), "html": str(html_path), "hash": digest}
 
