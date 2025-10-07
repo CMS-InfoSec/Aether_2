@@ -188,6 +188,9 @@ def _safe_extract_tar(archive: tarfile.TarFile, destination: Path) -> None:
     members = archive.getmembers()
 
     for member in members:
+        if not (member.isfile() or member.isdir()):
+            raise ValueError("Tar archive entries must be regular files or directories")
+
         member_path = PurePosixPath(member.name)
         if member_path.is_absolute():
             raise ValueError("Tar archive entries must be relative paths")
@@ -552,7 +555,7 @@ class BackupJob:
         if parent_dir.exists() and parent_dir.is_symlink():
             raise ValueError("MLflow artifact parent directory must not be a symlink")
         with tarfile.open(archive_path, "r:gz") as archive:
-            safe_extract_tar(archive, parent_dir)
+            _safe_extract_tar(archive, parent_dir)
         # tarball contains original directory name; move contents to target
         extracted_root = target_dir.parent / target_dir.name
         if extracted_root.exists() and extracted_root != target_dir:
