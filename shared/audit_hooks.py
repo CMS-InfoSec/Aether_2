@@ -47,6 +47,22 @@ class AuditEvent:
     context: Optional[Mapping[str, Any]] = None
     context_factory: ContextFactory | None = None
 
+    def resolve_ip_hash(self, hooks: "AuditHooks") -> "ResolvedIpHash":
+        """Resolve the event's hashed IP using the provided hooks.
+
+        The helper delegates to :meth:`AuditHooks.resolve_ip_hash` so callers
+        can pre-compute the hash outcome (including any fallback metadata)
+        before handing control to :func:`log_event_with_fallback` or the
+        service-level wrappers.  The stored ``ip_hash`` is respected when
+        present, avoiding redundant hashing, while ``ip_address`` is hashed on
+        demand and retains the shared error-handling semantics.
+        """
+
+        return hooks.resolve_ip_hash(
+            ip_address=self.ip_address,
+            ip_hash=self.ip_hash,
+        )
+
     def log_with_fallback(
         self,
         hooks: "AuditHooks",

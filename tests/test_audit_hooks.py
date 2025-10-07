@@ -1134,3 +1134,74 @@ def test_audit_event_with_ip_hash_updates_immutably():
 
     unchanged = updated.with_ip_hash("hash")
     assert unchanged is updated
+
+
+def test_audit_event_resolve_ip_hash_reuses_explicit_hash():
+    hooks = audit_hooks.AuditHooks(
+        log=None,
+        hash_ip=lambda value: pytest.fail("hash_ip should not be invoked"),
+    )
+
+    event = audit_hooks.AuditEvent(
+        actor="oliver",
+        action="demo.event.resolve",
+        entity="resource",
+        before={},
+        after={},
+        ip_hash="provided-hash",
+    )
+
+    resolved = event.resolve_ip_hash(hooks)
+
+    assert isinstance(resolved, audit_hooks.ResolvedIpHash)
+    assert resolved.value == "provided-hash"
+    assert resolved.fallback is False
+    assert resolved.error is None
+
+
+def test_audit_event_resolve_ip_hash_hashes_missing_value():
+    calls: List[Optional[str]] = []
+
+    def tracking_hash(value: Optional[str]) -> Optional[str]:
+        calls.append(value)
+        return f"hashed:{value}"
+
+    hooks = audit_hooks.AuditHooks(log=None, hash_ip=tracking_hash)
+
+    event = audit_hooks.AuditEvent(
+        actor="piper",
+        action="demo.event.hash",
+        entity="resource",
+        before={},
+        after={},
+        ip_address="203.0.113.42",
+    )
+
+    resolved = event.resolve_ip_hash(hooks)
+
+    assert resolved.value == "hashed:203.0.113.42"
+    assert resolved.fallback is False
+    assert resolved.error is None
+    assert calls == ["203.0.113.42"]
+
+
+def test_audit_event_resolve_ip_hash_preserves_fallback_metadata():
+    def failing_hash(value: Optional[str]) -> Optional[str]:
+        raise RuntimeError("hash failure")
+
+    hooks = audit_hooks.AuditHooks(log=None, hash_ip=failing_hash)
+
+    event = audit_hooks.AuditEvent(
+        actor="quinn",
+        action="demo.event.fallback",
+        entity="resource",
+        before={},
+        after={},
+        ip_address="198.51.100.9",
+    )
+
+    resolved = event.resolve_ip_hash(hooks)
+
+    assert resolved.value == audit_hooks._hash_ip_fallback("198.51.100.9")
+    assert resolved.fallback is True
+    assert isinstance(resolved.error, RuntimeError)
