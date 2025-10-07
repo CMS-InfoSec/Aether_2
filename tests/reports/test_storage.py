@@ -272,3 +272,30 @@ def test_filesystem_storage_rejects_symlink_base(tmp_path: Path) -> None:
         ArtifactStorage(symlink_base)
 
     assert "symlink" in str(excinfo.value)
+
+
+def test_filesystem_storage_rejects_symlink_ancestor(tmp_path: Path) -> None:
+    if not hasattr(os, "symlink"):
+        pytest.skip("platform does not support symlinks")
+
+    real_root = tmp_path / "real-root"
+    real_root.mkdir()
+
+    symlink_parent = tmp_path / "link-parent"
+    symlink_parent.symlink_to(real_root, target_is_directory=True)
+
+    base_path = symlink_parent / "reports"
+
+    with pytest.raises(ValueError) as excinfo:
+        ArtifactStorage(base_path)
+
+    assert "symlink" in str(excinfo.value)
+
+
+def test_filesystem_storage_requires_absolute_base(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(ValueError) as excinfo:
+        ArtifactStorage(Path("relative-base"))
+
+    assert "absolute" in str(excinfo.value)
