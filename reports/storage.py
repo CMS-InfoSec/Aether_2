@@ -15,7 +15,7 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Protocol
 
 LOGGER = logging.getLogger(__name__)
@@ -142,8 +142,40 @@ class ArtifactStorage:
     # Internal helpers
 
     def _canonical_key(self, account_id: str, object_key: str) -> str:
-        parts = [part.strip("/") for part in (account_id, object_key) if part]
-        return "/".join(parts)
+        """Return a normalised storage key while rejecting traversal attempts."""
+
+        segments: list[str] = []
+
+        def _extend_from(part: str | Path, *, label: str) -> None:
+            raw = str(part or "")
+            if not raw:
+                return
+
+            # Normalise Windows style separators so downstream checks operate on a
+            # consistent delimiter set.
+            sanitized = raw.replace("\\", "/")
+            tokens = [token.strip("/") for token in sanitized.split("/") if token.strip("/")]
+
+            for token in tokens:
+                if not token:
+                    continue
+                if token in {".", ".."}:
+                    raise ValueError(
+                        f"{label} must not contain path traversal sequences"
+                    )
+                segments.append(token)
+
+        _extend_from(account_id, label="account_id")
+        _extend_from(object_key, label="object_key")
+
+        if not segments:
+            raise ValueError("object_key must be provided")
+
+        canonical = PurePosixPath(*segments)
+        if canonical.is_absolute() or any(part in {".", ".."} for part in canonical.parts):
+            raise ValueError("account_id and object_key must reference relative paths")
+
+        return "/".join(canonical.parts)
 
     def _s3_key(self, canonical_key: str) -> str:
         if not self._s3_prefix:
