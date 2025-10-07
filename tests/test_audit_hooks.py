@@ -259,6 +259,78 @@ def test_log_event_with_fallback_context_factory_used_for_fallback(
     assert record.audit == {"source": "factory"}
 
 
+def test_log_audit_event_with_fallback_event_context_factory_skips_when_unused():
+    hooks = audit_hooks.AuditHooks(
+        log=lambda **payload: None,
+        hash_ip=lambda value: pytest.fail("hash_ip should not be called"),
+    )
+    logger = logging.getLogger("test.audit.event_factory.success")
+    factory_calls: List[int] = []
+
+    def context_factory() -> Mapping[str, str]:
+        factory_calls.append(1)
+        return {"audit": {"source": "event"}}
+
+    event = audit_hooks.AuditEvent(
+        actor="gail",
+        action="demo.event.success",
+        entity="resource",
+        before={},
+        after={},
+        context_factory=context_factory,
+    )
+
+    result = audit_hooks.log_audit_event_with_fallback(
+        hooks,
+        logger,
+        event,
+        failure_message="should not trigger",
+        disabled_message="should not log",
+    )
+
+    assert result.handled is True
+    assert factory_calls == []
+
+
+def test_log_audit_event_with_fallback_event_context_factory_used_for_fallback(
+    caplog: pytest.LogCaptureFixture,
+):
+    hooks = audit_hooks.AuditHooks(log=None, hash_ip=lambda value: value)
+    logger = logging.getLogger("test.audit.event_factory.fallback")
+    factory_calls: List[int] = []
+
+    def context_factory() -> Mapping[str, str]:
+        factory_calls.append(1)
+        return {"audit": {"source": "event"}}
+
+    event = audit_hooks.AuditEvent(
+        actor="hank",
+        action="demo.event.disabled",
+        entity="resource",
+        before={},
+        after={},
+        context_factory=context_factory,
+    )
+
+    with caplog.at_level(logging.DEBUG, logger=logger.name):
+        result = audit_hooks.log_audit_event_with_fallback(
+            hooks,
+            logger,
+            event,
+            failure_message="should not trigger",
+            disabled_message="audit disabled via event context factory",
+        )
+
+    assert result.handled is False
+    assert factory_calls == [1]
+    record = next(
+        entry
+        for entry in caplog.records
+        if entry.message == "audit disabled via event context factory"
+    )
+    assert record.audit == {"source": "event"}
+
+
 def test_log_event_with_fallback_handles_exceptions(caplog: pytest.LogCaptureFixture):
     def failing_log(**payload):
         raise RuntimeError("boom")
@@ -761,6 +833,53 @@ def test_audit_event_log_with_fallback_forwards_context_factory(monkeypatch):
         logger,
         failure_message="failure",
         context_factory=context_factory,
+    )
+
+    assert result is expected
+    assert captured["kwargs"]["context"] is None
+    assert captured["kwargs"]["context_factory"] is context_factory
+    assert factory_calls == []
+
+
+def test_audit_event_log_with_fallback_uses_event_context_factory(monkeypatch):
+    hooks = audit_hooks.AuditHooks(
+        log=lambda **_: None,
+        hash_ip=lambda value: value,
+    )
+    logger = logging.getLogger("tests.audit.event_default_factory")
+    factory_calls: List[int] = []
+
+    def context_factory() -> Mapping[str, str]:
+        factory_calls.append(1)
+        return {"audit": {"origin": "event"}}
+
+    event = audit_hooks.AuditEvent(
+        actor="lee",
+        action="demo.event.factory",
+        entity="resource",
+        before={},
+        after={},
+        context_factory=context_factory,
+    )
+
+    expected = audit_hooks.AuditLogResult(
+        handled=True,
+        ip_hash=None,
+        hash_fallback=False,
+        hash_error=None,
+    )
+    captured: dict[str, object] = {}
+
+    def fake_helper(*args: object, **kwargs: object) -> audit_hooks.AuditLogResult:
+        captured["kwargs"] = kwargs
+        return expected
+
+    monkeypatch.setattr(audit_hooks, "log_audit_event_with_fallback", fake_helper)
+
+    result = event.log_with_fallback(
+        hooks,
+        logger,
+        failure_message="failure",
     )
 
     assert result is expected

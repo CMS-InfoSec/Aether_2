@@ -45,6 +45,7 @@ class AuditEvent:
     ip_address: Optional[str] = None
     ip_hash: Optional[str] = None
     context: Optional[Mapping[str, Any]] = None
+    context_factory: ContextFactory | None = None
 
     def log_with_fallback(
         self,
@@ -63,14 +64,17 @@ class AuditEvent:
         Callers may override the structured fallback context by supplying a
         mapping via ``context`` or defer construction entirely with
         ``context_factory``.  When neither argument is provided the event's
-        stored ``context`` is reused.
+        stored ``context`` or ``context_factory`` is reused.
         """
 
+        effective_factory = context_factory
         context_mapping: Optional[Mapping[str, Any]]
         if context is _EVENT_CONTEXT_SENTINEL:
-            if context_factory is None:
+            if effective_factory is None and self.context is not None:
                 context_mapping = self.context
             else:
+                if effective_factory is None:
+                    effective_factory = self.context_factory
                 context_mapping = None
         else:
             context_mapping = cast(Optional[Mapping[str, Any]], context)
@@ -83,7 +87,7 @@ class AuditEvent:
             disabled_message=disabled_message,
             disabled_level=disabled_level,
             context=context_mapping,
-            context_factory=context_factory,
+            context_factory=effective_factory,
             resolved_ip_hash=resolved_ip_hash,
         )
 
@@ -539,10 +543,13 @@ def log_audit_event_with_fallback(
     resolved_ip_hash: ResolvedIpHash | None = None,
 ) -> AuditLogResult:
     """Convenience wrapper for logging :class:`AuditEvent` instances."""
+    effective_factory = context_factory
     if context is _EVENT_CONTEXT_SENTINEL:
-        if context_factory is None:
+        if effective_factory is None and event.context is not None:
             context_mapping = event.context
         else:
+            if effective_factory is None:
+                effective_factory = event.context_factory
             context_mapping = None
     else:
         context_mapping = cast(Optional[Mapping[str, Any]], context)
@@ -561,7 +568,7 @@ def log_audit_event_with_fallback(
         disabled_message=disabled_message,
         disabled_level=disabled_level,
         context=context_mapping,
-        context_factory=context_factory,
+        context_factory=effective_factory,
         resolved_ip_hash=resolved_ip_hash,
     )
 
