@@ -48,8 +48,6 @@ _AUDIT_HOOKS = load_audit_hooks()
 log_audit = _AUDIT_HOOKS.log
 hash_ip = _AUDIT_HOOKS.hash_ip
 
-    hash_ip = _hash_ip_passthrough
-
 
 # ---------------------------------------------------------------------------
 # Database configuration
