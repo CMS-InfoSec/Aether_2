@@ -965,8 +965,8 @@ async def get_daily_report(
     account_id: str | None = Query(default=None),
     report_date: date | None = Query(default=None),
     _: str = Depends(require_admin_account),
+    service: DailyReportService = Depends(get_daily_report_service),
 ) -> Dict[str, Any]:
-    service = get_daily_report_service()
     try:
         report = service.build_daily_report(account_id=account_id, report_date=report_date)
     except ValueError as exc:
@@ -984,8 +984,8 @@ async def get_daily_return_pct(
     account_id: str | None = Query(default=None),
     nav_date: date | None = Query(default=None, alias="date"),
     _: str = Depends(require_admin_account),
+    service: DailyReportService = Depends(get_daily_report_service),
 ) -> Dict[str, Any]:
-    service = get_daily_report_service()
     try:
         return service.get_daily_return_summary(account_id=account_id, nav_date=nav_date)
     except ValueError as exc:
@@ -998,8 +998,8 @@ async def export_daily_report(
     account_id: str | None = Query(default=None),
     report_date: date | None = Query(default=None),
     _: str = Depends(require_admin_account),
+    service: DailyReportService = Depends(get_daily_report_service),
 ) -> StreamingResponse:
-    service = get_daily_report_service()
     try:
         report = service.build_daily_report(account_id=account_id, report_date=report_date)
     except ValueError as exc:
@@ -1023,8 +1023,8 @@ async def export_daily_report(
 async def explain_trade(
     trade_id: str = Query(..., description="Unique trade or order identifier"),
     _: str = Depends(require_admin_account),
+    service: DailyReportService = Depends(get_daily_report_service),
 ) -> Dict[str, Any]:
-    service = get_daily_report_service()
     try:
         return service.explain_trade(trade_id)
     except ValueError as exc:
