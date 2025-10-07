@@ -196,13 +196,12 @@ def test_write_artifacts_normalises_relative_base_path(
     expected_path = tmp_path / "artifacts" / "output" / "metrics.json"
     assert Path(result["metrics.json"]) == expected_path
     assert expected_path.exists()
+    assert Path(config.base_path) == tmp_path / "artifacts" / "output"
 
 
 def test_write_artifacts_rejects_parent_reference_in_base_path() -> None:
-    config = ObjectStorageConfig(base_path="../escape")
-
     with pytest.raises(ValueError, match="parent directory"):
-        _write_artifacts({"metrics.json": b"{}"}, config)
+        ObjectStorageConfig(base_path="../escape")
 
 
 def test_write_artifacts_rejects_symlink_base_path(tmp_path: Path) -> None:
@@ -210,10 +209,9 @@ def test_write_artifacts_rejects_symlink_base_path(tmp_path: Path) -> None:
     target.mkdir()
     link = tmp_path / "link"
     link.symlink_to(target, target_is_directory=True)
-    config = ObjectStorageConfig(base_path=str(link))
 
     with pytest.raises(ValueError, match="symlink"):
-        _write_artifacts({"metrics.json": b"{}"}, config)
+        ObjectStorageConfig(base_path=str(link))
 
 
 def test_write_artifacts_s3_prefix_normalised(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -239,6 +237,7 @@ def test_write_artifacts_s3_prefix_normalised(monkeypatch: pytest.MonkeyPatch) -
 
     assert stub_client.calls == [("aether", "unsafe/prefix/metrics.json", b"{}")]  # type: ignore[arg-type]
     assert result["metrics.json"] == "s3://aether/unsafe/prefix/metrics.json"
+    assert config.s3_prefix == "unsafe/prefix"
 
 
 def test_write_artifacts_rejects_traversal_in_s3_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -248,10 +247,18 @@ def test_write_artifacts_rejects_traversal_in_s3_prefix(monkeypatch: pytest.Monk
 
     monkeypatch.setattr("ml.training.workflow.boto3", _StubBoto3())
 
-    config = ObjectStorageConfig(s3_bucket="aether", s3_prefix="../escape")
-
     with pytest.raises(ValueError, match="prefix"):
-        _write_artifacts({"metrics.json": b"{}"}, config)
+        ObjectStorageConfig(s3_bucket="aether", s3_prefix="../escape")
+
+
+def test_object_storage_config_normalises_base_and_prefix(tmp_path: Path) -> None:
+    base = tmp_path / "artifacts"
+    prefix = " /reports///daily/ "
+
+    config = ObjectStorageConfig(base_path=str(base), s3_bucket="bucket", s3_prefix=prefix)
+
+    assert Path(config.base_path) == base
+    assert config.s3_prefix == "reports/daily"
 
 
 def test_write_artifacts_rejects_traversal_in_artifact_name(tmp_path: Path) -> None:

@@ -122,6 +122,15 @@ class ObjectStorageConfig:
     def is_s3(self) -> bool:
         return bool(self.s3_bucket)
 
+    def __post_init__(self) -> None:
+        """Normalise filesystem and S3 settings during initialisation."""
+
+        normalised_base = _normalise_local_artifact_base_path(self.base_path)
+        object.__setattr__(self, "base_path", str(normalised_base))
+
+        normalised_prefix = _normalise_s3_prefix(self.s3_prefix)
+        object.__setattr__(self, "s3_prefix", normalised_prefix)
+
 
 @dataclass
 class MLflowConfig:
