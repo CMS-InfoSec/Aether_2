@@ -51,7 +51,7 @@ import tarfile
 import tempfile
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Dict, Iterable, List, Optional
 
 from common.utils.tar import safe_extract_tar
@@ -173,6 +173,35 @@ class BackupArtifact:
             "nonce": self.nonce_b64,
             "encryption": self.encryption,
         }
+
+
+def _safe_extract_tar(archive: tarfile.TarFile, destination: Path) -> None:
+    """Safely extract ``archive`` into ``destination``.
+
+    Each archive member is validated to ensure it is a relative path located
+    within ``destination``.  Absolute paths, traversal sequences, and entries
+    that would resolve outside of the destination directory raise
+    ``ValueError`` and prevent any extraction.
+    """
+
+    destination_resolved = destination.resolve()
+    members = archive.getmembers()
+
+    for member in members:
+        member_path = PurePosixPath(member.name)
+        if member_path.is_absolute():
+            raise ValueError("Tar archive entries must be relative paths")
+        if any(part == ".." for part in member_path.parts):
+            raise ValueError("Tar archive entries must not contain traversal sequences")
+
+        candidate = destination_resolved.joinpath(Path(*member_path.parts))
+        resolved_candidate = candidate.resolve(strict=False)
+        try:
+            resolved_candidate.relative_to(destination_resolved)
+        except ValueError as exc:
+            raise ValueError("Tar archive entry escapes extraction directory") from exc
+
+    archive.extractall(path=destination_resolved, filter="data")
 
 
 class BackupJob:
