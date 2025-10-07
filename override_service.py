@@ -8,7 +8,7 @@ import sys
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional
 
 from fastapi import Depends, FastAPI, Header, Query, Request, status
 from pydantic import BaseModel, Field
@@ -44,6 +44,8 @@ except ModuleNotFoundError:  # pragma: no cover - fallback when installed under 
 _AUDIT_HOOKS = load_audit_hooks()
 log_audit = _AUDIT_HOOKS.log
 hash_ip = _AUDIT_HOOKS.hash_ip
+
+    hash_ip = _hash_ip_passthrough
 
 
 LOGGER = logging.getLogger("override_service")

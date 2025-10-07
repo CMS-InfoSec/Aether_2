@@ -29,7 +29,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from typing import Any, Iterable, Mapping, MutableMapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, MutableMapping, Sequence
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -48,6 +48,8 @@ from shared.spot import is_spot_symbol, normalize_spot_symbol
 _AUDIT_HOOKS = load_audit_hooks()
 log_audit = _AUDIT_HOOKS.log
 hash_ip = _AUDIT_HOOKS.hash_ip
+
+    hash_ip = _hash_ip_passthrough
 
 
 LOGGER = logging.getLogger(__name__)
