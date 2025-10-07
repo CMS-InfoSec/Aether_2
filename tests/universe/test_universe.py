@@ -2,16 +2,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from services.common.adapters import RedisFeastAdapter
-import pytest
-from fastapi.testclient import TestClient
-
-from services.common.adapters import RedisFeastAdapter
 from services.common.security import ADMIN_ACCOUNTS
 from services.universe import main as universe_main
 from services.universe.main import app
-
 from services.universe.repository import UniverseRepository
-from tests.universe.conftest import UniverseTimescaleFixture
 
 
 class NoopFeastStore:
