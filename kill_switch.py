@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
@@ -17,10 +17,12 @@ from shared.async_utils import dispatch_async
 try:  # pragma: no cover - optional audit dependency
     from common.utils.audit_logger import hash_ip, log_audit
 except Exception:  # pragma: no cover - degrade gracefully
-    log_audit = None  # type: ignore[assignment]
+    log_audit: Callable[..., None] | None = None
 
-    def hash_ip(_: Optional[str]) -> Optional[str]:  # type: ignore[override]
+    def _hash_ip_passthrough(value: Optional[str]) -> Optional[str]:
         return None
+
+    hash_ip = _hash_ip_passthrough
 
 app = FastAPI(title="Kill Switch Service")
 

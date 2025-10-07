@@ -99,3 +99,38 @@ markers = [
     "smoke: smoke tests covering service persistence and deployment wiring",
 ]
 
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+include = [
+    "training_service.py",
+    "watchdog.py",
+    "tests/**/*.py",
+]
+
+[tool.ruff.lint]
+select = ["E402", "F401", "F402", "F811", "F841"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["E402"]
+
+[tool.mypy]
+files = [
+    "training_service.py",
+    "watchdog.py",
+]
+exclude = [
+    "data/migrations/env.py",
+    "data/alembic/env.py",
+    "data/.*",
+    "common/utils/.*",
+    "common/schemas/.*",
+    "docs/.*",
+    "ml/.*",
+    "ops/.*",
+    "services/backtest/.*",
+    "release_manifest.py",
+    "tests/.*",
+]
+ignore_missing_imports = true
+

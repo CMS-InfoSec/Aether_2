@@ -29,7 +29,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from typing import Any, Iterable, Mapping, MutableMapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, MutableMapping, Sequence
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -47,10 +47,12 @@ from shared.spot import is_spot_symbol, normalize_spot_symbol
 try:  # pragma: no cover - optional audit dependency
     from common.utils.audit_logger import hash_ip, log_audit
 except Exception:  # pragma: no cover - degrade gracefully
-    log_audit = None  # type: ignore[assignment]
+    log_audit: Callable[..., None] | None = None
 
-    def hash_ip(_: str | None) -> str | None:  # type: ignore[override]
+    def _hash_ip_passthrough(value: str | None) -> str | None:
         return None
+
+    hash_ip = _hash_ip_passthrough
 
 
 LOGGER = logging.getLogger(__name__)
