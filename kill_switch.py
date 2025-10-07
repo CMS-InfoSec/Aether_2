@@ -13,7 +13,7 @@ from kill_alerts import NotificationDispatchError, dispatch_notifications
 from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
 from services.common.security import require_admin_account
 from shared.async_utils import dispatch_async
-from shared.audit_hooks import load_audit_hooks, log_event_with_fallback
+from shared.audit_hooks import AuditEvent, load_audit_hooks, log_audit_event_with_fallback
 
 app = FastAPI(title="Kill Switch Service")
 
@@ -111,9 +111,7 @@ def trigger_kill_switch(
     )
 
     audit_hooks = load_audit_hooks()
-    log_event_with_fallback(
-        audit_hooks,
-        LOGGER,
+    event = AuditEvent(
         actor=actor_account,
         action="kill_switch.triggered",
         entity=normalized_account,
@@ -126,6 +124,11 @@ def trigger_kill_switch(
             "triggered_at": activation_ts.isoformat(),
         },
         ip_address=request.client.host if request.client else None,
+    )
+    log_audit_event_with_fallback(
+        audit_hooks,
+        LOGGER,
+        event,
         failure_message=(
             f"Failed to record audit log for kill switch activation on {normalized_account}"
         ),

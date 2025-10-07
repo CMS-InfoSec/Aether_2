@@ -14,7 +14,7 @@ from services.common.adapters import KafkaNATSAdapter
 from services.common.security import require_admin_account
 from shared.sim_mode import SimModeStatus, sim_mode_repository
 from shared.simulation import sim_mode_state
-from shared.audit_hooks import load_audit_hooks, log_event_with_fallback
+from shared.audit_hooks import AuditEvent, load_audit_hooks, log_audit_event_with_fallback
 
 
 LOGGER = logging.getLogger(__name__)
@@ -77,9 +77,7 @@ def _audit_transition(
     before: SimModeStatus, after: SimModeStatus, actor: str, request: Request
 ) -> None:
     audit_hooks = load_audit_hooks()
-    log_event_with_fallback(
-        audit_hooks,
-        LOGGER,
+    event = AuditEvent(
         actor=actor,
         action="sim_mode.transition",
         entity="platform",
@@ -94,6 +92,11 @@ def _audit_transition(
             "ts": after.ts.isoformat(),
         },
         ip_address=request.client.host if request.client else None,
+    )
+    log_audit_event_with_fallback(
+        audit_hooks,
+        LOGGER,
+        event,
         failure_message="Failed to record audit log for simulation mode transition",
         disabled_message="Audit logging disabled; skipping sim_mode.transition",
     )

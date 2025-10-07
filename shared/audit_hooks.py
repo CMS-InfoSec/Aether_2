@@ -29,6 +29,43 @@ HashIpCallable = Callable[[Optional[str]], Optional[str]]
 
 
 @dataclass(frozen=True)
+class AuditEvent:
+    """Structured payload describing an audit event to be recorded."""
+
+    actor: str
+    action: str
+    entity: str
+    before: Mapping[str, Any]
+    after: Mapping[str, Any]
+    ip_address: Optional[str] = None
+    ip_hash: Optional[str] = None
+
+    def log_with_fallback(
+        self,
+        hooks: "AuditHooks",
+        logger: logging.Logger,
+        *,
+        failure_message: str,
+        disabled_message: Optional[str] = None,
+        disabled_level: int = logging.DEBUG,
+        context: Optional[Mapping[str, Any]] = None,
+        resolved_ip_hash: "ResolvedIpHash" | None = None,
+    ) -> "AuditLogResult":
+        """Log the event using :func:`log_audit_event_with_fallback`."""
+
+        return log_audit_event_with_fallback(
+            hooks,
+            logger,
+            self,
+            failure_message=failure_message,
+            disabled_message=disabled_message,
+            disabled_level=disabled_level,
+            context=context,
+            resolved_ip_hash=resolved_ip_hash,
+        )
+
+
+@dataclass(frozen=True)
 class AuditLogResult:
     """Structured metadata describing the outcome of an audit logging attempt."""
 
@@ -429,13 +466,46 @@ def log_event_with_fallback(
     )
 
 
+def log_audit_event_with_fallback(
+    hooks: AuditHooks,
+    logger: logging.Logger,
+    event: AuditEvent,
+    *,
+    failure_message: str,
+    disabled_message: Optional[str] = None,
+    disabled_level: int = logging.DEBUG,
+    context: Optional[Mapping[str, Any]] = None,
+    resolved_ip_hash: ResolvedIpHash | None = None,
+) -> AuditLogResult:
+    """Convenience wrapper for logging :class:`AuditEvent` instances."""
+
+    return log_event_with_fallback(
+        hooks,
+        logger,
+        actor=event.actor,
+        action=event.action,
+        entity=event.entity,
+        before=event.before,
+        after=event.after,
+        ip_address=event.ip_address,
+        ip_hash=event.ip_hash,
+        failure_message=failure_message,
+        disabled_message=disabled_message,
+        disabled_level=disabled_level,
+        context=context,
+        resolved_ip_hash=resolved_ip_hash,
+    )
+
+
 __all__ = [
     "AuditHooks",
+    "AuditEvent",
     "AuditLogResult",
     "ResolvedIpHash",
     "AuditCallable",
     "HashIpCallable",
     "load_audit_hooks",
+    "log_audit_event_with_fallback",
     "log_event_with_fallback",
     "reset_audit_hooks_cache",
     "temporary_audit_hooks",

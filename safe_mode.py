@@ -27,7 +27,7 @@ from metrics import increment_safe_mode_triggers, setup_metrics
 from services.common.security import require_admin_account
 from common.utils.redis import create_redis_from_url
 from shared.async_utils import dispatch_async
-from shared.audit_hooks import load_audit_hooks, log_event_with_fallback
+from shared.audit_hooks import AuditEvent, load_audit_hooks, log_audit_event_with_fallback
 
 
 LOGGER = logging.getLogger(__name__)
@@ -742,15 +742,18 @@ def enter_safe_mode(
     response = controller.status().to_response()
 
     audit_hooks = load_audit_hooks()
-    log_event_with_fallback(
-        audit_hooks,
-        LOGGER,
+    event = AuditEvent(
         actor=actor_account,
         action="safe_mode.enter",
         entity="safe_mode",
         before=before_snapshot,
         after=dict(response),
         ip_address=request.client.host if request.client else None,
+    )
+    log_audit_event_with_fallback(
+        audit_hooks,
+        LOGGER,
+        event,
         failure_message="Failed to record audit log for safe mode entry",
         disabled_message="Audit logging disabled; skipping safe_mode.enter",
     )
@@ -771,15 +774,18 @@ def exit_safe_mode(
     response = controller.status().to_response()
 
     audit_hooks = load_audit_hooks()
-    log_event_with_fallback(
-        audit_hooks,
-        LOGGER,
+    event = AuditEvent(
         actor=actor_account,
         action="safe_mode.exit",
         entity="safe_mode",
         before=before_snapshot,
         after=dict(response),
         ip_address=request.client.host if request.client else None,
+    )
+    log_audit_event_with_fallback(
+        audit_hooks,
+        LOGGER,
+        event,
         failure_message="Failed to record audit log for safe mode exit",
         disabled_message="Audit logging disabled; skipping safe_mode.exit",
     )

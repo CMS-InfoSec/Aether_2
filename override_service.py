@@ -17,7 +17,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from shared.audit_hooks import load_audit_hooks, log_event_with_fallback
+from shared.audit_hooks import AuditEvent, load_audit_hooks, log_audit_event_with_fallback
 from shared.postgres import normalize_sqlalchemy_dsn
 
 try:  # pragma: no cover - support alternative namespace packages
@@ -229,9 +229,7 @@ def record_override(
     session.flush()
 
     audit_hooks = load_audit_hooks()
-    log_event_with_fallback(
-        audit_hooks,
-        LOGGER,
+    event = AuditEvent(
         actor=admin_account,
         action="override.human_decision",
         entity=payload.intent_id,
@@ -243,6 +241,11 @@ def record_override(
             "source": "human decision",
         },
         ip_address=request.client.host if request.client else None,
+    )
+    log_audit_event_with_fallback(
+        audit_hooks,
+        LOGGER,
+        event,
         failure_message=f"Failed to record audit log for override {payload.intent_id}",
         disabled_message=(
             f"Audit logging disabled; skipping override.human_decision for {payload.intent_id}"

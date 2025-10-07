@@ -19,6 +19,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from shared.audit_hooks import AuditEvent, load_audit_hooks, log_audit_event_with_fallback
 from shared.postgres import normalize_sqlalchemy_dsn
 
 ROOT = Path(__file__).resolve().parent
@@ -42,9 +43,6 @@ except ModuleNotFoundError:  # pragma: no cover - fallback when installed under 
         spec.loader.exec_module(security_module)
         require_admin_account = getattr(security_module, "require_admin_account")
 
-from shared.audit_hooks import load_audit_hooks, log_event_with_fallback
-
-
 # ---------------------------------------------------------------------------
 # Database configuration
 # ---------------------------------------------------------------------------
@@ -67,15 +65,18 @@ def _log_config_audit(
     """Emit a config service audit entry while handling optional fallbacks."""
 
     hooks = load_audit_hooks()
-    log_event_with_fallback(
-        hooks,
-        LOGGER,
+    event = AuditEvent(
         actor=actor,
         action=action,
         entity=entity,
         before=before,
         after=after,
         ip_address=client_ip,
+    )
+    log_audit_event_with_fallback(
+        hooks,
+        LOGGER,
+        event,
         failure_message=failure_message,
         disabled_message=f"Audit logging disabled; skipping {action} for {entity}",
     )

@@ -514,6 +514,88 @@ def test_log_event_with_fallback_defers_extra_until_needed(caplog: pytest.LogCap
     assert not caplog.records
 
 
+def test_log_audit_event_with_fallback_logs_event_payload():
+    captured: dict[str, object] = {}
+
+    def fake_log(**payload: object) -> None:
+        captured.update(payload)  # type: ignore[arg-type]
+
+    hooks = audit_hooks.AuditHooks(log=fake_log, hash_ip=lambda value: f"hash:{value}")
+    event = audit_hooks.AuditEvent(
+        actor="grace",
+        action="demo.action",
+        entity="resource",
+        before={"before": True},
+        after={"after": True},
+        ip_address="10.1.2.3",
+    )
+
+    result = audit_hooks.log_audit_event_with_fallback(
+        hooks,
+        logging.getLogger("tests.audit"),
+        event,
+        failure_message="should not trigger",
+        disabled_message="should not log",
+    )
+
+    assert result.handled is True
+    assert result.ip_hash == "hash:10.1.2.3"
+    assert captured == {
+        "actor": "grace",
+        "action": "demo.action",
+        "entity": "resource",
+        "before": {"before": True},
+        "after": {"after": True},
+        "ip_hash": "hash:10.1.2.3",
+    }
+
+
+def test_audit_event_log_with_fallback_method_delegates(monkeypatch):
+    hooks = audit_hooks.AuditHooks(log=lambda **_: None, hash_ip=lambda value: value)
+    logger = logging.getLogger("tests.audit.delegation")
+    event = audit_hooks.AuditEvent(
+        actor="heidi",
+        action="demo.action",
+        entity="resource",
+        before={},
+        after={},
+    )
+
+    expected = audit_hooks.AuditLogResult(
+        handled=True,
+        ip_hash=None,
+        hash_fallback=False,
+        hash_error=None,
+    )
+    captured: dict[str, object] = {}
+
+    def fake_helper(*args: object, **kwargs: object) -> audit_hooks.AuditLogResult:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return expected
+
+    monkeypatch.setattr(audit_hooks, "log_audit_event_with_fallback", fake_helper)
+
+    result = event.log_with_fallback(
+        hooks,
+        logger,
+        failure_message="failure",
+        disabled_message="disabled",
+        disabled_level=logging.INFO,
+        context={"request_id": "abc"},
+    )
+
+    assert result is expected
+    assert captured["args"] == (hooks, logger, event)
+    assert captured["kwargs"] == {
+        "failure_message": "failure",
+        "disabled_message": "disabled",
+        "disabled_level": logging.INFO,
+        "context": {"request_id": "abc"},
+        "resolved_ip_hash": None,
+    }
+
+
 def test_resolve_ip_hash_prefers_explicit_hash():
     hooks = audit_hooks.AuditHooks(log=None, hash_ip=lambda value: pytest.fail("hash_ip should not be invoked"))
 
