@@ -50,11 +50,11 @@ def _resolve_artifact_root(raw: str | None, *, default: Path) -> Path:
 
     resolved_candidate = candidate.resolve(strict=False)
 
-    if candidate.exists() and candidate.is_symlink():
+    if candidate.is_symlink():
         raise ValueError("TRAINING_ARTIFACT_ROOT must not be a symlink")
 
     for ancestor in candidate.parents:
-        if ancestor.exists() and ancestor.is_symlink():
+        if ancestor.is_symlink():
             try:
                 resolved_ancestor = ancestor.resolve(strict=False)
             except OSError as exc:  # pragma: no cover - extremely unlikely on supported platforms

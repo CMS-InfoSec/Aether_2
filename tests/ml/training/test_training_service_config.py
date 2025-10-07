@@ -213,6 +213,20 @@ def test_training_service_rejects_artifact_root_symlink(
         _load_training_module(module_name)
 
 
+def test_training_service_rejects_broken_symlink_artifact_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TRAINING_TIMESCALE_URI", "postgresql://user:pass@localhost/db")
+    missing = tmp_path / "missing"
+    link = tmp_path / "link"
+    link.symlink_to(missing)
+    monkeypatch.setenv("TRAINING_ARTIFACT_ROOT", str(link))
+
+    module_name = "tests.ml.training.training_service_artifact_root_broken_symlink"
+    with pytest.raises(ValueError, match="symlink"):
+        _load_training_module(module_name)
+
+
 def test_training_service_allows_symlink_parent_for_artifact_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

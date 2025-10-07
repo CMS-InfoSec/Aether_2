@@ -214,6 +214,15 @@ def test_write_artifacts_rejects_symlink_base_path(tmp_path: Path) -> None:
         ObjectStorageConfig(base_path=str(link))
 
 
+def test_write_artifacts_rejects_broken_symlink_base_path(tmp_path: Path) -> None:
+    missing = tmp_path / "missing"
+    link = tmp_path / "link"
+    link.symlink_to(missing, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        ObjectStorageConfig(base_path=str(link))
+
+
 def test_write_artifacts_allows_symlink_parent(tmp_path: Path) -> None:
     real_root = tmp_path / "real"
     real_root.mkdir()

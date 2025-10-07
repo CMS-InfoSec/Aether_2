@@ -697,11 +697,11 @@ def _normalise_local_artifact_base_path(base_path: str | os.PathLike[str]) -> Pa
 
     resolved_candidate = candidate.resolve(strict=False)
 
-    if candidate.exists() and candidate.is_symlink():
+    if candidate.is_symlink():
         raise ValueError("Artifact base path must not be a symlink")
 
     for ancestor in candidate.parents:
-        if ancestor.exists() and ancestor.is_symlink():
+        if ancestor.is_symlink():
             try:
                 resolved_ancestor = ancestor.resolve(strict=False)
             except OSError as exc:  # pragma: no cover - extremely unlikely on supported platforms
