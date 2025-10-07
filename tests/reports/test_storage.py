@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -135,3 +136,112 @@ def test_store_artifact_logs_target_descriptor_on_audit_failure_s3(
         in message
         for message in messages
     )
+
+
+def test_store_artifact_rejects_object_key_traversal(tmp_path: Path) -> None:
+    storage = ArtifactStorage(tmp_path)
+    session = StubSession()
+
+    with pytest.raises(ValueError) as excinfo:
+        storage.store_artifact(
+            session,
+            account_id="acct-123",
+            object_key="../secrets.txt",
+            data=b"payload",
+            content_type="text/plain",
+        )
+
+    assert "path traversal" in str(excinfo.value)
+    # Ensure nothing was written to disk and no audit record attempted.
+    assert not any(tmp_path.iterdir())
+    assert not session.executions
+
+
+def test_store_artifact_rejects_account_traversal(tmp_path: Path) -> None:
+    storage = ArtifactStorage(tmp_path)
+    session = StubSession()
+
+    with pytest.raises(ValueError) as excinfo:
+        storage.store_artifact(
+            session,
+            account_id="../../acct-123",
+            object_key="reports/output.csv",
+            data=b"payload",
+            content_type="text/csv",
+        )
+
+    assert "path traversal" in str(excinfo.value)
+    assert not any(tmp_path.iterdir())
+    assert not session.executions
+
+
+def test_store_artifact_rejects_symlink_directory(tmp_path: Path) -> None:
+    if not hasattr(os, "symlink"):
+        pytest.skip("platform does not support symlinks")
+
+    storage = ArtifactStorage(tmp_path)
+    session = StubSession()
+
+    outside = tmp_path.parent / "outside"
+    outside.mkdir()
+
+    account_root = tmp_path / "acct-123"
+    account_root.mkdir()
+    (account_root / "reports").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError) as excinfo:
+        storage.store_artifact(
+            session,
+            account_id="acct-123",
+            object_key="reports/output.csv",
+            data=b"payload",
+            content_type="text/csv",
+        )
+
+    assert "symlink" in str(excinfo.value)
+    assert not list(outside.iterdir())
+    assert not session.executions
+
+
+def test_store_artifact_rejects_symlink_target(tmp_path: Path) -> None:
+    if not hasattr(os, "symlink"):
+        pytest.skip("platform does not support symlinks")
+
+    storage = ArtifactStorage(tmp_path)
+    session = StubSession()
+
+    object_dir = tmp_path / "acct-123" / "reports"
+    object_dir.mkdir(parents=True)
+
+    outside_file = tmp_path.parent / "outside.csv"
+    outside_file.write_text("secret")
+    (object_dir / "output.csv").symlink_to(outside_file)
+
+    with pytest.raises(ValueError) as excinfo:
+        storage.store_artifact(
+            session,
+            account_id="acct-123",
+            object_key="reports/output.csv",
+            data=b"payload",
+            content_type="text/csv",
+        )
+
+    assert "symlink" in str(excinfo.value)
+    assert outside_file.read_text() == "secret"
+    assert not session.executions
+
+
+def test_filesystem_storage_rejects_symlink_base(tmp_path: Path) -> None:
+    if not hasattr(os, "symlink"):
+        pytest.skip("platform does not support symlinks")
+
+    real_base = tmp_path / "real-base"
+    real_base.mkdir()
+
+    symlink_base = tmp_path / "symlink-base"
+    symlink_base.symlink_to(real_base, target_is_directory=True)
+
+    with pytest.raises(ValueError) as excinfo:
+        ArtifactStorage(symlink_base)
+
+    assert "symlink" in str(excinfo.value)
