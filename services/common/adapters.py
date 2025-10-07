@@ -718,6 +718,7 @@ class _TimescaleStore:
             except Exception:  # pragma: no cover - connection might already be closed
                 logger.debug("Error while closing Timescale connection", exc_info=True)
 
+
     @classmethod
     def _execute_static(
         cls, state: _TimescaleConnectionState, sql: str, params: Tuple[Any, ...] | None = None
@@ -728,6 +729,255 @@ class _TimescaleStore:
             state.connection = connection
         with connection.cursor() as cursor:
             cursor.execute(sql, params)
+
+
+class _InMemoryTimescaleStore:
+    """Fallback Timescale store used when psycopg is unavailable."""
+
+    _lock: ClassVar[threading.RLock] = threading.RLock()
+    _connections: ClassVar[Dict[str, Dict[str, Any]]] = {}
+
+    def __init__(
+        self,
+        account_id: str,
+        *,
+        session_factory: Callable[[str], "TimescaleSession"],
+        max_retries: int,
+        backoff_seconds: float,
+    ) -> None:
+        self.account_id = account_id
+        with self._lock:
+            state = self._connections.get(account_id)
+            if state is None:
+                state = {
+                    "acks": [],
+                    "fills": [],
+                    "shadow_fills": [],
+                    "events": [],
+                    "telemetry": [],
+                    "audit_logs": [],
+                    "credential_events": [],
+                    "credential_rotations": [],
+                    "risk_config": None,
+                }
+                self._connections[account_id] = state
+            self._state = state
+
+    # ------------------------------------------------------------------
+    # Insert helpers
+    # ------------------------------------------------------------------
+    def record_ack(self, payload: Mapping[str, Any]) -> None:
+        entry = {**dict(payload), "recorded_at": datetime.now(timezone.utc)}
+        with self._lock:
+            self._state["acks"].append(entry)
+
+    def record_fill(self, payload: Mapping[str, Any], *, shadow: bool = False) -> None:
+        entry = {**dict(payload), "recorded_at": datetime.now(timezone.utc)}
+        bucket = "shadow_fills" if shadow else "fills"
+        with self._lock:
+            self._state[bucket].append(entry)
+
+    def record_event(self, event_type: str, payload: Mapping[str, Any]) -> None:
+        entry = {
+            "type": event_type,
+            "event_type": event_type,
+            "payload": dict(payload),
+            "timestamp": datetime.now(timezone.utc),
+        }
+        with self._lock:
+            self._state["events"].append(entry)
+
+    def record_audit_log(self, record: Mapping[str, Any]) -> None:
+        payload = dict(record)
+        entry_id = payload.setdefault("id", str(uuid.uuid4()))
+        payload.setdefault("created_at", datetime.now(timezone.utc))
+        with self._lock:
+            logs: List[Dict[str, Any]] = self._state["audit_logs"]
+            for index, existing in enumerate(logs):
+                if existing.get("id") == entry_id:
+                    logs[index] = deepcopy(payload)
+                    break
+            else:
+                logs.append(deepcopy(payload))
+
+    def record_decision(self, order_id: str, payload: Mapping[str, Any]) -> None:
+        entry = {
+            "order_id": order_id,
+            "payload": dict(payload),
+            "timestamp": datetime.now(timezone.utc),
+        }
+        with self._lock:
+            self._state["telemetry"].append(entry)
+            if len(self._state["telemetry"]) > 500:
+                self._state["telemetry"] = self._state["telemetry"][-500:]
+
+    def record_credential_event(
+        self,
+        *,
+        event: str,
+        event_type: str,
+        secret_name: str | None,
+        metadata: Mapping[str, Any],
+        recorded_at: datetime,
+    ) -> None:
+        entry = {
+            "event": event,
+            "event_type": event_type,
+            "secret_name": secret_name,
+            "metadata": dict(metadata),
+            "recorded_at": recorded_at,
+        }
+        with self._lock:
+            self._state["credential_events"].append(entry)
+
+    def upsert_credential_rotation(
+        self,
+        *,
+        secret_name: str,
+        created_at: datetime,
+        rotated_at: datetime,
+        kms_key_id: str | None,
+    ) -> Dict[str, Any]:
+        metadata: Dict[str, Any] = {
+            "secret_name": secret_name,
+            "created_at": created_at,
+            "rotated_at": rotated_at,
+        }
+        if kms_key_id is not None:
+            metadata["kms_key_id"] = kms_key_id
+        with self._lock:
+            self._state["credential_rotations"].append(deepcopy(metadata))
+        return deepcopy(metadata)
+
+    def upsert_risk_config(self, config: Mapping[str, Any]) -> None:
+        with self._lock:
+            stored = self._state.get("risk_config")
+            if stored is None:
+                self._state["risk_config"] = dict(config)
+            else:
+                stored.update(dict(config))
+
+    # ------------------------------------------------------------------
+    # Query helpers
+    # ------------------------------------------------------------------
+    def fetch_events(self) -> Dict[str, List[Dict[str, Any]]]:
+        with self._lock:
+            acks = [deepcopy(entry) for entry in self._state["acks"]]
+            fills = [deepcopy(entry) for entry in self._state["fills"]]
+            shadow_fills = [deepcopy(entry) for entry in self._state["shadow_fills"]]
+            events = [deepcopy(entry) for entry in self._state["events"]]
+            rotation_events: List[Dict[str, Any]] = []
+            for entry in self._state["credential_events"]:
+                if entry.get("event") != "rotation":
+                    continue
+                metadata = deepcopy(entry.get("metadata", {}))
+                metadata["timestamp"] = entry.get("recorded_at")
+                rotation_events.append(metadata)
+        return {
+            "acks": acks,
+            "fills": fills,
+            "shadow_fills": shadow_fills,
+            "events": events,
+            "credential_rotations": rotation_events,
+        }
+
+    def fetch_telemetry(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            telemetry = sorted(
+                (deepcopy(entry) for entry in self._state["telemetry"]),
+                key=lambda item: item["timestamp"],
+                reverse=True,
+            )
+        return telemetry[:250]
+
+    def fetch_audit_logs(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            logs = [deepcopy(entry) for entry in self._state["audit_logs"]]
+        logs.sort(key=lambda item: item.get("created_at", datetime.now(timezone.utc)))
+        return logs
+
+    def fetch_credential_events(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            events = [deepcopy(entry) for entry in self._state["credential_events"]]
+        results: List[Dict[str, Any]] = []
+        for entry in events:
+            results.append(
+                {
+                    "event": entry.get("event"),
+                    "event_type": entry.get("event_type"),
+                    "secret_name": entry.get("secret_name"),
+                    "metadata": entry.get("metadata"),
+                    "timestamp": entry.get("recorded_at"),
+                }
+            )
+        return results
+
+    def fetch_rotation_status(self) -> Dict[str, Any] | None:
+        with self._lock:
+            rotations = [deepcopy(entry) for entry in self._state["credential_rotations"]]
+        if not rotations:
+            return None
+        rotations.sort(key=lambda item: item.get("rotated_at", datetime.min.replace(tzinfo=timezone.utc)))
+        return rotations[-1]
+
+    def fetch_risk_config(self, default: Mapping[str, Any]) -> Dict[str, Any]:
+        with self._lock:
+            stored = self._state.get("risk_config")
+            if stored is None:
+                snapshot = dict(default)
+                self._state["risk_config"] = dict(default)
+            else:
+                snapshot = dict(default | stored)
+        return snapshot
+
+    # ------------------------------------------------------------------
+    # Maintenance helpers
+    # ------------------------------------------------------------------
+    def clear_rotation_state(self) -> None:
+        with self._lock:
+            self._state["credential_rotations"].clear()
+            self._state["credential_events"] = [
+                entry
+                for entry in self._state["credential_events"]
+                if entry.get("event") != "rotation"
+            ]
+
+    @classmethod
+    async def flush_all(cls) -> Dict[str, Dict[str, int]]:
+        await asyncio.sleep(0)
+        return {}
+
+    @classmethod
+    def clear_all_rotation_state(cls, account_id: str | None = None) -> None:
+        with cls._lock:
+            if account_id is not None:
+                state = cls._connections.get(account_id)
+                if state is None:
+                    return
+                state["credential_rotations"].clear()
+                state["credential_events"] = [
+                    entry for entry in state["credential_events"] if entry.get("event") != "rotation"
+                ]
+                return
+            for state in cls._connections.values():
+                state["credential_rotations"].clear()
+                state["credential_events"] = [
+                    entry for entry in state["credential_events"] if entry.get("event") != "rotation"
+                ]
+
+    @classmethod
+    def reset_account(cls, account_id: str) -> None:
+        with cls._lock:
+            cls._connections.pop(account_id, None)
+
+    @classmethod
+    def reset_all(cls) -> None:
+        with cls._lock:
+            cls._connections.clear()
+
+
+_ORIGINAL_TIMESCALE_STORE = _TimescaleStore
+_STORE_SWITCH_LOCK = threading.Lock()
 
 @dataclass(eq=False)
 class KafkaNATSAdapter:
@@ -1146,12 +1396,38 @@ class TimescaleAdapter:
     ) -> None:
         normalized = _normalize_account_id(account_id)
         self.account_id = normalized
-        self._store = _TimescaleStore(
-            normalized,
-            session_factory=session_factory,
-            max_retries=max_retries,
-            backoff_seconds=backoff_seconds,
-        )
+        store_cls = _TimescaleStore
+        try:
+            self._store = store_cls(
+                normalized,
+                session_factory=session_factory,
+                max_retries=max_retries,
+                backoff_seconds=backoff_seconds,
+            )
+        except (RuntimeError, PsycopgError, OSError) as exc:
+            if store_cls is _ORIGINAL_TIMESCALE_STORE and psycopg is None:
+                logger.info(
+                    "Using in-memory Timescale store for %s because psycopg is unavailable: %s",
+                    normalized,
+                    exc,
+                )
+                with _STORE_SWITCH_LOCK:
+                    globals()["_TimescaleStore"] = _InMemoryTimescaleStore
+                    store_cls = _TimescaleStore
+                self._store = store_cls(
+                    normalized,
+                    session_factory=session_factory,
+                    max_retries=max_retries,
+                    backoff_seconds=backoff_seconds,
+                )
+                return
+
+            logger.error(
+                "Failed to initialize Timescale store for %s: %s",
+                normalized,
+                exc,
+            )
+            raise
 
         self._metrics.setdefault(self.account_id, {"limit": 1_000_000.0, "usage": 0.0})
         self._daily_usage.setdefault(self.account_id, {})
