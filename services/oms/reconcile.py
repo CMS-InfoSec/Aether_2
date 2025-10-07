@@ -10,7 +10,11 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-import httpx
+try:  # pragma: no cover - optional dependency in lightweight test environments
+    import httpx
+except ImportError:  # pragma: no cover - exercised in unit-only environments
+    httpx = None  # type: ignore[assignment]
+
 from fastapi import APIRouter, FastAPI, HTTPException
 
 from services.oms.kraken_rest import KrakenRESTError
@@ -502,6 +506,11 @@ class OMSReconciler:
             "description": "Persistent OMS reconciliation mismatch detected",
         }
         url = f"{self._alerts_base_url}/alerts/publish"
+        if httpx is None:
+            logger.warning(
+                "Unable to publish reconcile alert for %s because httpx is not installed", account_id
+            )
+            return False
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 response = await client.post(url, json=payload)
@@ -512,7 +521,7 @@ class OMSReconciler:
                 mismatches,
             )
             return True
-        except httpx.HTTPError as exc:  # pragma: no cover - defensive logging
+        except (httpx.HTTPError if httpx is not None else Exception) as exc:  # pragma: no cover - defensive logging
             logger.warning(
                 "Failed to publish reconcile alert for account %s: %s", account_id, exc
             )
