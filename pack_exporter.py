@@ -109,43 +109,96 @@ def _storage_config_from_env() -> ObjectStorageConfig:
     return ObjectStorageConfig(bucket=bucket, prefix=prefix, endpoint_url=endpoint_url)
 
 
-def _resolve_path(env_name: str, *, default: Path | None = None) -> Path:
+def _ensure_no_symlink_ancestors(path: Path, *, context: str) -> None:
+    """Raise ``MissingArtifactError`` if *path* or an ancestor is a symlink."""
+
+    for ancestor in (path,) + tuple(path.parents):
+        if ancestor.exists() and ancestor.is_symlink():
+            raise MissingArtifactError(f"{context} must not reference symlinks")
+
+
+def _ensure_regular_path(path: Path, *, context: str) -> None:
+    """Ensure *path* points to a regular file or directory."""
+
+    if path.is_dir() or path.is_file():
+        return
+    raise MissingArtifactError(f"{context} must reference a file or directory")
+
+
+def _ensure_within_base(base: Path, target: Path, *, context: str) -> None:
+    """Ensure *target* resides within *base*."""
+
+    try:
+        target.relative_to(base)
+    except ValueError as exc:
+        raise MissingArtifactError(
+            f"{context} must reside within {base}"
+        ) from exc
+
+
+def _resolve_base_path() -> Path:
+    raw_base = Path(os.getenv("KNOWLEDGE_PACK_ROOT", ".")).expanduser()
+    try:
+        resolved = raw_base.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise MissingArtifactError(
+            "KNOWLEDGE_PACK_ROOT must reference an existing directory"
+        ) from exc
+    if not resolved.is_dir():
+        raise MissingArtifactError("KNOWLEDGE_PACK_ROOT must be a directory")
+    _ensure_no_symlink_ancestors(resolved, context="KNOWLEDGE_PACK_ROOT")
+    return resolved
+
+
+def _resolve_path(env_name: str, *, default: Path | None = None, base: Path) -> Path:
     raw = os.getenv(env_name)
     if raw:
-        path = Path(raw).expanduser()
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = base / candidate
     elif default is not None:
-        path = default
+        candidate = default
     else:
         raise MissingArtifactError(
             f"{env_name} must be set to locate knowledge pack artefacts"
         )
-    resolved = path.resolve()
-    if not resolved.exists():
+
+    context = f"{env_name}"
+    if not candidate.exists():
         raise MissingArtifactError(
-            f"Expected artefact at {resolved} (from {env_name!s}) does not exist"
+            f"Expected artefact at {candidate} (from {env_name!s}) does not exist"
         )
+    _ensure_no_symlink_ancestors(candidate, context=context)
+    _ensure_regular_path(candidate, context=context)
+
+    resolved = candidate.resolve(strict=True)
+    _ensure_within_base(base, resolved, context=context)
     return resolved
 
 
 def resolve_inputs() -> PackInputs:
     """Resolve artefact locations from environment variables."""
 
-    base = Path(os.getenv("KNOWLEDGE_PACK_ROOT", ".")).resolve()
+    base = _resolve_base_path()
     defaults = {
         "model_weights": base / "artifacts" / "model_weights",
         "feature_importance": base / "artifacts" / "feature_importance",
         "anomaly_tags": base / "artifacts" / "anomaly_tags",
-        "config": Path("config").resolve(),
+        "config": base / "config",
     }
     return PackInputs(
-        model_weights=_resolve_path("KNOWLEDGE_PACK_WEIGHTS", default=defaults["model_weights"]),
+        model_weights=_resolve_path(
+            "KNOWLEDGE_PACK_WEIGHTS", default=defaults["model_weights"], base=base
+        ),
         feature_importance=_resolve_path(
-            "KNOWLEDGE_PACK_FEATURE_IMPORTANCE", default=defaults["feature_importance"]
+            "KNOWLEDGE_PACK_FEATURE_IMPORTANCE",
+            default=defaults["feature_importance"],
+            base=base,
         ),
         anomaly_tags=_resolve_path(
-            "KNOWLEDGE_PACK_ANOMALY_TAGS", default=defaults["anomaly_tags"]
+            "KNOWLEDGE_PACK_ANOMALY_TAGS", default=defaults["anomaly_tags"], base=base
         ),
-        config=_resolve_path("KNOWLEDGE_PACK_CONFIG", default=defaults["config"]),
+        config=_resolve_path("KNOWLEDGE_PACK_CONFIG", default=defaults["config"], base=base),
     )
 
 

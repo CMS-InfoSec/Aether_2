@@ -1,5 +1,6 @@
 import datetime as dt
 import hashlib
+import shutil
 import tarfile
 from pathlib import Path
 
@@ -176,3 +177,58 @@ def test_latest_pack_endpoint_rejects_unauthorized(monkeypatch: pytest.MonkeyPat
     response = http.get("/knowledge/export/latest")
 
     assert response.status_code in {401, 403}
+
+
+def _prepare_default_artifacts(root: Path) -> None:
+    (root / "artifacts" / "model_weights").mkdir(parents=True, exist_ok=True)
+    (root / "artifacts" / "feature_importance").mkdir(parents=True, exist_ok=True)
+    (root / "artifacts" / "anomaly_tags").mkdir(parents=True, exist_ok=True)
+    (root / "config").mkdir(parents=True, exist_ok=True)
+
+
+def test_resolve_inputs_rejects_paths_outside_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    _prepare_default_artifacts(root)
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "weights.bin").write_text("secret")
+
+    monkeypatch.setenv("KNOWLEDGE_PACK_ROOT", str(root))
+    monkeypatch.delenv("KNOWLEDGE_PACK_WEIGHTS", raising=False)
+    monkeypatch.setenv("KNOWLEDGE_PACK_WEIGHTS", str(outside / "weights.bin"))
+
+    with pytest.raises(pack_exporter.MissingArtifactError) as excinfo:
+        pack_exporter.resolve_inputs()
+
+    assert "must reside within" in str(excinfo.value)
+
+
+def test_resolve_inputs_rejects_symlink_targets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    _prepare_default_artifacts(root)
+
+    target = root / "artifacts" / "model_weights_real"
+    target.mkdir(parents=True)
+    link = root / "artifacts" / "model_weights"
+    if link.exists():
+        if link.is_symlink():
+            link.unlink()
+        else:
+            shutil.rmtree(link)
+    link.symlink_to(target, target_is_directory=True)
+
+    monkeypatch.setenv("KNOWLEDGE_PACK_ROOT", str(root))
+    monkeypatch.delenv("KNOWLEDGE_PACK_WEIGHTS", raising=False)
+    monkeypatch.setenv("KNOWLEDGE_PACK_WEIGHTS", str(link))
+
+    with pytest.raises(pack_exporter.MissingArtifactError) as excinfo:
+        pack_exporter.resolve_inputs()
+
+    assert "must not reference symlinks" in str(excinfo.value)
