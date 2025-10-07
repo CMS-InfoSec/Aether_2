@@ -27,7 +27,7 @@ from metrics import increment_safe_mode_triggers, setup_metrics
 from services.common.security import require_admin_account
 from common.utils.redis import create_redis_from_url
 from shared.async_utils import dispatch_async
-from shared.audit_hooks import load_audit_hooks
+from shared.audit_hooks import load_audit_hooks, log_event_with_fallback
 
 
 _AUDIT_HOOKS = load_audit_hooks()
@@ -744,17 +744,18 @@ def enter_safe_mode(
         ) from exc
     response = controller.status().to_response()
 
-    try:
-        _AUDIT_HOOKS.log_event(
-            actor=actor_account,
-            action="safe_mode.enter",
-            entity="safe_mode",
-            before=before_snapshot,
-            after=dict(response),
-            ip_address=request.client.host if request.client else None,
-        )
-    except Exception:  # pragma: no cover - defensive best effort
-        LOGGER.exception("Failed to record audit log for safe mode entry")
+    log_event_with_fallback(
+        _AUDIT_HOOKS,
+        LOGGER,
+        actor=actor_account,
+        action="safe_mode.enter",
+        entity="safe_mode",
+        before=before_snapshot,
+        after=dict(response),
+        ip_address=request.client.host if request.client else None,
+        failure_message="Failed to record audit log for safe mode entry",
+        disabled_message="Audit logging disabled; skipping safe_mode.enter",
+    )
 
     return response
 
@@ -771,17 +772,18 @@ def exit_safe_mode(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     response = controller.status().to_response()
 
-    try:
-        _AUDIT_HOOKS.log_event(
-            actor=actor_account,
-            action="safe_mode.exit",
-            entity="safe_mode",
-            before=before_snapshot,
-            after=dict(response),
-            ip_address=request.client.host if request.client else None,
-        )
-    except Exception:  # pragma: no cover - defensive best effort
-        LOGGER.exception("Failed to record audit log for safe mode exit")
+    log_event_with_fallback(
+        _AUDIT_HOOKS,
+        LOGGER,
+        actor=actor_account,
+        action="safe_mode.exit",
+        entity="safe_mode",
+        before=before_snapshot,
+        after=dict(response),
+        ip_address=request.client.host if request.client else None,
+        failure_message="Failed to record audit log for safe mode exit",
+        disabled_message="Audit logging disabled; skipping safe_mode.exit",
+    )
 
     return response
 

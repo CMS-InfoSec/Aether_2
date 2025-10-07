@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Callable, Mapping, Optional, Protocol
@@ -106,5 +107,56 @@ def load_audit_hooks() -> AuditHooks:
     return AuditHooks(log=log_audit, hash_ip=hash_ip)
 
 
-__all__ = ["AuditHooks", "AuditCallable", "HashIpCallable", "load_audit_hooks"]
+def log_event_with_fallback(
+    hooks: AuditHooks,
+    logger: logging.Logger,
+    *,
+    actor: str,
+    action: str,
+    entity: str,
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    ip_address: Optional[str] = None,
+    ip_hash: Optional[str] = None,
+    failure_message: str,
+    disabled_message: Optional[str] = None,
+    disabled_level: int = logging.DEBUG,
+) -> bool:
+    """Emit an audit event while shielding callers from optional failures.
+
+    The helper wraps :meth:`AuditHooks.log_event` to provide consistent
+    fallback logging across services.  When the optional audit dependency is
+    absent the function logs ``disabled_message`` (when provided) at
+    ``disabled_level``.  When the audit logger raises an unexpected exception
+    the error is recorded using :meth:`logging.Logger.exception` and ``False``
+    is returned to signal that no entry was written.
+    """
+
+    try:
+        handled = hooks.log_event(
+            actor=actor,
+            action=action,
+            entity=entity,
+            before=before,
+            after=after,
+            ip_address=ip_address,
+            ip_hash=ip_hash,
+        )
+    except Exception:
+        logger.exception(failure_message)
+        return False
+
+    if not handled and disabled_message is not None:
+        logger.log(disabled_level, disabled_message)
+
+    return handled
+
+
+__all__ = [
+    "AuditHooks",
+    "AuditCallable",
+    "HashIpCallable",
+    "load_audit_hooks",
+    "log_event_with_fallback",
+]
 

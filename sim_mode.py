@@ -15,7 +15,7 @@ from metrics import setup_metrics
 from services.common.adapters import KafkaNATSAdapter
 from services.common.security import require_admin_account
 from shared.sim_mode import SimModeStatus, sim_mode_repository
-from shared.audit_hooks import load_audit_hooks
+from shared.audit_hooks import load_audit_hooks, log_event_with_fallback
 
 
 _AUDIT_HOOKS = load_audit_hooks()
@@ -62,17 +62,18 @@ async def _publish_event(status: SimModeStatus, actor: str) -> None:
 
 
 def _log_audit_transition(before: SimModeStatus, after: SimModeStatus, actor: str, request: Request) -> None:
-    try:
-        _AUDIT_HOOKS.log_event(
-            actor=actor,
-            action="sim_mode.transition",
-            entity="platform",
-            before={"active": before.active, "reason": before.reason, "ts": before.ts.isoformat()},
-            after={"active": after.active, "reason": after.reason, "ts": after.ts.isoformat()},
-            ip_address=request.client.host if request.client else None,
-        )
-    except Exception:  # pragma: no cover - ensure state change isn't blocked by audit failure
-        LOGGER.exception("Failed to record audit trail for simulation mode transition")
+    log_event_with_fallback(
+        _AUDIT_HOOKS,
+        LOGGER,
+        actor=actor,
+        action="sim_mode.transition",
+        entity="platform",
+        before={"active": before.active, "reason": before.reason, "ts": before.ts.isoformat()},
+        after={"active": after.active, "reason": after.reason, "ts": after.ts.isoformat()},
+        ip_address=request.client.host if request.client else None,
+        failure_message="Failed to record audit trail for simulation mode transition",
+        disabled_message="Audit logging disabled; skipping sim_mode.transition",
+    )
 
 
 @app.get("/sim/status", response_model=SimModeStatusResponse)

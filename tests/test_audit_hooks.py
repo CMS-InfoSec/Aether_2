@@ -1,5 +1,6 @@
 import builtins
 import hashlib
+import logging
 
 import pytest
 
@@ -124,3 +125,50 @@ def test_log_event_respects_explicit_ip_hash():
 
     assert handled is True
     assert captured["ip_hash"] == "explicit-hash"
+
+
+def test_log_event_with_fallback_logs_when_disabled(caplog: pytest.LogCaptureFixture):
+    hooks = audit_hooks.AuditHooks(log=None, hash_ip=lambda value: "hash")
+
+    logger = logging.getLogger("test.audit.disabled")
+    with caplog.at_level(logging.DEBUG, logger=logger.name):
+        handled = audit_hooks.log_event_with_fallback(
+            hooks,
+            logger,
+            actor="dave",
+            action="demo.disabled",
+            entity="resource",
+            before={},
+            after={},
+            failure_message="should not trigger",
+            disabled_message="audit disabled",
+        )
+
+    assert handled is False
+    assert any(record.message == "audit disabled" for record in caplog.records)
+
+
+def test_log_event_with_fallback_handles_exceptions(caplog: pytest.LogCaptureFixture):
+    def failing_log(**payload):
+        raise RuntimeError("boom")
+
+    hooks = audit_hooks.AuditHooks(log=failing_log, hash_ip=lambda value: "hash")
+    logger = logging.getLogger("test.audit.errors")
+
+    with caplog.at_level(logging.ERROR, logger=logger.name):
+        handled = audit_hooks.log_event_with_fallback(
+            hooks,
+            logger,
+            actor="erin",
+            action="demo.error",
+            entity="resource",
+            before={},
+            after={},
+            failure_message="failed to record",
+        )
+
+    assert handled is False
+    assert any(
+        record.levelno == logging.ERROR and "failed to record" in record.message
+        for record in caplog.records
+    )

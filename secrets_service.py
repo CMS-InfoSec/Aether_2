@@ -23,7 +23,7 @@ from kubernetes.config.config_exception import ConfigException
 from pydantic import BaseModel, Field, validator
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from services.secrets.signing import sign_kraken_request
-from shared.audit_hooks import load_audit_hooks
+from shared.audit_hooks import load_audit_hooks, log_event_with_fallback
 
 _AUDIT_HOOKS = load_audit_hooks()
 
@@ -591,22 +591,24 @@ async def store_kraken_secret(
 
     log_rotation(payload.account_id, verified_actor, result["last_rotated"])
 
-    try:
-        audit_after = dict(result)
-        audit_after["actor"] = verified_actor
-        _AUDIT_HOOKS.log_event(
-            actor=verified_actor,
-            action="secret.kraken.rotate",
-            entity=payload.account_id,
-            before=before_snapshot,
-            after=audit_after,
-            ip_address=request.client.host if request.client else None,
-        )
-    except Exception:  # pragma: no cover - defensive best effort
-        LOGGER.exception(
-            "Failed to record audit log for Kraken secret rotation for %s",
-            payload.account_id,
-        )
+    audit_after = dict(result)
+    audit_after["actor"] = verified_actor
+    log_event_with_fallback(
+        _AUDIT_HOOKS,
+        LOGGER,
+        actor=verified_actor,
+        action="secret.kraken.rotate",
+        entity=payload.account_id,
+        before=before_snapshot,
+        after=audit_after,
+        ip_address=request.client.host if request.client else None,
+        failure_message=(
+            f"Failed to record audit log for Kraken secret rotation for {payload.account_id}"
+        ),
+        disabled_message=(
+            f"Audit logging disabled; skipping secret.kraken.rotate for {payload.account_id}"
+        ),
+    )
 
     return JSONResponse(status_code=status.HTTP_201_CREATED, content=result)
 

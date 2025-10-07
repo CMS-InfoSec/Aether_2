@@ -13,7 +13,7 @@ from kill_alerts import NotificationDispatchError, dispatch_notifications
 from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
 from services.common.security import require_admin_account
 from shared.async_utils import dispatch_async
-from shared.audit_hooks import load_audit_hooks
+from shared.audit_hooks import load_audit_hooks, log_event_with_fallback
 
 _AUDIT_HOOKS = load_audit_hooks()
 
@@ -112,25 +112,28 @@ def trigger_kill_switch(
         channels_sent=channels_sent,
     )
 
-    try:
-        _AUDIT_HOOKS.log_event(
-            actor=actor_account,
-            action="kill_switch.triggered",
-            entity=normalized_account,
-            before={},
-            after={
-                "reason_code": reason_code.value,
-                "reason": reason_description,
-                "channels_sent": channels_sent,
-                "failed_channels": failed_channels,
-                "triggered_at": activation_ts.isoformat(),
-            },
-            ip_address=request.client.host if request.client else None,
-        )
-    except Exception:  # pragma: no cover - defensive best effort
-        LOGGER.exception(
-            "Failed to record audit log for kill switch activation on %s", normalized_account
-        )
+    log_event_with_fallback(
+        _AUDIT_HOOKS,
+        LOGGER,
+        actor=actor_account,
+        action="kill_switch.triggered",
+        entity=normalized_account,
+        before={},
+        after={
+            "reason_code": reason_code.value,
+            "reason": reason_description,
+            "channels_sent": channels_sent,
+            "failed_channels": failed_channels,
+            "triggered_at": activation_ts.isoformat(),
+        },
+        ip_address=request.client.host if request.client else None,
+        failure_message=(
+            f"Failed to record audit log for kill switch activation on {normalized_account}"
+        ),
+        disabled_message=(
+            f"Audit logging disabled; skipping kill switch event for {normalized_account}"
+        ),
+    )
 
     response_body = {
         "status": response_status,

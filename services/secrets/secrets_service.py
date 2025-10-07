@@ -83,7 +83,7 @@ from services.secrets.secure_secrets import (
     SecretsMetadataStore,
 )
 from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
-from shared.audit_hooks import load_audit_hooks
+from shared.audit_hooks import load_audit_hooks, log_event_with_fallback
 
 
 _AUDIT_HOOKS = load_audit_hooks()
@@ -301,19 +301,22 @@ def _perform_secure_rotation(
         after=audit_after,
     )
 
-    try:
-        _AUDIT_HOOKS.log_event(
-            actor=actor,
-            action="secret.kraken.rotate",
-            entity=f"kraken:{account_id}",
-            before=before_for_audit,
-            after=chain_audit_after,
-            ip_hash=chain_ip_hash,
-        )
-    except Exception:  # pragma: no cover - defensive best effort
-        LOGGER.exception(
-            "Failed to record tamper-evident audit log for Kraken rotation on %s", account_id
-        )
+    log_event_with_fallback(
+        _AUDIT_HOOKS,
+        LOGGER,
+        actor=actor,
+        action="secret.kraken.rotate",
+        entity=f"kraken:{account_id}",
+        before=before_for_audit,
+        after=chain_audit_after,
+        ip_hash=chain_ip_hash,
+        failure_message=(
+            f"Failed to record tamper-evident audit log for Kraken rotation on {account_id}"
+        ),
+        disabled_message=(
+            f"Audit logging disabled; skipping secret.kraken.rotate for {account_id}"
+        ),
+    )
 
     LOGGER.info(
         "OMS watcher note: Kraken credentials rotated with envelope encryption",  # pragma: no cover - log only
