@@ -7,7 +7,7 @@ import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, Callable, Iterator, Mapping, Optional, Protocol
+from typing import Any, Callable, Iterator, Mapping, Optional, Protocol, Tuple
 
 
 class AuditCallable(Protocol):
@@ -26,6 +26,9 @@ class AuditCallable(Protocol):
 
 
 HashIpCallable = Callable[[Optional[str]], Optional[str]]
+
+
+LOGGER = logging.getLogger("shared.audit_hooks")
 
 
 def _hash_ip_fallback(value: Optional[str]) -> Optional[str]:
@@ -47,6 +50,26 @@ class AuditHooks:
 
     log: AuditCallable | None
     hash_ip: HashIpCallable
+
+    def resolve_ip_hash(
+        self,
+        *,
+        ip_address: Optional[str],
+        ip_hash: Optional[str],
+    ) -> Tuple[Optional[str], bool, Optional[Exception]]:
+        """Return a hashed IP, tracking whether a fallback hash was required."""
+
+        if ip_hash is not None:
+            return ip_hash, False, None
+
+        if ip_address is None:
+            return None, False, None
+
+        try:
+            return self.hash_ip(ip_address), False, None
+        except Exception as exc:  # pragma: no cover - exercised via tests
+            fallback_hash = _hash_ip_fallback(ip_address)
+            return fallback_hash, True, exc
 
     def log_event(
         self,
@@ -71,9 +94,16 @@ class AuditHooks:
         if log_callable is None:
             return False
 
-        resolved_ip_hash = ip_hash
-        if resolved_ip_hash is None and ip_address is not None:
-            resolved_ip_hash = self.hash_ip(ip_address)
+        resolved_ip_hash, _hash_fallback, hash_error = self.resolve_ip_hash(
+            ip_address=ip_address,
+            ip_hash=ip_hash,
+        )
+
+        if hash_error is not None:
+            LOGGER.error(
+                "Audit hash_ip callable failed; using fallback hash.",
+                exc_info=(type(hash_error), hash_error, hash_error.__traceback__),
+            )
 
         log_callable(
             actor=actor,
@@ -161,11 +191,21 @@ def _build_audit_log_extra(
     ip_address: Optional[str],
     ip_hash: Optional[str],
     context: Optional[Mapping[str, Any]],
+    hash_fallback: bool,
 ) -> dict[str, Any]:
     """Construct structured logging metadata for audit fallbacks."""
 
     if context is not None:
-        return dict(context)
+        extra = dict(context)
+        if hash_fallback:
+            audit_metadata = extra.get("audit")
+            if isinstance(audit_metadata, Mapping):
+                audit_copy = dict(audit_metadata)
+                audit_copy.setdefault("hash_fallback", True)
+                extra["audit"] = audit_copy
+            else:
+                extra.setdefault("hash_fallback", True)
+        return extra
 
     return {
         "audit": {
@@ -176,6 +216,7 @@ def _build_audit_log_extra(
             "after": dict(after),
             "ip_address": ip_address,
             "ip_hash": ip_hash,
+            "hash_fallback": hash_fallback,
         }
     }
 
@@ -208,9 +249,10 @@ def log_event_with_fallback(
     to signal that no entry was written.
     """
 
-    resolved_ip_hash = ip_hash
-    if resolved_ip_hash is None and ip_address is not None:
-        resolved_ip_hash = hooks.hash_ip(ip_address)
+    resolved_ip_hash, hash_fallback, hash_error = hooks.resolve_ip_hash(
+        ip_address=ip_address,
+        ip_hash=ip_hash,
+    )
 
     log_extra = _build_audit_log_extra(
         actor=actor,
@@ -221,7 +263,15 @@ def log_event_with_fallback(
         ip_address=ip_address,
         ip_hash=resolved_ip_hash,
         context=context,
+        hash_fallback=hash_fallback,
     )
+
+    if hash_error is not None:
+        logger.error(
+            "Audit hash_ip callable failed; using fallback hash.",
+            extra=log_extra,
+            exc_info=(type(hash_error), hash_error, hash_error.__traceback__),
+        )
 
     try:
         handled = hooks.log_event(

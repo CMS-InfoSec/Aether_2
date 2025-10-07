@@ -2,6 +2,8 @@ import builtins
 import hashlib
 import logging
 
+from typing import Optional
+
 import pytest
 
 from shared import audit_hooks
@@ -154,6 +156,7 @@ def test_log_event_with_fallback_logs_when_disabled(caplog: pytest.LogCaptureFix
         "after": {},
         "ip_address": None,
         "ip_hash": None,
+        "hash_fallback": False,
     }
 
 
@@ -190,7 +193,91 @@ def test_log_event_with_fallback_handles_exceptions(caplog: pytest.LogCaptureFix
         "after": {},
         "ip_address": None,
         "ip_hash": None,
+        "hash_fallback": False,
     }
+
+
+def test_log_event_with_fallback_uses_fallback_hash_on_error(caplog: pytest.LogCaptureFixture):
+    calls = []
+
+    def fake_log(**payload):
+        calls.append(payload)
+
+    def failing_hash(value: Optional[str]) -> Optional[str]:
+        raise RuntimeError("hash failure")
+
+    hooks = audit_hooks.AuditHooks(log=fake_log, hash_ip=failing_hash)
+    logger = logging.getLogger("test.audit.hash")
+
+    with caplog.at_level(logging.ERROR, logger=logger.name):
+        handled = audit_hooks.log_event_with_fallback(
+            hooks,
+            logger,
+            actor="ivy",
+            action="demo.hash",
+            entity="resource",
+            before={"before": True},
+            after={"after": True},
+            ip_address="192.168.0.10",
+            failure_message="should not trigger",
+        )
+
+    assert handled is True
+    expected_hash = audit_hooks._hash_ip_fallback("192.168.0.10")
+    assert calls == [
+        {
+            "actor": "ivy",
+            "action": "demo.hash",
+            "entity": "resource",
+            "before": {"before": True},
+            "after": {"after": True},
+            "ip_hash": expected_hash,
+        }
+    ]
+
+    error_record = next(
+        record for record in caplog.records if record.message == "Audit hash_ip callable failed; using fallback hash."
+    )
+    assert error_record.audit == {
+        "actor": "ivy",
+        "action": "demo.hash",
+        "entity": "resource",
+        "before": {"before": True},
+        "after": {"after": True},
+        "ip_address": "192.168.0.10",
+        "ip_hash": expected_hash,
+        "hash_fallback": True,
+    }
+
+
+def test_log_event_falls_back_when_hash_raises(caplog: pytest.LogCaptureFixture):
+    captured = {}
+
+    def fake_log(**payload):
+        captured.update(payload)
+
+    def failing_hash(value: Optional[str]) -> Optional[str]:
+        raise RuntimeError("hash failure")
+
+    hooks = audit_hooks.AuditHooks(log=fake_log, hash_ip=failing_hash)
+
+    with caplog.at_level(logging.ERROR, logger="shared.audit_hooks"):
+        handled = hooks.log_event(
+            actor="jane",
+            action="demo.log",
+            entity="resource",
+            before={"state": "before"},
+            after={"state": "after"},
+            ip_address="172.16.0.2",
+        )
+
+    assert handled is True
+    expected_hash = audit_hooks._hash_ip_fallback("172.16.0.2")
+    assert captured["ip_hash"] == expected_hash
+    module_record = next(
+        record for record in caplog.records if record.message == "Audit hash_ip callable failed; using fallback hash."
+    )
+    assert module_record.levelno == logging.ERROR
 
 
 def test_log_event_with_fallback_allows_custom_context(caplog: pytest.LogCaptureFixture):
