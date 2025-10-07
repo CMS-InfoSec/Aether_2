@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -24,6 +25,7 @@ from ml.training.workflow import (
     _prepare_supervised_frame,
     _chronological_split,
     _apply_outlier_handling,
+    _write_artifacts,
     _TARGET_COLUMN,
 )
 
@@ -180,3 +182,45 @@ def test_outlier_handling_clip_and_drop() -> None:
     dropped = _apply_outlier_handling(prepared, _TARGET_COLUMN, drop_config)
     assert len(dropped) < len(prepared)
     assert dropped[_TARGET_COLUMN].between(lower, upper).all()
+
+
+def test_write_artifacts_normalises_relative_base_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    config = ObjectStorageConfig(base_path="artifacts/output")
+
+    result = _write_artifacts({"metrics.json": b"{}"}, config)
+
+    expected_path = tmp_path / "artifacts" / "output" / "metrics.json"
+    assert Path(result["metrics.json"]) == expected_path
+    assert expected_path.exists()
+
+
+def test_write_artifacts_rejects_parent_reference_in_base_path() -> None:
+    config = ObjectStorageConfig(base_path="../escape")
+
+    with pytest.raises(ValueError, match="parent directory"):
+        _write_artifacts({"metrics.json": b"{}"}, config)
+
+
+def test_write_artifacts_rejects_symlink_base_path(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(target, target_is_directory=True)
+    config = ObjectStorageConfig(base_path=str(link))
+
+    with pytest.raises(ValueError, match="symlink"):
+        _write_artifacts({"metrics.json": b"{}"}, config)
+
+
+def test_write_artifacts_rejects_traversal_in_artifact_name(tmp_path: Path) -> None:
+    base = tmp_path / "artifacts"
+    config = ObjectStorageConfig(base_path=str(base))
+
+    with pytest.raises(ValueError, match="parent directory"):
+        _write_artifacts({"../escape": b"{}"}, config)
+
+    with pytest.raises(ValueError, match="parent directory"):
+        _write_artifacts({"..\\escape": b"{}"}, config)
