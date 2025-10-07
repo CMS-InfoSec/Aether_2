@@ -3,7 +3,8 @@
 This repository provides reference infrastructure for ingesting, validating, and
 serving market data for the Aether research platform. The stack centres around
 TimescaleDB for historical storage, Kafka/NATS for real-time dissemination, and
-Feast/Redis for feature serving.
+Feast/Redis for feature serving. **All trading logic is restricted to USD-quoted
+Kraken spot markets only.**
 
 ## Components
 

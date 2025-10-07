@@ -28,6 +28,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from reports.storage import ArtifactStorage, build_storage_from_env
 from services.common.security import require_admin_account
+from services.common.spot import require_spot_http
 from services.models.model_server import get_active_model
 from shared.spot import is_spot_symbol, normalize_spot_symbol
 
@@ -740,9 +741,11 @@ def get_trade_explanation(
     instrument = trade.get("instrument") or trade.get("symbol")
     if not instrument:
         raise HTTPException(status_code=422, detail="Trade is missing instrument context")
-    normalized_instrument = normalize_spot_symbol(instrument)
-    if not normalized_instrument or not is_spot_symbol(normalized_instrument):
-        raise HTTPException(status_code=422, detail="Trade references non-spot instrument")
+    normalized_instrument = require_spot_http(
+        instrument,
+        param="instrument",
+        logger=LOGGER,
+    )
 
     features = _extract_feature_mapping(trade)
     model = get_active_model(str(account_id), normalized_instrument)
