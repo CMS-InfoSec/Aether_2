@@ -15,15 +15,7 @@ from metrics import setup_metrics
 from services.common.adapters import KafkaNATSAdapter
 from services.common.security import require_admin_account
 from shared.sim_mode import SimModeStatus, sim_mode_repository
-
-
-try:  # pragma: no cover - optional audit dependency
-    from common.utils.audit_logger import hash_ip as audit_hash_ip, log_audit as chain_log_audit
-except Exception:  # pragma: no cover - degrade gracefully if audit subsystem unavailable
-    chain_log_audit = None  # type: ignore[assignment]
-
-    def audit_hash_ip(_: Optional[str]) -> Optional[str]:  # type: ignore[override]
-        return None
+from shared.audit_hooks import load_audit_hooks, log_event_with_fallback
 
 
 LOGGER = logging.getLogger("sim_mode_service")
@@ -67,20 +59,19 @@ async def _publish_event(status: SimModeStatus, actor: str) -> None:
 
 
 def _log_audit_transition(before: SimModeStatus, after: SimModeStatus, actor: str, request: Request) -> None:
-    if chain_log_audit is None:  # pragma: no cover - audit optional
-        return
-    try:
-        ip_hash = audit_hash_ip(request.client.host if request.client else None)
-        chain_log_audit(
-            actor=actor,
-            action="sim_mode.transition",
-            entity="platform",
-            before={"active": before.active, "reason": before.reason, "ts": before.ts.isoformat()},
-            after={"active": after.active, "reason": after.reason, "ts": after.ts.isoformat()},
-            ip_hash=ip_hash,
-        )
-    except Exception:  # pragma: no cover - ensure state change isn't blocked by audit failure
-        LOGGER.exception("Failed to record audit trail for simulation mode transition")
+    audit_hooks = load_audit_hooks()
+    log_event_with_fallback(
+        audit_hooks,
+        LOGGER,
+        actor=actor,
+        action="sim_mode.transition",
+        entity="platform",
+        before={"active": before.active, "reason": before.reason, "ts": before.ts.isoformat()},
+        after={"active": after.active, "reason": after.reason, "ts": after.ts.isoformat()},
+        ip_address=request.client.host if request.client else None,
+        failure_message="Failed to record audit trail for simulation mode transition",
+        disabled_message="Audit logging disabled; skipping sim_mode.transition",
+    )
 
 
 @app.get("/sim/status", response_model=SimModeStatusResponse)
