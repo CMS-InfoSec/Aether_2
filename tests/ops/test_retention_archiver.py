@@ -68,3 +68,48 @@ def test_from_env_rejects_symlink_ancestor(monkeypatch: pytest.MonkeyPatch, tmp_
 
     with pytest.raises(ValueError, match="symlinked directories"):
         RetentionConfig.from_env()
+
+
+def _prime_directory_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    snapshot_dir = tmp_path / "snapshots"
+    audit_dir = tmp_path / "audit"
+    oms_dir = tmp_path / "oms"
+    tca_dir = tmp_path / "tca"
+
+    for directory in (snapshot_dir, audit_dir, oms_dir, tca_dir):
+        directory.mkdir()
+
+    monkeypatch.setenv("PROMETHEUS_SNAPSHOT_DIR", str(snapshot_dir))
+    monkeypatch.setenv("AUDIT_LOG_DIR", str(audit_dir))
+    monkeypatch.setenv("OMS_LOG_DIR", str(oms_dir))
+    monkeypatch.setenv("TCA_REPORT_DIR", str(tca_dir))
+
+
+def test_from_env_normalises_prefix(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _set_required_env(monkeypatch)
+    _prime_directory_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("RETENTION_PREFIX", " logs//2024 / ")
+
+    config = RetentionConfig.from_env()
+
+    assert config.prefix == "logs/2024"
+
+
+def test_from_env_rejects_prefix_traversal(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _set_required_env(monkeypatch)
+    _prime_directory_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("RETENTION_PREFIX", "../escape")
+
+    with pytest.raises(ValueError, match="path traversal"):
+        RetentionConfig.from_env()
+
+
+def test_from_env_rejects_prefix_control_chars(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_required_env(monkeypatch)
+    _prime_directory_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("RETENTION_PREFIX", "bad\x01prefix")
+
+    with pytest.raises(ValueError, match="control characters"):
+        RetentionConfig.from_env()

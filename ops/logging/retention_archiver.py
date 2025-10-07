@@ -59,6 +59,26 @@ def _ensure_safe_directory(path: Path, env_var: str) -> Path:
     return path
 
 
+def _normalise_s3_prefix(prefix: str) -> str:
+    """Return a sanitised S3 prefix free from traversal or control chars."""
+
+    if not prefix:
+        return ""
+
+    segments: list[str] = []
+    for raw_segment in prefix.replace("\\", "/").split("/"):
+        segment = raw_segment.strip()
+        if not segment:
+            continue
+        if segment in {".", ".."}:
+            raise ValueError("RETENTION_PREFIX must not contain path traversal sequences")
+        if any(ord(char) < 32 for char in segment):
+            raise ValueError("RETENTION_PREFIX must not contain control characters")
+        segments.append(segment)
+
+    return "/".join(segments)
+
+
 @dataclass(frozen=True)
 class ArchiveRecord:
     """Metadata recorded for each log archive exported to object storage."""
@@ -131,7 +151,7 @@ class RetentionConfig:
         if not logs_days:
             raise RuntimeError("LOG_RETENTION_DAYS environment variable is required")
 
-        prefix = os.getenv("RETENTION_PREFIX", DEFAULT_PREFIX)
+        prefix = _normalise_s3_prefix(os.getenv("RETENTION_PREFIX", DEFAULT_PREFIX))
         endpoint_url = os.getenv("RETENTION_ENDPOINT")
         storage_class = os.getenv("RETENTION_STORAGE_CLASS")
 
@@ -341,13 +361,13 @@ class RetentionArchiver:
         return digest.hexdigest()
 
     def _build_s3_key(self, now: dt.datetime, filename: str) -> str:
-        return "/".join(
-            [
-                self.config.prefix.rstrip("/"),
-                f"{now:%Y/%m/%d}",
-                filename,
-            ]
-        )
+        parts = []
+        prefix = self.config.prefix.strip("/")
+        if prefix:
+            parts.append(prefix)
+        parts.append(f"{now:%Y/%m/%d}")
+        parts.append(filename)
+        return "/".join(parts)
 
     def _upload_file(self, path: Path, key: str) -> None:
         extra_args: Dict[str, object] = {}
@@ -432,3 +452,4 @@ __all__ = [
     "configure_retention_archiver",
     "router",
 ]
+
