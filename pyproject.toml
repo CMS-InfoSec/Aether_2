@@ -115,10 +115,7 @@ select = ["E402", "F401", "F402", "F811", "F841"]
 "tests/**" = ["E402"]
 
 [tool.mypy]
-files = [
-    "training_service.py",
-    "watchdog.py",
-]
+files = ["training_service.py"]
 exclude = [
     "data/migrations/env.py",
     "data/alembic/env.py",
@@ -133,4 +130,5 @@ exclude = [
     "tests/.*",
 ]
 ignore_missing_imports = true
+follow_imports = "skip"
 

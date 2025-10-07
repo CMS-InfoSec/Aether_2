@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, MutableMapping, Optional
+from typing import Any, Awaitable, Callable, Dict, Generator, List, Mapping, MutableMapping, Optional, TypeVar, cast
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
@@ -33,7 +33,7 @@ from sqlalchemy import (
     create_engine,
 )
 from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session, declarative_base, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from services.common.security import require_admin_account
@@ -174,16 +174,16 @@ def _database_url() -> str:
 
 def _engine_options(url: str) -> Dict[str, object]:
     options: Dict[str, object] = {"future": True, "pool_pre_ping": True}
+    connect_args: Dict[str, object] = {}
 
     if url.startswith("sqlite"):
-        connect_args: Dict[str, object] = {"check_same_thread": False}
+        connect_args = {"check_same_thread": False}
         options["connect_args"] = connect_args
         if ":memory:" in url:
             options["poolclass"] = StaticPool
         return options
 
     sslmode = os.getenv("TRAINING_DB_SSLMODE", "require").strip()
-    connect_args: Dict[str, object] = {}
     if sslmode:
         connect_args["sslmode"] = sslmode
     options["connect_args"] = connect_args
@@ -219,7 +219,11 @@ PROMOTE_MIN_FEE_PNL = float(os.getenv("PROMOTE_MIN_FEE_AWARE_PNL", "0.0"))
 # ---------------------------------------------------------------------------
 
 
-Base = declarative_base()
+
+class Base(DeclarativeBase):
+    """Declarative base for the training service models."""
+
+    pass
 
 
 class TrainingRunRecord(Base):
@@ -264,13 +268,14 @@ SessionLocal = sessionmaker(
     autoflush=False,
     expire_on_commit=False,
     future=True,
+    class_=Session,
 )
 Base.metadata.create_all(bind=ENGINE)
 
 
 @contextmanager
-def session_scope() -> Session:
-    session = SessionLocal()
+def session_scope() -> Generator[Session, None, None]:
+    session: Session = SessionLocal()
     try:
         yield session
         session.commit()
@@ -636,21 +641,25 @@ def _register_model(
         return str(result.version)
 
 
+T = TypeVar("T")
+
+
 async def _execute_with_retries(
     step: str,
-    correlation_id: str,
-    func,
+    trace_id: str,
+    func: Callable[..., Awaitable[T] | T],
     *args: Any,
     max_retries: int = 3,
     backoff: float = 1.5,
     **kwargs: Any,
-) -> Any:
+) -> T:
     for attempt in range(1, max_retries + 1):
         try:
             result = func(*args, **kwargs)
             if asyncio.iscoroutine(result):
-                result = await result
-            return result
+                awaited = await cast(Awaitable[T], result)
+                return awaited
+            return cast(T, result)
         except Exception as exc:
             if attempt >= max_retries:
                 logger.error(
@@ -658,7 +667,7 @@ async def _execute_with_retries(
                     step,
                     attempt,
                     exc,
-                    extra={"correlation_id": correlation_id},
+                    extra={"correlation_id": trace_id},
                 )
                 raise
             delay = backoff * attempt
@@ -669,7 +678,7 @@ async def _execute_with_retries(
                 max_retries,
                 exc,
                 delay,
-                extra={"correlation_id": correlation_id},
+                extra={"correlation_id": trace_id},
             )
             await asyncio.sleep(delay)
     raise RuntimeError("Unreachable")  # pragma: no cover - defensive
