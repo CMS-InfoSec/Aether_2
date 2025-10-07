@@ -68,11 +68,14 @@ from services.secrets.secure_secrets import (
     SecretsMetadataStore,
 )
 from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
+from shared.audit_hooks import load_audit_hooks
 
-try:  # pragma: no cover - optional audit dependency
-    from common.utils.audit_logger import hash_ip as audit_chain_hash_ip, log_audit as chain_log_audit
-except Exception:  # pragma: no cover - degrade gracefully when audit logger unavailable
-    chain_log_audit = None  # type: ignore[assignment]
+
+_AUDIT_HOOKS = load_audit_hooks()
+chain_log_audit = _AUDIT_HOOKS.log
+if _AUDIT_HOOKS.hash_ip is not None:
+    audit_chain_hash_ip = _AUDIT_HOOKS.hash_ip
+else:
 
     def audit_chain_hash_ip(_: Optional[str]) -> Optional[str]:  # type: ignore[override]
         return None

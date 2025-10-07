@@ -17,12 +17,14 @@ from metrics import increment_safe_mode_triggers, setup_metrics
 from services.common.security import require_admin_account
 from common.utils.redis import create_redis_from_url
 from shared.async_utils import dispatch_async
+from shared.audit_hooks import load_audit_hooks
 
 
-try:  # pragma: no cover - optional audit dependency
-    from common.utils.audit_logger import hash_ip as audit_hash_ip, log_audit as chain_log_audit
-except Exception:  # pragma: no cover - degrade gracefully
-    chain_log_audit = None  # type: ignore[assignment]
+_AUDIT_HOOKS = load_audit_hooks()
+chain_log_audit = _AUDIT_HOOKS.log
+if _AUDIT_HOOKS.hash_ip is not None:
+    audit_hash_ip = _AUDIT_HOOKS.hash_ip
+else:
 
     def audit_hash_ip(_: Optional[str]) -> Optional[str]:  # type: ignore[override]
         return None
