@@ -16,7 +16,6 @@ def client_fixture() -> TestClient:
 
 @pytest.fixture(name="base_payload")
 def base_payload_fixture() -> dict[str, object]:
-    fee = {"currency": "USD", "maker": 0.1, "taker": 0.2}
     return {
 
         "account_id": "company",
