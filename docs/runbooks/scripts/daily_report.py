@@ -12,9 +12,40 @@ from typing import List
 
 import requests
 
+
+def _resolve_output_dir(raw_path: str) -> Path:
+    """Resolve the output directory while guarding against unsafe inputs.
+
+    The helper rejects traversal tokens (".."), control characters, and any
+    symlinked ancestor to ensure report generation cannot escape the intended
+    filesystem tree. Returned paths are absolute so downstream callers can rely
+    on consistent behaviour regardless of the current working directory.
+    """
+
+    if any(ord(char) < 32 for char in raw_path):
+        raise ValueError("OUTPUT_DIR contains control characters")
+
+    candidate = Path(raw_path).expanduser()
+
+    if any(part == ".." for part in candidate.parts):
+        raise ValueError("OUTPUT_DIR must not contain parent directory traversal")
+
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+
+    # Convert to an absolute path without collapsing symlinks for validation.
+    candidate = candidate.absolute()
+
+    for ancestor in (candidate, *candidate.parents):
+        if ancestor.exists() and ancestor.is_symlink():
+            raise ValueError("OUTPUT_DIR must not include symlinked paths")
+
+    return candidate
+
+
 PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "http://prometheus:9090")
 LOKI_URL = os.environ.get("LOKI_URL", "http://loki:3100")
-OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "."))
+OUTPUT_DIR = _resolve_output_dir(os.environ.get("OUTPUT_DIR", "."))
 
 RISK_METRICS = {
     "p99_latency": 'histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{service="risk-api"}[5m])) by (le))',

@@ -50,6 +50,36 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
+def _resolve_artifact_root(raw: str | None, *, default: Path) -> Path:
+    """Return an absolute, symlink-free artifact directory."""
+
+    candidate_text = (raw or "").strip()
+    if candidate_text and any(ord(char) < 32 for char in candidate_text):
+        raise ValueError("TRAINING_ARTIFACT_ROOT must not contain control characters")
+
+    candidate = Path(candidate_text).expanduser() if candidate_text else default
+    if any(part == ".." for part in candidate.parts):
+        raise ValueError("TRAINING_ARTIFACT_ROOT must not contain parent directory references")
+
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+
+    for ancestor in (candidate,) + tuple(candidate.parents):
+        if ancestor.exists() and ancestor.is_symlink():
+            raise ValueError("TRAINING_ARTIFACT_ROOT must not reference symlinks")
+
+    if candidate.exists() and not candidate.is_dir():
+        raise ValueError("TRAINING_ARTIFACT_ROOT must reference a directory")
+
+    candidate.mkdir(parents=True, exist_ok=True)
+    return candidate.resolve(strict=False)
+
+
+ARTIFACT_ROOT = _resolve_artifact_root(
+    os.getenv("TRAINING_ARTIFACT_ROOT"), default=Path("artifacts/training_runs")
+)
+
+
 # ---------------------------------------------------------------------------
 # External dependency fallbacks
 # ---------------------------------------------------------------------------
@@ -86,9 +116,7 @@ except ModuleNotFoundError:  # pragma: no cover - graceful fallback.
                 "build_features module not found – generating placeholder features.",
                 extra={"feature_version": feature_version},
             )
-            artifact_dir = Path(os.getenv("TRAINING_ARTIFACT_ROOT", "artifacts/training_runs"))
-            artifact_dir.mkdir(parents=True, exist_ok=True)
-            placeholder = artifact_dir / f"features_{feature_version}.json"
+            placeholder = ARTIFACT_ROOT / f"features_{feature_version}.json"
             placeholder.write_text(json.dumps({"feature_version": feature_version, "status": "placeholder"}))
             return {"artifact": str(placeholder)}
 
@@ -156,8 +184,6 @@ def _engine_options(url: str) -> Dict[str, object]:
 
 
 DATABASE_URL = _database_url()
-ARTIFACT_ROOT = Path(os.getenv("TRAINING_ARTIFACT_ROOT", "artifacts/training_runs"))
-ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
 
 COINGECKO_RATE_LIMIT = float(os.getenv("COINGECKO_RATE_LIMIT", "5.0"))
 COINGECKO_BATCH_SIZE = int(os.getenv("COINGECKO_BATCH_SIZE", "100"))

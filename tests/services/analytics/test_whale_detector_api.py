@@ -91,3 +91,41 @@ def test_recent_whales_returns_results_for_authorized_admin(client: TestClient) 
 
     assert response.status_code == status.HTTP_200_OK
     assert response.json() == []
+
+
+def test_recent_whales_rejects_non_spot_symbol(client: TestClient) -> None:
+    with override_admin_auth(client.app, module.require_admin_account, "ops-admin") as headers:
+        response = client.get(
+            "/whales/recent",
+            headers=headers,
+            params={"symbol": "BTC-PERP"},
+        )
+
+    assert response.status_code == status.HTTP_422_UNPROCESSABLE_CONTENT
+    assert (
+        response.json()["detail"]
+        == "symbol 'BTC-PERP' is not a supported USD spot market instrument"
+    )
+
+
+def test_trade_observation_normalises_spot_symbol() -> None:
+    observation = module.TradeObservation(
+        symbol="eth/usd",
+        size=1.0,
+        notional=1000.0,
+        side="buy",
+        impact=0.5,
+    )
+
+    assert observation.symbol == "ETH-USD"
+
+
+def test_trade_observation_rejects_derivative_symbol() -> None:
+    with pytest.raises(ValueError):
+        module.TradeObservation(
+            symbol="BTC-PERP",
+            size=1.0,
+            notional=1000.0,
+            side="buy",
+            impact=0.5,
+        )
