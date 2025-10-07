@@ -72,21 +72,51 @@ class ArtifactSummary:
     files: List[Dict[str, Any]]
 
 
-def _env_override(name: str, default: Iterable[str]) -> List[Path]:
-    """Resolve directories for a given artifact type.
+def _sanitise_directory(raw: str, env_var: str) -> Path:
+    """Return a safe absolute directory path derived from ``raw``."""
 
-    Parameters
-    ----------
-    name:
-        Name of the environment variable to inspect for overrides.
-    default:
-        Iterable of default path strings to use when the variable is unset.
-    """
+    text = raw.strip()
+    if not text:
+        raise ValueError(f"{env_var} entries must not be empty")
+    if any(ord(char) < 32 for char in text):
+        raise ValueError(f"{env_var} entries must not contain control characters")
 
-    override = os.getenv(name)
+    candidate = Path(text).expanduser()
+    if any(part == ".." for part in candidate.parts):
+        raise ValueError(f"{env_var} entries must not contain parent directory traversal")
+
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+
+    candidate = candidate.absolute()
+
+    for ancestor in (candidate, *candidate.parents):
+        if ancestor.exists() and ancestor.is_symlink():
+            raise ValueError(f"{env_var} entries must not reference symlinked paths")
+
+    if candidate.exists() and not candidate.is_dir():
+        raise ValueError(f"{env_var} entries must point to directories")
+
+    return candidate
+
+
+def _resolve_artifact_dirs(env_var: str, default: Iterable[str]) -> List[Path]:
+    """Resolve and sanitise artifact directories for state reconstruction."""
+
+    override = os.getenv(env_var)
     if override:
-        return [Path(part).expanduser() for part in override.split(os.pathsep) if part]
-    return [Path(path).expanduser() for path in default]
+        raw_entries = [part for part in override.split(os.pathsep) if part]
+    else:
+        raw_entries = list(default)
+
+    directories: List[Path] = []
+    for raw in raw_entries:
+        text = str(raw).strip()
+        if not text:
+            continue
+        directories.append(_sanitise_directory(text, env_var))
+
+    return directories
 
 
 def parse_timestamp(ts: str) -> datetime:
@@ -124,7 +154,7 @@ def _load_event_logs(timestamp: datetime, limit: int = 100) -> Dict[str, Any]:
     payload is intentionally small to keep the API responsive.
     """
 
-    log_dirs = _env_override("AETHER_EVENT_LOG_DIRS", DEFAULT_EVENT_LOG_DIRS)
+    log_dirs = _resolve_artifact_dirs("AETHER_EVENT_LOG_DIRS", DEFAULT_EVENT_LOG_DIRS)
     events: List[Dict[str, Any]] = []
     searched: List[str] = []
 
@@ -133,22 +163,28 @@ def _load_event_logs(timestamp: datetime, limit: int = 100) -> Dict[str, Any]:
         if not directory.exists():
             continue
 
-        for path in sorted(directory.glob("**/*.json*")):
-            if not path.is_file():
-                continue
-
-            for entry in _read_json_entries(path):
-                entry_ts = entry.get("timestamp")
-                if entry_ts is None:
+        for current_root, _, files in os.walk(directory, followlinks=False):
+            current_path = Path(current_root)
+            for name in files:
+                if not name.endswith((".json", ".jsonl")):
                     continue
 
-                try:
-                    entry_dt = parse_timestamp(str(entry_ts))
-                except ValueError:
+                path = current_path / name
+                if path.is_symlink():
                     continue
 
-                if entry_dt <= timestamp:
-                    events.append({"source": str(path), "event": entry})
+                for entry in _read_json_entries(path):
+                    entry_ts = entry.get("timestamp")
+                    if entry_ts is None:
+                        continue
+
+                    try:
+                        entry_dt = parse_timestamp(str(entry_ts))
+                    except ValueError:
+                        continue
+
+                    if entry_dt <= timestamp:
+                        events.append({"source": str(path), "event": entry})
 
     events.sort(key=lambda item: item["event"].get("timestamp", ""))
 
@@ -199,7 +235,7 @@ def _collect_file_state(
 ) -> Dict[str, Any]:
     """Collect metadata for files whose modification time predates ``timestamp``."""
 
-    roots = _env_override(env_var, directories)
+    roots = _resolve_artifact_dirs(env_var, directories)
     summaries: List[ArtifactSummary] = []
     searched: List[str] = []
 
@@ -210,19 +246,25 @@ def _collect_file_state(
 
         files: List[Dict[str, Any]] = []
         try:
-            for path in sorted(root.rglob("*")):
-                if not path.is_file():
-                    continue
-                stat = path.stat()
-                modified = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
-                if modified <= timestamp:
-                    files.append(
-                        {
-                            "path": str(path.relative_to(root)),
-                            "modified": modified.isoformat(),
-                            "size": stat.st_size,
-                        }
-                    )
+            for current_root, _, filenames in os.walk(root, followlinks=False):
+                current_path = Path(current_root)
+                for name in filenames:
+                    path = current_path / name
+                    if path.is_symlink():
+                        continue
+                    try:
+                        stat = path.stat()
+                    except FileNotFoundError:
+                        continue
+                    modified = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+                    if modified <= timestamp:
+                        files.append(
+                            {
+                                "path": str(path.relative_to(root)),
+                                "modified": modified.isoformat(),
+                                "size": stat.st_size,
+                            }
+                        )
         except OSError:  # pragma: no cover - filesystem edge cases
             continue
 
@@ -286,7 +328,11 @@ def _cli(argv: Optional[List[str]] = None) -> int:
         parser.error(str(exc))
         return 2  # pragma: no cover - parser.error exits
 
-    state = reconstruct_state(timestamp)
+    try:
+        state = reconstruct_state(timestamp)
+    except ValueError as exc:
+        parser.error(str(exc))
+        return 2  # pragma: no cover - parser.error exits
     json.dump(state, fp=os.sys.stdout, indent=2)
     os.sys.stdout.write("\n")
     return 0
@@ -304,7 +350,10 @@ def time_travel_endpoint(ts: str = Query(..., description=ISO_TIMESTAMP_HELP)) -
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    return reconstruct_state(timestamp)
+    try:
+        return reconstruct_state(timestamp)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI dispatch

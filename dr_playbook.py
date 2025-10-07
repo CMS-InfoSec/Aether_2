@@ -27,6 +27,8 @@ from urllib.parse import urlparse
 
 LOGGER = logging.getLogger("dr_playbook")
 
+from common.utils.tar import safe_extract_tar
+
 
 try:  # pragma: no cover - optional dependency exercised in integration tests
     import psycopg
@@ -90,6 +92,8 @@ class DisasterRecoveryConfig:
                 "Missing required environment variables: " + ", ".join(missing)
             )
 
+        work_dir = _resolve_work_dir(os.environ.get("DR_WORK_DIR"))
+
         config = cls(
             timescale_dsn=timescale_dsn,
             redis_url=redis_url,
@@ -102,8 +106,7 @@ class DisasterRecoveryConfig:
                 "DR_OBJECT_STORE_ENDPOINT_URL"
             ),
             object_store_region=os.environ.get("DR_OBJECT_STORE_REGION"),
-            work_dir=Path(os.environ.get("DR_WORK_DIR", tempfile.gettempdir()))
-            / "aether-dr",
+            work_dir=work_dir,
             mlflow_restore_path=(
                 Path(os.environ["DR_MLFLOW_RESTORE_PATH"])
                 if "DR_MLFLOW_RESTORE_PATH" in os.environ
@@ -144,6 +147,29 @@ def _parse_redis_url(url: str) -> Dict[str, Any]:
         "password": parsed.password,
         "ssl": parsed.scheme == "rediss",
     }
+
+
+def _resolve_work_dir(raw: Optional[str]) -> Path:
+    """Return a safe working directory for DR artifacts.
+
+    The directory is derived from ``raw`` (or ``tempfile.gettempdir()`` when unset)
+    and must be absolute, free from symlinked ancestors, and point to a directory
+    when it already exists.
+    """
+
+    base = Path(raw).expanduser() if raw else Path(tempfile.gettempdir())
+    if not base.is_absolute():
+        base = Path.cwd() / base
+
+    _ensure_no_symlink_ancestors(base, context="DR_WORK_DIR")
+
+    resolved = base.resolve()
+    if resolved.exists() and not resolved.is_dir():
+        raise ValueError("DR_WORK_DIR must reference a directory")
+
+    work_dir = resolved / "aether-dr"
+    _ensure_no_symlink_ancestors(work_dir, context="DR_WORK_DIR")
+    return work_dir
 
 
 def _build_object_store_client(config: DisasterRecoveryConfig):
@@ -374,20 +400,38 @@ def _restore_redis_state(config: DisasterRecoveryConfig, snapshot: Path) -> None
     LOGGER.info("Redis restore complete")
 
 
+def _ensure_no_symlink_ancestors(path: Path, *, context: str) -> None:
+    """Raise ``ValueError`` if ``path`` or any existing ancestor is a symlink."""
+
+    for ancestor in (path,) + tuple(path.parents):
+        if ancestor.exists() and ancestor.is_symlink():
+            raise ValueError(f"{context} must not reference symlinked directories")
+
+
 def _restore_mlflow_artifacts(config: DisasterRecoveryConfig, archive: Path) -> None:
     if config.mlflow_restore_path is None:
         raise RuntimeError(
             "MLflow restore path is not configured (set DR_MLFLOW_RESTORE_PATH)."
         )
 
-    target_path = config.mlflow_restore_path
+    target_path = config.mlflow_restore_path.expanduser()
+    if not target_path.is_absolute():
+        raise ValueError("MLflow restore path must be absolute")
+
+    _ensure_no_symlink_ancestors(target_path, context="MLflow restore path")
+
     LOGGER.info("Restoring MLflow artifacts to %s", target_path)
     if target_path.exists():
+        if target_path.is_symlink():
+            raise ValueError("MLflow restore path must not be a symlink")
+        if not target_path.is_dir():
+            raise ValueError("MLflow restore path must be a directory")
         shutil.rmtree(target_path)
+
     target_path.mkdir(parents=True, exist_ok=True)
 
     with tarfile.open(archive, "r:gz") as tar:
-        tar.extractall(path=target_path)
+        safe_extract_tar(tar, target_path)
 
 
 def _log_dr_action(config: DisasterRecoveryConfig, action: str) -> None:
@@ -420,7 +464,8 @@ def restore_cluster(
     try:
         client = _build_object_store_client(config)
         with tempfile.TemporaryDirectory() as tmpdir:
-            bundle_path = Path(tmpdir) / Path(key).name
+            tmp_path = Path(tmpdir)
+            bundle_path = tmp_path / Path(key).name
             LOGGER.info(
                 "Downloading snapshot s3://%s/%s to %s",
                 config.object_store_bucket,
@@ -430,16 +475,16 @@ def restore_cluster(
             client.download_file(config.object_store_bucket, key, str(bundle_path))
 
             with tarfile.open(bundle_path, "r:gz") as tar:
-                tar.extractall(path=tmpdir)
+                safe_extract_tar(tar, tmp_path)
 
-            manifest_path = Path(tmpdir) / "manifest.json"
+            manifest_path = tmp_path / "manifest.json"
             if not manifest_path.exists():
                 raise RuntimeError("Snapshot manifest missing from bundle")
             manifest = json.loads(manifest_path.read_text())
 
-            dump_path = Path(tmpdir) / manifest["timescale_dump"]
-            redis_snapshot = Path(tmpdir) / manifest["redis_snapshot"]
-            mlflow_archive = Path(tmpdir) / manifest["mlflow_archive"]
+            dump_path = tmp_path / manifest["timescale_dump"]
+            redis_snapshot = tmp_path / manifest["redis_snapshot"]
+            mlflow_archive = tmp_path / manifest["mlflow_archive"]
 
             _restore_timescaledb(config, dump_path, drop_existing=drop_existing)
             _restore_redis_state(config, redis_snapshot)

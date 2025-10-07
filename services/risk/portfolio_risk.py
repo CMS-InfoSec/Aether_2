@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from services.common.adapters import TimescaleAdapter
 from services.common.security import get_admin_accounts, require_admin_account
+from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 
 PORTFOLIO_LOGGER = logging.getLogger("portfolio_risk_log")
@@ -37,14 +38,12 @@ DEFAULT_CLUSTER_LIMITS: Dict[str, float] = {
 }
 DEFAULT_CLUSTER_MAP: Dict[str, str] = {
     "BTC-USD": "BTC",
-    "BTC-USDT": "BTC",
     "ETH-USD": "ETH",
     "SOL-USD": "ALT",
     "ADA-USD": "ALT",
 }
 DEFAULT_BETA_MAP: Dict[str, float] = {
     "BTC-USD": 1.0,
-    "BTC-USDT": 1.0,
     "ETH-USD": 0.8,
     "SOL-USD": 1.4,
     "ADA-USD": 1.2,
@@ -151,11 +150,23 @@ class PortfolioRiskAggregator:
 
     @staticmethod
     def _normalize_exposures(exposures: Mapping[str, float]) -> Dict[str, float]:
-        return {
-            str(instrument): abs(float(notional))
-            for instrument, notional in exposures.items()
-            if abs(float(notional)) > 0.0
-        }
+        filtered: Dict[str, float] = {}
+        for instrument, notional in exposures.items():
+            normalized = normalize_spot_symbol(instrument)
+            if not normalized or not is_spot_symbol(normalized):
+                PORTFOLIO_LOGGER.warning(
+                    "Ignoring non-spot exposure in portfolio aggregation",
+                    extra={"instrument": instrument},
+                )
+                continue
+
+            absolute_notional = abs(float(notional))
+            if absolute_notional <= 0.0:
+                continue
+
+            filtered[normalized] = filtered.get(normalized, 0.0) + absolute_notional
+
+        return filtered
 
     def _latest_cvar_observation(
         self, history: Sequence[Mapping[str, object]]
@@ -278,10 +289,28 @@ class PortfolioRiskAggregator:
             for instrument, row in matrix.items():
                 if not isinstance(row, Mapping):
                     continue
+
+                normalized_instrument = normalize_spot_symbol(instrument)
+                if not normalized_instrument or not is_spot_symbol(normalized_instrument):
+                    PORTFOLIO_LOGGER.warning(
+                        "Skipping non-spot correlation instrument",
+                        extra={"instrument": instrument},
+                    )
+                    continue
+
                 for other, value in row.items():
-                    key = tuple(sorted((str(instrument), str(other))))
+                    normalized_other = normalize_spot_symbol(other)
+                    if not normalized_other or not is_spot_symbol(normalized_other):
+                        PORTFOLIO_LOGGER.warning(
+                            "Skipping non-spot correlation counterpart",
+                            extra={"instrument": instrument, "other": other},
+                        )
+                        continue
+
+                    key = tuple(sorted((normalized_instrument, normalized_other)))
                     combined[key] = combined.get(key, 0.0) + float(value)
                     counts[key] = counts.get(key, 0) + 1
+
         averaged: Dict[Tuple[str, str], float] = {}
         for key, total in combined.items():
             averaged[key] = total / counts[key]
@@ -374,9 +403,18 @@ def _load_cluster_map() -> Dict[str, str]:
     mapping: Dict[str, str] = {}
     if isinstance(payload, Mapping):
         for instrument, cluster in payload.items():
+            normalized = normalize_spot_symbol(instrument)
+            if not normalized or not is_spot_symbol(normalized):
+                PORTFOLIO_LOGGER.warning(
+                    "Skipping non-spot cluster mapping entry",
+                    extra={"instrument": instrument},
+                )
+                continue
             if cluster:
-                mapping[str(instrument)] = str(cluster)
-    return mapping or dict(DEFAULT_CLUSTER_MAP)
+                mapping[normalized] = str(cluster)
+    if mapping:
+        return mapping
+    return dict(DEFAULT_CLUSTER_MAP)
 
 
 def _load_beta_map() -> Dict[str, float]:
@@ -384,13 +422,22 @@ def _load_beta_map() -> Dict[str, float]:
     betas: Dict[str, float] = {}
     if isinstance(payload, Mapping):
         for instrument, beta in payload.items():
+            normalized = normalize_spot_symbol(instrument)
+            if not normalized or not is_spot_symbol(normalized):
+                PORTFOLIO_LOGGER.warning(
+                    "Skipping non-spot beta entry",
+                    extra={"instrument": instrument},
+                )
+                continue
             try:
-                betas[str(instrument)] = float(beta)
+                betas[normalized] = float(beta)
             except (TypeError, ValueError):
                 PORTFOLIO_LOGGER.warning(
                     "Invalid beta entry", extra={"instrument": instrument, "value": beta}
                 )
-    return betas or dict(DEFAULT_BETA_MAP)
+    if betas:
+        return betas
+    return dict(DEFAULT_BETA_MAP)
 
 
 def _load_beta_limit() -> float:

@@ -60,7 +60,57 @@ from services.oms.shadow_oms import shadow_oms
 LOG = logging.getLogger("snapshot_replay")
 
 DEFAULT_OUTPUT_DIR = Path(os.getenv("SNAPSHOT_REPLAY_OUTPUT", "reports/snapshots"))
-DEFAULT_STORAGE_PATH = Path(os.getenv("SNAPSHOT_REPLAY_STORAGE", "reports/replay_inputs"))
+DEFAULT_STORAGE_PATH = Path(
+    os.getenv("SNAPSHOT_REPLAY_STORAGE", "reports/replay_inputs")
+)
+
+
+def _normalise_user_path(path: Path) -> Path:
+    """Expand ``path`` to an absolute location without following symlinks."""
+
+    expanded = path.expanduser()
+    if expanded.is_absolute():
+        return expanded
+    return Path.cwd() / expanded
+
+
+def _ensure_no_traversal(path: Path, *, context: str) -> None:
+    if any(part == ".." for part in path.parts):
+        raise ValueError(f"{context} must not contain parent directory references")
+
+
+def _ensure_no_symlink_ancestors(path: Path, *, context: str) -> None:
+    for ancestor in (path,) + tuple(path.parents):
+        if ancestor.exists() and ancestor.is_symlink():
+            raise ValueError(f"{context} must not reference symlinks")
+
+
+def _ensure_safe_path(
+    path: Path,
+    *,
+    context: str,
+    allow_directory: bool,
+    allow_file: bool,
+) -> Path:
+    """Validate that *path* is an absolute, symlink-free location."""
+
+    candidate = _normalise_user_path(path)
+    _ensure_no_traversal(candidate, context=context)
+    _ensure_no_symlink_ancestors(candidate, context=context)
+
+    if candidate.exists():
+        if candidate.is_symlink():
+            raise ValueError(f"{context} must not reference symlinks")
+        if candidate.is_dir():
+            if not allow_directory:
+                raise ValueError(f"{context} must not be a directory")
+        elif candidate.is_file():
+            if not allow_file:
+                raise ValueError(f"{context} must not be a file")
+        else:
+            raise ValueError(f"{context} must reference a regular file or directory")
+
+    return candidate.resolve(strict=False)
 
 
 @dataclass(slots=True)
@@ -88,8 +138,18 @@ class SnapshotReplayConfig:
             raise ValueError("End timestamp must be after start timestamp")
 
         self.account_id = self.account_id.strip().lower()
-        self.output_dir = self.output_dir.expanduser().resolve()
-        self.storage_path = self.storage_path.expanduser().resolve()
+        self.output_dir = _ensure_safe_path(
+            self.output_dir,
+            context="Snapshot replay output directory",
+            allow_directory=True,
+            allow_file=False,
+        )
+        self.storage_path = _ensure_safe_path(
+            self.storage_path,
+            context="Snapshot replay storage path",
+            allow_directory=True,
+            allow_file=True,
+        )
 
 
 @dataclass(slots=True)
@@ -190,6 +250,10 @@ class HistoricalDataLoader:
             return []
 
         for file_path in files:
+            if file_path.is_symlink():
+                raise ValueError(
+                    f"Replay storage path must not contain symlinked files: {file_path}"
+                )
             try:
                 yield from self._parse_file(file_path)
             except Exception as exc:  # pragma: no cover - defensive logging

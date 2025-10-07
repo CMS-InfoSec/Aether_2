@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -24,6 +25,8 @@ from ml.training.workflow import (
     _prepare_supervised_frame,
     _chronological_split,
     _apply_outlier_handling,
+    _write_artifacts,
+    _normalise_s3_prefix,
     _TARGET_COLUMN,
 )
 
@@ -180,3 +183,135 @@ def test_outlier_handling_clip_and_drop() -> None:
     dropped = _apply_outlier_handling(prepared, _TARGET_COLUMN, drop_config)
     assert len(dropped) < len(prepared)
     assert dropped[_TARGET_COLUMN].between(lower, upper).all()
+
+
+def test_write_artifacts_normalises_relative_base_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    config = ObjectStorageConfig(base_path="artifacts/output")
+
+    result = _write_artifacts({"metrics.json": b"{}"}, config)
+
+    expected_path = tmp_path / "artifacts" / "output" / "metrics.json"
+    assert Path(result["metrics.json"]) == expected_path
+    assert expected_path.exists()
+    assert Path(config.base_path) == tmp_path / "artifacts" / "output"
+
+
+def test_write_artifacts_rejects_parent_reference_in_base_path() -> None:
+    with pytest.raises(ValueError, match="parent directory"):
+        ObjectStorageConfig(base_path="../escape")
+
+
+def test_write_artifacts_rejects_symlink_base_path(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        ObjectStorageConfig(base_path=str(link))
+
+
+def test_write_artifacts_rejects_broken_symlink_base_path(tmp_path: Path) -> None:
+    missing = tmp_path / "missing"
+    link = tmp_path / "link"
+    link.symlink_to(missing, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        ObjectStorageConfig(base_path=str(link))
+
+
+def test_write_artifacts_allows_symlink_parent(tmp_path: Path) -> None:
+    real_root = tmp_path / "real"
+    real_root.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real_root, target_is_directory=True)
+
+    config = ObjectStorageConfig(base_path=str(link / "output"))
+
+    result = _write_artifacts({"metrics.json": b"{}"}, config)
+
+    expected_root = (real_root / "output").resolve()
+    expected_path = expected_root / "metrics.json"
+    assert Path(config.base_path) == expected_root
+    assert Path(result["metrics.json"]) == expected_path
+    assert expected_path.exists()
+
+
+def test_write_artifacts_s3_prefix_normalised(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _StubClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, bytes]] = []
+
+        def put_object(self, *, Bucket: str, Key: str, Body: bytes) -> None:  # noqa: N803 - boto3 signature
+            self.calls.append((Bucket, Key, Body))
+
+    stub_client = _StubClient()
+
+    class _StubBoto3:
+        def client(self, name: str) -> _StubClient:
+            assert name == "s3"
+            return stub_client
+
+    monkeypatch.setattr("ml.training.workflow.boto3", _StubBoto3())
+
+    config = ObjectStorageConfig(s3_bucket="aether", s3_prefix=" /unsafe//prefix/ ")
+
+    result = _write_artifacts({"metrics.json": b"{}"}, config)
+
+    assert stub_client.calls == [("aether", "unsafe/prefix/metrics.json", b"{}")]  # type: ignore[arg-type]
+    assert result["metrics.json"] == "s3://aether/unsafe/prefix/metrics.json"
+    assert config.s3_prefix == "unsafe/prefix"
+
+
+def test_write_artifacts_rejects_traversal_in_s3_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _StubBoto3:
+        def client(self, name: str) -> None:  # pragma: no cover - should not be called
+            raise AssertionError("client should not be invoked when prefix is invalid")
+
+    monkeypatch.setattr("ml.training.workflow.boto3", _StubBoto3())
+
+    with pytest.raises(ValueError, match="prefix"):
+        ObjectStorageConfig(s3_bucket="aether", s3_prefix="../escape")
+
+
+def test_object_storage_config_normalises_base_and_prefix(tmp_path: Path) -> None:
+    base = tmp_path / "artifacts"
+    prefix = " /reports///daily/ "
+
+    config = ObjectStorageConfig(base_path=str(base), s3_bucket="bucket", s3_prefix=prefix)
+
+    assert Path(config.base_path) == base
+    assert config.s3_prefix == "reports/daily"
+
+
+def test_write_artifacts_rejects_traversal_in_artifact_name(tmp_path: Path) -> None:
+    base = tmp_path / "artifacts"
+    config = ObjectStorageConfig(base_path=str(base))
+
+    with pytest.raises(ValueError, match="parent directory"):
+        _write_artifacts({"../escape": b"{}"}, config)
+
+    with pytest.raises(ValueError, match="parent directory"):
+        _write_artifacts({"..\\escape": b"{}"}, config)
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("", ""),
+        ("  prefix/child  ", "prefix/child"),
+        ("prefix//child", "prefix/child"),
+        (None, ""),
+    ],
+)
+def test_normalise_s3_prefix_valid_inputs(raw: str | None, expected: str) -> None:
+    assert _normalise_s3_prefix(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["../escape", "prefix/../escape", "bad\nprefix"])
+def test_normalise_s3_prefix_rejects_invalid_inputs(raw: str) -> None:
+    with pytest.raises(ValueError):
+        _normalise_s3_prefix(raw)
