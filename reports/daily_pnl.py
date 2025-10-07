@@ -12,7 +12,7 @@ from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence
 
 from reports.storage import ArtifactStorage, TimescaleSession, build_storage_from_env
-from shared.spot import is_spot_symbol, normalize_spot_symbol
+from shared.spot import normalize_spot_symbol, require_spot_symbol
 
 LOGGER = logging.getLogger(__name__)
 
@@ -62,9 +62,12 @@ def _canonical_spot_instrument(
     if not normalized:
         return None
 
-    if not is_spot_symbol(normalized):
+    try:
+        return require_spot_symbol(candidate)
+    except ValueError as exc:
         extra = dict(details or {})
         extra.setdefault("instrument", normalized)
+        extra.setdefault("error", str(exc))
         LOGGER.warning(
             "Ignoring non-spot instrument '%s' while processing %s",
             candidate,
@@ -72,8 +75,6 @@ def _canonical_spot_instrument(
             extra=extra or None,
         )
         return None
-
-    return normalized
 
 
 @dataclass
