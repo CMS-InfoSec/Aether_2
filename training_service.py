@@ -387,16 +387,18 @@ class TrainingRequest(BaseModel):
     @model_validator(mode="before")
     def _coerce_dates(cls, values: Mapping[str, Any]) -> Mapping[str, Any]:
         data = dict(values)
-        for field in ("from", "to"):
-            raw = data.get(field)
+        for field_name in ("from", "to"):
+            raw = data.get(field_name)
             if isinstance(raw, str):
                 try:
                     parsed = datetime.fromisoformat(raw)
                 except ValueError as exc:
-                    raise ValueError(f"Field '{field}' must be ISO datetime") from exc
+                    raise ValueError(
+                        f"Field '{field_name}' must be ISO datetime"
+                    ) from exc
                 if parsed.tzinfo is None:
                     parsed = parsed.replace(tzinfo=timezone.utc)
-                data[field] = parsed
+                data[field_name] = parsed
         return data
 
     @model_validator(mode="after")
