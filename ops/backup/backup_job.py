@@ -54,6 +54,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Dict, Iterable, List, Optional
 
+from common.utils.tar import safe_extract_tar
+
 try:  # pragma: no cover - optional dependency for operational runtime
     import boto3
 except Exception:  # pragma: no cover - boto3 not required for static analysis
@@ -550,7 +552,7 @@ class BackupJob:
         if parent_dir.exists() and parent_dir.is_symlink():
             raise ValueError("MLflow artifact parent directory must not be a symlink")
         with tarfile.open(archive_path, "r:gz") as archive:
-            _safe_extract_tar(archive, parent_dir)
+            safe_extract_tar(archive, parent_dir)
         # tarball contains original directory name; move contents to target
         extracted_root = target_dir.parent / target_dir.name
         if extracted_root.exists() and extracted_root != target_dir:
