@@ -15,15 +15,12 @@ from metrics import setup_metrics
 from services.common.adapters import KafkaNATSAdapter
 from services.common.security import require_admin_account
 from shared.sim_mode import SimModeStatus, sim_mode_repository
+from shared.audit_hooks import load_audit_hooks
 
 
-try:  # pragma: no cover - optional audit dependency
-    from common.utils.audit_logger import hash_ip as audit_hash_ip, log_audit as chain_log_audit
-except Exception:  # pragma: no cover - degrade gracefully if audit subsystem unavailable
-    chain_log_audit = None  # type: ignore[assignment]
-
-    def audit_hash_ip(_: Optional[str]) -> Optional[str]:  # type: ignore[override]
-        return None
+_AUDIT_HOOKS = load_audit_hooks()
+chain_log_audit = _AUDIT_HOOKS.log
+audit_hash_ip = _AUDIT_HOOKS.hash_ip
 
 
 LOGGER = logging.getLogger("sim_mode_service")

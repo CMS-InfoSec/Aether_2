@@ -10,7 +10,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import httpx
 
@@ -23,14 +23,11 @@ from kubernetes.config.config_exception import ConfigException
 from pydantic import BaseModel, Field, validator
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from services.secrets.signing import sign_kraken_request
+from shared.audit_hooks import load_audit_hooks
 
-try:  # pragma: no cover - optional audit dependency
-    from common.utils.audit_logger import hash_ip, log_audit
-except Exception:  # pragma: no cover - degrade gracefully
-    log_audit = None  # type: ignore[assignment]
-
-    def hash_ip(_: Optional[str]) -> Optional[str]:  # type: ignore[override]
-        return None
+_AUDIT_HOOKS = load_audit_hooks()
+log_audit = _AUDIT_HOOKS.log
+hash_ip = _AUDIT_HOOKS.hash_ip
 
 
 LOGGER = logging.getLogger(__name__)
