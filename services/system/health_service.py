@@ -37,6 +37,9 @@ def _ensure_safe_state_path(path: Path, *, env_var: str) -> Path:
         if ancestor.is_symlink():
             raise ValueError(f"{env_var} must not reference symlinks")
 
+    if path.exists() and not path.is_file():
+        raise ValueError(f"{env_var} must reference a regular file")
+
     return path
 
 

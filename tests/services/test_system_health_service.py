@@ -105,6 +105,15 @@ def test_resolve_sim_mode_state_path_rejects_broken_symlink(monkeypatch, tmp_pat
         health_service._resolve_sim_mode_state_path()
 
 
+def test_resolve_sim_mode_state_path_rejects_directory(monkeypatch, tmp_path):
+    state_dir = tmp_path / "state_dir"
+    state_dir.mkdir()
+    monkeypatch.setenv("SIM_MODE_STATE_PATH", str(state_dir))
+
+    with pytest.raises(ValueError, match="regular file"):
+        health_service._resolve_sim_mode_state_path()
+
+
 def test_load_sim_mode_file_skips_symlink(monkeypatch, tmp_path, caplog):
     target = tmp_path / "state.json"
     target.write_text("{}", encoding="utf-8")
