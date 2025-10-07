@@ -720,14 +720,46 @@ def _normalise_artifact_name(name: str) -> Tuple[str, ...]:
     return tuple(parts)
 
 
+def _normalise_s3_prefix(prefix: Optional[str]) -> str:
+    """Return a traversal-free S3 prefix suitable for object keys."""
+
+    if not prefix:
+        return ""
+
+    if isinstance(prefix, str):
+        candidate = prefix.strip()
+    else:
+        candidate = str(prefix)
+
+    if not candidate:
+        return ""
+
+    candidate = candidate.replace("\\", "/")
+    if any(ord(char) < 32 for char in candidate):
+        raise ValueError("S3 prefix must not contain control characters")
+
+    parts: List[str] = []
+    for segment in candidate.split("/"):
+        if segment in {"", "."}:
+            continue
+        if segment == "..":
+            raise ValueError("S3 prefix must not contain parent directory references")
+        parts.append(segment)
+
+    return "/".join(parts)
+
+
 def _write_artifacts(artifacts: Mapping[str, bytes], config: ObjectStorageConfig) -> Dict[str, str]:
     """Persist artifacts to either the filesystem or S3."""
 
     output_locations: Dict[str, str] = {}
     base_path: Optional[Path] = None
+    prefix: str = ""
     if not config.is_s3():
         base_path = _normalise_local_artifact_base_path(config.base_path)
         base_path.mkdir(parents=True, exist_ok=True)
+    else:
+        prefix = _normalise_s3_prefix(config.s3_prefix)
 
     for name, payload in artifacts.items():
         segments = _normalise_artifact_name(name)
@@ -736,7 +768,7 @@ def _write_artifacts(artifacts: Mapping[str, bytes], config: ObjectStorageConfig
                 raise RuntimeError("boto3 is required for S3 artifact uploads but is not installed")
             client = boto3.client("s3")
             key_body = "/".join(segments)
-            key_parts = [part.strip("/") for part in (config.s3_prefix, key_body) if part]
+            key_parts = [part.strip("/") for part in (prefix, key_body) if part]
             key = "/".join(key_parts)
             LOGGER.debug("Uploading artifact %s to s3://%s/%s", name, config.s3_bucket, key)
             client.put_object(Bucket=config.s3_bucket, Key=key, Body=payload)

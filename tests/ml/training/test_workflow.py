@@ -26,6 +26,7 @@ from ml.training.workflow import (
     _chronological_split,
     _apply_outlier_handling,
     _write_artifacts,
+    _normalise_s3_prefix,
     _TARGET_COLUMN,
 )
 
@@ -215,6 +216,44 @@ def test_write_artifacts_rejects_symlink_base_path(tmp_path: Path) -> None:
         _write_artifacts({"metrics.json": b"{}"}, config)
 
 
+def test_write_artifacts_s3_prefix_normalised(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _StubClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, bytes]] = []
+
+        def put_object(self, *, Bucket: str, Key: str, Body: bytes) -> None:  # noqa: N803 - boto3 signature
+            self.calls.append((Bucket, Key, Body))
+
+    stub_client = _StubClient()
+
+    class _StubBoto3:
+        def client(self, name: str) -> _StubClient:
+            assert name == "s3"
+            return stub_client
+
+    monkeypatch.setattr("ml.training.workflow.boto3", _StubBoto3())
+
+    config = ObjectStorageConfig(s3_bucket="aether", s3_prefix=" /unsafe//prefix/ ")
+
+    result = _write_artifacts({"metrics.json": b"{}"}, config)
+
+    assert stub_client.calls == [("aether", "unsafe/prefix/metrics.json", b"{}")]  # type: ignore[arg-type]
+    assert result["metrics.json"] == "s3://aether/unsafe/prefix/metrics.json"
+
+
+def test_write_artifacts_rejects_traversal_in_s3_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _StubBoto3:
+        def client(self, name: str) -> None:  # pragma: no cover - should not be called
+            raise AssertionError("client should not be invoked when prefix is invalid")
+
+    monkeypatch.setattr("ml.training.workflow.boto3", _StubBoto3())
+
+    config = ObjectStorageConfig(s3_bucket="aether", s3_prefix="../escape")
+
+    with pytest.raises(ValueError, match="prefix"):
+        _write_artifacts({"metrics.json": b"{}"}, config)
+
+
 def test_write_artifacts_rejects_traversal_in_artifact_name(tmp_path: Path) -> None:
     base = tmp_path / "artifacts"
     config = ObjectStorageConfig(base_path=str(base))
@@ -224,3 +263,22 @@ def test_write_artifacts_rejects_traversal_in_artifact_name(tmp_path: Path) -> N
 
     with pytest.raises(ValueError, match="parent directory"):
         _write_artifacts({"..\\escape": b"{}"}, config)
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("", ""),
+        ("  prefix/child  ", "prefix/child"),
+        ("prefix//child", "prefix/child"),
+        (None, ""),
+    ],
+)
+def test_normalise_s3_prefix_valid_inputs(raw: str | None, expected: str) -> None:
+    assert _normalise_s3_prefix(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["../escape", "prefix/../escape", "bad\nprefix"])
+def test_normalise_s3_prefix_rejects_invalid_inputs(raw: str) -> None:
+    with pytest.raises(ValueError):
+        _normalise_s3_prefix(raw)
