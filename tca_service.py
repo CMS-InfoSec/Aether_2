@@ -41,16 +41,11 @@ from sqlalchemy.pool import StaticPool
 
 from services.common.security import require_admin_account
 from services.common.spot import require_spot_http
+from shared.audit_hooks import load_audit_hooks
 from shared.postgres import normalize_sqlalchemy_dsn
 from shared.spot import is_spot_symbol, normalize_spot_symbol
 
-try:  # pragma: no cover - optional audit dependency
-    from common.utils.audit_logger import hash_ip, log_audit
-except Exception:  # pragma: no cover - degrade gracefully
-    log_audit = None  # type: ignore[assignment]
-
-    def hash_ip(_: str | None) -> str | None:  # type: ignore[override]
-        return None
+_AUDIT_HOOKS = load_audit_hooks()
 
 
 LOGGER = logging.getLogger(__name__)
@@ -157,18 +152,15 @@ def _audit_access(
 ) -> None:
     """Record audit information for report access using the verified identity."""
 
-    if log_audit is None:
-        return
-
     try:
         ip_address = request.client.host if request.client else None
-        log_audit(
+        _AUDIT_HOOKS.log_event(
             actor=actor,
             action=action,
             entity=entity,
             before={},
             after=dict(metadata or {}),
-            ip_hash=hash_ip(ip_address),
+            ip_address=ip_address,
         )
     except Exception:  # pragma: no cover - defensive best effort
         AUDIT_LOGGER.exception(
