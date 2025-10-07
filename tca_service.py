@@ -843,7 +843,7 @@ def get_trade_report(
     with SessionLocal() as session:
         try:
             rows = _fetch_trade_rows(session, trade_id)
-        except SQLAlchemyError as exc:  # pragma: no cover - defensive guard
+        except SQLAlchemyError:  # pragma: no cover - defensive guard
             LOGGER.exception("Database query failed for trade_id=%s", trade_id)
             raise HTTPException(status_code=500, detail="Database error") from exc
 

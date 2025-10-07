@@ -550,6 +550,34 @@ def test_log_audit_event_with_fallback_logs_event_payload():
     }
 
 
+def test_log_audit_event_with_fallback_uses_event_context(caplog: pytest.LogCaptureFixture):
+    hooks = audit_hooks.AuditHooks(log=None, hash_ip=lambda value: value)
+    event = audit_hooks.AuditEvent(
+        actor="ivy",
+        action="demo.context",
+        entity="resource",
+        before={},
+        after={},
+        context={"request_id": "req-123"},
+    )
+    logger = logging.getLogger("tests.audit.event_context")
+
+    with caplog.at_level(logging.DEBUG, logger=logger.name):
+        result = audit_hooks.log_audit_event_with_fallback(
+            hooks,
+            logger,
+            event,
+            failure_message="should not raise",
+            disabled_message="Audit logging disabled",
+        )
+
+    assert result.handled is False
+    assert len(caplog.records) == 1
+    record = caplog.records[0]
+    assert record.message == "Audit logging disabled"
+    assert getattr(record, "request_id", None) == "req-123"
+
+
 def test_audit_event_log_with_fallback_method_delegates(monkeypatch):
     hooks = audit_hooks.AuditHooks(log=lambda **_: None, hash_ip=lambda value: value)
     logger = logging.getLogger("tests.audit.delegation")
@@ -594,6 +622,43 @@ def test_audit_event_log_with_fallback_method_delegates(monkeypatch):
         "context": {"request_id": "abc"},
         "resolved_ip_hash": None,
     }
+
+
+def test_audit_event_log_with_fallback_infers_event_context(monkeypatch):
+    hooks = audit_hooks.AuditHooks(log=lambda **_: None, hash_ip=lambda value: value)
+    logger = logging.getLogger("tests.audit.event_default")
+    event = audit_hooks.AuditEvent(
+        actor="judy",
+        action="demo.infer",
+        entity="resource",
+        before={},
+        after={},
+        context={"source": "controller"},
+    )
+
+    expected = audit_hooks.AuditLogResult(
+        handled=True,
+        ip_hash=None,
+        hash_fallback=False,
+        hash_error=None,
+    )
+    captured: dict[str, object] = {}
+
+    def fake_helper(*args: object, **kwargs: object) -> audit_hooks.AuditLogResult:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return expected
+
+    monkeypatch.setattr(audit_hooks, "log_audit_event_with_fallback", fake_helper)
+
+    result = event.log_with_fallback(
+        hooks,
+        logger,
+        failure_message="failure",
+    )
+
+    assert result is expected
+    assert captured["kwargs"]["context"] == {"source": "controller"}
 
 
 def test_resolve_ip_hash_prefers_explicit_hash():

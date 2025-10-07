@@ -28,6 +28,9 @@ class AuditCallable(Protocol):
 HashIpCallable = Callable[[Optional[str]], Optional[str]]
 
 
+_EVENT_CONTEXT_SENTINEL = object()
+
+
 @dataclass(frozen=True)
 class AuditEvent:
     """Structured payload describing an audit event to be recorded."""
@@ -39,6 +42,7 @@ class AuditEvent:
     after: Mapping[str, Any]
     ip_address: Optional[str] = None
     ip_hash: Optional[str] = None
+    context: Optional[Mapping[str, Any]] = None
 
     def log_with_fallback(
         self,
@@ -48,10 +52,16 @@ class AuditEvent:
         failure_message: str,
         disabled_message: Optional[str] = None,
         disabled_level: int = logging.DEBUG,
-        context: Optional[Mapping[str, Any]] = None,
+        context: Optional[Mapping[str, Any]] | object = _EVENT_CONTEXT_SENTINEL,
         resolved_ip_hash: "ResolvedIpHash" | None = None,
     ) -> "AuditLogResult":
         """Log the event using :func:`log_audit_event_with_fallback`."""
+
+        context_mapping: Optional[Mapping[str, Any]]
+        if context is _EVENT_CONTEXT_SENTINEL:
+            context_mapping = self.context
+        else:
+            context_mapping = context  # type: ignore[assignment]
 
         return log_audit_event_with_fallback(
             hooks,
@@ -60,7 +70,7 @@ class AuditEvent:
             failure_message=failure_message,
             disabled_message=disabled_message,
             disabled_level=disabled_level,
-            context=context,
+            context=context_mapping,
             resolved_ip_hash=resolved_ip_hash,
         )
 
@@ -474,10 +484,14 @@ def log_audit_event_with_fallback(
     failure_message: str,
     disabled_message: Optional[str] = None,
     disabled_level: int = logging.DEBUG,
-    context: Optional[Mapping[str, Any]] = None,
+    context: Optional[Mapping[str, Any]] | object = _EVENT_CONTEXT_SENTINEL,
     resolved_ip_hash: ResolvedIpHash | None = None,
 ) -> AuditLogResult:
     """Convenience wrapper for logging :class:`AuditEvent` instances."""
+    if context is _EVENT_CONTEXT_SENTINEL:
+        context_mapping = event.context
+    else:
+        context_mapping = context  # type: ignore[assignment]
 
     return log_event_with_fallback(
         hooks,
@@ -492,7 +506,7 @@ def log_audit_event_with_fallback(
         failure_message=failure_message,
         disabled_message=disabled_message,
         disabled_level=disabled_level,
-        context=context,
+        context=context_mapping,
         resolved_ip_hash=resolved_ip_hash,
     )
 
