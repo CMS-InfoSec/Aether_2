@@ -14,6 +14,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from services.common.security import require_admin_account
+from services.common.spot import require_spot_http
 from services.fees.fee_optimizer import FeeOptimizer
 from services.fees.models import AccountFill, AccountVolume30d, Base, FeeTier
 
@@ -400,7 +401,10 @@ def get_effective_fee(
     session: Session = Depends(get_session),
     account_id: str = Depends(require_admin_account),
 ) -> EffectiveFeeResponse:
-    del pair  # the current schedule is global and does not vary by pair
+    canonical_pair = require_spot_http(pair, param="pair", logger=logger)
+    logger.debug(
+        "Calculating effective fee", extra={"pair": canonical_pair, "account_id": account_id}
+    )
 
     normalized_liquidity = liquidity.lower()
     tiers = _ordered_tiers(session)
@@ -469,6 +473,8 @@ def get_fee_estimate(
     session: Session = Depends(get_session),
     _: str = Depends(require_admin_account),
 ) -> FeeEstimateResponse:
+    symbol_key = require_spot_http(symbol)
+
     tiers = _ordered_tiers(session)
     if not tiers:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Fee schedule is not configured")
@@ -493,7 +499,7 @@ def get_fee_estimate(
 
     return FeeEstimateResponse(
         account_id=account_id,
-        symbol=symbol.upper(),
+        symbol=symbol_key,
         side=side.lower(),
         order_type=order_type.lower(),
         tier=tier.tier_id,

@@ -109,7 +109,7 @@ def test_get_universe_allows_admin_accounts(
     assert body["account_id"] == account_id
 
     assert isinstance(body["instruments"], list)
-    assert all(symbol.split("-")[-1] in {"USD", "USDT"} for symbol in body["instruments"])
+    assert all(symbol.endswith("-USD") for symbol in body["instruments"])
     assert isinstance(body["fee_overrides"], dict)
 
 

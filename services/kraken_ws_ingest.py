@@ -20,6 +20,8 @@ import websockets
 from aiokafka import AIOKafkaProducer
 from aiokafka.errors import KafkaError
 
+from shared.spot import is_spot_symbol, normalize_spot_symbol
+
 
 KRAKEN_WS_URL = "wss://ws.kraken.com"
 DEFAULT_TRADE_TOPIC = "md.trades"
@@ -43,6 +45,36 @@ class KrakenConfig:
     reconnect_delay: float = RECONNECT_DELAY_SECONDS
     heartbeat_timeout: float = HEARTBEAT_TIMEOUT_SECONDS
     heartbeat_check_interval: float = HEARTBEAT_CHECK_INTERVAL_SECONDS
+
+    def __post_init__(self) -> None:
+        """Normalise and validate Kraken trading pairs for USD spot-only usage."""
+
+        normalized_pairs: List[str] = []
+        seen: set[str] = set()
+        invalid: List[str] = []
+
+        for pair in self.pairs:
+            normalized = normalize_spot_symbol(pair)
+            if not normalized or not is_spot_symbol(normalized):
+                invalid.append(str(pair))
+                continue
+
+            if normalized in seen:
+                continue
+
+            normalized_pairs.append(normalized)
+            seen.add(normalized)
+
+        if invalid:
+            invalid_list = ", ".join(invalid)
+            raise ValueError(
+                f"KrakenConfig pairs must be USD spot instruments; rejected: {invalid_list}"
+            )
+
+        if not normalized_pairs:
+            raise ValueError("At least one USD spot trading pair must be provided.")
+
+        self.pairs = normalized_pairs
 
 
 class KrakenIngestor:

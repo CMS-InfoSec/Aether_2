@@ -5,6 +5,7 @@ import logging
 import math
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, List, Optional
 from uuid import uuid4
 
@@ -33,6 +34,43 @@ APP_VERSION = "1.0.0"
 _SQLITE_FALLBACK_FLAG = "TRAINING_ALLOW_SQLITE_FOR_TESTS"
 
 
+def _resolve_artifact_root(raw: str | None, *, default: Path) -> Path:
+    """Return a sanitised artifact directory path."""
+
+    candidate_text = (raw or "").strip()
+    if candidate_text and any(ord(char) < 32 for char in candidate_text):
+        raise ValueError("TRAINING_ARTIFACT_ROOT must not contain control characters")
+
+    candidate = Path(candidate_text).expanduser() if candidate_text else default
+    if any(part == ".." for part in candidate.parts):
+        raise ValueError("TRAINING_ARTIFACT_ROOT must not contain parent directory references")
+
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+
+    resolved_candidate = candidate.resolve(strict=False)
+
+    if candidate.exists() and candidate.is_symlink():
+        raise ValueError("TRAINING_ARTIFACT_ROOT must not be a symlink")
+
+    for ancestor in candidate.parents:
+        if ancestor.exists() and ancestor.is_symlink():
+            try:
+                resolved_ancestor = ancestor.resolve(strict=False)
+            except OSError as exc:  # pragma: no cover - extremely unlikely on supported platforms
+                raise ValueError("TRAINING_ARTIFACT_ROOT symlink target could not be resolved") from exc
+            try:
+                resolved_candidate.relative_to(resolved_ancestor)
+            except ValueError:
+                raise ValueError("TRAINING_ARTIFACT_ROOT must not escape via symlinked ancestors")
+
+    if resolved_candidate.exists() and not resolved_candidate.is_dir():
+        raise ValueError("TRAINING_ARTIFACT_ROOT must reference a directory")
+
+    resolved_candidate.mkdir(parents=True, exist_ok=True)
+    return resolved_candidate
+
+
 def _resolve_timescale_uri() -> str:
     raw_dsn = os.getenv("TRAINING_TIMESCALE_URI") or os.getenv("DATABASE_URL")
     if not raw_dsn:
@@ -59,7 +97,9 @@ def _resolve_timescale_uri() -> str:
 
 
 DEFAULT_TIMESCALE_URI = _resolve_timescale_uri()
-DEFAULT_ARTIFACT_ROOT = os.getenv("TRAINING_ARTIFACT_ROOT", "/tmp/aether-training")
+DEFAULT_ARTIFACT_ROOT = _resolve_artifact_root(
+    os.getenv("TRAINING_ARTIFACT_ROOT"), default=Path("/tmp/aether-training")
+)
 MLFLOW_TRACKING_URI = os.getenv("TRAINING_MLFLOW_TRACKING_URI", os.getenv("MLFLOW_TRACKING_URI"))
 MLFLOW_EXPERIMENT = os.getenv("TRAINING_MLFLOW_EXPERIMENT", os.getenv("MLFLOW_EXPERIMENT_NAME", "training-service"))
 MLFLOW_MODEL_NAME = os.getenv("TRAINING_MLFLOW_MODEL_NAME", os.getenv("MLFLOW_MODEL_NAME"))
