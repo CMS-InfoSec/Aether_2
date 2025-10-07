@@ -145,7 +145,16 @@ def test_log_event_with_fallback_logs_when_disabled(caplog: pytest.LogCaptureFix
         )
 
     assert handled is False
-    assert any(record.message == "audit disabled" for record in caplog.records)
+    record = next(record for record in caplog.records if record.message == "audit disabled")
+    assert record.audit == {
+        "actor": "dave",
+        "action": "demo.disabled",
+        "entity": "resource",
+        "before": {},
+        "after": {},
+        "ip_address": None,
+        "ip_hash": None,
+    }
 
 
 def test_log_event_with_fallback_handles_exceptions(caplog: pytest.LogCaptureFixture):
@@ -168,10 +177,51 @@ def test_log_event_with_fallback_handles_exceptions(caplog: pytest.LogCaptureFix
         )
 
     assert handled is False
-    assert any(
-        record.levelno == logging.ERROR and "failed to record" in record.message
+    error_record = next(
+        record
         for record in caplog.records
+        if record.levelno == logging.ERROR and "failed to record" in record.message
     )
+    assert error_record.audit == {
+        "actor": "erin",
+        "action": "demo.error",
+        "entity": "resource",
+        "before": {},
+        "after": {},
+        "ip_address": None,
+        "ip_hash": None,
+    }
+
+
+def test_log_event_with_fallback_allows_custom_context(caplog: pytest.LogCaptureFixture):
+    hooks = audit_hooks.AuditHooks(log=None, hash_ip=lambda value: "hashed")
+    logger = logging.getLogger("test.audit.context")
+
+    context = {
+        "audit": {"actor": "frank", "action": "demo.context"},
+        "extra_field": "value",
+    }
+
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        handled = audit_hooks.log_event_with_fallback(
+            hooks,
+            logger,
+            actor="frank",
+            action="demo.context",
+            entity="resource",
+            before={"before": True},
+            after={"after": True},
+            ip_address="10.1.2.3",
+            failure_message="should not trigger",
+            disabled_message="audit disabled",
+            disabled_level=logging.INFO,
+            context=context,
+        )
+
+    assert handled is False
+    record = next(record for record in caplog.records if record.message == "audit disabled")
+    assert record.audit == context["audit"]
+    assert record.extra_field == "value"
 
 
 def test_temporary_audit_hooks_override_and_restore():

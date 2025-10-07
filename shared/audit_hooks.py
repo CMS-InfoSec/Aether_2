@@ -151,6 +151,35 @@ def temporary_audit_hooks(hooks: AuditHooks) -> Iterator[None]:
         _AUDIT_HOOK_OVERRIDE = previous
 
 
+def _build_audit_log_extra(
+    *,
+    actor: str,
+    action: str,
+    entity: str,
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    ip_address: Optional[str],
+    ip_hash: Optional[str],
+    context: Optional[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Construct structured logging metadata for audit fallbacks."""
+
+    if context is not None:
+        return dict(context)
+
+    return {
+        "audit": {
+            "actor": actor,
+            "action": action,
+            "entity": entity,
+            "before": dict(before),
+            "after": dict(after),
+            "ip_address": ip_address,
+            "ip_hash": ip_hash,
+        }
+    }
+
+
 def log_event_with_fallback(
     hooks: AuditHooks,
     logger: logging.Logger,
@@ -165,16 +194,34 @@ def log_event_with_fallback(
     failure_message: str,
     disabled_message: Optional[str] = None,
     disabled_level: int = logging.DEBUG,
+    context: Optional[Mapping[str, Any]] = None,
 ) -> bool:
     """Emit an audit event while shielding callers from optional failures.
 
     The helper wraps :meth:`AuditHooks.log_event` to provide consistent
     fallback logging across services.  When the optional audit dependency is
     absent the function logs ``disabled_message`` (when provided) at
-    ``disabled_level``.  When the audit logger raises an unexpected exception
-    the error is recorded using :meth:`logging.Logger.exception` and ``False``
-    is returned to signal that no entry was written.
+    ``disabled_level`` with structured metadata describing the attempted
+    event.  When the audit logger raises an unexpected exception the error is
+    recorded using :meth:`logging.Logger.exception`, the same metadata is
+    attached via ``extra`` for downstream processors, and ``False`` is returned
+    to signal that no entry was written.
     """
+
+    resolved_ip_hash = ip_hash
+    if resolved_ip_hash is None and ip_address is not None:
+        resolved_ip_hash = hooks.hash_ip(ip_address)
+
+    log_extra = _build_audit_log_extra(
+        actor=actor,
+        action=action,
+        entity=entity,
+        before=before,
+        after=after,
+        ip_address=ip_address,
+        ip_hash=resolved_ip_hash,
+        context=context,
+    )
 
     try:
         handled = hooks.log_event(
@@ -184,14 +231,14 @@ def log_event_with_fallback(
             before=before,
             after=after,
             ip_address=ip_address,
-            ip_hash=ip_hash,
+            ip_hash=resolved_ip_hash,
         )
     except Exception:
-        logger.exception(failure_message)
+        logger.exception(failure_message, extra=log_extra)
         return False
 
     if not handled and disabled_message is not None:
-        logger.log(disabled_level, disabled_message)
+        logger.log(disabled_level, disabled_message, extra=log_extra)
 
     return handled
 
