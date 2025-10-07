@@ -17,6 +17,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from shared.audit_hooks import load_audit_hooks, log_event_with_fallback
 from shared.postgres import normalize_sqlalchemy_dsn
 
 try:  # pragma: no cover - support alternative namespace packages
@@ -39,15 +40,6 @@ except ModuleNotFoundError:  # pragma: no cover - fallback when installed under 
         sys.modules.setdefault("override_service._security", security_module)
         spec.loader.exec_module(security_module)
         require_admin_account = getattr(security_module, "require_admin_account")
-
-try:  # pragma: no cover - import guarded for optional dependency
-    from common.utils.audit_logger import hash_ip, log_audit
-except Exception:  # pragma: no cover - degrade gracefully if audit logger unavailable
-    log_audit = None  # type: ignore[assignment]
-
-    def hash_ip(_: Optional[str]) -> Optional[str]:  # type: ignore[override]
-        return None
-
 
 LOGGER = logging.getLogger("override_service")
 
@@ -236,24 +228,26 @@ def record_override(
     session.add(entry)
     session.flush()
 
-    if log_audit is not None:
-        try:
-            ip_hash = hash_ip(request.client.host if request.client else None)
-            log_audit(
-                actor=admin_account,
-                action="override.human_decision",
-                entity=payload.intent_id,
-                before={},
-                after={
-                    "decision": payload.decision.value,
-                    "reason": payload.reason,
-                    "account_id": normalized_account,
-                    "source": "human decision",
-                },
-                ip_hash=ip_hash,
-            )
-        except Exception:  # pragma: no cover - audit logging best effort
-            LOGGER.exception("Failed to record audit log for override %s", payload.intent_id)
+    audit_hooks = load_audit_hooks()
+    log_event_with_fallback(
+        audit_hooks,
+        LOGGER,
+        actor=admin_account,
+        action="override.human_decision",
+        entity=payload.intent_id,
+        before={},
+        after={
+            "decision": payload.decision.value,
+            "reason": payload.reason,
+            "account_id": normalized_account,
+            "source": "human decision",
+        },
+        ip_address=request.client.host if request.client else None,
+        failure_message=f"Failed to record audit log for override {payload.intent_id}",
+        disabled_message=(
+            f"Audit logging disabled; skipping override.human_decision for {payload.intent_id}"
+        ),
+    )
 
     session.refresh(entry)
     return OverrideRecord.model_validate(entry)
