@@ -17,9 +17,9 @@ from __future__ import annotations
 import base64
 import json
 from collections.abc import MutableMapping
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from dataclasses import dataclass
-from inspect import Parameter, Signature, isclass, iscoroutine, signature
+from inspect import Parameter, Signature, isclass, iscoroutine, isgenerator, signature
 from types import ModuleType, SimpleNamespace
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple, Type
 
@@ -591,7 +591,11 @@ async def _call_endpoint(
     body: Dict[str, Any],
     query_params: Dict[str, Any],
     path_params: Dict[str, Any],
+    dependency_stack: Optional[ExitStack] = None,
 ) -> Any:
+    stack = dependency_stack or ExitStack()
+    owns_stack = dependency_stack is None
+
     resolved_kwargs: Dict[str, Any] = {}
     func_sig: Signature = signature(func)
     try:
@@ -622,6 +626,7 @@ async def _call_endpoint(
                     body=body,
                     query_params=query_params,
                     path_params=path_params,
+                    dependency_stack=stack,
                 )
                 resolved_kwargs[name] = value
             continue
@@ -670,10 +675,22 @@ async def _call_endpoint(
 
     if "request" in func_sig.parameters and resolved_kwargs.get("request") is None:
         resolved_kwargs["request"] = request or Request()
-    result = func(**resolved_kwargs)
-    if iscoroutine(result):
-        result = await result
-    return result
+    try:
+        result = func(**resolved_kwargs)
+        if isgenerator(result):
+            try:
+                yielded = next(result)
+            except StopIteration as exc:  # pragma: no cover - generator returned immediately
+                result = exc.value
+            else:
+                stack.callback(result.close)
+                result = yielded
+        if iscoroutine(result):
+            result = await result
+        return result
+    finally:
+        if owns_stack:
+            stack.close()
 
 
 class _ClientResponse:
