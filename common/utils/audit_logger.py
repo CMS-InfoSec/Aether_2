@@ -10,6 +10,9 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Union
 
+import errno
+import logging
+
 try:  # pragma: no cover - import is validated in unit tests indirectly
     import psycopg  # type: ignore
 except Exception as exc:  # pragma: no cover - handled at runtime when psycopg is unavailable
@@ -18,6 +21,8 @@ except Exception as exc:  # pragma: no cover - handled at runtime when psycopg i
 else:  # pragma: no cover
     _PSYCOPG_IMPORT_ERROR = None
 
+
+LOGGER = logging.getLogger(__name__)
 
 _GENESIS_HASH = "0" * 64
 _CORE_FIELDS: Iterable[str] = (
@@ -37,6 +42,35 @@ _SENSITIVE_ACTION_PREFIXES: Iterable[str] = (
     "override.",
     "safe_mode.",
 )
+
+_DEFAULT_CHAIN_DIR = Path.home() / ".cache"
+
+
+def _sanitize_chain_path(env_var: str, default_filename: str) -> Path:
+    """Return a secure filesystem path for audit chain artefacts."""
+
+    raw = os.getenv(env_var)
+    if raw:
+        candidate = Path(raw).expanduser()
+    else:
+        candidate = _DEFAULT_CHAIN_DIR / default_filename
+
+    if not candidate.is_absolute():
+        raise ValueError(f"{env_var} must be an absolute path")
+
+    if any(part in {".", ".."} for part in candidate.parts[1:]):
+        raise ValueError(f"{env_var} must not contain path traversal sequences")
+
+    ancestors = [candidate] + list(candidate.parents)
+    anchor = Path(candidate.anchor) if candidate.is_absolute() else None
+
+    for ancestor in ancestors:
+        if anchor is not None and ancestor == anchor:
+            break
+        if ancestor.is_symlink():
+            raise ValueError(f"{env_var} must not reference symlinks")
+
+    return candidate
 
 
 def is_sensitive_action(action: str) -> bool:
@@ -70,29 +104,84 @@ def _database_dsn() -> str:
 
 
 def _chain_state_path() -> Path:
-    path = os.getenv("AUDIT_CHAIN_STATE")
-    if path:
-        return Path(path).expanduser()
-    return Path.home() / ".cache" / "audit_chain_state.json"
+    return _sanitize_chain_path("AUDIT_CHAIN_STATE", "audit_chain_state.json")
 
 
 def _chain_log_path() -> Path:
-    path = os.getenv("AUDIT_CHAIN_LOG")
-    if path:
-        return Path(path).expanduser()
-    return Path.home() / ".cache" / "audit_chain.log"
+    return _sanitize_chain_path("AUDIT_CHAIN_LOG", "audit_chain.log")
 
 
 def _ensure_parent(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    parent = path.parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+    except FileExistsError as exc:
+        raise ValueError("Audit chain parent path must be a directory") from exc
+
+    if parent.exists() and parent.is_symlink():
+        raise ValueError("Audit chain parent path must not be a symlink")
+
+
+def _ensure_not_symlink(path: Path) -> None:
+    if path.is_symlink():
+        raise ValueError("Audit chain path must not be a symlink")
+
+
+def _write_text_secure(path: Path, payload: str, *, append: bool = False) -> None:
+    """Write ``payload`` to ``path`` while guarding against symlink traversal."""
+
+    _ensure_not_symlink(path)
+
+    flags = os.O_WRONLY | os.O_CREAT
+    flags |= os.O_APPEND if append else os.O_TRUNC
+
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW  # pragma: no cover - platform specific branch
+
+    mode = 0o600
+
+    try:
+        fd = os.open(path, flags, mode)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.EPERM}:
+            raise ValueError("Audit chain path must not be a symlink") from exc
+        raise
+
+    with os.fdopen(fd, "a" if append else "w", encoding="utf-8") as handle:
+        handle.write(payload)
+
+
+def _read_text_secure(path: Path) -> str:
+    """Return the contents of ``path`` while preventing symlink traversal."""
+
+    _ensure_not_symlink(path)
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW  # pragma: no cover - platform specific branch
+
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.EPERM}:
+            raise ValueError("Audit chain path must not be a symlink") from exc
+        raise
+
+    with os.fdopen(fd, "r", encoding="utf-8") as handle:
+        return handle.read()
 
 
 def _read_last_hash(state_path: Path) -> str:
     try:
-        with state_path.open("r", encoding="utf-8") as fh:
-            payload = json.load(fh)
+        raw = _read_text_secure(state_path)
     except FileNotFoundError:
         return _GENESIS_HASH
+    except ValueError as exc:
+        LOGGER.error("Audit chain state path %s is invalid: %s", state_path, exc)
+        raise
+
+    try:
+        payload = json.loads(raw)
     except json.JSONDecodeError:  # pragma: no cover - indicates manual tampering
         return _GENESIS_HASH
     return payload.get("last_hash", _GENESIS_HASH)
@@ -101,14 +190,14 @@ def _read_last_hash(state_path: Path) -> str:
 def _write_last_hash(state_path: Path, entry_hash: str) -> None:
     _ensure_parent(state_path)
     payload = {"last_hash": entry_hash}
-    with state_path.open("w", encoding="utf-8") as fh:
-        json.dump(payload, fh, separators=(",", ":"))
+    serialized = json.dumps(payload, separators=(",", ":"))
+    _write_text_secure(state_path, serialized)
 
 
 def _append_chain_log(log_path: Path, entry: Dict[str, Any]) -> None:
     _ensure_parent(log_path)
-    with log_path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(entry, separators=(",", ":"), sort_keys=True) + "\n")
+    payload = json.dumps(entry, separators=(",", ":"), sort_keys=True) + "\n"
+    _write_text_secure(log_path, payload, append=True)
 
 
 def _canonical_payload(entry: Dict[str, Any]) -> Dict[str, Any]:
@@ -217,57 +306,61 @@ def verify_audit_chain(
     log_path = Path(log_path) if log_path is not None else _chain_log_path()
     state_path = Path(state_path) if state_path is not None else _chain_state_path()
 
-    if not log_path.exists():
+    try:
+        raw_log = _read_text_secure(log_path)
+    except FileNotFoundError:
         print("No audit chain entries found.")
         return True
+    except ValueError as exc:
+        LOGGER.error("Audit chain log path %s is invalid: %s", log_path, exc)
+        raise
 
     prev_entry_hash = _GENESIS_HASH
     valid = True
     final_entry_hash = prev_entry_hash
 
-    with log_path.open("r", encoding="utf-8") as fh:
-        for line_number, line in enumerate(fh, start=1):
-            if not line.strip():
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                print(f"Invalid JSON at line {line_number}")
-                valid = False
-                break
+    for line_number, line in enumerate(raw_log.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            print(f"Invalid JSON at line {line_number}")
+            valid = False
+            break
 
-            try:
-                entry_prev = entry["prev_hash"]
-                entry_hash = entry["hash"]
-            except KeyError as exc:
-                print(f"Missing key {exc.args[0]!r} at line {line_number}")
-                valid = False
-                break
+        try:
+            entry_prev = entry["prev_hash"]
+            entry_hash = entry["hash"]
+        except KeyError as exc:
+            print(f"Missing key {exc.args[0]!r} at line {line_number}")
+            valid = False
+            break
 
-            expected_prev_hash = prev_entry_hash
+        expected_prev_hash = prev_entry_hash
 
-            if entry_prev != expected_prev_hash:
-                print(
-                    "Chain break at line "
-                    f"{line_number}: expected prev_hash {expected_prev_hash}, got {entry_prev}"
-                )
-                valid = False
-                break
+        if entry_prev != expected_prev_hash:
+            print(
+                "Chain break at line "
+                f"{line_number}: expected prev_hash {expected_prev_hash}, got {entry_prev}"
+            )
+            valid = False
+            break
 
-            canonical_payload = _canonical_payload(entry)
-            recalculated = hashlib.sha256(
-                (expected_prev_hash + _canonical_serialized(canonical_payload)).encode("utf-8")
-            ).hexdigest()
+        canonical_payload = _canonical_payload(entry)
+        recalculated = hashlib.sha256(
+            (expected_prev_hash + _canonical_serialized(canonical_payload)).encode("utf-8")
+        ).hexdigest()
 
-            if recalculated != entry_hash:
-                print(
-                    f"Hash mismatch at line {line_number}: expected {entry_hash}, calculated {recalculated}"
-                )
-                valid = False
-                break
+        if recalculated != entry_hash:
+            print(
+                f"Hash mismatch at line {line_number}: expected {entry_hash}, calculated {recalculated}"
+            )
+            valid = False
+            break
 
-            prev_entry_hash = entry_hash
-            final_entry_hash = entry_hash
+        prev_entry_hash = entry_hash
+        final_entry_hash = entry_hash
 
     if valid:
         recorded_state_hash = _read_last_hash(state_path)

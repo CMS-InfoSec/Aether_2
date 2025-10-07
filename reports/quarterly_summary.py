@@ -13,6 +13,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence
 
 from reports.storage import ArtifactStorage, TimescaleSession, build_storage_from_env
+from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 LOGGER = logging.getLogger(__name__)
 
@@ -76,6 +77,30 @@ def _format_decimal(value: Decimal) -> str:
     return str(value.quantize(DECIMAL_QUANTIZE_UNIT, rounding=ROUND_HALF_UP))
 
 
+def _canonical_spot_instrument(
+    instrument: Any,
+    *,
+    account_id: str,
+    context: str,
+) -> str | None:
+    """Return a normalised USD spot instrument or ``None`` when invalid."""
+
+    normalized = normalize_spot_symbol(instrument)
+    if not normalized:
+        return None
+
+    if not is_spot_symbol(normalized):
+        LOGGER.warning(
+            "Ignoring non-spot instrument '%s' for account %s while processing quarterly %s",
+            instrument,
+            account_id,
+            context,
+        )
+        return None
+
+    return normalized
+
+
 class ResultSetAdapter:
     def __init__(self, result: Any):
         self._result = result
@@ -107,13 +132,29 @@ def merge_quarterly_metrics(
     )
 
     for order in orders:
-        key = (str(order["account_id"]), str(order["instrument"]))
+        account_id = str(order.get("account_id", ""))
+        instrument = _canonical_spot_instrument(
+            order.get("instrument"),
+            account_id=account_id,
+            context="order aggregates",
+        )
+        if not instrument:
+            continue
+        key = (account_id, instrument)
         bucket = aggregates[key]
         bucket["order_count"] += int(order.get("order_count", 0))
         bucket["submitted_qty"] += _to_decimal(order.get("submitted_qty", 0))
 
     for fill in fills:
-        key = (str(fill["account_id"]), str(fill["instrument"]))
+        account_id = str(fill.get("account_id", ""))
+        instrument = _canonical_spot_instrument(
+            fill.get("instrument"),
+            account_id=account_id,
+            context="fill aggregates",
+        )
+        if not instrument:
+            continue
+        key = (account_id, instrument)
         bucket = aggregates[key]
         bucket["fill_count"] += int(fill.get("fill_count", 0))
         bucket["notional"] += _to_decimal(fill.get("notional", 0))

@@ -12,8 +12,9 @@ if str(ROOT) not in sys.path:
 import pytest
 from fastapi.testclient import TestClient
 
+from auth.service import InMemorySessionStore
 from services.common.adapters import RedisFeastAdapter
-from services.common.security import ADMIN_ACCOUNTS
+from services.common.security import ADMIN_ACCOUNTS, set_default_session_store
 
 
 @pytest.fixture(name="client")
@@ -91,6 +92,27 @@ def test_get_effective_fees_rejects_non_admin(client: TestClient) -> None:
     )
 
     assert response.status_code == 403
+
+
+def test_get_effective_fees_rejects_derivative_pair(client: TestClient) -> None:
+    store = InMemorySessionStore(ttl_minutes=120)
+    try:
+        set_default_session_store(store)
+        token = store.create("company").token
+        response = client.get(
+            "/fees/effective",
+            params={"pair": "BTC-PERP", "liquidity": "maker", "notional": 25_000},
+            headers={
+                "X-Account-ID": "company",
+                "Authorization": f"Bearer {token}",
+            },
+        )
+    finally:
+        set_default_session_store(None)
+
+    assert response.status_code == 422
+    body = response.json()
+    assert "spot" in body["detail"].lower()
 
 
 def test_get_effective_fees_transitions_between_tiers(
