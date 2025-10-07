@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from shared.postgres import normalize_sqlalchemy_dsn
+from services.common.spot import require_spot_http
 
 LOGGER = logging.getLogger(__name__)
 
@@ -169,9 +170,10 @@ def _coerce_datetime(value: object) -> datetime | None:
 
 def _load_price_series(session: Session, symbol: str, window: int) -> tuple[list[float], datetime | None]:
     normalised = symbol.strip().upper()
+    candidates = {normalised, normalised.replace("-", "/")}
     stmt = (
         select(OhlcvBar.bucket_start, OhlcvBar.close)
-        .where(func.upper(OhlcvBar.market) == normalised)
+        .where(func.upper(OhlcvBar.market).in_(candidates))
         .order_by(OhlcvBar.bucket_start.desc())
         .limit(window)
     )
@@ -315,24 +317,24 @@ def lead_lag(
 ) -> LeadLagResponse:
     """Return correlation and lag coefficient for the provided pair."""
 
-    if not base or not target:
-        raise HTTPException(status_code=422, detail="Both base and target are required")
+    base_symbol = require_spot_http(base, param="base", logger=LOGGER)
+    target_symbol = require_spot_http(target, param="target", logger=LOGGER)
 
     with SessionLocal() as session:
-        base_series, base_ts = _load_price_series(session, base, window=DEFAULT_WINDOW_POINTS)
-        target_series, target_ts = _load_price_series(session, target, window=DEFAULT_WINDOW_POINTS)
+        base_series, base_ts = _load_price_series(session, base_symbol, window=DEFAULT_WINDOW_POINTS)
+        target_series, target_ts = _load_price_series(session, target_symbol, window=DEFAULT_WINDOW_POINTS)
 
-    _record_data_age(base, base_ts, max_age=STALE_THRESHOLD)
-    _record_data_age(target, target_ts, max_age=STALE_THRESHOLD)
-    _require_series(base_series, base, MIN_REQUIRED_POINTS)
-    _require_series(target_series, target, MIN_REQUIRED_POINTS)
+    _record_data_age(base_symbol, base_ts, max_age=STALE_THRESHOLD)
+    _record_data_age(target_symbol, target_ts, max_age=STALE_THRESHOLD)
+    _require_series(base_series, base_symbol, MIN_REQUIRED_POINTS)
+    _require_series(target_series, target_symbol, MIN_REQUIRED_POINTS)
 
     base_series, target_series = _align_series(base_series, target_series)
 
     correlation = _pearson_correlation(base_series, target_series)
     lag = _lag_coefficient(base_series, target_series)
     ts = datetime.now(tz=timezone.utc)
-    pair = f"{base.upper()}/{target.upper()}"
+    pair = f"{base_symbol}/{target_symbol}"
 
     _persist_metrics(pair, (("leadlag_correlation", correlation), ("leadlag_lag", float(lag))), ts)
 
@@ -347,20 +349,22 @@ def rolling_beta(
 ) -> BetaResponse:
     """Return a rolling beta estimate for the provided alt/base pair."""
 
+    alt_symbol = require_spot_http(alt, param="alt", logger=LOGGER)
+    base_symbol = require_spot_http(base, param="base", logger=LOGGER)
     lookback = max(DEFAULT_WINDOW_POINTS, window * 3)
     with SessionLocal() as session:
-        alt_series, alt_ts = _load_price_series(session, alt, window=lookback)
-        base_series, base_ts = _load_price_series(session, base, window=lookback)
+        alt_series, alt_ts = _load_price_series(session, alt_symbol, window=lookback)
+        base_series, base_ts = _load_price_series(session, base_symbol, window=lookback)
 
-    _record_data_age(alt, alt_ts, max_age=STALE_THRESHOLD)
-    _record_data_age(base, base_ts, max_age=STALE_THRESHOLD)
-    _require_series(alt_series, alt, window)
-    _require_series(base_series, base, window)
+    _record_data_age(alt_symbol, alt_ts, max_age=STALE_THRESHOLD)
+    _record_data_age(base_symbol, base_ts, max_age=STALE_THRESHOLD)
+    _require_series(alt_series, alt_symbol, window)
+    _require_series(base_series, base_symbol, window)
 
     alt_series, base_series = _align_series(alt_series, base_series)
     beta_value = _rolling_beta(alt_series, base_series, window=window)
     ts = datetime.now(tz=timezone.utc)
-    pair = f"{alt.upper()}/{base.upper()}"
+    pair = f"{alt_symbol}/{base_symbol}"
 
     _persist_metrics(pair, (("rolling_beta", beta_value),), ts)
 
@@ -373,32 +377,31 @@ def stablecoin_deviation(
 ) -> StablecoinResponse:
     """Return deviation of the stablecoin price from the 1.0 USD peg."""
 
-    if "/" not in symbol:
-        raise HTTPException(status_code=422, detail="Symbol must include the quoted currency, e.g. USDT/USD")
+    normalized = require_spot_http(symbol, logger=LOGGER)
 
     with SessionLocal() as session:
-        series, observed_ts = _load_price_series(session, symbol, window=DEFAULT_WINDOW_POINTS)
+        series, observed_ts = _load_price_series(session, normalized, window=DEFAULT_WINDOW_POINTS)
 
-    _record_data_age(symbol, observed_ts, max_age=STABLECOIN_STALE_THRESHOLD)
-    _require_series(series, symbol, 1)
+    _record_data_age(normalized, observed_ts, max_age=STABLECOIN_STALE_THRESHOLD)
+    _require_series(series, normalized, 1)
 
     price = float(series[-1])
     deviation = price - 1.0
     deviation_bps = deviation * 10000
     ts = datetime.now(tz=timezone.utc)
 
-    _persist_metrics(symbol.upper(), (("stablecoin_deviation", deviation),), ts)
+    _persist_metrics(normalized, (("stablecoin_deviation", deviation),), ts)
 
     if abs(deviation) > 0.005:
         LOGGER.warning(
             "Stablecoin peg deviation detected: %s deviated by %.4f (%.2f bps)",
-            symbol.upper(),
+            normalized,
             deviation,
             deviation_bps,
         )
 
     return StablecoinResponse(
-        symbol=symbol.upper(),
+        symbol=normalized,
         price=price,
         deviation=deviation,
         deviation_bps=deviation_bps,

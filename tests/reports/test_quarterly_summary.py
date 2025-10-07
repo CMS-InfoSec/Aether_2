@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -280,6 +281,61 @@ def test_merge_quarterly_metrics_preserves_decimal_precision() -> None:
     summary = summaries[0]
     assert summary.submitted_qty == Decimal("0.3")
     assert summary.notional == Decimal("0.10")
+
+
+def test_merge_quarterly_metrics_filters_non_spot_instruments(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    orders = [
+        {
+            "account_id": "acct-deriv",
+            "instrument": "BTC-PERP",
+            "order_count": 1,
+            "submitted_qty": Decimal("1"),
+        }
+    ]
+    fills = [
+        {
+            "account_id": "acct-deriv",
+            "instrument": "BTC-PERP",
+            "fill_count": 1,
+            "notional": Decimal("100"),
+        }
+    ]
+
+    audits: List[Mapping[str, Any]] = []
+
+    with caplog.at_level(logging.WARNING):
+        summaries = merge_quarterly_metrics(orders, fills, audits)
+
+    assert summaries == []
+    assert "Ignoring non-spot instrument" in caplog.text
+
+
+def test_merge_quarterly_metrics_normalises_symbols() -> None:
+    orders = [
+        {
+            "account_id": "acct-spot",
+            "instrument": "eth/usd",
+            "order_count": 1,
+            "submitted_qty": Decimal("1"),
+        }
+    ]
+    fills = [
+        {
+            "account_id": "acct-spot",
+            "instrument": "ETH_usd",
+            "fill_count": 1,
+            "notional": Decimal("200"),
+        }
+    ]
+
+    audits: List[Mapping[str, Any]] = []
+
+    summaries = merge_quarterly_metrics(orders, fills, audits)
+
+    assert len(summaries) == 1
+    assert summaries[0].instrument == "ETH-USD"
 
 
 def test_audit_query_returns_actor_created_at_rows(

@@ -19,12 +19,12 @@ def test_order_symbol_normalized_to_spot_pair() -> None:
     order = Order(
         client_id="client-spot",
         account_id="acct-1",
-        symbol="eth/usdt",
+        symbol="eth/usd",
         status="NEW",
         ts=_timestamp(),
     )
 
-    assert order.symbol == "ETH-USDT"
+    assert order.symbol == "ETH-USD"
 
 
 def test_order_rejects_non_spot_symbol() -> None:

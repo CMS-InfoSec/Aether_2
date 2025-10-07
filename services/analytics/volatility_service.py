@@ -23,6 +23,7 @@ from sqlalchemy.exc import ArgumentError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 import metrics
+from services.common.spot import require_spot_http
 
 logger = logging.getLogger(__name__)
 
@@ -427,8 +428,9 @@ def _build_response(metrics_payload: VolatilityAnalytics) -> VolatilityResponse:
 
 
 def _evaluate(session: Session, symbol: str, window: int) -> VolatilityResponse:
-    points = _fetch_ohlcv(session, symbol, window)
-    metrics_payload = _compute_metrics(points, symbol, window)
+    normalized = require_spot_http(symbol)
+    points = _fetch_ohlcv(session, normalized, window)
+    metrics_payload = _compute_metrics(points, normalized, window)
     _persist_metrics(session, metrics_payload)
     _update_gauge(metrics_payload)
     return _build_response(metrics_payload)
