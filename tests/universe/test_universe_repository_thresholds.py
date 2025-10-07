@@ -106,7 +106,7 @@ def test_non_usd_pairs_are_ignored(universe_timescale: UniverseTimescaleFixture)
     )
     universe_timescale.add_snapshot(
         base_asset="ETH",
-        quote_asset="USDT",
+        quote_asset="EUR",
         market_cap=UniverseRepository.MARKET_CAP_THRESHOLD * 2,
         global_volume_24h=UniverseRepository.GLOBAL_VOLUME_THRESHOLD * 3,
         kraken_volume_24h=UniverseRepository.KRAKEN_VOLUME_THRESHOLD * 3,
