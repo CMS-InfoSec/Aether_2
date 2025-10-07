@@ -1,6 +1,8 @@
 import logging
 from types import SimpleNamespace
 
+import pytest
+
 from services.system import health_service
 
 
@@ -73,3 +75,34 @@ def test_build_health_snapshot_filters_non_spot(monkeypatch, caplog):
         {"instrument": "ETH-USD", "exposure": 250.0},
     ]
     assert "Dropping non-spot instruments" in caplog.text
+
+
+def test_resolve_sim_mode_state_path_rejects_relative(monkeypatch):
+    monkeypatch.setenv("SIM_MODE_STATE_PATH", "../state.json")
+
+    with pytest.raises(ValueError):
+        health_service._resolve_sim_mode_state_path()
+
+
+def test_resolve_sim_mode_state_path_rejects_symlink(monkeypatch, tmp_path):
+    target = tmp_path / "state.json"
+    target.write_text("{}", encoding="utf-8")
+    link = tmp_path / "link.json"
+    link.symlink_to(target)
+    monkeypatch.setenv("SIM_MODE_STATE_PATH", str(link))
+
+    with pytest.raises(ValueError):
+        health_service._resolve_sim_mode_state_path()
+
+
+def test_load_sim_mode_file_skips_symlink(monkeypatch, tmp_path, caplog):
+    target = tmp_path / "state.json"
+    target.write_text("{}", encoding="utf-8")
+    link = tmp_path / "link.json"
+    link.symlink_to(target)
+    monkeypatch.setattr(health_service, "_SIM_MODE_STATE_PATH", link)
+
+    caplog.set_level(logging.WARNING)
+
+    assert health_service._load_sim_mode_file() is None
+    assert "Refusing to read simulation mode state from symlink" in caplog.text
