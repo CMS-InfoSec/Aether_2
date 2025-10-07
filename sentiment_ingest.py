@@ -56,6 +56,7 @@ except Exception:  # pragma: no cover - keep runtime light during tests
     httpx = None  # type: ignore
 
 from shared.spot import filter_spot_symbols, is_spot_symbol, normalize_spot_symbol
+from services.common.spot import require_spot_http
 
 def _resolve_security_dependency() -> Callable[..., str]:
     module_names = ("services.common.security", "aether.services.common.security")
@@ -407,6 +408,37 @@ Index("ix_sentiment_scores_symbol_ts", _SENTIMENT_TABLE.c.symbol, _SENTIMENT_TAB
 Index("ix_sentiment_scores_ts", _SENTIMENT_TABLE.c.ts)
 
 
+def _ensure_safe_sqlite_path(path: Path) -> None:
+    """Ensure SQLite database files reside on a safe, regular filesystem path."""
+
+    if not path.is_absolute():
+        raise RuntimeError(
+            "Sentiment repository database URL must resolve to an absolute filesystem path"
+        )
+
+    if path.exists():
+        if path.is_symlink():
+            raise RuntimeError(
+                "Sentiment repository database URL must not reference symlinks"
+            )
+        if path.is_dir():
+            raise RuntimeError(
+                "Sentiment repository database URL must reference a regular file path"
+            )
+
+    for ancestor in path.parents:
+        if not ancestor.exists():
+            continue
+        if ancestor.is_symlink():
+            raise RuntimeError(
+                "Sentiment repository database URL must not reference symlinks"
+            )
+        if not ancestor.is_dir():
+            raise RuntimeError(
+                "Sentiment repository database URL must reside within a directory"
+            )
+
+
 def _resolve_database_url(candidate: str | None = None) -> str:
     """Resolve and normalise the sentiment repository database URL."""
 
@@ -446,6 +478,7 @@ def _resolve_database_url(candidate: str | None = None) -> str:
                 path = Path(database).expanduser()
                 if not path.is_absolute():
                     path = Path.cwd() / path
+                _ensure_safe_sqlite_path(path)
                 path.parent.mkdir(parents=True, exist_ok=True)
 
         return normalised
@@ -638,12 +671,7 @@ class SentimentAPI:
             symbol: str = Query(..., description="Symbol ticker, e.g. BTC-USD"),
             _: str = Depends(require_admin_account),
         ) -> SentimentResponse:
-            normalized_symbol = normalize_spot_symbol(symbol)
-            if not normalized_symbol or not is_spot_symbol(normalized_symbol):
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"Symbol '{symbol}' is not a supported spot market",
-                )
+            normalized_symbol = require_spot_http(symbol)
             try:
                 record = await self._repository.latest(normalized_symbol)
             except ValueError as exc:
@@ -659,13 +687,7 @@ class SentimentAPI:
         async def refresh(symbols: List[str], _: str = Depends(require_admin_account)) -> dict[str, str]:
             normalized_symbols: List[str] = []
             for raw_symbol in symbols:
-                normalized_symbol = normalize_spot_symbol(raw_symbol)
-                if not normalized_symbol or not is_spot_symbol(normalized_symbol):
-                    raise HTTPException(
-                        status_code=422,
-                        detail=f"Symbol '{raw_symbol}' is not a supported spot market",
-                    )
-                normalized_symbols.append(normalized_symbol)
+                normalized_symbols.append(require_spot_http(raw_symbol))
 
             try:
                 await self._service.ingest_many(normalized_symbols)

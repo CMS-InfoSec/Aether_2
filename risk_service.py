@@ -8,7 +8,6 @@ import logging
 import os
 
 import math
-import re
 
 import time
 from contextlib import contextmanager
@@ -48,6 +47,7 @@ from services.common.compliance import (
     is_blocking_status,
 )
 from services.common.security import require_admin_account
+from services.common.spot import require_spot_http
 from battle_mode import BattleModeController, create_battle_mode_tables
 
 from cost_throttler import CostThrottler
@@ -490,46 +490,10 @@ _STUB_FILLS: List[Dict[str, object]] = [
 ]
 
 
-_SPOT_PAIR_PATTERN = re.compile(r"^[A-Z0-9]{2,}[-/][A-Z0-9]{2,}$")
-_NON_SPOT_KEYWORDS = ("PERP", "FUT", "FUTURE", "MARGIN", "SWAP", "OPTION", "DERIV")
-_LEVERAGE_SUFFIXES = ("UP", "DOWN")
-_LEVERAGE_PATTERN = re.compile(r"\d+(?:X|L|S)$")
-
-
-def _is_spot_instrument(symbol: str) -> bool:
-    """Return ``True`` when *symbol* appears to represent a spot market pair."""
-
-    normalized = str(symbol or "").strip().upper()
-    if not normalized:
-        return False
-    if any(keyword in normalized for keyword in _NON_SPOT_KEYWORDS):
-        return False
-    if not _SPOT_PAIR_PATTERN.match(normalized):
-        return False
-    base, _ = re.split(r"[-/]", normalized, maxsplit=1)
-    if any(base.endswith(suffix) for suffix in _LEVERAGE_SUFFIXES):
-        return False
-    if _LEVERAGE_PATTERN.search(base):
-        return False
-    return True
-
-
 def _filter_spot_instruments(symbols: Iterable[str]) -> List[str]:
-    """Return normalized spot symbols, discarding non-spot entries."""
+    """Return normalized USD spot symbols, discarding non-compliant entries."""
 
-    filtered: List[str] = []
-    seen: Set[str] = set()
-    for symbol in symbols:
-        normalized = str(symbol or "").strip().upper()
-        if not normalized:
-            continue
-        if not _is_spot_instrument(normalized):
-            logger.warning("Ignoring non-spot instrument '%s' in spot-only context", symbol)
-            continue
-        if normalized not in seen:
-            filtered.append(normalized)
-            seen.add(normalized)
-    return filtered
+    return filter_spot_symbols(symbols, logger=logger)
 
 
 class TradeIntent(BaseModel):
@@ -841,14 +805,7 @@ async def get_position_size(
     symbol: str = Query(..., min_length=1, description="Instrument symbol to size"),
     account_id: str = Depends(require_admin_account),
 ) -> Dict[str, Any]:
-    normalized_symbol = normalize_spot_symbol(symbol)
-    if not is_spot_symbol(normalized_symbol):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only spot market symbols are supported for position sizing.",
-        )
-
-    symbol = normalized_symbol
+    symbol = require_spot_http(symbol, logger=logger)
 
     try:
         limits = _load_account_limits(account_id)
