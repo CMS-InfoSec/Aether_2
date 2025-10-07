@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
@@ -267,12 +268,38 @@ __all__ = [
 
 
 
+def _resolve_output_path(raw_path: str) -> Path:
+    """Normalise and validate the walk-forward output path."""
+
+    if any(ord(char) < 32 for char in raw_path):
+        raise ValueError("OUTPUT_PATH contains control characters")
+
+    candidate = Path(raw_path).expanduser()
+
+    if any(part == ".." for part in candidate.parts):
+        raise ValueError("OUTPUT_PATH must not contain parent directory traversal")
+
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+
+    # Avoid following symlinks while ensuring a canonical absolute path.
+    candidate = candidate.absolute()
+
+    for ancestor in (candidate, *candidate.parents):
+        if ancestor.exists() and ancestor.is_symlink():
+            raise ValueError("OUTPUT_PATH must not include symlinked paths")
+
+    if candidate.exists() and candidate.is_dir():
+        raise ValueError("OUTPUT_PATH must reference a file, not a directory")
+
+    return candidate
+
+
 def main() -> None:
     """CLI entry-point for the data loader."""
 
     import json
     import os
-    from pathlib import Path
 
     config_payload = os.environ.get("DATA_LOADER_CONFIG")
     if not config_payload:
@@ -293,7 +320,9 @@ def main() -> None:
         test_window=test_window,
     )
     splits = loader.load()
-    output_path = Path(os.environ.get("OUTPUT_PATH", "/tmp/walk_forward_splits.parquet"))
+    output_path = _resolve_output_path(
+        os.environ.get("OUTPUT_PATH", "/tmp/walk_forward_splits.parquet")
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         str(idx): {
