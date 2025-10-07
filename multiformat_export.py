@@ -46,6 +46,26 @@ class MissingDependencyError(RuntimeError):
     """Raised when a required optional dependency is missing."""
 
 
+def _normalise_export_prefix(prefix: str | None) -> str:
+    """Return a sanitised S3 key prefix suitable for log exports."""
+
+    if not prefix:
+        return ""
+
+    segments: list[str] = []
+    for raw_segment in prefix.replace("\\", "/").split("/"):
+        segment = raw_segment.strip()
+        if not segment:
+            continue
+        if segment in {".", ".."}:
+            raise ValueError("Log export prefix must not contain path traversal sequences")
+        if any(ord(char) < 32 for char in segment):
+            raise ValueError("Log export prefix must not contain control characters")
+        segments.append(segment)
+
+    return "/".join(segments)
+
+
 @dataclass(frozen=True)
 class StorageConfig:
     """Configuration required to persist exports to object storage."""
@@ -53,6 +73,10 @@ class StorageConfig:
     bucket: str
     prefix: str = "log-exports"
     endpoint_url: str | None = None
+
+    def __post_init__(self) -> None:
+        normalised_prefix = _normalise_export_prefix(self.prefix)
+        object.__setattr__(self, "prefix", normalised_prefix)
 
 
 @dataclass(frozen=True)

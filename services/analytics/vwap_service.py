@@ -29,6 +29,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.pool import StaticPool
 
 from services.common.security import require_admin_account
+from services.common.spot import require_spot_http
 from shared.postgres import normalize_postgres_schema, normalize_sqlalchemy_dsn
 
 
@@ -294,8 +295,10 @@ def vwap_divergence(
                 detail="Authenticated account is not authorized for requested scope.",
             )
 
+    normalized = require_spot_http(symbol, logger=LOGGER)
+
     try:
-        return service.compute(symbol)
+        return service.compute(normalized)
     except VWAPComputationError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     except Exception as exc:  # pragma: no cover - unexpected defensive guard

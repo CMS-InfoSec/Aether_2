@@ -12,6 +12,7 @@ import csv
 import io
 import uuid
 from collections import defaultdict
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
@@ -22,6 +23,12 @@ from typing import Any, Dict, Iterable, List, Optional
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
+
+from services.common.spot import require_spot_http
+from shared.spot import require_spot_symbol
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class CostBasisMethod(str, Enum):
@@ -103,10 +110,17 @@ class TaxLotCreate(BaseModel):
     def default_lot_id(cls, value: Optional[str]) -> str:
         return value or str(uuid.uuid4())
 
+    @field_validator("symbol")
+    @classmethod
+    def validate_symbol(cls, value: str) -> str:
+        """Ensure symbols correspond to allowed USD spot market instruments."""
+
+        return require_spot_symbol(value)
+
     def to_domain(self) -> TaxLot:
         return TaxLot(
             account_id=self.account_id,
-            symbol=self.symbol.upper(),
+            symbol=self.symbol,
             qty=self.qty,
             price=self.price,
             ts=self.ts,
@@ -194,8 +208,7 @@ class TaxLotStore:
         with self._lock:
             lots = list(self._lots.get(account_id, []))
         if symbol:
-            upper_symbol = symbol.upper()
-            lots = [lot for lot in lots if lot.symbol == upper_symbol]
+            lots = [lot for lot in lots if lot.symbol == symbol]
         return lots
 
     def accounts(self) -> Iterable[str]:
@@ -626,7 +639,11 @@ async def get_realized_pnl(
     symbol: Optional[str] = Query(None, description="Optional symbol filter"),
     export: Optional[str] = Query(None, description="Set to 'csv' to export results"),
 ) -> Response:
-    lots = store.get(account_id, symbol)
+    normalized_symbol: Optional[str] = None
+    if symbol is not None:
+        normalized_symbol = require_spot_http(symbol, logger=LOGGER)
+
+    lots = store.get(account_id, normalized_symbol)
     if not lots:
         raise HTTPException(status_code=404, detail="No tax lots found for account")
 
@@ -668,7 +685,11 @@ async def get_unrealized_pnl(
     symbol: Optional[str] = Query(None, description="Optional symbol filter"),
     export: Optional[str] = Query(None, description="Set to 'csv' to export results"),
 ) -> Response:
-    lots = store.get(account_id, symbol)
+    normalized_symbol: Optional[str] = None
+    if symbol is not None:
+        normalized_symbol = require_spot_http(symbol, logger=LOGGER)
+
+    lots = store.get(account_id, normalized_symbol)
     if not lots:
         raise HTTPException(status_code=404, detail="No tax lots found for account")
 
