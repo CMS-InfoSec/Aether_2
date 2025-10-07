@@ -46,6 +46,43 @@ class AuditHooks:
     log: AuditCallable | None
     hash_ip: HashIpCallable
 
+    def log_event(
+        self,
+        *,
+        actor: str,
+        action: str,
+        entity: str,
+        before: Mapping[str, Any],
+        after: Mapping[str, Any],
+        ip_address: Optional[str] = None,
+        ip_hash: Optional[str] = None,
+    ) -> bool:
+        """Record an audit entry when the optional logger is available.
+
+        The helper mirrors :func:`common.utils.audit_logger.log_audit` while
+        deferring hashing logic to the configured :func:`hash_ip` callback.  It
+        returns ``True`` when an audit logger handled the event and ``False``
+        when the optional dependency is absent.
+        """
+
+        log_callable = self.log
+        if log_callable is None:
+            return False
+
+        resolved_ip_hash = ip_hash
+        if resolved_ip_hash is None and ip_address is not None:
+            resolved_ip_hash = self.hash_ip(ip_address)
+
+        log_callable(
+            actor=actor,
+            action=action,
+            entity=entity,
+            before=before,
+            after=after,
+            ip_hash=resolved_ip_hash,
+        )
+        return True
+
 
 @lru_cache(maxsize=1)
 def load_audit_hooks() -> AuditHooks:

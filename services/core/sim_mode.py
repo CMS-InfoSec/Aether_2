@@ -64,8 +64,6 @@ async def _publish_event(status: SimModeStatus, actor: str) -> None:
 
 
 _AUDIT_HOOKS = load_audit_hooks()
-_LOG_AUDIT = _AUDIT_HOOKS.log
-_HASH_IP = _AUDIT_HOOKS.hash_ip
 
 
 async def _sync_runtime_state(active: bool) -> None:
@@ -78,13 +76,8 @@ async def _sync_runtime_state(active: bool) -> None:
 def _audit_transition(
     before: SimModeStatus, after: SimModeStatus, actor: str, request: Request
 ) -> None:
-    if _LOG_AUDIT is None:  # pragma: no cover - optional dependency missing
-        return
-
     try:
-        client = request.client.host if request.client else None
-        ip_hash = _HASH_IP(client)
-        _LOG_AUDIT(
+        _AUDIT_HOOKS.log_event(
             actor=actor,
             action="sim_mode.transition",
             entity="platform",
@@ -98,7 +91,7 @@ def _audit_transition(
                 "reason": after.reason,
                 "ts": after.ts.isoformat(),
             },
-            ip_hash=ip_hash,
+            ip_address=request.client.host if request.client else None,
         )
     except Exception:  # pragma: no cover - defensive logging only
         LOGGER.exception("Failed to record audit log for simulation mode transition")

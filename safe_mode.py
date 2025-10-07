@@ -31,8 +31,6 @@ from shared.audit_hooks import load_audit_hooks
 
 
 _AUDIT_HOOKS = load_audit_hooks()
-chain_log_audit = _AUDIT_HOOKS.log
-audit_hash_ip = _AUDIT_HOOKS.hash_ip
 
 
 LOGGER = logging.getLogger(__name__)
@@ -746,19 +744,17 @@ def enter_safe_mode(
         ) from exc
     response = controller.status().to_response()
 
-    if chain_log_audit is not None:
-        try:
-            ip_hash = audit_hash_ip(request.client.host if request.client else None)
-            chain_log_audit(
-                actor=actor_account,
-                action="safe_mode.enter",
-                entity="safe_mode",
-                before=before_snapshot,
-                after=dict(response),
-                ip_hash=ip_hash,
-            )
-        except Exception:  # pragma: no cover - defensive best effort
-            LOGGER.exception("Failed to record audit log for safe mode entry")
+    try:
+        _AUDIT_HOOKS.log_event(
+            actor=actor_account,
+            action="safe_mode.enter",
+            entity="safe_mode",
+            before=before_snapshot,
+            after=dict(response),
+            ip_address=request.client.host if request.client else None,
+        )
+    except Exception:  # pragma: no cover - defensive best effort
+        LOGGER.exception("Failed to record audit log for safe mode entry")
 
     return response
 
@@ -775,19 +771,17 @@ def exit_safe_mode(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     response = controller.status().to_response()
 
-    if chain_log_audit is not None:
-        try:
-            ip_hash = audit_hash_ip(request.client.host if request.client else None)
-            chain_log_audit(
-                actor=actor_account,
-                action="safe_mode.exit",
-                entity="safe_mode",
-                before=before_snapshot,
-                after=dict(response),
-                ip_hash=ip_hash,
-            )
-        except Exception:  # pragma: no cover - defensive best effort
-            LOGGER.exception("Failed to record audit log for safe mode exit")
+    try:
+        _AUDIT_HOOKS.log_event(
+            actor=actor_account,
+            action="safe_mode.exit",
+            entity="safe_mode",
+            before=before_snapshot,
+            after=dict(response),
+            ip_address=request.client.host if request.client else None,
+        )
+    except Exception:  # pragma: no cover - defensive best effort
+        LOGGER.exception("Failed to record audit log for safe mode exit")
 
     return response
 

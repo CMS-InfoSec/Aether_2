@@ -19,8 +19,6 @@ from shared.audit_hooks import load_audit_hooks
 
 
 _AUDIT_HOOKS = load_audit_hooks()
-chain_log_audit = _AUDIT_HOOKS.log
-audit_hash_ip = _AUDIT_HOOKS.hash_ip
 
 
 LOGGER = logging.getLogger("sim_mode_service")
@@ -64,17 +62,14 @@ async def _publish_event(status: SimModeStatus, actor: str) -> None:
 
 
 def _log_audit_transition(before: SimModeStatus, after: SimModeStatus, actor: str, request: Request) -> None:
-    if chain_log_audit is None:  # pragma: no cover - audit optional
-        return
     try:
-        ip_hash = audit_hash_ip(request.client.host if request.client else None)
-        chain_log_audit(
+        _AUDIT_HOOKS.log_event(
             actor=actor,
             action="sim_mode.transition",
             entity="platform",
             before={"active": before.active, "reason": before.reason, "ts": before.ts.isoformat()},
             after={"active": after.active, "reason": after.reason, "ts": after.ts.isoformat()},
-            ip_hash=ip_hash,
+            ip_address=request.client.host if request.client else None,
         )
     except Exception:  # pragma: no cover - ensure state change isn't blocked by audit failure
         LOGGER.exception("Failed to record audit trail for simulation mode transition")

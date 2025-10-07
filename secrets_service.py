@@ -26,8 +26,6 @@ from services.secrets.signing import sign_kraken_request
 from shared.audit_hooks import load_audit_hooks
 
 _AUDIT_HOOKS = load_audit_hooks()
-log_audit = _AUDIT_HOOKS.log
-hash_ip = _AUDIT_HOOKS.hash_ip
 
 
 LOGGER = logging.getLogger(__name__)
@@ -526,7 +524,7 @@ async def store_kraken_secret(
     verified_actor = authorized_actor
 
     before_snapshot: Dict[str, Any] = {}
-    if log_audit is not None:
+    if _AUDIT_HOOKS.log is not None:
         try:
             before_snapshot = manager.get_status(payload.account_id)
         except HTTPException as exc:
@@ -593,23 +591,22 @@ async def store_kraken_secret(
 
     log_rotation(payload.account_id, verified_actor, result["last_rotated"])
 
-    if log_audit is not None:
-        try:
-            audit_after = dict(result)
-            audit_after["actor"] = verified_actor
-            log_audit(
-                actor=verified_actor,
-                action="secret.kraken.rotate",
-                entity=payload.account_id,
-                before=before_snapshot,
-                after=audit_after,
-                ip_hash=hash_ip(request.client.host if request.client else None),
-            )
-        except Exception:  # pragma: no cover - defensive best effort
-            LOGGER.exception(
-                "Failed to record audit log for Kraken secret rotation for %s",
-                payload.account_id,
-            )
+    try:
+        audit_after = dict(result)
+        audit_after["actor"] = verified_actor
+        _AUDIT_HOOKS.log_event(
+            actor=verified_actor,
+            action="secret.kraken.rotate",
+            entity=payload.account_id,
+            before=before_snapshot,
+            after=audit_after,
+            ip_address=request.client.host if request.client else None,
+        )
+    except Exception:  # pragma: no cover - defensive best effort
+        LOGGER.exception(
+            "Failed to record audit log for Kraken secret rotation for %s",
+            payload.account_id,
+        )
 
     return JSONResponse(status_code=status.HTTP_201_CREATED, content=result)
 

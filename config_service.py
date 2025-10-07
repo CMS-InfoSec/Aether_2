@@ -45,8 +45,6 @@ except ModuleNotFoundError:  # pragma: no cover - fallback when installed under 
 from shared.audit_hooks import load_audit_hooks
 
 _AUDIT_HOOKS = load_audit_hooks()
-log_audit = _AUDIT_HOOKS.log
-hash_ip = _AUDIT_HOOKS.hash_ip
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +384,7 @@ def update_config(
     before_record = _latest_config_record(session, account_id=account_id, key=key)
     before_snapshot = _audit_snapshot(before_record)
     entity = f"{account_id}:{key}"
-    ip_hash = hash_ip(request.client.host if request.client else None)
+    client_ip = request.client.host if request.client else None
 
     if key in GUARDED_KEYS:
         pending = _pending_guarded.get(pending_identifier)
@@ -408,29 +406,28 @@ def update_config(
                 required_approvals=required_approvals,
             )
 
-            if log_audit is not None:
-                try:
-                    after_snapshot = {
-                        "account_id": account_id,
-                        "key": key,
-                        "value": payload.value,
-                        "status": "pending",
-                        "requested_by": admin_account,
-                        "requested_at": created_at.isoformat(),
-                        "required_approvals": required_approvals,
-                    }
-                    log_audit(
-                        actor=admin_account,
-                        action="config.change.requested",
-                        entity=entity,
-                        before=before_snapshot,
-                        after=after_snapshot,
-                        ip_hash=ip_hash,
-                    )
-                except Exception:  # pragma: no cover - defensive best effort
-                    LOGGER.exception(
-                        "Failed to record audit log for pending config change %s", entity
-                    )
+            try:
+                after_snapshot = {
+                    "account_id": account_id,
+                    "key": key,
+                    "value": payload.value,
+                    "status": "pending",
+                    "requested_by": admin_account,
+                    "requested_at": created_at.isoformat(),
+                    "required_approvals": required_approvals,
+                }
+                _AUDIT_HOOKS.log_event(
+                    actor=admin_account,
+                    action="config.change.requested",
+                    entity=entity,
+                    before=before_snapshot,
+                    after=after_snapshot,
+                    ip_address=client_ip,
+                )
+            except Exception:  # pragma: no cover - defensive best effort
+                LOGGER.exception(
+                    "Failed to record audit log for pending config change %s", entity
+                )
             return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=response.model_dump())
 
         if pending.author == admin_account:
@@ -457,18 +454,17 @@ def update_config(
             required_approvals=required_approvals,
         )
 
-        if log_audit is not None:
-            try:
-                log_audit(
-                    actor=admin_account,
-                    action="config.change.approved",
-                    entity=entity,
-                    before=before_snapshot,
-                    after=_audit_snapshot(record),
-                    ip_hash=ip_hash,
-                )
-            except Exception:  # pragma: no cover - defensive best effort
-                LOGGER.exception("Failed to record audit log for config approval %s", entity)
+        try:
+            _AUDIT_HOOKS.log_event(
+                actor=admin_account,
+                action="config.change.approved",
+                entity=entity,
+                before=before_snapshot,
+                after=_audit_snapshot(record),
+                ip_address=client_ip,
+            )
+        except Exception:  # pragma: no cover - defensive best effort
+            LOGGER.exception("Failed to record audit log for config approval %s", entity)
 
         return response
 
@@ -490,18 +486,17 @@ def update_config(
         required_approvals=required_approvals,
     )
 
-    if log_audit is not None:
-        try:
-            log_audit(
-                actor=admin_account,
-                action="config.change.applied",
-                entity=entity,
-                before=before_snapshot,
-                after=_audit_snapshot(record),
-                ip_hash=ip_hash,
-            )
-        except Exception:  # pragma: no cover - defensive best effort
-            LOGGER.exception("Failed to record audit log for config change %s", entity)
+    try:
+        _AUDIT_HOOKS.log_event(
+            actor=admin_account,
+            action="config.change.applied",
+            entity=entity,
+            before=before_snapshot,
+            after=_audit_snapshot(record),
+            ip_address=client_ip,
+        )
+    except Exception:  # pragma: no cover - defensive best effort
+        LOGGER.exception("Failed to record audit log for config change %s", entity)
 
     return response
 

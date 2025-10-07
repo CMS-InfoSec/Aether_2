@@ -42,8 +42,6 @@ except ModuleNotFoundError:  # pragma: no cover - fallback when installed under 
         require_admin_account = getattr(security_module, "require_admin_account")
 
 _AUDIT_HOOKS = load_audit_hooks()
-log_audit = _AUDIT_HOOKS.log
-hash_ip = _AUDIT_HOOKS.hash_ip
 
 
 LOGGER = logging.getLogger("override_service")
@@ -233,24 +231,22 @@ def record_override(
     session.add(entry)
     session.flush()
 
-    if log_audit is not None:
-        try:
-            ip_hash = hash_ip(request.client.host if request.client else None)
-            log_audit(
-                actor=admin_account,
-                action="override.human_decision",
-                entity=payload.intent_id,
-                before={},
-                after={
-                    "decision": payload.decision.value,
-                    "reason": payload.reason,
-                    "account_id": normalized_account,
-                    "source": "human decision",
-                },
-                ip_hash=ip_hash,
-            )
-        except Exception:  # pragma: no cover - audit logging best effort
-            LOGGER.exception("Failed to record audit log for override %s", payload.intent_id)
+    try:
+        _AUDIT_HOOKS.log_event(
+            actor=admin_account,
+            action="override.human_decision",
+            entity=payload.intent_id,
+            before={},
+            after={
+                "decision": payload.decision.value,
+                "reason": payload.reason,
+                "account_id": normalized_account,
+                "source": "human decision",
+            },
+            ip_address=request.client.host if request.client else None,
+        )
+    except Exception:  # pragma: no cover - audit logging best effort
+        LOGGER.exception("Failed to record audit log for override %s", payload.intent_id)
 
     session.refresh(entry)
     return OverrideRecord.model_validate(entry)

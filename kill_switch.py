@@ -16,8 +16,6 @@ from shared.async_utils import dispatch_async
 from shared.audit_hooks import load_audit_hooks
 
 _AUDIT_HOOKS = load_audit_hooks()
-log_audit = _AUDIT_HOOKS.log
-hash_ip = _AUDIT_HOOKS.hash_ip
 
 app = FastAPI(title="Kill Switch Service")
 
@@ -114,26 +112,25 @@ def trigger_kill_switch(
         channels_sent=channels_sent,
     )
 
-    if log_audit is not None:
-        try:
-            log_audit(
-                actor=actor_account,
-                action="kill_switch.triggered",
-                entity=normalized_account,
-                before={},
-                after={
-                    "reason_code": reason_code.value,
-                    "reason": reason_description,
-                    "channels_sent": channels_sent,
-                    "failed_channels": failed_channels,
-                    "triggered_at": activation_ts.isoformat(),
-                },
-                ip_hash=hash_ip(request.client.host if request.client else None),
-            )
-        except Exception:  # pragma: no cover - defensive best effort
-            LOGGER.exception(
-                "Failed to record audit log for kill switch activation on %s", normalized_account
-            )
+    try:
+        _AUDIT_HOOKS.log_event(
+            actor=actor_account,
+            action="kill_switch.triggered",
+            entity=normalized_account,
+            before={},
+            after={
+                "reason_code": reason_code.value,
+                "reason": reason_description,
+                "channels_sent": channels_sent,
+                "failed_channels": failed_channels,
+                "triggered_at": activation_ts.isoformat(),
+            },
+            ip_address=request.client.host if request.client else None,
+        )
+    except Exception:  # pragma: no cover - defensive best effort
+        LOGGER.exception(
+            "Failed to record audit log for kill switch activation on %s", normalized_account
+        )
 
     response_body = {
         "status": response_status,

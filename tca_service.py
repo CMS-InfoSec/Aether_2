@@ -46,8 +46,6 @@ from shared.postgres import normalize_sqlalchemy_dsn
 from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 _AUDIT_HOOKS = load_audit_hooks()
-log_audit = _AUDIT_HOOKS.log
-hash_ip = _AUDIT_HOOKS.hash_ip
 
 
 LOGGER = logging.getLogger(__name__)
@@ -154,18 +152,15 @@ def _audit_access(
 ) -> None:
     """Record audit information for report access using the verified identity."""
 
-    if log_audit is None:
-        return
-
     try:
         ip_address = request.client.host if request.client else None
-        log_audit(
+        _AUDIT_HOOKS.log_event(
             actor=actor,
             action=action,
             entity=entity,
             before={},
             after=dict(metadata or {}),
-            ip_hash=hash_ip(ip_address),
+            ip_address=ip_address,
         )
     except Exception:  # pragma: no cover - defensive best effort
         AUDIT_LOGGER.exception(

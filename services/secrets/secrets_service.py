@@ -87,8 +87,6 @@ from shared.audit_hooks import load_audit_hooks
 
 
 _AUDIT_HOOKS = load_audit_hooks()
-chain_log_audit = _AUDIT_HOOKS.log
-audit_chain_hash_ip = _AUDIT_HOOKS.hash_ip
 
 try:  # pragma: no cover - OMS watcher is optional in some runtimes
     from services.oms.oms_kraken import KrakenCredentialWatcher
@@ -269,7 +267,7 @@ def _perform_secure_rotation(
 
     ip_address = request.client.host if request.client else None
     hashed_ip = _hash_ip(ip_address)
-    chain_ip_hash = audit_chain_hash_ip(ip_address)
+    chain_ip_hash = _AUDIT_HOOKS.hash_ip(ip_address)
 
     recorded_meta = meta_store.record_rotation(
         kms_key_id=envelope.kms_key_id,
@@ -303,20 +301,19 @@ def _perform_secure_rotation(
         after=audit_after,
     )
 
-    if chain_log_audit is not None:
-        try:
-            chain_log_audit(
-                actor=actor,
-                action="secret.kraken.rotate",
-                entity=f"kraken:{account_id}",
-                before=before_for_audit,
-                after=chain_audit_after,
-                ip_hash=chain_ip_hash,
-            )
-        except Exception:  # pragma: no cover - defensive best effort
-            LOGGER.exception(
-                "Failed to record tamper-evident audit log for Kraken rotation on %s", account_id
-            )
+    try:
+        _AUDIT_HOOKS.log_event(
+            actor=actor,
+            action="secret.kraken.rotate",
+            entity=f"kraken:{account_id}",
+            before=before_for_audit,
+            after=chain_audit_after,
+            ip_hash=chain_ip_hash,
+        )
+    except Exception:  # pragma: no cover - defensive best effort
+        LOGGER.exception(
+            "Failed to record tamper-evident audit log for Kraken rotation on %s", account_id
+        )
 
     LOGGER.info(
         "OMS watcher note: Kraken credentials rotated with envelope encryption",  # pragma: no cover - log only
