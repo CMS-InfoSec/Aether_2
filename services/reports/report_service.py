@@ -12,8 +12,17 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, MutableMapping, Optional, Sequence
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import StreamingResponse
+try:  # pragma: no cover - FastAPI is optional in some unit tests
+    from fastapi import APIRouter, Depends, HTTPException, Query
+    from fastapi.responses import StreamingResponse
+except ImportError:  # pragma: no cover - fallback when FastAPI is stubbed out
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        APIRouter,
+        Depends,
+        HTTPException,
+        Query,
+        StreamingResponse,
+    )
 from psycopg2 import sql
 from psycopg2.extras import RealDictCursor
 

@@ -5,7 +5,15 @@ import os
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Optional, Tuple
 
-from fastapi import Header, HTTPException, Request, status
+try:  # pragma: no cover - FastAPI is optional in some unit tests
+    from fastapi import Header, HTTPException, Request, status
+except ImportError:  # pragma: no cover - fallback when FastAPI is stubbed out
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        Header,
+        HTTPException,
+        Request,
+        status,
+    )
 
 from auth.service import Session, SessionStoreProtocol
 
