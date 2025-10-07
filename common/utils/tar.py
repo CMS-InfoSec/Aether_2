@@ -9,16 +9,23 @@ def safe_extract_tar(archive: tarfile.TarFile, destination: Path) -> None:
     """Safely extract ``archive`` into ``destination``.
 
     The destination directory is created if necessary and validated to ensure
-    it is not a symbolic link.  Each archive member is inspected before
-    extraction to verify that it represents a regular file or directory with a
-    relative path that stays within the destination tree.  Any attempt at path
-    traversal, absolute paths, or special file types raises ``ValueError`` and
-    aborts the extraction.
+    it is absolute and not backed by symbolic links.  Each archive member is
+    inspected before extraction to verify that it represents a regular file or
+    directory with a relative path that stays within the destination tree.  Any
+    attempt at path traversal, absolute paths, or special file types raises
+    ``ValueError`` and aborts the extraction.
     """
 
+    if not destination.is_absolute():
+        raise ValueError("Tar extraction destination must be an absolute path")
+
+    for ancestor in (destination,) + tuple(destination.parents):
+        if ancestor.exists() and ancestor.is_symlink():
+            raise ValueError(
+                "Tar extraction destination and its ancestors must not be symlinks"
+            )
+
     if destination.exists():
-        if destination.is_symlink():
-            raise ValueError("Tar extraction destination must not be a symlink")
         if not destination.is_dir():
             raise ValueError("Tar extraction destination must be a directory")
     destination.mkdir(parents=True, exist_ok=True)

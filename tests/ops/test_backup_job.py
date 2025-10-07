@@ -71,6 +71,30 @@ def test_safe_extract_tar_rejects_symlinks(tmp_path: Path) -> None:
     assert not any(destination.rglob("link"))
 
 
+def test_safe_extract_tar_rejects_relative_destination(tmp_path: Path) -> None:
+    archive_path = tmp_path / "safe.tar.gz"
+    _build_archive(archive_path, {"mlruns/metrics.json": b"{}"})
+
+    with tarfile.open(archive_path, "r:gz") as archive:
+        with pytest.raises(ValueError, match="absolute path"):
+            safe_extract_tar(archive, Path("relative/dest"))
+
+
+def test_safe_extract_tar_rejects_symlink_ancestor(tmp_path: Path) -> None:
+    archive_path = tmp_path / "safe.tar.gz"
+    _build_archive(archive_path, {"mlruns/metrics.json": b"{}"})
+
+    real_parent = tmp_path / "real"
+    real_parent.mkdir()
+    symlink_parent = tmp_path / "link"
+    os.symlink(real_parent, symlink_parent)
+    destination = symlink_parent / "dest"
+
+    with tarfile.open(archive_path, "r:gz") as archive:
+        with pytest.raises(ValueError, match="ancestors must not be symlinks"):
+            safe_extract_tar(archive, destination)
+
+
 def test_safe_extract_tar_writes_expected_payload(tmp_path: Path) -> None:
     archive_path = tmp_path / "safe.tar.gz"
     _build_archive(archive_path, {"mlruns/metrics.json": b"{}"})
