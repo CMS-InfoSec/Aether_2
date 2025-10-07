@@ -10,9 +10,29 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, MutableMapping, Sequence
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, StreamingResponse
-from starlette.middleware.base import BaseHTTPMiddleware
+try:  # pragma: no cover - FastAPI is optional in certain unit tests
+    from fastapi import Depends, FastAPI, HTTPException, Query, Request
+    from fastapi.responses import JSONResponse, StreamingResponse
+except ImportError:  # pragma: no cover - fallback when FastAPI is stubbed out
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        Depends,
+        FastAPI,
+        HTTPException,
+        JSONResponse,
+        Query,
+        Request,
+        StreamingResponse,
+    )
+
+try:  # pragma: no cover - starlette is optional in some environments
+    from starlette.middleware.base import BaseHTTPMiddleware
+except ImportError:  # pragma: no cover - fallback when starlette is unavailable
+    class BaseHTTPMiddleware:  # type: ignore[no-redef]
+        def __init__(self, app):
+            self.app = app
+
+        async def dispatch(self, request, call_next):
+            return await call_next(request)
 
 from shared.spot import is_spot_symbol, normalize_spot_symbol
 
@@ -137,12 +157,25 @@ def _connect():
 
 
 def _parse_datetime(value: str | None) -> datetime | None:
-    if not value:
+    if value is None:
         return None
+
+    candidate = value.strip()
+    if not candidate:
+        return None
+
+    if candidate[-1] in {"z", "Z"}:
+        candidate = f"{candidate[:-1]}+00:00"
+
     try:
-        return datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(candidate)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=f"Invalid datetime: {value}") from exc
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+
+    return parsed.astimezone(timezone.utc)
 
 
 def _query_records(
@@ -271,7 +304,7 @@ async def get_positions(
     _: str = Depends(require_admin_account),
     limit: int = Query(100, ge=1, le=10_000),
     offset: int = Query(0, ge=0),
-    format: str | None = Query(None, regex="^(json|csv)$"),
+    format: str | None = Query(None, pattern="^(json|csv)$"),
 ):
     rows = _query_records(
         request,
@@ -302,7 +335,7 @@ async def get_pnl(
     to_ts: str | None = Query(None, alias="to"),
     limit: int = Query(500, ge=1, le=50_000),
     offset: int = Query(0, ge=0),
-    format: str | None = Query(None, regex="^(json|csv)$"),
+    format: str | None = Query(None, pattern="^(json|csv)$"),
 ):
     start = _parse_datetime(from_ts)
     end = _parse_datetime(to_ts)
@@ -335,7 +368,7 @@ async def get_orders(
     to_ts: str | None = Query(None, alias="to"),
     limit: int = Query(500, ge=1, le=50_000),
     offset: int = Query(0, ge=0),
-    format: str | None = Query(None, regex="^(json|csv)$"),
+    format: str | None = Query(None, pattern="^(json|csv)$"),
 ):
     start = _parse_datetime(from_ts)
     end = _parse_datetime(to_ts)
@@ -368,7 +401,7 @@ async def get_fills(
     to_ts: str | None = Query(None, alias="to"),
     limit: int = Query(500, ge=1, le=50_000),
     offset: int = Query(0, ge=0),
-    format: str | None = Query(None, regex="^(json|csv)$"),
+    format: str | None = Query(None, pattern="^(json|csv)$"),
 ):
     start = _parse_datetime(from_ts)
     end = _parse_datetime(to_ts)
