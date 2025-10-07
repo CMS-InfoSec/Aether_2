@@ -7,7 +7,7 @@ import logging
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from functools import lru_cache
-from typing import Any, Callable, Iterator, Mapping, Optional, Protocol
+from typing import Any, Callable, Iterator, Mapping, Optional, Protocol, cast
 
 
 class AuditCallable(Protocol):
@@ -26,6 +26,8 @@ class AuditCallable(Protocol):
 
 
 HashIpCallable = Callable[[Optional[str]], Optional[str]]
+
+ContextFactory = Callable[[], Optional[Mapping[str, Any]]]
 
 
 _EVENT_CONTEXT_SENTINEL = object()
@@ -53,15 +55,25 @@ class AuditEvent:
         disabled_message: Optional[str] = None,
         disabled_level: int = logging.DEBUG,
         context: Optional[Mapping[str, Any]] | object = _EVENT_CONTEXT_SENTINEL,
+        context_factory: ContextFactory | None = None,
         resolved_ip_hash: "ResolvedIpHash" | None = None,
     ) -> "AuditLogResult":
-        """Log the event using :func:`log_audit_event_with_fallback`."""
+        """Log the event using :func:`log_audit_event_with_fallback`.
+
+        Callers may override the structured fallback context by supplying a
+        mapping via ``context`` or defer construction entirely with
+        ``context_factory``.  When neither argument is provided the event's
+        stored ``context`` is reused.
+        """
 
         context_mapping: Optional[Mapping[str, Any]]
         if context is _EVENT_CONTEXT_SENTINEL:
-            context_mapping = self.context
+            if context_factory is None:
+                context_mapping = self.context
+            else:
+                context_mapping = None
         else:
-            context_mapping = context  # type: ignore[assignment]
+            context_mapping = cast(Optional[Mapping[str, Any]], context)
 
         return log_audit_event_with_fallback(
             hooks,
@@ -71,6 +83,7 @@ class AuditEvent:
             disabled_message=disabled_message,
             disabled_level=disabled_level,
             context=context_mapping,
+            context_factory=context_factory,
             resolved_ip_hash=resolved_ip_hash,
         )
 
@@ -410,6 +423,7 @@ def log_event_with_fallback(
     disabled_message: Optional[str] = None,
     disabled_level: int = logging.DEBUG,
     context: Optional[Mapping[str, Any]] = None,
+    context_factory: ContextFactory | None = None,
     resolved_ip_hash: ResolvedIpHash | None = None,
 ) -> AuditLogResult:
     """Emit an audit event while shielding callers from optional failures.
@@ -428,7 +442,10 @@ def log_event_with_fallback(
     ``resolved_ip_hash``.  Doing so skips the internal resolution step while
     preserving the structured fallback logging semantics, allowing services to
     compute hashes once per request and fan the result out to multiple audit
-    events without recomputing (or re-logging) failures.
+    events without recomputing (or re-logging) failures.  When the structured
+    fallback ``context`` is expensive to build, ``context_factory`` can be
+    provided to defer that work until a fallback log entry is actually
+    required.
     """
 
     resolved = resolved_ip_hash
@@ -439,10 +456,15 @@ def log_event_with_fallback(
         )
 
     log_extra: dict[str, Any] | None = None
+    context_value = context
+    context_evaluated = context_value is not None or context_factory is None
 
     def ensure_log_extra() -> Mapping[str, Any]:
-        nonlocal log_extra
+        nonlocal log_extra, context_value, context_evaluated
         if log_extra is None:
+            if not context_evaluated and context_factory is not None:
+                context_value = context_factory()
+                context_evaluated = True
             log_extra = _build_audit_log_extra(
                 actor=actor,
                 action=action,
@@ -451,7 +473,7 @@ def log_event_with_fallback(
                 after=after,
                 ip_address=ip_address,
                 ip_hash=resolved.value,
-                context=context,
+                context=context_value,
                 hash_fallback=resolved.fallback,
                 hash_error=resolved.error,
             )
@@ -513,13 +535,17 @@ def log_audit_event_with_fallback(
     disabled_message: Optional[str] = None,
     disabled_level: int = logging.DEBUG,
     context: Optional[Mapping[str, Any]] | object = _EVENT_CONTEXT_SENTINEL,
+    context_factory: ContextFactory | None = None,
     resolved_ip_hash: ResolvedIpHash | None = None,
 ) -> AuditLogResult:
     """Convenience wrapper for logging :class:`AuditEvent` instances."""
     if context is _EVENT_CONTEXT_SENTINEL:
-        context_mapping = event.context
+        if context_factory is None:
+            context_mapping = event.context
+        else:
+            context_mapping = None
     else:
-        context_mapping = context  # type: ignore[assignment]
+        context_mapping = cast(Optional[Mapping[str, Any]], context)
 
     return log_event_with_fallback(
         hooks,
@@ -535,6 +561,7 @@ def log_audit_event_with_fallback(
         disabled_message=disabled_message,
         disabled_level=disabled_level,
         context=context_mapping,
+        context_factory=context_factory,
         resolved_ip_hash=resolved_ip_hash,
     )
 
@@ -546,6 +573,7 @@ __all__ = [
     "ResolvedIpHash",
     "AuditCallable",
     "HashIpCallable",
+    "ContextFactory",
     "load_audit_hooks",
     "log_audit_event_with_fallback",
     "log_event_with_fallback",

@@ -2,7 +2,7 @@ import builtins
 import hashlib
 import logging
 
-from typing import Iterator, Mapping, Optional
+from typing import Iterator, List, Mapping, Optional
 
 import pytest
 
@@ -194,6 +194,69 @@ def test_log_event_with_fallback_logs_when_disabled(caplog: pytest.LogCaptureFix
         "ip_hash": None,
         "hash_fallback": False,
     }
+
+
+def test_log_event_with_fallback_context_factory_skips_when_unused():
+    hooks = audit_hooks.AuditHooks(
+        log=lambda **payload: None,
+        hash_ip=lambda value: pytest.fail("hash_ip should not be called"),
+    )
+    logger = logging.getLogger("test.audit.context_factory.success")
+    factory_calls: List[int] = []
+
+    def context_factory() -> Mapping[str, str]:
+        factory_calls.append(1)
+        return {"source": "factory"}
+
+    result = audit_hooks.log_event_with_fallback(
+        hooks,
+        logger,
+        actor="erin",
+        action="demo.factory.success",
+        entity="resource",
+        before={},
+        after={},
+        failure_message="should not trigger",
+        context_factory=context_factory,
+    )
+
+    assert result.handled is True
+    assert factory_calls == []
+
+
+def test_log_event_with_fallback_context_factory_used_for_fallback(
+    caplog: pytest.LogCaptureFixture,
+):
+    hooks = audit_hooks.AuditHooks(log=None, hash_ip=lambda value: value)
+    logger = logging.getLogger("test.audit.context_factory.fallback")
+    factory_calls: List[int] = []
+
+    def context_factory() -> Mapping[str, str]:
+        factory_calls.append(1)
+        return {"audit": {"source": "factory"}}
+
+    with caplog.at_level(logging.DEBUG, logger=logger.name):
+        result = audit_hooks.log_event_with_fallback(
+            hooks,
+            logger,
+            actor="frank",
+            action="demo.factory.disabled",
+            entity="resource",
+            before={},
+            after={},
+            failure_message="should not trigger",
+            disabled_message="audit disabled via context factory",
+            context_factory=context_factory,
+        )
+
+    assert result.handled is False
+    assert factory_calls == [1]
+    record = next(
+        entry
+        for entry in caplog.records
+        if entry.message == "audit disabled via context factory"
+    )
+    assert record.audit == {"source": "factory"}
 
 
 def test_log_event_with_fallback_handles_exceptions(caplog: pytest.LogCaptureFixture):
@@ -620,6 +683,7 @@ def test_audit_event_log_with_fallback_method_delegates(monkeypatch):
         "disabled_message": "disabled",
         "disabled_level": logging.INFO,
         "context": {"request_id": "abc"},
+        "context_factory": None,
         "resolved_ip_hash": None,
     }
 
@@ -659,6 +723,50 @@ def test_audit_event_log_with_fallback_infers_event_context(monkeypatch):
 
     assert result is expected
     assert captured["kwargs"]["context"] == {"source": "controller"}
+    assert captured["kwargs"]["context_factory"] is None
+
+
+def test_audit_event_log_with_fallback_forwards_context_factory(monkeypatch):
+    hooks = audit_hooks.AuditHooks(
+        log=lambda **_: None,
+        hash_ip=lambda value: value,
+    )
+    logger = logging.getLogger("tests.audit.event_factory")
+    event = audit_hooks.AuditEvent(
+        actor="kay", action="demo.factory", entity="resource", before={}, after={}
+    )
+    expected = audit_hooks.AuditLogResult(
+        handled=True,
+        ip_hash=None,
+        hash_fallback=False,
+        hash_error=None,
+    )
+    captured: dict[str, object] = {}
+
+    def fake_helper(*args: object, **kwargs: object) -> audit_hooks.AuditLogResult:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return expected
+
+    monkeypatch.setattr(audit_hooks, "log_audit_event_with_fallback", fake_helper)
+
+    factory_calls: List[int] = []
+
+    def context_factory() -> Mapping[str, str]:
+        factory_calls.append(1)
+        return {"audit": {"origin": "factory"}}
+
+    result = event.log_with_fallback(
+        hooks,
+        logger,
+        failure_message="failure",
+        context_factory=context_factory,
+    )
+
+    assert result is expected
+    assert captured["kwargs"]["context"] is None
+    assert captured["kwargs"]["context_factory"] is context_factory
+    assert factory_calls == []
 
 
 def test_resolve_ip_hash_prefers_explicit_hash():
