@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import json
 from collections.abc import MutableMapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from inspect import Parameter, Signature, isclass, iscoroutine, signature
 from types import ModuleType, SimpleNamespace
@@ -343,7 +344,19 @@ class FastAPI:
         self.routes: List["_Route"] = []
         self.user_middleware: List[Any] = []
         self.dependency_overrides: Dict[Any, Callable[..., Any]] = {}
-        self.router = SimpleNamespace(lifespan_context=None)
+        lifespan = kwargs.get("lifespan")
+        if lifespan is None:
+
+            @asynccontextmanager
+            async def _default_lifespan(_: "FastAPI"):
+                yield
+
+            lifespan = _default_lifespan
+
+        def _lifespan_context(app: "FastAPI"):
+            return lifespan(app)
+
+        self.router = SimpleNamespace(lifespan_context=_lifespan_context)
         self.title = kwargs.get("title")
         self.event_handlers: Dict[str, List[Callable[..., Any]]] = {}
 
