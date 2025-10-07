@@ -59,7 +59,7 @@ def test_non_usd_symbols_are_filtered() -> None:
             ),
             MarketSnapshot(
                 base_asset="ETH",
-                quote_asset="USDT",
+                quote_asset="EUR",
                 market_cap=4.0e11,
                 global_volume_24h=2.5e10,
                 kraken_volume_24h=1.2e10,
