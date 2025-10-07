@@ -15,16 +15,99 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 from uuid import UUID, uuid4
 
-from alembic import command
-from alembic.config import Config
+try:  # pragma: no cover - alembic is optional during tests
+    from alembic import command
+    from alembic.config import Config
+except ModuleNotFoundError:  # pragma: no cover - allow import without alembic
+    command = None  # type: ignore[assignment]
+    Config = None  # type: ignore[assignment]
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import Boolean, Column, DateTime, Float, String, create_engine, func, select
-from sqlalchemy.dialects.postgresql import JSONB, UUID as PGUUID
-from sqlalchemy.engine import Engine, URL
-from sqlalchemy.engine.url import make_url
-from sqlalchemy.exc import ArgumentError
-from sqlalchemy.orm import Session, declarative_base, sessionmaker
+
+try:  # pragma: no cover - SQLAlchemy is optional in lightweight environments
+    from sqlalchemy import Boolean, Column, DateTime, Float, String, create_engine, func, select
+    from sqlalchemy.dialects.postgresql import JSONB, UUID as PGUUID
+    from sqlalchemy.engine import Engine, URL
+    from sqlalchemy.engine.url import make_url
+    from sqlalchemy.exc import ArgumentError
+    from sqlalchemy.orm import Session, declarative_base, sessionmaker
+    SQLALCHEMY_AVAILABLE = True
+except ModuleNotFoundError:  # pragma: no cover - allow import without SQLAlchemy
+    from urllib.parse import parse_qsl, urlparse
+
+    SQLALCHEMY_AVAILABLE = False
+
+    class _MissingSQLAlchemy(RuntimeError):
+        pass
+
+    def _unavailable(feature: str) -> _MissingSQLAlchemy:
+        return _MissingSQLAlchemy(
+            "SQLAlchemy is required for universe service operations; "
+            f"missing functionality: {feature}."
+        )
+
+    class Column:  # type: ignore[override]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.args = args
+            self.kwargs = kwargs
+
+    class _TypePlaceholder:  # simple stand-ins for SQLAlchemy field types
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.args = args
+            self.kwargs = kwargs
+
+    Boolean = Float = DateTime = String = _TypePlaceholder  # type: ignore[assignment]
+
+    class JSONB(_TypePlaceholder):
+        pass
+
+    class PGUUID(_TypePlaceholder):  # pragma: no cover - placeholder when SQLAlchemy missing
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+
+    class _FuncProxy:
+        def __getattr__(self, name: str) -> Any:
+            raise _unavailable(f"func.{name}")
+
+    func = _FuncProxy()
+
+    def select(*_: Any, **__: Any) -> Any:  # type: ignore[override]
+        raise _unavailable("select")
+
+    class URL:
+        def __init__(self, value: str) -> None:
+            self._value = value
+            parsed = urlparse(value)
+            self.drivername = parsed.scheme or ""
+            self.host = parsed.hostname
+            self.query = {key: val for key, val in parse_qsl(parsed.query, keep_blank_values=True)}
+
+        def render_as_string(self, *, hide_password: bool = True) -> str:
+            del hide_password
+            return self._value
+
+    class Engine:  # type: ignore[override]
+        pass
+
+    class Session:  # type: ignore[override]
+        pass
+
+    def declarative_base() -> type:  # type: ignore[override]
+        return type("Base", (), {})
+
+    def sessionmaker(*_: Any, **__: Any) -> Any:  # type: ignore[override]
+        raise _unavailable("sessionmaker")
+
+    def create_engine(*_: Any, **__: Any) -> Any:  # type: ignore[override]
+        raise _unavailable("create_engine")
+
+    def make_url(value: str) -> URL:  # type: ignore[override]
+        if not isinstance(value, str):
+            raise ValueError("Database URL must be a string")
+        return URL(value)
+
+    class ArgumentError(ValueError):
+        pass
 
 from services.common.security import require_admin_account
 from shared.spot import filter_spot_symbols, is_spot_symbol, normalize_spot_symbol
@@ -218,6 +301,11 @@ def run_migrations(url: Optional[URL] = None) -> None:
     target_url = url or DATABASE_URL
     if target_url is None:
         raise RuntimeError("Universe database is not configured; cannot run migrations.")
+
+    if command is None or Config is None:
+        raise RuntimeError(
+            "Universe migrations require alembic; install the optional dependency or stub run_migrations in tests."
+        )
 
     config = Config()
     config.set_main_option("script_location", str(_MIGRATIONS_PATH))
