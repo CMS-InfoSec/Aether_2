@@ -52,6 +52,7 @@ def _reset_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TRAINING_DATABASE_URL", raising=False)
     monkeypatch.delenv("TIMESCALE_DSN", raising=False)
     monkeypatch.delenv("TRAINING_ALLOW_SQLITE_FOR_TESTS", raising=False)
+    monkeypatch.delenv("TRAINING_ARTIFACT_ROOT", raising=False)
 
 
 def test_training_service_requires_database_url() -> None:
@@ -119,5 +120,84 @@ def test_training_service_allows_sqlite_when_flag_enabled(monkeypatch: pytest.Mo
     try:
         assert str(captured["url"]).startswith("sqlite")
         assert module.DATABASE_URL.startswith("sqlite")  # type: ignore[attr-defined]
+    finally:
+        _dispose_training_module(module_name)
+
+
+def test_training_service_rejects_artifact_root_parent_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRAINING_DATABASE_URL", "postgresql://user:pass@localhost/db")
+    monkeypatch.setenv("TRAINING_ARTIFACT_ROOT", "../outside")
+
+    def _fake_create_engine(url: str, **kwargs: Any):
+        return real_create_engine(
+            "sqlite+pysqlite:///:memory:",
+            future=True,
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+
+    monkeypatch.setattr("sqlalchemy.create_engine", _fake_create_engine)
+
+    module_name = "tests.training_service_artifact_root_parent"
+    with pytest.raises(ValueError, match="parent directory references"):
+        _load_training_module(module_name)
+
+
+def test_training_service_rejects_artifact_root_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TRAINING_DATABASE_URL", "postgresql://user:pass@localhost/db")
+    target = tmp_path / "real"
+    target.mkdir()
+    symlink_path = tmp_path / "link"
+    symlink_path.symlink_to(target)
+    monkeypatch.setenv("TRAINING_ARTIFACT_ROOT", str(symlink_path))
+
+    def _fake_create_engine(url: str, **kwargs: Any):
+        return real_create_engine(
+            "sqlite+pysqlite:///:memory:",
+            future=True,
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+
+    monkeypatch.setattr("sqlalchemy.create_engine", _fake_create_engine)
+
+    module_name = "tests.training_service_artifact_root_symlink"
+    with pytest.raises(ValueError, match="must not reference symlinks"):
+        _load_training_module(module_name)
+
+
+def test_training_service_normalises_relative_artifact_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(
+        "TRAINING_DATABASE_URL",
+        "timescale://user:pass@example.com:5432/training",
+    )
+    monkeypatch.setenv("TRAINING_ARTIFACT_ROOT", "artifacts/runs")
+
+    captured: Dict[str, Any] = {}
+
+    def _fake_create_engine(url: str, **kwargs: Any):
+        captured["url"] = url
+        return real_create_engine(
+            "sqlite+pysqlite:///:memory:",
+            future=True,
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+
+    monkeypatch.setattr("sqlalchemy.create_engine", _fake_create_engine)
+
+    module_name = "tests.training_service_artifact_root_normalised"
+    module = _load_training_module(module_name)
+    try:
+        expected = (tmp_path / "artifacts" / "runs").resolve()
+        assert module.ARTIFACT_ROOT == expected  # type: ignore[attr-defined]
+        assert expected.exists()
     finally:
         _dispose_training_module(module_name)

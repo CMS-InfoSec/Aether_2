@@ -142,6 +142,7 @@ def _reset_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TRAINING_TIMESCALE_URI", raising=False)
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("TRAINING_ALLOW_SQLITE_FOR_TESTS", raising=False)
+    monkeypatch.delenv("TRAINING_ARTIFACT_ROOT", raising=False)
 
     _install_training_stubs(monkeypatch)
 
@@ -182,5 +183,117 @@ def test_training_service_allows_sqlite_when_flag_enabled(monkeypatch: pytest.Mo
     module = _load_training_module(module_name)
     try:
         assert module.DEFAULT_TIMESCALE_URI.startswith("sqlite")  # type: ignore[attr-defined]
+    finally:
+        _dispose_training_module(module_name)
+
+
+def test_training_service_rejects_artifact_root_parent_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRAINING_TIMESCALE_URI", "postgresql://user:pass@localhost/db")
+    monkeypatch.setenv("TRAINING_ARTIFACT_ROOT", "../danger")
+
+    module_name = "tests.ml.training.training_service_artifact_root_parent"
+    with pytest.raises(ValueError, match="parent directory references"):
+        _load_training_module(module_name)
+
+
+def test_training_service_rejects_artifact_root_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TRAINING_TIMESCALE_URI", "postgresql://user:pass@localhost/db")
+    target = tmp_path / "real"
+    target.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(target)
+    monkeypatch.setenv("TRAINING_ARTIFACT_ROOT", str(link))
+
+    module_name = "tests.ml.training.training_service_artifact_root_symlink"
+    with pytest.raises(ValueError, match="must not be a symlink"):
+        _load_training_module(module_name)
+
+
+def test_training_service_rejects_broken_symlink_artifact_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TRAINING_TIMESCALE_URI", "postgresql://user:pass@localhost/db")
+    missing = tmp_path / "missing"
+    link = tmp_path / "link"
+    link.symlink_to(missing)
+    monkeypatch.setenv("TRAINING_ARTIFACT_ROOT", str(link))
+
+    module_name = "tests.ml.training.training_service_artifact_root_broken_symlink"
+    with pytest.raises(ValueError, match="symlink"):
+        _load_training_module(module_name)
+
+
+def test_training_service_allows_symlink_parent_for_artifact_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TRAINING_TIMESCALE_URI", "postgresql://user:pass@localhost/db")
+    real_root = tmp_path / "real"
+    real_root.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real_root, target_is_directory=True)
+    artifact_root = link / "artifacts"
+    monkeypatch.setenv("TRAINING_ARTIFACT_ROOT", str(artifact_root))
+
+    module_name = "tests.ml.training.training_service_artifact_root_symlink_parent"
+    module = _load_training_module(module_name)
+    try:
+        expected = (real_root / "artifacts").resolve()
+        assert module.DEFAULT_ARTIFACT_ROOT == expected  # type: ignore[attr-defined]
+        assert expected.exists()
+    finally:
+        _dispose_training_module(module_name)
+
+
+def test_training_service_rejects_file_backed_symlink_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TRAINING_TIMESCALE_URI", "postgresql://user:pass@localhost/db")
+    target_file = tmp_path / "file"
+    target_file.write_text("placeholder")
+    link = tmp_path / "link"
+    link.symlink_to(target_file)
+    artifact_root = link / "artifacts"
+    monkeypatch.setenv("TRAINING_ARTIFACT_ROOT", str(artifact_root))
+
+    module_name = "tests.ml.training.training_service_artifact_root_file_parent"
+    with pytest.raises(ValueError, match="directories"):
+        _load_training_module(module_name)
+
+
+def test_training_service_rejects_missing_symlink_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TRAINING_TIMESCALE_URI", "postgresql://user:pass@localhost/db")
+    missing = tmp_path / "missing"
+    link = tmp_path / "link"
+    link.symlink_to(missing, target_is_directory=True)
+    artifact_root = link / "artifacts"
+    monkeypatch.setenv("TRAINING_ARTIFACT_ROOT", str(artifact_root))
+
+    module_name = "tests.ml.training.training_service_artifact_root_missing_parent"
+    with pytest.raises(ValueError, match="must exist"):
+        _load_training_module(module_name)
+
+
+def test_training_service_normalises_relative_artifact_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(
+        "TRAINING_TIMESCALE_URI",
+        "timescale://user:pass@example.com:5432/training",
+    )
+    monkeypatch.setenv("TRAINING_ARTIFACT_ROOT", "artifacts/runs")
+
+    module_name = "tests.ml.training.training_service_artifact_root_normalised"
+    module = _load_training_module(module_name)
+    try:
+        expected = (tmp_path / "artifacts" / "runs").resolve()
+        assert module.DEFAULT_ARTIFACT_ROOT == expected  # type: ignore[attr-defined]
+        assert expected.exists()
     finally:
         _dispose_training_module(module_name)
