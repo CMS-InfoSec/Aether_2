@@ -736,3 +736,48 @@ def test_temporary_audit_hooks_nest_cleanly():
     reset = audit_hooks.load_audit_hooks()
     assert reset is not inner
     assert reset is not outer
+
+
+def test_audit_event_with_context_merges_without_mutating_original():
+    original_context = {"existing": True, "audit": {"hash_fallback": False}}
+    event = audit_hooks.AuditEvent(
+        actor="ivy",
+        action="demo.merge",
+        entity="resource",
+        before={},
+        after={},
+        context=original_context,
+    )
+
+    merged = event.with_context({"extra": "value"})
+
+    assert merged is not event
+    assert merged.context is not original_context
+    assert merged.context == {
+        "existing": True,
+        "audit": {"hash_fallback": False},
+        "extra": "value",
+    }
+    # The mapping stored on the original event is not mutated by merging.
+    assert event.context is original_context
+    assert event.context == {"existing": True, "audit": {"hash_fallback": False}}
+
+
+def test_audit_event_with_context_replaces_or_clears():
+    event = audit_hooks.AuditEvent(
+        actor="jane",
+        action="demo.replace",
+        entity="resource",
+        before={},
+        after={},
+        context={"initial": True},
+    )
+
+    replaced = event.with_context({"replacement": True}, merge=False)
+    assert replaced.context == {"replacement": True}
+
+    cleared = replaced.with_context(None, merge=False)
+    assert cleared.context is None
+
+    unchanged = event.with_context(None)
+    assert unchanged is event

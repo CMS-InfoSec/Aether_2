@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import Any, Callable, Iterator, Mapping, Optional, Protocol
 
@@ -73,6 +73,34 @@ class AuditEvent:
             context=context_mapping,
             resolved_ip_hash=resolved_ip_hash,
         )
+
+    def with_context(
+        self,
+        context: Optional[Mapping[str, Any]],
+        *,
+        merge: bool = True,
+    ) -> "AuditEvent":
+        """Return a copy of the event with updated structured context.
+
+        When ``merge`` is ``True`` (the default) the supplied ``context`` is
+        merged with any existing context, allowing callers to add supplemental
+        metadata without mutating the original mapping.  Passing ``merge=False``
+        replaces the stored context instead.  Supplying ``None`` while merging
+        leaves the event unchanged, whereas ``merge=False`` and ``None`` clears
+        the stored context entirely.
+        """
+
+        if context is None:
+            if merge:
+                return self
+            return replace(self, context=None)
+
+        if not merge or self.context is None:
+            return replace(self, context=context)
+
+        merged_context = dict(self.context)
+        merged_context.update(context)
+        return replace(self, context=merged_context)
 
 
 @dataclass(frozen=True)
