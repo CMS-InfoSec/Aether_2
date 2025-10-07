@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 from services.common.security import require_admin_account
-from shared.spot import is_spot_symbol, normalize_spot_symbol
+from shared.spot import require_spot_symbol
 
 try:  # pragma: no cover - mlflow is optional for local tests.
     import mlflow
@@ -45,13 +45,6 @@ if mlflow is not None:
         mlflow.set_registry_uri(registry_uri)
 
 
-def _require_spot_symbol(symbol: object) -> str:
-    normalized = normalize_spot_symbol(symbol)
-    if not normalized or not is_spot_symbol(normalized):
-        raise ValueError("Only spot market instruments are supported.")
-    return normalized
-
-
 class PredictRequest(BaseModel):
     account_id: str = Field(..., description="Trading account identifier")
     symbol: str = Field(..., description="Instrument symbol")
@@ -61,7 +54,7 @@ class PredictRequest(BaseModel):
     @field_validator("symbol")
     @classmethod
     def _validate_symbol(cls, value: str) -> str:
-        return _require_spot_symbol(value)
+        return require_spot_symbol(value)
 
 
 class IntentResponse(BaseModel):
@@ -183,7 +176,7 @@ def _load_mlflow_model(symbol: str) -> Optional[CachedModel]:
 
 
 def get_model(symbol: str) -> CachedModel:
-    canonical_symbol = _require_spot_symbol(symbol)
+    canonical_symbol = require_spot_symbol(symbol)
     cached = model_cache.get(canonical_symbol)
     if cached is not None:
         return cached
