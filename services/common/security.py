@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import inspect
 import os
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple
+from typing import Any, Iterable, List, Optional, Tuple
 
 from fastapi import Header, HTTPException, Request, status
 
@@ -186,7 +187,8 @@ def require_admin_account(
     x_account_id: Optional[str] = Header(None, alias="X-Account-ID"),
 ) -> str:
     principal = require_authenticated_principal(request, authorization)
-    header_account = (x_account_id or "").strip().lower()
+    header_value = x_account_id if isinstance(x_account_id, str) else ""
+    header_account = header_value.strip().lower()
     if header_account and header_account != principal.normalized_account:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -199,6 +201,58 @@ def require_admin_account(
             detail="Account is not authorized for administrative access.",
         )
     return principal.account_id
+
+
+async def ensure_admin_access(
+    request: Request,
+    *,
+    authorization: Optional[str] = None,
+    x_account_id: Optional[str] = None,
+    forbid_on_missing_token: bool = False,
+) -> str:
+    """Resolve the administrator guard while respecting dependency overrides."""
+
+    overrides = getattr(getattr(request, "app", None), "dependency_overrides", None)
+    override = overrides.get(require_admin_account) if overrides else None
+
+    auth_value = authorization if authorization is not None else request.headers.get("Authorization")
+    header_value = x_account_id if x_account_id is not None else request.headers.get("X-Account-ID")
+
+    try:
+        if override is not None:
+            call_kwargs: dict[str, Any] = {}
+            try:
+                signature = inspect.signature(override)
+            except (TypeError, ValueError):
+                signature = None
+            if signature is not None:
+                parameters = signature.parameters
+                if "request" in parameters:
+                    call_kwargs["request"] = request
+                if "authorization" in parameters:
+                    call_kwargs["authorization"] = auth_value
+                if "x_account_id" in parameters:
+                    call_kwargs["x_account_id"] = header_value
+            try:
+                result = override(**call_kwargs)
+            except TypeError:
+                result = override()
+            if inspect.isawaitable(result):
+                result = await result
+            return result
+
+        return require_admin_account(
+            request,
+            authorization=auth_value,
+            x_account_id=header_value,
+        )
+    except HTTPException as exc:
+        if forbid_on_missing_token and exc.status_code == status.HTTP_401_UNAUTHORIZED:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=exc.detail,
+            ) from exc
+        raise
 
 
 def require_mfa_context(
