@@ -56,6 +56,7 @@ except Exception:  # pragma: no cover - keep runtime light during tests
     httpx = None  # type: ignore
 
 from shared.spot import filter_spot_symbols, is_spot_symbol, normalize_spot_symbol
+from services.common.spot import require_spot_http
 
 def _resolve_security_dependency() -> Callable[..., str]:
     module_names = ("services.common.security", "aether.services.common.security")
@@ -638,12 +639,7 @@ class SentimentAPI:
             symbol: str = Query(..., description="Symbol ticker, e.g. BTC-USD"),
             _: str = Depends(require_admin_account),
         ) -> SentimentResponse:
-            normalized_symbol = normalize_spot_symbol(symbol)
-            if not normalized_symbol or not is_spot_symbol(normalized_symbol):
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"Symbol '{symbol}' is not a supported spot market",
-                )
+            normalized_symbol = require_spot_http(symbol)
             try:
                 record = await self._repository.latest(normalized_symbol)
             except ValueError as exc:
@@ -659,13 +655,7 @@ class SentimentAPI:
         async def refresh(symbols: List[str], _: str = Depends(require_admin_account)) -> dict[str, str]:
             normalized_symbols: List[str] = []
             for raw_symbol in symbols:
-                normalized_symbol = normalize_spot_symbol(raw_symbol)
-                if not normalized_symbol or not is_spot_symbol(normalized_symbol):
-                    raise HTTPException(
-                        status_code=422,
-                        detail=f"Symbol '{raw_symbol}' is not a supported spot market",
-                    )
-                normalized_symbols.append(normalized_symbol)
+                normalized_symbols.append(require_spot_http(raw_symbol))
 
             try:
                 await self._service.ingest_many(normalized_symbols)

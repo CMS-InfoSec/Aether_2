@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -242,3 +243,89 @@ def test_sensitive_action_flag(monkeypatch, tmp_path, capsys):
     assert "INSERT INTO audit_log" in sql
     assert params[6] == payload["hash"]
     assert params[7] == payload["prev_hash"]
+
+
+def test_log_audit_rejects_relative_chain_log(monkeypatch, tmp_path):
+    monkeypatch.setenv("AUDIT_DATABASE_URL", "postgresql://audit:audit@localhost:5432/audit")
+    monkeypatch.setenv("AUDIT_CHAIN_LOG", "relative.log")
+    monkeypatch.setenv("AUDIT_CHAIN_STATE", str(tmp_path / "chain_state.json"))
+    conn, _ = _make_connection_mock()
+    monkeypatch.setattr(
+        audit_logger,
+        "psycopg",
+        MagicMock(connect=MagicMock(return_value=conn)),
+    )
+
+    with pytest.raises(ValueError):
+        audit_logger.log_audit(
+            actor="mallory",
+            action="update",
+            entity="order-1",
+            before={},
+            after={},
+            ip_hash=None,
+        )
+
+
+def test_log_audit_rejects_traversal_chain_state(monkeypatch, tmp_path):
+    monkeypatch.setenv("AUDIT_DATABASE_URL", "postgresql://audit:audit@localhost:5432/audit")
+    monkeypatch.setenv("AUDIT_CHAIN_LOG", str(tmp_path / "chain.log"))
+    monkeypatch.setenv("AUDIT_CHAIN_STATE", "../invalid/state.json")
+    conn, _ = _make_connection_mock()
+    monkeypatch.setattr(
+        audit_logger,
+        "psycopg",
+        MagicMock(connect=MagicMock(return_value=conn)),
+    )
+
+    with pytest.raises(ValueError):
+        audit_logger.log_audit(
+            actor="trent",
+            action="update",
+            entity="order-2",
+            before={},
+            after={},
+            ip_hash=None,
+        )
+
+
+def test_log_audit_rejects_symlink_chain_state(monkeypatch, tmp_path):
+    if not hasattr(os, "symlink"):
+        pytest.skip("platform does not support symlinks")
+
+    real_state = tmp_path / "real_state.json"
+    symlink_state = tmp_path / "state_link.json"
+    symlink_state.symlink_to(real_state)
+
+    monkeypatch.setenv("AUDIT_DATABASE_URL", "postgresql://audit:audit@localhost:5432/audit")
+    monkeypatch.setenv("AUDIT_CHAIN_LOG", str(tmp_path / "chain.log"))
+    monkeypatch.setenv("AUDIT_CHAIN_STATE", str(symlink_state))
+    conn, _ = _make_connection_mock()
+    monkeypatch.setattr(
+        audit_logger,
+        "psycopg",
+        MagicMock(connect=MagicMock(return_value=conn)),
+    )
+
+    with pytest.raises(ValueError):
+        audit_logger.log_audit(
+            actor="oscar",
+            action="update",
+            entity="order-3",
+            before={},
+            after={},
+            ip_hash=None,
+        )
+
+
+def test_verify_audit_chain_rejects_symlink_log(tmp_path):
+    if not hasattr(os, "symlink"):
+        pytest.skip("platform does not support symlinks")
+
+    real_log = tmp_path / "real.log"
+    real_log.write_text("")
+    symlink_log = tmp_path / "log_link.log"
+    symlink_log.symlink_to(real_log)
+
+    with pytest.raises(ValueError):
+        audit_logger.verify_audit_chain(log_path=symlink_log, state_path=tmp_path / "state.json")
