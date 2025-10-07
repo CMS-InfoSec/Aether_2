@@ -224,6 +224,7 @@ def create_app(
     _maybe_include_router(app, "multiformat_export", "router")
     _maybe_include_router(app, "compliance_pack", "router")
     _maybe_include_router(app, "pack_exporter", "router")
+    _maybe_include_router(app, "services.logging_export", "router")
     _maybe_include_router(app, "services.system.health_service", "router")
     _maybe_include_router(app, "services.hedge.hedge_service", "router")
 
