@@ -54,6 +54,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Dict, Iterable, List, Optional
 
+from common.utils.tar import safe_extract_tar
+
 try:  # pragma: no cover - optional dependency for operational runtime
     import boto3
 except Exception:  # pragma: no cover - boto3 not required for static analysis
