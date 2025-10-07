@@ -119,6 +119,33 @@ class AuditEvent:
         merged_context.update(context)
         return replace(self, context=merged_context)
 
+    def with_context_factory(
+        self,
+        context_factory: ContextFactory | None,
+        *,
+        preserve_context: bool = False,
+    ) -> "AuditEvent":
+        """Return a copy of the event with an updated context factory.
+
+        Replacing the context factory typically invalidates any eagerly stored
+        context payload, so this helper clears ``context`` by default.  Callers
+        that wish to retain the existing context can pass
+        ``preserve_context=True``.  Supplying the same factory without
+        preserving the context simply clears the stored mapping when present,
+        allowing callers to drop cached metadata without constructing a new
+        factory.
+        """
+
+        if context_factory is self.context_factory:
+            if preserve_context or self.context is None:
+                return self
+            return replace(self, context=None)
+
+        if preserve_context:
+            return replace(self, context_factory=context_factory)
+
+        return replace(self, context=None, context_factory=context_factory)
+
     def with_ip_address(
         self,
         ip_address: Optional[str],

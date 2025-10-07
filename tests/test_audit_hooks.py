@@ -1010,6 +1010,60 @@ def test_audit_event_with_context_replaces_or_clears():
     assert unchanged is event
 
 
+def test_audit_event_with_context_factory_clears_context_by_default():
+    def original_factory() -> Mapping[str, str]:
+        return {"factory": "original"}
+
+    def new_factory() -> Mapping[str, str]:
+        return {"factory": "new"}
+
+    event = audit_hooks.AuditEvent(
+        actor="keira",
+        action="demo.context_factory",
+        entity="resource",
+        before={},
+        after={},
+        context={"cached": True},
+        context_factory=original_factory,
+    )
+
+    updated = event.with_context_factory(new_factory)
+
+    assert updated is not event
+    assert updated.context is None
+    assert updated.context_factory is new_factory
+    # The original context payload remains intact on the source event.
+    assert event.context == {"cached": True}
+    assert event.context_factory is original_factory
+
+
+def test_audit_event_with_context_factory_optionally_preserves_context():
+    def factory() -> Mapping[str, str]:
+        return {"factory": "value"}
+
+    event = audit_hooks.AuditEvent(
+        actor="luke",
+        action="demo.context_factory.preserve",
+        entity="resource",
+        before={},
+        after={},
+        context={"cached": True},
+        context_factory=None,
+    )
+
+    preserved = event.with_context_factory(factory, preserve_context=True)
+
+    assert preserved.context_factory is factory
+    assert preserved.context == {"cached": True}
+
+    # Updating with the same factory while preserving context returns the same instance.
+    same = preserved.with_context_factory(factory, preserve_context=True)
+    assert same is preserved
+
+    # Calling without preservation clears the stored context when already set.
+    cleared = preserved.with_context_factory(factory)
+    assert cleared.context is None
+
 def test_audit_event_with_ip_address_resets_hash_by_default():
     event = audit_hooks.AuditEvent(
         actor="karl",
