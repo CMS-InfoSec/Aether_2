@@ -27,6 +27,7 @@ from ml.training.workflow import (
     _apply_outlier_handling,
     _write_artifacts,
     _normalise_s3_prefix,
+    _normalise_local_artifact_base_path,
     _TARGET_COLUMN,
 )
 
@@ -238,6 +239,16 @@ def test_write_artifacts_allows_symlink_parent(tmp_path: Path) -> None:
     assert Path(config.base_path) == expected_root
     assert Path(result["metrics.json"]) == expected_path
     assert expected_path.exists()
+
+
+def test_normalise_local_artifact_base_path_rejects_file_symlink_parent(tmp_path: Path) -> None:
+    target_file = tmp_path / "file"
+    target_file.write_text("placeholder")
+    link = tmp_path / "link"
+    link.symlink_to(target_file)
+
+    with pytest.raises(ValueError, match="directory"):
+        _normalise_local_artifact_base_path(link / "artifacts")
 
 
 def test_write_artifacts_s3_prefix_normalised(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -706,6 +706,8 @@ def _normalise_local_artifact_base_path(base_path: str | os.PathLike[str]) -> Pa
                 resolved_ancestor = ancestor.resolve(strict=False)
             except OSError as exc:  # pragma: no cover - extremely unlikely on supported platforms
                 raise ValueError("Artifact base path symlink could not be resolved") from exc
+            if resolved_ancestor.exists() and not resolved_ancestor.is_dir():
+                raise ValueError("Artifact base path symlink targets must resolve to directories")
             try:
                 resolved_candidate.relative_to(resolved_ancestor)
             except ValueError:

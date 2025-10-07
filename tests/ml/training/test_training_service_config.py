@@ -248,6 +248,22 @@ def test_training_service_allows_symlink_parent_for_artifact_root(
         _dispose_training_module(module_name)
 
 
+def test_training_service_rejects_file_backed_symlink_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TRAINING_TIMESCALE_URI", "postgresql://user:pass@localhost/db")
+    target_file = tmp_path / "file"
+    target_file.write_text("placeholder")
+    link = tmp_path / "link"
+    link.symlink_to(target_file)
+    artifact_root = link / "artifacts"
+    monkeypatch.setenv("TRAINING_ARTIFACT_ROOT", str(artifact_root))
+
+    module_name = "tests.ml.training.training_service_artifact_root_file_parent"
+    with pytest.raises(ValueError, match="directories"):
+        _load_training_module(module_name)
+
+
 def test_training_service_normalises_relative_artifact_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
