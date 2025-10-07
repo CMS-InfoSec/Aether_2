@@ -7,7 +7,7 @@ import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, Callable, Iterator, Mapping, Optional, Protocol, Tuple
+from typing import Any, Callable, Iterator, Mapping, Optional, Protocol
 
 
 class AuditCallable(Protocol):
@@ -45,6 +45,15 @@ class AuditLogResult:
 LOGGER = logging.getLogger("shared.audit_hooks")
 
 
+@dataclass(frozen=True)
+class ResolvedIpHash:
+    """Structured response describing the resolved IP hash state."""
+
+    value: Optional[str]
+    fallback: bool
+    error: Optional[Exception]
+
+
 def _hash_ip_fallback(value: Optional[str]) -> Optional[str]:
     """Mirror :func:`common.utils.audit_logger.hash_ip` when the module is absent."""
 
@@ -70,20 +79,24 @@ class AuditHooks:
         *,
         ip_address: Optional[str],
         ip_hash: Optional[str],
-    ) -> Tuple[Optional[str], bool, Optional[Exception]]:
+    ) -> ResolvedIpHash:
         """Return a hashed IP, tracking whether a fallback hash was required."""
 
         if ip_hash is not None:
-            return ip_hash, False, None
+            return ResolvedIpHash(value=ip_hash, fallback=False, error=None)
 
         if ip_address is None:
-            return None, False, None
+            return ResolvedIpHash(value=None, fallback=False, error=None)
 
         try:
-            return self.hash_ip(ip_address), False, None
+            return ResolvedIpHash(
+                value=self.hash_ip(ip_address),
+                fallback=False,
+                error=None,
+            )
         except Exception as exc:  # pragma: no cover - exercised via tests
             fallback_hash = _hash_ip_fallback(ip_address)
-            return fallback_hash, True, exc
+            return ResolvedIpHash(value=fallback_hash, fallback=True, error=exc)
 
     def log_event(
         self,
@@ -113,12 +126,12 @@ class AuditHooks:
                 hash_error=None,
             )
 
-        resolved_ip_hash, hash_fallback, hash_error = self.resolve_ip_hash(
+        resolved = self.resolve_ip_hash(
             ip_address=ip_address,
             ip_hash=ip_hash,
         )
 
-        if hash_error is not None:
+        if resolved.error is not None:
             LOGGER.error(
                 "Audit hash_ip callable failed; using fallback hash.",
                 extra=_build_audit_log_extra(
@@ -128,12 +141,16 @@ class AuditHooks:
                     before=before,
                     after=after,
                     ip_address=ip_address,
-                    ip_hash=resolved_ip_hash,
+                    ip_hash=resolved.value,
                     context=None,
-                    hash_fallback=hash_fallback,
-                    hash_error=hash_error,
+                    hash_fallback=resolved.fallback,
+                    hash_error=resolved.error,
                 ),
-                exc_info=(type(hash_error), hash_error, hash_error.__traceback__),
+                exc_info=(
+                    type(resolved.error),
+                    resolved.error,
+                    resolved.error.__traceback__,
+                ),
             )
 
         log_callable(
@@ -142,13 +159,13 @@ class AuditHooks:
             entity=entity,
             before=before,
             after=after,
-            ip_hash=resolved_ip_hash,
+            ip_hash=resolved.value,
         )
         return AuditLogResult(
             handled=True,
-            ip_hash=resolved_ip_hash,
-            hash_fallback=hash_fallback,
-            hash_error=hash_error,
+            ip_hash=resolved.value,
+            hash_fallback=resolved.fallback,
+            hash_error=resolved.error,
         )
 
 
@@ -317,7 +334,7 @@ def log_event_with_fallback(
     signal that no entry was written.
     """
 
-    resolved_ip_hash, hash_fallback, hash_error = hooks.resolve_ip_hash(
+    resolved = hooks.resolve_ip_hash(
         ip_address=ip_address,
         ip_hash=ip_hash,
     )
@@ -329,17 +346,21 @@ def log_event_with_fallback(
         before=before,
         after=after,
         ip_address=ip_address,
-        ip_hash=resolved_ip_hash,
+        ip_hash=resolved.value,
         context=context,
-        hash_fallback=hash_fallback,
-        hash_error=hash_error,
+        hash_fallback=resolved.fallback,
+        hash_error=resolved.error,
     )
 
-    if hash_error is not None:
+    if resolved.error is not None:
         logger.error(
             "Audit hash_ip callable failed; using fallback hash.",
             extra=log_extra,
-            exc_info=(type(hash_error), hash_error, hash_error.__traceback__),
+            exc_info=(
+                type(resolved.error),
+                resolved.error,
+                resolved.error.__traceback__,
+            ),
         )
 
     try:
@@ -350,27 +371,27 @@ def log_event_with_fallback(
             before=before,
             after=after,
             ip_address=ip_address,
-            ip_hash=resolved_ip_hash,
+            ip_hash=resolved.value,
         )
     except Exception as exc:
         logger.exception(failure_message, extra=log_extra)
         return AuditLogResult(
             handled=False,
-            ip_hash=resolved_ip_hash,
-            hash_fallback=hash_fallback,
-            hash_error=hash_error,
+            ip_hash=resolved.value,
+            hash_fallback=resolved.fallback,
+            hash_error=resolved.error,
             log_error=exc,
         )
 
     if not result.handled and disabled_message is not None:
         logger.log(disabled_level, disabled_message, extra=log_extra)
 
-    combined_hash_fallback = hash_fallback or result.hash_fallback
-    combined_hash_error = hash_error or result.hash_error
+    combined_hash_fallback = resolved.fallback or result.hash_fallback
+    combined_hash_error = resolved.error or result.hash_error
 
     return AuditLogResult(
         handled=result.handled,
-        ip_hash=result.ip_hash or resolved_ip_hash,
+        ip_hash=result.ip_hash or resolved.value,
         hash_fallback=combined_hash_fallback,
         hash_error=combined_hash_error,
         log_error=result.log_error,
@@ -380,6 +401,7 @@ def log_event_with_fallback(
 __all__ = [
     "AuditHooks",
     "AuditLogResult",
+    "ResolvedIpHash",
     "AuditCallable",
     "HashIpCallable",
     "load_audit_hooks",

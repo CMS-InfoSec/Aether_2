@@ -361,6 +361,40 @@ def test_log_event_with_fallback_allows_custom_context(caplog: pytest.LogCapture
     assert record.extra_field == "value"
 
 
+def test_resolve_ip_hash_prefers_explicit_hash():
+    hooks = audit_hooks.AuditHooks(log=None, hash_ip=lambda value: pytest.fail("hash_ip should not be invoked"))
+
+    resolved = hooks.resolve_ip_hash(ip_address="198.51.100.4", ip_hash="provided-hash")
+
+    assert isinstance(resolved, audit_hooks.ResolvedIpHash)
+    assert resolved.value == "provided-hash"
+    assert resolved.fallback is False
+    assert resolved.error is None
+
+
+def test_resolve_ip_hash_hashes_when_no_override():
+    hooks = audit_hooks.AuditHooks(log=None, hash_ip=lambda value: f"hashed:{value}")
+
+    resolved = hooks.resolve_ip_hash(ip_address="203.0.113.5", ip_hash=None)
+
+    assert resolved.value == "hashed:203.0.113.5"
+    assert resolved.fallback is False
+    assert resolved.error is None
+
+
+def test_resolve_ip_hash_records_fallback_on_error():
+    def failing_hash(value: Optional[str]) -> Optional[str]:
+        raise RuntimeError("hash failure")
+
+    hooks = audit_hooks.AuditHooks(log=None, hash_ip=failing_hash)
+
+    resolved = hooks.resolve_ip_hash(ip_address="192.0.2.1", ip_hash=None)
+
+    assert resolved.value == audit_hooks._hash_ip_fallback("192.0.2.1")
+    assert resolved.fallback is True
+    assert isinstance(resolved.error, RuntimeError)
+
+
 def test_temporary_audit_hooks_override_and_restore():
     audit_hooks.reset_audit_hooks_cache()
     sentinel = audit_hooks.AuditHooks(log=lambda **kwargs: None, hash_ip=lambda value: "sentinel")
