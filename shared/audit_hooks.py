@@ -335,6 +335,7 @@ def log_event_with_fallback(
     disabled_message: Optional[str] = None,
     disabled_level: int = logging.DEBUG,
     context: Optional[Mapping[str, Any]] = None,
+    resolved_ip_hash: ResolvedIpHash | None = None,
 ) -> AuditLogResult:
     """Emit an audit event while shielding callers from optional failures.
 
@@ -347,12 +348,20 @@ def log_event_with_fallback(
     attached via ``extra`` for downstream processors, and an
     :class:`AuditLogResult` with ``handled`` set to ``False`` is returned to
     signal that no entry was written.
+
+    Callers that need to reuse previously resolved hash metadata can supply
+    ``resolved_ip_hash``.  Doing so skips the internal resolution step while
+    preserving the structured fallback logging semantics, allowing services to
+    compute hashes once per request and fan the result out to multiple audit
+    events without recomputing (or re-logging) failures.
     """
 
-    resolved = hooks.resolve_ip_hash(
-        ip_address=ip_address,
-        ip_hash=ip_hash,
-    )
+    resolved = resolved_ip_hash
+    if resolved is None:
+        resolved = hooks.resolve_ip_hash(
+            ip_address=ip_address,
+            ip_hash=ip_hash,
+        )
 
     log_extra = _build_audit_log_extra(
         actor=actor,

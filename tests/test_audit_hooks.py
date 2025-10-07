@@ -337,6 +337,56 @@ def test_log_event_with_fallback_reuses_resolved_hash(caplog: pytest.LogCaptureF
     assert not [record for record in caplog.records if record.name == "shared.audit_hooks"]
 
 
+def test_log_event_with_fallback_accepts_pre_resolved_hash(caplog: pytest.LogCaptureFixture):
+    hash_calls = {"count": 0}
+
+    def tracking_hash(value: Optional[str]) -> Optional[str]:
+        hash_calls["count"] += 1
+        return f"hash:{value}"
+
+    captured = []
+
+    def fake_log(**payload):
+        captured.append(payload)
+
+    hooks = audit_hooks.AuditHooks(log=fake_log, hash_ip=tracking_hash)
+
+    resolved = hooks.resolve_ip_hash(ip_address="198.51.100.10", ip_hash=None)
+
+    assert hash_calls["count"] == 1
+
+    logger = logging.getLogger("test.audit.pre_resolved")
+
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        result = audit_hooks.log_event_with_fallback(
+            hooks,
+            logger,
+            actor="lisa",
+            action="demo.pre_resolved",
+            entity="resource",
+            before={"before": True},
+            after={"after": True},
+            ip_address="198.51.100.10",
+            failure_message="should not trigger",
+            resolved_ip_hash=resolved,
+        )
+
+    assert result.handled is True
+    assert result.ip_hash == "hash:198.51.100.10"
+    assert hash_calls["count"] == 1
+    assert captured == [
+        {
+            "actor": "lisa",
+            "action": "demo.pre_resolved",
+            "entity": "resource",
+            "before": {"before": True},
+            "after": {"after": True},
+            "ip_hash": "hash:198.51.100.10",
+        }
+    ]
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+
+
 def test_log_event_falls_back_when_hash_raises(caplog: pytest.LogCaptureFixture):
     captured = {}
 
