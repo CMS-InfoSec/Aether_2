@@ -41,11 +41,21 @@ def test_validate_kraken_credentials_success(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(secrets_service, "KrakenRESTClient", factory)
 
     assert secrets_service.validate_kraken_credentials(
-        "ABCDEF", "SECRET", account_id="acct"
+        "ABCDEF", "U0VDUkVU", account_id="acct"
     )
     client = created["client"]
     assert client.calls == 1
     assert client.closed is True
+
+
+def test_validate_kraken_credentials_invalid_secret() -> None:
+    with pytest.raises(HTTPException) as excinfo:
+        secrets_service.validate_kraken_credentials(
+            "ABCDEF",
+            "not-base64",
+            account_id="acct",
+        )
+    assert excinfo.value.status_code == 400
 
 
 def test_validate_kraken_credentials_auth_failure(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -61,7 +71,7 @@ def test_validate_kraken_credentials_auth_failure(monkeypatch: pytest.MonkeyPatc
 
     with pytest.raises(HTTPException) as excinfo:
         secrets_service.validate_kraken_credentials(
-            "ABCDEF", "SECRET", account_id="acct"
+            "ABCDEF", "U0VDUkVU", account_id="acct"
         )
     assert excinfo.value.status_code == 400
     assert created["client"].closed is True
@@ -82,7 +92,7 @@ def test_validate_kraken_credentials_transport_failure(
 
     with pytest.raises(HTTPException) as excinfo:
         secrets_service.validate_kraken_credentials(
-            "ABCDEF", "SECRET", account_id="acct"
+            "ABCDEF", "U0VDUkVU", account_id="acct"
         )
     assert excinfo.value.status_code == 502
     assert created["client"].closed is True
