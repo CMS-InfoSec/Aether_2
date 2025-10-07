@@ -137,3 +137,70 @@ def test_correlation_service_rejects_sqlite_dsn_in_production(monkeypatch: pytes
         else:
             sys.modules.pop("pandas", None)
         sys.modules.pop("services.risk.correlation_service", None)
+
+
+def test_tracked_symbols_filters_non_spot_pairs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    original_alert_manager = _install_alert_manager_stub()
+    original_pandas = _install_pandas_stub()
+
+    correlations_db = tmp_path / "correlations.db"
+    marketdata_db = tmp_path / "marketdata.db"
+
+    monkeypatch.setenv("RISK_CORRELATION_DATABASE_URL", f"sqlite:///{correlations_db}")
+    monkeypatch.setenv("RISK_MARKETDATA_URL", f"sqlite:///{marketdata_db}")
+    monkeypatch.setenv(
+        "RISK_CORRELATION_SYMBOLS",
+        "BTC-USD,ETH-PERP,adaUP-usd,ETH-USD",
+    )
+
+    try:
+        _reload_correlation_service()
+        module = sys.modules["services.risk.correlation_service"]
+        assert module._tracked_symbols() == ("BTC-USD", "ETH-USD")
+    finally:
+        module = sys.modules.pop("services.risk.correlation_service", None)
+        if module is not None and hasattr(module, "ENGINE"):
+            module.ENGINE.dispose()
+            module._reset_marketdata_engine()
+        if original_alert_manager is not None:
+            sys.modules["services.alert_manager"] = original_alert_manager
+        else:
+            sys.modules.pop("services.alert_manager", None)
+        if original_pandas is not None:
+            sys.modules["pandas"] = original_pandas
+        else:
+            sys.modules.pop("pandas", None)
+
+
+def test_tracked_symbols_defaults_when_all_invalid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    original_alert_manager = _install_alert_manager_stub()
+    original_pandas = _install_pandas_stub()
+
+    correlations_db = tmp_path / "correlations.db"
+    marketdata_db = tmp_path / "marketdata.db"
+
+    monkeypatch.setenv("RISK_CORRELATION_DATABASE_URL", f"sqlite:///{correlations_db}")
+    monkeypatch.setenv("RISK_MARKETDATA_URL", f"sqlite:///{marketdata_db}")
+    monkeypatch.setenv("RISK_CORRELATION_SYMBOLS", "btc-perp,adaup-usd")
+
+    try:
+        _reload_correlation_service()
+        module = sys.modules["services.risk.correlation_service"]
+        assert module._tracked_symbols() == ("BTC-USD", "ETH-USD")
+    finally:
+        module = sys.modules.pop("services.risk.correlation_service", None)
+        if module is not None and hasattr(module, "ENGINE"):
+            module.ENGINE.dispose()
+            module._reset_marketdata_engine()
+        if original_alert_manager is not None:
+            sys.modules["services.alert_manager"] = original_alert_manager
+        else:
+            sys.modules.pop("services.alert_manager", None)
+        if original_pandas is not None:
+            sys.modules["pandas"] = original_pandas
+        else:
+            sys.modules.pop("pandas", None)

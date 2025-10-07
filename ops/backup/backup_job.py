@@ -51,7 +51,7 @@ import tarfile
 import tempfile
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Dict, Iterable, List, Optional
 
 try:  # pragma: no cover - optional dependency for operational runtime
@@ -158,8 +158,8 @@ class BackupArtifact:
     sha256: str
     size_bytes: int
     nonce_b64: str
-    encryption: str = "AESGCM"
     type: str
+    encryption: str = "AESGCM"
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -171,6 +171,38 @@ class BackupArtifact:
             "nonce": self.nonce_b64,
             "encryption": self.encryption,
         }
+
+
+def _safe_extract_tar(archive: tarfile.TarFile, destination: Path) -> None:
+    """Safely extract ``archive`` into ``destination``.
+
+    Each archive member is validated to ensure it is a relative path located
+    within ``destination``.  Absolute paths, traversal sequences, and entries
+    that would resolve outside of the destination directory raise
+    ``ValueError`` and prevent any extraction.
+    """
+
+    destination_resolved = destination.resolve()
+    members = archive.getmembers()
+
+    for member in members:
+        if not (member.isfile() or member.isdir()):
+            raise ValueError("Tar archive entries must be regular files or directories")
+
+        member_path = PurePosixPath(member.name)
+        if member_path.is_absolute():
+            raise ValueError("Tar archive entries must be relative paths")
+        if any(part == ".." for part in member_path.parts):
+            raise ValueError("Tar archive entries must not contain traversal sequences")
+
+        candidate = destination_resolved.joinpath(Path(*member_path.parts))
+        resolved_candidate = candidate.resolve(strict=False)
+        try:
+            resolved_candidate.relative_to(destination_resolved)
+        except ValueError as exc:
+            raise ValueError("Tar archive entry escapes extraction directory") from exc
+
+    archive.extractall(path=destination_resolved, filter="data")
 
 
 class BackupJob:
@@ -499,15 +531,29 @@ class BackupJob:
 
     def _restore_mlflow_artifacts(self, archive_path: Path) -> None:
         target_dir = self.config.mlflow_artifact_dir
+        if not target_dir.is_absolute():
+            raise ValueError("MLflow artifact directory must be absolute")
+
+        for ancestor in (target_dir,) + tuple(target_dir.parents):
+            if ancestor.exists() and ancestor.is_symlink():
+                raise ValueError("MLflow artifact directory must not reference symlinks")
+
         LOGGER.info("Restoring MLflow artifacts to %s", target_dir)
         backup_dir = target_dir.with_suffix(".bak")
         if target_dir.exists():
+            if target_dir.is_symlink():
+                raise ValueError("MLflow artifact directory must not be a symlink")
             if backup_dir.exists():
+                if backup_dir.is_symlink():
+                    raise ValueError("MLflow artifact backup path must not be a symlink")
                 shutil.rmtree(backup_dir)
             target_dir.rename(backup_dir)
         target_dir.mkdir(parents=True, exist_ok=True)
+        parent_dir = target_dir.parent
+        if parent_dir.exists() and parent_dir.is_symlink():
+            raise ValueError("MLflow artifact parent directory must not be a symlink")
         with tarfile.open(archive_path, "r:gz") as archive:
-            archive.extractall(path=target_dir.parent)
+            _safe_extract_tar(archive, parent_dir)
         # tarball contains original directory name; move contents to target
         extracted_root = target_dir.parent / target_dir.name
         if extracted_root.exists() and extracted_root != target_dir:
