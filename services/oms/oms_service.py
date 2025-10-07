@@ -19,7 +19,16 @@ from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_EVEN, ROUND_UP
 from pathlib import Path
 from typing import Any, Awaitable, Dict, Iterable, List, Optional, Set, Tuple
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+try:  # pragma: no cover - FastAPI is optional when running pure unit tests
+    from fastapi import Depends, FastAPI, HTTPException, Request, status
+except ImportError:  # pragma: no cover - fallback when FastAPI is stubbed out
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        Depends,
+        FastAPI,
+        HTTPException,
+        Request,
+        status,
+    )
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 
 from services.common.security import require_admin_account
