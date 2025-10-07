@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib.util
-import os
 import sys
 from pathlib import Path
 
@@ -69,7 +68,7 @@ def test_config_sandbox_normalizes_timescale_urls(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr("sqlalchemy.create_engine", _fake_create_engine)
 
     module_name = "tests.config_sandbox_timescale"
-    module = _load_module(module_name)
+    _load_module(module_name)
     try:
         assert str(captured["url"]).startswith("postgresql+psycopg2://")
     finally:

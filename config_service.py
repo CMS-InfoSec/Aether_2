@@ -9,7 +9,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Generator, Iterable, List, Optional, Set, Tuple, cast
+from typing import Any, Dict, Generator, Iterable, List, Mapping, Optional, Set, Tuple, cast
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
@@ -19,6 +19,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from shared.audit_hooks import AuditEvent, load_audit_hooks, log_audit_event_with_fallback
 from shared.postgres import normalize_sqlalchemy_dsn
 
 ROOT = Path(__file__).resolve().parent
@@ -42,15 +43,6 @@ except ModuleNotFoundError:  # pragma: no cover - fallback when installed under 
         spec.loader.exec_module(security_module)
         require_admin_account = getattr(security_module, "require_admin_account")
 
-try:  # pragma: no cover - optional audit dependency
-    from common.utils.audit_logger import hash_ip, log_audit
-except Exception:  # pragma: no cover - degrade gracefully
-    log_audit = None  # type: ignore[assignment]
-
-    def hash_ip(_: Optional[str]) -> Optional[str]:  # type: ignore[override]
-        return None
-
-
 # ---------------------------------------------------------------------------
 # Database configuration
 # ---------------------------------------------------------------------------
@@ -58,6 +50,36 @@ except Exception:  # pragma: no cover - degrade gracefully
 
 LOGGER = logging.getLogger("config_service")
 _SQLITE_FALLBACK_FLAG = "CONFIG_ALLOW_SQLITE_FOR_TESTS"
+
+
+def _log_config_audit(
+    *,
+    actor: str,
+    action: str,
+    entity: str,
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    client_ip: Optional[str],
+    failure_message: str,
+) -> None:
+    """Emit a config service audit entry while handling optional fallbacks."""
+
+    hooks = load_audit_hooks()
+    event = AuditEvent(
+        actor=actor,
+        action=action,
+        entity=entity,
+        before=before,
+        after=after,
+        ip_address=client_ip,
+    )
+    log_audit_event_with_fallback(
+        hooks,
+        LOGGER,
+        event,
+        failure_message=failure_message,
+        disabled_message=f"Audit logging disabled; skipping {action} for {entity}",
+    )
 
 
 def _require_database_url() -> str:
@@ -388,7 +410,7 @@ def update_config(
     before_record = _latest_config_record(session, account_id=account_id, key=key)
     before_snapshot = _audit_snapshot(before_record)
     entity = f"{account_id}:{key}"
-    ip_hash = hash_ip(request.client.host if request.client else None)
+    client_ip = request.client.host if request.client else None
 
     if key in GUARDED_KEYS:
         pending = _pending_guarded.get(pending_identifier)
@@ -410,29 +432,24 @@ def update_config(
                 required_approvals=required_approvals,
             )
 
-            if log_audit is not None:
-                try:
-                    after_snapshot = {
-                        "account_id": account_id,
-                        "key": key,
-                        "value": payload.value,
-                        "status": "pending",
-                        "requested_by": admin_account,
-                        "requested_at": created_at.isoformat(),
-                        "required_approvals": required_approvals,
-                    }
-                    log_audit(
-                        actor=admin_account,
-                        action="config.change.requested",
-                        entity=entity,
-                        before=before_snapshot,
-                        after=after_snapshot,
-                        ip_hash=ip_hash,
-                    )
-                except Exception:  # pragma: no cover - defensive best effort
-                    LOGGER.exception(
-                        "Failed to record audit log for pending config change %s", entity
-                    )
+            after_snapshot = {
+                "account_id": account_id,
+                "key": key,
+                "value": payload.value,
+                "status": "pending",
+                "requested_by": admin_account,
+                "requested_at": created_at.isoformat(),
+                "required_approvals": required_approvals,
+            }
+            _log_config_audit(
+                actor=admin_account,
+                action="config.change.requested",
+                entity=entity,
+                before=before_snapshot,
+                after=after_snapshot,
+                client_ip=client_ip,
+                failure_message=f"Failed to record audit log for pending config change {entity}",
+            )
             return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=response.model_dump())
 
         if pending.author == admin_account:
@@ -459,18 +476,15 @@ def update_config(
             required_approvals=required_approvals,
         )
 
-        if log_audit is not None:
-            try:
-                log_audit(
-                    actor=admin_account,
-                    action="config.change.approved",
-                    entity=entity,
-                    before=before_snapshot,
-                    after=_audit_snapshot(record),
-                    ip_hash=ip_hash,
-                )
-            except Exception:  # pragma: no cover - defensive best effort
-                LOGGER.exception("Failed to record audit log for config approval %s", entity)
+        _log_config_audit(
+            actor=admin_account,
+            action="config.change.approved",
+            entity=entity,
+            before=before_snapshot,
+            after=_audit_snapshot(record),
+            client_ip=client_ip,
+            failure_message=f"Failed to record audit log for config approval {entity}",
+        )
 
         return response
 
@@ -492,18 +506,15 @@ def update_config(
         required_approvals=required_approvals,
     )
 
-    if log_audit is not None:
-        try:
-            log_audit(
-                actor=admin_account,
-                action="config.change.applied",
-                entity=entity,
-                before=before_snapshot,
-                after=_audit_snapshot(record),
-                ip_hash=ip_hash,
-            )
-        except Exception:  # pragma: no cover - defensive best effort
-            LOGGER.exception("Failed to record audit log for config change %s", entity)
+    _log_config_audit(
+        actor=admin_account,
+        action="config.change.applied",
+        entity=entity,
+        before=before_snapshot,
+        after=_audit_snapshot(record),
+        client_ip=client_ip,
+        failure_message=f"Failed to record audit log for config change {entity}",
+    )
 
     return response
 

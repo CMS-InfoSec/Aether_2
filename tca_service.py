@@ -41,16 +41,9 @@ from sqlalchemy.pool import StaticPool
 
 from services.common.security import require_admin_account
 from services.common.spot import require_spot_http
+from shared.audit_hooks import AuditEvent, load_audit_hooks, log_audit_event_with_fallback
 from shared.postgres import normalize_sqlalchemy_dsn
 from shared.spot import is_spot_symbol, normalize_spot_symbol
-
-try:  # pragma: no cover - optional audit dependency
-    from common.utils.audit_logger import hash_ip, log_audit
-except Exception:  # pragma: no cover - degrade gracefully
-    log_audit = None  # type: ignore[assignment]
-
-    def hash_ip(_: str | None) -> str | None:  # type: ignore[override]
-        return None
 
 
 LOGGER = logging.getLogger(__name__)
@@ -157,23 +150,23 @@ def _audit_access(
 ) -> None:
     """Record audit information for report access using the verified identity."""
 
-    if log_audit is None:
-        return
-
-    try:
-        ip_address = request.client.host if request.client else None
-        log_audit(
-            actor=actor,
-            action=action,
-            entity=entity,
-            before={},
-            after=dict(metadata or {}),
-            ip_hash=hash_ip(ip_address),
-        )
-    except Exception:  # pragma: no cover - defensive best effort
-        AUDIT_LOGGER.exception(
-            "Failed to write audit log for action=%s entity=%s", action, entity
-        )
+    ip_address = request.client.host if request.client else None
+    audit_hooks = load_audit_hooks()
+    event = AuditEvent(
+        actor=actor,
+        action=action,
+        entity=entity,
+        before={},
+        after=dict(metadata or {}),
+        ip_address=ip_address,
+    )
+    log_audit_event_with_fallback(
+        audit_hooks,
+        AUDIT_LOGGER,
+        event,
+        failure_message=f"Failed to write audit log for action={action} entity={entity}",
+        disabled_message=f"Audit logging disabled; skipping {action} for {entity}",
+    )
 
 
 def _ensure_datetime(value: datetime | None) -> datetime | None:
@@ -850,7 +843,7 @@ def get_trade_report(
     with SessionLocal() as session:
         try:
             rows = _fetch_trade_rows(session, trade_id)
-        except SQLAlchemyError as exc:  # pragma: no cover - defensive guard
+        except SQLAlchemyError:  # pragma: no cover - defensive guard
             LOGGER.exception("Database query failed for trade_id=%s", trade_id)
             raise HTTPException(status_code=500, detail="Database error") from exc
 
@@ -1016,7 +1009,7 @@ def generate_daily_reports(target_date: date | None = None) -> list[TCAReportMod
                 ),
                 {"start_ts": start, "end_ts": end},
             )
-        except SQLAlchemyError as exc:  # pragma: no cover - defensive guard
+        except SQLAlchemyError:  # pragma: no cover - defensive guard
             LOGGER.exception("Failed to enumerate executions for TCA report job")
             raise
 
@@ -1042,7 +1035,7 @@ def generate_daily_reports(target_date: date | None = None) -> list[TCAReportMod
                     start=start,
                     end=end,
                 )
-            except SQLAlchemyError as exc:  # pragma: no cover - defensive guard
+            except SQLAlchemyError:  # pragma: no cover - defensive guard
                 LOGGER.exception(
                     "Failed to fetch execution rows for account=%s symbol=%s",
                     account_id,
