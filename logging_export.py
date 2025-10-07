@@ -26,6 +26,26 @@ except Exception:  # pragma: no cover
 DEFAULT_EXPORT_PREFIX = "log-exports"
 
 
+def _normalise_s3_prefix(prefix: str) -> str:
+    """Return a sanitised S3 prefix free from traversal or control chars."""
+
+    if not prefix:
+        return ""
+
+    segments: list[str] = []
+    for raw_segment in prefix.replace("\\", "/").split("/"):
+        segment = raw_segment.strip()
+        if not segment:
+            continue
+        if segment in {".", ".."}:
+            raise ValueError("Export prefix must not contain path traversal sequences")
+        if any(ord(char) < 32 for char in segment):
+            raise ValueError("Export prefix must not contain control characters")
+        segments.append(segment)
+
+    return "/".join(segments)
+
+
 class MissingDependencyError(RuntimeError):
     """Raised when an optional dependency required at runtime is missing."""
 
@@ -37,6 +57,9 @@ class ExportConfig:
     bucket: str
     prefix: str = DEFAULT_EXPORT_PREFIX
     endpoint_url: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "prefix", _normalise_s3_prefix(self.prefix))
 
 
 @dataclass(frozen=True)
@@ -172,7 +195,9 @@ def _s3_client(endpoint_url: str | None = None):
 
 
 def _build_s3_key(prefix: str, export_date: dt.date) -> str:
-    return f"{prefix.rstrip('/')}/audit-reg-log-{export_date.isoformat()}.json.gz"
+    safe_prefix = _normalise_s3_prefix(prefix)
+    suffix = f"audit-reg-log-{export_date.isoformat()}.json.gz"
+    return f"{safe_prefix}/{suffix}" if safe_prefix else suffix
 
 
 def run_export(
