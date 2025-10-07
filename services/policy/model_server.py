@@ -30,7 +30,7 @@ except Exception:  # pragma: no cover - gracefully degrade if mlflow missing.
         """Fallback placeholder used when mlflow is absent."""
 
 from services.common.schemas import ActionTemplate, BookSnapshot, ConfidenceMetrics
-from shared.spot import is_spot_symbol, normalize_spot_symbol
+from shared.spot import require_spot_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -406,10 +406,11 @@ def _augment_metadata(
 
 
 def _require_spot_symbol(symbol: object) -> str:
-    normalized = normalize_spot_symbol(symbol)
-    if not normalized or not is_spot_symbol(normalized):
-        raise ValueError("Only spot market instruments are supported.")
-    return normalized
+    try:
+        return require_spot_symbol(symbol)
+    except ValueError as exc:
+        logger.warning("Rejected non-spot symbol in policy model server", extra={"symbol": symbol})
+        raise ValueError(str(exc)) from exc
 
 
 def _model_name(account_id: str, symbol: str, variant: str | None = None) -> str:

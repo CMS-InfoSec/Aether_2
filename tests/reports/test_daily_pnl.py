@@ -450,6 +450,31 @@ def test_fetch_daily_orders_filters_non_spot_symbols(caplog: pytest.LogCaptureFi
     assert "Ignoring non-spot instrument" in caplog.text
 
 
+def test_fetch_daily_orders_logs_validation_error_details(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    session = _StubSession(
+        [
+            {"order_id": 1, "account_id": 42, "instrument": "btc-perp"},
+        ]
+    )
+
+    with caplog.at_level(logging.WARNING):
+        fetch_daily_orders(
+            session,
+            start=datetime(2024, 5, 2, tzinfo=timezone.utc),
+            end=datetime(2024, 5, 3, tzinfo=timezone.utc),
+        )
+
+    warning = next(
+        record
+        for record in caplog.records
+        if "Ignoring non-spot instrument" in record.getMessage()
+    )
+    assert warning.instrument == "BTC-PERP"
+    assert warning.error.startswith("Only spot market instruments are supported")
+
+
 def test_compute_daily_pnl_normalizes_instruments() -> None:
     rows = compute_daily_pnl(
         [_fill(instrument="btc/usd", side="SELL", size="2", price="10", fee="0")],
