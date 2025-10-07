@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field
 from policy_service import MODEL_VARIANTS, RegimeSnapshot, regime_classifier
 from services.common.security import ADMIN_ACCOUNTS, require_admin_account
 from services.common.spot import require_spot_http
+from shared.spot import require_spot_symbol
 
 
 _ALLOWED_REGIMES = {"trend", "range", "high_vol"}
@@ -55,8 +56,14 @@ class MetaGovernanceLog:
         self._lock = Lock()
 
     def append(self, symbol: str, regime: str, weights: Mapping[str, float], ts: datetime) -> None:
+        normalized_symbol = require_spot_symbol(symbol)
         payload = json.dumps(dict(sorted(weights.items())), sort_keys=True)
-        entry = MetaGovernanceLogEntry(symbol=symbol, regime=regime, weights_json=payload, ts=ts)
+        entry = MetaGovernanceLogEntry(
+            symbol=normalized_symbol,
+            regime=regime,
+            weights_json=payload,
+            ts=ts,
+        )
         with self._lock:
             self._entries.append(entry)
 
@@ -64,7 +71,7 @@ class MetaGovernanceLog:
         with self._lock:
             if symbol is None:
                 return list(self._entries)
-            norm = symbol.upper()
+            norm = require_spot_symbol(symbol)
             return [entry for entry in self._entries if entry.symbol == norm]
 
     def reset(self) -> None:
@@ -92,7 +99,7 @@ class MetaLearner:
     ) -> None:
         """Record a new performance observation for ``model``."""
 
-        norm_symbol = symbol.upper()
+        norm_symbol = require_spot_symbol(symbol)
         norm_regime = regime.lower()
         if norm_regime not in _ALLOWED_REGIMES:
             raise ValueError(f"Unsupported regime '{regime}'")
@@ -142,7 +149,7 @@ class MetaLearner:
         return sorted(candidates) if candidates else []
 
     def train(self, symbol: str) -> Dict[str, Dict[str, float]]:
-        norm_symbol = symbol.upper()
+        norm_symbol = require_spot_symbol(symbol)
         with self._lock:
             history = self._history.get(norm_symbol)
             if not history:
@@ -156,7 +163,7 @@ class MetaLearner:
             return stats
 
     def predict_weights(self, symbol: str, regime: str) -> Dict[str, float]:
-        norm_symbol = symbol.upper()
+        norm_symbol = require_spot_symbol(symbol)
         norm_regime = regime.lower()
         candidates = self._candidate_models(norm_symbol)
         if not candidates:
