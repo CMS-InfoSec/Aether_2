@@ -389,7 +389,7 @@ class IdempotencyCache:
 
     @staticmethod
     def _default_redis_factory(account_id: str) -> Any:
-        from redis.asyncio import Redis  # type: ignore import-not-found
+        from redis.asyncio import Redis  # type: ignore[import-not-found]
 
         from services.common.config import get_redis_client
 
