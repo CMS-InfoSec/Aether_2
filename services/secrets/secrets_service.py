@@ -85,9 +85,6 @@ from services.secrets.secure_secrets import (
 from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
 from shared.audit_hooks import load_audit_hooks, log_event_with_fallback
 
-
-_AUDIT_HOOKS = load_audit_hooks()
-
 try:  # pragma: no cover - OMS watcher is optional in some runtimes
     from services.oms.oms_kraken import KrakenCredentialWatcher
 except Exception:  # pragma: no cover - fallback when OMS package unavailable
@@ -267,7 +264,8 @@ def _perform_secure_rotation(
 
     ip_address = request.client.host if request.client else None
     hashed_ip = _hash_ip(ip_address)
-    chain_ip_hash = _AUDIT_HOOKS.hash_ip(ip_address)
+    audit_hooks = load_audit_hooks()
+    chain_ip_hash = audit_hooks.hash_ip(ip_address)
 
     recorded_meta = meta_store.record_rotation(
         kms_key_id=envelope.kms_key_id,
@@ -302,7 +300,7 @@ def _perform_secure_rotation(
     )
 
     log_event_with_fallback(
-        _AUDIT_HOOKS,
+        audit_hooks,
         LOGGER,
         actor=actor,
         action="secret.kraken.rotate",

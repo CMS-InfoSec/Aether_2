@@ -18,9 +18,6 @@ from shared.sim_mode import SimModeStatus, sim_mode_repository
 from shared.audit_hooks import load_audit_hooks, log_event_with_fallback
 
 
-_AUDIT_HOOKS = load_audit_hooks()
-
-
 LOGGER = logging.getLogger("sim_mode_service")
 
 app = FastAPI(title="Simulation Mode Service", version="1.0.0")
@@ -62,8 +59,9 @@ async def _publish_event(status: SimModeStatus, actor: str) -> None:
 
 
 def _log_audit_transition(before: SimModeStatus, after: SimModeStatus, actor: str, request: Request) -> None:
+    audit_hooks = load_audit_hooks()
     log_event_with_fallback(
-        _AUDIT_HOOKS,
+        audit_hooks,
         LOGGER,
         actor=actor,
         action="sim_mode.transition",

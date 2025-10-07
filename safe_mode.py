@@ -30,9 +30,6 @@ from shared.async_utils import dispatch_async
 from shared.audit_hooks import load_audit_hooks, log_event_with_fallback
 
 
-_AUDIT_HOOKS = load_audit_hooks()
-
-
 LOGGER = logging.getLogger(__name__)
 
 
@@ -744,8 +741,9 @@ def enter_safe_mode(
         ) from exc
     response = controller.status().to_response()
 
+    audit_hooks = load_audit_hooks()
     log_event_with_fallback(
-        _AUDIT_HOOKS,
+        audit_hooks,
         LOGGER,
         actor=actor_account,
         action="safe_mode.enter",
@@ -772,8 +770,9 @@ def exit_safe_mode(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     response = controller.status().to_response()
 
+    audit_hooks = load_audit_hooks()
     log_event_with_fallback(
-        _AUDIT_HOOKS,
+        audit_hooks,
         LOGGER,
         actor=actor_account,
         action="safe_mode.exit",

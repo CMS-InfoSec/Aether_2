@@ -15,8 +15,6 @@ from services.common.security import require_admin_account
 from shared.async_utils import dispatch_async
 from shared.audit_hooks import load_audit_hooks, log_event_with_fallback
 
-_AUDIT_HOOKS = load_audit_hooks()
-
 app = FastAPI(title="Kill Switch Service")
 
 
@@ -112,8 +110,9 @@ def trigger_kill_switch(
         channels_sent=channels_sent,
     )
 
+    audit_hooks = load_audit_hooks()
     log_event_with_fallback(
-        _AUDIT_HOOKS,
+        audit_hooks,
         LOGGER,
         actor=actor_account,
         action="kill_switch.triggered",

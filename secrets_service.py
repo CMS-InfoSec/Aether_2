@@ -25,8 +25,6 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from services.secrets.signing import sign_kraken_request
 from shared.audit_hooks import load_audit_hooks, log_event_with_fallback
 
-_AUDIT_HOOKS = load_audit_hooks()
-
 
 LOGGER = logging.getLogger(__name__)
 SECRETS_LOGGER = logging.getLogger("secrets_log")
@@ -523,8 +521,9 @@ async def store_kraken_secret(
 
     verified_actor = authorized_actor
 
+    audit_hooks = load_audit_hooks()
     before_snapshot: Dict[str, Any] = {}
-    if _AUDIT_HOOKS.log is not None:
+    if audit_hooks.log is not None:
         try:
             before_snapshot = manager.get_status(payload.account_id)
         except HTTPException as exc:
@@ -594,7 +593,7 @@ async def store_kraken_secret(
     audit_after = dict(result)
     audit_after["actor"] = verified_actor
     log_event_with_fallback(
-        _AUDIT_HOOKS,
+        audit_hooks,
         LOGGER,
         actor=verified_actor,
         action="secret.kraken.rotate",

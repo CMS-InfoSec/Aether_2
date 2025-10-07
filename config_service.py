@@ -44,8 +44,6 @@ except ModuleNotFoundError:  # pragma: no cover - fallback when installed under 
 
 from shared.audit_hooks import load_audit_hooks, log_event_with_fallback
 
-_AUDIT_HOOKS = load_audit_hooks()
-
 
 # ---------------------------------------------------------------------------
 # Database configuration
@@ -68,8 +66,9 @@ def _log_config_audit(
 ) -> None:
     """Emit a config service audit entry while handling optional fallbacks."""
 
+    hooks = load_audit_hooks()
     log_event_with_fallback(
-        _AUDIT_HOOKS,
+        hooks,
         LOGGER,
         actor=actor,
         action=action,

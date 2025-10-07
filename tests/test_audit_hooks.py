@@ -188,6 +188,17 @@ def test_temporary_audit_hooks_override_and_restore():
     assert restored is not sentinel
 
 
+def test_temporary_audit_hooks_override_even_after_initial_load():
+    audit_hooks.reset_audit_hooks_cache()
+    original = audit_hooks.load_audit_hooks()
+    override = audit_hooks.AuditHooks(log=lambda **kwargs: None, hash_ip=lambda value: "override")
+
+    with audit_hooks.temporary_audit_hooks(override):
+        assert audit_hooks.load_audit_hooks() is override
+
+    assert audit_hooks.load_audit_hooks() is original
+
+
 def test_temporary_audit_hooks_nest_cleanly():
     audit_hooks.reset_audit_hooks_cache()
     outer = audit_hooks.AuditHooks(log=lambda **kwargs: None, hash_ip=lambda value: "outer")

@@ -41,9 +41,6 @@ except ModuleNotFoundError:  # pragma: no cover - fallback when installed under 
         spec.loader.exec_module(security_module)
         require_admin_account = getattr(security_module, "require_admin_account")
 
-_AUDIT_HOOKS = load_audit_hooks()
-
-
 LOGGER = logging.getLogger("override_service")
 
 _DATABASE_URL_ENV = "OVERRIDE_DATABASE_URL"
@@ -231,8 +228,9 @@ def record_override(
     session.add(entry)
     session.flush()
 
+    audit_hooks = load_audit_hooks()
     log_event_with_fallback(
-        _AUDIT_HOOKS,
+        audit_hooks,
         LOGGER,
         actor=admin_account,
         action="override.human_decision",

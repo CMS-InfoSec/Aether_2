@@ -76,8 +76,9 @@ async def _sync_runtime_state(active: bool) -> None:
 def _audit_transition(
     before: SimModeStatus, after: SimModeStatus, actor: str, request: Request
 ) -> None:
+    audit_hooks = load_audit_hooks()
     log_event_with_fallback(
-        _AUDIT_HOOKS,
+        audit_hooks,
         LOGGER,
         actor=actor,
         action="sim_mode.transition",

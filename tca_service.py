@@ -45,8 +45,6 @@ from shared.audit_hooks import load_audit_hooks, log_event_with_fallback
 from shared.postgres import normalize_sqlalchemy_dsn
 from shared.spot import is_spot_symbol, normalize_spot_symbol
 
-_AUDIT_HOOKS = load_audit_hooks()
-
 
 LOGGER = logging.getLogger(__name__)
 AUDIT_LOGGER = logging.getLogger("tca.audit")
@@ -153,8 +151,9 @@ def _audit_access(
     """Record audit information for report access using the verified identity."""
 
     ip_address = request.client.host if request.client else None
+    audit_hooks = load_audit_hooks()
     log_event_with_fallback(
-        _AUDIT_HOOKS,
+        audit_hooks,
         AUDIT_LOGGER,
         actor=actor,
         action=action,
