@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Callable, Optional
 
 
@@ -29,7 +28,6 @@ class AuditHooks:
     hash_ip: HashIpCallable
 
 
-@lru_cache(maxsize=1)
 def load_audit_hooks() -> AuditHooks:
     """Return the configured audit logging helpers if available.
 
@@ -38,9 +36,7 @@ def load_audit_hooks() -> AuditHooks:
     missing (for example in stripped-down test environments) the services
     should continue to function with audit logging disabled.  This helper
     encapsulates that import guard while retaining type information for
-    downstream modules.  The resolved hooks are cached so repeated callers
-    avoid importing the optional dependency multiple times; test suites can
-    force a reload by invoking :func:`load_audit_hooks.cache_clear`.
+    downstream modules.
     """
 
     try:  # pragma: no cover - import guarded for optional dependency
