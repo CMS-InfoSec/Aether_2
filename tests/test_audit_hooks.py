@@ -66,7 +66,7 @@ def test_load_audit_hooks_caches_optional_import(monkeypatch):
 def test_log_event_skips_when_logger_missing():
     hooks = audit_hooks.AuditHooks(log=None, hash_ip=lambda value: pytest.fail("hash_ip should not be called"))
 
-    handled = hooks.log_event(
+    result = hooks.log_event(
         actor="alice",
         action="test.action",
         entity="resource",
@@ -75,7 +75,11 @@ def test_log_event_skips_when_logger_missing():
         ip_address="127.0.0.1",
     )
 
-    assert handled is False
+    assert result.handled is False
+    assert result.ip_hash is None
+    assert result.hash_fallback is False
+    assert result.hash_error is None
+    assert not result
 
 
 def test_log_event_records_with_ip_hash():
@@ -86,7 +90,7 @@ def test_log_event_records_with_ip_hash():
 
     hooks = audit_hooks.AuditHooks(log=fake_log, hash_ip=lambda value: f"hashed:{value}")
 
-    handled = hooks.log_event(
+    result = hooks.log_event(
         actor="bob",
         action="demo.action",
         entity="resource",
@@ -95,7 +99,12 @@ def test_log_event_records_with_ip_hash():
         ip_address="10.0.0.5",
     )
 
-    assert handled is True
+    assert result.handled is True
+    assert result.ip_hash == "hashed:10.0.0.5"
+    assert result.hash_fallback is False
+    assert result.hash_error is None
+    assert result.log_error is None
+    assert result
     assert calls == [
         {
             "actor": "bob",
@@ -116,7 +125,7 @@ def test_log_event_respects_explicit_ip_hash():
 
     hooks = audit_hooks.AuditHooks(log=fake_log, hash_ip=lambda value: "should-not-be-used")
 
-    handled = hooks.log_event(
+    result = hooks.log_event(
         actor="carol",
         action="demo.override",
         entity="resource",
@@ -125,8 +134,30 @@ def test_log_event_respects_explicit_ip_hash():
         ip_hash="explicit-hash",
     )
 
-    assert handled is True
+    assert result.handled is True
     assert captured["ip_hash"] == "explicit-hash"
+    assert result.ip_hash == "explicit-hash"
+    assert result.hash_fallback is False
+    assert result.hash_error is None
+
+
+def test_audit_log_result_truthiness():
+    success = audit_hooks.AuditLogResult(
+        handled=True,
+        ip_hash="hash",
+        hash_fallback=False,
+        hash_error=None,
+    )
+    failure = audit_hooks.AuditLogResult(
+        handled=False,
+        ip_hash=None,
+        hash_fallback=False,
+        hash_error=None,
+        log_error=None,
+    )
+
+    assert success
+    assert not failure
 
 
 def test_log_event_with_fallback_logs_when_disabled(caplog: pytest.LogCaptureFixture):
@@ -134,7 +165,7 @@ def test_log_event_with_fallback_logs_when_disabled(caplog: pytest.LogCaptureFix
 
     logger = logging.getLogger("test.audit.disabled")
     with caplog.at_level(logging.DEBUG, logger=logger.name):
-        handled = audit_hooks.log_event_with_fallback(
+        result = audit_hooks.log_event_with_fallback(
             hooks,
             logger,
             actor="dave",
@@ -146,7 +177,12 @@ def test_log_event_with_fallback_logs_when_disabled(caplog: pytest.LogCaptureFix
             disabled_message="audit disabled",
         )
 
-    assert handled is False
+    assert result.handled is False
+    assert result.ip_hash is None
+    assert result.hash_fallback is False
+    assert result.hash_error is None
+    assert result.log_error is None
+    assert not result
     record = next(record for record in caplog.records if record.message == "audit disabled")
     assert record.audit == {
         "actor": "dave",
@@ -168,7 +204,7 @@ def test_log_event_with_fallback_handles_exceptions(caplog: pytest.LogCaptureFix
     logger = logging.getLogger("test.audit.errors")
 
     with caplog.at_level(logging.ERROR, logger=logger.name):
-        handled = audit_hooks.log_event_with_fallback(
+        result = audit_hooks.log_event_with_fallback(
             hooks,
             logger,
             actor="erin",
@@ -179,7 +215,10 @@ def test_log_event_with_fallback_handles_exceptions(caplog: pytest.LogCaptureFix
             failure_message="failed to record",
         )
 
-    assert handled is False
+    assert result.handled is False
+    assert isinstance(result.log_error, RuntimeError)
+    assert result.hash_fallback is False
+    assert result.hash_error is None
     error_record = next(
         record
         for record in caplog.records
@@ -210,7 +249,7 @@ def test_log_event_with_fallback_uses_fallback_hash_on_error(caplog: pytest.LogC
     logger = logging.getLogger("test.audit.hash")
 
     with caplog.at_level(logging.ERROR, logger=logger.name):
-        handled = audit_hooks.log_event_with_fallback(
+        result = audit_hooks.log_event_with_fallback(
             hooks,
             logger,
             actor="ivy",
@@ -222,7 +261,10 @@ def test_log_event_with_fallback_uses_fallback_hash_on_error(caplog: pytest.LogC
             failure_message="should not trigger",
         )
 
-    assert handled is True
+    assert result.handled is True
+    assert result.hash_fallback is True
+    assert isinstance(result.hash_error, RuntimeError)
+    assert result.log_error is None
     expected_hash = audit_hooks._hash_ip_fallback("192.168.0.10")
     assert calls == [
         {
@@ -263,7 +305,7 @@ def test_log_event_falls_back_when_hash_raises(caplog: pytest.LogCaptureFixture)
     hooks = audit_hooks.AuditHooks(log=fake_log, hash_ip=failing_hash)
 
     with caplog.at_level(logging.ERROR, logger="shared.audit_hooks"):
-        handled = hooks.log_event(
+        result = hooks.log_event(
             actor="jane",
             action="demo.log",
             entity="resource",
@@ -272,9 +314,12 @@ def test_log_event_falls_back_when_hash_raises(caplog: pytest.LogCaptureFixture)
             ip_address="172.16.0.2",
         )
 
-    assert handled is True
+    assert result.handled is True
     expected_hash = audit_hooks._hash_ip_fallback("172.16.0.2")
     assert captured["ip_hash"] == expected_hash
+    assert result.ip_hash == expected_hash
+    assert result.hash_fallback is True
+    assert isinstance(result.hash_error, RuntimeError)
     module_record = next(
         record for record in caplog.records if record.message == "Audit hash_ip callable failed; using fallback hash."
     )
@@ -292,7 +337,7 @@ def test_log_event_with_fallback_allows_custom_context(caplog: pytest.LogCapture
     }
 
     with caplog.at_level(logging.INFO, logger=logger.name):
-        handled = audit_hooks.log_event_with_fallback(
+        result = audit_hooks.log_event_with_fallback(
             hooks,
             logger,
             actor="frank",
@@ -307,7 +352,10 @@ def test_log_event_with_fallback_allows_custom_context(caplog: pytest.LogCapture
             context=context,
         )
 
-    assert handled is False
+    assert result.handled is False
+    assert result.hash_fallback is False
+    assert result.hash_error is None
+    assert result.log_error is None
     record = next(record for record in caplog.records if record.message == "audit disabled")
     assert record.audit == context["audit"]
     assert record.extra_field == "value"

@@ -28,6 +28,20 @@ class AuditCallable(Protocol):
 HashIpCallable = Callable[[Optional[str]], Optional[str]]
 
 
+@dataclass(frozen=True)
+class AuditLogResult:
+    """Structured metadata describing the outcome of an audit logging attempt."""
+
+    handled: bool
+    ip_hash: Optional[str]
+    hash_fallback: bool
+    hash_error: Optional[Exception]
+    log_error: Optional[Exception] = None
+
+    def __bool__(self) -> bool:  # pragma: no cover - exercised implicitly via truthiness
+        return self.handled
+
+
 LOGGER = logging.getLogger("shared.audit_hooks")
 
 
@@ -81,18 +95,23 @@ class AuditHooks:
         after: Mapping[str, Any],
         ip_address: Optional[str] = None,
         ip_hash: Optional[str] = None,
-    ) -> bool:
+    ) -> AuditLogResult:
         """Record an audit entry when the optional logger is available.
 
         The helper mirrors :func:`common.utils.audit_logger.log_audit` while
         deferring hashing logic to the configured :func:`hash_ip` callback.  It
-        returns ``True`` when an audit logger handled the event and ``False``
-        when the optional dependency is absent.
+        returns an :class:`AuditLogResult` describing whether the optional
+        dependency handled the event and capturing any fallback metadata.
         """
 
         log_callable = self.log
         if log_callable is None:
-            return False
+            return AuditLogResult(
+                handled=False,
+                ip_hash=ip_hash,
+                hash_fallback=False,
+                hash_error=None,
+            )
 
         resolved_ip_hash, hash_fallback, hash_error = self.resolve_ip_hash(
             ip_address=ip_address,
@@ -125,7 +144,12 @@ class AuditHooks:
             after=after,
             ip_hash=resolved_ip_hash,
         )
-        return True
+        return AuditLogResult(
+            handled=True,
+            ip_hash=resolved_ip_hash,
+            hash_fallback=hash_fallback,
+            hash_error=hash_error,
+        )
 
 
 _AUDIT_HOOK_OVERRIDE: AuditHooks | None = None
@@ -279,7 +303,7 @@ def log_event_with_fallback(
     disabled_message: Optional[str] = None,
     disabled_level: int = logging.DEBUG,
     context: Optional[Mapping[str, Any]] = None,
-) -> bool:
+) -> AuditLogResult:
     """Emit an audit event while shielding callers from optional failures.
 
     The helper wraps :meth:`AuditHooks.log_event` to provide consistent
@@ -288,8 +312,9 @@ def log_event_with_fallback(
     ``disabled_level`` with structured metadata describing the attempted
     event.  When the audit logger raises an unexpected exception the error is
     recorded using :meth:`logging.Logger.exception`, the same metadata is
-    attached via ``extra`` for downstream processors, and ``False`` is returned
-    to signal that no entry was written.
+    attached via ``extra`` for downstream processors, and an
+    :class:`AuditLogResult` with ``handled`` set to ``False`` is returned to
+    signal that no entry was written.
     """
 
     resolved_ip_hash, hash_fallback, hash_error = hooks.resolve_ip_hash(
@@ -318,7 +343,7 @@ def log_event_with_fallback(
         )
 
     try:
-        handled = hooks.log_event(
+        result = hooks.log_event(
             actor=actor,
             action=action,
             entity=entity,
@@ -327,18 +352,34 @@ def log_event_with_fallback(
             ip_address=ip_address,
             ip_hash=resolved_ip_hash,
         )
-    except Exception:
+    except Exception as exc:
         logger.exception(failure_message, extra=log_extra)
-        return False
+        return AuditLogResult(
+            handled=False,
+            ip_hash=resolved_ip_hash,
+            hash_fallback=hash_fallback,
+            hash_error=hash_error,
+            log_error=exc,
+        )
 
-    if not handled and disabled_message is not None:
+    if not result.handled and disabled_message is not None:
         logger.log(disabled_level, disabled_message, extra=log_extra)
 
-    return handled
+    combined_hash_fallback = hash_fallback or result.hash_fallback
+    combined_hash_error = hash_error or result.hash_error
+
+    return AuditLogResult(
+        handled=result.handled,
+        ip_hash=result.ip_hash or resolved_ip_hash,
+        hash_fallback=combined_hash_fallback,
+        hash_error=combined_hash_error,
+        log_error=result.log_error,
+    )
 
 
 __all__ = [
     "AuditHooks",
+    "AuditLogResult",
     "AuditCallable",
     "HashIpCallable",
     "load_audit_hooks",
