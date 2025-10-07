@@ -1,3 +1,9 @@
 """Minimal Starlette compatibility layer for tests."""
 
-__all__: list[str] = []
+from __future__ import annotations
+
+from services.common.fastapi_stub import status as _status
+
+status = _status
+
+__all__ = ["status"]

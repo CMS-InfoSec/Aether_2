@@ -20,7 +20,7 @@ from collections.abc import MutableMapping
 from dataclasses import dataclass
 from inspect import Parameter, Signature, isclass, iscoroutine, signature
 from types import ModuleType, SimpleNamespace
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple, Type
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple, Type
 
 try:  # pragma: no cover - prefer the real FastAPI implementation when available
     import importlib.util
@@ -557,6 +557,18 @@ def _dump_response_payload(value: Any) -> Any:
     return value
 
 
+def _is_mapping_annotation(annotation: Any) -> bool:
+    try:
+        from typing import get_origin
+    except Exception:  # pragma: no cover - Python <3.8 compatibility safeguard
+        return annotation in (dict, Dict, Mapping)
+
+    origin = get_origin(annotation)
+    if origin is None:
+        return annotation in (dict, Dict, Mapping)
+    return origin in (dict, Dict, Mapping)
+
+
 async def _call_endpoint(
     app: FastAPI,
     func: Callable[..., Any],
@@ -630,6 +642,10 @@ async def _call_endpoint(
 
         if name in body:
             resolved_kwargs[name] = body[name]
+            continue
+
+        if _is_mapping_annotation(annotation):
+            resolved_kwargs[name] = dict(body)
             continue
 
         if default is not Parameter.empty:
