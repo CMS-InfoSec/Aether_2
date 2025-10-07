@@ -21,7 +21,7 @@ def test_risk_validate_authorized_accounts():
     }
     for account in ADMIN_ACCOUNTS:
         payload["account_id"] = account
-        payload["instrument"] = "ETH-USD" if account != "director-2" else "ETH-USDT"
+        payload["instrument"] = "ETH-USD"
         response = client.post("/risk/validate", json=payload, headers={"X-Account-ID": account})
         assert response.status_code == 200
         data = response.json()

@@ -109,3 +109,20 @@ def test_meta_weights_endpoint_logs_governance_record() -> None:
     assert records, "expected governance entry to be recorded"
     logged_weights = json.loads(records[-1].weights_json)
     assert logged_weights.keys() == weights.keys()
+
+
+def test_meta_learner_rejects_derivative_symbol() -> None:
+    learner = get_meta_learner()
+
+    with pytest.raises(ValueError, match="spot market"):
+        learner.record_performance(
+            symbol="BTC-PERP",
+            regime="trend",
+            model="trend_model",
+            score=1.2,
+        )
+
+
+def test_meta_governance_log_rejects_non_spot_requests() -> None:
+    with pytest.raises(ValueError, match="spot market"):
+        meta_governance_log.records("ETH-PERP")
