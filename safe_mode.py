@@ -11,7 +11,17 @@ import os
 import sys
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
-from fastapi import Body, Depends, FastAPI, HTTPException, Request, status
+try:  # pragma: no cover - FastAPI is optional in some test environments
+    from fastapi import Body, Depends, FastAPI, HTTPException, Request, status
+except ImportError:  # pragma: no cover - fallback when FastAPI is stubbed out
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        Body,
+        Depends,
+        FastAPI,
+        HTTPException,
+        Request,
+        status,
+    )
 
 from metrics import increment_safe_mode_triggers, setup_metrics
 from services.common.security import require_admin_account
