@@ -68,14 +68,7 @@ from services.secrets.secure_secrets import (
     SecretsMetadataStore,
 )
 from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
-
-try:  # pragma: no cover - optional audit dependency
-    from common.utils.audit_logger import hash_ip as audit_chain_hash_ip, log_audit as chain_log_audit
-except Exception:  # pragma: no cover - degrade gracefully when audit logger unavailable
-    chain_log_audit = None  # type: ignore[assignment]
-
-    def audit_chain_hash_ip(_: Optional[str]) -> Optional[str]:  # type: ignore[override]
-        return None
+from shared.audit_hooks import AuditEvent, load_audit_hooks, log_audit_event_with_fallback
 
 try:  # pragma: no cover - OMS watcher is optional in some runtimes
     from services.oms.oms_kraken import KrakenCredentialWatcher
@@ -256,7 +249,8 @@ def _perform_secure_rotation(
 
     ip_address = request.client.host if request.client else None
     hashed_ip = _hash_ip(ip_address)
-    chain_ip_hash = audit_chain_hash_ip(ip_address)
+    audit_hooks = load_audit_hooks()
+    chain_ip_hash = audit_hooks.hash_ip(ip_address)
 
     recorded_meta = meta_store.record_rotation(
         kms_key_id=envelope.kms_key_id,
@@ -290,20 +284,25 @@ def _perform_secure_rotation(
         after=audit_after,
     )
 
-    if chain_log_audit is not None:
-        try:
-            chain_log_audit(
-                actor=actor,
-                action="secret.kraken.rotate",
-                entity=f"kraken:{account_id}",
-                before=before_for_audit,
-                after=chain_audit_after,
-                ip_hash=chain_ip_hash,
-            )
-        except Exception:  # pragma: no cover - defensive best effort
-            LOGGER.exception(
-                "Failed to record tamper-evident audit log for Kraken rotation on %s", account_id
-            )
+    event = AuditEvent(
+        actor=actor,
+        action="secret.kraken.rotate",
+        entity=f"kraken:{account_id}",
+        before=before_for_audit,
+        after=chain_audit_after,
+        ip_hash=chain_ip_hash,
+    )
+    log_audit_event_with_fallback(
+        audit_hooks,
+        LOGGER,
+        event,
+        failure_message=(
+            f"Failed to record tamper-evident audit log for Kraken rotation on {account_id}"
+        ),
+        disabled_message=(
+            f"Audit logging disabled; skipping secret.kraken.rotate for {account_id}"
+        ),
+    )
 
     LOGGER.info(
         "OMS watcher note: Kraken credentials rotated with envelope encryption",  # pragma: no cover - log only
