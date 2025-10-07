@@ -247,6 +247,7 @@ def test_log_event_with_fallback_uses_fallback_hash_on_error(caplog: pytest.LogC
         "ip_address": "192.168.0.10",
         "ip_hash": expected_hash,
         "hash_fallback": True,
+        "hash_error": {"type": "RuntimeError", "message": "hash failure"},
     }
 
 
@@ -278,6 +279,7 @@ def test_log_event_falls_back_when_hash_raises(caplog: pytest.LogCaptureFixture)
         record for record in caplog.records if record.message == "Audit hash_ip callable failed; using fallback hash."
     )
     assert module_record.levelno == logging.ERROR
+    assert module_record.audit["hash_error"] == {"type": "RuntimeError", "message": "hash failure"}
 
 
 def test_log_event_with_fallback_allows_custom_context(caplog: pytest.LogCaptureFixture):

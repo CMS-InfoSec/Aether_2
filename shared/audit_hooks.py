@@ -94,7 +94,7 @@ class AuditHooks:
         if log_callable is None:
             return False
 
-        resolved_ip_hash, _hash_fallback, hash_error = self.resolve_ip_hash(
+        resolved_ip_hash, hash_fallback, hash_error = self.resolve_ip_hash(
             ip_address=ip_address,
             ip_hash=ip_hash,
         )
@@ -102,6 +102,18 @@ class AuditHooks:
         if hash_error is not None:
             LOGGER.error(
                 "Audit hash_ip callable failed; using fallback hash.",
+                extra=_build_audit_log_extra(
+                    actor=actor,
+                    action=action,
+                    entity=entity,
+                    before=before,
+                    after=after,
+                    ip_address=ip_address,
+                    ip_hash=resolved_ip_hash,
+                    context=None,
+                    hash_fallback=hash_fallback,
+                    hash_error=hash_error,
+                ),
                 exc_info=(type(hash_error), hash_error, hash_error.__traceback__),
             )
 
@@ -181,6 +193,19 @@ def temporary_audit_hooks(hooks: AuditHooks) -> Iterator[None]:
         _AUDIT_HOOK_OVERRIDE = previous
 
 
+def _build_hash_error_metadata(hash_error: Exception) -> Mapping[str, str]:
+    """Return structured metadata describing a hashing failure."""
+
+    message = str(hash_error)
+    if not message:
+        message = repr(hash_error)
+
+    return {
+        "type": type(hash_error).__name__,
+        "message": message,
+    }
+
+
 def _build_audit_log_extra(
     *,
     actor: str,
@@ -192,8 +217,13 @@ def _build_audit_log_extra(
     ip_hash: Optional[str],
     context: Optional[Mapping[str, Any]],
     hash_fallback: bool,
+    hash_error: Optional[Exception],
 ) -> dict[str, Any]:
     """Construct structured logging metadata for audit fallbacks."""
+
+    error_metadata: Optional[Mapping[str, str]] = None
+    if hash_error is not None:
+        error_metadata = _build_hash_error_metadata(hash_error)
 
     if context is not None:
         extra = dict(context)
@@ -205,9 +235,17 @@ def _build_audit_log_extra(
                 extra["audit"] = audit_copy
             else:
                 extra.setdefault("hash_fallback", True)
+        if error_metadata is not None:
+            audit_metadata = extra.get("audit")
+            if isinstance(audit_metadata, Mapping):
+                audit_copy = dict(audit_metadata)
+                audit_copy.setdefault("hash_error", error_metadata)
+                extra["audit"] = audit_copy
+            else:
+                extra.setdefault("hash_error", error_metadata)
         return extra
 
-    return {
+    audit_payload: dict[str, Any] = {
         "audit": {
             "actor": actor,
             "action": action,
@@ -219,6 +257,11 @@ def _build_audit_log_extra(
             "hash_fallback": hash_fallback,
         }
     }
+    if error_metadata is not None:
+        audit_section = audit_payload["audit"]
+        audit_section.setdefault("hash_error", error_metadata)
+
+    return audit_payload
 
 
 def log_event_with_fallback(
@@ -264,6 +307,7 @@ def log_event_with_fallback(
         ip_hash=resolved_ip_hash,
         context=context,
         hash_fallback=hash_fallback,
+        hash_error=hash_error,
     )
 
     if hash_error is not None:
