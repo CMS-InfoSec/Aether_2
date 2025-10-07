@@ -1008,3 +1008,75 @@ def test_audit_event_with_context_replaces_or_clears():
 
     unchanged = event.with_context(None)
     assert unchanged is event
+
+
+def test_audit_event_with_ip_address_resets_hash_by_default():
+    event = audit_hooks.AuditEvent(
+        actor="karl",
+        action="demo.ip",
+        entity="resource",
+        before={},
+        after={},
+        ip_address="127.0.0.1",
+        ip_hash="hashed:127.0.0.1",
+    )
+
+    updated = event.with_ip_address("10.0.0.1")
+
+    assert updated is not event
+    assert updated.ip_address == "10.0.0.1"
+    assert updated.ip_hash is None
+    # The original event remains unchanged.
+    assert event.ip_address == "127.0.0.1"
+    assert event.ip_hash == "hashed:127.0.0.1"
+
+
+def test_audit_event_with_ip_address_preserves_hash_when_requested():
+    event = audit_hooks.AuditEvent(
+        actor="lena",
+        action="demo.ip.preserve",
+        entity="resource",
+        before={},
+        after={},
+        ip_address="127.0.0.1",
+        ip_hash="hashed:127.0.0.1",
+    )
+
+    updated = event.with_ip_address("10.0.0.1", preserve_hash=True)
+
+    assert updated.ip_address == "10.0.0.1"
+    assert updated.ip_hash == "hashed:127.0.0.1"
+
+
+def test_audit_event_with_ip_address_same_value_clears_hash_when_needed():
+    event = audit_hooks.AuditEvent(
+        actor="maya",
+        action="demo.ip.same",
+        entity="resource",
+        before={},
+        after={},
+        ip_address="127.0.0.1",
+        ip_hash="stale",
+    )
+
+    updated = event.with_ip_address("127.0.0.1")
+
+    assert updated.ip_address == "127.0.0.1"
+    assert updated.ip_hash is None
+
+
+def test_audit_event_with_ip_hash_updates_immutably():
+    event = audit_hooks.AuditEvent(
+        actor="nina",
+        action="demo.ip.hash",
+        entity="resource",
+        before={},
+        after={},
+    )
+
+    updated = event.with_ip_hash("hash")
+    assert updated is not event
+    assert updated.ip_hash == "hash"
+
+    unchanged = updated.with_ip_hash("hash")
+    assert unchanged is updated

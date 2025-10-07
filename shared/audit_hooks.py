@@ -119,6 +119,38 @@ class AuditEvent:
         merged_context.update(context)
         return replace(self, context=merged_context)
 
+    def with_ip_address(
+        self,
+        ip_address: Optional[str],
+        *,
+        preserve_hash: bool = False,
+    ) -> "AuditEvent":
+        """Return a copy of the event with an updated IP address.
+
+        By default the stored ``ip_hash`` is cleared whenever the IP address is
+        changed to avoid accidentally reusing hashes derived from a different
+        address.  Callers can keep the existing hash by passing
+        ``preserve_hash=True``—useful when the hash originates from an external
+        source.  Supplying the same IP address returns the original instance
+        unless the hash needs to be cleared.
+        """
+
+        if ip_address == self.ip_address:
+            if preserve_hash or self.ip_hash is None:
+                return self
+            return replace(self, ip_hash=None)
+
+        next_hash = self.ip_hash if preserve_hash else None
+        return replace(self, ip_address=ip_address, ip_hash=next_hash)
+
+    def with_ip_hash(self, ip_hash: Optional[str]) -> "AuditEvent":
+        """Return a copy of the event with an updated IP hash."""
+
+        if ip_hash == self.ip_hash:
+            return self
+
+        return replace(self, ip_hash=ip_hash)
+
 
 @dataclass(frozen=True)
 class AuditLogResult:
