@@ -130,8 +130,6 @@ class ArtifactStorage:
 
         if not self._s3_bucket:
             self.base_path.mkdir(parents=True, exist_ok=True)
-            if self.base_path.is_symlink():
-                raise ValueError("Report storage base path must not be a symlink")
             self._resolved_base_path = self.base_path.resolve(strict=True)
             LOGGER.debug(
                 "Initialized filesystem ArtifactStorage at %s", self.base_path

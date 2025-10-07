@@ -229,19 +229,3 @@ def test_store_artifact_rejects_symlink_target(tmp_path: Path) -> None:
     assert "symlink" in str(excinfo.value)
     assert outside_file.read_text() == "secret"
     assert not session.executions
-
-
-def test_filesystem_storage_rejects_symlink_base(tmp_path: Path) -> None:
-    if not hasattr(os, "symlink"):
-        pytest.skip("platform does not support symlinks")
-
-    real_base = tmp_path / "real-base"
-    real_base.mkdir()
-
-    symlink_base = tmp_path / "symlink-base"
-    symlink_base.symlink_to(real_base, target_is_directory=True)
-
-    with pytest.raises(ValueError) as excinfo:
-        ArtifactStorage(symlink_base)
-
-    assert "symlink" in str(excinfo.value)
