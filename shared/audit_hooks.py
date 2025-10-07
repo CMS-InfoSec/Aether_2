@@ -4,20 +4,39 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from typing import Callable, Optional
+from functools import lru_cache
+from typing import Any, Callable, Mapping, Optional, Protocol
 
 
-AuditCallable = Callable[..., None]
+class AuditCallable(Protocol):
+    """Protocol describing the signature of :func:`log_audit`."""
+
+    def __call__(
+        self,
+        actor: str,
+        action: str,
+        entity: str,
+        before: Mapping[str, Any],
+        after: Mapping[str, Any],
+        ip_hash: Optional[str],
+    ) -> None:
+        """Emit an audit entry."""
+
+
 HashIpCallable = Callable[[Optional[str]], Optional[str]]
 
 
 def _hash_ip_fallback(value: Optional[str]) -> Optional[str]:
-    """Return a deterministic hash for IP values when the audit module is absent."""
+    """Mirror :func:`common.utils.audit_logger.hash_ip` when the module is absent."""
 
-    if not value:
-        return "anonymous"
-    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
-    return digest
+    if value is None:
+        return None
+
+    stripped = value.strip()
+    if not stripped:
+        return None
+
+    return hashlib.sha256(stripped.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -28,6 +47,7 @@ class AuditHooks:
     hash_ip: HashIpCallable
 
 
+@lru_cache(maxsize=1)
 def load_audit_hooks() -> AuditHooks:
     """Return the configured audit logging helpers if available.
 
@@ -36,7 +56,9 @@ def load_audit_hooks() -> AuditHooks:
     missing (for example in stripped-down test environments) the services
     should continue to function with audit logging disabled.  This helper
     encapsulates that import guard while retaining type information for
-    downstream modules.
+    downstream modules.  The resolved hooks are cached so repeated callers
+    avoid importing the optional dependency multiple times; test suites can
+    force a reload by invoking :func:`load_audit_hooks.cache_clear`.
     """
 
     try:  # pragma: no cover - import guarded for optional dependency
