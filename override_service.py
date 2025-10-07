@@ -8,7 +8,7 @@ import sys
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional
 
 from fastapi import Depends, FastAPI, Header, Query, Request, status
 from pydantic import BaseModel, Field
@@ -17,6 +17,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from shared.audit_hooks import load_audit_hooks
 from shared.postgres import normalize_sqlalchemy_dsn
 
 try:  # pragma: no cover - support alternative namespace packages
@@ -40,13 +41,9 @@ except ModuleNotFoundError:  # pragma: no cover - fallback when installed under 
         spec.loader.exec_module(security_module)
         require_admin_account = getattr(security_module, "require_admin_account")
 
-try:  # pragma: no cover - import guarded for optional dependency
-    from common.utils.audit_logger import hash_ip, log_audit
-except Exception:  # pragma: no cover - degrade gracefully if audit logger unavailable
-    log_audit = None  # type: ignore[assignment]
-
-    def hash_ip(_: Optional[str]) -> Optional[str]:  # type: ignore[override]
-        return None
+_AUDIT_HOOKS = load_audit_hooks()
+log_audit = _AUDIT_HOOKS.log
+hash_ip = _AUDIT_HOOKS.hash_ip
 
 
 LOGGER = logging.getLogger("override_service")

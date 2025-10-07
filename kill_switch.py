@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
@@ -13,14 +13,11 @@ from kill_alerts import NotificationDispatchError, dispatch_notifications
 from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
 from services.common.security import require_admin_account
 from shared.async_utils import dispatch_async
+from shared.audit_hooks import load_audit_hooks
 
-try:  # pragma: no cover - optional audit dependency
-    from common.utils.audit_logger import hash_ip, log_audit
-except Exception:  # pragma: no cover - degrade gracefully
-    log_audit = None  # type: ignore[assignment]
-
-    def hash_ip(_: Optional[str]) -> Optional[str]:  # type: ignore[override]
-        return None
+_AUDIT_HOOKS = load_audit_hooks()
+log_audit = _AUDIT_HOOKS.log
+hash_ip = _AUDIT_HOOKS.hash_ip
 
 app = FastAPI(title="Kill Switch Service")
 

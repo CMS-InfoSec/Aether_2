@@ -83,14 +83,12 @@ from services.secrets.secure_secrets import (
     SecretsMetadataStore,
 )
 from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
+from shared.audit_hooks import load_audit_hooks
 
-try:  # pragma: no cover - optional audit dependency
-    from common.utils.audit_logger import hash_ip as audit_chain_hash_ip, log_audit as chain_log_audit
-except Exception:  # pragma: no cover - degrade gracefully when audit logger unavailable
-    chain_log_audit = None  # type: ignore[assignment]
 
-    def audit_chain_hash_ip(_: Optional[str]) -> Optional[str]:  # type: ignore[override]
-        return None
+_AUDIT_HOOKS = load_audit_hooks()
+chain_log_audit = _AUDIT_HOOKS.log
+audit_chain_hash_ip = _AUDIT_HOOKS.hash_ip
 
 try:  # pragma: no cover - OMS watcher is optional in some runtimes
     from services.oms.oms_kraken import KrakenCredentialWatcher

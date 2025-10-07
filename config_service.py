@@ -9,7 +9,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Generator, Iterable, List, Optional, Set, Tuple, cast
+from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Set, Tuple, cast
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
@@ -42,13 +42,11 @@ except ModuleNotFoundError:  # pragma: no cover - fallback when installed under 
         spec.loader.exec_module(security_module)
         require_admin_account = getattr(security_module, "require_admin_account")
 
-try:  # pragma: no cover - optional audit dependency
-    from common.utils.audit_logger import hash_ip, log_audit
-except Exception:  # pragma: no cover - degrade gracefully
-    log_audit = None  # type: ignore[assignment]
+from shared.audit_hooks import load_audit_hooks
 
-    def hash_ip(_: Optional[str]) -> Optional[str]:  # type: ignore[override]
-        return None
+_AUDIT_HOOKS = load_audit_hooks()
+log_audit = _AUDIT_HOOKS.log
+hash_ip = _AUDIT_HOOKS.hash_ip
 
 
 # ---------------------------------------------------------------------------
