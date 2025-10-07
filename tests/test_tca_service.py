@@ -253,7 +253,10 @@ def test_tca_report_rejects_non_spot_symbol(
         client.app.dependency_overrides.pop(module.require_admin_account, None)
 
     assert response.status_code == 422
-    assert response.json()["detail"] == "Symbol 'BTC-PERP' is not a supported spot market instrument"
+    assert (
+        response.json()["detail"]
+        == "symbol 'BTC-PERP' is not a supported USD spot market instrument"
+    )
 
 
 def test_trade_report_persists_high_precision_fills(
