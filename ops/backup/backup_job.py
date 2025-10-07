@@ -84,6 +84,26 @@ DEFAULT_NONCE_SIZE = 12
 MANIFEST_NAME = "manifest.json"
 
 
+def _normalise_bucket_prefix(prefix: str | None) -> str:
+    """Return a sanitised S3 prefix for backup archives."""
+
+    if not prefix:
+        return ""
+
+    segments: list[str] = []
+    for raw_segment in prefix.replace("\\", "/").split("/"):
+        segment = raw_segment.strip()
+        if not segment:
+            continue
+        if segment in {".", ".."}:
+            raise ValueError("LINODE_PREFIX must not contain path traversal sequences")
+        if any(ord(char) < 32 for char in segment):
+            raise ValueError("LINODE_PREFIX must not contain control characters")
+        segments.append(segment)
+
+    return "/".join(segments)
+
+
 @dataclass
 class BackupConfig:
     """Configuration for the backup job."""
@@ -101,6 +121,9 @@ class BackupConfig:
     pg_database: Optional[str] = None
     retention_days: Optional[int] = None
     encryption_key: bytes = b""
+
+    def __post_init__(self) -> None:
+        self.bucket_prefix = _normalise_bucket_prefix(self.bucket_prefix)
 
     @classmethod
     def from_env(cls) -> "BackupConfig":
