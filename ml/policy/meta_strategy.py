@@ -23,6 +23,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 from services.common.security import require_admin_account
+from services.common.spot import require_spot_http
 
 logger = logging.getLogger(__name__)
 
@@ -276,17 +277,19 @@ def get_strategy_weights(
     have not yet observed the requested symbol.
     """
 
+    normalized = require_spot_http(symbol, logger=logger)
+
     try:
-        allocation = _allocator.get_allocation(symbol)
+        allocation = _allocator.get_allocation(normalized)
     except KeyError as exc:  # pragma: no cover - HTTP layer
         logger.warning(
             "Meta strategy allocation missing",
-            extra={"symbol": symbol, "account_id": admin_account},
+            extra={"symbol": normalized, "account_id": admin_account},
         )
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     audit_details = {
-        "symbol": allocation.get("symbol", symbol),
+        "symbol": allocation.get("symbol", normalized),
         "regime": allocation.get("regime"),
         "weights": dict(allocation.get("weights", {})),
         "account_id": admin_account,
