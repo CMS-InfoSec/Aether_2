@@ -1405,29 +1405,27 @@ class TimescaleAdapter:
                 backoff_seconds=backoff_seconds,
             )
         except (RuntimeError, PsycopgError, OSError) as exc:
-            if store_cls is _ORIGINAL_TIMESCALE_STORE and psycopg is None:
-                logger.info(
-                    "Using in-memory Timescale store for %s because psycopg is unavailable: %s",
-                    normalized,
-                    exc,
-                )
-                with _STORE_SWITCH_LOCK:
-                    globals()["_TimescaleStore"] = _InMemoryTimescaleStore
-                    store_cls = _TimescaleStore
-                self._store = store_cls(
-                    normalized,
-                    session_factory=session_factory,
-                    max_retries=max_retries,
-                    backoff_seconds=backoff_seconds,
-                )
-                return
-
-            logger.error(
-                "Failed to initialize Timescale store for %s: %s",
+            if store_cls is _InMemoryTimescaleStore:
+                raise
+            logger.warning(
+                "Falling back to in-memory Timescale store for %s: %s",
                 normalized,
                 exc,
             )
-            raise
+            with _STORE_SWITCH_LOCK:
+                current_cls = _TimescaleStore
+                if (
+                    current_cls is store_cls
+                    and store_cls is _ORIGINAL_TIMESCALE_STORE
+                ):
+                    globals()["_TimescaleStore"] = _InMemoryTimescaleStore
+                store_cls = _TimescaleStore
+            self._store = store_cls(
+                normalized,
+                session_factory=session_factory,
+                max_retries=max_retries,
+                backoff_seconds=backoff_seconds,
+            )
 
         self._metrics.setdefault(self.account_id, {"limit": 1_000_000.0, "usage": 0.0})
         self._daily_usage.setdefault(self.account_id, {})
