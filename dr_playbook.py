@@ -92,6 +92,8 @@ class DisasterRecoveryConfig:
                 "Missing required environment variables: " + ", ".join(missing)
             )
 
+        work_dir = _resolve_work_dir(os.environ.get("DR_WORK_DIR"))
+
         config = cls(
             timescale_dsn=timescale_dsn,
             redis_url=redis_url,
@@ -104,8 +106,7 @@ class DisasterRecoveryConfig:
                 "DR_OBJECT_STORE_ENDPOINT_URL"
             ),
             object_store_region=os.environ.get("DR_OBJECT_STORE_REGION"),
-            work_dir=Path(os.environ.get("DR_WORK_DIR", tempfile.gettempdir()))
-            / "aether-dr",
+            work_dir=work_dir,
             mlflow_restore_path=(
                 Path(os.environ["DR_MLFLOW_RESTORE_PATH"])
                 if "DR_MLFLOW_RESTORE_PATH" in os.environ
@@ -146,6 +147,29 @@ def _parse_redis_url(url: str) -> Dict[str, Any]:
         "password": parsed.password,
         "ssl": parsed.scheme == "rediss",
     }
+
+
+def _resolve_work_dir(raw: Optional[str]) -> Path:
+    """Return a safe working directory for DR artifacts.
+
+    The directory is derived from ``raw`` (or ``tempfile.gettempdir()`` when unset)
+    and must be absolute, free from symlinked ancestors, and point to a directory
+    when it already exists.
+    """
+
+    base = Path(raw).expanduser() if raw else Path(tempfile.gettempdir())
+    if not base.is_absolute():
+        base = Path.cwd() / base
+
+    _ensure_no_symlink_ancestors(base, context="DR_WORK_DIR")
+
+    resolved = base.resolve()
+    if resolved.exists() and not resolved.is_dir():
+        raise ValueError("DR_WORK_DIR must reference a directory")
+
+    work_dir = resolved / "aether-dr"
+    _ensure_no_symlink_ancestors(work_dir, context="DR_WORK_DIR")
+    return work_dir
 
 
 def _build_object_store_client(config: DisasterRecoveryConfig):
@@ -376,12 +400,12 @@ def _restore_redis_state(config: DisasterRecoveryConfig, snapshot: Path) -> None
     LOGGER.info("Redis restore complete")
 
 
-def _ensure_no_symlink_ancestors(path: Path) -> None:
+def _ensure_no_symlink_ancestors(path: Path, *, context: str) -> None:
     """Raise ``ValueError`` if ``path`` or any existing ancestor is a symlink."""
 
     for ancestor in (path,) + tuple(path.parents):
         if ancestor.exists() and ancestor.is_symlink():
-            raise ValueError("MLflow restore path must not reference symlinks")
+            raise ValueError(f"{context} must not reference symlinked directories")
 
 
 def _restore_mlflow_artifacts(config: DisasterRecoveryConfig, archive: Path) -> None:
@@ -394,7 +418,7 @@ def _restore_mlflow_artifacts(config: DisasterRecoveryConfig, archive: Path) -> 
     if not target_path.is_absolute():
         raise ValueError("MLflow restore path must be absolute")
 
-    _ensure_no_symlink_ancestors(target_path)
+    _ensure_no_symlink_ancestors(target_path, context="MLflow restore path")
 
     LOGGER.info("Restoring MLflow artifacts to %s", target_path)
     if target_path.exists():
