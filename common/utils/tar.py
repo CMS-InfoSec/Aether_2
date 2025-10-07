@@ -32,6 +32,7 @@ def safe_extract_tar(archive: tarfile.TarFile, destination: Path) -> None:
 
     destination_resolved = destination.resolve(strict=True)
     members = archive.getmembers()
+    sanitised_members = []
 
     for member in members:
         if not (member.isfile() or member.isdir()):
@@ -50,7 +51,30 @@ def safe_extract_tar(archive: tarfile.TarFile, destination: Path) -> None:
         except ValueError as exc:  # pragma: no cover - defensive programming
             raise ValueError("Tar archive entry escapes extraction directory") from exc
 
-    archive.extractall(path=destination_resolved)
+        updates: dict[str, object] = {}
+        mode = member.mode
+        if mode is not None:
+            mode &= 0o755
+            if member.isfile():
+                if not mode & 0o100:
+                    mode &= ~0o111
+                mode |= 0o600
+            else:
+                mode = None
+
+            if mode != member.mode:
+                updates["mode"] = mode
+
+        for attr in ("uid", "gid", "uname", "gname"):
+            if getattr(member, attr) is not None:
+                updates[attr] = None
+
+        if updates:
+            member = member.replace(**updates, deep=False)
+
+        sanitised_members.append(member)
+
+    archive.extractall(path=destination_resolved, members=sanitised_members)
 
 
 __all__ = ["safe_extract_tar"]
