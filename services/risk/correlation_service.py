@@ -32,6 +32,7 @@ from sqlalchemy.pool import StaticPool
 
 from services.alert_manager import AlertManager, RiskEvent, get_alert_metrics
 from shared.postgres import normalize_sqlalchemy_dsn
+from shared.spot import filter_spot_symbols
 
 
 logger = logging.getLogger(__name__)
@@ -115,10 +116,17 @@ def _tracked_symbols() -> Sequence[str]:
         "RISK_CORRELATION_SYMBOLS",
         "BTC-USD,ETH-USD,SOL-USD,ADA-USD",
     )
-    symbols = [symbol.strip() for symbol in configured.split(",") if symbol.strip()]
-    if not symbols:
-        symbols = ["BTC-USD", "ETH-USD"]
-    return tuple(dict.fromkeys(symbols))
+    configured_symbols = [symbol.strip() for symbol in configured.split(",") if symbol.strip()]
+
+    filtered = filter_spot_symbols(configured_symbols, logger=logger)
+    if not filtered:
+        logger.warning(
+            "Risk correlation service defaulting tracked symbols to BTC-USD and ETH-USD",
+            extra={"configured_symbols": configured_symbols or None},
+        )
+        filtered = ["BTC-USD", "ETH-USD"]
+
+    return tuple(filtered)
 
 
 def _staleness_threshold() -> timedelta:
