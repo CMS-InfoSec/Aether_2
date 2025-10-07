@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 try:  # pragma: no cover - fastapi is optional for unit tests
-    from fastapi import APIRouter, Depends, FastAPI, HTTPException
+    from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 except ModuleNotFoundError:  # pragma: no cover - fallback stub for tests
     class HTTPException(Exception):
         def __init__(self, status_code: int, detail: str) -> None:
@@ -51,7 +51,7 @@ except ModuleNotFoundError:  # pragma: no cover - fallback stub for tests
 
 from prometheus_client import CollectorRegistry, Counter
 
-from services.common.security import require_admin_account
+from services.common.security import ensure_admin_access
 
 if TYPE_CHECKING:
     import httpx
@@ -362,17 +362,19 @@ def get_alert_dedupe_service() -> AlertDedupeService:
 
 @router.get("/active")
 async def get_active_alerts(
-    _: str = Depends(require_admin_account),
+    request: Request,
     service: AlertDedupeService = Depends(get_alert_dedupe_service),
 ) -> List[Dict[str, Any]]:
+    await ensure_admin_access(request, forbid_on_missing_token=True)
     return await service.refresh()
 
 
 @router.get("/policies")
-def get_alert_policies(
-    _: str = Depends(require_admin_account),
+async def get_alert_policies(
+    request: Request,
     service: AlertDedupeService = Depends(get_alert_dedupe_service),
 ) -> Dict[str, Any]:
+    await ensure_admin_access(request, forbid_on_missing_token=True)
     return service.policies()
 
 
