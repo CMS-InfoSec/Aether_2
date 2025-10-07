@@ -37,6 +37,28 @@ DEFAULT_OMS_LOG_DIR = Path("/var/log/aether/oms_log")
 DEFAULT_TCA_REPORT_DIR = Path("/var/log/aether/tca_reports")
 
 
+def _ensure_safe_directory(path: Path, env_var: str) -> Path:
+    """Validate that *path* is an absolute, traversal-free directory reference.
+
+    Paths supplied via environment variables participate directly in filesystem
+    archival routines.  Guard against directory escape by requiring absolute
+    paths, prohibiting ".." segments, and rejecting symlink-backed ancestors.
+    """
+
+    if not path.is_absolute():
+        raise ValueError(f"{env_var} must be an absolute path")
+    if any(part == ".." for part in path.parts):
+        raise ValueError(f"{env_var} must not contain parent directory references")
+
+    for ancestor in (path,) + tuple(path.parents):
+        # ``Path.is_symlink`` safely handles non-existent elements and raises no
+        # exceptions when intermediate directories are missing.
+        if ancestor.is_symlink():
+            raise ValueError(f"{env_var} must not reference symlinked directories")
+
+    return path
+
+
 @dataclass(frozen=True)
 class ArchiveRecord:
     """Metadata recorded for each log archive exported to object storage."""
@@ -113,10 +135,22 @@ class RetentionConfig:
         endpoint_url = os.getenv("RETENTION_ENDPOINT")
         storage_class = os.getenv("RETENTION_STORAGE_CLASS")
 
-        snapshot_dir = Path(os.getenv("PROMETHEUS_SNAPSHOT_DIR", str(DEFAULT_PROMETHEUS_SNAPSHOT_DIR)))
-        audit_dir = Path(os.getenv("AUDIT_LOG_DIR", str(DEFAULT_AUDIT_LOG_DIR)))
-        oms_dir = Path(os.getenv("OMS_LOG_DIR", str(DEFAULT_OMS_LOG_DIR)))
-        tca_dir = Path(os.getenv("TCA_REPORT_DIR", str(DEFAULT_TCA_REPORT_DIR)))
+        snapshot_dir = _ensure_safe_directory(
+            Path(os.getenv("PROMETHEUS_SNAPSHOT_DIR", str(DEFAULT_PROMETHEUS_SNAPSHOT_DIR))),
+            "PROMETHEUS_SNAPSHOT_DIR",
+        )
+        audit_dir = _ensure_safe_directory(
+            Path(os.getenv("AUDIT_LOG_DIR", str(DEFAULT_AUDIT_LOG_DIR))),
+            "AUDIT_LOG_DIR",
+        )
+        oms_dir = _ensure_safe_directory(
+            Path(os.getenv("OMS_LOG_DIR", str(DEFAULT_OMS_LOG_DIR))),
+            "OMS_LOG_DIR",
+        )
+        tca_dir = _ensure_safe_directory(
+            Path(os.getenv("TCA_REPORT_DIR", str(DEFAULT_TCA_REPORT_DIR))),
+            "TCA_REPORT_DIR",
+        )
 
         return cls(
             prometheus_url=prometheus_url,

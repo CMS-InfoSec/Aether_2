@@ -6,11 +6,15 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
+from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from taxlots import (
     CostBasisMethod,
     TaxLot,
     TaxLotCreate,
+    app,
+    store,
     _quantize_usd,
     _realized_average,
     _realized_fifo_lifo,
@@ -70,6 +74,49 @@ def test_taxlot_create_parses_decimal_strings() -> None:
     assert domain.symbol == "BTC-USD"
     assert domain.qty == Decimal("0.00000051")
     assert domain.price == Decimal("31000.12345678")
+
+
+def test_taxlot_create_rejects_non_spot_symbol() -> None:
+    """Derivatives or leveraged pairs should be rejected during validation."""
+
+    with pytest.raises(ValidationError) as excinfo:
+        TaxLotCreate(
+            account_id="acct-kraken",
+            symbol="btc-perp",
+            qty="0.1",
+            price="27000",
+            ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        )
+
+    assert "Only spot market instruments are supported" in str(excinfo.value)
+
+
+def test_realized_endpoint_rejects_non_spot_symbol_filter() -> None:
+    """HTTP filter parameters must also comply with the spot-only policy."""
+
+    store._lots.clear()
+    lot = TaxLotCreate(
+        account_id="acct-kraken",
+        symbol="eth/usd",
+        qty="0.5",
+        price="1800",
+        ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
+    ).to_domain()
+    store.add(lot)
+
+    client = TestClient(app)
+    response = client.get(
+        "/taxlots/realized",
+        params={
+            "account_id": "acct-kraken",
+            "symbol": "eth-perp",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "symbol 'ETH-PERP' is not a supported USD spot market instrument"
+
+    store._lots.clear()
 
 
 def test_fifo_precision_matches_decimal_math(high_precision_lots: list[TaxLot]) -> None:

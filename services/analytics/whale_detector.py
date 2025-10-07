@@ -1,6 +1,7 @@
 """Whale trade detection and toxic flow analytics service."""
 from __future__ import annotations
 
+import logging
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -8,9 +9,14 @@ from threading import Lock
 from typing import Deque, Dict, Iterable, Literal, Optional
 
 from fastapi import Depends, FastAPI, Query
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from services.common.security import require_admin_account
+from services.common.spot import require_spot_http
+from shared.spot import require_spot_symbol
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _utcnow() -> datetime:
@@ -62,6 +68,13 @@ class TradeObservation(BaseModel):
         default=None,
         description="Execution timestamp. Defaults to current UTC time if omitted.",
     )
+
+    @field_validator("symbol")
+    @classmethod
+    def _validate_symbol(cls, value: str) -> str:
+        """Normalise and enforce USD spot instruments for inbound trades."""
+
+        return require_spot_symbol(value)
 
 
 class WhaleEventResponse(BaseModel):
@@ -137,9 +150,13 @@ class WhaleDetector:
     def recent_events(self, symbol: Optional[str] = None, limit: int = 50) -> list[WhaleEvent]:
         """Return the most recent whale events across symbols."""
 
+        canonical_symbol: Optional[str] = None
+        if symbol is not None:
+            canonical_symbol = require_spot_symbol(symbol)
+
         with self._lock:
-            if symbol is not None:
-                events = list(self._events.get(symbol, tuple()))
+            if canonical_symbol is not None:
+                events = list(self._events.get(canonical_symbol, tuple()))
             else:
                 events = [event for queue in self._events.values() for event in queue]
 
@@ -149,8 +166,9 @@ class WhaleDetector:
     def latest_toxic_metric(self, symbol: str) -> Optional[ToxicFlowMetric]:
         """Return the latest toxic flow metric for a symbol, if any."""
 
+        canonical_symbol = require_spot_symbol(symbol)
         with self._lock:
-            queue = self._metrics.get(symbol)
+            queue = self._metrics.get(canonical_symbol)
             if not queue:
                 return None
             return queue[-1]
@@ -158,9 +176,13 @@ class WhaleDetector:
     def iter_metrics(self, symbol: Optional[str] = None) -> Iterable[ToxicFlowMetric]:
         """Yield toxic flow metrics for a symbol or all symbols."""
 
+        canonical_symbol: Optional[str] = None
+        if symbol is not None:
+            canonical_symbol = require_spot_symbol(symbol)
+
         with self._lock:
-            if symbol is not None:
-                yield from list(self._metrics.get(symbol, tuple()))
+            if canonical_symbol is not None:
+                yield from list(self._metrics.get(canonical_symbol, tuple()))
             else:
                 for metrics in self._metrics.values():
                     yield from list(metrics)
@@ -241,5 +263,9 @@ async def recent_whales(
 ) -> list[WhaleEventResponse]:
     """Return recently observed whale trades, optionally filtered by symbol."""
 
-    events = detector.recent_events(symbol=symbol, limit=limit)
+    canonical_symbol: Optional[str] = None
+    if symbol is not None:
+        canonical_symbol = require_spot_http(symbol, logger=LOGGER)
+
+    events = detector.recent_events(symbol=canonical_symbol, limit=limit)
     return [WhaleEventResponse.model_validate(event) for event in events]
