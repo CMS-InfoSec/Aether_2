@@ -42,6 +42,30 @@ class MissingArtifactError(RuntimeError):
     """Raised when an expected artefact directory or file is absent."""
 
 
+def _normalise_storage_prefix(prefix: str | None) -> str:
+    """Return a sanitised S3 prefix for knowledge pack uploads."""
+
+    if not prefix:
+        return ""
+
+    segments: list[str] = []
+    for raw_segment in prefix.replace("\\", "/").split("/"):
+        segment = raw_segment.strip()
+        if not segment:
+            continue
+        if segment in {".", ".."}:
+            raise ValueError(
+                "Knowledge pack prefix must not contain path traversal sequences"
+            )
+        if any(ord(char) < 32 or ord(char) == 127 for char in segment):
+            raise ValueError(
+                "Knowledge pack prefix must not contain control characters"
+            )
+        segments.append(segment)
+
+    return "/".join(segments)
+
+
 @dataclass(frozen=True)
 class ObjectStorageConfig:
     """Configuration for interacting with object storage."""
@@ -49,6 +73,10 @@ class ObjectStorageConfig:
     bucket: str
     prefix: str = "knowledge-packs"
     endpoint_url: str | None = None
+
+    def __post_init__(self) -> None:
+        normalised_prefix = _normalise_storage_prefix(self.prefix)
+        object.__setattr__(self, "prefix", normalised_prefix)
 
 
 @dataclass(frozen=True)
@@ -202,10 +230,6 @@ def resolve_inputs() -> PackInputs:
     )
 
 
-def _normalise_prefix(prefix: str) -> str:
-    return prefix.strip("/")
-
-
 def _tarball_contents(inputs: PackInputs, output_path: Path) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with tarfile.open(output_path, "w:gz") as tar:
@@ -294,10 +318,9 @@ class KnowledgePackRepository:
 
 
 def _object_key(config: ObjectStorageConfig, output_file: Path) -> str:
-    prefix = _normalise_prefix(config.prefix)
     filename = output_file.name
-    if prefix:
-        return f"{prefix}/{filename}"
+    if config.prefix:
+        return f"{config.prefix}/{filename}"
     return filename
 
 

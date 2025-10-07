@@ -44,6 +44,22 @@ class FakeS3Client:
         return f"https://example.com/{Params['Key']}?ttl={ExpiresIn}"
 
 
+def test_object_storage_config_normalises_prefix() -> None:
+    config = pack_exporter.ObjectStorageConfig(bucket="bucket", prefix=" packs\\exports /2024 ")
+
+    assert config.prefix == "packs/exports/2024"
+
+
+def test_object_storage_config_rejects_traversal_prefix() -> None:
+    with pytest.raises(ValueError, match="path traversal"):
+        pack_exporter.ObjectStorageConfig(bucket="bucket", prefix="../secrets")
+
+
+def test_object_storage_config_rejects_control_characters() -> None:
+    with pytest.raises(ValueError, match="control characters"):
+        pack_exporter.ObjectStorageConfig(bucket="bucket", prefix="invalid\nprefix")
+
+
 @pytest.fixture()
 def fake_s3(monkeypatch: pytest.MonkeyPatch) -> FakeS3Client:
     client = FakeS3Client()
