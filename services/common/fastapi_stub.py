@@ -405,8 +405,9 @@ class FastAPI:
 
         return decorator
 
-    def on_event(self, *_: Any, **__: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def on_event(self, event_type: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+            self.add_event_handler(event_type, func)
             return func
 
         return decorator
@@ -689,11 +690,27 @@ class TestClient:
 
     def __init__(self, app: FastAPI) -> None:
         self.app = app
+        self._lifespan_cm = None
 
     def __enter__(self) -> "TestClient":  # pragma: no cover - simple context protocol
+        lifespan_factory = getattr(self.app.router, "lifespan_context", None)
+        if lifespan_factory is not None:
+            self._lifespan_cm = lifespan_factory(self.app)
+            enter = getattr(self._lifespan_cm, "__aenter__", None)
+            if enter is not None:
+                _run_async(enter())
+        for handler in self.app.event_handlers.get("startup", []):
+            _run_async(handler())
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:  # pragma: no cover - simple context protocol
+        for handler in reversed(self.app.event_handlers.get("shutdown", [])):
+            _run_async(handler())
+        if self._lifespan_cm is not None:
+            exit_ = getattr(self._lifespan_cm, "__aexit__", None)
+            if exit_ is not None:
+                _run_async(exit_(exc_type, exc, tb))
+        self._lifespan_cm = None
         return False
 
     def _build_request(
