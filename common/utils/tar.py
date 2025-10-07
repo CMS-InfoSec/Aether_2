@@ -50,7 +50,7 @@ def safe_extract_tar(archive: tarfile.TarFile, destination: Path) -> None:
         except ValueError as exc:  # pragma: no cover - defensive programming
             raise ValueError("Tar archive entry escapes extraction directory") from exc
 
-    archive.extractall(path=destination_resolved, filter="data")
+    archive.extractall(path=destination_resolved)
 
 
 __all__ = ["safe_extract_tar"]
