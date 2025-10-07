@@ -10,7 +10,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import httpx
 
@@ -27,10 +27,12 @@ from services.secrets.signing import sign_kraken_request
 try:  # pragma: no cover - optional audit dependency
     from common.utils.audit_logger import hash_ip, log_audit
 except Exception:  # pragma: no cover - degrade gracefully
-    log_audit = None  # type: ignore[assignment]
+    log_audit: Callable[..., None] | None = None
 
-    def hash_ip(_: Optional[str]) -> Optional[str]:  # type: ignore[override]
+    def _hash_ip_passthrough(value: Optional[str]) -> Optional[str]:
         return None
+
+    hash_ip = _hash_ip_passthrough
 
 
 LOGGER = logging.getLogger(__name__)
