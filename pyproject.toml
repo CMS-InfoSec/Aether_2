@@ -115,7 +115,7 @@ select = ["E402", "F401", "F402", "F811", "F841"]
 "tests/**" = ["E402"]
 
 [tool.mypy]
-files = ["training_service.py"]
+files = ["training_service.py", "pg_session.py"]
 exclude = [
     "data/migrations/env.py",
     "data/alembic/env.py",
