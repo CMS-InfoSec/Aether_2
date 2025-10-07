@@ -22,7 +22,7 @@ class _StubTimescaleAdapter:
             "BTC-USD": 25_000.0,
             "ETH/USD": 50_000.0,
             "ETH-PERP": 12_500.0,
-            "ADAUP-USDT": 5_000.0,
+            "ADAUP-USD": 5_000.0,
         }
 
     def record_cvar_result(

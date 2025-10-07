@@ -10,12 +10,14 @@ kept intentionally simple so it can be swapped out for a real object store
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Protocol
 
 LOGGER = logging.getLogger(__name__)
@@ -113,10 +115,11 @@ class ArtifactStorage:
         s3_prefix: str = "",
         s3_client: Any | None = None,
     ) -> None:
-        self.base_path = Path(base_path or "/tmp/aether-reports")
+        self.base_path = Path(base_path or "/tmp/aether-reports").expanduser()
         self._s3_bucket = s3_bucket
         self._s3_prefix = s3_prefix.strip("/")
         self._s3_client = s3_client
+        self._resolved_base_path: Path | None = None
 
         if self._s3_bucket and self._s3_client is None:
             try:  # pragma: no cover - optional dependency
@@ -127,6 +130,7 @@ class ArtifactStorage:
 
         if not self._s3_bucket:
             self.base_path.mkdir(parents=True, exist_ok=True)
+            self._resolved_base_path = self.base_path.resolve(strict=True)
             LOGGER.debug(
                 "Initialized filesystem ArtifactStorage at %s", self.base_path
             )
@@ -142,8 +146,93 @@ class ArtifactStorage:
     # Internal helpers
 
     def _canonical_key(self, account_id: str, object_key: str) -> str:
-        parts = [part.strip("/") for part in (account_id, object_key) if part]
-        return "/".join(parts)
+        """Return a normalised storage key while rejecting traversal attempts."""
+
+        segments: list[str] = []
+
+        def _extend_from(part: str | Path, *, label: str) -> None:
+            raw = str(part or "")
+            if not raw:
+                return
+
+            # Normalise Windows style separators so downstream checks operate on a
+            # consistent delimiter set.
+            sanitized = raw.replace("\\", "/")
+            tokens = [token.strip("/") for token in sanitized.split("/") if token.strip("/")]
+
+            for token in tokens:
+                if not token:
+                    continue
+                if token in {".", ".."}:
+                    raise ValueError(
+                        f"{label} must not contain path traversal sequences"
+                    )
+                segments.append(token)
+
+        _extend_from(account_id, label="account_id")
+        _extend_from(object_key, label="object_key")
+
+        if not segments:
+            raise ValueError("object_key must be provided")
+
+        canonical = PurePosixPath(*segments)
+        if canonical.is_absolute() or any(part in {".", ".."} for part in canonical.parts):
+            raise ValueError("account_id and object_key must reference relative paths")
+
+        return "/".join(canonical.parts)
+
+    def _assert_within_base(self, candidate: Path) -> None:
+        """Ensure *candidate* resolves inside the configured base directory."""
+
+        if self._resolved_base_path is None:
+            return
+
+        if candidate.exists() and candidate.is_symlink():
+            raise ValueError("Refusing to write artifact to symlinked path")
+
+        resolved = candidate.resolve(strict=False)
+        try:
+            resolved.relative_to(self._resolved_base_path)
+        except ValueError as exc:  # pragma: no cover - defensive guard
+            raise ValueError("Resolved artifact path escapes storage base directory") from exc
+
+    @staticmethod
+    def _ensure_directory(path: Path) -> None:
+        """Create directory ``path`` if needed, disallowing symlink traversal."""
+
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except FileExistsError as exc:
+            raise ValueError("Artifact parent path must be a directory") from exc
+
+    @staticmethod
+    def _ensure_no_symlink(path: Path) -> None:
+        if path.exists() and path.is_symlink():
+            raise ValueError("Refusing to write artifact to symlinked path")
+
+    def _write_bytes_secure(self, path: Path, payload: bytes) -> None:
+        """Write *payload* to ``path`` while guarding against symlink abuse."""
+
+        self._ensure_no_symlink(path)
+
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        mode = 0o600
+
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW  # pragma: no cover - platform specific branch
+
+        try:
+            fd = os.open(path, flags, mode)
+        except AttributeError:  # pragma: no cover - Windows / limited platforms
+            path.write_bytes(payload)
+            return
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.EPERM}:
+                raise ValueError("Refusing to write artifact to symlinked path") from exc
+            raise
+
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
 
     def _s3_key(self, canonical_key: str) -> str:
         if not self._s3_prefix:
@@ -195,12 +284,20 @@ class ArtifactStorage:
         target_descriptor: str
 
         if not self._s3_bucket:
-            target_path = self.base_path / canonical_key
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            target_path.write_bytes(data)
+            assert self._resolved_base_path is not None
+            target_path = self.base_path.joinpath(*Path(canonical_key).parts)
+
+            parent = target_path.parent
+            self._assert_within_base(parent)
+            self._ensure_directory(parent)
+            self._assert_within_base(target_path)
+            self._write_bytes_secure(target_path, data)
+
             checksum_path = target_path.with_name(target_path.name + ".sha256")
-            checksum_path.write_bytes(
-                self._checksum_payload(canonical_key, checksum)
+            self._assert_within_base(checksum_path)
+            self._write_bytes_secure(
+                checksum_path,
+                self._checksum_payload(canonical_key, checksum),
             )
             target_descriptor = str(target_path)
             LOGGER.info(
