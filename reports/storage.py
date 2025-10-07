@@ -116,6 +116,8 @@ class ArtifactStorage:
         s3_client: Any | None = None,
     ) -> None:
         self.base_path = Path(base_path or "/tmp/aether-reports").expanduser()
+        if not self.base_path.is_absolute():
+            raise ValueError("Report storage base path must be absolute")
         self._s3_bucket = s3_bucket
         self._s3_prefix = self._validate_s3_prefix(s3_prefix)
         self._s3_client = s3_client
@@ -130,8 +132,7 @@ class ArtifactStorage:
 
         if not self._s3_bucket:
             self.base_path.mkdir(parents=True, exist_ok=True)
-            if self.base_path.is_symlink():
-                raise ValueError("Report storage base path must not be a symlink")
+            self._ensure_no_symlink_ancestors(self.base_path)
             self._resolved_base_path = self.base_path.resolve(strict=True)
             LOGGER.debug(
                 "Initialized filesystem ArtifactStorage at %s", self.base_path
@@ -233,6 +234,14 @@ class ArtifactStorage:
             path.mkdir(parents=True, exist_ok=True)
         except FileExistsError as exc:
             raise ValueError("Artifact parent path must be a directory") from exc
+
+    @staticmethod
+    def _ensure_no_symlink_ancestors(path: Path) -> None:
+        """Raise ``ValueError`` when any ancestor of ``path`` is a symlink."""
+
+        for ancestor in (path, *path.parents):
+            if ancestor.exists() and ancestor.is_symlink():
+                raise ValueError("Report storage base path must not reference symlinks")
 
     @staticmethod
     def _ensure_no_symlink(path: Path) -> None:
