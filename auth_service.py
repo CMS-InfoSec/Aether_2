@@ -54,19 +54,90 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Any, Dict, Literal, Mapping, Optional
 
-import httpx
-import pyotp
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
+
+try:  # pragma: no cover - optional dependency used in production
+    import httpx
+except ImportError:  # pragma: no cover - exercised in unit-only environments
+    class _MissingHTTPX(SimpleNamespace):
+        def __getattr__(self, name: str) -> Any:
+            raise RuntimeError("httpx is required for auth_service network operations")
+
+    httpx = _MissingHTTPX()
+
+try:  # pragma: no cover - optional dependency used in production
+    import pyotp
+except ImportError:  # pragma: no cover - exercised in unit-only environments
+    class _MissingPyOTP(SimpleNamespace):
+        def __getattr__(self, name: str) -> Any:
+            raise RuntimeError("pyotp is required for auth_service MFA operations")
+
+    pyotp = _MissingPyOTP()
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, HttpUrl
-from sqlalchemy import Boolean, Column, DateTime, String, create_engine
-from sqlalchemy.engine import Engine
-from sqlalchemy.engine.url import make_url
-from sqlalchemy.orm import Session as OrmSession
-from sqlalchemy.orm import declarative_base, sessionmaker
+
+_SQLALCHEMY_AVAILABLE = True
+
+try:  # pragma: no cover - optional dependency used in production
+    from sqlalchemy import Boolean, Column, DateTime, String, create_engine
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.engine.url import make_url
+    from sqlalchemy.orm import Session as OrmSession
+    from sqlalchemy.orm import declarative_base, sessionmaker
+except ImportError:  # pragma: no cover - exercised in unit-only environments
+    _SQLALCHEMY_AVAILABLE = False
+    Engine = Any  # type: ignore[assignment]
+
+    class OrmSession(SimpleNamespace):
+        pass
+
+    def _missing_sqlalchemy(*_: Any, **__: Any) -> None:
+        raise RuntimeError("SQLAlchemy is required for the auth service database layer")
+
+    def create_engine(*args: Any, **kwargs: Any):  # type: ignore[override]
+        _missing_sqlalchemy(*args, **kwargs)
+
+    def make_url(url: str):  # type: ignore[override]
+        _missing_sqlalchemy(url)
+
+    def declarative_base() -> Any:  # type: ignore[override]
+        metadata = SimpleNamespace(schema=None, create_all=lambda *args, **kwargs: None)
+
+        class _Base:
+            pass
+
+        _Base.metadata = metadata  # type: ignore[attr-defined]
+        return _Base
+
+    def sessionmaker(*args: Any, **kwargs: Any):  # type: ignore[override]
+        def _factory(*_: Any, **__: Any) -> OrmSession:
+            raise RuntimeError("SQLAlchemy sessionmaker is unavailable")
+
+        return _factory
+
+    class Column:  # type: ignore[override]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.args = args
+            self.kwargs = kwargs
+
+    class Boolean:  # type: ignore[override]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.args = args
+            self.kwargs = kwargs
+
+    class DateTime:  # type: ignore[override]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.args = args
+            self.kwargs = kwargs
+
+    class String:  # type: ignore[override]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.args = args
+            self.kwargs = kwargs
 
 from services.auth import jwt_tokens
 from shared.postgres import normalize_postgres_dsn, normalize_postgres_schema
@@ -262,7 +333,8 @@ class SessionRepository:
 
 
 # Attempt to initialise configuration eagerly when the environment is already populated.
-_initialise_database()
+if _SQLALCHEMY_AVAILABLE:
+    _initialise_database()
 _initialise_jwt_secret()
 
 
