@@ -336,12 +336,54 @@ class RetentionArchiver:
                 LOGGER.debug("Failed to remove temporary archive %s", temp_path, exc_info=True)
 
     def _select_files(self, directory: Path, cutoff: dt.datetime) -> Iterable[Path]:
-        for path in directory.rglob("*"):
-            if not path.is_file():
-                continue
-            modified = dt.datetime.fromtimestamp(path.stat().st_mtime, tz=dt.timezone.utc)
-            if modified <= cutoff:
-                yield path
+        """Yield files under *directory* that are older than *cutoff*.
+
+        The walk intentionally refuses to follow or archive symlinked entries so
+        that attackers cannot smuggle arbitrary filesystem contents (for
+        example, ``/etc/passwd``) into the retention bundle by dropping
+        symlinks into the log directory.  Any file that ultimately resolves
+        outside the directory tree is ignored with an audit log warning.
+        """
+
+        root = directory.resolve()
+        for current_root, _, files in os.walk(directory, followlinks=False):
+            current_path = Path(current_root)
+            for name in files:
+                path = current_path / name
+                if path.is_symlink():
+                    LOGGER.warning(
+                        "Skipping symlinked file %s while archiving %s", path, directory
+                    )
+                    continue
+
+                try:
+                    resolved = path.resolve(strict=True)
+                except FileNotFoundError:
+                    LOGGER.warning(
+                        "Skipping %s because it disappeared during retention scan", path
+                    )
+                    continue
+
+                try:
+                    resolved.relative_to(root)
+                except ValueError:
+                    LOGGER.warning(
+                        "Skipping %s because it resolves outside of %s", path, directory
+                    )
+                    continue
+
+                try:
+                    modified = dt.datetime.fromtimestamp(
+                        resolved.stat().st_mtime, tz=dt.timezone.utc
+                    )
+                except FileNotFoundError:
+                    LOGGER.warning(
+                        "Skipping %s because it disappeared during retention scan", path
+                    )
+                    continue
+
+                if modified <= cutoff:
+                    yield path
 
     def _create_archive(self, destination: Path, root: Path, files: Iterable[Path]) -> int:
         size_bytes = 0

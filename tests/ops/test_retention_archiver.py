@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import datetime as dt
 from pathlib import Path
 
 import pytest
 
-from ops.logging.retention_archiver import RetentionConfig
+from ops.logging.retention_archiver import RetentionArchiver, RetentionConfig
 
 
 def _set_required_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -113,3 +114,53 @@ def test_from_env_rejects_prefix_control_chars(
 
     with pytest.raises(ValueError, match="control characters"):
         RetentionConfig.from_env()
+
+
+def _make_archiver() -> RetentionArchiver:
+    archiver = RetentionArchiver.__new__(RetentionArchiver)
+    archiver.config = None  # type: ignore[assignment]
+    archiver.status = None  # type: ignore[assignment]
+    return archiver
+
+
+def test_select_files_skips_symlink_files(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    archiver = _make_archiver()
+    root = tmp_path / "logs"
+    root.mkdir()
+    allowed = root / "inside.log"
+    allowed.write_text("ok")
+
+    outside = tmp_path / "outside.log"
+    outside.write_text("secret")
+    symlink = root / "link.log"
+    symlink.symlink_to(outside)
+
+    cutoff = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=1)
+
+    caplog.set_level("WARNING")
+
+    files = list(archiver._select_files(root, cutoff))
+
+    assert allowed in files
+    assert symlink not in files
+    assert any("symlinked file" in record.message for record in caplog.records)
+
+
+def test_select_files_ignores_symlink_directories(tmp_path: Path) -> None:
+    archiver = _make_archiver()
+    root = tmp_path / "logs"
+    root.mkdir()
+    allowed = root / "inside.log"
+    allowed.write_text("ok")
+
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    (outside_dir / "secret.log").write_text("secret")
+    (root / "linkdir").symlink_to(outside_dir, target_is_directory=True)
+
+    cutoff = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=1)
+
+    files = list(archiver._select_files(root, cutoff))
+
+    assert allowed in files
+    assert all(path.parent.name != "linkdir" for path in files)
