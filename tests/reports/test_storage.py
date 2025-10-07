@@ -97,6 +97,33 @@ class StubS3Client:
         self.calls.append(kwargs)
 
 
+def test_s3_storage_rejects_traversal_prefix(tmp_path: Path) -> None:
+    client = StubS3Client()
+
+    with pytest.raises(ValueError) as excinfo:
+        ArtifactStorage(
+            tmp_path,
+            s3_bucket="aether-bucket",
+            s3_prefix="../reports",
+            s3_client=client,
+        )
+
+    assert "prefix" in str(excinfo.value)
+
+
+def test_s3_storage_normalizes_prefix(tmp_path: Path) -> None:
+    client = StubS3Client()
+
+    storage = ArtifactStorage(
+        tmp_path,
+        s3_bucket="aether-bucket",
+        s3_prefix=" /reports/quarterly/ ",
+        s3_client=client,
+    )
+
+    assert storage._s3_prefix == "reports/quarterly"
+
+
 def test_store_artifact_logs_target_descriptor_on_audit_failure_s3(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -229,3 +256,19 @@ def test_store_artifact_rejects_symlink_target(tmp_path: Path) -> None:
     assert "symlink" in str(excinfo.value)
     assert outside_file.read_text() == "secret"
     assert not session.executions
+
+
+def test_filesystem_storage_rejects_symlink_base(tmp_path: Path) -> None:
+    if not hasattr(os, "symlink"):
+        pytest.skip("platform does not support symlinks")
+
+    real_base = tmp_path / "real-base"
+    real_base.mkdir()
+
+    symlink_base = tmp_path / "symlink-base"
+    symlink_base.symlink_to(real_base, target_is_directory=True)
+
+    with pytest.raises(ValueError) as excinfo:
+        ArtifactStorage(symlink_base)
+
+    assert "symlink" in str(excinfo.value)

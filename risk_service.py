@@ -805,15 +805,7 @@ async def get_position_size(
     symbol: str = Query(..., min_length=1, description="Instrument symbol to size"),
     account_id: str = Depends(require_admin_account),
 ) -> Dict[str, Any]:
-    try:
-        symbol = require_spot_http(symbol, logger=logger)
-    except HTTPException as exc:
-        if exc.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Only spot market symbols are supported for position sizing",
-            ) from exc
-        raise
+    symbol = require_spot_http(symbol, logger=logger)
 
     try:
         limits = _load_account_limits(account_id)

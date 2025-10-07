@@ -117,7 +117,7 @@ class ArtifactStorage:
     ) -> None:
         self.base_path = Path(base_path or "/tmp/aether-reports").expanduser()
         self._s3_bucket = s3_bucket
-        self._s3_prefix = s3_prefix.strip("/")
+        self._s3_prefix = self._validate_s3_prefix(s3_prefix)
         self._s3_client = s3_client
         self._resolved_base_path: Path | None = None
 
@@ -130,6 +130,8 @@ class ArtifactStorage:
 
         if not self._s3_bucket:
             self.base_path.mkdir(parents=True, exist_ok=True)
+            if self.base_path.is_symlink():
+                raise ValueError("Report storage base path must not be a symlink")
             self._resolved_base_path = self.base_path.resolve(strict=True)
             LOGGER.debug(
                 "Initialized filesystem ArtifactStorage at %s", self.base_path
@@ -144,6 +146,33 @@ class ArtifactStorage:
 
     # ------------------------------------------------------------------
     # Internal helpers
+
+    @staticmethod
+    def _validate_s3_prefix(prefix: str | None) -> str:
+        """Return a normalised S3 key prefix while rejecting unsafe inputs."""
+
+        if not prefix:
+            return ""
+
+        normalized = prefix.strip().strip("/")
+        if not normalized:
+            return ""
+
+        sanitized_segments: list[str] = []
+        for segment in normalized.replace("\\", "/").split("/"):
+            token = segment.strip()
+            if not token:
+                continue
+            if token in {".", ".."}:
+                raise ValueError("S3 prefix must not contain path traversal sequences")
+            if any(ord(char) < 32 for char in token):
+                raise ValueError("S3 prefix must not contain control characters")
+            sanitized_segments.append(token)
+
+        if not sanitized_segments:
+            return ""
+
+        return "/".join(sanitized_segments)
 
     def _canonical_key(self, account_id: str, object_key: str) -> str:
         """Return a normalised storage key while rejecting traversal attempts."""
