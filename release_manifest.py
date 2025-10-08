@@ -96,10 +96,33 @@ except Exception:  # pragma: no cover - provide lightweight stand-ins
     class StaticPool:  # type: ignore[override]
         pass
 
-try:
-    import yaml  # type: ignore
-except ImportError:  # pragma: no cover - optional dependency
-    yaml = None  # type: ignore
+        return _Base
+
+
+    def sessionmaker(**_: object):  # type: ignore[override]
+        raise RuntimeError("SQLAlchemy sessionmaker is unavailable in this environment")
+
+
+    class StaticPool:  # type: ignore[override]
+        pass
+
+    def declarative_base():  # type: ignore[override]
+        class _Base:
+            metadata = None
+
+        return _Base
+
+
+    def sessionmaker(**_: object):  # type: ignore[override]
+        raise RuntimeError("SQLAlchemy sessionmaker is unavailable in this environment")
+
+
+    class StaticPool:  # type: ignore[override]
+        pass
+
+from shared.yaml_compat import load_yaml_module
+
+yaml = load_yaml_module()
 
 
 LOGGER = logging.getLogger("release_manifest")
@@ -489,11 +512,12 @@ def _create_engine(url: str) -> Engine:
         parsed = None
 
     if parsed and parsed.drivername.startswith("sqlite"):
-        connect_args = {"check_same_thread": False}
+        sqlite_options = dict(options)
+        sqlite_connect_args: Dict[str, object] = {"check_same_thread": False}
         if ":memory:" in url or parsed.database in {":memory:", None}:
-            options["poolclass"] = StaticPool
-        options["connect_args"] = connect_args
-        return create_engine(url, **options)
+            sqlite_options["poolclass"] = StaticPool
+        sqlite_options["connect_args"] = sqlite_connect_args
+        return create_engine(url, **sqlite_options)
 
     options["pool_size"] = _env_int("RELEASE_MANIFEST_POOL_SIZE", 5)
     options["max_overflow"] = _env_int("RELEASE_MANIFEST_MAX_OVERFLOW", 5)
@@ -927,7 +951,7 @@ def _diff_versions(category: str, expected: Dict[str, str], actual: Dict[str, st
     return messages
 
 
-def _coerce_str_mapping(value: Optional[Dict[str, object]]) -> Dict[str, str]:
+def _coerce_str_mapping(value: Optional[Mapping[str, object]]) -> Dict[str, str]:
     """Normalise payload fragments that may be missing or loosely typed."""
 
     if not isinstance(value, dict):

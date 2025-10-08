@@ -4,29 +4,147 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, ClassVar, Dict, Iterator, List, Mapping, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    ClassVar,
+    Dict,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    SupportsFloat,
+    Tuple,
+    cast,
+)
 
 from shared.audit import AuditLogEntry, AuditLogStore, TimescaleAuditLogger
 from shared.spot import is_spot_symbol, normalize_spot_symbol
-
-try:  # pragma: no cover - exercised in integration tests when SQLAlchemy installed
-    from sqlalchemy import JSON, Column, DateTime, Float, Integer, MetaData, String, Table, insert, select
-    from sqlalchemy.engine import Engine
-    from sqlalchemy.exc import NoSuchTableError, SQLAlchemyError
-    from sqlalchemy.orm import Session, sessionmaker
-    from sqlalchemy import create_engine
-
-    SQLALCHEMY_AVAILABLE = True
-except Exception:  # pragma: no cover - fallback when SQLAlchemy missing
-    SQLALCHEMY_AVAILABLE = False
-    JSON = object  # type: ignore[assignment]
-    Column = DateTime = Float = Integer = MetaData = String = Table = object  # type: ignore[assignment]
-    insert = select = create_engine = None  # type: ignore[assignment]
-    Engine = Session = sessionmaker = object  # type: ignore[assignment]
-    NoSuchTableError = SQLAlchemyError = Exception  # type: ignore[assignment]
-
 from services.common.config import TimescaleSession, get_timescale_session
 
+
+class ResultProtocol(Protocol):
+    """Subset of the SQLAlchemy ``Result`` API consumed by the repository."""
+
+    def all(self) -> Sequence[Any]:
+        ...
+
+    def scalar_one_or_none(self) -> Optional[Any]:
+        ...
+
+    def one_or_none(self) -> Optional[Any]:
+        ...
+
+
+class SessionProtocol(Protocol):
+    """Minimal subset of the SQLAlchemy Session API used by the repository."""
+
+    def execute(self, *args: Any, **kwargs: Any) -> ResultProtocol:
+        ...
+
+    def commit(self) -> None:
+        ...
+
+    def rollback(self) -> None:
+        ...
+
+    def close(self) -> None:
+        ...
+
+
+SessionFactory = Callable[[], SessionProtocol]
+
+
+if TYPE_CHECKING:  # pragma: no cover - typing-only SQLAlchemy imports
+    from sqlalchemy import (
+        JSON,
+        Column,
+        DateTime,
+        Float,
+        Integer,
+        MetaData,
+        String,
+        Table,
+        create_engine,
+        insert,
+        select,
+    )
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.exc import NoSuchTableError, SQLAlchemyError
+    from sqlalchemy.orm import Session
+    from sqlalchemy.orm import sessionmaker as sessionmaker
+
+    SQLALCHEMY_AVAILABLE = True
+else:  # pragma: no cover - runtime imports with graceful degradation
+    try:
+        from sqlalchemy import (
+            JSON,
+            Column,
+            DateTime,
+            Float,
+            Integer,
+            MetaData,
+            String,
+            Table,
+            create_engine,
+            insert,
+            select,
+        )
+        from sqlalchemy.engine import Engine
+        from sqlalchemy.exc import NoSuchTableError, SQLAlchemyError
+        from sqlalchemy.orm import Session
+        from sqlalchemy.orm import sessionmaker as sessionmaker
+
+        SQLALCHEMY_AVAILABLE = True
+    except Exception:  # pragma: no cover - fallback when SQLAlchemy missing
+        JSON = Column = DateTime = Float = Integer = MetaData = String = Table = object
+
+        def insert(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("sqlalchemy is required for Timescale integration")
+
+        def select(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("sqlalchemy is required for Timescale integration")
+
+        def create_engine(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("sqlalchemy is required for Timescale integration")
+
+        class SQLAlchemyError(Exception):
+            """Fallback SQLAlchemy error type used when the dependency is missing."""
+
+        class NoSuchTableError(SQLAlchemyError):
+            """Fallback error for missing tables when SQLAlchemy is unavailable."""
+
+        class Result(ResultProtocol):  # pragma: no cover - runtime stub
+            def all(self) -> Sequence[Any]:
+                raise RuntimeError("sqlalchemy is required for Timescale integration")
+
+            def scalar_one_or_none(self) -> Optional[Any]:
+                raise RuntimeError("sqlalchemy is required for Timescale integration")
+
+            def one_or_none(self) -> Optional[Any]:
+                raise RuntimeError("sqlalchemy is required for Timescale integration")
+
+        class Session(SessionProtocol):  # pragma: no cover - runtime stub
+            def execute(self, *args: Any, **kwargs: Any) -> ResultProtocol:
+                raise RuntimeError("sqlalchemy is required for Timescale integration")
+
+            def commit(self) -> None:
+                raise RuntimeError("sqlalchemy is required for Timescale integration")
+
+            def rollback(self) -> None:
+                raise RuntimeError("sqlalchemy is required for Timescale integration")
+
+            def close(self) -> None:
+                raise RuntimeError("sqlalchemy is required for Timescale integration")
+
+        def sessionmaker(*args: Any, **kwargs: Any) -> SessionFactory:  # pragma: no cover - runtime stub
+            raise RuntimeError("sqlalchemy is required for Timescale integration")
+
+        Engine = object
+        SQLALCHEMY_AVAILABLE = False
 
 @dataclass(frozen=True)
 class MarketSnapshot:
@@ -70,9 +188,9 @@ class UniverseRepository:
     FEE_OVERRIDE_MAX_AGE: ClassVar[timedelta] = timedelta(hours=6)
     CONFIG_VERSION_MAX_AGE: ClassVar[timedelta] = timedelta(days=7)
 
-    _session_factories: ClassVar[Dict[str, Callable[[], Session]]] = {}
+    _session_factories: ClassVar[Dict[str, SessionFactory]] = {}
     _engines: ClassVar[Dict[str, Engine]] = {}
-    _session_factory_overrides: ClassVar[Dict[str, Callable[[], Session]]] = {}
+    _session_factory_overrides: ClassVar[Dict[str, SessionFactory]] = {}
     _schemas: ClassVar[Dict[str, Optional[str]]] = {}
     _audit_store: ClassVar[AuditLogStore] = AuditLogStore()
     _audit_logger: ClassVar[TimescaleAuditLogger] = TimescaleAuditLogger(_audit_store)
@@ -82,7 +200,7 @@ class UniverseRepository:
         account_id: str,
         audit_logger: Optional[TimescaleAuditLogger] = None,
         *,
-        session_factory: Optional[Callable[[], Session]] = None,
+        session_factory: Optional[SessionFactory] = None,
         now_fn: Optional[Callable[[], datetime]] = None,
     ) -> None:
         self.account_id = account_id
@@ -96,13 +214,16 @@ class UniverseRepository:
 
     @classmethod
     def configure_session_factory(
-        cls, account_id: str, factory: Callable[[], Session], *, schema: Optional[str] = None
+        cls, account_id: str, factory: SessionFactory, *, schema: Optional[str] = None
     ) -> None:
         """Install a custom SQLAlchemy session factory for *account_id*."""
 
         cls._session_factory_overrides[account_id] = factory
         if schema is not None:
             cls._schemas[account_id] = schema
+        else:
+            cls._schemas.pop(account_id, None)
+        cls._session_factories.pop(account_id, None)
 
     # ------------------------------------------------------------------
     # Manual override management
@@ -120,7 +241,29 @@ class UniverseRepository:
             return None
         return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
-    def _current_overrides(self, session: Session) -> Tuple[Dict[str, Dict[str, Any]], Optional[datetime]]:
+    @staticmethod
+    def _coerce_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return float(value)
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, SupportsFloat):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                return None
+        return None
+
+    def _current_overrides(
+        self, session: SessionProtocol
+    ) -> Tuple[Dict[str, Dict[str, Any]], Optional[datetime]]:
         record = self._latest_config_record(session)
         if record is None:
             return {}, None
@@ -134,7 +277,7 @@ class UniverseRepository:
 
         return payload, record.applied_at
 
-    def _next_version(self, session: Session) -> int:
+    def _next_version(self, session: SessionProtocol) -> int:
         table = self._config_versions_table()
         stmt = (
             select(table.c.version)
@@ -269,7 +412,7 @@ class UniverseRepository:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _resolve_session_factory(self) -> Callable[[], Session]:
+    def _resolve_session_factory(self) -> SessionFactory:
         if self._session_factory is not None:
             return self._session_factory
 
@@ -290,15 +433,18 @@ class UniverseRepository:
             engine = create_engine(session_cfg.dsn, future=True)
             self._engines[session_cfg.dsn] = engine
 
-        factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True)
+        factory = cast(
+            SessionFactory,
+            sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True),
+        )
         self._session_factories[self.account_id] = factory
         self._schemas[self.account_id] = session_cfg.account_schema
         return factory
 
     @contextmanager
-    def _session_scope(self) -> Iterator[Session]:
+    def _session_scope(self) -> Iterator[SessionProtocol]:
         factory = self._resolve_session_factory()
-        session: Optional[Session] = None
+        session: Optional[SessionProtocol] = None
         try:
             session = factory()
             yield session
@@ -356,7 +502,16 @@ class UniverseRepository:
             extend_existing=True,
         )
 
-    def _load_market_snapshots(self, session: Session) -> Dict[str, MarketSnapshot]:
+    @staticmethod
+    def _row_mapping(row: Any) -> Mapping[str, Any]:
+        if isinstance(row, Mapping):
+            return row
+        mapping = getattr(row, "_mapping", None)
+        if isinstance(mapping, Mapping):
+            return mapping
+        raise TypeError("Result rows must provide mapping-style access")
+
+    def _load_market_snapshots(self, session: SessionProtocol) -> Dict[str, MarketSnapshot]:
         table = self._market_snapshots_table()
         try:
             rows = session.execute(
@@ -381,29 +536,48 @@ class UniverseRepository:
         snapshots: Dict[str, MarketSnapshot] = {}
         now = self._now()
         for row in rows:
-            observed_at = self._coerce_datetime(row.observed_at)
+            try:
+                mapping = self._row_mapping(row)
+            except TypeError:
+                continue
+            observed_at = self._coerce_datetime(mapping.get("observed_at"))
             if observed_at is None or now - observed_at > self.MARKET_SNAPSHOT_MAX_AGE:
                 continue
-            raw_symbol = f"{row.base_asset}-{row.quote_asset}"
+            base_asset_raw = mapping.get("base_asset")
+            quote_asset_raw = mapping.get("quote_asset")
+            if not isinstance(base_asset_raw, str) or not isinstance(quote_asset_raw, str):
+                continue
+            raw_symbol = f"{base_asset_raw}-{quote_asset_raw}"
             normalized_symbol = normalize_spot_symbol(raw_symbol)
             if not normalized_symbol or not is_spot_symbol(normalized_symbol):
                 continue
             if normalized_symbol in snapshots:
                 continue
             base_asset, quote_asset = normalized_symbol.split("-", 1)
+            market_cap = self._coerce_float(mapping.get("market_cap"))
+            global_volume = self._coerce_float(mapping.get("global_volume_24h"))
+            kraken_volume = self._coerce_float(mapping.get("kraken_volume_24h"))
+            volatility = self._coerce_float(mapping.get("volatility_30d"))
+            if (
+                market_cap is None
+                or global_volume is None
+                or kraken_volume is None
+                or volatility is None
+            ):
+                continue
             snapshots[normalized_symbol] = MarketSnapshot(
                 base_asset=base_asset,
                 quote_asset=quote_asset,
-                market_cap=float(row.market_cap),
-                global_volume_24h=float(row.global_volume_24h),
-                kraken_volume_24h=float(row.kraken_volume_24h),
-                volatility_30d=float(row.volatility_30d),
-                source=str(row.source or "coingecko"),
+                market_cap=market_cap,
+                global_volume_24h=global_volume,
+                kraken_volume_24h=kraken_volume,
+                volatility_30d=volatility,
+                source=str(mapping.get("source") or "coingecko"),
                 observed_at=observed_at,
             )
         return snapshots
 
-    def _load_fee_overrides(self, session: Session) -> Dict[str, Dict[str, Any]]:
+    def _load_fee_overrides(self, session: SessionProtocol) -> Dict[str, Dict[str, Any]]:
         table = self._fee_overrides_table()
         try:
             rows = session.execute(
@@ -421,23 +595,37 @@ class UniverseRepository:
         overrides: Dict[str, Dict[str, Any]] = {}
         now = self._now()
         for row in rows:
-            updated_at = self._coerce_datetime(row.updated_at)
+            try:
+                mapping = self._row_mapping(row)
+            except TypeError:
+                continue
+            updated_at = self._coerce_datetime(mapping.get("updated_at"))
             if updated_at is None or now - updated_at > self.FEE_OVERRIDE_MAX_AGE:
                 continue
-            normalized = normalize_spot_symbol(row.instrument)
+            instrument = mapping.get("instrument")
+            if not isinstance(instrument, str):
+                continue
+            normalized = normalize_spot_symbol(instrument)
             if not normalized or not is_spot_symbol(normalized):
                 continue
             if normalized in overrides:
                 continue
+            maker = self._coerce_float(mapping.get("maker"))
+            taker = self._coerce_float(mapping.get("taker"))
+            if maker is None or taker is None:
+                continue
+            currency = mapping.get("currency")
+            if currency is not None and not isinstance(currency, str):
+                currency = str(currency)
             overrides[normalized] = {
-                "currency": row.currency,
-                "maker": float(row.maker),
-                "taker": float(row.taker),
+                "currency": currency,
+                "maker": maker,
+                "taker": taker,
                 "updated_at": updated_at,
             }
         return overrides
 
-    def _latest_config_record(self, session: Session) -> Optional[ConfigVersionRecord]:
+    def _latest_config_record(self, session: SessionProtocol) -> Optional[ConfigVersionRecord]:
         table = self._config_versions_table()
         try:
             row = (
@@ -459,15 +647,27 @@ class UniverseRepository:
 
         if row is None:
             return None
-        applied_at = self._coerce_datetime(row.applied_at)
+        try:
+            mapping = self._row_mapping(row)
+        except TypeError:
+            return None
+        applied_at = self._coerce_datetime(mapping.get("applied_at"))
         if applied_at is None:
             applied_at = self._now()
+        config_key = mapping.get("config_key")
+        if not isinstance(config_key, str):
+            config_key = str(config_key)
+        version_raw = mapping.get("version", 0)
+        try:
+            version = int(version_raw)
+        except (TypeError, ValueError):
+            return None
         return ConfigVersionRecord(
-            config_key=str(row.config_key),
-            version=int(row.version),
+            config_key=config_key,
+            version=version,
             applied_at=applied_at,
-            payload=row.payload or {},
-            checksum=row.checksum,
+            payload=mapping.get("payload") or {},
+            checksum=mapping.get("checksum"),
         )
 
 
