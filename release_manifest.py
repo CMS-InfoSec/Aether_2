@@ -210,6 +210,12 @@ class Base(DeclarativeBase):
 
     pass
 
+
+class Base(DeclarativeBase):
+    """Declarative base for the release manifest ORM model."""
+
+    pass
+
     class ReleaseManifest(Base):
         """ORM model for persisted release manifests."""
 

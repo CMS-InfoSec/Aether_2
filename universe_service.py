@@ -219,6 +219,21 @@ else:  # pragma: no cover - runtime base when SQLAlchemy is available
     try:
         from sqlalchemy.orm import declarative_base
 
+        Base = declarative_base()
+        Base.__doc__ = "Declarative base for the local universe service models."
+    except Exception:  # pragma: no cover - degraded runtime base without SQLAlchemy
+        class Base:  # type: ignore[too-many-ancestors]
+            """Fallback base exposing SQLAlchemy attributes when SQLAlchemy is absent."""
+
+            metadata: Any
+            registry: Any
+
+        metadata: Any  # pragma: no cover - provided by SQLAlchemy
+        registry: Any  # pragma: no cover - provided by SQLAlchemy
+else:  # pragma: no cover - runtime base when SQLAlchemy is available
+    try:
+        from sqlalchemy.orm import declarative_base
+
 if SQLALCHEMY_AVAILABLE:
 
 if SQLALCHEMY_AVAILABLE:
@@ -266,6 +281,18 @@ if SQLALCHEMY_AVAILABLE:
             created_at: datetime | None = ...,
         ) -> None: ...
 
+    if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
+        __table__: Any
+
+        def __init__(
+            self,
+            *,
+            symbol: str,
+            enabled: bool,
+            reason: str,
+            created_at: datetime | None = ...,
+        ) -> None: ...
+
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     symbol: Mapped[str] = mapped_column(String, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
@@ -289,61 +316,15 @@ if SQLALCHEMY_AVAILABLE:
         return create_engine(_DB_URL, **_engine_options(_DB_URL))
 
 
-    ENGINE = _create_engine()
-    SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
-
-else:
-
-    @dataclass
-    class UniverseWhitelist:  # type: ignore[no-redef]
-        """In-memory representation of the computed trading universe."""
-
-        symbol: str
-        enabled: bool = True
-        metrics_json: Dict[str, float] = field(default_factory=dict)
-        ts: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-
-
-    @dataclass
-    class AuditLog:  # type: ignore[no-redef]
-        """In-memory audit record for manual overrides."""
-
-        symbol: str
-        enabled: bool
-        reason: str
-        id: Optional[int] = None
-        created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-
-
 ENGINE = _create_engine()
 SessionLocal: "Sessionmaker[Session]" = sessionmaker(
     bind=ENGINE, autoflush=False, expire_on_commit=False, future=True
 )
 
-    class InMemorySession:
-        """Tiny transactional layer mimicking the SQLAlchemy session API."""
-
-        def __init__(self) -> None:
-            self._closed = False
-            self._lock = _IN_MEMORY_LOCK
-            self._lock.acquire()
-
-        # ------------------------------------------------------------------
-        # Context manager support
-        # ------------------------------------------------------------------
-        def __enter__(self) -> "InMemorySession":
-            return self
-
-        def __exit__(self, exc_type, exc, tb) -> None:  # pragma: no cover - no exceptions expected
-            self.close()
-
-        # ------------------------------------------------------------------
-        # Session API
-        # ------------------------------------------------------------------
-        def close(self) -> None:
-            if not self._closed:
-                self._closed = True
-                self._lock.release()
+        symbol: str
+        enabled: bool = True
+        metrics_json: Dict[str, float] = field(default_factory=dict)
+        ts: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 def get_session() -> Iterator[Session]:
     """Provide a SQLAlchemy session scoped to the request lifecycle."""
