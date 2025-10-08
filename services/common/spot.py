@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import logging
+from typing import Callable
 
 from fastapi import HTTPException, status
 
-from shared.spot import normalize_spot_symbol, require_spot_symbol
+from shared import spot as _spot
+
+normalize_spot_symbol: Callable[[object], str] = _spot.normalize_spot_symbol
+require_spot_symbol: Callable[[object], str] = _spot.require_spot_symbol
 
 LOGGER = logging.getLogger(__name__)
 
