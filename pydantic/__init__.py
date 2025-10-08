@@ -30,6 +30,7 @@ compatible with the stubbed environment.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta
 from collections.abc import Mapping as ABCMapping, Sequence as ABCSequence, Set as ABCSet
 import types as _types
 from typing import (
@@ -84,6 +85,9 @@ __all__ = [
 
 
 _T = TypeVar("_T")
+
+
+_SENTINEL = object()
 
 
 class ValidationError(ValueError):
@@ -378,12 +382,16 @@ class BaseModel:
 
         origin = get_origin(annotation)
         if origin is None:
-            if isinstance(annotation, type) and issubclass(annotation, BaseModel):
-                if value is None or isinstance(value, annotation):
-                    return value
-                if isinstance(value, Mapping):
-                    return annotation(**value)
-                return annotation(value)
+            if isinstance(annotation, type):
+                if issubclass(annotation, BaseModel):
+                    if value is None or isinstance(value, annotation):
+                        return value
+                    if isinstance(value, Mapping):
+                        return annotation(**value)
+                    return annotation(value)
+                converted = BaseModel._coerce_builtin(annotation, value)
+                if converted is not _SENTINEL:
+                    return converted
             return value
 
         if origin in (list, List, ABCSequence):
@@ -433,6 +441,83 @@ class BaseModel:
                 except Exception:
                     continue
         return value
+
+
+    @staticmethod
+    def _coerce_builtin(annotation: type, value: Any) -> Any:
+        if annotation is datetime:
+            return _coerce_datetime(value)
+        if annotation is date:
+            return _coerce_date(value)
+        if annotation is time:
+            return _coerce_time(value)
+        if annotation is timedelta:
+            return _coerce_timedelta(value)
+        return _SENTINEL
+
+
+def _ensure_string(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, bytes):
+        return value.decode().strip()
+    raise ValidationError("Expected string")
+
+
+def _coerce_datetime(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    text = _ensure_string(value)
+    if not text:
+        raise ValidationError("Datetime value cannot be empty")
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except Exception as exc:  # pragma: no cover - defensive guard
+        raise ValidationError(str(exc)) from exc
+    return parsed
+
+
+def _coerce_date(value: Any) -> date:
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    text = _ensure_string(value)
+    if not text:
+        raise ValidationError("Date value cannot be empty")
+    try:
+        return date.fromisoformat(text)
+    except Exception as exc:  # pragma: no cover - defensive guard
+        raise ValidationError(str(exc)) from exc
+
+
+def _coerce_time(value: Any) -> time:
+    if isinstance(value, time) and not isinstance(value, datetime):
+        return value
+    text = _ensure_string(value)
+    if not text:
+        raise ValidationError("Time value cannot be empty")
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return time.fromisoformat(text)
+    except Exception as exc:  # pragma: no cover - defensive guard
+        raise ValidationError(str(exc)) from exc
+
+
+def _coerce_timedelta(value: Any) -> timedelta:
+    if isinstance(value, timedelta):
+        return value
+    if isinstance(value, (int, float)):
+        return timedelta(seconds=float(value))
+    text = _ensure_string(value)
+    if not text:
+        raise ValidationError("Timedelta value cannot be empty")
+    try:
+        seconds = float(text)
+    except Exception as exc:  # pragma: no cover - defensive guard
+        raise ValidationError(str(exc)) from exc
+    return timedelta(seconds=seconds)
 
 
 __version__ = "0.0"

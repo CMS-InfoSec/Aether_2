@@ -60,7 +60,6 @@ except Exception:  # pragma: no cover - exercised in lightweight environments
     def sessionmaker(**_: object) -> Callable[[], Any]:  # type: ignore[override]
         raise RuntimeError("SQLAlchemy sessionmaker is unavailable in this environment")
 
-from shared.audit_hooks import AuditEvent, load_audit_hooks
 from shared.postgres import normalize_sqlalchemy_dsn
 
 ROOT = Path(__file__).resolve().parent
