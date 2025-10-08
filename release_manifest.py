@@ -34,81 +34,26 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, cast
-from urllib.parse import parse_qsl, unquote, urlparse, urlunparse
+from typing import Dict, Iterable, Iterator, List, Mapping, Optional
 
-try:  # pragma: no cover - alembic is optional in lightweight environments
-    from alembic import command
-    from alembic.config import Config
-except Exception:  # pragma: no cover - allow module import without alembic
-    command = None  # type: ignore[assignment]
-    Config = None  # type: ignore[assignment]
-
-try:  # pragma: no cover - SQLAlchemy is optional for lightweight deployments
-    from sqlalchemy import (
-        JSON,
-        Column,
-        DateTime,
-        MetaData,
-        String,
-        Table,
-        create_engine,
-        func,
-        select,
-    )
-    from sqlalchemy.engine import Engine
-    from sqlalchemy.engine.url import make_url as _sa_make_url
-    from sqlalchemy.exc import ArgumentError, NoSuchTableError, SQLAlchemyError
-    from sqlalchemy.orm import Session, declarative_base, sessionmaker
-    from sqlalchemy.pool import StaticPool
-    _SQLALCHEMY_AVAILABLE = True
-except Exception:  # pragma: no cover - provide lightweight stand-ins
-    JSON = Column = DateTime = MetaData = String = Table = None  # type: ignore[assignment]
-    Engine = Any  # type: ignore[assignment]
-    _sa_make_url = None  # type: ignore[assignment]
-    _SQLALCHEMY_AVAILABLE = False
-
-    class SQLAlchemyError(Exception):
-        pass
-
-
-    class ArgumentError(SQLAlchemyError):
-        pass
-
-
-    class NoSuchTableError(SQLAlchemyError):
-        pass
-
-
-    Session = Any  # type: ignore[assignment]
-
-    def declarative_base():  # type: ignore[override]
-        class _Base:
-            metadata = None
-
-        return _Base
-
-
-    def sessionmaker(**_: object):  # type: ignore[override]
-        raise RuntimeError("SQLAlchemy sessionmaker is unavailable in this environment")
-
-
-    class StaticPool:  # type: ignore[override]
-        pass
-
-    def declarative_base():  # type: ignore[override]
-        class _Base:
-            metadata = None
-
-        return _Base
-
-
-    def sessionmaker(**_: object):  # type: ignore[override]
-        raise RuntimeError("SQLAlchemy sessionmaker is unavailable in this environment")
-
-
-    class StaticPool:  # type: ignore[override]
-        pass
+from alembic import command
+from alembic.config import Config
+from sqlalchemy import (
+    JSON,
+    Column,
+    DateTime,
+    MetaData,
+    String,
+    Table,
+    create_engine,
+    func,
+    select,
+)
+from sqlalchemy.engine import Engine
+from sqlalchemy.engine.url import make_url
+from sqlalchemy.exc import ArgumentError, NoSuchTableError, SQLAlchemyError
+from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from shared.yaml_compat import load_yaml_module
 
@@ -258,8 +203,12 @@ DEFAULT_MANIFEST_FILE = Path("release_manifest_current.json")
 DEFAULT_MANIFEST_MARKDOWN = Path("release_manifest_current.md")
 
 
-if _SQLALCHEMY_AVAILABLE:
-    Base = declarative_base()
+
+
+class Base(DeclarativeBase):
+    """Declarative base for the release manifest ORM model."""
+
+    pass
 
     class ReleaseManifest(Base):
         """ORM model for persisted release manifests."""
@@ -502,11 +451,12 @@ def _create_engine(url: str) -> Engine:
         parsed = None
 
     if parsed and parsed.drivername.startswith("sqlite"):
-        connect_args = {"check_same_thread": False}
+        sqlite_options = dict(options)
+        sqlite_connect_args: Dict[str, object] = {"check_same_thread": False}
         if ":memory:" in url or parsed.database in {":memory:", None}:
-            options["poolclass"] = StaticPool
-        options["connect_args"] = connect_args
-        return create_engine(url, **options)
+            sqlite_options["poolclass"] = StaticPool
+        sqlite_options["connect_args"] = sqlite_connect_args
+        return create_engine(url, **sqlite_options)
 
     options["pool_size"] = _env_int("RELEASE_MANIFEST_POOL_SIZE", 5)
     options["max_overflow"] = _env_int("RELEASE_MANIFEST_MAX_OVERFLOW", 5)
@@ -940,7 +890,7 @@ def _diff_versions(category: str, expected: Dict[str, str], actual: Dict[str, st
     return messages
 
 
-def _coerce_str_mapping(value: Optional[Dict[str, object]]) -> Dict[str, str]:
+def _coerce_str_mapping(value: Optional[Mapping[str, object]]) -> Dict[str, str]:
     """Normalise payload fragments that may be missing or loosely typed."""
 
     if not isinstance(value, dict):
