@@ -213,6 +213,21 @@ else:  # pragma: no cover - runtime base when SQLAlchemy is available
             metadata: Any
             registry: Any
 
+        metadata: Any  # pragma: no cover - provided by SQLAlchemy
+        registry: Any  # pragma: no cover - provided by SQLAlchemy
+else:  # pragma: no cover - runtime base when SQLAlchemy is available
+    try:
+        from sqlalchemy.orm import declarative_base
+
+        Base = declarative_base()
+        Base.__doc__ = "Declarative base for the local universe service models."
+    except Exception:  # pragma: no cover - degraded runtime base without SQLAlchemy
+        class Base:  # type: ignore[too-many-ancestors]
+            """Fallback base exposing SQLAlchemy attributes when SQLAlchemy is absent."""
+
+            metadata: Any
+            registry: Any
+
         Base = declarative_base()
         Base.__doc__ = "Declarative base for the local universe service models."
     except Exception:  # pragma: no cover - degraded runtime base without SQLAlchemy
@@ -262,16 +277,17 @@ if SQLALCHEMY_AVAILABLE:
             self,
             *,
             symbol: str,
-            enabled: bool,
-            reason: str,
-            created_at: datetime | None = ...,
+            enabled: bool = ...,
+            metrics_json: Dict[str, float] | None = ...,
+            ts: datetime | None = ...,
         ) -> None: ...
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    symbol: Mapped[str] = mapped_column(String, nullable=False)
-    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
-    reason: Mapped[str] = mapped_column(String, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(
+    symbol: Mapped[str] = mapped_column(String, primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    metrics_json: Mapped[Dict[str, float]] = mapped_column(
+        JSON, nullable=False, default=_default_metrics
+    )
+    ts: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
     )
 
@@ -286,9 +302,25 @@ if SQLALCHEMY_AVAILABLE:
         )
 
 
-    def _create_engine() -> Engine:
-        return create_engine(_DB_URL, **_engine_options(_DB_URL))
+    if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
+        __table__: Any
 
+        def __init__(
+            self,
+            *,
+            symbol: str,
+            enabled: bool,
+            reason: str,
+            created_at: datetime | None = ...,
+        ) -> None: ...
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    reason: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+    )
 
     ENGINE = _create_engine()
     SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
