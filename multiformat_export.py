@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import datetime as dt
 import io
 import json
@@ -10,14 +11,28 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping
 
-import markdown2
-import pandas as pd
+try:  # pragma: no cover - markdown2 may be absent during some tests.
+    import markdown2
+except Exception:  # pragma: no cover
+    markdown2 = None  # type: ignore[assignment]
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import LETTER
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+try:  # pragma: no cover - reportlab is an optional dependency.
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import LETTER
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+except Exception:  # pragma: no cover
+    colors = None  # type: ignore[assignment]
+    LETTER = None  # type: ignore[assignment]
+    getSampleStyleSheet = None  # type: ignore[assignment]
+    Paragraph = None  # type: ignore[assignment]
+    SimpleDocTemplate = None  # type: ignore[assignment]
+    Spacer = None  # type: ignore[assignment]
+    Table = None  # type: ignore[assignment]
+    TableStyle = None  # type: ignore[assignment]
 
 from audit_mode import AuditorPrincipal, require_auditor_identity
 
@@ -110,6 +125,36 @@ def _require_psycopg() -> None:
 def _require_boto3() -> None:
     if boto3 is None:  # pragma: no cover - exercised when dependency missing.
         raise MissingDependencyError("boto3 is required for log export uploads")
+
+
+def _require_markdown2() -> Any:
+    if markdown2 is None:  # pragma: no cover - exercised when dependency missing.
+        raise MissingDependencyError("markdown2 is required for log export markdown rendering")
+    return markdown2
+
+
+def _require_reportlab() -> tuple[Any, ...]:
+    if (
+        SimpleDocTemplate is None
+        or Paragraph is None
+        or Spacer is None
+        or Table is None
+        or TableStyle is None
+        or colors is None
+        or LETTER is None
+        or getSampleStyleSheet is None
+    ):  # pragma: no cover - exercised when dependency missing.
+        raise MissingDependencyError("reportlab is required for log export PDF rendering")
+    return (
+        SimpleDocTemplate,
+        Paragraph,
+        Spacer,
+        Table,
+        TableStyle,
+        colors,
+        LETTER,
+        getSampleStyleSheet,
+    )
 
 
 def _database_dsn() -> str:
@@ -254,17 +299,24 @@ class LogExporter:
         return artifacts
 
     def _render_csv_bytes(self, combined: Mapping[str, List[Dict[str, Any]]]) -> bytes:
-        frames = []
+        headers: list[str] = []
+        seen: set[str] = set()
+        for rows in combined.values():
+            for row in rows:
+                for key in row.keys():
+                    if key not in seen:
+                        seen.add(key)
+                        headers.append(key)
+
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator="\n")
+        writer.writerow(["log_type", *headers])
         for name, rows in combined.items():
-            frame = pd.DataFrame(rows)
-            frame.insert(0, "log_type", name)
-            frames.append(frame)
-        if frames:
-            df = pd.concat(frames, ignore_index=True, sort=False)
-        else:
-            df = pd.DataFrame(columns=["log_type"])
-        df = df.fillna("")
-        return df.to_csv(index=False).encode("utf-8")
+            for row in rows:
+                record = [row.get(header, "") for header in headers]
+                values = ["" if value is None else str(value) for value in record]
+                writer.writerow([name, *values])
+        return buffer.getvalue().encode("utf-8")
 
     def _render_markdown_bytes(
         self,
@@ -272,6 +324,7 @@ class LogExporter:
         export_date: dt.date,
         run_id: str,
     ) -> bytes:
+        markdown_module = _require_markdown2()
         lines = ["# Daily Log Export", ""]
         lines.append(f"*Date:* {export_date.isoformat()}")
         lines.append(f"*Run ID:* {run_id}")
@@ -295,7 +348,7 @@ class LogExporter:
             lines.append("")
         markdown_content = "\n".join(lines).strip() + "\n"
         # Validate markdown structure using markdown2 (requirement mandates usage).
-        markdown2.markdown(markdown_content)
+        markdown_module.markdown(markdown_content)
         return markdown_content.encode("utf-8")
 
     def _render_pdf_bytes(
@@ -304,39 +357,49 @@ class LogExporter:
         export_date: dt.date,
         run_id: str,
     ) -> bytes:
+        (
+            SimpleDocTemplate_cls,
+            Paragraph_cls,
+            Spacer_cls,
+            Table_cls,
+            TableStyle_cls,
+            colors_module,
+            letter_page_size,
+            get_stylesheet,
+        ) = _require_reportlab()
         buffer = io.BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=LETTER)
-        styles = getSampleStyleSheet()
-        story = [Paragraph("Daily Log Export", styles["Title"])]
-        story.append(Paragraph(f"Date: {export_date.isoformat()}", styles["Normal"]))
-        story.append(Paragraph(f"Run ID: {run_id}", styles["Normal"]))
-        story.append(Spacer(1, 12))
+        doc = SimpleDocTemplate_cls(buffer, pagesize=letter_page_size)
+        styles = get_stylesheet()
+        story = [Paragraph_cls("Daily Log Export", styles["Title"])]
+        story.append(Paragraph_cls(f"Date: {export_date.isoformat()}", styles["Normal"]))
+        story.append(Paragraph_cls(f"Run ID: {run_id}", styles["Normal"]))
+        story.append(Spacer_cls(1, 12))
 
         for name, rows in combined.items():
-            story.append(Paragraph(name.replace("_", " ").title(), styles["Heading2"]))
+            story.append(Paragraph_cls(name.replace("_", " ").title(), styles["Heading2"]))
             if not rows:
-                story.append(Paragraph("No records found.", styles["Italic"]))
-                story.append(Spacer(1, 12))
+                story.append(Paragraph_cls("No records found.", styles["Italic"]))
+                story.append(Spacer_cls(1, 12))
                 continue
             headers = sorted({key for row in rows for key in row.keys()})
             table_data = [["Log Type", *headers]]
             for row in rows:
                 values = [row.get(header, "") for header in headers]
                 table_data.append([name, *[str(value) for value in values]])
-            table = Table(table_data, repeatRows=1)
+            table = Table_cls(table_data, repeatRows=1)
             table.setStyle(
-                TableStyle(
+                TableStyle_cls(
                     [
-                        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-                        ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
-                        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                        ("BACKGROUND", (0, 0), (-1, 0), colors_module.lightgrey),
+                        ("TEXTCOLOR", (0, 0), (-1, 0), colors_module.black),
+                        ("GRID", (0, 0), (-1, -1), 0.25, colors_module.grey),
                         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
                         ("ALIGN", (0, 0), (-1, -1), "LEFT"),
                     ]
                 )
             )
             story.append(table)
-            story.append(Spacer(1, 12))
+            story.append(Spacer_cls(1, 12))
 
         doc.build(story)
         return buffer.getvalue()
