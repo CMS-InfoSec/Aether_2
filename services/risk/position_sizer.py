@@ -280,40 +280,57 @@ class PositionSizer:
             return self._sizing_config
 
         raw_config = self._timescale.load_risk_config()
-        source: Mapping[str, Any]
-        if isinstance(raw_config, Mapping) and isinstance(raw_config.get("position_sizer"), Mapping):
-            source = raw_config["position_sizer"]  # type: ignore[assignment]
-        elif isinstance(raw_config, Mapping):
-            source = raw_config
+        if isinstance(raw_config, Mapping):
+            position_section = raw_config.get("position_sizer")
+            if isinstance(position_section, Mapping):
+                source = dict(position_section)
+            else:
+                source = dict(raw_config)
         else:
             source = {}
 
+        default_nav_pct = float(getattr(self._limits, "max_nav_pct_per_trade", 0.0))
         nav_pct = self._coerce_float(
             source.get("max_trade_risk_pct_nav"),
-            default=float(getattr(self._limits, "max_nav_pct_per_trade", 0.0)),
+            default=default_nav_pct,
         )
+        if nav_pct is None:
+            nav_pct = default_nav_pct
+
         cash_pct = self._coerce_float(
             source.get("max_trade_risk_pct_cash"),
-            default=float(getattr(self._limits, "max_nav_pct_per_trade", 0.0)),
+            default=default_nav_pct,
         )
-        volatility_floor = max(
-            self._coerce_float(source.get("volatility_floor"), default=self._min_volatility),
-            self._min_volatility,
+        if cash_pct is None:
+            cash_pct = default_nav_pct
+
+        volatility_candidate = self._coerce_float(
+            source.get("volatility_floor"), default=self._min_volatility
         )
-        slippage_bps = max(
-            self._coerce_float(source.get("slippage_bps"), default=DEFAULT_SLIPPAGE_BPS),
-            0.0,
+        if volatility_candidate is None:
+            volatility_candidate = self._min_volatility
+        volatility_floor = max(volatility_candidate, self._min_volatility)
+
+        slippage_candidate = self._coerce_float(
+            source.get("slippage_bps"), default=DEFAULT_SLIPPAGE_BPS
         )
-        safety_margin_bps = max(
-            self._coerce_float(
-                source.get("safety_margin_bps"), default=DEFAULT_SAFETY_MARGIN_BPS
-            ),
-            0.0,
+        if slippage_candidate is None:
+            slippage_candidate = DEFAULT_SLIPPAGE_BPS
+        slippage_bps = max(slippage_candidate, 0.0)
+
+        safety_candidate = self._coerce_float(
+            source.get("safety_margin_bps"), default=DEFAULT_SAFETY_MARGIN_BPS
         )
-        min_notional = max(
-            self._coerce_float(source.get("min_trade_notional"), default=DEFAULT_MIN_NOTIONAL),
-            0.0,
+        if safety_candidate is None:
+            safety_candidate = DEFAULT_SAFETY_MARGIN_BPS
+        safety_margin_bps = max(safety_candidate, 0.0)
+
+        min_notional_candidate = self._coerce_float(
+            source.get("min_trade_notional"), default=DEFAULT_MIN_NOTIONAL
         )
+        if min_notional_candidate is None:
+            min_notional_candidate = DEFAULT_MIN_NOTIONAL
+        min_notional = max(min_notional_candidate, 0.0)
 
         self._sizing_config = PositionSizingConfig(
             max_trade_risk_pct_nav=nav_pct,
@@ -407,7 +424,7 @@ class PositionSizer:
                 value = float(fee_bps_estimate)
             except (TypeError, ValueError):  # pragma: no cover - defensive casting
                 value = None
-            else:
+            if value is not None:
                 return max(value, 0.0)
 
         try:
@@ -425,11 +442,13 @@ class PositionSizer:
     async def _resolve_lot_size(self, symbol: str) -> float:
         metadata = await precision_provider.require(symbol)
 
+        native_pair_raw = metadata.get("native_pair")
+        native_pair = str(native_pair_raw) if isinstance(native_pair_raw, str) else None
+
         lot_size = metadata.get("lot")
         try:
             value = float(lot_size) if lot_size is not None else 0.0
         except (TypeError, ValueError) as exc:  # pragma: no cover - defensive casting
-
             pair = native_pair or symbol
             raise PrecisionMetadataUnavailable(f"Invalid lot size for {pair}") from exc
         if value <= 0:
