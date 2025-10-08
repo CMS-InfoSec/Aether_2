@@ -9,56 +9,15 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Set, Tuple
-from types import SimpleNamespace
+from typing import Any, Dict, Generator, Iterable, List, Mapping, Optional, Set, Tuple, cast
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-_SQLALCHEMY_AVAILABLE = True
-
-try:  # pragma: no cover - optional dependency used in production
-    from sqlalchemy import (
-        JSON,
-        Column,
-        DateTime,
-        Integer,
-        String,
-        UniqueConstraint,
-        create_engine,
-        func,
-        select,
-    )
-    from sqlalchemy.engine import Engine
-    from sqlalchemy.orm import Session, declarative_base, sessionmaker
-    from sqlalchemy.pool import StaticPool
-except Exception:  # pragma: no cover - exercised in lightweight environments
-    _SQLALCHEMY_AVAILABLE = False
-    Engine = Any  # type: ignore[assignment]
-    Session = Any  # type: ignore[assignment]
-    StaticPool = type("StaticPool", (), {})  # type: ignore[assignment]
-    JSON = Column = DateTime = Integer = String = UniqueConstraint = None  # type: ignore[assignment]
-    create_engine = func = select = None  # type: ignore[assignment]
-
-    class _FallbackMetadata:
-        def create_all(self, **kwargs: Any) -> None:
-            bind = kwargs.get("bind")
-            if hasattr(bind, "reset"):
-                bind.reset()
-
-        def drop_all(self, **kwargs: Any) -> None:
-            bind = kwargs.get("bind")
-            if hasattr(bind, "reset"):
-                bind.reset()
-
-    class _FallbackBase(SimpleNamespace):
-        metadata = _FallbackMetadata()
-
-    def declarative_base() -> Any:  # type: ignore[override]
-        return _FallbackBase()
-
-    def sessionmaker(**_: object) -> Callable[[], Any]:  # type: ignore[override]
-        raise RuntimeError("SQLAlchemy sessionmaker is unavailable in this environment")
+from sqlalchemy import JSON, Column, DateTime, Integer, String, UniqueConstraint, create_engine, func, select
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session, declarative_base, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from shared.audit_hooks import AuditEvent, load_audit_hooks
 from shared.postgres import normalize_sqlalchemy_dsn
@@ -93,139 +52,33 @@ LOGGER = logging.getLogger("config_service")
 _SQLITE_FALLBACK_FLAG = "CONFIG_ALLOW_SQLITE_FOR_TESTS"
 
 
-if not _SQLALCHEMY_AVAILABLE:
+def _log_config_audit(
+    *,
+    actor: str,
+    action: str,
+    entity: str,
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    client_ip: Optional[str],
+    failure_message: str,
+) -> None:
+    """Emit a config service audit entry while handling optional fallbacks."""
 
-    @dataclass
-    class ConfigVersion:  # type: ignore[override]
-        """In-memory representation of committed configuration versions."""
-
-        id: int
-        account_id: str
-        key: str
-        value_json: Any
-        version: int
-        approvers: List[str]
-        ts: datetime
-
-    class _InMemoryConfigStore:
-        def __init__(self) -> None:
-            self._records: Dict[str, Dict[str, List[ConfigVersion]]] = {}
-            self._next_id = 1
-
-        def reset(self) -> None:
-            self._records.clear()
-            self._next_id = 1
-
-        def next_version(self, *, account_id: str, key: str) -> int:
-            account_records = self._records.get(account_id, {})
-            key_records = account_records.get(key, [])
-            if not key_records:
-                return 1
-            return key_records[-1].version + 1
-
-        def commit_version(
-            self,
-            *,
-            account_id: str,
-            key: str,
-            value: Any,
-            approvers: Iterable[str],
-            version: int,
-            ts: datetime,
-        ) -> ConfigVersion:
-            record = ConfigVersion(
-                id=self._next_id,
-                account_id=account_id,
-                key=key,
-                value_json=value,
-                version=version,
-                approvers=list(approvers),
-                ts=ts,
-            )
-            self._next_id += 1
-            account_records = self._records.setdefault(account_id, {})
-            account_records.setdefault(key, []).append(record)
-            return record
-
-        def latest(self, *, account_id: str, key: str) -> Optional[ConfigVersion]:
-            account_records = self._records.get(account_id, {})
-            entries = account_records.get(key)
-            if not entries:
-                return None
-            return entries[-1]
-
-        def history(self, *, account_id: str, key: str) -> List[ConfigVersion]:
-            account_records = self._records.get(account_id, {})
-            entries = account_records.get(key, [])
-            return list(entries)
-
-        def account_records(self, account_id: str) -> List[ConfigVersion]:
-            account_records = self._records.get(account_id, {})
-            results: List[ConfigVersion] = []
-            for records in account_records.values():
-                results.extend(records)
-            return list(results)
-
-    _IN_MEMORY_STORES: Dict[str, _InMemoryConfigStore] = {}
-
-    def _get_in_memory_store(url: str) -> _InMemoryConfigStore:
-        store = _IN_MEMORY_STORES.get(url)
-        if store is None:
-            store = _InMemoryConfigStore()
-            _IN_MEMORY_STORES[url] = store
-        return store
-
-    class _InMemoryEngine:
-        def __init__(self, url: str) -> None:
-            self.url = url
-            self.store = _get_in_memory_store(url)
-
-        def reset(self) -> None:
-            self.store.reset()
-
-    class _InMemorySession:
-        def __init__(self, store: _InMemoryConfigStore) -> None:
-            self._store = store
-
-        def close(self) -> None:  # pragma: no cover - API parity
-            return None
-
-        def next_version(self, *, account_id: str, key: str) -> int:
-            return self._store.next_version(account_id=account_id, key=key)
-
-        def latest(self, *, account_id: str, key: str) -> Optional[ConfigVersion]:
-            return self._store.latest(account_id=account_id, key=key)
-
-        def commit_version(
-            self,
-            *,
-            account_id: str,
-            key: str,
-            value: Any,
-            approvers: Iterable[str],
-            version: int,
-            ts: datetime,
-        ) -> ConfigVersion:
-            return self._store.commit_version(
-                account_id=account_id,
-                key=key,
-                value=value,
-                approvers=approvers,
-                version=version,
-                ts=ts,
-            )
-
-        def history(self, *, account_id: str, key: str) -> List[ConfigVersion]:
-            return self._store.history(account_id=account_id, key=key)
-
-        def account_records(self, account_id: str) -> List[ConfigVersion]:
-            return self._store.account_records(account_id)
-
-    def _in_memory_sessionmaker(store: _InMemoryConfigStore) -> Callable[[], _InMemorySession]:
-        def factory() -> _InMemorySession:
-            return _InMemorySession(store)
-
-        return factory
+    hooks = load_audit_hooks()
+    event = AuditEvent(
+        actor=actor,
+        action=action,
+        entity=entity,
+        before=before,
+        after=after,
+        ip_address=client_ip,
+    )
+    event.log_with_fallback(
+        hooks,
+        LOGGER,
+        failure_message=failure_message,
+        disabled_message=f"Audit logging disabled; skipping {action} for {entity}",
+    )
 
 
 def _require_database_url() -> str:
