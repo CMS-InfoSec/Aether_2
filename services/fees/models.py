@@ -8,6 +8,9 @@ from typing import TYPE_CHECKING, Any
 from sqlalchemy import DateTime, Integer, Numeric, String
 from sqlalchemy.orm import Mapped, declarative_base, mapped_column
 
+if TYPE_CHECKING:
+    from sqlalchemy.sql.schema import Table
+
 
 if TYPE_CHECKING:
 
@@ -26,6 +29,19 @@ class FeeTier(Base):
 
     __tablename__ = "fee_tiers"
 
+    if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
+        __table__: Table
+
+        def __init__(
+            self,
+            *,
+            tier_id: str,
+            notional_threshold_usd: Decimal,
+            maker_bps: Decimal,
+            taker_bps: Decimal,
+            effective_from: datetime,
+        ) -> None: ...
+
     tier_id: Mapped[str] = mapped_column(String(32), primary_key=True)
     notional_threshold_usd: Mapped[Decimal] = mapped_column(
         Numeric(20, 2), nullable=False, default=Decimal("0")
@@ -41,6 +57,20 @@ class AccountVolume30d(Base):
     """Stores the rolling 30-day notional trading volume per account."""
 
     __tablename__ = "account_volume_30d"
+
+    if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
+        __table__: Table
+
+        def __init__(
+            self,
+            *,
+            account_id: str,
+            notional_usd_30d: Decimal,
+            updated_at: datetime,
+            maker_fee_bps_estimate: Decimal | None = None,
+            taker_fee_bps_estimate: Decimal | None = None,
+            fee_estimate_updated_at: datetime | None = None,
+        ) -> None: ...
 
     account_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     notional_usd_30d: Mapped[Decimal] = mapped_column(
@@ -62,6 +92,22 @@ class AccountFill(Base):
     """Stores individual fills for computing rolling volume and realized fees."""
 
     __tablename__ = "account_fills"
+
+    if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
+        __table__: Table
+
+        def __init__(
+            self,
+            *,
+            account_id: str,
+            liquidity: str | None = None,
+            notional_usd: Decimal,
+            estimated_fee_bps: Decimal | None = None,
+            estimated_fee_usd: Decimal | None = None,
+            actual_fee_usd: Decimal | None = None,
+            fill_ts: datetime,
+            recorded_at: datetime | None = None,
+        ) -> None: ...
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     account_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
@@ -86,6 +132,18 @@ class FeeTierProgress(Base):
     """Persists proximity alerts when an account nears the next fee tier."""
 
     __tablename__ = "fee_tier_progress"
+
+    if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
+        __table__: Table
+
+        def __init__(
+            self,
+            *,
+            account_id: str,
+            current_tier: str,
+            progress: Decimal,
+            ts: datetime,
+        ) -> None: ...
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     account_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
