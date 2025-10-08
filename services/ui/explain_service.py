@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from typing import Any, Iterable, Mapping, MutableMapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence, TypeVar, cast
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
@@ -20,10 +20,24 @@ from shared.psycopg_compat import (
     load_psycopg,
 )
 
+TCallable = TypeVar("TCallable", bound=Callable[..., Any])
+
 psycopg: PsycopgModule | None
 dict_row: RowFactory | None
 psycopg, _ = load_psycopg()
 dict_row = load_dict_row()
+
+
+def typed_app_get(
+    application: FastAPI, path: str, **kwargs: Any
+) -> Callable[[TCallable], TCallable]:
+    """Wrap ``FastAPI.get`` to preserve typing for decorated callables."""
+
+    def decorator(func: TCallable) -> TCallable:
+        wrapped = application.get(path, **kwargs)(func)
+        return cast(TCallable, wrapped)
+
+    return decorator
 
 
 LOGGER = logging.getLogger(__name__)
@@ -40,14 +54,18 @@ def _database_url() -> str:
 
     for env_key in _DATABASE_ENV_KEYS:
         raw_value = os.getenv(env_key)
-        if not raw_value:
+        if raw_value is None:
+            continue
+        candidate = raw_value.strip()
+        if not candidate:
             continue
         try:
-            return normalize_postgres_dsn(
-                raw_value,
+            normalized: str = normalize_postgres_dsn(
+                candidate,
                 allow_sqlite=False,
                 label="Explain service database URL",
             )
+            return normalized
         except RuntimeError as exc:  # pragma: no cover - configuration error paths
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -69,11 +87,11 @@ def _database_url() -> str:
     )
 
 
-def _normalise_feature_payload(raw: Any) -> MutableMapping[str, float]:
+def _normalise_feature_payload(raw: Any) -> dict[str, float]:
     """Convert a feature payload into a flat mapping of floats."""
 
     if isinstance(raw, Mapping):
-        normalised: MutableMapping[str, float] = {}
+        normalised: dict[str, float] = {}
         for key, value in raw.items():
             try:
                 normalised[str(key)] = float(value)
@@ -85,21 +103,21 @@ def _normalise_feature_payload(raw: Any) -> MutableMapping[str, float]:
         return normalised
 
     if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, bytearray)):
-        normalised = {}
+        sequence_normalised: dict[str, float] = {}
         for idx, value in enumerate(raw):
             try:
-                normalised[f"feature_{idx}"] = float(value)
+                sequence_normalised[f"feature_{idx}"] = float(value)
             except (TypeError, ValueError) as exc:  # pragma: no cover - validation guard
                 raise HTTPException(
                     status_code=422,
                     detail=f"Feature at position {idx} is not numeric",
                 ) from exc
-        return normalised
+        return sequence_normalised
 
     return {}
 
 
-def _extract_feature_mapping(trade_row: Mapping[str, Any]) -> MutableMapping[str, float]:
+def _extract_feature_mapping(trade_row: Mapping[str, Any]) -> dict[str, float]:
     """Return the normalised feature vector stored with the trade."""
 
     candidates = ("features", "feature_vector", "feature_values")
@@ -128,8 +146,9 @@ def _extract_feature_mapping(trade_row: Mapping[str, Any]) -> MutableMapping[str
 def _extract_model_version(trade_row: Mapping[str, Any]) -> str | None:
     """Attempt to find the model version recorded with the trade."""
 
-    if isinstance(trade_row.get("model_version"), str):
-        return trade_row["model_version"]
+    direct_version: object = trade_row.get("model_version")
+    if isinstance(direct_version, str):
+        return direct_version
 
     metadata_candidates = (
         trade_row.get("order_metadata"),
@@ -138,7 +157,7 @@ def _extract_model_version(trade_row: Mapping[str, Any]) -> str | None:
     )
     for container in metadata_candidates:
         if isinstance(container, Mapping):
-            model_version = container.get("model_version")
+            model_version: object = container.get("model_version")
             if isinstance(model_version, str) and model_version:
                 return model_version
     return None
@@ -157,12 +176,12 @@ def _extract_regime_label(trade_row: Mapping[str, Any]) -> str:
 
     for candidate in search_space:
         if isinstance(candidate, Mapping):
-            regime = candidate.get("regime")
+            regime: object = candidate.get("regime")
             if isinstance(regime, str) and regime:
                 return regime
-            state = candidate.get("state")
+            state: object = candidate.get("state")
             if isinstance(state, Mapping):
-                nested = state.get("regime")
+                nested: object = state.get("regime")
                 if isinstance(nested, str) and nested:
                     return nested
         elif isinstance(candidate, str) and candidate:
@@ -221,7 +240,7 @@ def _load_trade_record(trade_id: str) -> Mapping[str, Any]:
         with psycopg.connect(_database_url(), row_factory=dict_row) as conn:
             with conn.cursor() as cursor:
                 cursor.execute(query, {"trade_id": trade_id})
-                row = cursor.fetchone()
+                row: Mapping[str, Any] | None = cursor.fetchone()
     except HTTPException:
         raise
     except Exception as exc:  # pragma: no cover - database errors
@@ -237,7 +256,7 @@ def _load_trade_record(trade_id: str) -> Mapping[str, Any]:
 app = FastAPI(title="Explainability Service", version="1.0.0")
 
 
-@app.get("/explain/trade")
+@typed_app_get(app, "/explain/trade")
 def get_trade_explanation(
     trade_id: str = Query(..., description="Unique trade/fill identifier"),
     actor_account: str = Depends(require_admin_account),
