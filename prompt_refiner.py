@@ -3,15 +3,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import os
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable, List, Sequence
-
 from typing import TYPE_CHECKING
+from typing import Any, Iterable, List, Sequence
 
 try:  # pragma: no cover - optional dependency for database access.
     import psycopg2  # type: ignore[import-not-found]
@@ -39,6 +39,15 @@ else:  # pragma: no cover - runtime fallback when psycopg2 is absent.
     TimescaleConnection = Any  # type: ignore[assignment]
 
 from services.common.config import get_timescale_session
+
+try:  # pragma: no cover - optional dependency during unit tests.
+    from services.common.security import ensure_admin_access as _ensure_admin_access
+    from services.common.security import (
+        require_admin_account as _security_require_admin_account,
+    )
+except Exception:  # pragma: no cover - fallback when security dependencies unavailable.
+    _ensure_admin_access = None  # type: ignore[assignment]
+    _security_require_admin_account = None  # type: ignore[assignment]
 
 
 LOGGER = logging.getLogger(__name__)
@@ -74,8 +83,11 @@ def _authenticate_request_headers(
     return ACCOUNT_ID
 
 
-def _authenticate_request(request: Request) -> str:
+async def _authenticate_request(request: Request) -> str:
     """Resolve the caller account from the incoming HTTP request."""
+
+    if _ensure_admin_access is not None:
+        return await _ensure_admin_access(request)
 
     actor = _authenticate_request_headers(
         request.headers.get("authorization"),
@@ -109,6 +121,16 @@ async def require_admin_account(
     x_account_id: str | None = Header(None, alias="X-Account-ID"),
 ) -> str:
     """Compatibility shim retained for tests that override this dependency."""
+
+    if _security_require_admin_account is not None:
+        result = _security_require_admin_account(
+            request,
+            authorization=authorization,
+            x_account_id=x_account_id,
+        )
+        if inspect.isawaitable(result):
+            result = await result
+        return result
 
     actor = _authenticate_request_headers(authorization, x_account_id)
     if actor is None:
@@ -645,7 +667,7 @@ async def get_latest_prompt(
 ) -> PromptRecord:
     """Return the latest generated prompt artifact."""
 
-    actor = _authenticate_request(request)
+    actor = await _authenticate_request(request)
     _assert_account_scope(actor, account_id)
     return refiner.latest_prompt()
 
@@ -658,7 +680,7 @@ async def post_prompt_test(
 ) -> PromptTestResponse:
     """Record a prompt experiment and surface follow-up candidates if needed."""
 
-    actor = _authenticate_request(request)
+    actor = await _authenticate_request(request)
     _assert_account_scope(actor, account_id)
     run_id = payload.run_id or str(uuid.uuid4())
     stored_prompt = refiner.record_prompt(run_id, payload.prompt_text)
