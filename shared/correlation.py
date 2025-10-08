@@ -3,24 +3,37 @@ from __future__ import annotations
 
 import logging
 import uuid
-from contextvars import ContextVar
-from typing import Any, Awaitable, Callable, Optional
+from contextvars import ContextVar, Token
+from typing import Any, Awaitable, Callable, Mapping, MutableMapping, Optional, Protocol, TYPE_CHECKING
 
-try:  # pragma: no cover - optional dependency for test environments
+if TYPE_CHECKING:  # pragma: no cover - import real types for static analysis
     from fastapi import Request
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.types import ASGIApp
-except ImportError:  # pragma: no cover - fallback for unit tests without FastAPI
-    Request = Any  # type: ignore
+else:  # pragma: no cover - fallback for unit tests without FastAPI
+    Scope = MutableMapping[str, Any]
+    Receive = Callable[[], Awaitable[Any]]
+    Send = Callable[[Any], Awaitable[Any]]
 
-    class BaseHTTPMiddleware:  # type: ignore
-        def __init__(self, app: Any) -> None:
+    class Request(Protocol):
+        """Structural representation of the minimum Request API we rely upon."""
+
+        headers: Mapping[str, str]
+
+    ASGIApp = Callable[[Scope, Receive, Send], Awaitable[Any]]
+
+    class BaseHTTPMiddleware:
+        """Lightweight stand-in used when Starlette isn't installed."""
+
+        def __init__(self, app: ASGIApp) -> None:
             self.app = app
 
-        async def dispatch(self, request: Any, call_next: Callable[[Any], Awaitable]) -> Any:
+        async def dispatch(
+            self,
+            request: Request,
+            call_next: Callable[[Request], Awaitable[Any]],
+        ) -> Any:
             return await call_next(request)
-
-    ASGIApp = Any  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -43,8 +56,8 @@ class CorrelationIdMiddleware(BaseHTTPMiddleware):
         super().__init__(app)
 
     async def dispatch(
-        self, request: Request, call_next: Callable[[Request], Awaitable]
-    ):
+        self, request: Request, call_next: Callable[[Request], Awaitable[Any]]
+    ) -> Any:
         incoming_id = request.headers.get(self.header_name)
         correlation_id = incoming_id or str(uuid.uuid4())
         token = _correlation_id_ctx.set(correlation_id)
@@ -62,13 +75,18 @@ class CorrelationContext:
 
     def __init__(self, correlation_id: Optional[str] = None) -> None:
         self._correlation_id = correlation_id or str(uuid.uuid4())
-        self._token = None
+        self._token: Token[Optional[str]] | None = None
 
     def __enter__(self) -> str:
         self._token = _correlation_id_ctx.set(self._correlation_id)
         return self._correlation_id
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> None:
         if self._token is not None:
             _correlation_id_ctx.reset(self._token)
             self._token = None
