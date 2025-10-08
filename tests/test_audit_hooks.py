@@ -1170,9 +1170,11 @@ def test_audit_event_with_ip_address_resets_hash_by_default():
     assert updated is not event
     assert updated.ip_address == "10.0.0.1"
     assert updated.ip_hash is None
+    assert updated.resolved_ip_hash is None
     # The original event remains unchanged.
     assert event.ip_address == "127.0.0.1"
     assert event.ip_hash == "hashed:127.0.0.1"
+    assert event.resolved_ip_hash is None
 
 
 def test_audit_event_with_ip_address_preserves_hash_when_requested():
@@ -1190,6 +1192,7 @@ def test_audit_event_with_ip_address_preserves_hash_when_requested():
 
     assert updated.ip_address == "10.0.0.1"
     assert updated.ip_hash == "hashed:127.0.0.1"
+    assert updated.resolved_ip_hash is None
 
 
 def test_audit_event_with_ip_address_same_value_clears_hash_when_needed():
@@ -1207,6 +1210,7 @@ def test_audit_event_with_ip_address_same_value_clears_hash_when_needed():
 
     assert updated.ip_address == "127.0.0.1"
     assert updated.ip_hash is None
+    assert updated.resolved_ip_hash is None
 
 
 def test_audit_event_with_ip_hash_updates_immutably():
@@ -1221,6 +1225,8 @@ def test_audit_event_with_ip_hash_updates_immutably():
     updated = event.with_ip_hash("hash")
     assert updated is not event
     assert updated.ip_hash == "hash"
+    assert updated.resolved_ip_hash is None
+    assert event.resolved_ip_hash is None
 
     unchanged = updated.with_ip_hash("hash")
     assert unchanged is updated
@@ -1291,6 +1297,8 @@ def test_audit_event_with_resolved_ip_hash_updates_hash_without_dropping_ip():
     assert updated is not event
     assert updated.ip_hash == "hashed-value"
     assert updated.ip_address == "203.0.113.10"
+    assert updated.resolved_ip_hash is resolved
+    assert event.resolved_ip_hash is None
 
 
 def test_audit_event_with_resolved_ip_hash_can_drop_ip_address():
@@ -1308,11 +1316,33 @@ def test_audit_event_with_resolved_ip_hash_can_drop_ip_address():
 
     assert updated.ip_hash == "hashed-value"
     assert updated.ip_address is None
+    assert updated.resolved_ip_hash is resolved
     assert event.ip_address == "198.51.100.20"
     assert event.ip_hash is None
+    assert event.resolved_ip_hash is None
 
 
-def test_audit_event_with_resolved_ip_hash_returns_self_when_no_change():
+def test_audit_event_resolve_ip_hash_reuses_persisted_metadata():
+    hooks = audit_hooks.AuditHooks(
+        log=None,
+        hash_ip=lambda value: pytest.fail("hash_ip should not be called"),
+    )
+
+    event = audit_hooks.AuditEvent(
+        actor="otto",
+        action="demo.reuse",
+        entity="resource",
+        before={},
+        after={},
+        ip_address="203.0.113.11",
+    )
+    resolved = audit_hooks.ResolvedIpHash(value="cached", fallback=True, error=RuntimeError("boom"))
+    persisted = event.with_resolved_ip_hash(resolved)
+
+    assert persisted.resolve_ip_hash(hooks) is resolved
+
+
+def test_audit_event_with_resolved_ip_hash_persists_metadata_when_missing():
     event = audit_hooks.AuditEvent(
         actor="quinn",
         action="demo.same.hash",
@@ -1324,10 +1354,15 @@ def test_audit_event_with_resolved_ip_hash_returns_self_when_no_change():
     )
     resolved = audit_hooks.ResolvedIpHash(value="existing", fallback=False, error=None)
 
-    assert event.with_resolved_ip_hash(resolved) is event
+    updated = event.with_resolved_ip_hash(resolved)
+
+    assert updated is not event
+    assert updated.ip_hash == "existing"
+    assert updated.ip_address == "192.0.2.5"
+    assert updated.resolved_ip_hash is resolved
 
 
-def test_audit_event_with_resolved_ip_hash_drop_without_address_returns_self():
+def test_audit_event_with_resolved_ip_hash_drop_without_address_persists_metadata():
     event = audit_hooks.AuditEvent(
         actor="ria",
         action="demo.no.address",
@@ -1339,7 +1374,76 @@ def test_audit_event_with_resolved_ip_hash_drop_without_address_returns_self():
     )
     resolved = audit_hooks.ResolvedIpHash(value="cached", fallback=False, error=None)
 
-    assert event.with_resolved_ip_hash(resolved, drop_ip_address=True) is event
+    updated = event.with_resolved_ip_hash(resolved, drop_ip_address=True)
+
+    assert updated is not event
+    assert updated.ip_hash == "cached"
+    assert updated.ip_address is None
+    assert updated.resolved_ip_hash is resolved
+
+
+def test_audit_event_log_with_fallback_uses_persisted_resolved_metadata(
+    caplog: pytest.LogCaptureFixture,
+):
+    hash_calls = {"count": 0}
+
+    def failing_hash(value: Optional[str]) -> Optional[str]:
+        hash_calls["count"] += 1
+        raise RuntimeError("hash failure")
+
+    captured = []
+
+    def fake_log(**payload: object) -> None:
+        captured.append(payload)
+
+    hooks = audit_hooks.AuditHooks(log=fake_log, hash_ip=failing_hash)
+    logger = logging.getLogger("tests.audit.persisted")
+
+    event = audit_hooks.AuditEvent(
+        actor="sara",
+        action="demo.persisted",
+        entity="resource",
+        before={},
+        after={},
+        ip_address="198.51.100.9",
+    )
+
+    resolved = event.resolve_ip_hash(hooks)
+
+    assert hash_calls["count"] == 1
+    assert resolved.fallback is True
+    assert isinstance(resolved.error, RuntimeError)
+
+    persisted = event.with_resolved_ip_hash(resolved, drop_ip_address=True)
+
+    with caplog.at_level(logging.ERROR, logger=logger.name):
+        result = persisted.log_with_fallback(
+            hooks,
+            logger,
+            failure_message="should not trigger",
+        )
+
+    assert hash_calls["count"] == 1
+    assert captured == [
+        {
+            "actor": "sara",
+            "action": "demo.persisted",
+            "entity": "resource",
+            "before": {},
+            "after": {},
+            "ip_hash": resolved.value,
+        }
+    ]
+    assert result.handled is True
+    assert result.ip_hash == resolved.value
+    assert result.hash_fallback is True
+    assert result.hash_error is resolved.error
+    assert result.log_error is None
+    assert persisted.resolved_ip_hash is resolved
+    assert any(
+        record.message == "Audit hash_ip callable failed; using fallback hash."
+        for record in caplog.records
+    )
 
 
 def test_audit_event_resolve_ip_hash_preserves_fallback_metadata():
