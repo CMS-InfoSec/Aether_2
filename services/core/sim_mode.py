@@ -14,6 +14,7 @@ from services.common.adapters import KafkaNATSAdapter
 from services.common.security import require_admin_account
 from shared.sim_mode import SimModeStatus, sim_mode_repository
 from shared.simulation import sim_mode_state
+from shared.audit_hooks import AuditEvent, load_audit_hooks
 
 
 LOGGER = logging.getLogger(__name__)
@@ -62,6 +63,9 @@ async def _publish_event(status: SimModeStatus, actor: str) -> None:
         LOGGER.exception("Failed to publish simulation mode event", extra={"actor": actor})
 
 
+_AUDIT_HOOKS = load_audit_hooks()
+
+
 async def _sync_runtime_state(active: bool) -> None:
     if active:
         await sim_mode_state.enable()
@@ -72,32 +76,29 @@ async def _sync_runtime_state(active: bool) -> None:
 def _audit_transition(
     before: SimModeStatus, after: SimModeStatus, actor: str, request: Request
 ) -> None:
-    try:  # pragma: no cover - optional audit dependency
-        from common.utils.audit_logger import hash_ip as audit_hash_ip, log_audit as log_audit_event
-    except Exception:  # pragma: no cover - optional dependency missing
-        return
-
-    try:
-        client = request.client.host if request.client else None
-        ip_hash = audit_hash_ip(client)
-        log_audit_event(
-            actor=actor,
-            action="sim_mode.transition",
-            entity="platform",
-            before={
-                "active": before.active,
-                "reason": before.reason,
-                "ts": before.ts.isoformat(),
-            },
-            after={
-                "active": after.active,
-                "reason": after.reason,
-                "ts": after.ts.isoformat(),
-            },
-            ip_hash=ip_hash,
-        )
-    except Exception:  # pragma: no cover - defensive logging only
-        LOGGER.exception("Failed to record audit log for simulation mode transition")
+    audit_hooks = load_audit_hooks()
+    event = AuditEvent(
+        actor=actor,
+        action="sim_mode.transition",
+        entity="platform",
+        before={
+            "active": before.active,
+            "reason": before.reason,
+            "ts": before.ts.isoformat(),
+        },
+        after={
+            "active": after.active,
+            "reason": after.reason,
+            "ts": after.ts.isoformat(),
+        },
+        ip_address=request.client.host if request.client else None,
+    )
+    event.log_with_fallback(
+        audit_hooks,
+        LOGGER,
+        failure_message="Failed to record audit log for simulation mode transition",
+        disabled_message="Audit logging disabled; skipping sim_mode.transition",
+    )
 
 
 @router.get("/status", response_model=SimModeStatusResponse)
