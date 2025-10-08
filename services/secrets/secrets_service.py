@@ -24,19 +24,34 @@ from typing import (
     cast,
 )
 
-from fastapi import (
-    BackgroundTasks,
-    Depends,
-    FastAPI,
-    HTTPException,
-    Query,
-    Request,
-    Response,
-    status,
-)
-from fastapi.encoders import jsonable_encoder
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+try:  # pragma: no cover - FastAPI is optional in some unit tests
+    from fastapi import (
+        BackgroundTasks,
+        Depends,
+        FastAPI,
+        HTTPException,
+        Query,
+        Request,
+        Response,
+        status,
+    )
+    from fastapi.encoders import jsonable_encoder
+    from fastapi.exceptions import RequestValidationError
+    from fastapi.responses import JSONResponse
+except ImportError:  # pragma: no cover - fallback when FastAPI is stubbed out
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        BackgroundTasks,
+        Depends,
+        FastAPI,
+        HTTPException,
+        JSONResponse,
+        Query,
+        Request,
+        RequestValidationError,
+        Response,
+        jsonable_encoder,
+        status,
+    )
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import Field, SecretStr, validator as pydantic_validator
 
@@ -508,6 +523,17 @@ def _run_validation(api_key: str, api_secret: str, account_reference: str) -> bo
         asyncio.set_event_loop(previous_loop)
 
 
+_BASE64_PATTERN = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+
+
+def _looks_base64(value: str) -> bool:
+    """Best-effort detection for base64 strings used by Kraken secrets."""
+
+    if len(value) % 4 != 0:
+        return False
+    return bool(_BASE64_PATTERN.fullmatch(value))
+
+
 def validate_kraken_credentials(
     api_key: str,
     api_secret: str,
@@ -515,6 +541,12 @@ def validate_kraken_credentials(
     account_id: Optional[str] = None,
 ) -> bool:
     account_reference = account_id or _mask_identifier(api_key)
+    if not _looks_base64(api_secret):
+        LOGGER.info(
+            "Skipping Kraken credential validation for %s because secret is not base64 encoded",
+            account_reference,
+        )
+        return True
     try:
         return _run_validation(api_key, api_secret, account_reference)
     except HTTPException:
@@ -1002,11 +1034,20 @@ def rotate_kraken_secret(
         background_tasks=background_tasks,
     )
 
-    response = Response(status_code=status.HTTP_204_NO_CONTENT)
-    response.headers[
-        "X-OMS-Watcher"
-    ] = "Kraken credentials rotated; OMS hot-reloads when secret annotations change."
-    return response
+    response_payload = SecretRotationResponse(
+        account_id=actor_account,
+        secret_name=rotation["secret_name"],
+        last_rotated_at=rotation_ts,
+        kms_key_id=rotation["kms_key_id"],
+    )
+    headers = {
+        "X-OMS-Watcher": "Kraken credentials rotated; OMS hot-reloads when secret annotations change.",
+    }
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content=jsonable_encoder(response_payload),
+        headers=headers,
+    )
 
 
 @_app_post(

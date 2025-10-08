@@ -19,19 +19,41 @@ import json
 import logging
 import os
 import sys
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from types import ModuleType, SimpleNamespace, TracebackType
+from typing import Any, Callable, Dict, Iterable, List, Optional, cast
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, Field, validator
-from sqlalchemy import JSON, Column, DateTime, Integer, String, create_engine
-from sqlalchemy.engine import Engine
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
+
+_SQLALCHEMY_AVAILABLE = True
+
+try:  # pragma: no cover - exercised when SQLAlchemy is installed
+    from sqlalchemy import JSON, Column, DateTime, Integer, String, create_engine
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.exc import SQLAlchemyError
+    from sqlalchemy.ext.declarative import declarative_base
+    from sqlalchemy.orm import Session, sessionmaker
+    from sqlalchemy.pool import StaticPool
+except Exception:  # pragma: no cover - executed in lightweight environments
+    _SQLALCHEMY_AVAILABLE = False
+    JSON = Column = DateTime = Integer = String = None  # type: ignore[assignment]
+    SQLAlchemyError = RuntimeError  # type: ignore[assignment]
+    Engine = Any  # type: ignore[assignment]
+    Session = Any  # type: ignore[assignment]
+    StaticPool = type("StaticPool", (), {})  # type: ignore[assignment]
+
+    def create_engine(*_: Any, **__: Any) -> Any:  # type: ignore[override]
+        raise RuntimeError("SQLAlchemy is not available in this environment")
+
+    def declarative_base(*_: Any, **__: Any) -> Any:  # type: ignore[override]
+        return SimpleNamespace(metadata=SimpleNamespace(create_all=lambda **__: None, drop_all=lambda **__: None))
+
+    def sessionmaker(*_: Any, **__: Any) -> Callable[[], Any]:  # type: ignore[override]
+        raise RuntimeError("SQLAlchemy sessionmaker is unavailable")
 
 from auth.service import (
     InMemorySessionStore,
@@ -93,8 +115,171 @@ def _require_database_url() -> str:
     )
 
 
-def _create_engine(database_url: str) -> Engine:
-    """Create a SQLAlchemy engine configured for pooled, managed connections."""
+class _InMemoryAdvisorStore:
+    """Minimal persistence layer used when SQLAlchemy is unavailable."""
+
+    def __init__(self) -> None:
+        self._records: List[AdvisorQuery] = []
+        self._next_id = 1
+
+    def reset(self) -> None:
+        self._records.clear()
+        self._next_id = 1
+
+    def add(self, record: "AdvisorQuery") -> None:
+        if getattr(record, "id", None) in (None, 0):
+            record.id = self._next_id  # type: ignore[attr-defined]
+            self._next_id += 1
+        self._records.append(record)
+
+    def all(self) -> List["AdvisorQuery"]:
+        return list(self._records)
+
+
+class _InMemoryQueryResult:
+    def __init__(self, rows: List["AdvisorQuery"]) -> None:
+        self._rows = rows
+
+    def all(self) -> List["AdvisorQuery"]:
+        return list(self._rows)
+
+
+class _InMemorySession:
+    def __init__(self, store: _InMemoryAdvisorStore) -> None:
+        self._store = store
+        self._pending: List[AdvisorQuery] = []
+
+    def add(self, record: "AdvisorQuery") -> None:
+        self._pending.append(record)
+
+    def commit(self) -> None:
+        for record in self._pending:
+            self._store.add(record)
+        self._pending.clear()
+
+    def rollback(self) -> None:
+        self._pending.clear()
+
+    def close(self) -> None:  # pragma: no cover - API parity
+        self._pending.clear()
+
+    def query(self, model: Any) -> _InMemoryQueryResult:
+        if model is AdvisorQuery:
+            return _InMemoryQueryResult(self._store.all())
+        return _InMemoryQueryResult([])
+
+    def __enter__(self) -> "_InMemorySession":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[type[BaseException]],
+        exc: Optional[BaseException],
+        tb: Optional[TracebackType],
+    ) -> bool:
+        self.close()
+        return False
+
+
+class _InMemoryEngine:
+    def __init__(self, url: str) -> None:
+        self.url = url
+        self.store = _get_in_memory_store(url)
+
+    def dispose(self) -> None:  # pragma: no cover - API parity
+        return None
+
+    def reset(self) -> None:
+        self.store.reset()
+
+    def ensure_ready(self) -> None:  # pragma: no cover - API parity
+        return None
+
+
+def _in_memory_sessionmaker(store: _InMemoryAdvisorStore) -> Callable[[], _InMemorySession]:
+    def factory() -> _InMemorySession:
+        return _InMemorySession(store)
+
+    return factory
+
+
+_IN_MEMORY_STORE_MODULE = "_advisor_service_store"
+_store_module = cast(ModuleType, sys.modules.get(_IN_MEMORY_STORE_MODULE))
+if _store_module is None:
+    _store_module = ModuleType(_IN_MEMORY_STORE_MODULE)
+    _store_module.stores = {}  # type: ignore[attr-defined]
+    sys.modules[_IN_MEMORY_STORE_MODULE] = _store_module
+
+_IN_MEMORY_STORES = cast(Dict[str, _InMemoryAdvisorStore], getattr(_store_module, "stores"))
+
+
+def _get_in_memory_store(url: str) -> _InMemoryAdvisorStore:
+    normalized = url.strip()
+    store = _IN_MEMORY_STORES.get(normalized)
+    if store is None:
+        store = _InMemoryAdvisorStore()
+        _IN_MEMORY_STORES[normalized] = store
+    return store
+
+
+class _InMemoryMetadata:
+    def create_all(self, **kwargs: Any) -> None:
+        engine = kwargs.get("bind")
+        if hasattr(engine, "ensure_ready"):
+            engine.ensure_ready()
+
+    def drop_all(self, **kwargs: Any) -> None:
+        engine = kwargs.get("bind")
+        if hasattr(engine, "reset"):
+            engine.reset()
+
+
+Base = declarative_base() if _SQLALCHEMY_AVAILABLE else SimpleNamespace(metadata=_InMemoryMetadata())
+
+
+if _SQLALCHEMY_AVAILABLE:
+
+    class AdvisorQuery(Base):
+        """SQLAlchemy model backing the ``advisor_queries`` table."""
+
+        __tablename__ = "advisor_queries"
+
+        id: int = Column(Integer, primary_key=True, autoincrement=True)
+        user_id: str = Column(String(255), nullable=False, index=True)
+        question: str = Column(String(4096), nullable=False)
+        answer: str = Column(String(8192), nullable=False)
+        context: Dict[str, Any] = Column(JSON, nullable=False, default=dict)
+        created_at: datetime = Column(
+            DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
+        )
+
+else:
+
+    @dataclass
+    class AdvisorQuery:
+        """Simple record persisted via the in-memory advisor store."""
+
+        user_id: str
+        question: str
+        answer: str
+        context: Dict[str, Any] = field(default_factory=dict)
+        created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+        id: int | None = None
+
+
+ENGINE: Engine | _InMemoryEngine | None = None
+SessionLocal: Callable[[], Session] | Callable[[], _InMemorySession] | None = None
+
+
+def _create_engine(database_url: str) -> Engine | _InMemoryEngine:
+    """Create the backing persistence engine for advisor history."""
+
+    if not _SQLALCHEMY_AVAILABLE:
+        LOGGER.warning(
+            "SQLAlchemy is unavailable; using in-memory advisor persistence for %s",
+            database_url,
+        )
+        return _InMemoryEngine(database_url)
 
     connect_args: Dict[str, Any] = {}
     engine_kwargs: Dict[str, Any] = {
@@ -120,24 +305,12 @@ def _create_engine(database_url: str) -> Engine:
     return create_engine(database_url, **engine_kwargs)
 
 
-ENGINE: Engine | None = None
-SessionLocal: sessionmaker | None = None
-Base = declarative_base()
+def _initialise_session_factory(engine: Engine | _InMemoryEngine) -> Callable[[], Any]:
+    if _SQLALCHEMY_AVAILABLE:
+        return sessionmaker(bind=engine, autocommit=False, autoflush=False, future=True)
 
-
-class AdvisorQuery(Base):
-    """SQLAlchemy model backing the ``advisor_queries`` table."""
-
-    __tablename__ = "advisor_queries"
-
-    id: int = Column(Integer, primary_key=True, autoincrement=True)
-    user_id: str = Column(String(255), nullable=False, index=True)
-    question: str = Column(String(4096), nullable=False)
-    answer: str = Column(String(8192), nullable=False)
-    context: Dict[str, Any] = Column(JSON, nullable=False, default=dict)
-    created_at: datetime = Column(
-        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
-    )
+    assert isinstance(engine, _InMemoryEngine)
+    return _in_memory_sessionmaker(engine.store)
 
 
 def _init_database(application: FastAPI) -> None:
@@ -151,9 +324,7 @@ def _init_database(application: FastAPI) -> None:
     if ENGINE is None or SessionLocal is None:
         database_url = _require_database_url()
         engine = _create_engine(database_url)
-        SessionLocal = sessionmaker(
-            bind=engine, autocommit=False, autoflush=False, future=True
-        )
+        SessionLocal = _initialise_session_factory(engine)
         ENGINE = engine
 
     application.state.db_engine = ENGINE
@@ -582,6 +753,7 @@ async def _on_startup() -> None:
 __all__ = [
     "app",
     "AdvisorSummarizer",
+    "AdvisorQuery",
     "AdvisorQueryRequest",
     "AdvisorQueryResponse",
     "fetch_recent_logs",

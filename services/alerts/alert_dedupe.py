@@ -70,7 +70,7 @@ else:  # pragma: no cover - runtime import with fallback stub
 
 from prometheus_client import CollectorRegistry, Counter
 
-from services.common.security import require_admin_account
+from services.common.security import ensure_admin_access
 
 
 RouteFn = TypeVar("RouteFn", bound=Callable[..., Any])
@@ -426,9 +426,10 @@ def get_alert_dedupe_service() -> AlertDedupeService:
 
 @_router_get("/active")
 async def get_active_alerts(
-    _: str = Depends(require_admin_account),
+    request: Request,
     service: AlertDedupeService = Depends(get_alert_dedupe_service),
 ) -> List[Dict[str, Any]]:
+    await ensure_admin_access(request, forbid_on_missing_token=True)
     return await service.refresh()
 
 
@@ -437,6 +438,7 @@ def get_alert_policies(
     _: str = Depends(require_admin_account),
     service: AlertDedupeService = Depends(get_alert_dedupe_service),
 ) -> Dict[str, Any]:
+    await ensure_admin_access(request, forbid_on_missing_token=True)
     return service.policies()
 
 
