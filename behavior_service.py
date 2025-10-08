@@ -20,9 +20,11 @@ import os
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, Generator, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Generator, Iterable, List, Mapping, Optional, Sequence, Tuple, cast
 
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+
+import sys
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -213,7 +215,23 @@ def _in_memory_sessionmaker(db: _InMemoryBehaviorDatabase) -> Callable[[], _InMe
 
 ENGINE: Engine | _InMemoryEngine | None = None
 SessionLocal: Callable[[], Any] | None = None
-_IN_MEMORY_DB = _InMemoryBehaviorDatabase()
+_STORE_MODULE_NAME = "_behavior_service_in_memory_store"
+_store_module = cast(ModuleType, sys.modules.get(_STORE_MODULE_NAME))
+if _store_module is None:
+    _store_module = ModuleType(_STORE_MODULE_NAME)
+    _store_module.db_cache = {}  # type: ignore[attr-defined]
+    sys.modules[_STORE_MODULE_NAME] = _store_module
+
+_IN_MEMORY_DBS = cast(Dict[str, _InMemoryBehaviorDatabase], getattr(_store_module, "db_cache"))
+
+
+def _get_in_memory_db(url: str) -> _InMemoryBehaviorDatabase:
+    normalized = _normalize_database_url(url)
+    db = _IN_MEMORY_DBS.get(normalized)
+    if db is None:
+        db = _InMemoryBehaviorDatabase()
+        _IN_MEMORY_DBS[normalized] = db
+    return db
 
 
 if _SQLALCHEMY_AVAILABLE:
@@ -538,11 +556,12 @@ def _initialize_database() -> None:
     ENGINE = engine
 
     if not _SQLALCHEMY_AVAILABLE:
-        _IN_MEMORY_DB.reset()
-        session_factory = _in_memory_sessionmaker(_IN_MEMORY_DB)
+        in_memory_db = _get_in_memory_db(database_url)
+        session_factory = _in_memory_sessionmaker(in_memory_db)
         SessionLocal = session_factory
         app.state.behavior_db_engine = engine
         app.state.behavior_db_sessionmaker = session_factory
+        app.state.behavior_in_memory_db = in_memory_db
         return
 
     _ensure_schema(engine, DATABASE_SCHEMA)

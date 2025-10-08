@@ -768,8 +768,12 @@ class TestClient:
     def __init__(self, app: FastAPI) -> None:
         self.app = app
         self._lifespan_cm = None
+        self._entered = False
+        self._ensure_started()
 
-    def __enter__(self) -> "TestClient":  # pragma: no cover - simple context protocol
+    def _ensure_started(self) -> None:
+        if self._entered:
+            return
         lifespan_factory = getattr(self.app.router, "lifespan_context", None)
         if lifespan_factory is not None:
             self._lifespan_cm = lifespan_factory(self.app)
@@ -778,9 +782,11 @@ class TestClient:
                 _run_async(enter())
         for handler in self.app.event_handlers.get("startup", []):
             _run_async(handler())
-        return self
+        self._entered = True
 
-    def __exit__(self, exc_type, exc, tb) -> bool:  # pragma: no cover - simple context protocol
+    def _shutdown(self, exc_type=None, exc=None, tb=None) -> None:
+        if not self._entered:
+            return
         for handler in reversed(self.app.event_handlers.get("shutdown", [])):
             _run_async(handler())
         if self._lifespan_cm is not None:
@@ -788,7 +794,19 @@ class TestClient:
             if exit_ is not None:
                 _run_async(exit_(exc_type, exc, tb))
         self._lifespan_cm = None
+        self._entered = False
+
+    def __enter__(self) -> "TestClient":  # pragma: no cover - simple context protocol
+        self._ensure_started()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:  # pragma: no cover - simple context protocol
+        self._shutdown(exc_type, exc, tb)
         return False
+
+    def close(self) -> None:
+        """Mirror the real TestClient API by exposing an explicit close hook."""
+        self._shutdown()
 
     def _build_request(
         self,
@@ -823,6 +841,7 @@ class TestClient:
         headers: Optional[Dict[str, str]] = None,
         params: Optional[Dict[str, Any]] = None,
     ) -> _ClientResponse:
+        self._ensure_started()
         route, path_params = self._find_route(method, path)
         body = self._prepare_body(json)
         request = self._build_request(headers=headers, params=params, path_params=path_params)
