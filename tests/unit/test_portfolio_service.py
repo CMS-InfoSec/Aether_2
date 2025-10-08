@@ -4,9 +4,6 @@ from datetime import datetime, timezone
 from types import ModuleType, SimpleNamespace
 from typing import Any, Iterable, Mapping
 
-import importlib
-import sys
-
 import pytest
 
 

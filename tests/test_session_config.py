@@ -1,5 +1,3 @@
-import os
-
 import pytest
 
 from shared.session_config import load_session_ttl_minutes
