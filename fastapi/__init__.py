@@ -26,6 +26,7 @@ run_in_threadpool = getattr(_stub, "run_in_threadpool", None)
 _submodules = {
     "fastapi.testclient": {"TestClient": getattr(_stub, "TestClient", None)},
     "fastapi.responses": {
+        "Response": getattr(_stub, "Response", None),
         "JSONResponse": getattr(_stub, "JSONResponse", None),
         "StreamingResponse": getattr(_stub, "StreamingResponse", None),
     },
