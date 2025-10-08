@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Any, Callable, TypeVar, cast, SupportsFloat, SupportsIndex
 
 from fastapi import Depends, FastAPI, HTTPException, status
 
@@ -34,12 +35,20 @@ LOGGER = logging.getLogger(__name__)
 app = FastAPI(title="Policy Service")
 setup_metrics(app, service_name="policy-service")
 
+RouteFn = TypeVar("RouteFn", bound=Callable[..., Any])
+
+
+def _app_post(*args: Any, **kwargs: Any) -> Callable[[RouteFn], RouteFn]:
+    """Typed wrapper around ``FastAPI.post`` to satisfy strict type checks."""
+
+    return cast(Callable[[RouteFn], RouteFn], app.post(*args, **kwargs))
+
 
 def _normalise_feature_vector(raw: object) -> list[float]:
     """Coerce feature payloads to a numeric vector for responses and telemetry."""
 
     if isinstance(raw, Mapping):
-        iterable = raw.values()
+        iterable: Iterable[object] = raw.values()
     elif isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, bytearray)):
         iterable = raw
     else:
@@ -47,17 +56,14 @@ def _normalise_feature_vector(raw: object) -> list[float]:
 
     vector: list[float] = []
     for value in iterable:
-        try:
-            numeric = float(value)
-        except (TypeError, ValueError):
-            continue
-        if math.isnan(numeric) or math.isinf(numeric):
+        numeric = _to_numeric(value)
+        if numeric is None:
             continue
         vector.append(numeric)
     return vector
 
 
-@app.post("/policy/decide", response_model=PolicyDecisionResponse)
+@_app_post("/policy/decide", response_model=PolicyDecisionResponse)
 def decide_policy(
 
     request: PolicyDecisionRequest,
@@ -75,8 +81,12 @@ def decide_policy(
     redis = RedisFeastAdapter(account_id=account_id)
     online_features = redis.fetch_online_features(request.instrument)
 
-    online_payload = online_features if isinstance(online_features, Mapping) else {}
-    provided_fields = getattr(request, "model_fields_set", set())
+    online_payload: Mapping[str, Any] | dict[str, Any]
+    if isinstance(online_features, Mapping):
+        online_payload = online_features
+    else:
+        online_payload = {}
+    provided_fields: set[str] = getattr(request, "model_fields_set", set())
 
     if "features" in provided_fields:
         features = request.features
@@ -93,13 +103,8 @@ def decide_policy(
     )
 
     def _coerce_edge(value: object, default: float) -> float:
-        if value is None:
-            return default
-        try:
-            numeric = float(value)
-        except (TypeError, ValueError):
-            return default
-        if math.isnan(numeric) or math.isinf(numeric):
+        numeric = _to_numeric(value)
+        if numeric is None:
             return default
         return numeric
 
@@ -319,4 +324,18 @@ def decide_policy(
     )
 
     return response
+
+CoercibleScalar = SupportsFloat | SupportsIndex | str | bytes | bytearray
+
+
+def _to_numeric(value: object) -> float | None:
+    """Best-effort conversion of arbitrary objects to ``float`` values."""
+
+    try:
+        numeric = float(cast(CoercibleScalar, value))
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(numeric) or math.isinf(numeric):
+        return None
+    return numeric
 
