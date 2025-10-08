@@ -35,7 +35,11 @@ from typing import (
 from typing import Optional
 from typing import TypedDict
 
-import numpy as np
+try:  # pragma: no cover - optional scientific stack dependency
+    import numpy as np
+except Exception:  # pragma: no cover - executed when numpy is unavailable
+    np = None  # type: ignore[assignment]
+from fastapi import Depends, FastAPI, HTTPException, Query
 from prometheus_client import Gauge
 
 from shared.pydantic_compat import BaseModel
@@ -364,7 +368,34 @@ def _rolling_beta(series_alt: Sequence[float], series_base: Sequence[float], win
     return covariance / variance
 
 
-def _garch_forecast(prices: Sequence[float], horizon: int = 12) -> VolatilityMetrics:
+def _log_returns(prices: Sequence[float]) -> List[float]:
+    if len(prices) < 2:
+        return []
+
+    cleaned: List[float] = []
+    for idx, price in enumerate(prices):
+        if price is None:
+            raise HTTPException(status_code=422, detail=f"Encountered null price at index {idx}")
+        try:
+            value = float(price)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid price value at index {idx}") from exc
+        if value <= 0:
+            raise HTTPException(status_code=422, detail="Prices must be positive to compute log returns")
+        cleaned.append(value)
+
+    if np is not None:
+        array = np.asarray(cleaned, dtype=float)
+        returns = np.diff(np.log(array))
+        return [float(ret) for ret in returns.tolist()]
+
+    returns: List[float] = []
+    for previous, current in zip(cleaned, cleaned[1:]):
+        returns.append(math.log(current) - math.log(previous))
+    return returns
+
+
+def _garch_forecast(prices: Sequence[float], horizon: int = 12) -> Dict[str, object]:
     if len(prices) < 30:
         raise HTTPException(status_code=422, detail="Need at least 30 observations for GARCH")
     log_returns = _log_returns(prices)
@@ -388,9 +419,11 @@ def _garch_forecast(prices: Sequence[float], horizon: int = 12) -> VolatilityMet
 
     window = min(20, len(log_returns))
     recent = log_returns[-window:]
-    mean = float(np.mean(recent))
-    std = float(np.std(recent)) or 1e-6
-    jumps: List[JumpEvent] = []
+    mean = float(statistics.fmean(recent))
+    std = float(statistics.pstdev(recent)) if len(recent) > 1 else 0.0
+    if std == 0:
+        std = 1e-6
+    jumps = []
     for idx, ret in enumerate(log_returns[-horizon:], start=len(log_returns) - horizon):
         z_score = (ret - mean) / std
         if abs(z_score) > 4:

@@ -12,53 +12,38 @@ from decimal import Decimal
 from statistics import pstdev
 from typing import TYPE_CHECKING, Any, Callable, TypeVar, cast
 
-if TYPE_CHECKING:  # pragma: no cover - used solely for static analysis
-    from fastapi import APIRouter, Depends, HTTPException, Query
-else:  # pragma: no cover - runtime fallbacks when FastAPI is optional
-    try:
-        from fastapi import APIRouter, Depends, HTTPException, Query
-    except ModuleNotFoundError:  # pragma: no cover - lightweight shims
-        class HTTPException(Exception):
-            """Minimal HTTP exception capturing status and detail."""
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 
-            def __init__(self, status_code: int, detail: str) -> None:
-                super().__init__(detail)
-                self.status_code = status_code
-                self.detail = detail
+_SQLALCHEMY_AVAILABLE = True
 
-        class APIRouter:  # pragma: no cover - decorator-friendly stub
-            def __init__(self, *args: Any, **kwargs: Any) -> None:
-                del args, kwargs
+try:  # pragma: no cover - optional dependency present in production
+    from sqlalchemy import (
+        Column,
+        DateTime,
+        Float,
+        MetaData,
+        PrimaryKeyConstraint,
+        String,
+        Table,
+        select,
+    )
+    from sqlalchemy import create_engine
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.exc import SQLAlchemyError
+    from sqlalchemy.pool import StaticPool
+except ImportError:  # pragma: no cover - exercised when SQLAlchemy is unavailable
+    _SQLALCHEMY_AVAILABLE = False
+    Column = DateTime = Float = MetaData = PrimaryKeyConstraint = String = Table = None  # type: ignore[assignment]
+    Engine = object  # type: ignore[assignment]
+    SQLAlchemyError = Exception  # type: ignore[assignment]
+    StaticPool = object  # type: ignore[assignment]
 
-            def get(
-                self, *args: Any, **kwargs: Any
-            ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-                def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
-                    return func
+    def select(*_args: object, **_kwargs: object) -> None:  # type: ignore[override]
+        raise RuntimeError("SQLAlchemy is required for select queries in VWAP analytics")
 
-                return decorator
-
-        def Depends(dependency: Callable[..., Any]) -> Callable[..., Any]:  # type: ignore[misc]
-            return dependency
-
-        def Query(default: Any = None, **_: Any) -> Any:
-            return default
-
-from shared.pydantic_compat import BaseModel, Field
-from sqlalchemy import (
-    Column,
-    DateTime,
-    Float,
-    MetaData,
-    PrimaryKeyConstraint,
-    String,
-    Table,
-    select,
-)
-from sqlalchemy import create_engine
-from sqlalchemy.engine import Engine
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.pool import StaticPool
+    def create_engine(*_args: object, **_kwargs: object) -> Engine:  # type: ignore[override]
+        raise RuntimeError("SQLAlchemy engine creation requested but the dependency is missing")
 
 from services.common.security import require_admin_account
 from services.common.spot import require_spot_http
