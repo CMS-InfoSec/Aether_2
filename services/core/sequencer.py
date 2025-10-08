@@ -8,9 +8,9 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Callable, Dict, Iterable, Mapping, MutableMapping, Optional, Protocol
+from typing import Any, AsyncIterator, Callable, Dict, Iterable, Mapping, MutableMapping, Optional, Protocol, cast
 
-from pydantic import BaseModel
+from shared.pydantic_compat import BaseModel
 from sqlalchemy import Column, DateTime, Float, MetaData, String, Table, create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
@@ -109,10 +109,11 @@ class _LatencyRecorder:
     async def record(self, *, endpoint: str, latency_ms: float, ts: datetime) -> None:
         """Persist a latency sample for the sequencer."""
 
-        async def _write() -> None:
+        def _write() -> None:
             try:
-                with self._Session() as db:  # type: Session
-                    db.execute(
+                with self._Session() as db:
+                    session = cast(Session, db)
+                    session.execute(
                         self._table.insert(),
                         [
                             {
@@ -125,9 +126,12 @@ class _LatencyRecorder:
                             }
                         ],
                     )
-                    db.commit()
+                    session.commit()
             except SQLAlchemyError:
-                LOGGER.exception("Failed to persist sequencer latency for schema %s", self._session.account_schema)
+                LOGGER.exception(
+                    "Failed to persist sequencer latency for schema %s",
+                    self._session.account_schema,
+                )
 
         await asyncio.to_thread(_write)
 
@@ -175,14 +179,16 @@ class _TradeLifecycleLogger:
             "ts": ts,
         }
 
-        async def _write() -> None:
+        def _write() -> None:
             try:
-                with self._Session() as db:  # type: Session
-                    db.execute(self._table.insert(), [payload])
-                    db.commit()
+                with self._Session() as db:
+                    session = cast(Session, db)
+                    session.execute(self._table.insert(), [payload])
+                    session.commit()
             except SQLAlchemyError:
                 LOGGER.exception(
-                    "Failed to persist lifecycle transition for schema %s", self._session.account_schema
+                    "Failed to persist lifecycle transition for schema %s",
+                    self._session.account_schema,
                 )
 
         await asyncio.to_thread(_write)
@@ -236,7 +242,9 @@ class TradingSequencer:
             if isinstance(event.intent, Mapping):
                 intent_payload: Dict[str, Any] = dict(event.intent)
                 intent_payload["correlation_id"] = correlation_id
-                event.intent = intent_payload  # type: ignore[assignment]
+                event_data = event.model_dump(mode="json")
+                event_data["intent"] = intent_payload
+                event = IntentEvent.model_validate(event_data)
 
             intent_dump = event.model_dump(mode="json")
             tracing.attach_correlation(intent_dump, mutate=True)
@@ -544,7 +552,7 @@ def _to_dict(value: Any) -> Dict[str, Any]:
         return {}
     if isinstance(value, BaseModel):
         return value.model_dump(mode="json")
-    if is_dataclass(value):
+    if is_dataclass(value) and not isinstance(value, type):
         return asdict(value)
     if isinstance(value, Mapping):
         return dict(value)

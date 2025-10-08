@@ -6,31 +6,79 @@ import hashlib
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
-
-try:  # pragma: no cover - pandas optional during local testing.
-    import pandas as pd
-except Exception:  # pragma: no cover - executed when pandas/numpy not installed.
-    pd = None  # type: ignore[assignment]
-
-try:  # pragma: no cover - exercised when mlflow is unavailable locally.
-    from mlflow import pyfunc
-    from mlflow.exceptions import MlflowException
-    from mlflow.models.signature import ModelSignature
-    from mlflow.tracking import MlflowClient
-    from mlflow.types import ColSpec, DataType, Schema
-except Exception:  # pragma: no cover - gracefully degrade if mlflow missing.
-    pyfunc = None  # type: ignore[assignment]
-    MlflowClient = None  # type: ignore[assignment]
-    ModelSignature = None  # type: ignore[assignment]
-    Schema = None  # type: ignore[assignment]
-    ColSpec = None  # type: ignore[assignment]
-
-    class MlflowException(Exception):  # type: ignore[override]
-        """Fallback placeholder used when mlflow is absent."""
+from importlib import import_module
+from types import ModuleType
+from typing import Any, Dict, Iterable, List, Mapping, Protocol, Sequence, Tuple, TYPE_CHECKING, cast
 
 from services.common.schemas import ActionTemplate, BookSnapshot, ConfidenceMetrics
 from shared.spot import require_spot_symbol
+class _PyFuncModel(Protocol):
+    metadata: Any
+
+    def predict(self, data: Any, params: Mapping[str, Any]) -> Any: ...
+
+
+class _PyFuncModule(Protocol):
+    def load_model(self, model_uri: str) -> _PyFuncModel: ...
+
+
+class _ModelSignatureLike(Protocol):
+    inputs: Any
+
+
+class _MlflowClientProtocol(Protocol):
+    def get_model_version_by_alias(self, name: str, alias: str) -> Any: ...
+
+    def get_latest_versions(self, name: str, stages: Sequence[str]) -> Sequence[Any]: ...
+
+
+PyFuncModel = _PyFuncModel
+PyFuncModule = _PyFuncModule
+ModelSignatureLike = _ModelSignatureLike
+MlflowClientProtocol = _MlflowClientProtocol
+
+
+if TYPE_CHECKING:  # pragma: no cover - imported for typing only.
+    import pandas as pd
+    from mlflow import pyfunc as mlflow_pyfunc
+    from mlflow.models.signature import ModelSignature as MlflowModelSignature
+    from mlflow.tracking import MlflowClient as MlflowClientType
+else:  # pragma: no cover - executed at runtime.
+    pd = cast(ModuleType | None, None)
+    try:
+        pd = import_module("pandas")
+    except Exception:
+        pd = None
+
+    mlflow_pyfunc = None
+    MlflowModelSignature = cast(type[Any] | None, None)
+    MlflowClientType = cast(type[Any] | None, None)
+    try:
+        mlflow_pyfunc = import_module("mlflow.pyfunc")
+        MlflowModelSignature = cast(
+            type[Any], getattr(import_module("mlflow.models.signature"), "ModelSignature")
+        )
+        MlflowClientType = cast(
+            type[Any], getattr(import_module("mlflow.tracking"), "MlflowClient")
+        )
+    except Exception:
+        mlflow_pyfunc = None
+
+MlflowException: type[Exception]
+try:  # pragma: no cover - exercised when mlflow is unavailable locally.
+    from mlflow.exceptions import MlflowException as _MlflowException
+except Exception:  # pragma: no cover - gracefully degrade if mlflow missing.
+    MlflowException = Exception
+else:
+    MlflowException = cast(type[Exception], _MlflowException)
+
+pyfunc: PyFuncModule | None = cast(PyFuncModule | None, mlflow_pyfunc)
+MlflowClient: type[MlflowClientProtocol] | None = cast(
+    type[MlflowClientProtocol] | None, MlflowClientType
+)
+ModelSignature: type[ModelSignatureLike] | None = cast(
+    type[ModelSignatureLike] | None, MlflowModelSignature
+)
 
 logger = logging.getLogger(__name__)
 
@@ -109,39 +157,36 @@ class CachedPolicyModel:
 
     name: str
     version: str
-    signature: ModelSignature
+    signature: ModelSignatureLike
     feature_names: Tuple[str, ...]
     feature_types: Tuple[str, ...]
     signature_hash: str
-    model: Any
+    model: PyFuncModel
 
     @classmethod
     def from_pyfunc(
         cls,
         name: str,
         version: str,
-        model: Any,
-        signature: ModelSignature,
+        model: PyFuncModel,
+        signature: ModelSignatureLike,
     ) -> "CachedPolicyModel":
-        if signature.inputs is None:
+        if not hasattr(signature, "inputs"):
+            raise ModelResolutionError("Model signature object does not expose inputs")
+
+        inputs = getattr(signature, "inputs")
+        if inputs is None:
             raise ModelResolutionError("Model signature is missing input schema")
 
         feature_names: List[str] = []
         feature_types: List[str] = []
-        for idx, field in enumerate(signature.inputs):
-            if ColSpec is not None and isinstance(field, ColSpec):
-                feature_names.append(field.name or f"feature_{idx}")
-                feature_types.append(field.type.to_string())
-            else:  # pragma: no cover - depends on mlflow internals
-                name = getattr(field, "name", None) or f"feature_{idx}"
-                dtype = getattr(field, "type", None)
-                feature_names.append(str(name))
-                if hasattr(dtype, "to_string"):
-                    feature_types.append(str(dtype.to_string()))
-                else:
-                    feature_types.append(str(dtype))
+        for idx, field in enumerate(inputs):
+            name = getattr(field, "name", None) or f"feature_{idx}"
+            feature_names.append(str(name))
+            dtype = getattr(field, "type", None)
+            feature_types.append(_describe_dtype(dtype))
 
-        signature_hash = _signature_digest(signature.inputs)
+        signature_hash = _signature_digest(inputs)
 
         return cls(
             name=name,
@@ -180,12 +225,14 @@ class CachedPolicyModel:
 class PolicyModelRegistry:
     """MLflow-backed loader that caches production policy models."""
 
-    def __init__(self, client: MlflowClient | None) -> None:
+    def __init__(self, client: MlflowClientProtocol | None) -> None:
         self._client = client
         self._cache: Dict[str, CachedPolicyModel] = {}
 
     def load(self, name: str) -> CachedPolicyModel:
-        if self._client is None or pyfunc is None:
+        client = self._client
+        loader = pyfunc
+        if client is None or loader is None:
             raise ModelResolutionError("MLflow client is not available")
 
         version_info = self._resolve_production_version(name)
@@ -197,7 +244,7 @@ class PolicyModelRegistry:
 
         model_uri = self._build_model_uri(name, version_info)
         logger.info("Loading policy model", extra={"model_uri": model_uri, "version": version})
-        model = pyfunc.load_model(model_uri)
+        model = loader.load_model(model_uri)
 
         signature = getattr(model.metadata, "signature", None)
         if signature is None:
@@ -206,18 +253,27 @@ class PolicyModelRegistry:
         if signature is None:
             raise ModelResolutionError("Loaded model does not expose a signature")
 
-        cached = CachedPolicyModel.from_pyfunc(name, version, model, signature)
+        cached = CachedPolicyModel.from_pyfunc(
+            name,
+            version,
+            model,
+            cast(ModelSignatureLike, signature),
+        )
         self._cache[name] = cached
         return cached
 
-    def _resolve_production_version(self, name: str):  # type: ignore[override]
+    def _resolve_production_version(self, name: str) -> Any:
+        client = self._client
+        if client is None:
+            raise ModelResolutionError("MLflow client is not available")
+
         try:
-            return self._client.get_model_version_by_alias(name, PRODUCTION_ALIAS)
+            return client.get_model_version_by_alias(name, PRODUCTION_ALIAS)
         except MlflowException:
             logger.debug("Production alias not found for %s", name)
 
         try:
-            versions = self._client.get_latest_versions(name, stages=["Production"])
+            versions = client.get_latest_versions(name, stages=["Production"])
         except MlflowException as exc:  # pragma: no cover - depends on mlflow backend
             raise ModelResolutionError(f"Unable to query model registry for {name}") from exc
 
@@ -237,7 +293,23 @@ class PolicyModelRegistry:
         return f"models:/{name}/{version}"
 
 
-def _signature_digest(schema: Schema) -> str:
+def _describe_dtype(dtype: Any) -> str:
+    if dtype is None:
+        return "unknown"
+
+    to_string = getattr(dtype, "to_string", None)
+    if callable(to_string):
+        try:
+            return str(to_string())
+        except Exception:  # pragma: no cover - defensive formatting guard
+            return str(dtype)
+
+    return str(dtype)
+
+
+def _signature_digest(schema: Any) -> str:
+    if schema is None:
+        raise ModelResolutionError("Model signature is missing input schema")
     payload = schema.to_dict() if hasattr(schema, "to_dict") else schema
     serialised = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha1(serialised.encode("utf-8")).hexdigest()
@@ -314,24 +386,25 @@ def _build_feature_frame(
 
 def _normalise_model_output(result: Any) -> Mapping[str, Any]:
     if isinstance(result, Mapping):
-        return result
+        return cast(Mapping[str, Any], result)
 
-    if pd is not None and isinstance(result, pd.DataFrame):
+    if pd is not None and hasattr(pd, "DataFrame") and isinstance(result, pd.DataFrame):
         if result.empty:
             raise ModelInferenceError("Model returned an empty DataFrame")
-        return result.iloc[0].to_dict()
+        row_mapping = result.iloc[0].to_dict()
+        return cast(Mapping[str, Any], row_mapping)
 
     if hasattr(result, "to_dict") and not isinstance(result, (list, tuple)):
         coerced = result.to_dict()
         if isinstance(coerced, Mapping):
-            return coerced
+            return cast(Mapping[str, Any], coerced)
 
     if isinstance(result, Sequence) and not isinstance(result, (str, bytes, bytearray)):
         if not result:
             raise ModelInferenceError("Model returned an empty sequence")
         first = result[0]
         if isinstance(first, Mapping):
-            return first
+            return cast(Mapping[str, Any], first)
 
     raise ModelInferenceError(f"Unsupported model output type: {type(result).__name__}")
 
@@ -407,7 +480,7 @@ def _augment_metadata(
 
 def _require_spot_symbol(symbol: object) -> str:
     try:
-        return require_spot_symbol(symbol)
+        return cast(str, require_spot_symbol(symbol))
     except ValueError as exc:
         logger.warning("Rejected non-spot symbol in policy model server", extra={"symbol": symbol})
         raise ValueError(str(exc)) from exc
@@ -420,10 +493,11 @@ def _model_name(account_id: str, symbol: str, variant: str | None = None) -> str
 
 
 def _initialise_registry() -> PolicyModelRegistry:
-    client: MlflowClient | None = None
-    if MlflowClient is not None:
+    client: MlflowClientProtocol | None = None
+    factory = MlflowClient
+    if factory is not None:
         try:
-            client = MlflowClient()
+            client = factory()
         except Exception as exc:  # pragma: no cover - depends on mlflow runtime
             logger.warning("Unable to initialise MlflowClient: %s", exc)
     else:  # pragma: no cover - executed when mlflow is missing

@@ -1,12 +1,4 @@
-"""FastAPI service exposing cross-asset analytics endpoints.
-
-The service reads historical OHLCV bars from the Timescale-backed
-``ohlcv_bars`` hypertable populated by the ingestion pipeline.  Using the
-authoritative market data ensures lead/lag relationships, rolling beta, and
-stablecoin deviation metrics reflect production state.  Computed metrics are
-persisted into a lightweight SQL table for audit and downstream reporting.
-"""
-
+"""Cross-asset analytics FastAPI service with strict typing support."""
 from __future__ import annotations
 
 import logging
@@ -15,21 +7,100 @@ import os
 import statistics
 import sys
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional, Sequence, TypeVar, cast
 
-from fastapi import FastAPI, HTTPException, Query
 from prometheus_client import Gauge
-from pydantic import BaseModel, Field
 from sqlalchemy import Column, DateTime, Float, String, create_engine, func, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from shared.postgres import normalize_sqlalchemy_dsn
 from services.common.spot import require_spot_http
+from shared.postgres import normalize_sqlalchemy_dsn
+from shared.pydantic_compat import BaseModel, Field
+
+if TYPE_CHECKING:  # pragma: no cover - FastAPI is optional for type checking
+    from fastapi import FastAPI, HTTPException, Query
+else:  # pragma: no cover - runtime fallbacks when FastAPI is not installed
+    try:
+        from fastapi import FastAPI, HTTPException, Query
+    except ModuleNotFoundError:  # pragma: no cover - minimal shim for optional dependency
+        class HTTPException(Exception):
+            """Lightweight HTTP exception mirroring FastAPI semantics."""
+
+            def __init__(self, status_code: int, detail: str) -> None:
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+
+        class _State:  # pragma: no cover - generic container for FastAPI state
+            pass
+
+        class FastAPI:  # pragma: no cover - decorator-friendly shim
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                del args, kwargs
+                self.state = _State()
+
+            def get(self, *args: Any, **kwargs: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+                def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+                    return func
+
+                return decorator
+
+            def on_event(self, *_: Any, **__: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+                def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+                    return func
+
+                return decorator
+
+        def Query(default: Any = None, **_: Any) -> Any:  # pragma: no cover - simple passthrough
+            return default
+
 
 LOGGER = logging.getLogger(__name__)
+
+TCallable = TypeVar("TCallable", bound=Callable[..., Any])
+
+
+def typed_app_event(application: FastAPI, event: str) -> Callable[[TCallable], TCallable]:
+    """Wrap ``FastAPI.on_event`` to preserve typing for decorated callables."""
+
+    def decorator(func: TCallable) -> TCallable:
+        wrapped = application.on_event(event)(func)
+        return cast(TCallable, wrapped)
+
+    return decorator
+
+
+def typed_app_get(application: FastAPI, path: str, **kwargs: Any) -> Callable[[TCallable], TCallable]:
+    """Wrap ``FastAPI.get`` to retain endpoint typing under strict mypy."""
+
+    def decorator(func: TCallable) -> TCallable:
+        wrapped = application.get(path, **kwargs)(func)
+        return cast(TCallable, wrapped)
+
+    return decorator
+
+
+if TYPE_CHECKING:  # pragma: no cover - typed declarative base for mypy
+    class _DeclarativeBase:
+        metadata: Any
+        registry: Any
+
+    DeclarativeBase = _DeclarativeBase
+else:  # pragma: no cover - runtime declarative base when SQLAlchemy is installed
+    DeclarativeBase = declarative_base()
+
+
+ENGINE_STATE_KEY = "crossasset_engine"
+SESSIONMAKER_STATE_KEY = "crossasset_sessionmaker"
+DATABASE_URL_STATE_KEY = "crossasset_database_url"
+
+DATABASE_URL: Optional[str] = None
+ENGINE: Engine | None = None
+SessionFactory = Callable[[], Session]
+SESSION_FACTORY: SessionFactory | None = None
 
 DATA_STALENESS_GAUGE = Gauge(
     "crossasset_data_age_seconds",
@@ -41,14 +112,31 @@ DEFAULT_WINDOW_POINTS = 240
 MIN_REQUIRED_POINTS = 30
 STALE_THRESHOLD = timedelta(hours=6)
 STABLECOIN_STALE_THRESHOLD = timedelta(hours=12)
+_SQLITE_FALLBACK = "sqlite+pysqlite:///:memory:"
 
-Base = declarative_base()
+
+if TYPE_CHECKING:
+    Base = DeclarativeBase
+else:
+    Base = DeclarativeBase
 
 
 class CrossAssetMetric(Base):
     """SQLAlchemy model storing computed cross-asset analytics."""
 
     __tablename__ = "crossasset_metrics"
+
+    if TYPE_CHECKING:  # pragma: no cover - inform mypy of constructor/table fields
+        __table__: Any
+
+        def __init__(
+            self,
+            *,
+            pair: str,
+            metric_type: str,
+            ts: datetime,
+            value: float,
+        ) -> None: ...
 
     pair = Column(String, primary_key=True)
     metric_type = Column(String, primary_key=True)
@@ -60,6 +148,21 @@ class OhlcvBar(Base):
     """Subset of the ``ohlcv_bars`` table used for analytics."""
 
     __tablename__ = "ohlcv_bars"
+
+    if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
+        __table__: Any
+
+        def __init__(
+            self,
+            *,
+            market: str,
+            bucket_start: datetime,
+            open: float,
+            high: float,
+            low: float,
+            close: float,
+            volume: float,
+        ) -> None: ...
 
     market = Column(String, primary_key=True)
     bucket_start = Column(DateTime(timezone=True), primary_key=True)
@@ -97,7 +200,10 @@ class StablecoinResponse(BaseModel):
     ts: datetime = Field(..., description="Timestamp the metric was generated")
 
 
-_SQLITE_FALLBACK = "sqlite+pysqlite:///:memory:"
+app = FastAPI(title="Cross-Asset Analytics Service", version="1.0.0")
+setattr(app.state, DATABASE_URL_STATE_KEY, None)
+setattr(app.state, ENGINE_STATE_KEY, None)
+setattr(app.state, SESSIONMAKER_STATE_KEY, None)
 
 
 def _resolve_database_url() -> str:
@@ -122,11 +228,12 @@ def _resolve_database_url() -> str:
     if not candidate:
         raise RuntimeError("Cross-asset analytics database DSN cannot be empty once configured.")
 
-    return normalize_sqlalchemy_dsn(
+    normalized = normalize_sqlalchemy_dsn(
         candidate,
         allow_sqlite=allow_sqlite,
         label="Cross-asset analytics database DSN",
     )
+    return cast(str, normalized)
 
 
 def _engine_options(url: str) -> dict[str, object]:
@@ -138,22 +245,54 @@ def _engine_options(url: str) -> dict[str, object]:
     return options
 
 
-DATABASE_URL = _resolve_database_url()
-ENGINE: Engine = create_engine(DATABASE_URL, **_engine_options(DATABASE_URL))
-SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
-
-app = FastAPI(title="Cross-Asset Analytics Service", version="1.0.0")
+def _create_engine(url: str) -> Engine:
+    return create_engine(url, **_engine_options(url))
 
 
-@app.on_event("startup")
-def _create_tables() -> None:
-    """Ensure the analytics table exists before serving requests."""
+def _register_database(url: str, engine: Engine, session_factory: SessionFactory) -> SessionFactory:
+    """Persist database artefacts on the module and FastAPI state."""
+
+    global DATABASE_URL, ENGINE, SESSION_FACTORY
+
+    DATABASE_URL = url
+    ENGINE = engine
+    SESSION_FACTORY = session_factory
+
+    setattr(app.state, DATABASE_URL_STATE_KEY, url)
+    setattr(app.state, ENGINE_STATE_KEY, engine)
+    setattr(app.state, SESSIONMAKER_STATE_KEY, session_factory)
+
+    return session_factory
+
+
+def _ensure_session_factory() -> SessionFactory:
+    session_factory = SESSION_FACTORY
+    if session_factory is None:
+        raise RuntimeError(
+            "Cross-asset analytics session factory is not initialised. Ensure startup has run and "
+            "CROSSASSET_DATABASE_URL (or ANALYTICS_DATABASE_URL) is configured."
+        )
+    return session_factory
+
+
+@typed_app_event(app, "startup")
+def _on_startup() -> None:
+    """Initialise the Timescale connection and ensure tables exist."""
+
+    url = _resolve_database_url()
+    engine = _create_engine(url)
+    session_factory = cast(
+        SessionFactory,
+        sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True),
+    )
 
     try:
-        Base.metadata.create_all(ENGINE)
+        Base.metadata.create_all(engine)
     except SQLAlchemyError as exc:  # pragma: no cover - defensive logging
         LOGGER.exception("Failed to initialise crossasset tables: %s", exc)
         raise
+
+    _register_database(url, engine, session_factory)
 
 
 def _coerce_datetime(value: object) -> datetime | None:
@@ -198,16 +337,16 @@ def _load_price_series(session: Session, symbol: str, window: int) -> tuple[list
 
 
 def _record_data_age(symbol: str, observed_at: datetime | None, *, max_age: timedelta) -> None:
-    symbol_upper = symbol.strip().upper()
     if observed_at is None:
-        DATA_STALENESS_GAUGE.labels(symbol=symbol_upper).set(float("inf"))
-        raise HTTPException(status_code=404, detail=f"No price history for {symbol_upper}")
+        detail = f"No price history found for {symbol}"
+        LOGGER.warning(detail)
+        raise HTTPException(status_code=503, detail=detail)
 
-    observed = observed_at.astimezone(timezone.utc)
-    age_seconds = max(0.0, (datetime.now(timezone.utc) - observed).total_seconds())
-    DATA_STALENESS_GAUGE.labels(symbol=symbol_upper).set(age_seconds)
+    age_seconds = (datetime.now(tz=timezone.utc) - observed_at).total_seconds()
+    DATA_STALENESS_GAUGE.labels(symbol=symbol).set(age_seconds)
+
     if age_seconds > max_age.total_seconds():
-        detail = f"Price history for {symbol_upper} is stale ({int(age_seconds)}s old)"
+        detail = f"Price history for {symbol} is stale ({int(age_seconds)}s old)"
         LOGGER.warning(detail)
         raise HTTPException(status_code=503, detail=detail)
 
@@ -305,12 +444,13 @@ def _store_metrics(session: Session, pair: str, metrics: Iterable[tuple[str, flo
 
 
 def _persist_metrics(pair: str, metrics: Iterable[tuple[str, float]], ts: datetime) -> None:
-    with SessionLocal() as session:
+    session_factory = _ensure_session_factory()
+    with session_factory() as session:
         _store_metrics(session, pair, metrics, ts)
         session.commit()
 
 
-@app.get("/crossasset/leadlag", response_model=LeadLagResponse)
+@typed_app_get(app, "/crossasset/leadlag", response_model=LeadLagResponse)
 def lead_lag(
     base: str = Query(..., description="Base asset symbol"),
     target: str = Query(..., description="Target asset symbol"),
@@ -320,7 +460,8 @@ def lead_lag(
     base_symbol = require_spot_http(base, param="base", logger=LOGGER)
     target_symbol = require_spot_http(target, param="target", logger=LOGGER)
 
-    with SessionLocal() as session:
+    session_factory = _ensure_session_factory()
+    with session_factory() as session:
         base_series, base_ts = _load_price_series(session, base_symbol, window=DEFAULT_WINDOW_POINTS)
         target_series, target_ts = _load_price_series(session, target_symbol, window=DEFAULT_WINDOW_POINTS)
 
@@ -329,10 +470,10 @@ def lead_lag(
     _require_series(base_series, base_symbol, MIN_REQUIRED_POINTS)
     _require_series(target_series, target_symbol, MIN_REQUIRED_POINTS)
 
-    base_series, target_series = _align_series(base_series, target_series)
+    base_series_aligned, target_series_aligned = _align_series(base_series, target_series)
 
-    correlation = _pearson_correlation(base_series, target_series)
-    lag = _lag_coefficient(base_series, target_series)
+    correlation = _pearson_correlation(base_series_aligned, target_series_aligned)
+    lag = _lag_coefficient(base_series_aligned, target_series_aligned)
     ts = datetime.now(tz=timezone.utc)
     pair = f"{base_symbol}/{target_symbol}"
 
@@ -341,7 +482,7 @@ def lead_lag(
     return LeadLagResponse(pair=pair, correlation=correlation, lag=lag, ts=ts)
 
 
-@app.get("/crossasset/beta", response_model=BetaResponse)
+@typed_app_get(app, "/crossasset/beta", response_model=BetaResponse)
 def rolling_beta(
     alt: str = Query(..., description="Alt asset symbol"),
     base: str = Query(..., description="Base asset symbol"),
@@ -352,7 +493,9 @@ def rolling_beta(
     alt_symbol = require_spot_http(alt, param="alt", logger=LOGGER)
     base_symbol = require_spot_http(base, param="base", logger=LOGGER)
     lookback = max(DEFAULT_WINDOW_POINTS, window * 3)
-    with SessionLocal() as session:
+
+    session_factory = _ensure_session_factory()
+    with session_factory() as session:
         alt_series, alt_ts = _load_price_series(session, alt_symbol, window=lookback)
         base_series, base_ts = _load_price_series(session, base_symbol, window=lookback)
 
@@ -361,8 +504,8 @@ def rolling_beta(
     _require_series(alt_series, alt_symbol, window)
     _require_series(base_series, base_symbol, window)
 
-    alt_series, base_series = _align_series(alt_series, base_series)
-    beta_value = _rolling_beta(alt_series, base_series, window=window)
+    alt_series_aligned, base_series_aligned = _align_series(alt_series, base_series)
+    beta_value = _rolling_beta(alt_series_aligned, base_series_aligned, window=window)
     ts = datetime.now(tz=timezone.utc)
     pair = f"{alt_symbol}/{base_symbol}"
 
@@ -371,7 +514,7 @@ def rolling_beta(
     return BetaResponse(pair=pair, beta=beta_value, ts=ts)
 
 
-@app.get("/crossasset/stablecoin", response_model=StablecoinResponse)
+@typed_app_get(app, "/crossasset/stablecoin", response_model=StablecoinResponse)
 def stablecoin_deviation(
     symbol: str = Query(..., description="Stablecoin market symbol (e.g. USDT/USD)"),
 ) -> StablecoinResponse:
@@ -379,7 +522,8 @@ def stablecoin_deviation(
 
     normalized = require_spot_http(symbol, logger=LOGGER)
 
-    with SessionLocal() as session:
+    session_factory = _ensure_session_factory()
+    with session_factory() as session:
         series, observed_ts = _load_price_series(session, normalized, window=DEFAULT_WINDOW_POINTS)
 
     _record_data_age(normalized, observed_ts, max_age=STABLECOIN_STALE_THRESHOLD)
@@ -411,7 +555,11 @@ def stablecoin_deviation(
 
 __all__ = [
     "app",
-    "lead_lag",
-    "rolling_beta",
-    "stablecoin_deviation",
+    "DATABASE_URL",
+    "ENGINE",
+    "SESSION_FACTORY",
+    "CrossAssetMetric",
+    "LeadLagResponse",
+    "BetaResponse",
+    "StablecoinResponse",
 ]
