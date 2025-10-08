@@ -13,7 +13,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Any, Dict
+from typing import Any, Callable, Dict
 from urllib.parse import parse_qsl, urlparse, urlunparse
 
 import pytest
@@ -252,17 +252,47 @@ def _install_sqlalchemy_stub() -> None:
         def returning(self, *args: object, **kwargs: object) -> "_Insert":
             return self
 
-    def _select(*args: object, **kwargs: object) -> SimpleNamespace:
-        return SimpleNamespace(order_by=lambda *a, **k: SimpleNamespace(
-            where=lambda *a, **k: SimpleNamespace(
-                group_by=lambda *a, **k: SimpleNamespace(subquery=lambda *a, **k: SimpleNamespace())
-            )
-        ))
+    class _FunctionCall:
+        def __init__(self, name: str, *args: object, **kwargs: object) -> None:
+            self.name = name
+            self.args = args
+            self.kwargs = kwargs
+
+    class _FuncProxy:
+        def __getattr__(self, name: str) -> Callable[..., _FunctionCall]:
+            return lambda *args, **kwargs: _FunctionCall(name, *args, **kwargs)
+
+    class _SelectStatement:
+        def __init__(self, *entities: object) -> None:
+            self._entities = entities
+
+        def order_by(self, *args: object, **kwargs: object) -> "_SelectStatement":
+            return self
+
+        def where(self, *args: object, **kwargs: object) -> "_SelectStatement":
+            return self
+
+        def group_by(self, *args: object, **kwargs: object) -> "_SelectStatement":
+            return self
+
+        def subquery(self, *args: object, **kwargs: object) -> "_SelectStatement":
+            return self
+
+        def scalars(self) -> SimpleNamespace:
+            return SimpleNamespace(all=lambda: [])
+
+        def scalar(self) -> None:
+            return None
+
+    def _select(*args: object, **kwargs: object) -> _SelectStatement:
+        return _SelectStatement(*args)
 
     def _insert(table: Table) -> _Insert:
         return _Insert(table)
 
     def _create_engine(*args: object, **kwargs: object) -> SimpleNamespace:
+        url = args[0] if args else kwargs.get("url", "sqlite://")
+
         class _Connection(SimpleNamespace):
             def execute(self, *c_args: object, **c_kwargs: object) -> SimpleNamespace:
                 return SimpleNamespace(
@@ -271,7 +301,21 @@ def _install_sqlalchemy_stub() -> None:
                     scalars=lambda: SimpleNamespace(all=lambda: []),
                 )
 
-        return SimpleNamespace(connect=lambda: _Connection(), dispose=lambda: None)
+        class _BeginContext:
+            def __enter__(self) -> _Connection:
+                return _Connection()
+
+            def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[override]
+                return None
+
+        engine = SimpleNamespace(
+            connect=lambda: _Connection(),
+            dispose=lambda: None,
+            begin=lambda: _BeginContext(),
+            url=url,
+        )
+        engine._aether_url = url
+        return engine
 
     def _engine_from_config(*args: object, **kwargs: object) -> SimpleNamespace:
         return _create_engine()
@@ -290,7 +334,7 @@ def _install_sqlalchemy_stub() -> None:
     sa.Text = _Type
     sa.MetaData = MetaData
     sa.Table = Table
-    sa.func = SimpleNamespace(count=lambda *a, **k: 0)
+    sa.func = _FuncProxy()
     sa.select = _select
     sa.insert = _insert
     sa.create_engine = _create_engine
@@ -314,7 +358,11 @@ def _install_sqlalchemy_stub() -> None:
     orm = ModuleType("sqlalchemy.orm")
     orm.__spec__ = ModuleSpec("sqlalchemy.orm", loader=None)
     
-    class Session(SimpleNamespace):
+    class Session:
+        def __init__(self, bind: object | None = None) -> None:
+            self.bind = bind
+            self._bind_identifier = getattr(bind, "_aether_url", None)
+
         def execute(self, *args: object, **kwargs: object) -> SimpleNamespace:
             return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: []))
 
@@ -324,8 +372,19 @@ def _install_sqlalchemy_stub() -> None:
         def close(self) -> None:
             return None
 
+    def _sessionmaker(*args: object, **kwargs: object):
+        bind = kwargs.get("bind")
+        if bind is None and args:
+            bind = args[0]
+
+        def _factory() -> Session:
+            return Session(bind=bind)
+
+        _factory.bind = bind  # type: ignore[attr-defined]
+        return _factory
+
     orm.Session = Session
-    orm.sessionmaker = lambda *a, **k: lambda: Session()
+    orm.sessionmaker = _sessionmaker
 
     class _BaseMeta(type):
         def __new__(mcls, name, bases, attrs):
@@ -395,7 +454,27 @@ def _install_sqlalchemy_stub() -> None:
 
     exc = ModuleType("sqlalchemy.exc")
     exc.__spec__ = ModuleSpec("sqlalchemy.exc", loader=None)
-    exc.SQLAlchemyError = Exception
+
+    class SQLAlchemyError(Exception):
+        """Base error type exposed by the lightweight SQLAlchemy stub."""
+
+    class OperationalError(SQLAlchemyError):
+        """Raised when the database connection or statement execution fails."""
+
+    class IntegrityError(SQLAlchemyError):
+        """Raised when inserts or updates violate a constraint."""
+
+    class ArgumentError(SQLAlchemyError):
+        """Raised when configuration or invocation arguments are invalid."""
+
+    class NoSuchTableError(SQLAlchemyError):
+        """Raised when metadata lookups reference an unknown table."""
+
+    exc.SQLAlchemyError = SQLAlchemyError
+    exc.OperationalError = OperationalError
+    exc.IntegrityError = IntegrityError
+    exc.ArgumentError = ArgumentError
+    exc.NoSuchTableError = NoSuchTableError
     sys.modules["sqlalchemy.exc"] = exc
 
     pool = ModuleType("sqlalchemy.pool")
