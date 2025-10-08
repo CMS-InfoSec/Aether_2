@@ -7,6 +7,7 @@ import logging
 from datetime import datetime, timezone
 from enum import Enum
 from collections import defaultdict
+from types import ModuleType
 from typing import (
     Any,
     Awaitable,
@@ -19,23 +20,103 @@ from typing import (
     Optional,
     Protocol,
     Sequence,
+    TypeVar,
+    cast,
 )
+from typing_extensions import ParamSpec
 
 from fastapi import APIRouter, FastAPI, HTTPException
 
 try:  # pragma: no cover - optional dependency during documentation builds
     import sqlalchemy as sa
-    from sqlalchemy import select
-    from sqlalchemy.engine import Engine
-    from sqlalchemy.exc import SQLAlchemyError
-    from sqlalchemy.orm import Session, sessionmaker
+    from sqlalchemy import select as _select
+    from sqlalchemy.exc import SQLAlchemyError as _SQLAlchemyError
+    from sqlalchemy.orm import sessionmaker as _sessionmaker
 except Exception:  # pragma: no cover - fall back for environments without sqlalchemy
-    sa = None  # type: ignore[assignment]
-    select = None  # type: ignore[assignment]
-    Engine = Any  # type: ignore[assignment]
-    SQLAlchemyError = Exception  # type: ignore[assignment]
-    Session = Any  # type: ignore[assignment]
-    sessionmaker = None  # type: ignore[assignment]
+    sa = None
+    _select = None
+
+    class _FallbackSQLAlchemyError(Exception):
+        """Fallback exception when SQLAlchemy is unavailable."""
+
+
+SelectCallable = Callable[..., Any]
+
+
+class EngineProtocol(Protocol):
+    """Subset of SQLAlchemy engine behaviour consumed by the store."""
+
+    def connect(self) -> Any:
+        """Return a connection handle."""
+
+
+class MappingResultProtocol(Protocol):
+    """Result contract for ``Result.mappings()`` calls."""
+
+    def first(self) -> Optional[Mapping[str, Any]]:
+        """Return the first row mapping if present."""
+
+
+class ExecuteResultProtocol(Protocol):
+    """Subset of SQLAlchemy result behaviour consumed by the store."""
+
+    def mappings(self) -> MappingResultProtocol:
+        """Return a mapping-aware view over the result rows."""
+
+    def scalar_one_or_none(self) -> Optional[Any]:
+        """Return the scalar value or ``None`` when no row exists."""
+
+    def scalar(self) -> Any:
+        """Return the first column of the first row or ``None``."""
+
+
+class SessionProtocol(Protocol):
+    """Behaviour shared by SQLAlchemy sessions and our fallbacks."""
+
+    def execute(self, statement: Any, *args: Any, **kwargs: Any) -> ExecuteResultProtocol:
+        """Execute a SQL expression and return a result handle."""
+
+    def commit(self) -> None:
+        """Commit the current transaction if supported."""
+
+    def close(self) -> None:
+        """Release any underlying connection resources."""
+
+
+SessionFactory = Callable[[], SessionProtocol]
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+def typed_router_get(
+    router: APIRouter,
+    path: str,
+    **kwargs: Any,
+) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
+    """Wrap ``router.get`` with typing preserved for decorated callables."""
+
+    def decorator(func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
+        wrapped = router.get(path, **kwargs)(func)
+        return cast(Callable[P, Awaitable[R]], wrapped)
+
+    return decorator
+
+
+def _missing_sessionmaker(*_args: Any, **_kwargs: Any) -> SessionFactory:
+    """Fallback sessionmaker that signals SQLAlchemy is required."""
+
+    raise RuntimeError("sqlalchemy is required to use SQLStartupStateStore")
+
+
+if sa is not None:
+    SQLAlchemyError = _SQLAlchemyError
+    sessionmaker = cast(Callable[..., SessionFactory], _sessionmaker)
+    select: Optional[SelectCallable] = _select
+else:
+    SQLAlchemyError = _FallbackSQLAlchemyError
+    sessionmaker = _missing_sessionmaker
+    select = None
 
 
 LOGGER = logging.getLogger(__name__)
@@ -71,12 +152,21 @@ class StartupStateStore(Protocol):
 class SQLStartupStateStore:
     """Persist startup metadata inside the ``startup_state`` table."""
 
-    def __init__(self, engine: Engine, *, table_name: str = "startup_state") -> None:
-        if sa is None or select is None or sessionmaker is None:
+    def __init__(self, engine: EngineProtocol, *, table_name: str = "startup_state") -> None:
+        if sa is None or select is None:
             raise RuntimeError("sqlalchemy is required to use SQLStartupStateStore")
 
+        assert select is not None
+        assert sa is not None
+
         self._engine = engine
-        self._Session = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+        self._session_factory: SessionFactory = sessionmaker(
+            bind=engine,
+            expire_on_commit=False,
+            future=True,
+        )
+        self._select: SelectCallable = select
+        self._sa: ModuleType = sa
         metadata = sa.MetaData()
         self._table = sa.Table(
             table_name,
@@ -91,7 +181,7 @@ class SQLStartupStateStore:
         self._memory_state: Optional[Dict[str, Any]] = None
         self._use_memory_only = False
         try:
-            session = self._Session()
+            session = self._session_factory()
             close = getattr(session, "close", None)
             if callable(close):
                 close()
@@ -106,10 +196,11 @@ class SQLStartupStateStore:
             return self._memory_state
 
         try:
-            session = self._Session()  # type: Session
+            session = self._session_factory()
             try:
-                stmt = select(self._table).order_by(self._table.c.updated_at.desc()).limit(1)
-                row = session.execute(stmt).mappings().first()
+                stmt = self._select(self._table).order_by(self._table.c.updated_at.desc()).limit(1)
+                result: ExecuteResultProtocol = session.execute(stmt)
+                row = result.mappings().first()
             finally:
                 close = getattr(session, "close", None)
                 if callable(close):
@@ -187,9 +278,10 @@ class SQLStartupStateStore:
             return
 
         try:
-            session = self._Session()  # type: Session
+            session = self._session_factory()
             try:
-                existing_id = session.execute(select(self._table.c.id)).scalar_one_or_none()
+                result: ExecuteResultProtocol = session.execute(self._select(self._table.c.id))
+                existing_id = result.scalar_one_or_none()
                 if existing_id is None:
                     session.execute(self._table.insert().values(**payload))
                 else:
@@ -212,10 +304,11 @@ class SQLStartupStateStore:
         if self._use_memory_only:
             return self._memory_state is not None
         try:
-            session = self._Session()  # type: Session
+            session = self._session_factory()
             try:
-                stmt = select(sa.func.count()).select_from(self._table)
-                count = session.execute(stmt).scalar()
+                stmt = self._select(self._sa.func.count()).select_from(self._table)
+                result: ExecuteResultProtocol = session.execute(stmt)
+                count = result.scalar()
                 return bool(count)
             finally:
                 close = getattr(session, "close", None)
@@ -719,7 +812,7 @@ router = APIRouter(prefix="/startup", tags=["startup"])
 _MANAGER: Optional[StartupManager] = None
 
 
-@router.get("/status")
+@typed_router_get(router, "/status")
 async def startup_status() -> Dict[str, Any]:
     if _MANAGER is None:
         raise HTTPException(status_code=503, detail="Startup manager not configured")

@@ -19,7 +19,21 @@ import statistics
 import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import AsyncIterator, Dict, Iterable, List, Mapping, Sequence
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncIterator,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Sequence,
+    TypeVar,
+    Protocol,
+    cast,
+)
+from typing import Optional
+from typing import TypedDict
 
 try:  # pragma: no cover - optional scientific stack dependency
     import numpy as np
@@ -27,7 +41,46 @@ except Exception:  # pragma: no cover - executed when numpy is unavailable
     np = None  # type: ignore[assignment]
 from fastapi import Depends, FastAPI, HTTPException, Query
 from prometheus_client import Gauge
-from pydantic import BaseModel
+
+from shared.pydantic_compat import BaseModel
+
+if TYPE_CHECKING:  # pragma: no cover - FastAPI may be optional
+    from fastapi import Depends, FastAPI, HTTPException, Query
+else:  # pragma: no cover - lightweight fallbacks when FastAPI is unavailable
+    try:
+        from fastapi import Depends, FastAPI, HTTPException, Query
+    except ModuleNotFoundError:  # pragma: no cover - decorator-friendly shims
+        class HTTPException(Exception):
+            """Lightweight HTTP exception carrying status and detail."""
+
+            def __init__(self, status_code: int, detail: str) -> None:
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+
+        class _State:
+            def __init__(self) -> None:
+                self.market_data_adapter: Optional["TimescaleMarketDataAdapter"] = None
+                self.session_store: Optional["SessionStoreProtocol"] = None
+
+        class FastAPI:  # pragma: no cover - decorator-friendly application shim
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                del args, kwargs
+                self.state = _State()
+
+            def get(
+                self, *args: Any, **kwargs: Any
+            ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+                def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+                    return func
+
+                return decorator
+
+        def Depends(dependency: Callable[..., Any]) -> Callable[..., Any]:  # type: ignore[misc]
+            return dependency
+
+        def Query(default: Any = None, **_: Any) -> Any:
+            return default
 
 from auth.service import (
     InMemorySessionStore,
@@ -47,6 +100,21 @@ from shared.session_config import load_session_ttl_minutes
 from services.common.spot import require_spot_http
 
 
+TCallable = TypeVar("TCallable", bound=Callable[..., Any])
+
+
+def typed_app_get(
+    application: "FastAPI", path: str, **kwargs: Any
+) -> Callable[[TCallable], TCallable]:
+    """Wrap ``FastAPI.get`` so decorated callables retain their type."""
+
+    def decorator(func: TCallable) -> TCallable:
+        wrapped = application.get(path, **kwargs)(func)
+        return cast(TCallable, wrapped)
+
+    return decorator
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -55,6 +123,91 @@ DATA_STALENESS_GAUGE = Gauge(
     "Age of the market data powering signal service computations.",
     ["symbol", "feed"],
 )
+
+
+# ---------------------------------------------------------------------------
+# Typed payload helpers
+# ---------------------------------------------------------------------------
+
+
+class LiquidityGap(TypedDict):
+    side: str
+    level: int
+    drop_ratio: float
+    size: float
+
+
+class QueueAnomalyMetrics(TypedDict):
+    top_bid_depth: float
+    top_ask_depth: float
+    depth_imbalance: float
+    queue_skew: float
+    anomaly_score: float
+    liquidity_gaps: List[LiquidityGap]
+
+
+JumpEvent = TypedDict(
+    "JumpEvent", {"index": int, "return": float, "z_score": float}
+)
+
+
+WhaleTrade = TypedDict(
+    "WhaleTrade",
+    {"side": str, "volume": float, "price": float, "ts": datetime, "sigma": float},
+)
+
+
+FlashCrashInfo = TypedDict(
+    "FlashCrashInfo",
+    {
+        "price": float,
+        "expected_slippage": float,
+        "depth_absorption": float,
+    },
+)
+
+
+SpreadWideningInfo = TypedDict(
+    "SpreadWideningInfo",
+    {
+        "price": float,
+        "new_spread": Optional[float],
+        "depth_reduction": float,
+    },
+)
+
+
+class WhaleDetectionResult(TypedDict):
+    threshold_volume: float
+    count: int
+    share_of_trades: float
+    trades: List[WhaleTrade]
+
+
+class StressTestPayload(TypedDict):
+    symbol: str
+    flash_crash: FlashCrashInfo
+    spread_widening: SpreadWideningInfo
+
+
+class VolatilityMetrics(TypedDict):
+    variance: float
+    forecasts: List[float]
+    jump_events: List[JumpEvent]
+
+
+class _SignalServiceState(Protocol):
+    market_data_adapter: Optional["TimescaleMarketDataAdapter"]
+    session_store: Optional[SessionStoreProtocol]
+
+
+def _service_state(application: "FastAPI") -> _SignalServiceState:
+    state = cast(_SignalServiceState, application.state)
+    if not hasattr(state, "market_data_adapter"):
+        state.market_data_adapter = None
+    if not hasattr(state, "session_store"):
+        state.session_store = None
+    return state
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +267,7 @@ def _order_flow_metrics(trades: Sequence[Trade]) -> Dict[str, float]:
     }
 
 
-def _queue_depth_anomalies(order_book: Mapping[str, Sequence[Sequence[float]]]) -> Dict[str, object]:
+def _queue_depth_anomalies(order_book: Mapping[str, Sequence[Sequence[float]]]) -> QueueAnomalyMetrics:
     bids = list(order_book.get("bids", []))
     asks = list(order_book.get("asks", []))
     if not bids or not asks:
@@ -126,7 +279,7 @@ def _queue_depth_anomalies(order_book: Mapping[str, Sequence[Sequence[float]]]) 
     if top_depth_bid + top_depth_ask:
         depth_imbalance = (top_depth_bid - top_depth_ask) / (top_depth_bid + top_depth_ask)
 
-    anomalies: List[Dict[str, float]] = []
+    anomalies: List[LiquidityGap] = []
     for side_name, levels in ("bid", bids), ("ask", asks):
         for idx in range(1, len(levels)):
             prev = levels[idx - 1][1]
@@ -136,12 +289,15 @@ def _queue_depth_anomalies(order_book: Mapping[str, Sequence[Sequence[float]]]) 
             drop = (prev - curr) / prev
             if drop > 0.55:
                 anomalies.append(
-                    {
-                        "side": side_name,
-                        "level": idx + 1,
-                        "drop_ratio": round(drop, 6),
-                        "size": curr,
-                    }
+                    cast(
+                        LiquidityGap,
+                        {
+                            "side": side_name,
+                            "level": idx + 1,
+                            "drop_ratio": round(drop, 6),
+                            "size": float(curr),
+                        },
+                    )
                 )
 
     queue_skew = 0.0
@@ -150,14 +306,17 @@ def _queue_depth_anomalies(order_book: Mapping[str, Sequence[Sequence[float]]]) 
 
     anomaly_score = min(1.0, max((abs(depth_imbalance) + len(anomalies) * 0.1) / 2, 0))
 
-    return {
-        "top_bid_depth": round(top_depth_bid, 6),
-        "top_ask_depth": round(top_depth_ask, 6),
-        "depth_imbalance": round(depth_imbalance, 6),
-        "queue_skew": round(queue_skew, 6),
-        "anomaly_score": round(anomaly_score, 6),
-        "liquidity_gaps": anomalies,
-    }
+    return cast(
+        QueueAnomalyMetrics,
+        {
+            "top_bid_depth": round(top_depth_bid, 6),
+            "top_ask_depth": round(top_depth_ask, 6),
+            "depth_imbalance": round(depth_imbalance, 6),
+            "queue_skew": round(queue_skew, 6),
+            "anomaly_score": round(anomaly_score, 6),
+            "liquidity_gaps": anomalies,
+        },
+    )
 
 
 def _pearson(series_a: Sequence[float], series_b: Sequence[float]) -> float:
@@ -268,16 +427,28 @@ def _garch_forecast(prices: Sequence[float], horizon: int = 12) -> Dict[str, obj
     for idx, ret in enumerate(log_returns[-horizon:], start=len(log_returns) - horizon):
         z_score = (ret - mean) / std
         if abs(z_score) > 4:
-            jumps.append({"index": idx + 1, "return": float(ret), "z_score": round(float(z_score), 6)})
+            jumps.append(
+                cast(
+                    JumpEvent,
+                    {
+                        "index": idx + 1,
+                        "return": float(ret),
+                        "z_score": round(float(z_score), 6),
+                    },
+                )
+            )
 
-    return {
-        "variance": round(variance, 10),
-        "forecasts": [round(float(v), 10) for v in forecasts],
-        "jump_events": jumps,
-    }
+    return cast(
+        VolatilityMetrics,
+        {
+            "variance": round(variance, 10),
+            "forecasts": [round(float(v), 10) for v in forecasts],
+            "jump_events": jumps,
+        },
+    )
 
 
-def _detect_whales(trades: Sequence[Trade], threshold_sigma: float) -> Dict[str, object]:
+def _detect_whales(trades: Sequence[Trade], threshold_sigma: float) -> WhaleDetectionResult:
     if not trades:
         raise HTTPException(status_code=422, detail="No trades available for whale detection")
     volumes = [t.volume for t in trades]
@@ -287,25 +458,36 @@ def _detect_whales(trades: Sequence[Trade], threshold_sigma: float) -> Dict[str,
         std = mean * 0.1
     threshold = mean + threshold_sigma * std
     whales = [t for t in trades if t.volume >= threshold]
-    payload = [
-        {
-            "side": trade.side,
-            "volume": trade.volume,
-            "price": trade.price,
-            "ts": trade.ts,
-            "sigma": round((trade.volume - mean) / std if std else 0.0, 6),
-        }
+    payload: List[WhaleTrade] = [
+        cast(
+            WhaleTrade,
+            {
+                "side": trade.side,
+                "volume": trade.volume,
+                "price": trade.price,
+                "ts": trade.ts,
+                "sigma": round((trade.volume - mean) / std if std else 0.0, 6),
+            },
+        )
         for trade in whales
     ]
-    return {
-        "threshold_volume": round(threshold, 6),
-        "count": len(payload),
-        "share_of_trades": round(len(payload) / len(trades), 6),
-        "trades": payload,
-    }
+    share = len(payload) / len(trades) if trades else 0.0
+    return cast(
+        WhaleDetectionResult,
+        {
+            "threshold_volume": round(threshold, 6),
+            "count": len(payload),
+            "share_of_trades": round(share, 6),
+            "trades": payload,
+        },
+    )
 
 
-def _stress_test(symbol: str, prices: Sequence[float], order_book: Mapping[str, Sequence[Sequence[float]]]) -> Dict[str, object]:
+def _stress_test(
+    symbol: str,
+    prices: Sequence[float],
+    order_book: Mapping[str, Sequence[Sequence[float]]],
+) -> StressTestPayload:
     current_price = prices[-1]
     flash_crash_price = round(current_price * 0.82, 6)
     spread_widen_price = round(current_price * 0.97, 6)
@@ -315,23 +497,32 @@ def _stress_test(symbol: str, prices: Sequence[float], order_book: Mapping[str, 
     total_bid_depth = sum(level[1] for level in bids)
     total_ask_depth = sum(level[1] for level in asks)
 
-    flash_crash_liquidity = {
-        "price": flash_crash_price,
-        "expected_slippage": round((current_price - flash_crash_price) / current_price, 6),
-        "depth_absorption": round(min(total_bid_depth, total_ask_depth * 1.4), 6),
-    }
+    flash_crash_liquidity = cast(
+        FlashCrashInfo,
+        {
+            "price": flash_crash_price,
+            "expected_slippage": round((current_price - flash_crash_price) / current_price, 6),
+            "depth_absorption": round(min(total_bid_depth, total_ask_depth * 1.4), 6),
+        },
+    )
 
-    spread_widening = {
-        "price": spread_widen_price,
-        "new_spread": round((asks[0][0] - bids[0][0]) * 3, 6) if bids and asks else None,
-        "depth_reduction": round(total_bid_depth * 0.35 + total_ask_depth * 0.35, 6),
-    }
+    spread_widening = cast(
+        SpreadWideningInfo,
+        {
+            "price": spread_widen_price,
+            "new_spread": round((asks[0][0] - bids[0][0]) * 3, 6) if bids and asks else None,
+            "depth_reduction": round(total_bid_depth * 0.35 + total_ask_depth * 0.35, 6),
+        },
+    )
 
-    return {
-        "symbol": symbol,
-        "flash_crash": flash_crash_liquidity,
-        "spread_widening": spread_widening,
-    }
+    return cast(
+        StressTestPayload,
+        {
+            "symbol": symbol,
+            "flash_crash": flash_crash_liquidity,
+            "spread_widening": spread_widening,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +541,7 @@ class OrderFlowResponse(BaseModel):
     queue_skew: float
     depth_imbalance: float
     anomaly_score: float
-    liquidity_gaps: List[Dict[str, float]]
+    liquidity_gaps: List[LiquidityGap]
     ts: datetime
 
 
@@ -367,7 +558,7 @@ class VolatilityResponse(BaseModel):
     symbol: str
     variance: float
     forecasts: List[float]
-    jump_events: List[Dict[str, float]]
+    jump_events: List[JumpEvent]
     ts: datetime
 
 
@@ -376,14 +567,14 @@ class WhaleResponse(BaseModel):
     threshold_volume: float
     count: int
     share_of_trades: float
-    trades: List[Dict[str, object]]
+    trades: List[WhaleTrade]
     ts: datetime
 
 
 class StressTestResponse(BaseModel):
     symbol: str
-    flash_crash: Dict[str, float]
-    spread_widening: Dict[str, float | None]
+    flash_crash: FlashCrashInfo
+    spread_widening: SpreadWideningInfo
     ts: datetime
 
 
@@ -428,11 +619,12 @@ def _resolve_market_data_dsn() -> str:
             raise RuntimeError(
                 f"{env_var} is set but empty; configure a PostgreSQL/Timescale DSN for the signal service."
             )
-        return normalize_sqlalchemy_dsn(
+        normalized_dsn: str = normalize_sqlalchemy_dsn(
             candidate,
             allow_sqlite=allow_sqlite,
             label="Signal service market data DSN",
         )
+        return normalized_dsn
     raise RuntimeError(
         "SIGNAL_DATABASE_URL or TIMESCALE_DSN must be configured with a PostgreSQL/Timescale DSN for the signal service."
     )
@@ -442,33 +634,36 @@ def _resolve_market_data_schema() -> str | None:
     raw = os.getenv(_PRIMARY_SCHEMA_ENV) or os.getenv(_FALLBACK_SCHEMA_ENV)
     if raw is None:
         return None
-    return normalize_postgres_schema(
+    normalized_schema: str = normalize_postgres_schema(
         raw,
         label="Signal service schema",
         prefix_if_missing="signal_",
         allow_leading_digit_prefix=True,
     )
+    return normalized_schema
 
 
 def _configure_market_data_adapter(application: FastAPI) -> TimescaleMarketDataAdapter:
     dsn = _resolve_market_data_dsn()
     schema = _resolve_market_data_schema()
     adapter = TimescaleMarketDataAdapter(database_url=dsn, schema=schema)
-    application.state.market_data_adapter = adapter
+    state = _service_state(application)
+    state.market_data_adapter = adapter
     return adapter
 
 
 def _reset_market_data_adapter(application: FastAPI) -> None:
-    if hasattr(application.state, "market_data_adapter"):
-        adapter = getattr(application.state, "market_data_adapter", None)
-        if adapter is not None:
-            engine = getattr(adapter, "_engine", None)
-            if engine is not None:
-                try:
-                    engine.dispose()
-                except Exception:  # pragma: no cover - defensive cleanup
-                    logger.debug("Failed to dispose Timescale engine during shutdown", exc_info=True)
-        application.state.market_data_adapter = None
+    state = _service_state(application)
+    adapter = state.market_data_adapter
+    if adapter is None:
+        return
+    engine = getattr(adapter, "_engine", None)
+    if engine is not None:
+        try:
+            engine.dispose()
+        except Exception:  # pragma: no cover - defensive cleanup
+            logger.debug("Failed to dispose Timescale engine during shutdown", exc_info=True)
+    state.market_data_adapter = None
 
 
 
@@ -477,7 +672,7 @@ def _resolve_session_store_dsn() -> str:
         raw = os.getenv(env_var)
         if raw is None:
             continue
-        candidate = raw.strip()
+        candidate: str = raw.strip()
         if not candidate:
             raise RuntimeError(
                 f"{env_var} is set but empty; configure a redis:// DSN for the signal service session store."
@@ -492,7 +687,8 @@ def _resolve_session_store_dsn() -> str:
 def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
     global SESSION_STORE
 
-    existing = getattr(application.state, "session_store", None)
+    state = _service_state(application)
+    existing = state.session_store
     if isinstance(existing, SessionStoreProtocol):
         store = existing
     else:
@@ -506,14 +702,14 @@ def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
             store = InMemorySessionStore(ttl_minutes=ttl_minutes)
         else:
             store = build_session_store_from_url(dsn, ttl_minutes=ttl_minutes)
-        application.state.session_store = store
+        state.session_store = store
 
     security.set_default_session_store(store)
     SESSION_STORE = store
     return store
 
 
-app.state.market_data_adapter = None
+_service_state(app)
 try:
     SESSION_STORE = _configure_session_store(app)
 except RuntimeError:
@@ -521,7 +717,8 @@ except RuntimeError:
 
 
 def _market_data_adapter() -> MarketDataAdapter:
-    adapter = getattr(app.state, "market_data_adapter", None)
+    state = _service_state(app)
+    adapter = state.market_data_adapter
     if adapter is None:
         try:
             adapter = _configure_market_data_adapter(app)
@@ -539,10 +736,11 @@ def _require_spot_symbol(symbol: str, *, param_name: str) -> str:
     platform.
     """
 
-    return require_spot_http(symbol, param=param_name, logger=logger)
+    normalized_symbol: str = require_spot_http(symbol, param=param_name, logger=logger)
+    return normalized_symbol
 
 
-@app.get("/signals/orderflow/{symbol}", response_model=OrderFlowResponse)
+@typed_app_get(app, "/signals/orderflow/{symbol}", response_model=OrderFlowResponse)
 def order_flow_signals(
     symbol: str,
     window: int = Query(300, ge=60, le=3600),
@@ -581,7 +779,7 @@ def order_flow_signals(
     )
 
 
-@app.get("/signals/crossasset", response_model=CrossAssetResponse)
+@typed_app_get(app, "/signals/crossasset", response_model=CrossAssetResponse)
 def cross_asset_signals(
     base_symbol: str,
     alt_symbol: str,
@@ -617,7 +815,7 @@ def cross_asset_signals(
     )
 
 
-@app.get("/signals/volatility/{symbol}", response_model=VolatilityResponse)
+@typed_app_get(app, "/signals/volatility/{symbol}", response_model=VolatilityResponse)
 def volatility_signals(
     symbol: str,
     window: int = Query(240, ge=60, le=960),
@@ -645,7 +843,7 @@ def volatility_signals(
     )
 
 
-@app.get("/signals/whales/{symbol}", response_model=WhaleResponse)
+@typed_app_get(app, "/signals/whales/{symbol}", response_model=WhaleResponse)
 def whale_signals(
     symbol: str,
     window: int = Query(900, ge=120, le=7200),
@@ -674,7 +872,7 @@ def whale_signals(
     )
 
 
-@app.get("/signals/stress/{symbol}", response_model=StressTestResponse)
+@typed_app_get(app, "/signals/stress/{symbol}", response_model=StressTestResponse)
 def stress_test_signals(
     symbol: str,
     window: int = Query(240, ge=60, le=960),
