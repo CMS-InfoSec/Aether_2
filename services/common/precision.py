@@ -10,7 +10,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping
 from decimal import Decimal, InvalidOperation
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple, cast
 
 
 import httpx
@@ -18,6 +18,17 @@ import inspect
 
 # Module-level logger for metadata refresh diagnostics.
 logger = logging.getLogger(__name__)
+
+
+def _coerce_mapping(value: object) -> Dict[str, Any]:
+    """Return a mapping copy when the payload resembles the expected shape."""
+
+    if isinstance(value, Mapping):
+        # Ensure callers can safely mutate the result without affecting the source.
+        return dict(value)
+
+    logger.warning("Precision metadata fetcher returned non-mapping payload: %r", value)
+    return {}
 
 
 class PrecisionMetadataUnavailable(RuntimeError):
@@ -40,24 +51,19 @@ class PrecisionMetadataProvider:
         raw_fetcher = fetcher or self._default_fetcher
         self._fetcher: Callable[[], Awaitable[Mapping[str, Any]]]
         if inspect.iscoroutinefunction(raw_fetcher):
+            async_fetcher = cast(Callable[[], Awaitable[Mapping[str, Any]]], raw_fetcher)
 
             async def _async_fetcher() -> Mapping[str, Any]:
-                result = raw_fetcher()
-                if inspect.isawaitable(result):
-                    return await result
-                return result
+                result = await async_fetcher()
+                return _coerce_mapping(result)
 
             self._fetcher = _async_fetcher
         else:
-
-            def _call_fetcher() -> Mapping[str, Any] | Awaitable[Mapping[str, Any]]:
-                return raw_fetcher()
+            sync_fetcher = cast(Callable[[], Mapping[str, Any]], raw_fetcher)
 
             async def _threaded_fetcher() -> Mapping[str, Any]:
-                result = await asyncio.to_thread(_call_fetcher)
-                if inspect.isawaitable(result):
-                    return await result
-                return result
+                result = await asyncio.to_thread(sync_fetcher)
+                return _coerce_mapping(result)
 
             self._fetcher = _threaded_fetcher
         self._refresh_interval = max(float(refresh_interval), 0.0)
@@ -147,14 +153,8 @@ class PrecisionMetadataProvider:
             await self.refresh(force=False)
 
     async def _call_fetcher(self) -> Mapping[str, Any]:
-        fetcher = self._fetcher
-        if inspect.iscoroutinefunction(fetcher):
-            result = await fetcher()
-        else:
-            result = await asyncio.to_thread(fetcher)
-        if isinstance(result, Mapping):
-            return result
-        return {}
+        result = await self._fetcher()
+        return _coerce_mapping(result)
 
     async def _default_fetcher(self) -> Mapping[str, Any]:
 
@@ -363,27 +363,21 @@ def _step_from_metadata(
 
 
 def _parse_asset_pairs(payload: Mapping[str, Any]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str]]:
-    if isinstance(payload.get("result"), Mapping):
-        payload = payload["result"]  # type: ignore[assignment]
+    source: Mapping[str, Any] = payload
+    result_section = payload.get("result")
+    if isinstance(result_section, Mapping):
+        source = result_section
 
     parsed: Dict[str, Dict[str, Any]] = {}
 
     aliases: Dict[str, str] = {}
-    for entry in payload.values():
+    for entry in source.values():
         if not isinstance(entry, Mapping):
             continue
 
         native_pair = _normalize_instrument(entry)
         if not native_pair:
             continue
-
-        native = native_pair
-        try:
-            raw_base, raw_quote = native_pair.split("/", 1)
-        except ValueError:
-            continue
-        base = _normalize_asset(raw_base, is_quote=False) or raw_base
-        quote = _normalize_asset(raw_quote, is_quote=True) or raw_quote
 
         tick = _step_from_metadata(
             entry,

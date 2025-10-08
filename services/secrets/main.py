@@ -1,6 +1,6 @@
 
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Callable, Dict, TypeVar, cast
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -24,6 +24,21 @@ _audit_logger = TimescaleAuditLogger(_audit_store)
 _auditor = SensitiveActionRecorder(_audit_logger)
 
 
+RouteFn = TypeVar("RouteFn", bound=Callable[..., Any])
+
+
+def _app_post(*args: Any, **kwargs: Any) -> Callable[[RouteFn], RouteFn]:
+    """Typed wrapper around ``app.post`` to satisfy static type checking."""
+
+    return cast(Callable[[RouteFn], RouteFn], app.post(*args, **kwargs))
+
+
+def _app_get(*args: Any, **kwargs: Any) -> Callable[[RouteFn], RouteFn]:
+    """Typed wrapper around ``app.get`` to satisfy static type checking."""
+
+    return cast(Callable[[RouteFn], RouteFn], app.get(*args, **kwargs))
+
+
 def _normalize_metadata(metadata: Dict[str, Any], *, fallback_secret_name: str) -> Dict[str, Any]:
     normalized = dict(metadata)
     secret_name = normalized.get("secret_name", fallback_secret_name)
@@ -45,7 +60,7 @@ def _normalize_metadata(metadata: Dict[str, Any], *, fallback_secret_name: str) 
     return normalized
 
 
-@app.post("/secrets/kraken", response_model=KrakenCredentialResponse)
+@_app_post("/secrets/kraken", response_model=KrakenCredentialResponse)
 def upsert_kraken_secret(
     request: KrakenCredentialRequest,
     account_id: str = Depends(require_admin_account),
@@ -77,7 +92,7 @@ def upsert_kraken_secret(
     )
 
 
-@app.get("/secrets/kraken/status", response_model=KrakenSecretStatusResponse)
+@_app_get("/secrets/kraken/status", response_model=KrakenSecretStatusResponse)
 def kraken_secret_status(
     account_id: str = Query(..., description="Trading account identifier"),
     header_account: str = Depends(require_admin_account),
