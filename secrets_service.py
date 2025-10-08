@@ -23,7 +23,7 @@ from kubernetes.config.config_exception import ConfigException
 from pydantic import BaseModel, Field, validator
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from services.secrets.signing import sign_kraken_request
-from shared.audit_hooks import AuditEvent, load_audit_hooks, log_audit_event_with_fallback
+from shared.audit_hooks import AuditEvent, load_audit_hooks
 
 
 LOGGER = logging.getLogger(__name__)
@@ -600,10 +600,9 @@ async def store_kraken_secret(
         after=audit_after,
         ip_address=request.client.host if request.client else None,
     )
-    log_audit_event_with_fallback(
+    event.log_with_fallback(
         audit_hooks,
         LOGGER,
-        event,
         failure_message=(
             f"Failed to record audit log for Kraken secret rotation for {payload.account_id}"
         ),

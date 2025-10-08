@@ -162,6 +162,82 @@ class AuditEvent:
 
         return replace(self, context=None, context_factory=context_factory)
 
+    def with_actor(self, actor: str) -> "AuditEvent":
+        """Return a copy of the event with an updated actor value."""
+
+        if actor == self.actor:
+            return self
+
+        return replace(self, actor=actor)
+
+    def with_action(self, action: str) -> "AuditEvent":
+        """Return a copy of the event with an updated action value."""
+
+        if action == self.action:
+            return self
+
+        return replace(self, action=action)
+
+    def with_entity(self, entity: str) -> "AuditEvent":
+        """Return a copy of the event with an updated entity value."""
+
+        if entity == self.entity:
+            return self
+
+        return replace(self, entity=entity)
+
+    def with_before(
+        self,
+        before: Mapping[str, Any],
+        *,
+        merge: bool = False,
+    ) -> "AuditEvent":
+        """Return a copy of the event with updated ``before`` metadata."""
+
+        if merge:
+            merged = dict(self.before)
+            updated = False
+            for key, value in before.items():
+                if key not in merged or merged[key] != value:
+                    updated = True
+                merged[key] = value
+
+            if not updated:
+                return self
+
+            return replace(self, before=merged)
+
+        if before is self.before or before == self.before:
+            return self
+
+        return replace(self, before=before)
+
+    def with_after(
+        self,
+        after: Mapping[str, Any],
+        *,
+        merge: bool = False,
+    ) -> "AuditEvent":
+        """Return a copy of the event with updated ``after`` metadata."""
+
+        if merge:
+            merged = dict(self.after)
+            updated = False
+            for key, value in after.items():
+                if key not in merged or merged[key] != value:
+                    updated = True
+                merged[key] = value
+
+            if not updated:
+                return self
+
+            return replace(self, after=merged)
+
+        if after is self.after or after == self.after:
+            return self
+
+        return replace(self, after=after)
+
     def with_ip_address(
         self,
         ip_address: Optional[str],

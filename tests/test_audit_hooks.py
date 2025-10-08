@@ -1064,6 +1064,96 @@ def test_audit_event_with_context_factory_optionally_preserves_context():
     cleared = preserved.with_context_factory(factory)
     assert cleared.context is None
 
+
+def test_audit_event_with_actor_updates_when_changed():
+    event = audit_hooks.AuditEvent(
+        actor="logan",
+        action="demo.actor",
+        entity="resource",
+        before={},
+        after={},
+    )
+
+    updated = event.with_actor("morgan")
+
+    assert updated is not event
+    assert updated.actor == "morgan"
+    assert event.actor == "logan"
+    assert updated.with_actor("morgan") is updated
+
+
+def test_audit_event_with_action_updates_when_changed():
+    event = audit_hooks.AuditEvent(
+        actor="logan",
+        action="demo.original",
+        entity="resource",
+        before={},
+        after={},
+    )
+
+    updated = event.with_action("demo.updated")
+
+    assert updated.action == "demo.updated"
+    assert event.action == "demo.original"
+    assert updated.with_action("demo.updated") is updated
+
+
+def test_audit_event_with_entity_updates_when_changed():
+    event = audit_hooks.AuditEvent(
+        actor="logan",
+        action="demo.entity",
+        entity="resource",
+        before={},
+        after={},
+    )
+
+    updated = event.with_entity("resource:child")
+
+    assert updated.entity == "resource:child"
+    assert event.entity == "resource"
+    assert updated.with_entity("resource:child") is updated
+
+
+def test_audit_event_with_before_replaces_or_merges():
+    original_before = {"version": 1, "status": "pending"}
+    event = audit_hooks.AuditEvent(
+        actor="logan",
+        action="demo.before",
+        entity="resource",
+        before=original_before,
+        after={},
+    )
+
+    replaced = event.with_before({"version": 2})
+    assert replaced.before == {"version": 2}
+    assert event.with_before(original_before) is event
+
+    merged = event.with_before({"status": "approved"}, merge=True)
+    assert merged.before == {"version": 1, "status": "approved"}
+    assert merged.before is not original_before
+    assert merged.with_before({"status": "approved"}, merge=True) is merged
+
+
+def test_audit_event_with_after_replaces_or_merges():
+    original_after = {"status": "pending"}
+    event = audit_hooks.AuditEvent(
+        actor="logan",
+        action="demo.after",
+        entity="resource",
+        before={},
+        after=original_after,
+    )
+
+    replaced = event.with_after({"status": "approved"})
+    assert replaced.after == {"status": "approved"}
+    assert event.with_after(original_after) is event
+
+    merged = event.with_after({"notes": "reviewed"}, merge=True)
+    assert merged.after == {"status": "pending", "notes": "reviewed"}
+    assert merged.after is not original_after
+    assert merged.with_after({"notes": "reviewed"}, merge=True) is merged
+
+
 def test_audit_event_with_ip_address_resets_hash_by_default():
     event = audit_hooks.AuditEvent(
         actor="karl",

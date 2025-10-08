@@ -41,7 +41,7 @@ from sqlalchemy.pool import StaticPool
 
 from services.common.security import require_admin_account
 from services.common.spot import require_spot_http
-from shared.audit_hooks import AuditEvent, load_audit_hooks, log_audit_event_with_fallback
+from shared.audit_hooks import AuditEvent, load_audit_hooks
 from shared.postgres import normalize_sqlalchemy_dsn
 from shared.spot import is_spot_symbol, normalize_spot_symbol
 
@@ -160,10 +160,9 @@ def _audit_access(
         after=dict(metadata or {}),
         ip_address=ip_address,
     )
-    log_audit_event_with_fallback(
+    event.log_with_fallback(
         audit_hooks,
         AUDIT_LOGGER,
-        event,
         failure_message=f"Failed to write audit log for action={action} entity={entity}",
         disabled_message=f"Audit logging disabled; skipping {action} for {entity}",
     )

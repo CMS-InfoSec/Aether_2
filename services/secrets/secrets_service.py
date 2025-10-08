@@ -83,7 +83,7 @@ from services.secrets.secure_secrets import (
     SecretsMetadataStore,
 )
 from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
-from shared.audit_hooks import AuditEvent, load_audit_hooks, log_audit_event_with_fallback
+from shared.audit_hooks import AuditEvent, load_audit_hooks
 
 try:  # pragma: no cover - OMS watcher is optional in some runtimes
     from services.oms.oms_kraken import KrakenCredentialWatcher
@@ -307,10 +307,9 @@ def _perform_secure_rotation(
         after=chain_audit_after,
         ip_hash=chain_ip_hash,
     )
-    log_audit_event_with_fallback(
+    event.log_with_fallback(
         audit_hooks,
         LOGGER,
-        event,
         failure_message=(
             f"Failed to record tamper-evident audit log for Kraken rotation on {account_id}"
         ),
