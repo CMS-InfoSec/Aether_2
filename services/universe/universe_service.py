@@ -26,8 +26,12 @@ from typing import (
 )
 from uuid import UUID, uuid4
 
-from alembic import command
-from alembic.config import Config
+try:  # pragma: no cover - alembic is optional during tests
+    from alembic import command
+    from alembic.config import Config
+except ModuleNotFoundError:  # pragma: no cover - allow import without alembic
+    command = None  # type: ignore[assignment]
+    Config = None  # type: ignore[assignment]
 from fastapi import Depends, FastAPI, HTTPException
 from shared.pydantic_compat import BaseModel, Field
 from sqlalchemy import Boolean, Column, DateTime, Float, String, create_engine, func, select
@@ -305,6 +309,11 @@ def run_migrations(url: Optional[URL] = None) -> None:
     target_url = url or DATABASE_URL
     if target_url is None:
         raise RuntimeError("Universe database is not configured; cannot run migrations.")
+
+    if command is None or Config is None:
+        raise RuntimeError(
+            "Universe migrations require alembic; install the optional dependency or stub run_migrations in tests."
+        )
 
     config = Config()
     config.set_main_option("script_location", str(_MIGRATIONS_PATH))
