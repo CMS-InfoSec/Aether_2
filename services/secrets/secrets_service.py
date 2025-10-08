@@ -24,34 +24,19 @@ from typing import (
     cast,
 )
 
-try:  # pragma: no cover - FastAPI is optional in some unit tests
-    from fastapi import (
-        BackgroundTasks,
-        Depends,
-        FastAPI,
-        HTTPException,
-        Query,
-        Request,
-        Response,
-        status,
-    )
-    from fastapi.encoders import jsonable_encoder
-    from fastapi.exceptions import RequestValidationError
-    from fastapi.responses import JSONResponse
-except ImportError:  # pragma: no cover - fallback when FastAPI is stubbed out
-    from services.common.fastapi_stub import (  # type: ignore[misc]
-        BackgroundTasks,
-        Depends,
-        FastAPI,
-        HTTPException,
-        JSONResponse,
-        Query,
-        Request,
-        RequestValidationError,
-        Response,
-        jsonable_encoder,
-        status,
-    )
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import Field, SecretStr, validator as pydantic_validator
 
