@@ -4,12 +4,47 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Sequence
 
-import pandas as pd
+try:  # pragma: no cover - exercised indirectly when pandas is installed
+    import pandas as _pd  # type: ignore
+except Exception:  # pragma: no cover - fallback path is covered directly
+    _pd = None
 
-from backtest_engine import Backtester, Fill
+_BACKTEST_IMPORT_ERROR: Exception | None = None
+
+try:  # pragma: no cover - exercised indirectly when numpy/backtest_engine is installed
+    from backtest_engine import Backtester, Fill  # type: ignore
+except Exception as exc:  # pragma: no cover - fallback covered via tests
+    Backtester = Any  # type: ignore[misc]
+    Fill = Any  # type: ignore[misc]
+    _BACKTEST_IMPORT_ERROR = exc
+else:
+    _BACKTEST_IMPORT_ERROR = None
+
+
+def _default_timestamp_factory(epoch_seconds: float):
+    """Return a timezone-aware timestamp for the given epoch seconds."""
+
+    if _pd is not None:
+        return _pd.Timestamp(epoch_seconds, unit="s", tz="UTC")
+    return datetime.fromtimestamp(epoch_seconds, tz=timezone.utc)
+
+
+_TIMESTAMP_FACTORY: Callable[[float], Any] = _default_timestamp_factory
+
+
+def _to_timestamp(value: Any) -> Any:
+    """Coerce Kraken websocket timestamps to a comparable object."""
+
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError) as exc:  # pragma: no cover - exercised via caller
+        raise ValueError("invalid timestamp") from exc
+
+    return _TIMESTAMP_FACTORY(seconds)
 
 
 @dataclass
@@ -38,6 +73,8 @@ class StressEngine:
     """Runs targeted stress scenarios using a pre-configured backtester."""
 
     def __init__(self, backtester: Backtester) -> None:
+        if _BACKTEST_IMPORT_ERROR is not None:
+            raise RuntimeError("backtest_engine is unavailable") from _BACKTEST_IMPORT_ERROR
         self._backtester = backtester
 
     # ------------------------------------------------------------------
@@ -108,7 +145,7 @@ class StressEngine:
                     try:
                         price = float(trade[0])
                         quantity = float(trade[1])
-                        timestamp = pd.Timestamp(float(trade[2]), unit="s", tz="UTC")
+                        timestamp = _to_timestamp(trade[2])
                     except (TypeError, ValueError):
                         continue
                     side_token = str(trade[3]).lower()
