@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Protocol
-
-import numpy as np
+from statistics import StatisticsError, fmean
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol, Tuple
 
 from ml.experiment_tracking.mlflow_utils import MLFlowExperiment
+
+from .base import MissingDependencyError, TrainingResult, UncertaintyGate, fee_aware_reward, require_numpy
+
+if TYPE_CHECKING:  # pragma: no cover - typing only.
+    import numpy as np
 
 LOGGER = logging.getLogger(__name__)
 
@@ -18,10 +22,10 @@ class Environment(Protocol):
     action_space: Any
     observation_space: Any
 
-    def reset(self) -> np.ndarray:
+    def reset(self) -> "np.ndarray":
         ...
 
-    def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, Dict[str, Any]]:
+    def step(self, action: "np.ndarray") -> Tuple["np.ndarray", float, bool, Dict[str, Any]]:
         ...
 
 
@@ -94,9 +98,12 @@ class RLTrainer:
     def _policy_gradient(self, env: Environment, total_timesteps: int, **kwargs: Any) -> Any:
         """Fallback REINFORCE-style policy gradient."""
 
-        import torch
-        import torch.nn as nn
-        import torch.optim as optim
+        try:
+            import torch
+            import torch.nn as nn
+            import torch.optim as optim
+        except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency.
+            raise MissingDependencyError("torch is required for fallback policy gradient training") from exc
 
         obs_dim = env.observation_space.shape[0]
         act_dim = env.action_space.shape[0]
@@ -144,22 +151,30 @@ class RLTrainer:
             loss.backward()
             optimizer.step()
             all_rewards.append(episode_return)
+            try:
+                avg_turnover = fmean(turnovers)
+            except (StatisticsError, ZeroDivisionError):
+                avg_turnover = 0.0
             LOGGER.debug(
-                "Episode %d: reward=%s turnover=%s", episode, episode_return, np.mean(turnovers)
+                "Episode %d: reward=%s turnover=%s", episode, episode_return, avg_turnover
             )
             self._log_metrics({"episode_reward": episode_return})
         self._model = policy
         LOGGER.info("Finished fallback policy gradient training")
         return policy
 
-    def predict(self, obs: np.ndarray) -> np.ndarray:
+    def predict(self, obs: "np.ndarray") -> "np.ndarray":
         if self._model is None:
             raise RuntimeError("Model has not been trained yet")
         if hasattr(self._model, "predict"):
             action, _ = self._model.predict(obs, deterministic=True)
             return action
-        import torch
+        try:
+            import torch
+        except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency.
+            raise MissingDependencyError("torch is required for fallback policy gradient inference") from exc
 
+        require_numpy()
         with torch.no_grad():
             tensor = torch.tensor(obs, dtype=torch.float32)
             return self._model(tensor).numpy()
@@ -170,7 +185,10 @@ class RLTrainer:
         if hasattr(self._model, "save"):
             self._model.save(path)
         else:
-            import torch
+            try:
+                import torch
+            except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency.
+                raise MissingDependencyError("torch is required to save fallback policy gradient models") from exc
 
             torch.save(self._model.state_dict(), path)
         LOGGER.info("Saved RL model to %s", path)
