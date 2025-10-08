@@ -11,23 +11,77 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Mapping, Optional
+from typing import Dict, List, Mapping, Optional, Sequence
 
-import numpy as np
-import pandas as pd
+try:  # pragma: no cover - optional scientific stack
+    import numpy as np
+except Exception:  # pragma: no cover - fallback when numpy is unavailable
+    np = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - optional scientific stack
+    import pandas as pd
+except Exception:  # pragma: no cover - fallback when pandas is unavailable
+    pd = None  # type: ignore[assignment]
+
 from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
-from sklearn.base import ClassifierMixin
-from sklearn.linear_model import LogisticRegression
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
+
+try:  # pragma: no cover - optional scientific stack
+    from sklearn.base import ClassifierMixin
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+except Exception:  # pragma: no cover - fallback when sklearn is unavailable
+    ClassifierMixin = object  # type: ignore[misc,assignment]
+    LogisticRegression = None  # type: ignore[assignment]
+    Pipeline = None  # type: ignore[assignment]
+    StandardScaler = None  # type: ignore[assignment]
 
 from services.common.security import require_admin_account
 from services.common.spot import require_spot_http
+from shared.spot import normalize_spot_symbol
 
 logger = logging.getLogger(__name__)
 
 STRATEGIES: List[str] = ["trend", "mean-reversion", "scalping", "hedging"]
+
+
+_SCIENTIFIC_STACK_AVAILABLE = all(
+    dependency is not None
+    for dependency in (np, pd, Pipeline, StandardScaler, LogisticRegression)
+)
+
+
+class _FallbackClassifier:
+    """Lightweight classifier used when the scientific stack is unavailable."""
+
+    def __init__(self) -> None:
+        self.classes_: List[str] = list(STRATEGIES)
+        self._weights: Dict[str, float] = {
+            name: 1.0 / len(STRATEGIES) for name in STRATEGIES
+        }
+
+    def fit(
+        self, feature_matrix: Sequence[Sequence[float]], labels: Sequence[object]
+    ) -> "_FallbackClassifier":
+        counts: Dict[str, int] = {name: 0 for name in STRATEGIES}
+        for label in labels:
+            counts[str(label)] = counts.get(str(label), 0) + 1
+        total = sum(counts.values())
+        if total:
+            self._weights = {
+                name: counts.get(name, 0) / total for name in STRATEGIES
+            }
+        else:  # pragma: no cover - defensive fallback
+            self._weights = {
+                name: 1.0 / len(STRATEGIES) for name in STRATEGIES
+            }
+        return self
+
+    def predict_proba(
+        self, _feature_matrix: Sequence[Sequence[float]]
+    ) -> List[List[float]]:
+        return [[self._weights.get(name, 0.0) for name in STRATEGIES]]
 
 
 @dataclass
@@ -65,19 +119,30 @@ class MetaStrategyAllocator:
         self.smoothing = smoothing
         self._observations: List[StrategyObservation] = []
         self._feature_columns: List[str] = []
-        self._classifier: ClassifierMixin = classifier or Pipeline(
-            steps=[
-                ("scaler", StandardScaler()),
-                (
-                    "clf",
-                    LogisticRegression(
-                        multi_class="multinomial",
-                        max_iter=500,
-                        class_weight="balanced",
+        self._using_fallback_classifier = False
+
+        if classifier is not None:
+            self._classifier: object = classifier
+        elif _SCIENTIFIC_STACK_AVAILABLE:
+            self._classifier = Pipeline(
+                steps=[
+                    ("scaler", StandardScaler()),
+                    (
+                        "clf",
+                        LogisticRegression(
+                            multi_class="multinomial",
+                            max_iter=500,
+                            class_weight="balanced",
+                        ),
                     ),
-                ),
-            ]
-        )
+                ]
+            )
+        else:
+            logger.warning(
+                "Scientific stack unavailable; falling back to heuristic meta strategy allocations"
+            )
+            self._classifier = _FallbackClassifier()
+            self._using_fallback_classifier = True
         self._latest_allocations: Dict[str, Dict[str, object]] = {}
 
     # ------------------------------------------------------------------
@@ -148,9 +213,16 @@ class MetaStrategyAllocator:
             If no allocation has been computed for the provided symbol.
         """
 
-        if symbol not in self._latest_allocations:
+        allocation = self._latest_allocations.get(symbol)
+        if allocation is None:
+            normalized = normalize_spot_symbol(symbol)
+            for candidate, candidate_allocation in self._latest_allocations.items():
+                if normalize_spot_symbol(candidate) == normalized and normalized:
+                    allocation = candidate_allocation
+                    break
+        if allocation is None:
             raise KeyError(f"No allocation is available for symbol '{symbol}'")
-        return self._latest_allocations[symbol]
+        return allocation
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -182,9 +254,9 @@ class MetaStrategyAllocator:
 
         if classifier_ready:
             features = self._vectorise_features(observation.features)
-            probabilities = self._classifier.predict_proba(features)[0]
-            probability_map = dict(zip(self._classifier.classes_, probabilities))
-            weights = {name: probability_map.get(name, 0.0) for name in STRATEGIES}
+            probabilities = self._predict_probabilities(features)
+            probability_map = dict(zip(self._get_classifier_classes(), probabilities))
+            weights = {name: float(probability_map.get(name, 0.0)) for name in STRATEGIES}
         else:
             weights = self._fallback_weights(observation.performance)
 
@@ -193,31 +265,61 @@ class MetaStrategyAllocator:
 
     def _train_classifier(self) -> None:
         data = [obs for obs in self._observations]
-        feature_matrix = np.vstack(
-            [self._vectorise_features(obs.features) for obs in data]
-        )
-        labels = np.array([obs.best_strategy for obs in data])
+        feature_matrix = [self._vectorise_features(obs.features) for obs in data]
+        labels = [obs.best_strategy for obs in data]
 
-        df = pd.DataFrame(feature_matrix, columns=self._feature_columns)
+        if self._using_fallback_classifier:
+            self._classifier.fit(feature_matrix, labels)  # type: ignore[call-arg]
+            return
+
+        assert _SCIENTIFIC_STACK_AVAILABLE  # nosec - guarded during construction
+        assert np is not None and pd is not None  # satisfy type checkers
+
+        matrix = np.asarray(feature_matrix, dtype=float)
+        df = pd.DataFrame(matrix, columns=self._feature_columns)
         # Guard against constant features which can cause the solver to fail.
         df = df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        feature_matrix = df.to_numpy(dtype=float)
-        self._classifier.fit(feature_matrix, labels)
+        cleaned = df.to_numpy(dtype=float)
+        target = np.array(labels)
+        self._classifier.fit(cleaned, target)  # type: ignore[arg-type]
 
-    def _vectorise_features(self, features: Mapping[str, float]) -> np.ndarray:
-        vector = np.zeros(len(self._feature_columns), dtype=float)
-        feature_map = {**{k: 0.0 for k in self._feature_columns}, **features}
+    def _vectorise_features(self, features: Mapping[str, float]) -> List[float]:
+        vector = [0.0] * len(self._feature_columns)
         for idx, key in enumerate(self._feature_columns):
-            vector[idx] = float(feature_map.get(key, 0.0))
-        return vector.reshape(1, -1)
+            value = features.get(key, 0.0)
+            try:
+                vector[idx] = float(value)
+            except (TypeError, ValueError):  # pragma: no cover - defensive guard
+                vector[idx] = 0.0
+        return vector
+
+    def _predict_probabilities(self, features: Sequence[float]) -> Sequence[float]:
+        if self._using_fallback_classifier:
+            probabilities = self._classifier.predict_proba([list(features)])  # type: ignore[attr-defined]
+            return probabilities[0]
+
+        assert np is not None  # nosec - ensured by constructor
+        feature_array = np.asarray(features, dtype=float).reshape(1, -1)
+        probabilities = self._classifier.predict_proba(feature_array)[0]  # type: ignore[arg-type]
+        if hasattr(probabilities, "tolist"):
+            return probabilities.tolist()
+        return probabilities
+
+    def _get_classifier_classes(self) -> Sequence[str]:
+        classes = getattr(self._classifier, "classes_", None)
+        if classes is None:
+            return STRATEGIES
+        if np is not None and hasattr(classes, "tolist"):
+            return [str(value) for value in classes.tolist()]
+        return [str(value) for value in classes]
 
     def _fallback_weights(self, performance: Mapping[str, float]) -> Dict[str, float]:
-        performance_array = np.array([performance.get(name, 0.0) for name in STRATEGIES])
-        clipped = np.clip(performance_array, a_min=0.0, a_max=None)
-        if clipped.sum() == 0:
+        performance_values = [float(performance.get(name, 0.0)) for name in STRATEGIES]
+        clipped = [value if value > 0 else 0.0 for value in performance_values]
+        total = sum(clipped)
+        if total == 0:
             return {name: 1.0 / len(STRATEGIES) for name in STRATEGIES}
-        weights = clipped / clipped.sum()
-        return dict(zip(STRATEGIES, weights))
+        return {name: clipped[idx] / total for idx, name in enumerate(STRATEGIES)}
 
     def _blend_with_recent_performance(
         self,
@@ -237,16 +339,15 @@ class MetaStrategyAllocator:
         return {k: v / total for k, v in blended.items()}
 
     def _normalise_performance(self, performance: Mapping[str, float]) -> Dict[str, float]:
-        values = np.array([performance.get(name, 0.0) for name in STRATEGIES])
-        max_abs = np.max(np.abs(values))
+        values = [float(performance.get(name, 0.0)) for name in STRATEGIES]
+        max_abs = max((abs(value) for value in values), default=0.0)
         if max_abs == 0:
             return {name: 1.0 / len(STRATEGIES) for name in STRATEGIES}
-        normalised = (values / max_abs + 1.0) / 2.0
-        total = normalised.sum()
+        normalised = [((value / max_abs) + 1.0) / 2.0 for value in values]
+        total = sum(normalised)
         if total == 0:
             return {name: 1.0 / len(STRATEGIES) for name in STRATEGIES}
-        normalised /= total
-        return dict(zip(STRATEGIES, normalised))
+        return {name: normalised[idx] / total for idx, name in enumerate(STRATEGIES)}
 
 
 class StrategyWeightsResponse(BaseModel):
