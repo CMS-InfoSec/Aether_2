@@ -987,6 +987,82 @@ def test_log_audit_event_with_fallback_uses_event_context(caplog: pytest.LogCapt
     assert getattr(record, "request_id", None) == "req-123"
 
 
+def test_log_event_with_fallback_merges_result_and_wrapper_extra(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    hooks = audit_hooks.AuditHooks(
+        log=lambda **_: None,
+        hash_ip=lambda value: f"hash:{value}" if value is not None else None,
+    )
+    logger = logging.getLogger("tests.audit.merge_extra")
+
+    hook_extra: dict[str, Any] = {"hooked": True, "audit": {"source": "hook"}}
+
+    def fake_log_event(
+        self: audit_hooks.AuditHooks,
+        *,
+        actor: str,
+        action: str,
+        entity: str,
+        before: Mapping[str, Any],
+        after: Mapping[str, Any],
+        ip_address: Optional[str] = None,
+        ip_hash: Optional[str] = None,
+        resolved_ip_hash: audit_hooks.ResolvedIpHash | None = None,
+    ) -> audit_hooks.AuditLogResult:
+        resolved = resolved_ip_hash or audit_hooks.ResolvedIpHash(
+            value=ip_hash,
+            fallback=False,
+            error=None,
+        )
+        return audit_hooks.AuditLogResult(
+            handled=False,
+            ip_hash=resolved.value,
+            hash_fallback=resolved.fallback,
+            hash_error=resolved.error,
+            fallback_logged=True,
+            fallback_extra=hook_extra,
+        )
+
+    monkeypatch.setattr(
+        audit_hooks.AuditHooks,
+        "log_event",
+        fake_log_event,
+        raising=False,
+    )
+
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        result = audit_hooks.log_event_with_fallback(
+            hooks,
+            logger,
+            actor="jill",
+            action="demo.merge",
+            entity="resource",
+            before={"before": True},
+            after={"after": True},
+            ip_address="10.2.3.4",
+            failure_message="should not raise",
+            disabled_message="Audit logging disabled",
+            disabled_level=logging.INFO,
+        )
+
+    assert hook_extra == {"hooked": True, "audit": {"source": "hook"}}
+    assert result.fallback_logged is True
+    assert result.fallback_extra is not None
+    assert result.fallback_extra is not hook_extra
+    assert result.fallback_extra.get("hooked") is True
+    assert result.fallback_extra["audit"]["source"] == "hook"
+    assert result.fallback_extra["audit"]["actor"] == "jill"
+    assert result.fallback_extra["audit"]["ip_hash"] == "hash:10.2.3.4"
+    assert result.fallback_extra["audit"]["before"] == {"before": True}
+    assert result.fallback_extra["audit"]["after"] == {"after": True}
+    assert len(caplog.records) == 1
+    record = caplog.records[0]
+    assert record.message == "Audit logging disabled"
+    assert getattr(record, "audit", None)["actor"] == "jill"
+
+
 def test_audit_event_log_with_fallback_method_delegates(monkeypatch):
     hooks = audit_hooks.AuditHooks(log=lambda **_: None, hash_ip=lambda value: value)
     logger = logging.getLogger("tests.audit.delegation")

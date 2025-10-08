@@ -842,6 +842,35 @@ def _snapshot_context_mapping(
     return dict(context)
 
 
+def _combine_fallback_extra(
+    primary: Optional[Mapping[str, Any]],
+    secondary: Optional[Mapping[str, Any]],
+) -> Optional[Mapping[str, Any]]:
+    """Return a merged view of fallback logging metadata."""
+
+    if primary is None and secondary is None:
+        return None
+
+    if primary is None:
+        return None if secondary is None else dict(secondary)
+
+    if secondary is None:
+        return dict(primary)
+
+    combined: dict[str, Any] = dict(secondary)
+    for key, value in primary.items():
+        if key == "audit" and isinstance(value, Mapping):
+            existing = combined.get("audit")
+            if isinstance(existing, Mapping):
+                merged = dict(existing)
+                merged.update(dict(value))
+                combined["audit"] = merged
+                continue
+        combined[key] = dict(value) if isinstance(value, Mapping) else value
+
+    return combined
+
+
 def _build_audit_log_extra(
     *,
     actor: str,
@@ -1087,7 +1116,10 @@ def log_event_with_fallback(
     wrapper_fallback_extra = (
         dict(log_extra) if fallback_logged and log_extra is not None else None
     )
-    combined_fallback_extra = result.fallback_extra or wrapper_fallback_extra
+    combined_fallback_extra = _combine_fallback_extra(
+        result.fallback_extra,
+        wrapper_fallback_extra,
+    )
 
     return AuditLogResult(
         handled=result.handled,
