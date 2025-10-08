@@ -2517,6 +2517,90 @@ def test_audit_event_to_payload_can_use_context_factory_on_demand():
     assert calls == ["called"]
 
 
+def test_audit_event_to_payload_includes_context_metadata_from_resolved():
+    event = audit_hooks.AuditEvent(
+        actor="river",
+        action="demo.event.context.metadata",
+        entity="resource",
+        before={},
+        after={},
+    )
+    resolved_context = audit_hooks.ResolvedContext(
+        value={"request_id": "resolved"},
+        error=RuntimeError("context failed"),
+        evaluated=True,
+    )
+
+    payload = event.to_payload(
+        include_context_metadata=True,
+        resolved_context=resolved_context,
+    )
+
+    assert payload["context_evaluated"] is True
+    assert payload["context_error"] == {
+        "type": "RuntimeError",
+        "message": "context failed",
+    }
+    assert "context" not in payload
+
+
+def test_audit_event_to_payload_resolves_context_factory_for_metadata():
+    calls: list[str] = []
+
+    def build_context() -> Mapping[str, Any]:
+        calls.append("called")
+        return {"request_id": "factory"}
+
+    event = audit_hooks.AuditEvent(
+        actor="skyler",
+        action="demo.event.context.metadata.factory",
+        entity="resource",
+        before={},
+        after={},
+        context_factory=build_context,
+    )
+
+    payload = event.to_payload(
+        include_context_metadata=True,
+        use_context_factory=True,
+    )
+
+    assert payload["context_evaluated"] is True
+    assert "context_error" not in payload
+    assert "context" not in payload
+    assert calls == ["called"]
+
+
+def test_audit_event_to_payload_records_context_factory_errors():
+    calls: list[str] = []
+
+    def build_context() -> Mapping[str, Any]:
+        calls.append("called")
+        raise ValueError("boom")
+
+    event = audit_hooks.AuditEvent(
+        actor="tatum",
+        action="demo.event.context.metadata.error",
+        entity="resource",
+        before={},
+        after={},
+        context_factory=build_context,
+    )
+
+    payload = event.to_payload(
+        include_context_metadata=True,
+        use_context_factory=True,
+    )
+
+    assert payload["context_evaluated"] is True
+    assert payload["context_error"] == {
+        "type": "ValueError",
+        "message": "boom",
+    }
+    assert "context" not in payload
+    assert calls == ["called"]
+
+
 def test_audit_event_to_payload_skips_context_factory_when_not_included():
     calls: list[str] = []
 

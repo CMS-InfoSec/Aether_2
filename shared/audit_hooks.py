@@ -59,6 +59,8 @@ class AuditEvent:
         include_context: bool = False,
         resolved_ip_hash: "ResolvedIpHash" | None = None,
         use_context_factory: bool = False,
+        include_context_metadata: bool = False,
+        resolved_context: "ResolvedContext" | None = None,
         include_hash_metadata: bool = False,
         include_fallback_extra: bool = False,
         use_fallback_extra_factory: bool = False,
@@ -77,8 +79,13 @@ class AuditEvent:
         default the method only reuses eagerly stored context to avoid
         triggering expensive lazy builders; pass ``use_context_factory=True`` to
         evaluate :attr:`context_factory` when no stored mapping is available.
-        A pre-resolved hash can be supplied so the method reuses the computed
-        value instead of the event's cached ``ip_hash``.  When
+        Setting ``include_context_metadata`` to ``True`` records whether context
+        resolution work occurred and captures any factory exception in the
+        returned payload.  Supplying ``resolved_context`` allows callers to reuse
+        previously captured context metadata—such as from
+        :meth:`AuditEvent.resolve_context_metadata`—without re-executing lazy
+        factories.  A pre-resolved hash can be supplied so the method reuses the
+        computed value instead of the event's cached ``ip_hash``.  When
         ``include_hash_metadata`` is ``True`` the payload also includes whether
         hashing required a fallback and any associated error metadata.  For
         accurate metadata callers should supply ``resolved_ip_hash`` from
@@ -114,12 +121,47 @@ class AuditEvent:
         if include_ip_address:
             payload["ip_address"] = self.ip_address
 
-        if include_context:
-            context_mapping: Optional[Mapping[str, Any]] = self.context
-            if context_mapping is None and use_context_factory and self.context_factory is not None:
+        context_mapping: Optional[Mapping[str, Any]] = self.context
+        context_error: Optional[Exception] = None
+        context_evaluated = context_mapping is not None
+
+        if resolved_context is not None:
+            if context_mapping is None:
+                context_mapping = resolved_context.value
+            context_error = resolved_context.error
+            context_evaluated = context_evaluated or resolved_context.evaluated
+        elif (
+            (include_context or include_context_metadata)
+            and context_mapping is None
+            and use_context_factory
+            and self.context_factory is not None
+        ):
+            try:
                 context_mapping = self.context_factory()
-            if context_mapping is not None:
-                payload["context"] = dict(context_mapping)
+            except Exception as exc:  # pragma: no cover - exercised via tests
+                context_error = exc
+                context_mapping = None
+            finally:
+                context_evaluated = True
+        elif include_context_metadata and self.context_factory is None:
+            context_evaluated = True
+
+        if include_context and context_mapping is not None:
+            payload["context"] = dict(context_mapping)
+
+        if include_context_metadata:
+            if resolved_context is not None:
+                context_metadata = resolved_context
+            else:
+                context_metadata = ResolvedContext(
+                    value=context_mapping,
+                    error=context_error,
+                    evaluated=context_evaluated,
+                )
+
+            payload["context_evaluated"] = context_metadata.evaluated
+            if context_metadata.error is not None:
+                payload["context_error"] = _describe_exception(context_metadata.error)
 
         if include_hash_metadata:
             resolved_metadata = resolved_ip_hash
