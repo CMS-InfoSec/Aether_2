@@ -3,14 +3,18 @@
 
 from __future__ import annotations
 
+import importlib
 import asyncio
 import base64
+import inspect
 import os
 import sys
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Dict
+from typing import Any, Callable, Dict
+from urllib.parse import parse_qsl, urlparse, urlunparse
 
 import pytest
 
@@ -46,6 +50,58 @@ pytest_plugins = [
     "tests.fixtures.backends",
     "tests.fixtures.mock_kraken",
 ]
+
+
+def pytest_configure(config: Any) -> None:
+    config.addinivalue_line("markers", "asyncio: execute test inside an asyncio event loop")
+    config.addinivalue_line("markers", "anyio: execute test inside an asyncio event loop")
+
+    original_run = getattr(asyncio, "run", None)
+
+    if original_run is not None and not getattr(asyncio, "_nest_asyncio_patched", False):
+
+        def _nested_run(coro: Any, *args: Any, **kwargs: Any) -> Any:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return original_run(coro, *args, **kwargs)
+
+            result: Dict[str, Any] = {}
+
+            def _runner() -> None:
+                try:
+                    result["value"] = original_run(coro, *args, **kwargs)
+                except Exception as exc:  # pragma: no cover - defensive guard
+                    result["error"] = exc
+
+            thread = threading.Thread(target=_runner, daemon=True)
+            thread.start()
+            thread.join()
+            if "error" in result:
+                raise result["error"]
+            return result.get("value")
+
+        asyncio.run = _nested_run  # type: ignore[assignment]
+        asyncio._nest_asyncio_patched = True  # type: ignore[attr-defined]
+
+
+def pytest_pyfunc_call(pyfuncitem: Any) -> bool | None:
+    testfunc = pyfuncitem.obj
+    if inspect.iscoroutinefunction(testfunc):
+        argnames = getattr(pyfuncitem, "_fixtureinfo", None)
+        if argnames is not None:
+            argnames = argnames.argnames
+        else:  # pragma: no cover - fallback for unexpected pytest internals
+            argnames = tuple(pyfuncitem.funcargs.keys())
+        testargs = {name: pyfuncitem.funcargs[name] for name in argnames}
+
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(testfunc(**testargs))
+        finally:
+            loop.close()
+        return True
+    return None
 
 
 @pytest.fixture(autouse=True)
@@ -144,11 +200,18 @@ def _configure_session_backend(monkeypatch: pytest.MonkeyPatch) -> None:
         backend.flushall()
 
 
+from importlib.machinery import ModuleSpec
+
+
 def _install_sqlalchemy_stub() -> None:
     if "sqlalchemy" in sys.modules:
         return
 
     sa = ModuleType("sqlalchemy")
+    sa.__spec__ = ModuleSpec("sqlalchemy", loader=None)
+    if sa.__spec__ is not None:
+        sa.__spec__.submodule_search_locations = []
+    sa.__path__ = []  # type: ignore[attr-defined]
 
     class _Column:
         def __init__(self, *args: object, **kwargs: object) -> None:
@@ -189,17 +252,47 @@ def _install_sqlalchemy_stub() -> None:
         def returning(self, *args: object, **kwargs: object) -> "_Insert":
             return self
 
-    def _select(*args: object, **kwargs: object) -> SimpleNamespace:
-        return SimpleNamespace(order_by=lambda *a, **k: SimpleNamespace(
-            where=lambda *a, **k: SimpleNamespace(
-                group_by=lambda *a, **k: SimpleNamespace(subquery=lambda *a, **k: SimpleNamespace())
-            )
-        ))
+    class _FunctionCall:
+        def __init__(self, name: str, *args: object, **kwargs: object) -> None:
+            self.name = name
+            self.args = args
+            self.kwargs = kwargs
+
+    class _FuncProxy:
+        def __getattr__(self, name: str) -> Callable[..., _FunctionCall]:
+            return lambda *args, **kwargs: _FunctionCall(name, *args, **kwargs)
+
+    class _SelectStatement:
+        def __init__(self, *entities: object) -> None:
+            self._entities = entities
+
+        def order_by(self, *args: object, **kwargs: object) -> "_SelectStatement":
+            return self
+
+        def where(self, *args: object, **kwargs: object) -> "_SelectStatement":
+            return self
+
+        def group_by(self, *args: object, **kwargs: object) -> "_SelectStatement":
+            return self
+
+        def subquery(self, *args: object, **kwargs: object) -> "_SelectStatement":
+            return self
+
+        def scalars(self) -> SimpleNamespace:
+            return SimpleNamespace(all=lambda: [])
+
+        def scalar(self) -> None:
+            return None
+
+    def _select(*args: object, **kwargs: object) -> _SelectStatement:
+        return _SelectStatement(*args)
 
     def _insert(table: Table) -> _Insert:
         return _Insert(table)
 
     def _create_engine(*args: object, **kwargs: object) -> SimpleNamespace:
+        url = args[0] if args else kwargs.get("url", "sqlite://")
+
         class _Connection(SimpleNamespace):
             def execute(self, *c_args: object, **c_kwargs: object) -> SimpleNamespace:
                 return SimpleNamespace(
@@ -208,7 +301,21 @@ def _install_sqlalchemy_stub() -> None:
                     scalars=lambda: SimpleNamespace(all=lambda: []),
                 )
 
-        return SimpleNamespace(connect=lambda: _Connection(), dispose=lambda: None)
+        class _BeginContext:
+            def __enter__(self) -> _Connection:
+                return _Connection()
+
+            def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[override]
+                return None
+
+        engine = SimpleNamespace(
+            connect=lambda: _Connection(),
+            dispose=lambda: None,
+            begin=lambda: _BeginContext(),
+            url=url,
+        )
+        engine._aether_url = url
+        return engine
 
     def _engine_from_config(*args: object, **kwargs: object) -> SimpleNamespace:
         return _create_engine()
@@ -227,29 +334,119 @@ def _install_sqlalchemy_stub() -> None:
     sa.Text = _Type
     sa.MetaData = MetaData
     sa.Table = Table
-    sa.func = SimpleNamespace(count=lambda *a, **k: 0)
+    sa.func = _FuncProxy()
     sa.select = _select
     sa.insert = _insert
     sa.create_engine = _create_engine
-    sa.text = lambda *args, **kwargs: None
+    sa.text = lambda sql, **kwargs: sql
     sa.engine_from_config = _engine_from_config
 
     sys.modules["sqlalchemy"] = sa
 
-    orm = ModuleType("sqlalchemy.orm")
+    original_find_spec = getattr(importlib.util, "_sqlalchemy_original_find_spec", None)
+    if original_find_spec is None:
+        original_find_spec = importlib.util.find_spec
 
-    class Session(SimpleNamespace):
+        def _find_spec(name: str, package: str | None = None):  # type: ignore[override]
+            if name == "sqlalchemy":
+                return None
+            return original_find_spec(name, package)
+
+        importlib.util._sqlalchemy_original_find_spec = original_find_spec  # type: ignore[attr-defined]
+        importlib.util.find_spec = _find_spec  # type: ignore[assignment]
+
+    orm = ModuleType("sqlalchemy.orm")
+    orm.__spec__ = ModuleSpec("sqlalchemy.orm", loader=None)
+    
+    class Session:
+        def __init__(self, bind: object | None = None) -> None:
+            self.bind = bind
+            self._bind_identifier = getattr(bind, "_aether_url", None)
+
+        def __enter__(self) -> "Session":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[override]
+            self.close()
+
+        def begin(self) -> "_TransactionContext":
+            return _TransactionContext(self)
+
         def execute(self, *args: object, **kwargs: object) -> SimpleNamespace:
+            statement = args[0] if args else None
+            memory_runs = getattr(self, "_memory_runs", None)
+            if memory_runs is not None and getattr(statement, "_entities", None):
+                entities = list(getattr(statement, "_entities", ()))
+                entity = entities[0] if entities else None
+
+                def _scalar_result(values: Iterable[object]) -> SimpleNamespace:
+                    materialised = list(values)
+                    return SimpleNamespace(
+                        all=lambda: list(materialised),
+                        first=lambda: materialised[0] if materialised else None,
+                        __iter__=lambda self=materialised: iter(self),
+                    )
+
+                if isinstance(entity, str):
+                    if entity == "run_id":
+                        values = [record.run_id for record in memory_runs]
+                    else:
+                        values = []
+                    return SimpleNamespace(
+                        scalars=lambda: _scalar_result(values),
+                        scalar_one_or_none=lambda: values[0] if values else None,
+                    )
+
+                if entity is not None:
+                    values = list(memory_runs)
+                    return SimpleNamespace(
+                        scalars=lambda: _scalar_result(values),
+                        scalar_one_or_none=lambda: values[0] if values else None,
+                    )
+
             return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: []))
 
         def get(self, *args: object, **kwargs: object) -> None:
             return None
 
+        def add(self, *args: object, **kwargs: object) -> None:  # pragma: no cover - noop stub
+            return None
+
+        def flush(self) -> None:  # pragma: no cover - noop stub
+            return None
+
+        def commit(self) -> None:  # pragma: no cover - noop stub
+            return None
+
+        def rollback(self) -> None:  # pragma: no cover - noop stub
+            return None
+
         def close(self) -> None:
             return None
 
+    class _TransactionContext:
+        def __init__(self, session: Session) -> None:
+            self._session = session
+
+        def __enter__(self) -> Session:
+            return self._session
+
+        def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[override]
+            return None
+
+    def _sessionmaker(*args: object, **kwargs: object):
+        bind = kwargs.get("bind")
+        if bind is None and args:
+            bind = args[0]
+
+        def _factory() -> Session:
+            return Session(bind=bind)
+
+        _factory.bind = bind  # type: ignore[attr-defined]
+        return _factory
+
     orm.Session = Session
-    orm.sessionmaker = lambda *a, **k: lambda: Session()
+    orm.sessionmaker = _sessionmaker
 
     class _BaseMeta(type):
         def __new__(mcls, name, bases, attrs):
@@ -281,21 +478,78 @@ def _install_sqlalchemy_stub() -> None:
     sys.modules["sqlalchemy.orm"] = orm
 
     engine = ModuleType("sqlalchemy.engine")
+    engine.__spec__ = ModuleSpec("sqlalchemy.engine", loader=None)
     engine.Engine = SimpleNamespace
+
+    class _URL(SimpleNamespace):
+        def __init__(self, raw_url: str) -> None:
+            parsed = urlparse(raw_url)
+            if not parsed.scheme:
+                raise ValueError(f"Could not parse URL from string '{raw_url}'")
+            super().__init__(
+                drivername=parsed.scheme,
+                host=parsed.hostname,
+                query={key: value for key, value in parse_qsl(parsed.query)},
+            )
+            self._raw = raw_url
+            self._parsed = parsed
+
+        def set(self, drivername: str) -> "_URL":
+            parts = list(self._parsed)
+            parts[0] = drivername
+            return _URL(urlunparse(parts))
+
+        def render_as_string(self, hide_password: bool = False) -> str:
+            del hide_password
+            return self._raw
+
+    def _make_url(raw_url: str) -> _URL:
+        return _URL(raw_url)
+
+    engine_url = ModuleType("sqlalchemy.engine.url")
+    engine_url.__spec__ = ModuleSpec("sqlalchemy.engine.url", loader=None)
+    engine_url.URL = _URL
+    engine_url.make_url = _make_url
+    engine.url = engine_url
     sys.modules["sqlalchemy.engine"] = engine
+    sys.modules["sqlalchemy.engine.url"] = engine_url
 
     exc = ModuleType("sqlalchemy.exc")
-    exc.SQLAlchemyError = Exception
+    exc.__spec__ = ModuleSpec("sqlalchemy.exc", loader=None)
+
+    class SQLAlchemyError(Exception):
+        """Base error type exposed by the lightweight SQLAlchemy stub."""
+
+    class OperationalError(SQLAlchemyError):
+        """Raised when the database connection or statement execution fails."""
+
+    class IntegrityError(SQLAlchemyError):
+        """Raised when inserts or updates violate a constraint."""
+
+    class ArgumentError(SQLAlchemyError):
+        """Raised when configuration or invocation arguments are invalid."""
+
+    class NoSuchTableError(SQLAlchemyError):
+        """Raised when metadata lookups reference an unknown table."""
+
+    exc.SQLAlchemyError = SQLAlchemyError
+    exc.OperationalError = OperationalError
+    exc.IntegrityError = IntegrityError
+    exc.ArgumentError = ArgumentError
+    exc.NoSuchTableError = NoSuchTableError
     sys.modules["sqlalchemy.exc"] = exc
 
     pool = ModuleType("sqlalchemy.pool")
+    pool.__spec__ = ModuleSpec("sqlalchemy.pool", loader=None)
     pool.NullPool = object
     pool.StaticPool = object
     sa.pool = pool
     sys.modules["sqlalchemy.pool"] = pool
 
     dialects = ModuleType("sqlalchemy.dialects")
+    dialects.__spec__ = ModuleSpec("sqlalchemy.dialects", loader=None)
     postgresql = ModuleType("sqlalchemy.dialects.postgresql")
+    postgresql.__spec__ = ModuleSpec("sqlalchemy.dialects.postgresql", loader=None)
 
     class JSONB:  # pragma: no cover - simple placeholder
         def __init__(self, *args: object, **kwargs: object) -> None:
@@ -314,9 +568,11 @@ def _install_sqlalchemy_stub() -> None:
     sys.modules["sqlalchemy.dialects.postgresql"] = postgresql
 
     ext = ModuleType("sqlalchemy.ext")
+    ext.__spec__ = ModuleSpec("sqlalchemy.ext", loader=None)
     sys.modules["sqlalchemy.ext"] = ext
 
     ext_asyncio = ModuleType("sqlalchemy.ext.asyncio")
+    ext_asyncio.__spec__ = ModuleSpec("sqlalchemy.ext.asyncio", loader=None)
 
     class _AsyncConnection(SimpleNamespace):
         async def execute(self, *args: object, **kwargs: object) -> SimpleNamespace:
@@ -344,6 +600,7 @@ def _install_sqlalchemy_stub() -> None:
     sys.modules["sqlalchemy.ext.asyncio"] = ext_asyncio
 
     ext_compiler = ModuleType("sqlalchemy.ext.compiler")
+    ext_compiler.__spec__ = ModuleSpec("sqlalchemy.ext.compiler", loader=None)
 
     def compiles(*args: object, **kwargs: object):
         def decorator(func):
