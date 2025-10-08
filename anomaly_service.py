@@ -15,10 +15,9 @@ import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, TypeVar, cast
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
-from pydantic import BaseModel, Field
 from sqlalchemy import JSON, Column, DateTime, Integer, String, create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
@@ -27,6 +26,7 @@ from services.alert_manager import RiskEvent, get_alert_manager_instance
 from services.common.adapters import TimescaleAdapter
 from services.common.security import require_admin_account
 from shared.postgres import normalize_sqlalchemy_dsn
+from shared.pydantic_compat import BaseModel, Field
 
 
 logger = logging.getLogger(__name__)
@@ -56,25 +56,49 @@ def _database_url() -> str:
         raise RuntimeError("Anomaly service database DSN cannot be empty once configured.")
 
     allow_sqlite = _allow_sqlite_fallback()
-    return normalize_sqlalchemy_dsn(
+    normalized: str = normalize_sqlalchemy_dsn(
         candidate,
         allow_sqlite=allow_sqlite,
         label="Anomaly service database DSN",
     )
+    return normalized
 
 
 DATABASE_URL = _database_url()
 
 
 ENGINE: Engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)
-SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
-Base = declarative_base()
+SessionLocal: sessionmaker[Session] = sessionmaker(
+    bind=ENGINE, autoflush=False, expire_on_commit=False, future=True
+)
+
+
+if TYPE_CHECKING:
+
+    class Base:  # pragma: no cover - typing stub for declarative base
+        metadata: Any
+        registry: Any
+
+else:  # pragma: no cover - runtime declarative base when SQLAlchemy is available
+    Base = declarative_base()
+    Base.__doc__ = "Typed declarative base for the anomaly service ORM models."
 
 
 class AnomalyLog(Base):
     """SQLAlchemy ORM model backing ``anomaly_log``."""
 
     __tablename__ = "anomaly_log"
+
+    if TYPE_CHECKING:  # pragma: no cover - typing-only constructor metadata
+        def __init__(
+            self,
+            *,
+            account_id: str,
+            anomaly_type: str,
+            details_json: Dict[str, Any],
+            ts: datetime,
+        ) -> None:
+            ...
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     account_id = Column(String, nullable=False, index=True)
@@ -130,6 +154,17 @@ def _ensure_account_access(requested: str, authenticated: str) -> str:
             detail="Authenticated account does not match requested account.",
         )
     return normalized_request
+
+
+def _with_normalized_account(request: ScanRequest, account_id: str) -> ScanRequest:
+    """Return a copy of *request* with ``account_id`` normalised to *account_id*."""
+
+    if hasattr(request, "model_dump"):
+        payload = request.model_dump()
+    else:
+        payload = request.dict()
+    payload["account_id"] = account_id
+    return ScanRequest(**payload)
 
 
 @dataclass
@@ -442,10 +477,13 @@ def median(values: Iterable[float]) -> float:
     return (sorted_values[mid - 1] + sorted_values[mid]) / 2.0
 
 
+SessionFactory = Callable[[], Session]
+
+
 class IncidentRepository:
     """Persistence layer for anomaly incidents."""
 
-    def __init__(self, session_factory: sessionmaker = SessionLocal) -> None:
+    def __init__(self, session_factory: SessionFactory = SessionLocal) -> None:
         self._session_factory = session_factory
 
     def log_incident(self, incident: Incident) -> None:
@@ -456,13 +494,11 @@ class IncidentRepository:
             ts=incident.ts,
         )
         with self._session_factory() as session:
-            session: Session
             session.add(record)
             session.commit()
 
     def recent_incidents(self, account_id: str, limit: int = 20) -> List[Incident]:
         with self._session_factory() as session:
-            session: Session
             query = (
                 session.query(AnomalyLog)
                 .filter(AnomalyLog.account_id == account_id)
@@ -562,8 +598,22 @@ class ResponseFactory:
 app = FastAPI(title="Anomaly Detection Service")
 _coordinator = ResponseFactory()
 
+RouteFn = TypeVar("RouteFn", bound=Callable[..., Any])
 
-@app.get("/anomaly/status", response_model=StatusResponse)
+
+def _app_get(*args: Any, **kwargs: Any) -> Callable[[RouteFn], RouteFn]:
+    """Typed wrapper around ``FastAPI.get`` to satisfy strict type checks."""
+
+    return cast(Callable[[RouteFn], RouteFn], app.get(*args, **kwargs))
+
+
+def _app_post(*args: Any, **kwargs: Any) -> Callable[[RouteFn], RouteFn]:
+    """Typed wrapper around ``FastAPI.post`` to satisfy strict type checks."""
+
+    return cast(Callable[[RouteFn], RouteFn], app.post(*args, **kwargs))
+
+
+@_app_get("/anomaly/status", response_model=StatusResponse)
 def get_status(
     account_id: str = Query(..., min_length=1),
     caller_account: str = Depends(require_admin_account),
@@ -574,7 +624,7 @@ def get_status(
     return _coordinator.status(normalized)
 
 
-@app.post("/anomaly/scan", response_model=ScanResponse)
+@_app_post("/anomaly/scan", response_model=ScanResponse)
 def post_scan(
     request: ScanRequest,
     caller_account: str = Depends(require_admin_account),
@@ -582,5 +632,5 @@ def post_scan(
     """Run anomaly detection for the specified account."""
 
     normalized = _ensure_account_access(request.account_id, caller_account)
-    normalized_request = request.model_copy(update={"account_id": normalized})
+    normalized_request = _with_normalized_account(request, normalized)
     return _coordinator.scan(normalized_request)

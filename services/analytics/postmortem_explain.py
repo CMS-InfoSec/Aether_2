@@ -25,10 +25,54 @@ import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Sequence, TypeVar, cast
+from typing import TypedDict
 
-from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel
+from shared.pydantic_compat import BaseModel
+
+if TYPE_CHECKING:  # pragma: no cover - FastAPI may be optional
+    from fastapi import APIRouter, HTTPException, Query
+else:  # pragma: no cover - lightweight fallbacks when FastAPI is unavailable
+    try:
+        from fastapi import APIRouter, HTTPException, Query
+    except ModuleNotFoundError:  # pragma: no cover - decorator-friendly shims
+        class HTTPException(Exception):
+            """Minimal HTTP exception that matches FastAPI's interface."""
+
+            def __init__(self, status_code: int, detail: str) -> None:
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+
+        class APIRouter:  # pragma: no cover - decorator-friendly router stub
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                del args, kwargs
+
+            def get(
+                self, *args: Any, **kwargs: Any
+            ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+                def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+                    return func
+
+                return decorator
+
+        def Query(default: Any = None, **_: Any) -> Any:
+            return default
+
+
+TCallable = TypeVar("TCallable", bound=Callable[..., Any])
+
+
+def typed_router_get(
+    router: APIRouter, path: str, **kwargs: Any
+) -> Callable[[TCallable], TCallable]:
+    """Wrap ``router.get`` so decorated callables retain their type."""
+
+    def decorator(func: TCallable) -> TCallable:
+        wrapped = router.get(path, **kwargs)(func)
+        return cast(TCallable, wrapped)
+
+    return decorator
 
 
 LOGGER = logging.getLogger(__name__)
@@ -56,6 +100,22 @@ FEATURE_WEIGHTS: Mapping[str, float] = {
 }
 
 
+class FeatureRanking(TypedDict):
+    """Structured importance payload returned to clients."""
+
+    feature: str
+    importance: float
+    direction: str
+
+
+class ArtifactInfo(TypedDict):
+    """Artifact metadata persisted for downstream retrieval."""
+
+    json: str
+    html: str
+    hash: str
+
+
 class FeatureExplanation(BaseModel):
     """Schema returned to API consumers describing a single trade."""
 
@@ -66,7 +126,7 @@ class FeatureExplanation(BaseModel):
     model_version: str
     features: Mapping[str, float]
     shap_values: Mapping[str, float]
-    feature_ranking: List[Mapping[str, object]]
+    feature_ranking: Sequence[FeatureRanking]
     correlation_ids: Sequence[str]
     artifact_hash: str
     artifact_paths: Mapping[str, str]
@@ -270,23 +330,23 @@ def _compute_shap(features: Mapping[str, float]) -> Dict[str, float]:
     return shap_values
 
 
-def _rank_features(shap_values: Mapping[str, float]) -> List[Dict[str, object]]:
-    ranked = sorted(
-        (
-            {
-                "feature": name,
-                "importance": value,
-                "direction": "positive" if value >= 0 else "negative",
-            }
-            for name, value in shap_values.items()
-        ),
-        key=lambda item: abs(item["importance"]),
-        reverse=True,
-    )
-    return ranked
+def _rank_features(shap_values: Mapping[str, float]) -> List[FeatureRanking]:
+    entries: List[FeatureRanking] = []
+    for name, value in shap_values.items():
+        entry: FeatureRanking = {
+            "feature": name,
+            "importance": value,
+            "direction": "positive" if value >= 0 else "negative",
+        }
+        entries.append(entry)
+    return sorted(entries, key=lambda item: abs(item["importance"]), reverse=True)
 
 
-def _html_report(vector: FeatureVector, shap_values: Mapping[str, float], ranking: Sequence[Mapping[str, object]]) -> str:
+def _html_report(
+    vector: FeatureVector,
+    shap_values: Mapping[str, float],
+    ranking: Sequence[FeatureRanking],
+) -> str:
     rows = "".join(
         f"<tr><td>{item['feature']}</td><td>{vector.features[item['feature']]:,.6f}</td>"
         f"<td>{shap_values[item['feature']]:,.6f}</td><td>{item['direction']}</td></tr>"
@@ -306,7 +366,7 @@ def _html_report(vector: FeatureVector, shap_values: Mapping[str, float], rankin
     )
 
 
-def _persist_artifacts(payload: Mapping[str, object], html_report: str) -> Dict[str, str]:
+def _persist_artifacts(payload: Mapping[str, object], html_report: str) -> ArtifactInfo:
     root = _ensure_artifact_root()
 
     serialized = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
@@ -322,7 +382,7 @@ def _persist_artifacts(payload: Mapping[str, object], html_report: str) -> Dict[
     _write_bytes_secure(json_path, serialized)
     _write_bytes_secure(html_path, html_report.encode("utf-8"))
 
-    return {"json": str(json_path), "html": str(html_path), "hash": digest}
+    return cast(ArtifactInfo, {"json": str(json_path), "html": str(html_path), "hash": digest})
 
 
 def _build_explanation(vector: FeatureVector) -> FeatureExplanation:
@@ -358,7 +418,7 @@ def _generate_trade_ids(start: datetime, end: datetime) -> List[str]:
 
     duration = end - start
     step = max(duration / 5, timedelta(minutes=5))
-    trade_ids = []
+    trade_ids: List[str] = []
     cursor = start
     while cursor <= end and len(trade_ids) < 10:
         trade_ids.append(f"synthetic-{int(cursor.timestamp())}")
@@ -391,7 +451,7 @@ def _build_vectors(
     end = _normalize_timestamp(end)
 
     trade_ids = _generate_trade_ids(start, end)
-    vectors = []
+    vectors: List[FeatureVector] = []
     for idx, tid in enumerate(trade_ids):
         ts = start + (end - start) * (idx / max(len(trade_ids) - 1, 1))
         ts = _normalize_timestamp(ts)
@@ -399,7 +459,7 @@ def _build_vectors(
     return vectors
 
 
-@ROUTER.get("/explain/postmortem", response_model=ExplainResponse)
+@typed_router_get(ROUTER, "/explain/postmortem", response_model=ExplainResponse)
 async def postmortem_explain(
     *,
     trade_id: Optional[str] = Query(None, description="Unique trade identifier to explain"),

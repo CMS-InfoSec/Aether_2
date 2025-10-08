@@ -5,6 +5,10 @@ fallback instruments to ensure only USD-quoted pairs are returned to clients.
 This guarantee protects downstream systems that assume a USD quote currency.
 """
 
+from __future__ import annotations
+
+from typing import Any, Callable, TypeVar, cast
+
 from fastapi import Depends, FastAPI
 
 from services.common.adapters import RedisFeastAdapter
@@ -13,8 +17,16 @@ from services.common.security import require_admin_account
 
 app = FastAPI(title="Universe Service")
 
+RouteFn = TypeVar("RouteFn", bound=Callable[..., Any])
 
-@app.get("/universe/approved", response_model=ApprovedUniverseResponse)
+
+def _app_get(*args: Any, **kwargs: Any) -> Callable[[RouteFn], RouteFn]:
+    """Typed wrapper around ``FastAPI.get`` to satisfy strict type checks."""
+
+    return cast(Callable[[RouteFn], RouteFn], app.get(*args, **kwargs))
+
+
+@_app_get("/universe/approved", response_model=ApprovedUniverseResponse)
 def approved_universe(account_id: str = Depends(require_admin_account)) -> ApprovedUniverseResponse:
     redis = RedisFeastAdapter(account_id=account_id)
     instruments = redis.approved_instruments()
