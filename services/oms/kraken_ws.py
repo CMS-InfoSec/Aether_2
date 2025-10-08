@@ -12,9 +12,29 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional
 from uuid import uuid4
 
 
-import websockets
-from websockets import WebSocketClientProtocol
-from websockets.exceptions import WebSocketException
+try:  # pragma: no cover - optional dependency used in production
+    import websockets
+    from websockets import WebSocketClientProtocol
+    from websockets.exceptions import WebSocketException
+except ImportError:  # pragma: no cover - exercised in unit-only environments
+    websockets = None  # type: ignore[assignment]
+
+    class WebSocketClientProtocol:  # type: ignore[override]
+        async def send(self, *_: Any, **__: Any) -> None:
+            raise RuntimeError("websockets is required for Kraken websocket operations")
+
+        async def recv(self) -> Any:
+            raise RuntimeError("websockets is required for Kraken websocket operations")
+
+        async def close(self) -> None:
+            return None
+
+        @property
+        def closed(self) -> bool:  # pragma: no cover - simple property
+            return True
+
+    class WebSocketException(Exception):  # type: ignore[override]
+        pass
 
 
 if TYPE_CHECKING:
@@ -160,6 +180,8 @@ class KrakenWSClient:
     async def _default_transport(
         self, url: str, *, headers: Optional[Dict[str, str]] = None
     ) -> _WebsocketTransport:
+        if websockets is None:
+            raise RuntimeError("websockets is required for Kraken websocket operations")
         protocol = await websockets.connect(
             url, ping_interval=None, extra_headers=headers
         )

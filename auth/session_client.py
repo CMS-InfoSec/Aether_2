@@ -17,7 +17,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Mapping, Optional, Protocol
 
-import httpx
+try:
+    import httpx
+except Exception:  # pragma: no cover - optional dependency
+    httpx = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +101,8 @@ class HttpSessionClient(SessionClientProtocol):
 
     async def fetch_session(self, account_id: str) -> SessionToken:
         url = self._build_url(account_id)
+        if httpx is None:
+            raise RuntimeError("httpx is required to fetch admin sessions")
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             response = await client.get(url)
         try:
