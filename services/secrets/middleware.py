@@ -5,6 +5,7 @@ import os
 from typing import Iterable, Sequence
 
 from starlette.datastructures import Headers
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 TRUSTED_HOSTS: Sequence[str] = (
     "risk.aether.local",
@@ -32,13 +33,13 @@ TRUSTED_PROXY_CLIENTS: tuple[str, ...] = _load_trusted_proxy_clients()
 class ForwardedSchemeMiddleware:
     """ASGI middleware that normalizes the scheme from ingress headers."""
 
-    def __init__(self, app, header_names: Iterable[str] | None = None) -> None:
+    def __init__(self, app: ASGIApp, header_names: Iterable[str] | None = None) -> None:
         self.app = app
         self.header_names = tuple(
             header.lower() for header in (header_names or ("x-forwarded-proto", "x-forwarded-scheme"))
         )
 
-    async def __call__(self, scope, receive, send):  # type: ignore[override]
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope.get("type") not in {"http", "websocket"}:
             await self.app(scope, receive, send)
             return

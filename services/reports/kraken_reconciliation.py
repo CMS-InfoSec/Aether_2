@@ -12,21 +12,48 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_EVEN
-from typing import Any, Callable, Dict, Iterable, Iterator, Mapping, Optional, Protocol, Sequence
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+)
 
 try:  # pragma: no cover - optional dependency for tests
     import httpx
 except ImportError:  # pragma: no cover - optional dependency for tests
-    httpx = None  # type: ignore[assignment]
+    httpx = None
 from prometheus_client import CollectorRegistry, Gauge
 
 try:  # pragma: no cover - optional dependency for unit tests
-    from services.alert_manager import AlertManager, RiskEvent
+    from services.alert_manager import AlertManager as _AlertManager
+    from services.alert_manager import RiskEvent as _RiskEvent
 except ModuleNotFoundError:  # pragma: no cover - used when FastAPI is not installed
-    AlertManager = Any  # type: ignore
+    _AlertManager = None
+    _RiskEvent = None
+
+
+if TYPE_CHECKING:  # pragma: no cover - type checking only
+    from services.alert_manager import AlertManager as AlertManagerProtocol
+    from services.alert_manager import RiskEvent
+elif _AlertManager is not None and _RiskEvent is not None:
+    AlertManagerProtocol = _AlertManager
+    RiskEvent = _RiskEvent
+else:
+    class AlertManagerProtocol(Protocol):
+        """Minimal AlertManager protocol used for reconciliation alerts."""
+
+        def handle_risk_event(self, event: "RiskEvent") -> None:
+            ...
 
     @dataclass(slots=True)
-    class RiskEvent:  # type: ignore[override]
+    class RiskEvent:
         event_type: str
         severity: str
         description: str
@@ -357,16 +384,22 @@ class KrakenStatementDownloader:
         if not payload:
             return {}
         try:
-            return json.loads(payload)
+            parsed = json.loads(payload)
         except json.JSONDecodeError as exc:  # pragma: no cover - validated via tests
             raise ValueError("Failed to decode Kraken statement JSON payload") from exc
+        if not isinstance(parsed, Mapping):
+            raise ValueError("Kraken statement JSON payload must be a mapping")
+        return dict(parsed)
 
     def _parse_nav_snapshots(self, payload: Mapping[str, Any]) -> Sequence[KrakenNavSnapshot]:
         raw_nav = payload.get("nav_snapshots") or payload.get("nav") or []
+        raw_entries: Iterable[Mapping[str, Any]]
         if isinstance(raw_nav, Mapping):
-            raw_entries: Iterable[Mapping[str, Any]] = [raw_nav]
+            raw_entries = [raw_nav]
+        elif isinstance(raw_nav, Sequence) and not isinstance(raw_nav, (str, bytes, bytearray)):
+            raw_entries = [entry for entry in raw_nav if isinstance(entry, Mapping)]
         else:
-            raw_entries = raw_nav  # type: ignore[assignment]
+            raw_entries = []
 
         snapshots: list[KrakenNavSnapshot] = []
         for entry in raw_entries:
@@ -616,7 +649,7 @@ class KrakenReconciliationService:
         downloader: KrakenStatementDownloader,
         ledger: InternalLedger,
         metrics: Optional[KrakenReconciliationMetrics] = None,
-        alert_manager: Optional[AlertManager] = None,
+        alert_manager: Optional[AlertManagerProtocol] = None,
         tolerance: float = 1.0,
     ) -> None:
         self._downloader = downloader
