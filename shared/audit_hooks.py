@@ -44,9 +44,55 @@ class AuditEvent:
     after: Mapping[str, Any]
     ip_address: Optional[str] = None
     ip_hash: Optional[str] = None
-    resolved_ip_hash: "ResolvedIpHash | None" = None
     context: Optional[Mapping[str, Any]] = None
     context_factory: ContextFactory | None = None
+
+    def to_payload(
+        self,
+        *,
+        include_ip_address: bool = True,
+        include_context: bool = False,
+        resolved_ip_hash: "ResolvedIpHash" | None = None,
+        use_context_factory: bool = False,
+    ) -> dict[str, Any]:
+        """Return a serialisable representation of the audit event.
+
+        The payload mirrors the arguments consumed by
+        :func:`common.utils.audit_logger.log_audit`, making it suitable for
+        structured logging, downstream storage, or API responses.  ``before``
+        and ``after`` mappings are copied into plain dictionaries to avoid
+        exposing mutable references, and callers can opt out of including the
+        raw IP address via ``include_ip_address``.  When ``include_context`` is
+        ``True`` any eagerly stored context mapping is duplicated as well.  By
+        default the method only reuses eagerly stored context to avoid
+        triggering expensive lazy builders; pass ``use_context_factory=True`` to
+        evaluate :attr:`context_factory` when no stored mapping is available.
+        A pre-resolved hash can be supplied so the method reuses the computed
+        value instead of the event's cached ``ip_hash``.
+        """
+
+        resolved_hash = self.ip_hash if resolved_ip_hash is None else resolved_ip_hash.value
+
+        payload: dict[str, Any] = {
+            "actor": self.actor,
+            "action": self.action,
+            "entity": self.entity,
+            "before": dict(self.before),
+            "after": dict(self.after),
+            "ip_hash": resolved_hash,
+        }
+
+        if include_ip_address:
+            payload["ip_address"] = self.ip_address
+
+        if include_context:
+            context_mapping: Optional[Mapping[str, Any]] = self.context
+            if context_mapping is None and use_context_factory and self.context_factory is not None:
+                context_mapping = self.context_factory()
+            if context_mapping is not None:
+                payload["context"] = dict(context_mapping)
+
+        return payload
 
     def resolve_ip_hash(self, hooks: "AuditHooks") -> "ResolvedIpHash":
         """Resolve the event's hashed IP using the provided hooks.
@@ -58,9 +104,6 @@ class AuditEvent:
         present, avoiding redundant hashing, while ``ip_address`` is hashed on
         demand and retains the shared error-handling semantics.
         """
-
-        if self.resolved_ip_hash is not None:
-            return self.resolved_ip_hash
 
         return hooks.resolve_ip_hash(
             ip_address=self.ip_address,
@@ -77,32 +120,44 @@ class AuditEvent:
 
         The helper is useful when callers pre-compute hashed IP metadata via
         :meth:`resolve_ip_hash` and wish to persist the result before logging.
-        The full :class:`ResolvedIpHash` payload—including fallback metadata
-        and error state—is stored so later calls to :meth:`log_with_fallback`
-        retain the original hashing outcome when the raw IP has been dropped.
         Supplying ``drop_ip_address=True`` clears the raw address from the
         event so only the hashed value remains, which can help avoid retaining
-        sensitive data in long-lived structures.  When the resolved value,
-        resulting IP address, and stored metadata all match the current state
-        the original instance is returned to preserve object identity.
+        sensitive data in long-lived structures.  When the resolved value and
+        resulting IP address match the current state the original instance is
+        returned to preserve object identity.
         """
 
         next_hash = resolved.value
         next_ip = None if drop_ip_address else self.ip_address
 
-        if (
-            next_hash == self.ip_hash
-            and next_ip == self.ip_address
-            and self.resolved_ip_hash == resolved
-        ):
+        if next_hash == self.ip_hash and next_ip == self.ip_address:
             return self
 
-        return replace(
-            self,
-            ip_hash=next_hash,
-            ip_address=next_ip,
-            resolved_ip_hash=resolved,
-        )
+        return replace(self, ip_hash=next_hash, ip_address=next_ip)
+
+    def ensure_resolved_ip_hash(
+        self,
+        hooks: "AuditHooks",
+        *,
+        drop_ip_address: bool = False,
+    ) -> tuple["AuditEvent", "ResolvedIpHash"]:
+        """Return an updated event alongside the resolved IP hash metadata.
+
+        The helper delegates to :meth:`resolve_ip_hash` to compute the hashed
+        address (including fallback metadata) and persists the result on the
+        event via :meth:`with_resolved_ip_hash`.  Callers can request that the
+        raw IP address be cleared after hashing by supplying
+        ``drop_ip_address=True``—useful when the event should avoid retaining
+        the unhashed value beyond the resolution step.  The original event is
+        returned when no state changes are required, preserving object
+        identity.
+        """
+
+        resolved = self.resolve_ip_hash(hooks)
+        return self.with_resolved_ip_hash(
+            resolved,
+            drop_ip_address=drop_ip_address,
+        ), resolved
 
     def log_with_fallback(
         self,
@@ -136,10 +191,6 @@ class AuditEvent:
         else:
             context_mapping = cast(Optional[Mapping[str, Any]], context)
 
-        effective_resolved = resolved_ip_hash
-        if effective_resolved is None:
-            effective_resolved = self.resolved_ip_hash
-
         return log_audit_event_with_fallback(
             hooks,
             logger,
@@ -149,7 +200,7 @@ class AuditEvent:
             disabled_level=disabled_level,
             context=context_mapping,
             context_factory=effective_factory,
-            resolved_ip_hash=effective_resolved,
+            resolved_ip_hash=resolved_ip_hash,
         )
 
     def with_context(
@@ -302,15 +353,10 @@ class AuditEvent:
         if ip_address == self.ip_address:
             if preserve_hash or self.ip_hash is None:
                 return self
-            return replace(self, ip_hash=None, resolved_ip_hash=None)
+            return replace(self, ip_hash=None)
 
         next_hash = self.ip_hash if preserve_hash else None
-        return replace(
-            self,
-            ip_address=ip_address,
-            ip_hash=next_hash,
-            resolved_ip_hash=None,
-        )
+        return replace(self, ip_address=ip_address, ip_hash=next_hash)
 
     def with_ip_hash(self, ip_hash: Optional[str]) -> "AuditEvent":
         """Return a copy of the event with an updated IP hash."""
@@ -318,7 +364,7 @@ class AuditEvent:
         if ip_hash == self.ip_hash:
             return self
 
-        return replace(self, ip_hash=ip_hash, resolved_ip_hash=None)
+        return replace(self, ip_hash=ip_hash)
 
 
 @dataclass(frozen=True)
@@ -595,17 +641,17 @@ def _build_audit_log_extra(
         return extra
 
     audit_payload: dict[str, Any] = {
-        "audit": {
-            "actor": actor,
-            "action": action,
-            "entity": entity,
-            "before": dict(before),
-            "after": dict(after),
-            "ip_address": ip_address,
-            "ip_hash": ip_hash,
-            "hash_fallback": hash_fallback,
-        }
+        "audit": AuditEvent(
+            actor=actor,
+            action=action,
+            entity=entity,
+            before=before,
+            after=after,
+            ip_address=ip_address,
+            ip_hash=ip_hash,
+        ).to_payload()
     }
+    audit_payload["audit"]["hash_fallback"] = hash_fallback
     if error_metadata is not None:
         audit_section = audit_payload["audit"]
         audit_section.setdefault("hash_error", error_metadata)
@@ -755,10 +801,6 @@ def log_audit_event_with_fallback(
     else:
         context_mapping = cast(Optional[Mapping[str, Any]], context)
 
-    effective_resolved = resolved_ip_hash
-    if effective_resolved is None:
-        effective_resolved = event.resolved_ip_hash
-
     return log_event_with_fallback(
         hooks,
         logger,
@@ -774,7 +816,7 @@ def log_audit_event_with_fallback(
         disabled_level=disabled_level,
         context=context_mapping,
         context_factory=effective_factory,
-        resolved_ip_hash=effective_resolved,
+        resolved_ip_hash=resolved_ip_hash,
     )
 
 
