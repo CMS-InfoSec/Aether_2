@@ -6,14 +6,17 @@ import math
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Iterable, Mapping, Sequence
+from typing import Any, Callable, Dict, Iterable, Mapping, Sequence, TypeVar, cast
 
 import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field
 
 from services.common.adapters import RedisFeastAdapter, TimescaleAdapter
 from services.common.security import require_admin_account
+from shared.pydantic_compat import BaseModel, Field
+
+
+RouteFn = TypeVar("RouteFn", bound=Callable[..., Any])
 
 
 TRADING_DAYS_PER_YEAR = 252
@@ -302,7 +305,13 @@ class NavMonteCarloForecaster:
 router = APIRouter()
 
 
-@router.get("/risk/nav_forecast", response_model=NavForecastResponse)
+def _router_get(*args: Any, **kwargs: Any) -> Callable[[RouteFn], RouteFn]:
+    """Typed wrapper around ``router.get`` for static analysis."""
+
+    return cast(Callable[[RouteFn], RouteFn], router.get(*args, **kwargs))
+
+
+@_router_get("/risk/nav_forecast", response_model=NavForecastResponse)
 def get_nav_forecast(
     account_id: str = Query(..., description="Trading account identifier"),
     horizon: str = Query("24h", description="Forecast horizon such as 24h or 1w"),
