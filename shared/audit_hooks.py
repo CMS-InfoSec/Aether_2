@@ -559,7 +559,10 @@ class AuditLogResult:
     ``context_evaluated`` indicates whether fallback context resolution
     completed—either because an eager mapping was already available, the
     factory executed, or there was no factory to invoke—allowing callers to
-    detect when expensive context builders were triggered.
+    detect when expensive context builders were triggered.  ``fallback_extra``
+    captures the structured logging metadata that was passed to the logger
+    whenever a fallback entry was emitted so callers can reuse (or inspect)
+    exactly what was recorded without reconstituting the payload.
     """
 
     handled: bool
@@ -571,6 +574,7 @@ class AuditLogResult:
     context_error: Optional[Exception] = None
     context_evaluated: bool = False
     fallback_logged: bool = False
+    fallback_extra: Optional[Mapping[str, Any]] = None
 
     def __bool__(self) -> bool:  # pragma: no cover - exercised implicitly via truthiness
         return self.handled
@@ -692,21 +696,24 @@ class AuditHooks:
             )
 
         fallback_logged = False
+        fallback_extra: Optional[Mapping[str, Any]] = None
+
         if resolved.error is not None and computed_resolved:
+            log_extra_payload = _build_audit_log_extra(
+                actor=actor,
+                action=action,
+                entity=entity,
+                before=before,
+                after=after,
+                ip_address=ip_address,
+                ip_hash=resolved.value,
+                context=None,
+                hash_fallback=resolved.fallback,
+                hash_error=resolved.error,
+            )
             LOGGER.error(
                 "Audit hash_ip callable failed; using fallback hash.",
-                extra=_build_audit_log_extra(
-                    actor=actor,
-                    action=action,
-                    entity=entity,
-                    before=before,
-                    after=after,
-                    ip_address=ip_address,
-                    ip_hash=resolved.value,
-                    context=None,
-                    hash_fallback=resolved.fallback,
-                    hash_error=resolved.error,
-                ),
+                extra=log_extra_payload,
                 exc_info=(
                     type(resolved.error),
                     resolved.error,
@@ -714,6 +721,7 @@ class AuditHooks:
                 ),
             )
             fallback_logged = True
+            fallback_extra = dict(log_extra_payload)
 
         log_callable(
             actor=actor,
@@ -730,6 +738,7 @@ class AuditHooks:
             hash_error=resolved.error,
             context_evaluated=False,
             fallback_logged=fallback_logged,
+            fallback_extra=fallback_extra,
         )
 
 
@@ -964,6 +973,7 @@ def log_event_with_fallback(
         )
 
     log_extra: dict[str, Any] | None = None
+    fallback_extra: Mapping[str, Any] | None = None
     effective_context_factory = context_factory
     context_value = context
     context_error: Exception | None = None
@@ -983,7 +993,7 @@ def log_event_with_fallback(
     def ensure_log_extra() -> Mapping[str, Any]:
         nonlocal log_extra, context_value, context_evaluated
         nonlocal context_error, context_error_logged, effective_context_factory
-        nonlocal fallback_logged
+        nonlocal fallback_logged, fallback_extra
         if log_extra is None:
             if not context_evaluated and effective_context_factory is not None:
                 try:
@@ -1007,6 +1017,7 @@ def log_event_with_fallback(
                 hash_error=resolved.error,
                 context_error=context_error,
             )
+            fallback_extra = log_extra
             if context_error is not None and not context_error_logged:
                 logger.exception(
                     "Audit fallback context factory raised; omitting context metadata.",
@@ -1056,6 +1067,7 @@ def log_event_with_fallback(
             context_error=context_error,
             context_evaluated=context_evaluated,
             fallback_logged=True,
+            fallback_extra=dict(log_extra) if log_extra is not None else None,
         )
 
     if not result.handled and disabled_message is not None:
@@ -1072,6 +1084,11 @@ def log_event_with_fallback(
             copy=log_extra is not None,
         )
 
+    wrapper_fallback_extra = (
+        dict(log_extra) if fallback_logged and log_extra is not None else None
+    )
+    combined_fallback_extra = result.fallback_extra or wrapper_fallback_extra
+
     return AuditLogResult(
         handled=result.handled,
         ip_hash=result.ip_hash or resolved.value,
@@ -1082,6 +1099,7 @@ def log_event_with_fallback(
         context_error=result.context_error or context_error,
         context_evaluated=result.context_evaluated or context_evaluated,
         fallback_logged=result.fallback_logged or fallback_logged,
+        fallback_extra=combined_fallback_extra,
     )
 
 
