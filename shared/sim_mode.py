@@ -114,7 +114,7 @@ def _engine() -> Engine:
     url = _database_url()
     url_obj = make_url(url)
 
-    engine_kwargs = {"future": True, "pool_pre_ping": True}
+    engine_kwargs: Dict[str, object] = {"future": True, "pool_pre_ping": True}
     connect_args: Dict[str, object] = {}
 
     driver = url_obj.drivername.lower()
