@@ -12,13 +12,47 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
-from sqlalchemy import JSON, Column, DateTime, MetaData, String, Table, create_engine, func, select
-from sqlalchemy.engine import Engine
-from sqlalchemy.exc import NoSuchTableError, SQLAlchemyError
-from sqlalchemy.orm import Session, declarative_base, sessionmaker
-from sqlalchemy.pool import StaticPool
+try:  # pragma: no cover - SQLAlchemy is optional for ops tooling
+    from sqlalchemy import (
+        JSON,
+        Column,
+        DateTime,
+        MetaData,
+        String,
+        Table,
+        create_engine,
+        func,
+        select,
+    )
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.exc import NoSuchTableError, SQLAlchemyError
+    from sqlalchemy.orm import Session, declarative_base, sessionmaker
+    from sqlalchemy.pool import StaticPool
+    _SQLALCHEMY_AVAILABLE = True
+except Exception:  # pragma: no cover - provide minimal stand-ins when unavailable
+    JSON = Column = DateTime = MetaData = String = Table = None  # type: ignore[assignment]
+    Engine = Any  # type: ignore[assignment]
+    Session = Any  # type: ignore[assignment]
+    StaticPool = object  # type: ignore[assignment]
+    func = select = None  # type: ignore[assignment]
+    _SQLALCHEMY_AVAILABLE = False
+
+    class SQLAlchemyError(RuntimeError):
+        """Fallback SQLAlchemy error hierarchy."""
+
+    class NoSuchTableError(SQLAlchemyError):
+        """Raised when a reflected table is missing under the fallback."""
+
+    def declarative_base():  # type: ignore[override]
+        class _Base:
+            metadata = None
+
+        return _Base
+
+    def sessionmaker(**_: object):  # type: ignore[override]
+        raise RuntimeError("SQLAlchemy is required for release manifest persistence")
 
 from shared.postgres import normalize_sqlalchemy_dsn
 
@@ -31,6 +65,11 @@ except ImportError:  # pragma: no cover - optional dependency
 LOGGER = logging.getLogger("ops.release_manifest")
 _SQLITE_FALLBACK_FLAG = "CONFIG_ALLOW_SQLITE_FOR_TESTS"
 _RELEASE_SQLITE_FLAG = "RELEASE_MANIFEST_ALLOW_SQLITE_FOR_TESTS"
+
+
+def _require_sqlalchemy(feature: str) -> None:
+    if not _SQLALCHEMY_AVAILABLE:
+        raise RuntimeError(f"{feature} requires SQLAlchemy to be installed")
 
 
 def _resolve_release_db_url() -> str:
@@ -107,15 +146,27 @@ DEFAULT_HASH_OUTPUT = Path("release_manifest_current.sha256")
 Base = declarative_base()
 
 
-class ReleaseRecord(Base):
-    """ORM mapping for persisted release manifests."""
+if _SQLALCHEMY_AVAILABLE:
 
-    __tablename__ = "releases"
+    class ReleaseRecord(Base):
+        """ORM mapping for persisted release manifests."""
 
-    manifest_id = Column(String, primary_key=True)
-    manifest_json = Column(JSON, nullable=False)
-    manifest_hash = Column(String, nullable=False)
-    ts = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+        __tablename__ = "releases"
+
+        manifest_id = Column(String, primary_key=True)
+        manifest_json = Column(JSON, nullable=False)
+        manifest_hash = Column(String, nullable=False)
+        ts = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+else:
+
+    class ReleaseRecord:  # type: ignore[override]
+        """Lightweight stand-in when SQLAlchemy is unavailable."""
+
+        __tablename__ = "releases"
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise RuntimeError("Release manifest persistence requires SQLAlchemy")
 
 
 @dataclass
@@ -137,6 +188,8 @@ class Manifest:
 
 
 def _create_engine(url: str) -> Engine:
+    _require_sqlalchemy("Creating release manifest engines")
+
     kwargs = {"future": True}
     if url.startswith("sqlite"):  # pragma: no cover - sqlite specific config
         kwargs["connect_args"] = {"check_same_thread": False}
@@ -145,9 +198,20 @@ def _create_engine(url: str) -> Engine:
     return create_engine(url, **kwargs)
 
 
-release_engine = _create_engine(DEFAULT_RELEASE_DB_URL)
-Base.metadata.create_all(bind=release_engine)
-SessionLocal = sessionmaker(bind=release_engine, autoflush=False, autocommit=False, expire_on_commit=False)
+if _SQLALCHEMY_AVAILABLE:
+    release_engine = _create_engine(DEFAULT_RELEASE_DB_URL)
+    Base.metadata.create_all(bind=release_engine)
+    SessionLocal = sessionmaker(
+        bind=release_engine,
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+    )
+else:  # pragma: no cover - exercised when SQLAlchemy is absent
+    release_engine = None
+
+    def SessionLocal(*_: object, **__: object) -> Session:  # type: ignore[override]
+        raise RuntimeError("Release manifest persistence requires SQLAlchemy")
 
 
 def compute_manifest_hash(payload: Dict[str, Dict[str, str]]) -> str:
@@ -254,6 +318,12 @@ def collect_model_versions(root: Path = DEFAULT_MODELS_DIR) -> Dict[str, str]:
 def collect_config_versions(database_url: str = DEFAULT_CONFIG_DB_URL) -> Dict[str, str]:
     """Fetch configuration versions from the config service database."""
 
+    if not _SQLALCHEMY_AVAILABLE:
+        LOGGER.warning(
+            "SQLAlchemy is unavailable; skipping config version collection for release manifests.",
+        )
+        return {}
+
     try:
         engine = _create_engine(database_url)
     except SQLAlchemyError:  # pragma: no cover - invalid database URL
@@ -320,6 +390,8 @@ def create_manifest(
 def save_manifest(session: Session, manifest: Manifest) -> Manifest:
     """Persist the manifest to the releases table."""
 
+    _require_sqlalchemy("Saving release manifests")
+
     record = ReleaseRecord(
         manifest_id=manifest.manifest_id,
         manifest_json=manifest.payload,
@@ -338,6 +410,8 @@ def save_manifest(session: Session, manifest: Manifest) -> Manifest:
 
 
 def fetch_manifest(session: Session, manifest_id: str) -> Optional[Manifest]:
+    _require_sqlalchemy("Fetching release manifests")
+
     record: Optional[ReleaseRecord] = session.get(ReleaseRecord, manifest_id)
     if record is None:
         return None
@@ -350,6 +424,8 @@ def fetch_manifest(session: Session, manifest_id: str) -> Optional[Manifest]:
 
 
 def list_manifests(session: Session, limit: Optional[int] = None) -> List[Manifest]:
+    _require_sqlalchemy("Listing release manifests")
+
     stmt = select(ReleaseRecord).order_by(ReleaseRecord.ts.desc())
     if limit is not None:
         stmt = stmt.limit(limit)
@@ -503,6 +579,8 @@ def verify_release_manifest_by_id(
 ) -> Tuple[Manifest, List[str]]:
     """Fetch a stored manifest and compare it with the live environment."""
 
+    _require_sqlalchemy("Verifying release manifests from the database")
+
     with session_factory() as session:
         manifest = fetch_manifest(session, manifest_id)
 
@@ -524,6 +602,8 @@ def verify_release_manifest_by_id(
 
 
 def create_command(args: argparse.Namespace) -> int:
+    _require_sqlalchemy("The release manifest 'create' command")
+
     manifest = create_manifest(
         manifest_id=args.id,
         services_dir=Path(args.services_dir),
@@ -547,6 +627,8 @@ def create_command(args: argparse.Namespace) -> int:
 
 
 def list_command(args: argparse.Namespace) -> int:
+    _require_sqlalchemy("The release manifest 'list' command")
+
     with SessionLocal() as session:
         manifests = list_manifests(session, args.limit)
     print(json.dumps([m.to_dict() for m in manifests], indent=2, sort_keys=True))
@@ -554,6 +636,8 @@ def list_command(args: argparse.Namespace) -> int:
 
 
 def verify_command(args: argparse.Namespace) -> int:
+    _require_sqlalchemy("The release manifest 'verify' command")
+
     try:
         _, mismatches = verify_release_manifest_by_id(
             args.id,
