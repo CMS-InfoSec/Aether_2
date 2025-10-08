@@ -655,7 +655,7 @@ async def _call_endpoint(
             continue
 
         if annotation is Response:
-            resolved_kwargs[name] = default if isinstance(default, Response) else Response()
+            resolved_kwargs[name] = Response() if default is Parameter.empty else default
             continue
 
         if isinstance(default, _Dependency):
