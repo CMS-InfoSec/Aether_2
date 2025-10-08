@@ -90,6 +90,9 @@ async def _publish_event(status: SimModeStatus, actor: str) -> None:
         LOGGER.exception("Failed to publish simulation mode event", extra={"actor": actor})
 
 
+_AUDIT_HOOKS = load_audit_hooks()
+
+
 async def _sync_runtime_state(active: bool) -> None:
     if active:
         await sim_mode_state.enable()

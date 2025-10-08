@@ -22,7 +22,14 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, MutableMapping, Sequence
 
-import pandas as pd
+from types import ModuleType
+from typing import TYPE_CHECKING
+
+try:  # pragma: no cover - pandas is an optional dependency in lightweight environments
+    import pandas as pd
+except Exception:  # pragma: no cover - executed when pandas is unavailable
+    pd = None  # type: ignore[assignment]
+
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
@@ -31,6 +38,9 @@ from services.common.security import require_admin_account
 from services.common.spot import require_spot_http
 from services.models.model_server import get_active_model
 from shared.spot import is_spot_symbol, normalize_spot_symbol
+
+if TYPE_CHECKING:  # pragma: no cover - import only for type checking
+    import pandas  # noqa: F401
 
 try:  # pragma: no cover - psycopg is an optional dependency in tests
     import psycopg
@@ -62,6 +72,20 @@ def _ensure_caller_matches_account(caller: str, account_id: str) -> None:
             status_code=403,
             detail="Authenticated account is not authorized for the requested account.",
         )
+
+
+def _require_pandas() -> ModuleType:
+    """Ensure the pandas dependency is available before generating reports."""
+
+    if pd is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The pandas library is required to generate reports. Install pandas to "
+                "enable daily, quarterly, or XAI report generation."
+            ),
+        )
+    return pd
 
 
 def _allow_sqlite() -> bool:
@@ -140,6 +164,8 @@ def _to_date(value: str | None, *, default: date) -> date:
 
 
 def _query_dataframe(conn: Any, query: str, params: Mapping[str, Any]) -> pd.DataFrame:
+    _require_pandas()
+
     with conn.cursor() as cursor:
         cursor.execute(query, params)
         rows = cursor.fetchall()
@@ -166,6 +192,8 @@ def _filter_spot_instruments(
     context: str,
 ) -> pd.DataFrame:
     """Return *frame* with only canonical spot instruments preserved."""
+
+    _require_pandas()
 
     if frame.empty or column not in frame.columns:
         return frame
@@ -309,6 +337,8 @@ def _load_trade_record(trade_id: str) -> Mapping[str, Any]:
 
 
 def _first_column(frame: pd.DataFrame, candidates: Sequence[str]) -> str | None:
+    _require_pandas()
+
     for name in candidates:
         if name in frame.columns:
             return name
@@ -316,6 +346,8 @@ def _first_column(frame: pd.DataFrame, candidates: Sequence[str]) -> str | None:
 
 
 def _normalize_timestamp(frame: pd.DataFrame, *, report_date: date) -> pd.Series:
+    _require_pandas()
+
     time_col = _first_column(
         frame,
         (
@@ -348,6 +380,8 @@ def _daily_fill_summary(
     end: datetime,
     report_date: date,
 ) -> pd.DataFrame:
+    _require_pandas()
+
     query = """
         SELECT
             COALESCE(f.account_id, o.account_id) AS account_id,
@@ -402,6 +436,8 @@ def _daily_pnl_summary(
     end: datetime,
     report_date: date,
 ) -> pd.DataFrame:
+    _require_pandas()
+
     query = """
         SELECT *
         FROM pnl_curves
@@ -460,6 +496,8 @@ def _daily_risk_summary(
     end: datetime,
     report_date: date,
 ) -> pd.DataFrame:
+    _require_pandas()
+
     query = """
         SELECT account_id, occurred_at, severity, event_type
         FROM risk_events
@@ -497,6 +535,8 @@ def _merge_daily_components(
     pnl: pd.DataFrame,
     risk: pd.DataFrame,
 ) -> pd.DataFrame:
+    _require_pandas()
+
     frame = pd.merge(fills, pnl, on=["session_date", "account_id"], how="outer")
     frame = pd.merge(frame, risk, on=["session_date", "account_id"], how="left")
     for column in (
@@ -572,6 +612,8 @@ def _quarter_bounds(as_of: date) -> tuple[date, date]:
 
 
 def _quarterly_summary(frame: pd.DataFrame) -> pd.DataFrame:
+    _require_pandas()
+
     if frame.empty:
         return pd.DataFrame(
             columns=[
@@ -608,6 +650,8 @@ def _quarterly_summary(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def _shap_like_attribution(frame: pd.DataFrame) -> list[dict[str, float | str]]:
+    _require_pandas()
+
     if frame.empty:
         return []
     frame = frame.copy()
@@ -626,6 +670,8 @@ def _shap_like_attribution(frame: pd.DataFrame) -> list[dict[str, float | str]]:
 
 
 def _regime_detection(frame: pd.DataFrame) -> list[dict[str, Any]]:
+    _require_pandas()
+
     if frame.empty:
         return []
     frame = frame.sort_values("fill_time")
@@ -654,6 +700,8 @@ def _regime_detection(frame: pd.DataFrame) -> list[dict[str, Any]]:
 
 
 def _instrument_breakdown(frame: pd.DataFrame) -> list[dict[str, Any]]:
+    _require_pandas()
+
     if frame.empty:
         return []
     frame = frame.copy()
@@ -790,6 +838,8 @@ def get_daily_report(
 ) -> Response:
     """Return the daily operational report as a CSV attachment."""
 
+    _require_pandas()
+
     _ensure_caller_matches_account(caller, account_id)
 
     resolved_date = _to_date(report_date, default=date.today())
@@ -845,6 +895,8 @@ def get_quarterly_report(
     caller: str = Depends(require_admin_account),
 ) -> Response:
     """Generate quarterly accounting summary in CSV or Parquet format."""
+
+    _require_pandas()
 
     _ensure_caller_matches_account(caller, account_id)
 
@@ -925,6 +977,8 @@ def get_xai_report(
     caller: str = Depends(require_admin_account),
 ) -> Response:
     """Produce an explainability report summarising trade drivers."""
+
+    _require_pandas()
 
     _ensure_caller_matches_account(caller, account_id)
 
