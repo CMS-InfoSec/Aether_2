@@ -5,19 +5,38 @@ from __future__ import annotations
 import enum
 import logging
 import os
+import sqlite3
 import sys
+import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
 from typing import AsyncIterator, Iterable, Mapping, Optional
+from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from sqlalchemy import Column, DateTime, Float, String, create_engine, select
-from sqlalchemy.engine import Engine
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session, declarative_base, sessionmaker
-from sqlalchemy.pool import StaticPool
+
+_SQLALCHEMY_AVAILABLE = True
+
+try:  # pragma: no cover - optional dependency in production
+    from sqlalchemy import Column, DateTime, Float, String, create_engine, select
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.exc import SQLAlchemyError
+    from sqlalchemy.orm import Session, declarative_base, sessionmaker
+    from sqlalchemy.pool import StaticPool
+except ImportError:  # pragma: no cover - exercised in lightweight environments
+    _SQLALCHEMY_AVAILABLE = False
+    Column = DateTime = Float = String = object  # type: ignore[assignment]
+    Engine = object  # type: ignore[assignment]
+    SQLAlchemyError = Exception  # type: ignore[assignment]
+    Session = object  # type: ignore[assignment]
+    StaticPool = object  # type: ignore[assignment]
+
+    def declarative_base() -> object:  # type: ignore[override]
+        return object()
 
 from services.common.security import require_admin_account
 from shared.postgres import normalize_sqlalchemy_dsn
@@ -25,7 +44,32 @@ from shared.postgres import normalize_sqlalchemy_dsn
 LOGGER = logging.getLogger(__name__)
 
 
-Base = declarative_base()
+if _SQLALCHEMY_AVAILABLE:
+    Base = declarative_base()
+    metadata = getattr(Base, "metadata", None)
+    if metadata is None or not hasattr(metadata, "drop_all"):
+        _SQLALCHEMY_AVAILABLE = False
+
+if not _SQLALCHEMY_AVAILABLE:
+
+    class _FallbackMetadata:
+        def __init__(self) -> None:
+            self._store: "_SQLiteBenchmarkStore | None" = None
+
+        def bind(self, store: "_SQLiteBenchmarkStore") -> None:
+            self._store = store
+
+        def create_all(self, bind: object | None = None, **__: object) -> None:
+            if self._store is not None:
+                LOGGER.debug("benchmark metadata create_all using fallback store")
+                self._store.create_all()
+
+        def drop_all(self, bind: object | None = None, **__: object) -> None:
+            if self._store is not None:
+                LOGGER.debug("benchmark metadata drop_all using fallback store")
+                self._store.drop_all()
+
+    Base = SimpleNamespace(metadata=_FallbackMetadata())
 
 
 class BenchmarkName(str, enum.Enum):
@@ -37,15 +81,177 @@ class BenchmarkName(str, enum.Enum):
     EQUAL_WEIGHT = "equal_weight_basket"
 
 
-class BenchmarkCurve(Base):
-    """SQLAlchemy model for the ``benchmark_curves`` hypertable."""
+if _SQLALCHEMY_AVAILABLE:
 
-    __tablename__ = "benchmark_curves"
+    class BenchmarkCurve(Base):
+        """SQLAlchemy model for the ``benchmark_curves`` hypertable."""
 
-    account_id = Column(String, primary_key=True)
-    benchmark = Column(String, primary_key=True)
-    ts = Column(DateTime(timezone=True), primary_key=True)
-    pnl = Column(Float, nullable=False, default=0.0)
+        __tablename__ = "benchmark_curves"
+
+        account_id = Column(String, primary_key=True)
+        benchmark = Column(String, primary_key=True)
+        ts = Column(DateTime(timezone=True), primary_key=True)
+        pnl = Column(Float, nullable=False, default=0.0)
+
+else:
+
+    @dataclass
+    class BenchmarkCurve:
+        """Lightweight stand-in used when SQLAlchemy is unavailable."""
+
+        account_id: str
+        benchmark: str
+        ts: datetime
+        pnl: float
+
+
+if not _SQLALCHEMY_AVAILABLE:
+
+    class _SQLiteBenchmarkStore:
+        """SQLite-backed persistence used when SQLAlchemy is not installed."""
+
+        def __init__(self, url: str) -> None:
+            self._dsn = url
+            self._path = self._resolve_path(url)
+            self._lock = threading.RLock()
+            self.create_all()
+
+        @property
+        def path(self) -> str:
+            return self._path
+
+        def _resolve_path(self, url: str) -> str:
+            parsed = urlparse(url)
+            base, _, _driver = parsed.scheme.partition("+")
+            if base and base != "sqlite":
+                LOGGER.warning(
+                    "SQLAlchemy unavailable; using in-memory SQLite fallback for benchmark DSN %s",
+                    url,
+                )
+                return ":memory:"
+
+            netloc_path = f"{parsed.netloc}{parsed.path}" if parsed.netloc else parsed.path
+            if netloc_path.startswith("//"):
+                netloc_path = netloc_path[1:]
+            if netloc_path in {"", "/"}:
+                return ":memory:"
+
+            candidate = Path(netloc_path)
+            if not candidate.is_absolute():
+                candidate = Path.cwd() / candidate
+            if str(candidate) != ":memory:":
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+            return str(candidate)
+
+        def _connect(self) -> sqlite3.Connection:
+            conn = sqlite3.connect(self._path, detect_types=sqlite3.PARSE_DECLTYPES, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            return conn
+
+        def create_all(self) -> None:
+            with self._lock, self._connect() as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS benchmark_curves (
+                        account_id TEXT NOT NULL,
+                        benchmark TEXT NOT NULL,
+                        ts REAL NOT NULL,
+                        pnl REAL NOT NULL,
+                        PRIMARY KEY (account_id, benchmark, ts)
+                    )
+                    """.strip()
+                )
+                conn.commit()
+
+        def drop_all(self) -> None:
+            with self._lock, self._connect() as conn:
+                conn.execute("DROP TABLE IF EXISTS benchmark_curves")
+                conn.commit()
+
+        def open(self) -> sqlite3.Connection:
+            return self._connect()
+
+
+    class _SQLiteEngine:
+        def __init__(self, store: _SQLiteBenchmarkStore) -> None:
+            self.url = store._dsn  # pragma: no cover - simple data attribute
+            self._store = store
+
+        def dispose(self) -> None:  # pragma: no cover - API parity
+            return None
+
+
+    class _SQLiteSession:
+        def __init__(self, store: _SQLiteBenchmarkStore) -> None:
+            self._store = store
+            self._conn = store.open()
+            self._closed = False
+
+        def _ensure_open(self) -> None:
+            if self._closed:
+                raise RuntimeError("SQLite benchmark session has been closed")
+
+        def upsert(self, record: BenchmarkCurve) -> None:
+            self._ensure_open()
+            cutoff = record.ts.astimezone(timezone.utc).timestamp()
+            with self._store._lock:
+                self._conn.execute(
+                    """
+                    INSERT INTO benchmark_curves (account_id, benchmark, ts, pnl)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(account_id, benchmark, ts)
+                    DO UPDATE SET pnl = excluded.pnl
+                    """.strip(),
+                    (record.account_id, record.benchmark, cutoff, float(record.pnl)),
+                )
+
+        def latest_pnl(self, account_id: str, benchmark: str, as_of: datetime) -> Optional[float]:
+            self._ensure_open()
+            cutoff = as_of.astimezone(timezone.utc).timestamp()
+            with self._store._lock:
+                cursor = self._conn.execute(
+                    """
+                    SELECT pnl
+                    FROM benchmark_curves
+                    WHERE account_id = ? AND benchmark = ? AND ts <= ?
+                    ORDER BY ts DESC
+                    LIMIT 1
+                    """.strip(),
+                    (account_id, benchmark, cutoff),
+                )
+                row = cursor.fetchone()
+            return float(row[0]) if row else None
+
+        def commit(self) -> None:
+            self._ensure_open()
+            with self._store._lock:
+                self._conn.commit()
+
+        def rollback(self) -> None:
+            if self._closed:
+                return
+            with self._store._lock:
+                self._conn.rollback()
+
+        def close(self) -> None:
+            if self._closed:
+                return
+            self._conn.close()
+            self._closed = True
+
+        # Context manager protocol for ``with SessionLocal() as session`` usage.
+        def __enter__(self) -> "_SQLiteSession":
+            self._ensure_open()
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            try:
+                if exc_type is None:
+                    self.commit()
+                else:
+                    self.rollback()
+            finally:
+                self.close()
 
 
 @dataclass
@@ -81,7 +287,10 @@ class BenchmarkCurveRepository:
             ts=ts,
             pnl=snapshot.pnl,
         )
-        self._session.merge(record)
+        if _SQLALCHEMY_AVAILABLE:
+            self._session.merge(record)
+        else:
+            self._session.upsert(record)  # type: ignore[attr-defined]
 
     def record_many(self, account_id: str, snapshots: Iterable[BenchmarkSnapshot], ts: datetime) -> None:
         """Persist multiple benchmark snapshots in a single transaction."""
@@ -94,18 +303,25 @@ class BenchmarkCurveRepository:
     ) -> Optional[float]:
         """Return the latest PnL value prior to ``as_of`` for ``benchmark``."""
 
-        statement = (
-            select(BenchmarkCurve.pnl)
-            .where(
-                BenchmarkCurve.account_id == account_id,
-                BenchmarkCurve.benchmark == benchmark.value,
-                BenchmarkCurve.ts <= as_of,
+        if _SQLALCHEMY_AVAILABLE:
+            statement = (
+                select(BenchmarkCurve.pnl)
+                .where(
+                    BenchmarkCurve.account_id == account_id,
+                    BenchmarkCurve.benchmark == benchmark.value,
+                    BenchmarkCurve.ts <= as_of,
+                )
+                .order_by(BenchmarkCurve.ts.desc())
+                .limit(1)
             )
-            .order_by(BenchmarkCurve.ts.desc())
-            .limit(1)
+            result = self._session.execute(statement).scalar_one_or_none()
+            return float(result) if result is not None else None
+
+        return self._session.latest_pnl(  # type: ignore[attr-defined]
+            account_id,
+            benchmark.value,
+            as_of,
         )
-        result = self._session.execute(statement).scalar_one_or_none()
-        return float(result) if result is not None else None
 
 
 _DATABASE_ENV_VARS: tuple[str, ...] = (
@@ -169,8 +385,17 @@ def _engine_options(url: str) -> Mapping[str, object]:
 
 
 DATABASE_URL = _database_url()
-ENGINE: Engine = create_engine(DATABASE_URL, **_engine_options(DATABASE_URL))
-SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
+
+if _SQLALCHEMY_AVAILABLE:
+    ENGINE: Engine = create_engine(DATABASE_URL, **_engine_options(DATABASE_URL))
+    SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
+else:
+    _SQLITE_STORE = _SQLiteBenchmarkStore(DATABASE_URL)
+    Base.metadata.bind(_SQLITE_STORE)
+    ENGINE = _SQLiteEngine(_SQLITE_STORE)  # type: ignore[assignment]
+
+    def SessionLocal() -> _SQLiteSession:  # type: ignore[override]
+        return _SQLiteSession(_SQLITE_STORE)
 
 
 @asynccontextmanager
@@ -188,6 +413,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="Benchmark Service", version="1.0.0", lifespan=_lifespan)
 app.state.db_sessionmaker = SessionLocal
+
 
 
 def _parse_date(date_str: str | None) -> datetime:
@@ -252,6 +478,11 @@ def upsert_benchmark_curves(
     """Persist benchmark returns for an account at a point in time."""
 
     ts = payload.timestamp
+    if isinstance(ts, str):
+        try:
+            ts = datetime.fromisoformat(ts)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="Invalid date format") from exc
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
 
@@ -297,6 +528,8 @@ def upsert_benchmark_curves(
             session.rollback()
             LOGGER.exception("Failed to persist benchmark snapshots: %s", exc)
             raise HTTPException(status_code=500, detail="Failed to persist benchmark data")
+
+    return Response(status_code=204)
 
 
 @app.get("/benchmark/compare", response_model=BenchmarkComparison)
