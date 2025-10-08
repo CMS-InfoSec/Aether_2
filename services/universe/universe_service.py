@@ -12,7 +12,18 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    TypeVar,
+    cast,
+)
 from uuid import UUID, uuid4
 
 try:  # pragma: no cover - alembic is optional during tests
@@ -22,92 +33,16 @@ except ModuleNotFoundError:  # pragma: no cover - allow import without alembic
     command = None  # type: ignore[assignment]
     Config = None  # type: ignore[assignment]
 from fastapi import Depends, FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from shared.pydantic_compat import BaseModel, Field
+from sqlalchemy import Boolean, Column, DateTime, Float, String, create_engine, func, select
+from sqlalchemy.dialects.postgresql import JSONB, UUID as PGUUID
+from sqlalchemy.engine import Engine, URL
+from sqlalchemy.engine.url import make_url
+from sqlalchemy.exc import ArgumentError
+from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
-try:  # pragma: no cover - SQLAlchemy is optional in lightweight environments
-    from sqlalchemy import Boolean, Column, DateTime, Float, String, create_engine, func, select
-    from sqlalchemy.dialects.postgresql import JSONB, UUID as PGUUID
-    from sqlalchemy.engine import Engine, URL
-    from sqlalchemy.engine.url import make_url
-    from sqlalchemy.exc import ArgumentError
-    from sqlalchemy.orm import Session, declarative_base, sessionmaker
-    SQLALCHEMY_AVAILABLE = True
-except ModuleNotFoundError:  # pragma: no cover - allow import without SQLAlchemy
-    from urllib.parse import parse_qsl, urlparse
-
-    SQLALCHEMY_AVAILABLE = False
-
-    class _MissingSQLAlchemy(RuntimeError):
-        pass
-
-    def _unavailable(feature: str) -> _MissingSQLAlchemy:
-        return _MissingSQLAlchemy(
-            "SQLAlchemy is required for universe service operations; "
-            f"missing functionality: {feature}."
-        )
-
-    class Column:  # type: ignore[override]
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            self.args = args
-            self.kwargs = kwargs
-
-    class _TypePlaceholder:  # simple stand-ins for SQLAlchemy field types
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            self.args = args
-            self.kwargs = kwargs
-
-    Boolean = Float = DateTime = String = _TypePlaceholder  # type: ignore[assignment]
-
-    class JSONB(_TypePlaceholder):
-        pass
-
-    class PGUUID(_TypePlaceholder):  # pragma: no cover - placeholder when SQLAlchemy missing
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            super().__init__(*args, **kwargs)
-
-    class _FuncProxy:
-        def __getattr__(self, name: str) -> Any:
-            raise _unavailable(f"func.{name}")
-
-    func = _FuncProxy()
-
-    def select(*_: Any, **__: Any) -> Any:  # type: ignore[override]
-        raise _unavailable("select")
-
-    class URL:
-        def __init__(self, value: str) -> None:
-            self._value = value
-            parsed = urlparse(value)
-            self.drivername = parsed.scheme or ""
-            self.host = parsed.hostname
-            self.query = {key: val for key, val in parse_qsl(parsed.query, keep_blank_values=True)}
-
-        def render_as_string(self, *, hide_password: bool = True) -> str:
-            del hide_password
-            return self._value
-
-    class Engine:  # type: ignore[override]
-        pass
-
-    class Session:  # type: ignore[override]
-        pass
-
-    def declarative_base() -> type:  # type: ignore[override]
-        return type("Base", (), {})
-
-    def sessionmaker(*_: Any, **__: Any) -> Any:  # type: ignore[override]
-        raise _unavailable("sessionmaker")
-
-    def create_engine(*_: Any, **__: Any) -> Any:  # type: ignore[override]
-        raise _unavailable("create_engine")
-
-    def make_url(value: str) -> URL:  # type: ignore[override]
-        if not isinstance(value, str):
-            raise ValueError("Database URL must be a string")
-        return URL(value)
-
-    class ArgumentError(ValueError):
-        pass
+if TYPE_CHECKING:
+    from sqlalchemy.sql.schema import Table
 
 from services.common.security import require_admin_account
 from shared.spot import filter_spot_symbols, is_spot_symbol, normalize_spot_symbol
@@ -182,16 +117,46 @@ def _engine_options(url: URL) -> dict[str, Any]:
 
 DATABASE_URL: Optional[URL] = None
 ENGINE: Optional[Engine] = None
-SessionLocal: Optional[sessionmaker] = None
+SessionLocal: sessionmaker[Session] | None = None
 
 
-Base = declarative_base()
+if TYPE_CHECKING:
+    class Base:
+        """Static typing stub for the universe service declarative base."""
+
+        metadata: Any  # pragma: no cover - provided by SQLAlchemy at runtime
+        registry: Any  # pragma: no cover - provided by SQLAlchemy at runtime
+else:  # pragma: no cover - runtime base class when SQLAlchemy is available
+    try:
+        from sqlalchemy.orm import DeclarativeBase as _DeclarativeBase
+
+        class Base(_DeclarativeBase):
+            """Typed declarative base for the universe service models."""
+
+            pass
+
+    except Exception:
+        Base = declarative_base()
+        Base.__doc__ = "Typed declarative base for the universe service models."
 
 
 class Feature(Base):
     """TimescaleDB feature storage used by ingestion pipelines."""
 
     __tablename__ = "features"
+
+    if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
+        __table__: Table
+
+        def __init__(
+            self,
+            *,
+            feature_name: str,
+            entity_id: str,
+            event_timestamp: datetime,
+            value: float | None = None,
+            attributes: Dict[str, Any] | None = None,
+        ) -> None: ...
 
     feature_name = Column(String, primary_key=True)
     entity_id = Column(String, primary_key=True)
@@ -204,6 +169,21 @@ class OhlcvBar(Base):
     """Kraken OHLCV candles captured in TimescaleDB."""
 
     __tablename__ = "ohlcv_bars"
+
+    if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
+        __table__: Table
+
+        def __init__(
+            self,
+            *,
+            market: str,
+            bucket_start: datetime,
+            open: float | None = None,
+            high: float | None = None,
+            low: float | None = None,
+            close: float | None = None,
+            volume: float | None = None,
+        ) -> None: ...
 
     market = Column(String, primary_key=True)
     bucket_start = Column(DateTime(timezone=True), primary_key=True)
@@ -219,6 +199,19 @@ class UniverseWhitelist(Base):
 
     __tablename__ = "universe_whitelist"
 
+    if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
+        __table__: Table
+
+        def __init__(
+            self,
+            *,
+            asset_id: str,
+            as_of: datetime,
+            source: str,
+            approved: bool,
+            details: Dict[str, Any] | None = None,
+        ) -> None: ...
+
     asset_id = Column(String, primary_key=True)
     as_of = Column(DateTime(timezone=True), primary_key=True)
     source = Column(String, nullable=False)
@@ -230,6 +223,21 @@ class AuditLog(Base):
     """Audit events recorded for manual overrides."""
 
     __tablename__ = "audit_log"
+
+    if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
+        __table__: Table
+
+        def __init__(
+            self,
+            *,
+            event_id: UUID,
+            entity_type: str,
+            entity_id: str,
+            actor: str,
+            action: str,
+            event_time: datetime,
+            attributes: Dict[str, Any] | None = None,
+        ) -> None: ...
 
     event_id = Column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
     entity_type = Column(String, nullable=False)
@@ -336,8 +344,30 @@ app.state.db_sessionmaker = None
 app.state.universe_engine = None
 app.state.universe_database_url = None
 
+RouteFn = TypeVar("RouteFn", bound=Callable[..., Any])
 
-@app.on_event("startup")
+
+def _app_route(
+    factory: Callable[..., Any], *args: Any, **kwargs: Any
+) -> Callable[[RouteFn], RouteFn]:
+    """Cast FastAPI route decorators to typed callables for strict mypy."""
+
+    return cast(Callable[[RouteFn], RouteFn], factory(*args, **kwargs))
+
+
+def _app_get(*args: Any, **kwargs: Any) -> Callable[[RouteFn], RouteFn]:
+    return _app_route(app.get, *args, **kwargs)
+
+
+def _app_post(*args: Any, **kwargs: Any) -> Callable[[RouteFn], RouteFn]:
+    return _app_route(app.post, *args, **kwargs)
+
+
+def _app_on_event(event_type: str) -> Callable[[RouteFn], RouteFn]:
+    return _app_route(app.on_event, event_type)
+
+
+@_app_on_event("startup")
 def _on_startup() -> None:
     ensure_database(app)
 
@@ -531,7 +561,7 @@ def _finalize_spot_symbol(base_asset: str) -> Optional[str]:
     """Return a canonical USD spot symbol for *base_asset* if eligible."""
 
     candidate = f"{base_asset}-USD"
-    normalized = normalize_spot_symbol(candidate)
+    normalized: str = normalize_spot_symbol(candidate)
     if not normalized or not normalized.endswith("-USD"):
         return None
 
@@ -614,13 +644,13 @@ def _evaluate_universe(session: Session) -> List[str]:
     return [symbol for symbol in spot_symbols if symbol.endswith("-USD")]
 
 
-@app.get("/universe/approved", response_model=UniverseResponse)
+@_app_get("/universe/approved", response_model=UniverseResponse)
 def approved_universe(session: Session = Depends(get_session)) -> UniverseResponse:
     symbols = _evaluate_universe(session)
     return UniverseResponse(symbols=symbols, generated_at=datetime.now(timezone.utc))
 
 
-@app.post("/universe/override", response_model=OverrideResponse, status_code=201)
+@_app_post("/universe/override", response_model=OverrideResponse, status_code=201)
 def override_symbol(
     request: OverrideRequest,
     session: Session = Depends(get_session),
