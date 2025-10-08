@@ -32,15 +32,24 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import logging
 import os
-from typing import Callable, Dict, Mapping, MutableMapping, Sequence, Tuple
+from types import ModuleType
+from typing import Any, Callable, Dict, Mapping, MutableMapping, Sequence, Tuple, TYPE_CHECKING
 
-import pandas as pd
+try:  # pragma: no cover - pandas is optional in lightweight environments
+    import pandas as pd
+except Exception:  # pragma: no cover - executed when pandas is unavailable
+    pd = None  # type: ignore[assignment]
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
-from ml.monitoring.drift import DriftReport, generate_drift_report
+from ml.monitoring.drift import DriftReport, MissingDependencyError, generate_drift_report
 
 LOGGER = logging.getLogger(__name__)
+
+
+if TYPE_CHECKING:  # pragma: no cover - imported for typing only
+    import pandas
 
 
 try:  # pragma: no cover - mlflow is optional for tests/CI.
@@ -301,13 +310,34 @@ class CanaryDeploymentManager:
         )
 
 
+def _require_pandas() -> ModuleType:
+    if pd is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "The pandas library is required for drift monitoring. Install pandas to evaluate "
+                "drift metrics or disable the drift monitoring service."
+            ),
+        )
+    return pd
+
+
+def _coerce_dataframe(value: Any) -> Any:
+    pandas = _require_pandas()
+    if value is None:
+        return pandas.DataFrame()
+    if isinstance(value, pandas.DataFrame):
+        return value
+    return pandas.DataFrame(value)
+
+
 class DriftMonitoringService:
     """Evaluate feature drift and manage automated retraining workflows."""
 
     def __init__(
         self,
         *,
-        baseline: pd.DataFrame | None = None,
+        baseline: Any | None = None,
         psi_threshold: float = 0.2,
         ks_threshold: float = 0.1,
         retrain_callback: Callable[[Sequence[DriftReport]], str | None] | None = None,
@@ -319,7 +349,12 @@ class DriftMonitoringService:
     ) -> None:
         self.psi_threshold = psi_threshold
         self.ks_threshold = ks_threshold
-        self._baseline = baseline if baseline is not None else pd.DataFrame()
+        if baseline is not None and pd is not None:
+            self._baseline: Any | None = pd.DataFrame(baseline)
+        elif pd is not None:
+            self._baseline = pd.DataFrame()
+        else:
+            self._baseline = None
         self._retrain_callback = retrain_callback
         self._metrics: MutableMapping[str, FeatureDriftScore] = {}
         self._last_checked: datetime | None = None
@@ -340,27 +375,39 @@ class DriftMonitoringService:
         )
 
     @property
-    def baseline(self) -> pd.DataFrame:
+    def baseline(self) -> Any:
+        if self._baseline is None:
+            self._baseline = _coerce_dataframe(None)
         return self._baseline
 
-    def set_baseline(self, baseline: pd.DataFrame) -> None:
-        if baseline.empty:
+    def set_baseline(self, baseline: Any) -> None:
+        frame = _coerce_dataframe(baseline)
+        if frame.empty:
             raise ValueError("Baseline dataframe must contain at least one feature.")
-        self._baseline = baseline
+        self._baseline = frame
 
-    def evaluate(self, production: pd.DataFrame) -> Sequence[DriftReport]:
-        if self._baseline.empty:
+    def evaluate(self, production: Any) -> Sequence[DriftReport]:
+        baseline_df = self.baseline
+        if baseline_df.empty:
             raise HTTPException(
                 status_code=status.HTTP_412_PRECONDITION_FAILED,
                 detail="Baseline dataframe has not been initialised",
             )
 
-        reports = generate_drift_report(
-            baseline_df=self._baseline,
-            production_df=production,
-            psi_threshold=self.psi_threshold,
-            ks_threshold=self.ks_threshold,
-        )
+        production_df = _coerce_dataframe(production)
+
+        try:
+            reports = generate_drift_report(
+                baseline_df=baseline_df,
+                production_df=production_df,
+                psi_threshold=self.psi_threshold,
+                ks_threshold=self.ks_threshold,
+            )
+        except MissingDependencyError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(exc),
+            ) from exc
         evaluated_at = datetime.now(timezone.utc)
         self._last_checked = evaluated_at
         self._metrics = {
@@ -480,7 +527,6 @@ def _default_service() -> DriftMonitoringService:
         model_name = os.getenv("MLFLOW_MODEL_NAME")
         promote_after = int(os.getenv("CANARY_PROMOTE_AFTER_TRADES", "50"))
         instance = DriftMonitoringService(
-            baseline=pd.DataFrame(),
             canary_model_name=model_name,
             canary_promote_after_trades=promote_after,
             tracking_uri=tracking_uri,
