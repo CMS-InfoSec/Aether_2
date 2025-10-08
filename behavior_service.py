@@ -20,15 +20,34 @@ import os
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Generator, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Generator, Iterable, List, Mapping, Optional, Sequence, Tuple, cast
+
+from types import ModuleType, SimpleNamespace
+
+import sys
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import JSON, Column, DateTime, Integer, String, create_engine, inspect
-from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session, declarative_base, sessionmaker
-from sqlalchemy.pool import StaticPool
-from sqlalchemy.schema import CreateSchema
+
+_SQLALCHEMY_AVAILABLE = True
+
+try:  # pragma: no cover - optional dependency used in production
+    from sqlalchemy import JSON, Column, DateTime, Integer, String, create_engine, inspect
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.orm import Session, declarative_base, sessionmaker
+    from sqlalchemy.pool import StaticPool
+    from sqlalchemy.schema import CreateSchema
+except ImportError:  # pragma: no cover - exercised in unit-only environments
+    _SQLALCHEMY_AVAILABLE = False
+    Engine = Any  # type: ignore[assignment]
+    Session = Any  # type: ignore[assignment]
+    StaticPool = object  # type: ignore[assignment]
+
+    def declarative_base() -> Any:  # type: ignore[override]
+        base = SimpleNamespace()
+        base.metadata = SimpleNamespace(create_all=lambda **__: None)
+        return base
+
 
 from services.alert_manager import RiskEvent, get_alert_manager_instance
 from services.common.adapters import TimescaleAdapter
@@ -84,7 +103,9 @@ def _require_database_url() -> str:
     )
 
 
-def _create_engine(url: str) -> Engine:
+def _create_engine(url: str) -> Engine | _InMemoryEngine:
+    if not _SQLALCHEMY_AVAILABLE:
+        return _InMemoryEngine(url)
     connect_args: Dict[str, Any] = {}
     engine_options: Dict[str, Any] = {
         "future": True,
@@ -112,6 +133,8 @@ def _create_engine(url: str) -> Engine:
 
 
 def _ensure_schema(engine: Engine, schema: Optional[str]) -> None:
+    if not _SQLALCHEMY_AVAILABLE:
+        return
     if not schema:
         return
     if engine.dialect.name != "postgresql":
@@ -132,24 +155,111 @@ def _ensure_schema(engine: Engine, schema: Optional[str]) -> None:
 
 
 DATABASE_SCHEMA = os.getenv("BEHAVIOR_DB_SCHEMA")
-Base = declarative_base()
-
-ENGINE: Engine | None = None
-SessionLocal: sessionmaker | None = None
+Base = declarative_base() if _SQLALCHEMY_AVAILABLE else None
 
 
-class BehaviorLog(Base):
-    """SQLAlchemy model backing the ``behavior_log`` table."""
+class _InMemoryBehaviorDatabase:
+    """Minimal in-memory store used when SQLAlchemy isn't available."""
 
-    __tablename__ = "behavior_log"
-    if DATABASE_SCHEMA:
-        __table_args__ = {"schema": DATABASE_SCHEMA}
+    def __init__(self) -> None:
+        self._rows: List["BehaviorLog"] = []
+        self._next_id = 1
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    account_id = Column(String, nullable=False, index=True)
-    anomaly_type = Column(String, nullable=False)
-    details_json = Column(JSON, nullable=False, default=dict)
-    ts = Column(DateTime(timezone=True), nullable=False, index=True)
+    def reset(self) -> None:
+        self._rows.clear()
+        self._next_id = 1
+
+    def add(self, record: "BehaviorLog") -> None:
+        if getattr(record, "id", 0) in (None, 0):
+            record.id = self._next_id  # type: ignore[attr-defined]
+            self._next_id += 1
+        self._rows.append(record)
+
+    def fetch(self, account_id: str, limit: int) -> List["BehaviorLog"]:
+        rows = [row for row in self._rows if row.account_id == account_id]
+        rows.sort(key=lambda row: row.ts, reverse=True)
+        return rows[:limit]
+
+
+class _InMemoryEngine:
+    def __init__(self, url: str) -> None:
+        self.url = url
+
+    def dispose(self) -> None:  # pragma: no cover - API parity
+        return None
+
+
+class _InMemorySession:
+    def __init__(self, db: _InMemoryBehaviorDatabase) -> None:
+        self._db = db
+
+    def add(self, record: "BehaviorLog") -> None:
+        self._db.add(record)
+
+    def commit(self) -> None:  # pragma: no cover - API parity
+        return None
+
+    def close(self) -> None:  # pragma: no cover - API parity
+        return None
+
+    def fetch_behavior_logs(self, account_id: str, limit: int) -> List["BehaviorLog"]:
+        return self._db.fetch(account_id, limit)
+
+
+def _in_memory_sessionmaker(db: _InMemoryBehaviorDatabase) -> Callable[[], _InMemorySession]:
+    def factory() -> _InMemorySession:
+        return _InMemorySession(db)
+
+    return factory
+
+
+ENGINE: Engine | _InMemoryEngine | None = None
+SessionLocal: Callable[[], Any] | None = None
+_STORE_MODULE_NAME = "_behavior_service_in_memory_store"
+_store_module = cast(ModuleType, sys.modules.get(_STORE_MODULE_NAME))
+if _store_module is None:
+    _store_module = ModuleType(_STORE_MODULE_NAME)
+    _store_module.db_cache = {}  # type: ignore[attr-defined]
+    sys.modules[_STORE_MODULE_NAME] = _store_module
+
+_IN_MEMORY_DBS = cast(Dict[str, _InMemoryBehaviorDatabase], getattr(_store_module, "db_cache"))
+
+
+def _get_in_memory_db(url: str) -> _InMemoryBehaviorDatabase:
+    normalized = _normalize_database_url(url)
+    db = _IN_MEMORY_DBS.get(normalized)
+    if db is None:
+        db = _InMemoryBehaviorDatabase()
+        _IN_MEMORY_DBS[normalized] = db
+    return db
+
+
+if _SQLALCHEMY_AVAILABLE:
+
+    class BehaviorLog(Base):
+        """SQLAlchemy model backing the ``behavior_log`` table."""
+
+        __tablename__ = "behavior_log"
+        if DATABASE_SCHEMA:
+            __table_args__ = {"schema": DATABASE_SCHEMA}
+
+        id = Column(Integer, primary_key=True, autoincrement=True)
+        account_id = Column(String, nullable=False, index=True)
+        anomaly_type = Column(String, nullable=False)
+        details_json = Column(JSON, nullable=False, default=dict)
+        ts = Column(DateTime(timezone=True), nullable=False, index=True)
+
+else:
+
+    @dataclass
+    class BehaviorLog:
+        """Simple record used for in-memory persistence in tests."""
+
+        account_id: str
+        anomaly_type: str
+        details_json: Dict[str, Any]
+        ts: datetime
+        id: int = 0
 
 
 class ScanRequest(BaseModel):
@@ -443,8 +553,20 @@ def _initialize_database() -> None:
             logger.warning("Failed to dispose previous behavior engine", exc_info=True)
 
     engine = _create_engine(database_url)
+    ENGINE = engine
+
+    if not _SQLALCHEMY_AVAILABLE:
+        in_memory_db = _get_in_memory_db(database_url)
+        session_factory = _in_memory_sessionmaker(in_memory_db)
+        SessionLocal = session_factory
+        app.state.behavior_db_engine = engine
+        app.state.behavior_db_sessionmaker = session_factory
+        app.state.behavior_in_memory_db = in_memory_db
+        return
+
     _ensure_schema(engine, DATABASE_SCHEMA)
-    Base.metadata.create_all(bind=engine, checkfirst=True)
+    if Base is not None:
+        Base.metadata.create_all(bind=engine, checkfirst=True)
 
     session_factory = sessionmaker(
         bind=engine,
@@ -453,7 +575,6 @@ def _initialize_database() -> None:
         future=True,
     )
 
-    ENGINE = engine
     SessionLocal = session_factory
     app.state.behavior_db_engine = engine
     app.state.behavior_db_sessionmaker = session_factory
@@ -534,7 +655,7 @@ def scan_behavior(
 
     incidents = detector.scan_account(request.account_id, request.lookback_minutes)
     if not incidents:
-        return ScanResponse(incidents=[])
+        return ScanResponse(incidents=[]).model_dump()
 
     for incident in incidents:
         _persist_incident(session, incident)
@@ -543,7 +664,7 @@ def scan_behavior(
     for incident in incidents:
         _emit_alert(incident)
 
-    return ScanResponse(incidents=incidents)
+    return ScanResponse(incidents=incidents).model_dump()
 
 
 @app.get("/behavior/status", response_model=StatusResponse)
@@ -559,13 +680,19 @@ def behavior_status(
             detail="Authenticated account is not authorized for the requested account.",
         )
 
-    rows: List[BehaviorLog] = (
-        session.query(BehaviorLog)
-        .filter(BehaviorLog.account_id == account_id)
-        .order_by(BehaviorLog.ts.desc())
-        .limit(limit)
-        .all()
-    )
+    if _SQLALCHEMY_AVAILABLE and hasattr(session, "query"):
+        rows: List[BehaviorLog] = (
+            session.query(BehaviorLog)
+            .filter(BehaviorLog.account_id == account_id)
+            .order_by(BehaviorLog.ts.desc())
+            .limit(limit)
+            .all()
+        )
+    else:
+        fetch = getattr(session, "fetch_behavior_logs", None)
+        if fetch is None:
+            raise RuntimeError("Behavior session does not support fetching logs without SQLAlchemy.")
+        rows = fetch(account_id, limit)
 
     incidents: List[BehaviorIncident] = []
     for row in rows:

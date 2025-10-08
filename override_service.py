@@ -8,7 +8,7 @@ import sys
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional
 
 from fastapi import Depends, FastAPI, Header, Query, Request, status
 from pydantic import BaseModel, Field
