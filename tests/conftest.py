@@ -223,6 +223,11 @@ def _install_sqlalchemy_stub() -> None:
             self.args = args
             self.kwargs = kwargs
 
+    class _Constraint:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self.args = args
+            self.kwargs = kwargs
+
     class MetaData:
         def __init__(self, *args: object, **kwargs: object) -> None:
             self.tables: dict[str, "Table"] = {}
@@ -342,6 +347,10 @@ def _install_sqlalchemy_stub() -> None:
     sa.JSON = _Type
     sa.JSONB = _Type
     sa.Text = _Type
+    sa.UniqueConstraint = _Constraint
+    sa.ForeignKey = _Constraint
+    sa.PrimaryKeyConstraint = _Constraint
+    sa.Index = _Constraint
     sa.MetaData = MetaData
     sa.Table = Table
     sa.func = _FuncProxy()
