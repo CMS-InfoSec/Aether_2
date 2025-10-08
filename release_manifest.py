@@ -54,10 +54,9 @@ from sqlalchemy.exc import ArgumentError, NoSuchTableError, SQLAlchemyError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-try:
-    import yaml  # type: ignore
-except ImportError:  # pragma: no cover - optional dependency
-    yaml = None  # type: ignore
+from shared.yaml_compat import load_yaml_module
+
+yaml = load_yaml_module()
 
 
 LOGGER = logging.getLogger("release_manifest")
