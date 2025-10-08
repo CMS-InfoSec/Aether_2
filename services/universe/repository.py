@@ -4,29 +4,122 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, ClassVar, Dict, Iterator, List, Mapping, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    ClassVar,
+    Dict,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Tuple,
+    cast,
+)
 
 from shared.audit import AuditLogEntry, AuditLogStore, TimescaleAuditLogger
 from shared.spot import is_spot_symbol, normalize_spot_symbol
-
-try:  # pragma: no cover - exercised in integration tests when SQLAlchemy installed
-    from sqlalchemy import JSON, Column, DateTime, Float, Integer, MetaData, String, Table, insert, select
-    from sqlalchemy.engine import Engine
-    from sqlalchemy.exc import NoSuchTableError, SQLAlchemyError
-    from sqlalchemy.orm import Session, sessionmaker
-    from sqlalchemy import create_engine
-
-    SQLALCHEMY_AVAILABLE = True
-except Exception:  # pragma: no cover - fallback when SQLAlchemy missing
-    SQLALCHEMY_AVAILABLE = False
-    JSON = object  # type: ignore[assignment]
-    Column = DateTime = Float = Integer = MetaData = String = Table = object  # type: ignore[assignment]
-    insert = select = create_engine = None  # type: ignore[assignment]
-    Engine = Session = sessionmaker = object  # type: ignore[assignment]
-    NoSuchTableError = SQLAlchemyError = Exception  # type: ignore[assignment]
-
 from services.common.config import TimescaleSession, get_timescale_session
 
+
+class SessionProtocol(Protocol):
+    """Minimal subset of the SQLAlchemy Session API used by the repository."""
+
+    def execute(self, *args: Any, **kwargs: Any) -> Any:
+        ...
+
+    def commit(self) -> None:
+        ...
+
+    def rollback(self) -> None:
+        ...
+
+    def close(self) -> None:
+        ...
+
+
+SessionFactory = Callable[[], SessionProtocol]
+
+
+if TYPE_CHECKING:  # pragma: no cover - typing-only SQLAlchemy imports
+    from sqlalchemy import (
+        JSON,
+        Column,
+        DateTime,
+        Float,
+        Integer,
+        MetaData,
+        String,
+        Table,
+        create_engine,
+        insert,
+        select,
+    )
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.exc import NoSuchTableError, SQLAlchemyError
+    from sqlalchemy.orm import Session
+    from sqlalchemy.orm import sessionmaker as sessionmaker
+
+    SQLALCHEMY_AVAILABLE = True
+else:  # pragma: no cover - runtime imports with graceful degradation
+    try:
+        from sqlalchemy import (
+            JSON,
+            Column,
+            DateTime,
+            Float,
+            Integer,
+            MetaData,
+            String,
+            Table,
+            create_engine,
+            insert,
+            select,
+        )
+        from sqlalchemy.engine import Engine
+        from sqlalchemy.exc import NoSuchTableError, SQLAlchemyError
+        from sqlalchemy.orm import Session
+        from sqlalchemy.orm import sessionmaker as sessionmaker
+
+        SQLALCHEMY_AVAILABLE = True
+    except Exception:  # pragma: no cover - fallback when SQLAlchemy missing
+        JSON = Column = DateTime = Float = Integer = MetaData = String = Table = object
+
+        def insert(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("sqlalchemy is required for Timescale integration")
+
+        def select(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("sqlalchemy is required for Timescale integration")
+
+        def create_engine(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("sqlalchemy is required for Timescale integration")
+
+        class SQLAlchemyError(Exception):
+            """Fallback SQLAlchemy error type used when the dependency is missing."""
+
+        class NoSuchTableError(SQLAlchemyError):
+            """Fallback error for missing tables when SQLAlchemy is unavailable."""
+
+        class Session(SessionProtocol):  # pragma: no cover - runtime stub
+            def execute(self, *args: Any, **kwargs: Any) -> Any:
+                raise RuntimeError("sqlalchemy is required for Timescale integration")
+
+            def commit(self) -> None:
+                raise RuntimeError("sqlalchemy is required for Timescale integration")
+
+            def rollback(self) -> None:
+                raise RuntimeError("sqlalchemy is required for Timescale integration")
+
+            def close(self) -> None:
+                raise RuntimeError("sqlalchemy is required for Timescale integration")
+
+        def sessionmaker(*args: Any, **kwargs: Any) -> SessionFactory:  # pragma: no cover - runtime stub
+            raise RuntimeError("sqlalchemy is required for Timescale integration")
+
+        Engine = object
+        SQLALCHEMY_AVAILABLE = False
 
 @dataclass(frozen=True)
 class MarketSnapshot:
@@ -70,9 +163,9 @@ class UniverseRepository:
     FEE_OVERRIDE_MAX_AGE: ClassVar[timedelta] = timedelta(hours=6)
     CONFIG_VERSION_MAX_AGE: ClassVar[timedelta] = timedelta(days=7)
 
-    _session_factories: ClassVar[Dict[str, Callable[[], Session]]] = {}
+    _session_factories: ClassVar[Dict[str, SessionFactory]] = {}
     _engines: ClassVar[Dict[str, Engine]] = {}
-    _session_factory_overrides: ClassVar[Dict[str, Callable[[], Session]]] = {}
+    _session_factory_overrides: ClassVar[Dict[str, SessionFactory]] = {}
     _schemas: ClassVar[Dict[str, Optional[str]]] = {}
     _audit_store: ClassVar[AuditLogStore] = AuditLogStore()
     _audit_logger: ClassVar[TimescaleAuditLogger] = TimescaleAuditLogger(_audit_store)
@@ -82,7 +175,7 @@ class UniverseRepository:
         account_id: str,
         audit_logger: Optional[TimescaleAuditLogger] = None,
         *,
-        session_factory: Optional[Callable[[], Session]] = None,
+        session_factory: Optional[SessionFactory] = None,
         now_fn: Optional[Callable[[], datetime]] = None,
     ) -> None:
         self.account_id = account_id
@@ -96,7 +189,7 @@ class UniverseRepository:
 
     @classmethod
     def configure_session_factory(
-        cls, account_id: str, factory: Callable[[], Session], *, schema: Optional[str] = None
+        cls, account_id: str, factory: SessionFactory, *, schema: Optional[str] = None
     ) -> None:
         """Install a custom SQLAlchemy session factory for *account_id*."""
 
@@ -120,7 +213,9 @@ class UniverseRepository:
             return None
         return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
-    def _current_overrides(self, session: Session) -> Tuple[Dict[str, Dict[str, Any]], Optional[datetime]]:
+    def _current_overrides(
+        self, session: SessionProtocol
+    ) -> Tuple[Dict[str, Dict[str, Any]], Optional[datetime]]:
         record = self._latest_config_record(session)
         if record is None:
             return {}, None
@@ -134,7 +229,7 @@ class UniverseRepository:
 
         return payload, record.applied_at
 
-    def _next_version(self, session: Session) -> int:
+    def _next_version(self, session: SessionProtocol) -> int:
         table = self._config_versions_table()
         stmt = (
             select(table.c.version)
@@ -269,7 +364,7 @@ class UniverseRepository:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _resolve_session_factory(self) -> Callable[[], Session]:
+    def _resolve_session_factory(self) -> SessionFactory:
         if self._session_factory is not None:
             return self._session_factory
 
@@ -290,15 +385,18 @@ class UniverseRepository:
             engine = create_engine(session_cfg.dsn, future=True)
             self._engines[session_cfg.dsn] = engine
 
-        factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True)
+        factory = cast(
+            SessionFactory,
+            sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True),
+        )
         self._session_factories[self.account_id] = factory
         self._schemas[self.account_id] = session_cfg.account_schema
         return factory
 
     @contextmanager
-    def _session_scope(self) -> Iterator[Session]:
+    def _session_scope(self) -> Iterator[SessionProtocol]:
         factory = self._resolve_session_factory()
-        session: Optional[Session] = None
+        session: Optional[SessionProtocol] = None
         try:
             session = factory()
             yield session
@@ -356,7 +454,7 @@ class UniverseRepository:
             extend_existing=True,
         )
 
-    def _load_market_snapshots(self, session: Session) -> Dict[str, MarketSnapshot]:
+    def _load_market_snapshots(self, session: SessionProtocol) -> Dict[str, MarketSnapshot]:
         table = self._market_snapshots_table()
         try:
             rows = session.execute(
@@ -403,7 +501,7 @@ class UniverseRepository:
             )
         return snapshots
 
-    def _load_fee_overrides(self, session: Session) -> Dict[str, Dict[str, Any]]:
+    def _load_fee_overrides(self, session: SessionProtocol) -> Dict[str, Dict[str, Any]]:
         table = self._fee_overrides_table()
         try:
             rows = session.execute(
@@ -437,7 +535,7 @@ class UniverseRepository:
             }
         return overrides
 
-    def _latest_config_record(self, session: Session) -> Optional[ConfigVersionRecord]:
+    def _latest_config_record(self, session: SessionProtocol) -> Optional[ConfigVersionRecord]:
         table = self._config_versions_table()
         try:
             row = (
