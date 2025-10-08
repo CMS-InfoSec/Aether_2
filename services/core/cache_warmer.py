@@ -6,7 +6,21 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable, Deque, DefaultDict, Dict, Iterable, List, Optional, Sequence
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Deque,
+    DefaultDict,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    ParamSpec,
+    Sequence,
+    TypeVar,
+    cast,
+)
 
 from fastapi import APIRouter, FastAPI, HTTPException
 
@@ -388,10 +402,21 @@ class CacheWarmer:
 
 router = APIRouter(prefix="/ops/warmup", tags=["operations"])
 
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+def _router_get(*args: Any, **kwargs: Any) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
+    return cast(Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]], router.get(*args, **kwargs))
+
+
+def _app_on_event(app: FastAPI, event: str) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
+    return cast(Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]], app.on_event(event))
+
 _WARMER: Optional[CacheWarmer] = None
 
 
-@router.get("/status")
+@_router_get("/status")
 async def warmup_status() -> Dict[str, object]:
     if _WARMER is None:
         raise HTTPException(status_code=503, detail="Cache warmer not configured")
@@ -409,7 +434,7 @@ def register(app: FastAPI, warmer: Optional[CacheWarmer] = None) -> CacheWarmer:
     if not any(route.path.startswith(router.prefix) for route in app.router.routes):
         app.include_router(router)
 
-    @app.on_event("startup")
+    @_app_on_event(app, "startup")
     async def _run_cache_warmup() -> None:  # pragma: no cover - FastAPI lifecycle
         assert _WARMER is not None
         try:
