@@ -970,10 +970,12 @@ class TestClient:
             if dependency in self.app.dependency_overrides:
                 override_present = True
         if not override_present:
-            if store is None and security_module is not None:
-                store = getattr(security_module, "_DEFAULT_SESSION_STORE", None)
-                if store is not None:
-                    self.app.state.session_store = store
+            if security_module is not None:
+                default_store = getattr(security_module, "_DEFAULT_SESSION_STORE", None)
+                if store is None or (default_store is not None and store is not default_store):
+                    store = default_store
+                    if store is not None:
+                        self.app.state.session_store = store
             if store is None:
                 try:
                     from auth.service import InMemorySessionStore  # type: ignore[import]

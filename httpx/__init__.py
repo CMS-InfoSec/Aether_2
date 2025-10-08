@@ -184,11 +184,7 @@ class ASGITransport:
             )
 
         response = await loop.run_in_executor(None, _call)
-        return Response(
-            response.status_code,
-            content=response.content,
-            request=request,
-        )
+        return Response(response.status_code, json_data=response.json(), request=request)
 
 
 def _combine_url(url: str, params: Optional[Dict[str, Any]]) -> tuple[str, Dict[str, Any]]:
