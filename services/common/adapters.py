@@ -2,13 +2,9 @@ from __future__ import annotations
 
 
 import asyncio
-import base64
-import hashlib
 import json
 import logging
 import os
-import sqlite3
-import tempfile
 import threading
 import time
 import uuid
@@ -16,7 +12,19 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, ClassVar, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import (
+    Any,
+    Callable,
+    ClassVar,
+    ContextManager,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+    cast,
+)
 from urllib.parse import urlparse
 from weakref import WeakSet
 
@@ -32,12 +40,15 @@ from services.secrets.secure_secrets import (
 )
 
 from services.common.config import (
-
+    FeastClient,
+    KafkaProducer,
+    NATSProducer,
+    RedisClient,
     TimescaleSession,
     get_feast_client,
-    get_redis_client,
     get_kafka_producer,
     get_nats_producer,
+    get_redis_client,
     get_timescale_session,
 )
 from services.universe.repository import UniverseRepository
@@ -46,19 +57,24 @@ try:  # pragma: no cover - psycopg may be unavailable in minimal environments
     import psycopg
     from psycopg.rows import dict_row
 except Exception:  # pragma: no cover - allow unit tests without psycopg dependency
-    psycopg = None  # type: ignore[assignment]
-    dict_row = None  # type: ignore[assignment]
+    psycopg = None
+    dict_row = None
 
 if psycopg is not None:  # pragma: no cover - executed when psycopg available
     PsycopgError = psycopg.Error
 else:  # pragma: no cover - fallback for type checkers when psycopg missing
-    class PsycopgError(Exception):
-        pass
+    class _PsycopgErrorFallback(Exception):
+        """Fallback error used when psycopg is unavailable."""
 
+    PsycopgError = _PsycopgErrorFallback
+
+FeatureStore: Any
 try:
-    from feast import FeatureStore
+    from feast import FeatureStore as _RuntimeFeatureStore
 except Exception:  # pragma: no cover - Feast is optional during testing
-    FeatureStore = None  # type: ignore[assignment]
+    _RuntimeFeatureStore = None
+
+FeatureStore = _RuntimeFeatureStore
 
 def _normalize_account_id(account_id: str) -> str:
     """Convert human readable admin labels into canonical keys."""
@@ -637,7 +653,9 @@ class _TimescaleStore:
             self.upsert_risk_config(default)
             return dict(default)
         stored = _json_loads(row["config"])
-        return dict(default | stored)
+        merged = dict(default)
+        merged.update(stored)
+        return merged
 
     # ------------------------------------------------------------------
     # Maintenance helpers
@@ -732,10 +750,10 @@ class _TimescaleStore:
 @dataclass(eq=False)
 class KafkaNATSAdapter:
     account_id: str
-    kafka_config_factory: Callable[[str], "KafkaProducer"] = field(
+    kafka_config_factory: Callable[[str], KafkaProducer] = field(
         default=get_kafka_producer, repr=False
     )
-    nats_config_factory: Callable[[str], "NATSProducer"] = field(
+    nats_config_factory: Callable[[str], NATSProducer] = field(
         default=get_nats_producer, repr=False
     )
     max_retries: int = 3
@@ -801,14 +819,12 @@ class KafkaNATSAdapter:
 
     @classmethod
     def reset(cls, account_id: str | None = None) -> None:
-        try:
-            get_kafka_producer.cache_clear()  # type: ignore[attr-defined]
-        except AttributeError:  # pragma: no cover - defensive
-            pass
-        try:
-            get_nats_producer.cache_clear()  # type: ignore[attr-defined]
-        except AttributeError:  # pragma: no cover - defensive
-            pass
+        cache_clear = getattr(get_kafka_producer, "cache_clear", None)
+        if callable(cache_clear):  # pragma: no cover - depends on lru_cache availability
+            cache_clear()
+        cache_clear = getattr(get_nats_producer, "cache_clear", None)
+        if callable(cache_clear):  # pragma: no cover - depends on lru_cache availability
+            cache_clear()
 
         if account_id is None:
             cls.shutdown()
@@ -1316,7 +1332,13 @@ class TimescaleAdapter:
         kms_key_id: str | None = None,
     ) -> Dict[str, Any]:
         status = self.credential_rotation_status()
-        created_at = status.get("created_at") if status else rotated_at
+        created_at_value = status.get("created_at") if status else None
+        if isinstance(created_at_value, datetime):
+            created_at = created_at_value
+        elif isinstance(created_at_value, str):
+            created_at = _deserialize_timestamp(created_at_value)
+        else:
+            created_at = rotated_at
         metadata = self._store.upsert_credential_rotation(
             secret_name=secret_name,
             created_at=created_at,
@@ -1535,11 +1557,11 @@ class TimescaleAdapter:
                     return key
             return None
 
-        if lock is None:
-            match = _find_match()
-        else:
-            with lock:  # type: ignore[call-arg]
+        if lock is not None and hasattr(lock, "__enter__") and hasattr(lock, "__exit__"):
+            with cast(ContextManager[Any], lock):
                 match = _find_match()
+        else:
+            match = _find_match()
 
         if match is not None:
             return match
@@ -1555,13 +1577,13 @@ class RedisFeastAdapter:
         default=UniverseRepository, repr=False
     )
     repository: UniverseRepository | None = field(default=None, repr=False)
-    feast_client_factory: Callable[[str], "FeastClient"] = field(
+    feast_client_factory: Callable[[str], FeastClient] = field(
         default=get_feast_client, repr=False
     )
-    redis_client_factory: Callable[[str], "RedisClient"] = field(
+    redis_client_factory: Callable[[str], RedisClient] = field(
         default=get_redis_client, repr=False
     )
-    feature_store_factory: Callable[["FeastClient", "RedisClient"], Any] | None = field(
+    feature_store_factory: Callable[[FeastClient, RedisClient], Any] | None = field(
         default=None, repr=False
     )
     cache_ttl: int = 60
@@ -1602,7 +1624,7 @@ class RedisFeastAdapter:
         if repository is not None:
             self._repository = repository
         else:
-            self._repository = self.repository_factory(account_id=self.account_id)
+            self._repository = self.repository_factory(self.account_id)
 
         feast_client = self.feast_client_factory(self.account_id)
         redis_client = self.redis_client_factory(self.account_id)
@@ -1800,7 +1822,7 @@ class RedisFeastAdapter:
         return dict(payload)
 
     def _default_feature_store_factory(
-        self, feast_client: "FeastClient", redis_client: "RedisClient"
+        self, feast_client: FeastClient, redis_client: RedisClient
     ) -> Any:
         if FeatureStore is None:
             raise RuntimeError(
@@ -1866,9 +1888,11 @@ class RedisFeastAdapter:
             return [dict(record) for record in job.to_dicts()]
         if hasattr(job, "to_df"):
             frame = job.to_df()
-            if hasattr(frame, "to_dict"):
-                records = frame.to_dict(orient="records")  # type: ignore[arg-type]
-                return [dict(record) for record in records]
+            to_dict = getattr(frame, "to_dict", None)
+            if callable(to_dict):
+                records = to_dict(orient="records")
+                if isinstance(records, list):
+                    return [dict(record) for record in records]
         if isinstance(job, Iterable):
             return [dict(record) for record in job]
         return []
@@ -1934,8 +1958,13 @@ class KrakenSecretManager:
 
     @property
     def secret_name(self) -> str:
-        assert self.secret_store is not None
-        return self.secret_store.secret_name(self.account_id)
+        secret_store = self.secret_store
+        if secret_store is None:
+            raise RuntimeError("Secret store has not been initialised")
+        name = secret_store.secret_name(self.account_id)
+        if not isinstance(name, str):  # pragma: no cover - defensive programming
+            raise TypeError("Secret store returned a non-string secret name")
+        return name
 
 
     def rotate_credentials(self, *, api_key: str, api_secret: str) -> Dict[str, Any]:

@@ -10,7 +10,20 @@ import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, MutableMapping, Optional, Sequence
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    MutableMapping,
+    Optional,
+    Sequence,
+    TypeVar,
+    cast,
+)
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -944,6 +957,20 @@ def _extract_reason(trade_row: Mapping[str, Any]) -> Optional[str]:
 
 router = APIRouter(prefix="/reports", tags=["reports"])
 
+RouteFn = TypeVar("RouteFn", bound=Callable[..., Any])
+
+
+def _router_get(*args: Any, **kwargs: Any) -> Callable[[RouteFn], RouteFn]:
+    """Typed wrapper around :meth:`APIRouter.get` for static analysis."""
+
+    return cast(Callable[[RouteFn], RouteFn], router.get(*args, **kwargs))
+
+
+def _router_post(*args: Any, **kwargs: Any) -> Callable[[RouteFn], RouteFn]:
+    """Typed wrapper around :meth:`APIRouter.post` for static analysis."""
+
+    return cast(Callable[[RouteFn], RouteFn], router.post(*args, **kwargs))
+
 
 def _build_service() -> DailyReportService:
     account_id = os.getenv("AETHER_ACCOUNT_ID", "default")
@@ -960,7 +987,29 @@ def get_daily_report_service() -> DailyReportService:
     return _SERVICE
 
 
-@router.get("/daily")
+def reset_daily_report_service_cache() -> None:
+    """Clear the cached :class:`DailyReportService` instance."""
+
+    global _SERVICE
+    _SERVICE = None
+
+
+@contextmanager
+def override_daily_report_service(
+    service: DailyReportService,
+) -> Iterator[DailyReportService]:
+    """Temporarily replace the cached report service for tests or scripts."""
+
+    global _SERVICE
+    previous = _SERVICE
+    _SERVICE = service
+    try:
+        yield service
+    finally:
+        _SERVICE = previous
+
+
+@_router_get("/daily")
 async def get_daily_report(
     account_id: str | None = Query(default=None),
     report_date: date | None = Query(default=None),
@@ -979,7 +1028,7 @@ async def get_daily_report(
     return payload
 
 
-@router.get("/pnl/daily_pct")
+@_router_get("/pnl/daily_pct")
 async def get_daily_return_pct(
     account_id: str | None = Query(default=None),
     nav_date: date | None = Query(default=None, alias="date"),
@@ -992,7 +1041,7 @@ async def get_daily_return_pct(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@router.post("/export")
+@_router_post("/export")
 async def export_daily_report(
     format: str = Query(..., regex="^(?i)(pdf|csv|json)$"),
     account_id: str | None = Query(default=None),
@@ -1019,7 +1068,7 @@ async def export_daily_report(
     )
 
 
-@router.get("/explain")
+@_router_get("/explain")
 async def explain_trade(
     trade_id: str = Query(..., description="Unique trade or order identifier"),
     _: str = Depends(require_admin_account),
@@ -1073,5 +1122,7 @@ __all__ = [
     "TradeContextError",
     "router",
     "get_daily_report_service",
+    "override_daily_report_service",
+    "reset_daily_report_service_cache",
     "compute_daily_return_pct",
 ]
