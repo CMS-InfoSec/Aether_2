@@ -14,9 +14,31 @@ from decimal import Decimal, InvalidOperation
 
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 from uuid import uuid4
+from types import SimpleNamespace
 
 
-import aiohttp
+try:  # pragma: no cover - optional dependency used in production
+    import aiohttp
+except ImportError:  # pragma: no cover - exercised in unit-only environments
+    class _MissingClientSession:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("aiohttp is required for Kraken REST operations")
+
+        async def __aenter__(self) -> "_MissingClientSession":  # pragma: no cover - defensive fallback
+            return self
+
+        async def __aexit__(self, *exc_info: Any) -> None:  # pragma: no cover - defensive fallback
+            return None
+
+    class _MissingTimeout:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.total = kwargs.get("total")
+
+    aiohttp = SimpleNamespace(  # type: ignore[assignment]
+        ClientSession=_MissingClientSession,
+        ClientTimeout=_MissingTimeout,
+        ClientError=RuntimeError,
+    )
 
 from services.oms.kraken_ws import OrderAck
 from metrics import get_request_id
