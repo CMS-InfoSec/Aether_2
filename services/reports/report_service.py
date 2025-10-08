@@ -996,6 +996,28 @@ def get_daily_report_service() -> DailyReportService:
     return _SERVICE
 
 
+def reset_daily_report_service_cache() -> None:
+    """Clear the cached :class:`DailyReportService` instance."""
+
+    global _SERVICE
+    _SERVICE = None
+
+
+@contextmanager
+def override_daily_report_service(
+    service: DailyReportService,
+) -> Iterator[DailyReportService]:
+    """Temporarily replace the cached report service for tests or scripts."""
+
+    global _SERVICE
+    previous = _SERVICE
+    _SERVICE = service
+    try:
+        yield service
+    finally:
+        _SERVICE = previous
+
+
 @_router_get("/daily")
 async def get_daily_report(
     account_id: str | None = Query(default=None),
@@ -1109,5 +1131,7 @@ __all__ = [
     "TradeContextError",
     "router",
     "get_daily_report_service",
+    "override_daily_report_service",
+    "reset_daily_report_service_cache",
     "compute_daily_return_pct",
 ]
