@@ -96,18 +96,6 @@ except Exception:  # pragma: no cover - provide lightweight stand-ins
     class StaticPool:  # type: ignore[override]
         pass
 
-        return _Base
-
-
-    def sessionmaker(**_: object):  # type: ignore[override]
-        raise RuntimeError("SQLAlchemy sessionmaker is unavailable in this environment")
-
-
-    class StaticPool:  # type: ignore[override]
-        pass
-
-from shared.yaml_compat import load_yaml_module
-
 yaml = load_yaml_module()
 
 
