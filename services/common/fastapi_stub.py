@@ -654,10 +654,6 @@ async def _call_endpoint(
             resolved_kwargs[name] = request
             continue
 
-        if annotation is Response:
-            resolved_kwargs[name] = Response() if default is Parameter.empty else default
-            continue
-
         if isinstance(default, _Dependency):
             dependency = default.dependency
             if dependency is None:
@@ -1023,13 +1019,18 @@ class TestClient:
             if account_id and security_module is not None:
                 try:
                     existing = set(getattr(security_module, "ADMIN_ACCOUNTS", set()))
-                    candidates = {str(account_id)}
-                    subject = _extract_jwt_subject(token) if token else None
-                    if subject:
-                        candidates.add(subject)
-                    if not candidates.issubset(existing):
-                        existing.update(candidates)
-                        security_module.reload_admin_accounts(existing)
+                    if str(account_id) not in existing:
+                        subject = _extract_jwt_subject(token) if token else None
+                        session_admin = getattr(session, "admin_id", None)
+                        trusted_sources = {
+                            value.strip()
+                            for value in (subject, session_admin)
+                            if isinstance(value, str) and value.strip()
+                        }
+                        if trusted_sources & {admin.strip() for admin in existing}:
+                            updated = set(existing)
+                            updated.add(str(account_id))
+                            security_module.reload_admin_accounts(updated)
                 except Exception:  # pragma: no cover - defensive guard for minimal stubs
                     pass
             if store is None and security_module is not None:

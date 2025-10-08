@@ -132,37 +132,15 @@ else:
         def __init__(self, url: str) -> None:
             self._path = _sqlite_path_from_url(url)
             self._lock = threading.RLock()
-            self._memory_conn: sqlite3.Connection | None = None
-            if self._path == ":memory:":
-                self._memory_conn = sqlite3.connect(
-                    ":memory:",
-                    detect_types=sqlite3.PARSE_DECLTYPES,
-                    check_same_thread=False,
-                )
-                self._memory_conn.row_factory = sqlite3.Row
             self._ensure_schema()
 
         def _connect(self) -> sqlite3.Connection:
-            if self._memory_conn is not None:
-                return self._memory_conn
-            conn = sqlite3.connect(
-                self._path,
-                detect_types=sqlite3.PARSE_DECLTYPES,
-                check_same_thread=False,
-            )
+            conn = sqlite3.connect(self._path, detect_types=sqlite3.PARSE_DECLTYPES)
             conn.row_factory = sqlite3.Row
             return conn
 
-        def _close(self, conn: sqlite3.Connection) -> None:
-            if conn.in_transaction:
-                conn.rollback()
-            if conn is self._memory_conn:
-                return
-            conn.close()
-
         def _ensure_schema(self) -> None:
-            conn = self._connect()
-            try:
+            with self._connect() as conn:
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS admin_profiles (
@@ -196,9 +174,6 @@ else:
                     )
                     """.strip()
                 )
-                conn.commit()
-            finally:
-                self._close(conn)
 
         def _profile_from_row(self, row: sqlite3.Row) -> AdminProfile:
             return AdminProfile(
@@ -267,7 +242,7 @@ else:
                     assert refreshed is not None
                     return before, self._profile_from_row(refreshed)
                 finally:
-                    self._close(conn)
+                    conn.close()
 
         def get_profile(self, admin_id: str) -> Optional[AdminProfile]:
             with self._lock:
@@ -281,7 +256,7 @@ else:
                         return None
                     return self._profile_from_row(row)
                 finally:
-                    self._close(conn)
+                    conn.close()
 
         def set_kraken_credentials_status(self, admin_id: str, linked: bool) -> Tuple[AdminProfile, AdminProfile]:
             timestamp = datetime.now(timezone.utc).isoformat()
@@ -311,7 +286,7 @@ else:
                     assert refreshed is not None
                     return before, self._profile_from_row(refreshed)
                 finally:
-                    self._close(conn)
+                    conn.close()
 
         def request_risk_configuration_change(self, admin_id: str, payload: dict) -> RiskConfigurationChange:
             request_id = str(uuid.uuid4())
@@ -335,7 +310,7 @@ else:
                     assert row is not None
                     return self._change_from_row(row, approvals=[])
                 finally:
-                    self._close(conn)
+                    conn.close()
 
         def approve_risk_change(
             self, admin_id: str, request_id: str
@@ -414,7 +389,7 @@ else:
                     conn.rollback()
                     raise
                 finally:
-                    self._close(conn)
+                    conn.close()
 
 
 def _database_url() -> str:
