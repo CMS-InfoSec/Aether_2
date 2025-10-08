@@ -2,7 +2,7 @@ import builtins
 import hashlib
 import logging
 
-from typing import Any, Iterator, List, Mapping, Optional
+from typing import Iterator, List, Mapping, Optional
 
 import pytest
 
@@ -1318,52 +1318,6 @@ def test_audit_event_to_payload_can_skip_ip_address_and_include_context():
     assert payload["context"] == {"request_id": "abc"}
     assert payload["context"] is not event.context
     assert payload["ip_hash"] is None
-
-
-def test_audit_event_to_payload_can_use_context_factory_on_demand():
-    calls: list[str] = []
-    context_value: Mapping[str, Any] = {"request_id": "xyz"}
-
-    def build_context() -> Mapping[str, Any]:
-        calls.append("called")
-        return context_value
-
-    event = audit_hooks.AuditEvent(
-        actor="riley",
-        action="demo.event.context.factory",
-        entity="resource",
-        before={},
-        after={},
-        context_factory=build_context,
-    )
-
-    payload = event.to_payload(include_context=True, use_context_factory=True)
-
-    assert payload["context"] == {"request_id": "xyz"}
-    assert payload["context"] is not context_value
-    assert calls == ["called"]
-
-
-def test_audit_event_to_payload_skips_context_factory_when_not_included():
-    calls: list[str] = []
-
-    def build_context() -> Mapping[str, Any]:
-        calls.append("called")
-        return {"request_id": "xyz"}
-
-    event = audit_hooks.AuditEvent(
-        actor="sam",
-        action="demo.event.context.factory.skip",
-        entity="resource",
-        before={},
-        after={},
-        context_factory=build_context,
-    )
-
-    payload = event.to_payload(use_context_factory=True)
-
-    assert "context" not in payload
-    assert calls == []
 
 
 def test_audit_event_with_resolved_ip_hash_updates_hash_without_dropping_ip():

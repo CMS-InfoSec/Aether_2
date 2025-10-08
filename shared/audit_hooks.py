@@ -53,7 +53,6 @@ class AuditEvent:
         include_ip_address: bool = True,
         include_context: bool = False,
         resolved_ip_hash: "ResolvedIpHash" | None = None,
-        use_context_factory: bool = False,
     ) -> dict[str, Any]:
         """Return a serialisable representation of the audit event.
 
@@ -63,11 +62,8 @@ class AuditEvent:
         and ``after`` mappings are copied into plain dictionaries to avoid
         exposing mutable references, and callers can opt out of including the
         raw IP address via ``include_ip_address``.  When ``include_context`` is
-        ``True`` any eagerly stored context mapping is duplicated as well.  By
-        default the method only reuses eagerly stored context to avoid
-        triggering expensive lazy builders; pass ``use_context_factory=True`` to
-        evaluate :attr:`context_factory` when no stored mapping is available.
-        A pre-resolved hash can be supplied so the method reuses the computed
+        ``True`` any eagerly stored context mapping is duplicated as well.  A
+        pre-resolved hash can be supplied so the method reuses the computed
         value instead of the event's cached ``ip_hash``.
         """
 
@@ -85,12 +81,8 @@ class AuditEvent:
         if include_ip_address:
             payload["ip_address"] = self.ip_address
 
-        if include_context:
-            context_mapping: Optional[Mapping[str, Any]] = self.context
-            if context_mapping is None and use_context_factory and self.context_factory is not None:
-                context_mapping = self.context_factory()
-            if context_mapping is not None:
-                payload["context"] = dict(context_mapping)
+        if include_context and self.context is not None:
+            payload["context"] = dict(self.context)
 
         return payload
 
