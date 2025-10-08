@@ -319,6 +319,64 @@ class AuditEvent:
 
         return updated_event, resolved_hash, resolved_context
 
+    def ensure_resolved_all_metadata(
+        self,
+        hooks: "AuditHooks",
+        *,
+        drop_ip_address: bool = False,
+        use_context_factory: bool = True,
+        drop_context_factory: bool = False,
+        refresh_context: bool = False,
+        use_fallback_extra_factory: bool = True,
+        drop_fallback_extra_factory: bool = False,
+        drop_fallback_extra: bool = False,
+        refresh_fallback_extra: bool = False,
+    ) -> tuple[
+        "AuditEvent",
+        "ResolvedIpHash",
+        "ResolvedContext",
+        "ResolvedFallbackExtra",
+    ]:
+        """Return an updated event with resolved hash, context, and extras.
+
+        The helper extends :meth:`ensure_resolved_metadata` by also capturing
+        fallback extra metadata in a single pass.  Callers that need all three
+        resolution outcomes—hash, context, and fallback extras—can update the
+        event once while retrieving the structured metadata necessary for
+        logging.  Keyword arguments mirror the underlying helpers, allowing
+        callers to drop the raw IP address, control context factory execution,
+        refresh cached context, or discard factories after use.  Additional
+        parameters control fallback extra resolution so expensive metadata can
+        be generated lazily, refreshed, or cleared after capture.  The resulting
+        event reflects any requested updates (such as clearing the IP address,
+        context factory, or fallback extra factory) and is returned alongside
+        the resolved hash, context, and fallback extra metadata.
+        """
+
+        updated_event, resolved_hash, resolved_context = self.ensure_resolved_metadata(
+            hooks,
+            drop_ip_address=drop_ip_address,
+            use_context_factory=use_context_factory,
+            drop_context_factory=drop_context_factory,
+            refresh_context=refresh_context,
+        )
+
+        updated_event, resolved_fallback_extra = (
+            updated_event.resolve_fallback_extra_metadata(
+                use_factory=use_fallback_extra_factory,
+                drop_factory=drop_fallback_extra_factory,
+                drop_extra=drop_fallback_extra,
+                refresh=refresh_fallback_extra,
+            )
+        )
+
+        return (
+            updated_event,
+            resolved_hash,
+            resolved_context,
+            resolved_fallback_extra,
+        )
+
     def log_with_fallback(
         self,
         hooks: "AuditHooks",

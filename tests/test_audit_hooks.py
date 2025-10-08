@@ -3050,6 +3050,128 @@ def test_audit_event_ensure_resolved_metadata_returns_self_when_cached():
     assert resolved_context.evaluated is True
 
 
+def test_audit_event_ensure_resolved_all_metadata_updates_event_and_returns_results():
+    hash_calls: List[Optional[str]] = []
+    context_calls = {"count": 0}
+    fallback_extra_calls = {"count": 0}
+
+    def tracking_hash(value: Optional[str]) -> Optional[str]:
+        hash_calls.append(value)
+        return f"hashed:{value}"
+
+    def context_factory() -> Mapping[str, int]:
+        context_calls["count"] += 1
+        return {"context_calls": context_calls["count"]}
+
+    def fallback_extra_factory() -> Mapping[str, int]:
+        fallback_extra_calls["count"] += 1
+        return {"extra_calls": fallback_extra_calls["count"]}
+
+    hooks = audit_hooks.AuditHooks(log=None, hash_ip=tracking_hash)
+
+    event = audit_hooks.AuditEvent(
+        actor="yara",
+        action="demo.ensure.all-metadata",
+        entity="resource",
+        before={},
+        after={},
+        ip_address="203.0.113.14",
+        context_factory=context_factory,
+        fallback_extra_factory=fallback_extra_factory,
+    )
+
+    (
+        updated,
+        resolved_hash,
+        resolved_context,
+        resolved_fallback_extra,
+    ) = event.ensure_resolved_all_metadata(hooks)
+
+    assert updated is not event
+    assert updated.ip_hash == "hashed:203.0.113.14"
+    assert updated.ip_address == "203.0.113.14"
+    assert updated.context == {"context_calls": 1}
+    assert updated.context_factory is context_factory
+    assert updated.fallback_extra == {"extra_calls": 1}
+    assert updated.fallback_extra_factory is fallback_extra_factory
+    assert resolved_hash.value == "hashed:203.0.113.14"
+    assert resolved_hash.fallback is False
+    assert resolved_hash.error is None
+    assert resolved_context.value == {"context_calls": 1}
+    assert resolved_context.error is None
+    assert resolved_context.evaluated is True
+    assert resolved_fallback_extra.value == {"extra_calls": 1}
+    assert resolved_fallback_extra.error is None
+    assert resolved_fallback_extra.evaluated is True
+    assert hash_calls == ["203.0.113.14"]
+    assert context_calls == {"count": 1}
+    assert fallback_extra_calls == {"count": 1}
+
+
+def test_audit_event_ensure_resolved_all_metadata_honours_drop_and_failure_flags():
+    def failing_hash(value: Optional[str]) -> Optional[str]:
+        raise RuntimeError("hash failure")
+
+    context_calls = {"count": 0}
+
+    def failing_context() -> Mapping[str, str]:
+        context_calls["count"] += 1
+        raise ValueError("context failure")
+
+    fallback_extra_calls = {"count": 0}
+
+    def failing_fallback_extra() -> Mapping[str, str]:
+        fallback_extra_calls["count"] += 1
+        raise KeyError("extra failure")
+
+    hooks = audit_hooks.AuditHooks(log=None, hash_ip=failing_hash)
+
+    event = audit_hooks.AuditEvent(
+        actor="zane",
+        action="demo.ensure.all-metadata.failure",
+        entity="resource",
+        before={},
+        after={},
+        ip_address="198.51.100.101",
+        context_factory=failing_context,
+        fallback_extra_factory=failing_fallback_extra,
+    )
+
+    (
+        updated,
+        resolved_hash,
+        resolved_context,
+        resolved_fallback_extra,
+    ) = event.ensure_resolved_all_metadata(
+        hooks,
+        drop_ip_address=True,
+        drop_context_factory=True,
+        use_context_factory=True,
+        use_fallback_extra_factory=True,
+        drop_fallback_extra=True,
+        drop_fallback_extra_factory=True,
+    )
+
+    fallback_hash = audit_hooks._hash_ip_fallback("198.51.100.101")
+    assert updated.ip_address is None
+    assert updated.ip_hash == fallback_hash
+    assert updated.context is None
+    assert updated.context_factory is None
+    assert updated.fallback_extra is None
+    assert updated.fallback_extra_factory is None
+    assert isinstance(resolved_hash.error, RuntimeError)
+    assert resolved_hash.value == fallback_hash
+    assert resolved_hash.fallback is True
+    assert resolved_context.value is None
+    assert isinstance(resolved_context.error, ValueError)
+    assert resolved_context.evaluated is True
+    assert resolved_fallback_extra.value is None
+    assert isinstance(resolved_fallback_extra.error, KeyError)
+    assert resolved_fallback_extra.evaluated is True
+    assert context_calls == {"count": 1}
+    assert fallback_extra_calls == {"count": 1}
+
+
 def test_audit_event_resolve_ip_hash_preserves_fallback_metadata():
     def failing_hash(value: Optional[str]) -> Optional[str]:
         raise RuntimeError("hash failure")
