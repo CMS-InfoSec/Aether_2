@@ -15,14 +15,30 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from threading import RLock
-from typing import Optional, Protocol
+from types import ModuleType
+from typing import (
+    Any,
+    Callable,
+    Iterable,
+    Mapping,
+    Optional,
+    Protocol,
+    SupportsFloat,
+    SupportsIndex,
+    Union,
+    cast,
+)
 
 try:  # pragma: no cover - psycopg may be absent in lightweight test envs
-    import psycopg
-    from psycopg.rows import dict_row
+    import psycopg as _psycopg
+    from psycopg.rows import dict_row as _dict_row
 except Exception:  # pragma: no cover - allow tests to run without psycopg
-    psycopg = None  # type: ignore[assignment]
-    dict_row = None  # type: ignore[assignment]
+    _psycopg = None
+    _dict_row = None
+
+psycopg: ModuleType | None = _psycopg
+DictRowFactory = Callable[..., Any]
+dict_row: DictRowFactory | None = _dict_row
 
 
 logger = logging.getLogger(__name__)
@@ -58,12 +74,27 @@ _DELETE_ONE_SQL = "DELETE FROM cost_efficiency_metrics WHERE account_id = %(acco
 _DELETE_ALL_SQL = "DELETE FROM cost_efficiency_metrics"
 
 
+FloatConvertible = Union[str, bytes, SupportsFloat, SupportsIndex]
+
+
 def _normalize_timestamp(value: datetime) -> datetime:
     """Ensure ``value`` is timezone aware in UTC."""
 
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _coerce_float(value: object) -> float:
+    """Coerce ``value`` to ``float`` for metrics persisted in storage."""
+
+    return float(cast(FloatConvertible, value))
+
+
+def _coerce_datetime(value: object) -> datetime:
+    """Cast ``value`` to :class:`datetime` for stored timestamps."""
+
+    return cast(datetime, value)
 
 
 @dataclass(frozen=True)
@@ -136,19 +167,29 @@ class TimescaleCostEfficiencyStore:
     def _driver_available(self) -> bool:
         return bool(psycopg) and bool(self._dsn)
 
-    def _execute(self, sql: str, params: Optional[dict[str, object]] = None) -> list[dict[str, object]]:
+    def _execute(
+        self, sql: str, params: Optional[dict[str, object]] = None
+    ) -> list[dict[str, object]]:
         if not self._driver_available():
             return []
 
         assert psycopg is not None  # Satisfy type checkers
         try:
-            with psycopg.connect(self._dsn, autocommit=True) as conn:  # type: ignore[arg-type]
-                with conn.cursor(row_factory=dict_row) as cur:  # type: ignore[misc]
+            connect = cast(Callable[..., Any], psycopg.connect)
+            row_factory = dict_row
+            cursor_kwargs: dict[str, object] = {}
+            if row_factory is not None:
+                cursor_kwargs["row_factory"] = row_factory
+            with cast(Any, connect(self._dsn, autocommit=True)) as conn:
+                with cast(Any, conn).cursor(**cursor_kwargs) as cur:
                     cur.execute(_CREATE_TABLE_SQL)
                     cur.execute(sql, params or {})
                     if cur.description is None:
                         return []
-                    return list(cur.fetchall())
+                    rows: Iterable[Mapping[str, object]] = cast(
+                        Iterable[Mapping[str, object]], cur.fetchall()
+                    )
+                    return [dict(row) for row in rows]
         except Exception:  # pragma: no cover - depends on external service
             logger.warning("Falling back to in-memory cost efficiency store", exc_info=True)
             return []
@@ -159,10 +200,10 @@ class TimescaleCostEfficiencyStore:
             row = rows[0]
             return CostEfficiencyRecord(
                 account_id=str(row["account_id"]),
-                infra_cost=float(row["infra_cost"]),
-                recent_pnl=float(row["recent_pnl"]),
-                observed_at=_normalize_timestamp(row["observed_at"]),
-                stored_at=_normalize_timestamp(row["stored_at"]),
+                infra_cost=_coerce_float(row["infra_cost"]),
+                recent_pnl=_coerce_float(row["recent_pnl"]),
+                observed_at=_normalize_timestamp(_coerce_datetime(row["observed_at"])),
+                stored_at=_normalize_timestamp(_coerce_datetime(row["stored_at"])),
             )
         # fall back to in-memory record
         return self._fallback.fetch(account_id)
@@ -183,10 +224,10 @@ class TimescaleCostEfficiencyStore:
             row = rows[0]
             record = CostEfficiencyRecord(
                 account_id=str(row["account_id"]),
-                infra_cost=float(row["infra_cost"]),
-                recent_pnl=float(row["recent_pnl"]),
-                observed_at=_normalize_timestamp(row["observed_at"]),
-                stored_at=_normalize_timestamp(row["stored_at"]),
+                infra_cost=_coerce_float(row["infra_cost"]),
+                recent_pnl=_coerce_float(row["recent_pnl"]),
+                observed_at=_normalize_timestamp(_coerce_datetime(row["observed_at"])),
+                stored_at=_normalize_timestamp(_coerce_datetime(row["stored_at"])),
             )
         else:
             record = self._fallback.upsert(
