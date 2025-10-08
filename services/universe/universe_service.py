@@ -120,9 +120,6 @@ except ModuleNotFoundError:  # pragma: no cover - allow import without SQLAlchem
     class ArgumentError(ValueError):
         pass
 
-if TYPE_CHECKING:
-    from sqlalchemy.sql.schema import Table
-
 from services.common.security import require_admin_account
 from shared.spot import filter_spot_symbols, is_spot_symbol, normalize_spot_symbol
 
