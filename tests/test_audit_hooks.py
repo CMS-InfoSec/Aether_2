@@ -1043,6 +1043,56 @@ def test_log_event_with_fallback_fallback_extra_factory_failure(
         "message": "fallback extra boom",
     }
 
+
+def test_log_event_with_fallback_uses_resolved_fallback_extra(
+    caplog: pytest.LogCaptureFixture,
+):
+    hooks = audit_hooks.AuditHooks(log=None, hash_ip=lambda value: value)
+    logger = logging.getLogger("test.audit.fallback_extra.resolved")
+    factory_calls: list[str] = []
+
+    def extra_factory() -> Mapping[str, str]:
+        factory_calls.append("called")
+        return {"request_id": "req-999"}
+
+    event = audit_hooks.AuditEvent(
+        actor="quincy",
+        action="demo.extra.resolved",
+        entity="resource",
+        before={},
+        after={},
+        fallback_extra_factory=extra_factory,
+    )
+
+    _, resolved_extra = event.resolve_fallback_extra_metadata()
+    assert factory_calls == ["called"]
+
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        result = audit_hooks.log_event_with_fallback(
+            hooks,
+            logger,
+            actor="quincy",
+            action="demo.extra.resolved",
+            entity="resource",
+            before={},
+            after={},
+            failure_message="should not trigger",
+            disabled_message="audit disabled",
+            disabled_level=logging.INFO,
+            fallback_extra_factory=extra_factory,
+            resolved_fallback_extra=resolved_extra,
+        )
+
+    assert factory_calls == ["called"]
+    assert result.handled is False
+    assert result.fallback_logged is True
+    assert result.fallback_extra is not None
+    assert result.fallback_extra["request_id"] == "req-999"
+    assert result.fallback_extra_error is None
+    assert result.fallback_extra_evaluated is True
+    disabled_record = next(record for record in caplog.records if record.message == "audit disabled")
+    assert disabled_record.request_id == "req-999"
+
 def test_log_audit_event_with_fallback_logs_event_payload():
     captured: dict[str, object] = {}
 
@@ -1287,6 +1337,7 @@ def test_audit_event_log_with_fallback_method_delegates(monkeypatch):
         "resolved_context": None,
         "fallback_extra": fallback_extra,
         "fallback_extra_factory": None,
+        "resolved_fallback_extra": None,
     }
 
 
@@ -1505,6 +1556,59 @@ def test_audit_event_log_with_fallback_uses_event_fallback_extra_factory(monkeyp
     assert captured["kwargs"]["fallback_extra"] is None
     assert captured["kwargs"]["fallback_extra_factory"] is fallback_extra_factory
     assert factory_calls == []
+
+
+def test_audit_event_log_with_fallback_forwards_resolved_fallback_extra(monkeypatch):
+    hooks = audit_hooks.AuditHooks(log=lambda **_: None, hash_ip=lambda value: value)
+    logger = logging.getLogger("tests.audit.event_resolved_extra")
+    factory_calls: list[str] = []
+
+    def fallback_extra_factory() -> Mapping[str, str]:
+        factory_calls.append("called")
+        return {"request_id": "evt-789"}
+
+    event = audit_hooks.AuditEvent(
+        actor="opal",
+        action="demo.event.resolved_extra",
+        entity="resource",
+        before={},
+        after={},
+        fallback_extra_factory=fallback_extra_factory,
+    )
+
+    updated_event, resolved_extra = event.resolve_fallback_extra_metadata()
+    assert factory_calls == ["called"]
+
+    trimmed_event = updated_event.with_fallback_extra(None, merge=False)
+
+    expected = audit_hooks.AuditLogResult(
+        handled=True,
+        ip_hash=None,
+        hash_fallback=False,
+        hash_error=None,
+        fallback_logged=False,
+    )
+    captured: dict[str, object] = {}
+
+    def fake_helper(*args: object, **kwargs: object) -> audit_hooks.AuditLogResult:
+        captured["kwargs"] = kwargs
+        return expected
+
+    monkeypatch.setattr(audit_hooks, "log_audit_event_with_fallback", fake_helper)
+
+    result = trimmed_event.log_with_fallback(
+        hooks,
+        logger,
+        failure_message="failure",
+        fallback_extra_factory=fallback_extra_factory,
+        resolved_fallback_extra=resolved_extra,
+    )
+
+    assert result is expected
+    assert captured["kwargs"]["resolved_fallback_extra"] is resolved_extra
+    assert captured["kwargs"]["fallback_extra"] is None
+    assert captured["kwargs"]["fallback_extra_factory"] is fallback_extra_factory
+    assert factory_calls == ["called"]
 
 
 def test_resolve_ip_hash_prefers_explicit_hash():
@@ -1778,6 +1882,93 @@ def test_audit_event_with_fallback_extra_factory_optionally_preserves_extra():
 
     cleared = preserved.with_fallback_extra_factory(factory)
     assert cleared.fallback_extra is None
+
+
+def test_audit_event_resolve_fallback_extra_reuses_cached_mapping():
+    extra = {"cached": True}
+    event = audit_hooks.AuditEvent(
+        actor="quinn",
+        action="demo.fallback.resolve.cached",
+        entity="resource",
+        before={},
+        after={},
+        fallback_extra=extra,
+        fallback_extra_factory=lambda: pytest.fail("factory should not run"),
+    )
+
+    updated, resolved = event.resolve_fallback_extra()
+
+    assert updated is event
+    assert resolved is extra
+
+
+def test_audit_event_resolve_fallback_extra_evaluates_factory_once():
+    calls: list[int] = []
+
+    def factory() -> Mapping[str, str]:
+        calls.append(len(calls))
+        return {"request_id": "abc"}
+
+    event = audit_hooks.AuditEvent(
+        actor="rory",
+        action="demo.fallback.resolve.factory",
+        entity="resource",
+        before={},
+        after={},
+        fallback_extra_factory=factory,
+    )
+
+    updated, resolved = event.resolve_fallback_extra()
+
+    assert calls == [0]
+    assert resolved == {"request_id": "abc"}
+    assert updated.fallback_extra == {"request_id": "abc"}
+
+    updated_again, resolved_again = updated.resolve_fallback_extra()
+
+    assert updated_again is updated
+    assert resolved_again == {"request_id": "abc"}
+    assert calls == [0]
+
+
+def test_audit_event_resolve_fallback_extra_metadata_captures_error():
+    def factory() -> Mapping[str, str]:
+        raise RuntimeError("extra boom")
+
+    event = audit_hooks.AuditEvent(
+        actor="sasha",
+        action="demo.fallback.resolve.error",
+        entity="resource",
+        before={},
+        after={},
+        fallback_extra_factory=factory,
+    )
+
+    updated, resolved = event.resolve_fallback_extra_metadata(drop_factory=True)
+
+    assert updated.fallback_extra_factory is None
+    assert resolved.value is None
+    assert isinstance(resolved.error, RuntimeError)
+    assert str(resolved.error) == "extra boom"
+    assert resolved.evaluated is True
+
+
+def test_audit_event_resolve_fallback_extra_metadata_respects_skipped_factory():
+    event = audit_hooks.AuditEvent(
+        actor="taylor",
+        action="demo.fallback.resolve.skip",
+        entity="resource",
+        before={},
+        after={},
+        fallback_extra_factory=lambda: {"should": "not-run"},
+    )
+
+    updated, resolved = event.resolve_fallback_extra_metadata(use_factory=False)
+
+    assert updated is event
+    assert resolved.value is None
+    assert resolved.error is None
+    assert resolved.evaluated is True
 
 
 def test_audit_event_resolve_context_reuses_stored_mapping():

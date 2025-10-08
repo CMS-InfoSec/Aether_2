@@ -232,6 +232,7 @@ class AuditEvent:
         resolved_context: "ResolvedContext" | None = None,
         fallback_extra: Optional[Mapping[str, Any]] | object = _EVENT_FALLBACK_EXTRA_SENTINEL,
         fallback_extra_factory: FallbackExtraFactory | None = None,
+        resolved_fallback_extra: "ResolvedFallbackExtra" | None = None,
     ) -> "AuditLogResult":
         """Log the event using :func:`log_audit_event_with_fallback`.
 
@@ -282,6 +283,7 @@ class AuditEvent:
             resolved_context=resolved_context,
             fallback_extra=fallback_extra_mapping,
             fallback_extra_factory=effective_fallback_factory,
+            resolved_fallback_extra=resolved_fallback_extra,
         )
 
     def with_context(
@@ -503,6 +505,107 @@ class AuditEvent:
             evaluated=evaluated,
         )
 
+    def _resolve_fallback_extra_internal(
+        self,
+        *,
+        use_factory: bool,
+        drop_factory: bool,
+        refresh: bool,
+        capture_errors: bool,
+    ) -> tuple["AuditEvent", Optional[Mapping[str, Any]], Optional[Exception], bool]:
+        """Return fallback extra resolution metadata while reusing core logic."""
+
+        extra_value: Optional[Mapping[str, Any]]
+        if refresh:
+            extra_value = None
+        else:
+            extra_value = self.fallback_extra
+
+        factory = self.fallback_extra_factory
+        new_factory = factory
+
+        evaluated = False
+        if extra_value is not None and not refresh:
+            evaluated = True
+
+        error: Optional[Exception] = None
+
+        if use_factory and extra_value is None and factory is not None:
+            evaluated = True
+            try:
+                extra_value = factory()
+            except Exception as exc:
+                if not capture_errors:
+                    raise
+                error = exc
+                extra_value = None
+        elif capture_errors and (not use_factory):
+            evaluated = True
+
+        if drop_factory and new_factory is not None:
+            new_factory = None
+
+        updates: dict[str, Any] = {}
+
+        if refresh:
+            if self.fallback_extra is not extra_value:
+                updates["fallback_extra"] = extra_value
+        elif extra_value is not self.fallback_extra:
+            updates["fallback_extra"] = extra_value
+
+        if new_factory is not factory:
+            updates["fallback_extra_factory"] = new_factory
+
+        if updates:
+            updated_event = replace(self, **updates)
+        else:
+            updated_event = self
+
+        if capture_errors and (factory is None):
+            evaluated = True
+
+        return updated_event, extra_value, error, evaluated
+
+    def resolve_fallback_extra(
+        self,
+        *,
+        use_factory: bool = True,
+        drop_factory: bool = False,
+        refresh: bool = False,
+    ) -> tuple["AuditEvent", Optional[Mapping[str, Any]]]:
+        """Return an updated event alongside the resolved fallback metadata."""
+
+        updated_event, extra_value, _, _ = self._resolve_fallback_extra_internal(
+            use_factory=use_factory,
+            drop_factory=drop_factory,
+            refresh=refresh,
+            capture_errors=False,
+        )
+
+        return updated_event, extra_value
+
+    def resolve_fallback_extra_metadata(
+        self,
+        *,
+        use_factory: bool = True,
+        drop_factory: bool = False,
+        refresh: bool = False,
+    ) -> tuple["AuditEvent", "ResolvedFallbackExtra"]:
+        """Return an updated event and structured fallback extra metadata."""
+
+        updated_event, extra_value, error, evaluated = self._resolve_fallback_extra_internal(
+            use_factory=use_factory,
+            drop_factory=drop_factory,
+            refresh=refresh,
+            capture_errors=True,
+        )
+
+        return updated_event, ResolvedFallbackExtra(
+            value=extra_value,
+            error=error,
+            evaluated=evaluated,
+        )
+
     def with_actor(self, actor: str) -> "AuditEvent":
         """Return a copy of the event with an updated actor value."""
 
@@ -656,6 +759,15 @@ class AuditLogResult:
 @dataclass(frozen=True)
 class ResolvedContext:
     """Structured metadata describing context resolution state."""
+
+    value: Optional[Mapping[str, Any]]
+    error: Optional[Exception]
+    evaluated: bool
+
+
+@dataclass(frozen=True)
+class ResolvedFallbackExtra:
+    """Structured metadata describing fallback extra resolution state."""
 
     value: Optional[Mapping[str, Any]]
     error: Optional[Exception]
@@ -1038,6 +1150,7 @@ def log_event_with_fallback(
     resolved_context: "ResolvedContext" | None = None,
     fallback_extra: Optional[Mapping[str, Any]] = None,
     fallback_extra_factory: FallbackExtraFactory | None = None,
+    resolved_fallback_extra: "ResolvedFallbackExtra" | None = None,
 ) -> AuditLogResult:
     """Emit an audit event while shielding callers from optional failures.
 
@@ -1074,7 +1187,10 @@ def log_event_with_fallback(
     ``fallback_extra_factory``; the callable is only invoked when a fallback log
     entry is emitted.  Any factory exception is captured in the returned
     :class:`AuditLogResult` and recorded via the provided ``logger`` alongside
-    the structured fallback payload.
+    the structured fallback payload.  When callers have already resolved the
+    fallback metadata (or captured prior failures) they can supply
+    ``resolved_fallback_extra`` to skip re-evaluating factories while
+    preserving the recorded error context.
     """
 
     resolved = resolved_ip_hash
@@ -1105,6 +1221,14 @@ def log_event_with_fallback(
     fallback_extra_error: Exception | None = None
     fallback_extra_error_logged = False
     fallback_extra_evaluated = fallback_extra is not None
+
+    if resolved_fallback_extra is not None:
+        if fallback_extra_value is None:
+            fallback_extra_value = resolved_fallback_extra.value
+        fallback_extra_error = resolved_fallback_extra.error
+        fallback_extra_evaluated = (
+            fallback_extra_evaluated or resolved_fallback_extra.evaluated
+        )
 
     def ensure_log_extra() -> Mapping[str, Any]:
         nonlocal log_extra, context_value, context_evaluated
@@ -1282,6 +1406,7 @@ def log_audit_event_with_fallback(
     resolved_context: ResolvedContext | None = None,
     fallback_extra: Optional[Mapping[str, Any]] | object = _EVENT_FALLBACK_EXTRA_SENTINEL,
     fallback_extra_factory: FallbackExtraFactory | None = None,
+    resolved_fallback_extra: "ResolvedFallbackExtra" | None = None,
 ) -> AuditLogResult:
     """Convenience wrapper for logging :class:`AuditEvent` instances.
 
@@ -1290,7 +1415,10 @@ def log_audit_event_with_fallback(
     structured metadata (for example correlation identifiers) to any fallback
     log entries emitted during the call.  ``fallback_extra_factory`` allows
     callers to defer construction of custom fallback metadata until a fallback
-    log entry is required.
+    log entry is required.  When callers have already resolved fallback extra
+    metadata they can supply ``resolved_fallback_extra`` to reuse the cached
+    structure and propagate prior factory errors without re-evaluating the
+    callable.
     """
     effective_factory = context_factory
     if context is _EVENT_CONTEXT_SENTINEL:
@@ -1330,6 +1458,7 @@ def log_audit_event_with_fallback(
         resolved_context=resolved_context,
         fallback_extra=fallback_extra_mapping,
         fallback_extra_factory=effective_fallback_factory,
+        resolved_fallback_extra=resolved_fallback_extra,
     )
 
 
@@ -1339,6 +1468,7 @@ __all__ = [
     "AuditLogResult",
     "ResolvedIpHash",
     "ResolvedContext",
+    "ResolvedFallbackExtra",
     "AuditCallable",
     "HashIpCallable",
     "ContextFactory",
