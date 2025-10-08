@@ -274,7 +274,12 @@ class BaseModel:
 
     def model_dump(self, *, exclude_none: bool = False) -> Dict[str, Any]:
         result: Dict[str, Any] = {}
+        annotations = getattr(self.__class__, "__annotations__", {})
         for key, value in self.__dict__.items():
+            if key.startswith("_"):
+                continue
+            if key.startswith("model_") and key not in annotations:
+                continue
             if exclude_none and value is None:
                 continue
             if isinstance(value, BaseModel):
