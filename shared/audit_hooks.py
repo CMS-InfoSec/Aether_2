@@ -449,6 +449,7 @@ class AuditLogResult:
     hash_fallback: bool
     hash_error: Optional[Exception]
     log_error: Optional[Exception] = None
+    context_error: Optional[Exception] = None
 
     def __bool__(self) -> bool:  # pragma: no cover - exercised implicitly via truthiness
         return self.handled
@@ -661,17 +662,23 @@ def temporary_audit_hooks(hooks: AuditHooks) -> Iterator[None]:
         _AUDIT_HOOK_OVERRIDE = previous
 
 
+def _describe_exception(error: Exception) -> Mapping[str, str]:
+    """Return structured metadata describing an exception."""
+
+    message = str(error)
+    if not message:
+        message = repr(error)
+
+    return {
+        "type": type(error).__name__,
+        "message": message,
+    }
+
+
 def _build_hash_error_metadata(hash_error: Exception) -> Mapping[str, str]:
     """Return structured metadata describing a hashing failure."""
 
-    message = str(hash_error)
-    if not message:
-        message = repr(hash_error)
-
-    return {
-        "type": type(hash_error).__name__,
-        "message": message,
-    }
+    return _describe_exception(hash_error)
 
 
 def _build_audit_log_extra(
@@ -686,12 +693,17 @@ def _build_audit_log_extra(
     context: Optional[Mapping[str, Any]],
     hash_fallback: bool,
     hash_error: Optional[Exception],
+    context_error: Optional[Exception] = None,
 ) -> dict[str, Any]:
     """Construct structured logging metadata for audit fallbacks."""
 
     error_metadata: Optional[Mapping[str, str]] = None
     if hash_error is not None:
         error_metadata = _build_hash_error_metadata(hash_error)
+
+    context_error_metadata: Optional[Mapping[str, str]] = None
+    if context_error is not None:
+        context_error_metadata = _describe_exception(context_error)
 
     if context is not None:
         extra = dict(context)
@@ -711,6 +723,8 @@ def _build_audit_log_extra(
                 extra["audit"] = audit_copy
             else:
                 extra.setdefault("hash_error", error_metadata)
+        if context_error_metadata is not None:
+            extra.setdefault("audit_context_error", context_error_metadata)
         return extra
 
     resolved_metadata = ResolvedIpHash(
@@ -732,6 +746,8 @@ def _build_audit_log_extra(
             include_hash_metadata=True,
         )
     }
+    if context_error_metadata is not None:
+        audit_payload.setdefault("audit_context_error", context_error_metadata)
     if error_metadata is not None:
         audit_payload["audit"].setdefault("hash_error", error_metadata)
 
@@ -788,13 +804,20 @@ def log_event_with_fallback(
     log_extra: dict[str, Any] | None = None
     context_value = context
     context_evaluated = context_value is not None or context_factory is None
+    context_error: Exception | None = None
+    context_error_logged = False
 
     def ensure_log_extra() -> Mapping[str, Any]:
-        nonlocal log_extra, context_value, context_evaluated
+        nonlocal log_extra, context_value, context_evaluated, context_error, context_error_logged
         if log_extra is None:
             if not context_evaluated and context_factory is not None:
-                context_value = context_factory()
-                context_evaluated = True
+                try:
+                    context_value = context_factory()
+                except Exception as exc:  # pragma: no cover - exercised via tests
+                    context_error = exc
+                    context_value = None
+                finally:
+                    context_evaluated = True
             log_extra = _build_audit_log_extra(
                 actor=actor,
                 action=action,
@@ -806,7 +829,19 @@ def log_event_with_fallback(
                 context=context_value,
                 hash_fallback=resolved.fallback,
                 hash_error=resolved.error,
+                context_error=context_error,
             )
+            if context_error is not None and not context_error_logged:
+                logger.exception(
+                    "Audit fallback context factory raised; omitting context metadata.",
+                    extra=log_extra,
+                    exc_info=(
+                        type(context_error),
+                        context_error,
+                        context_error.__traceback__,
+                    ),
+                )
+                context_error_logged = True
         return log_extra
 
     if resolved.error is not None:
@@ -839,6 +874,7 @@ def log_event_with_fallback(
             hash_fallback=resolved.fallback,
             hash_error=resolved.error,
             log_error=exc,
+            context_error=context_error,
         )
 
     if not result.handled and disabled_message is not None:
@@ -853,6 +889,7 @@ def log_event_with_fallback(
         hash_fallback=combined_hash_fallback,
         hash_error=combined_hash_error,
         log_error=result.log_error,
+        context_error=result.context_error or context_error,
     )
 
 

@@ -224,6 +224,57 @@ def test_log_event_with_fallback_context_factory_skips_when_unused():
     assert factory_calls == []
 
 
+def test_log_event_with_fallback_context_factory_failure_records_metadata(
+    caplog: pytest.LogCaptureFixture,
+):
+    hooks = audit_hooks.AuditHooks(log=None, hash_ip=lambda value: "hash")
+
+    logger = logging.getLogger("test.audit.context_factory.failure")
+    factory_calls: List[str] = []
+
+    def failing_factory() -> Mapping[str, Any]:
+        factory_calls.append("called")
+        raise RuntimeError("context boom")
+
+    with caplog.at_level(logging.DEBUG, logger=logger.name):
+        result = audit_hooks.log_event_with_fallback(
+            hooks,
+            logger,
+            actor="erin",
+            action="demo.context.failure",
+            entity="resource",
+            before={},
+            after={},
+            failure_message="should not trigger",
+            disabled_message="audit disabled",
+            disabled_level=logging.INFO,
+            context_factory=failing_factory,
+        )
+
+    assert factory_calls == ["called"]
+    assert result.handled is False
+    assert isinstance(result.context_error, RuntimeError)
+    assert str(result.context_error) == "context boom"
+
+    context_error_records = [
+        record
+        for record in caplog.records
+        if record.message == "Audit fallback context factory raised; omitting context metadata."
+    ]
+    assert context_error_records
+    error_record = context_error_records[0]
+    assert getattr(error_record, "audit_context_error") == {
+        "type": "RuntimeError",
+        "message": "context boom",
+    }
+
+    disabled_record = next(record for record in caplog.records if record.message == "audit disabled")
+    assert getattr(disabled_record, "audit_context_error") == {
+        "type": "RuntimeError",
+        "message": "context boom",
+    }
+
+
 def test_log_event_with_fallback_context_factory_used_for_fallback(
     caplog: pytest.LogCaptureFixture,
 ):
