@@ -15,24 +15,29 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
-from typing import Any, Callable, Iterable, Iterator, Sequence, Tuple, cast
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Sequence, Tuple, cast
 
-try:  # pragma: no cover - FastAPI is optional in some unit test environments
+if TYPE_CHECKING:  # pragma: no cover - only used for static analysis
     from fastapi import Request
-except Exception:  # pragma: no cover - fallback to satisfy type checkers when FastAPI missing
-    Request = Any  # type: ignore[assignment]
-try:  # pragma: no cover - SQLAlchemy may be unavailable in lightweight test environments
     from sqlalchemy.engine import Connection
-    from sqlalchemy.orm import Session, sessionmaker
-except Exception:  # pragma: no cover - provide fallbacks when SQLAlchemy is missing
-    Connection = Any  # type: ignore[assignment]
-    Session = Any  # type: ignore[assignment]
+    from sqlalchemy.orm import Session, sessionmaker as Sessionmaker
+else:
+    try:  # pragma: no cover - FastAPI is optional in some unit test environments
+        from fastapi import Request
+    except Exception:  # pragma: no cover - fallback to satisfy type checkers when FastAPI missing
+        Request = Any  # type: ignore[assignment]
+    try:  # pragma: no cover - SQLAlchemy may be unavailable in lightweight test environments
+        from sqlalchemy.engine import Connection
+        from sqlalchemy.orm import Session, sessionmaker as Sessionmaker
+    except Exception:  # pragma: no cover - provide fallbacks when SQLAlchemy is missing
+        Connection = Any  # type: ignore[assignment]
+        Session = Any  # type: ignore[assignment]
 
-    class sessionmaker:  # type: ignore[override]
-        """Minimal stub allowing isinstance checks when SQLAlchemy is absent."""
+        class Sessionmaker:  # type: ignore[override]
+            """Minimal stub allowing isinstance checks when SQLAlchemy is absent."""
 
-        def __call__(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover - defensive fallback
-            raise RuntimeError("sqlalchemy is required for database session management")
+            def __call__(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover - defensive fallback
+                raise RuntimeError("sqlalchemy is required for database session management")
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +56,7 @@ def _resolve_session_factory(request: Request) -> SessionFactory:
             "FastAPI application state is missing 'db_sessionmaker'. "
             "Configure request.app.state.db_sessionmaker with a sessionmaker instance."
         )
-    if isinstance(factory, sessionmaker):
+    if isinstance(factory, Sessionmaker):
         return cast(SessionFactory, factory)
     if callable(factory):
         return cast(SessionFactory, factory)
