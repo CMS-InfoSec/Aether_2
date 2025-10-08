@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
-import json
 import sys
 import types
 from datetime import datetime, timezone
@@ -10,7 +9,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Mapping
 
-import pytest
 import sqlalchemy as sa
 
 if "fastapi" not in sys.modules:  # pragma: no cover - lightweight stub for unit tests

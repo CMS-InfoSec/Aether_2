@@ -19,7 +19,9 @@ import sys
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from threading import Lock
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, TypeVar, cast
+
+from typing_extensions import TypedDict
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query
 
@@ -40,13 +42,30 @@ from services.common.security import require_admin_account
 from shared.session_config import load_session_ttl_minutes
 from services.common.spot import require_spot_http
 from shared.postgres import normalize_sqlalchemy_dsn
+from shared.psycopg_compat import (
+    PsycopgConnection,
+    PsycopgModule,
+    SqlModule,
+    load_psycopg,
+)
 
-try:  # pragma: no cover - optional dependency during CI
-    import psycopg
-    from psycopg import sql
-except Exception:  # pragma: no cover - gracefully degrade without psycopg
-    psycopg = None  # type: ignore
-    sql = None  # type: ignore
+psycopg: PsycopgModule | None
+sql: SqlModule | None
+psycopg, sql = load_psycopg()
+
+TCallable = TypeVar("TCallable", bound=Callable[..., Any])
+
+
+def typed_router_get(
+    router: APIRouter, path: str, **kwargs: Any
+) -> Callable[[TCallable], TCallable]:
+    """Wrap ``router.get`` to preserve typing for decorated endpoints."""
+
+    def decorator(func: TCallable) -> TCallable:
+        wrapped = router.get(path, **kwargs)(func)
+        return cast(TCallable, wrapped)
+
+    return decorator
 
 
 LOGGER = logging.getLogger(__name__)
@@ -61,38 +80,54 @@ _MARKET_DATA_DSN_VARS = (
 )
 
 
+class NormalizedTrade(TypedDict):
+    """Structure for trades normalised from market data adapters."""
+
+    side: str
+    volume: float
+    price: float
+
+
+class LiquidityHole(TypedDict):
+    """Structured payload describing order book liquidity gaps."""
+
+    side: str
+    level: float
+    drop_ratio: float
+    depth: float
+
+
+Level = tuple[float, float]
+OrderBookSnapshot = Mapping[str, Sequence[Level]]
+EMPTY_LEVELS: tuple[Level, ...] = ()
+
+
 def _resolve_market_data_dsn() -> str:
     """Return the configured Timescale connection string for market data."""
 
     allow_sqlite = "pytest" in sys.modules
 
-    raw = next(
-        (
-            os.getenv(var)
-            for var in _MARKET_DATA_DSN_VARS
-            if os.getenv(var) is not None
-        ),
-        None,
-    )
-
-    if raw is None:
-        if allow_sqlite:
-            return "sqlite+pysqlite:///:memory:"
-        raise RuntimeError(
-            "Orderflow market data DSN is not configured. Set ORDERFLOW_MARKET_DATA_URL "
-            "to a PostgreSQL/Timescale connection string."
+    for env_var in _MARKET_DATA_DSN_VARS:
+        raw_value = os.getenv(env_var)
+        if raw_value is None:
+            continue
+        candidate = raw_value.strip()
+        if not candidate:
+            raise RuntimeError(
+                "Orderflow market data DSN cannot be empty once configured."
+            )
+        normalized: str = normalize_sqlalchemy_dsn(
+            candidate,
+            allow_sqlite=allow_sqlite,
+            label="Orderflow market data DSN",
         )
+        return normalized
 
-    candidate = raw.strip()
-    if not candidate:
-        raise RuntimeError(
-            "Orderflow market data DSN cannot be empty once configured."
-        )
-
-    return normalize_sqlalchemy_dsn(
-        candidate,
-        allow_sqlite=allow_sqlite,
-        label="Orderflow market data DSN",
+    if allow_sqlite:
+        return "sqlite+pysqlite:///:memory:"
+    raise RuntimeError(
+        "Orderflow market data DSN is not configured. Set ORDERFLOW_MARKET_DATA_URL "
+        "to a PostgreSQL/Timescale connection string."
     )
 
 
@@ -115,25 +150,24 @@ class MarketDataProvider:
         )
         self._depth = max(1, order_book_depth)
 
-    def get_recent_trades(self, symbol: str, window: int) -> List[Dict[str, float]]:
+    def get_recent_trades(self, symbol: str, window: int) -> List[NormalizedTrade]:
         trades = self._adapter.recent_trades(symbol, window)
-        normalized: List[Dict[str, float]] = []
+        normalized: List[NormalizedTrade] = []
         for trade in trades:
             side = getattr(trade, "side", "")
             volume = getattr(trade, "volume", 0.0)
             price = getattr(trade, "price", 0.0)
             if not side:
                 continue
-            normalized.append(
-                {
-                    "side": str(side).lower(),
-                    "volume": float(volume),
-                    "price": float(price),
-                }
-            )
+            trade_payload: NormalizedTrade = {
+                "side": str(side).lower(),
+                "volume": float(volume),
+                "price": float(price),
+            }
+            normalized.append(trade_payload)
         return normalized
 
-    def get_order_book(self, symbol: str) -> Dict[str, List[List[float]]]:
+    def get_order_book(self, symbol: str) -> Dict[str, List[Level]]:
         snapshot = self._adapter.order_book_snapshot(symbol, depth=self._depth)
         bids = self._normalize_levels(snapshot.get("bids", []))
         asks = self._normalize_levels(snapshot.get("asks", []))
@@ -142,8 +176,10 @@ class MarketDataProvider:
         return {"bids": bids, "asks": asks}
 
     @staticmethod
-    def _normalize_levels(levels: Sequence[Sequence[float]] | Iterable[Mapping[str, float]]) -> List[List[float]]:
-        normalized: List[List[float]] = []
+    def _normalize_levels(
+        levels: Sequence[Sequence[float]] | Iterable[Mapping[str, float]]
+    ) -> List[Level]:
+        normalized: List[Level] = []
         for entry in levels:
             price: float
             size: float
@@ -157,7 +193,7 @@ class MarketDataProvider:
                 continue
             if price <= 0 or size <= 0:
                 continue
-            normalized.append([price, size])
+            normalized.append((price, size))
         return normalized
 
 
@@ -176,7 +212,7 @@ class OrderflowSnapshot:
     depth_imbalance: float
     bid_depth: float
     ask_depth: float
-    liquidity_holes: List[Dict[str, float]]
+    liquidity_holes: List[LiquidityHole]
     impact_estimates: Dict[str, Mapping[str, Optional[float]]]
     ts: datetime
 
@@ -272,7 +308,7 @@ class OrderflowMetricsStore:
             )
             self._append_memory(record)
 
-    def _ensure_schema(self, conn: "psycopg.Connection[Any]", schema: str) -> None:
+    def _ensure_schema(self, conn: PsycopgConnection, schema: str) -> None:
         assert sql is not None  # nosec - guarded by caller
         with self._lock:
             if schema in self._initialized:
@@ -317,9 +353,10 @@ class OrderflowMetricsStore:
 # ---------------------------------------------------------------------------
 
 
-def _compute_buy_sell_imbalance(trades: Iterable[Mapping[str, float]]) -> float:
-    buy_volume = sum(trade["volume"] for trade in trades if trade.get("side") == "buy")
-    sell_volume = sum(trade["volume"] for trade in trades if trade.get("side") == "sell")
+def _compute_buy_sell_imbalance(trades: Iterable[NormalizedTrade]) -> float:
+    trade_list = list(trades)
+    buy_volume = sum(trade["volume"] for trade in trade_list if trade["side"] == "buy")
+    sell_volume = sum(trade["volume"] for trade in trade_list if trade["side"] == "sell")
     total = buy_volume + sell_volume
     if total <= 0:
         return 0.0
@@ -327,9 +364,9 @@ def _compute_buy_sell_imbalance(trades: Iterable[Mapping[str, float]]) -> float:
     return float(max(-1.0, min(1.0, imbalance)))
 
 
-def _compute_depth_imbalance(order_book: Mapping[str, Iterable[Iterable[float]]]) -> tuple[float, float, float]:
-    bids = order_book.get("bids", [])
-    asks = order_book.get("asks", [])
+def _compute_depth_imbalance(order_book: OrderBookSnapshot) -> tuple[float, float, float]:
+    bids = list(order_book.get("bids", EMPTY_LEVELS))
+    asks = list(order_book.get("asks", EMPTY_LEVELS))
     bid_depth = float(sum(level[1] for level in bids))
     ask_depth = float(sum(level[1] for level in asks))
     total = bid_depth + ask_depth
@@ -339,10 +376,10 @@ def _compute_depth_imbalance(order_book: Mapping[str, Iterable[Iterable[float]]]
     return float(max(-1.0, min(1.0, imbalance))), bid_depth, ask_depth
 
 
-def _detect_liquidity_holes(order_book: Mapping[str, Iterable[Iterable[float]]]) -> List[Dict[str, float]]:
-    holes: List[Dict[str, float]] = []
+def _detect_liquidity_holes(order_book: OrderBookSnapshot) -> List[LiquidityHole]:
+    holes: List[LiquidityHole] = []
     for side_name in ("bids", "asks"):
-        levels = list(order_book.get(side_name, []))
+        levels = list(order_book.get(side_name, EMPTY_LEVELS))
         if len(levels) < 2:
             continue
         sizes = [level[1] for level in levels]
@@ -354,21 +391,20 @@ def _detect_liquidity_holes(order_book: Mapping[str, Iterable[Iterable[float]]])
                 continue
             drop_ratio = 1.0 - (size / prev_size)
             if drop_ratio > 0.45 and size < median_depth * 0.6:
-                holes.append(
-                    {
-                        "side": side_name[:-1],
-                        "level": float(idx),
-                        "drop_ratio": round(drop_ratio, 4),
-                        "depth": round(size, 6),
-                    }
-                )
+                hole: LiquidityHole = {
+                    "side": side_name[:-1],
+                    "level": float(idx),
+                    "drop_ratio": float(round(drop_ratio, 4)),
+                    "depth": float(round(size, 6)),
+                }
+                holes.append(hole)
             prev_size = size
     return holes
 
 
-def _calc_mid(order_book: Mapping[str, Iterable[Iterable[float]]]) -> Optional[float]:
-    bids = list(order_book.get("bids", []))
-    asks = list(order_book.get("asks", []))
+def _calc_mid(order_book: OrderBookSnapshot) -> Optional[float]:
+    bids = list(order_book.get("bids", EMPTY_LEVELS))
+    asks = list(order_book.get("asks", EMPTY_LEVELS))
     if not bids or not asks:
         return None
     best_bid = bids[0][0]
@@ -377,7 +413,7 @@ def _calc_mid(order_book: Mapping[str, Iterable[Iterable[float]]]) -> Optional[f
 
 
 def _estimate_slippage(
-    levels: Iterable[Iterable[float]],
+    levels: Sequence[Level],
     target_qty: float,
     *,
     mid: float,
@@ -413,16 +449,17 @@ def _estimate_slippage(
         coverage = executed / max(target_qty, 1e-9)
         slippage += (1 - min(coverage, 1.0)) * 10_000
 
-    return round(slippage, 4)
+    return float(round(slippage, 4))
 
 
 def _compute_market_impact(
-    trades: Iterable[Mapping[str, float]],
-    order_book: Mapping[str, Iterable[Iterable[float]]],
+    trades: Iterable[NormalizedTrade],
+    order_book: OrderBookSnapshot,
 ) -> Dict[str, Mapping[str, Optional[float]]]:
-    volume = sum(trade["volume"] for trade in trades)
+    trade_list = list(trades)
+    volume = sum(trade["volume"] for trade in trade_list)
     if volume <= 0:
-        depth_volume = sum(level[1] for level in order_book.get("asks", []))
+        depth_volume = sum(level[1] for level in order_book.get("asks", EMPTY_LEVELS))
         volume = max(depth_volume, 1.0)
 
     mid = _calc_mid(order_book)
@@ -430,8 +467,8 @@ def _compute_market_impact(
         return {"buy": {}, "sell": {}}
 
     percentages = [0.01, 0.05, 0.10]
-    asks = list(order_book.get("asks", []))
-    bids = list(order_book.get("bids", []))
+    asks = list(order_book.get("asks", EMPTY_LEVELS))
+    bids = list(order_book.get("bids", EMPTY_LEVELS))
 
     buy_impact: Dict[str, Optional[float]] = {}
     sell_impact: Dict[str, Optional[float]] = {}
@@ -518,7 +555,7 @@ _service = OrderflowService()
 SESSION_STORE: SessionStoreProtocol | None = None
 
 
-@router.get("/imbalance")
+@typed_router_get(router, "/imbalance")
 async def buy_sell_imbalance(
     *,
     symbol: str = Query(..., description="Market symbol to analyse"),
@@ -534,7 +571,7 @@ async def buy_sell_imbalance(
     }
 
 
-@router.get("/queue")
+@typed_router_get(router, "/queue")
 async def queue_depth(
     *,
     symbol: str = Query(..., description="Market symbol to analyse"),
@@ -551,7 +588,7 @@ async def queue_depth(
     }
 
 
-@router.get("/liquidity_holes")
+@typed_router_get(router, "/liquidity_holes")
 async def liquidity_holes(
     *,
     symbol: str = Query(..., description="Market symbol to analyse"),
@@ -610,7 +647,6 @@ def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
     return store
 
 
-@app.on_event("startup")
 async def _initialize_session_store() -> None:
     store = _configure_session_store(app)
     app.state.session_store = store
@@ -618,6 +654,7 @@ async def _initialize_session_store() -> None:
     global SESSION_STORE
     SESSION_STORE = store
 
+app.add_event_handler("startup", _initialize_session_store)
 app.include_router(router)
 
 

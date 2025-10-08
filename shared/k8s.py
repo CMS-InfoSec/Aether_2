@@ -44,8 +44,14 @@ class KrakenSecretStore:
             except Exception:  # pragma: no cover - config loading failures
                 pass
             self.core_v1 = client.CoreV1Api()
+        self._ensure_core_v1()
+
+    def _ensure_core_v1(self) -> Any:
+        """Return a Kubernetes client instance, falling back to a stub."""
+
         if self.core_v1 is None:
-            self.core_v1 = SimpleNamespace()  # ensures attribute access works in tests
+            self.core_v1 = SimpleNamespace()
+        return self.core_v1
 
     # ---------------------------------------------------------------------
     # Public API
@@ -85,9 +91,11 @@ class KrakenSecretStore:
             "type": "Opaque",
         }
 
-        if hasattr(self.core_v1, "patch_namespaced_secret"):
+        core_v1 = self._ensure_core_v1()
+
+        if hasattr(core_v1, "patch_namespaced_secret"):
             try:  # pragma: no branch - handled for ApiException absence
-                self.core_v1.patch_namespaced_secret(  # type: ignore[call-arg]
+                core_v1.patch_namespaced_secret(  # type: ignore[call-arg]
                     name=name,
                     namespace=self.namespace,
                     body=payload,
@@ -96,7 +104,7 @@ class KrakenSecretStore:
             except Exception as exc:  # pragma: no cover - relies on k8s client
                 if getattr(exc, "status", None) != 404:
                     raise
-        if hasattr(self.core_v1, "create_namespaced_secret"):
+        if hasattr(core_v1, "create_namespaced_secret"):
             body = {
                 "metadata": {
                     "name": name,
@@ -106,7 +114,7 @@ class KrakenSecretStore:
                 "data": secret_data,
                 "type": "Opaque",
             }
-            self.core_v1.create_namespaced_secret(  # type: ignore[call-arg]
+            core_v1.create_namespaced_secret(  # type: ignore[call-arg]
                 namespace=self.namespace,
                 body=body,
             )
@@ -128,9 +136,11 @@ class KrakenSecretStore:
     def get_secret(self, name: str) -> Dict[str, Any]:
         """Return the raw secret payload for the provided name."""
 
-        if hasattr(self.core_v1, "read_namespaced_secret"):
+        core_v1 = self._ensure_core_v1()
+
+        if hasattr(core_v1, "read_namespaced_secret"):
             try:  # pragma: no branch - mirrors the Kubernetes client API
-                response = self.core_v1.read_namespaced_secret(  # type: ignore[call-arg]
+                response = core_v1.read_namespaced_secret(  # type: ignore[call-arg]
                     name=name,
                     namespace=self.namespace,
                 )
