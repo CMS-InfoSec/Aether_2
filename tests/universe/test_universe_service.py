@@ -1,16 +1,10 @@
 from __future__ import annotations
 
-import pytest
 from fastapi.testclient import TestClient
 
 from services.common.adapters import RedisFeastAdapter
-
-from fastapi.testclient import TestClient
-
-from services.common.adapters import RedisFeastAdapter
-from services.universe.repository import MarketSnapshot, UniverseRepository
-
 from services.universe import main as universe_main
+from services.universe.repository import MarketSnapshot, UniverseRepository
 from tests.universe.conftest import UniverseTimescaleFixture
 
 
