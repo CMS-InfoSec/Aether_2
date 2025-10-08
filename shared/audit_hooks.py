@@ -225,13 +225,18 @@ class AuditEvent:
         context_factory: ContextFactory | None = None,
         resolved_ip_hash: "ResolvedIpHash" | None = None,
         resolved_context: "ResolvedContext" | None = None,
+        fallback_extra: Optional[Mapping[str, Any]] = None,
     ) -> "AuditLogResult":
         """Log the event using :func:`log_audit_event_with_fallback`.
 
         Callers may override the structured fallback context by supplying a
         mapping via ``context`` or defer construction entirely with
         ``context_factory``.  When neither argument is provided the event's
-        stored ``context`` or ``context_factory`` is reused.
+        stored ``context`` or ``context_factory`` is reused.  Additional
+        structured metadata for fallback logging can be supplied via
+        ``fallback_extra`` without mutating the event payload, allowing callers
+        to attach correlation identifiers or request details to disabled/error
+        log entries.
         """
 
         effective_factory = context_factory
@@ -257,6 +262,7 @@ class AuditEvent:
             context_factory=effective_factory,
             resolved_ip_hash=resolved_ip_hash,
             resolved_context=resolved_context,
+            fallback_extra=fallback_extra,
         )
 
     def with_context(
@@ -962,6 +968,7 @@ def log_event_with_fallback(
     context_factory: ContextFactory | None = None,
     resolved_ip_hash: ResolvedIpHash | None = None,
     resolved_context: "ResolvedContext" | None = None,
+    fallback_extra: Optional[Mapping[str, Any]] = None,
 ) -> AuditLogResult:
     """Emit an audit event while shielding callers from optional failures.
 
@@ -991,7 +998,10 @@ def log_event_with_fallback(
     expensive factories.  ``context_evaluated`` reflects whether context
     resolution completed (for example because a factory ran, eager context was
     available, or no factory was provided), enabling callers to detect when
-    deferred work was triggered.
+    deferred work was triggered.  Additional structured metadata for fallback
+    logging can be supplied via ``fallback_extra`` so services can attach
+    correlation identifiers or request context without mutating the base audit
+    payload.
     """
 
     resolved = resolved_ip_hash
@@ -1002,7 +1012,6 @@ def log_event_with_fallback(
         )
 
     log_extra: dict[str, Any] | None = None
-    fallback_extra: Mapping[str, Any] | None = None
     effective_context_factory = context_factory
     context_value = context
     context_error: Exception | None = None
@@ -1022,7 +1031,7 @@ def log_event_with_fallback(
     def ensure_log_extra() -> Mapping[str, Any]:
         nonlocal log_extra, context_value, context_evaluated
         nonlocal context_error, context_error_logged, effective_context_factory
-        nonlocal fallback_logged, fallback_extra
+        nonlocal fallback_logged
         if log_extra is None:
             if not context_evaluated and effective_context_factory is not None:
                 try:
@@ -1046,7 +1055,14 @@ def log_event_with_fallback(
                 hash_error=resolved.error,
                 context_error=context_error,
             )
-            fallback_extra = log_extra
+            if fallback_extra is not None:
+                log_extra = dict(log_extra)
+                merged = _combine_fallback_extra(
+                    fallback_extra,
+                    log_extra,
+                )
+                assert merged is not None  # _combine_fallback_extra returns mapping when inputs provided
+                log_extra = dict(merged)
             if context_error is not None and not context_error_logged:
                 logger.exception(
                     "Audit fallback context factory raised; omitting context metadata.",
@@ -1147,8 +1163,15 @@ def log_audit_event_with_fallback(
     context_factory: ContextFactory | None = None,
     resolved_ip_hash: ResolvedIpHash | None = None,
     resolved_context: ResolvedContext | None = None,
+    fallback_extra: Optional[Mapping[str, Any]] = None,
 ) -> AuditLogResult:
-    """Convenience wrapper for logging :class:`AuditEvent` instances."""
+    """Convenience wrapper for logging :class:`AuditEvent` instances.
+
+    ``fallback_extra`` mirrors the similarly named argument on
+    :func:`log_event_with_fallback`, allowing callers to attach additional
+    structured metadata (for example correlation identifiers) to any fallback
+    log entries emitted during the call.
+    """
     effective_factory = context_factory
     if context is _EVENT_CONTEXT_SENTINEL:
         if effective_factory is None and event.context is not None:
@@ -1177,6 +1200,7 @@ def log_audit_event_with_fallback(
         context_factory=effective_factory,
         resolved_ip_hash=resolved_ip_hash,
         resolved_context=resolved_context,
+        fallback_extra=fallback_extra,
     )
 
 

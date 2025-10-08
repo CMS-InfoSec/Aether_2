@@ -987,6 +987,46 @@ def test_log_audit_event_with_fallback_uses_event_context(caplog: pytest.LogCapt
     assert getattr(record, "request_id", None) == "req-123"
 
 
+def test_log_event_with_fallback_includes_custom_extra(caplog: pytest.LogCaptureFixture):
+    hooks = audit_hooks.AuditHooks(log=None, hash_ip=lambda value: value)
+    logger = logging.getLogger("tests.audit.custom_extra")
+    fallback_extra: Mapping[str, Any] = {
+        "request_id": "req-456",
+        "audit": {"flow": "demo"},
+    }
+
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        result = audit_hooks.log_event_with_fallback(
+            hooks,
+            logger,
+            actor="lea",
+            action="demo.custom",
+            entity="resource",
+            before={"before": True},
+            after={"after": True},
+            failure_message="should not raise",
+            disabled_message="Audit logging disabled",
+            disabled_level=logging.INFO,
+            fallback_extra=fallback_extra,
+        )
+
+    assert fallback_extra == {
+        "request_id": "req-456",
+        "audit": {"flow": "demo"},
+    }
+    assert result.fallback_logged is True
+    assert result.fallback_extra is not None
+    assert result.fallback_extra is not fallback_extra
+    assert result.fallback_extra["request_id"] == "req-456"
+    audit_payload = result.fallback_extra["audit"]
+    assert audit_payload["actor"] == "lea"
+    assert audit_payload["flow"] == "demo"
+    record = caplog.records[0]
+    assert record.message == "Audit logging disabled"
+    assert getattr(record, "request_id", None) == "req-456"
+    assert getattr(record, "audit", None)["flow"] == "demo"
+
+
 def test_log_event_with_fallback_merges_result_and_wrapper_extra(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -1090,6 +1130,7 @@ def test_audit_event_log_with_fallback_method_delegates(monkeypatch):
 
     monkeypatch.setattr(audit_hooks, "log_audit_event_with_fallback", fake_helper)
 
+    fallback_extra = {"request_id": "abc"}
     result = event.log_with_fallback(
         hooks,
         logger,
@@ -1097,6 +1138,7 @@ def test_audit_event_log_with_fallback_method_delegates(monkeypatch):
         disabled_message="disabled",
         disabled_level=logging.INFO,
         context={"request_id": "abc"},
+        fallback_extra=fallback_extra,
     )
 
     assert result is expected
@@ -1109,6 +1151,7 @@ def test_audit_event_log_with_fallback_method_delegates(monkeypatch):
         "context_factory": None,
         "resolved_ip_hash": None,
         "resolved_context": None,
+        "fallback_extra": fallback_extra,
     }
 
 
