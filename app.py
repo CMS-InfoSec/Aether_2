@@ -9,7 +9,10 @@ import sys
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI
+try:  # pragma: no cover - FastAPI is optional in some unit tests
+    from fastapi import FastAPI
+except ImportError:  # pragma: no cover - fallback when FastAPI is stubbed out
+    from services.common.fastapi_stub import FastAPI  # type: ignore[misc]
 
 from audit_mode import configure_audit_mode
 from accounts.service import AccountsService
@@ -224,6 +227,7 @@ def create_app(
     _maybe_include_router(app, "multiformat_export", "router")
     _maybe_include_router(app, "compliance_pack", "router")
     _maybe_include_router(app, "pack_exporter", "router")
+    _maybe_include_router(app, "services.logging_export", "router")
     _maybe_include_router(app, "services.system.health_service", "router")
     _maybe_include_router(app, "services.hedge.hedge_service", "router")
 
