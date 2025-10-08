@@ -14,50 +14,10 @@ from typing import Any, Dict, Generator, Iterable, List, Mapping, Optional, Set,
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-_SQLALCHEMY_AVAILABLE = True
-
-try:  # pragma: no cover - optional dependency used in production
-    from sqlalchemy import (
-        JSON,
-        Column,
-        DateTime,
-        Integer,
-        String,
-        UniqueConstraint,
-        create_engine,
-        func,
-        select,
-    )
-    from sqlalchemy.engine import Engine
-    from sqlalchemy.orm import Session, declarative_base, sessionmaker
-    from sqlalchemy.pool import StaticPool
-except Exception:  # pragma: no cover - exercised in lightweight environments
-    _SQLALCHEMY_AVAILABLE = False
-    Engine = Any  # type: ignore[assignment]
-    Session = Any  # type: ignore[assignment]
-    StaticPool = type("StaticPool", (), {})  # type: ignore[assignment]
-    JSON = Column = DateTime = Integer = String = UniqueConstraint = None  # type: ignore[assignment]
-    create_engine = func = select = None  # type: ignore[assignment]
-
-    class _FallbackMetadata:
-        def create_all(self, **kwargs: Any) -> None:
-            bind = kwargs.get("bind")
-            if hasattr(bind, "reset"):
-                bind.reset()
-
-        def drop_all(self, **kwargs: Any) -> None:
-            bind = kwargs.get("bind")
-            if hasattr(bind, "reset"):
-                bind.reset()
-
-    class _FallbackBase(SimpleNamespace):
-        metadata = _FallbackMetadata()
-
-    def declarative_base() -> Any:  # type: ignore[override]
-        return _FallbackBase()
-
-    def sessionmaker(**_: object) -> Callable[[], Any]:  # type: ignore[override]
-        raise RuntimeError("SQLAlchemy sessionmaker is unavailable in this environment")
+from sqlalchemy import JSON, Column, DateTime, Integer, String, UniqueConstraint, create_engine, func, select
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session, declarative_base, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from shared.audit_hooks import AuditEvent, load_audit_hooks
 from shared.postgres import normalize_sqlalchemy_dsn

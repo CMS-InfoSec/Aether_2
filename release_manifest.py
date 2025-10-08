@@ -96,10 +96,9 @@ except Exception:  # pragma: no cover - provide lightweight stand-ins
     class StaticPool:  # type: ignore[override]
         pass
 
-try:
-    import yaml  # type: ignore
-except ImportError:  # pragma: no cover - optional dependency
-    yaml = None  # type: ignore
+from shared.yaml_compat import load_yaml_module
+
+yaml = load_yaml_module()
 
 
 LOGGER = logging.getLogger("release_manifest")
