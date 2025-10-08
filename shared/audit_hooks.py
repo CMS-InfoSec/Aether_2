@@ -553,9 +553,12 @@ class AuditLogResult:
     request as well as the resolved hash metadata used during logging.  When
     fallback logging occurs the ``context`` field contains the structured
     payload that was emitted (if any) alongside any factory errors captured in
-    ``context_error``.  ``context_evaluated`` signals whether fallback context
-    resolution completed—either because an eager mapping was already available,
-    the factory executed, or there was no factory to invoke—allowing callers to
+    ``context_error``.  ``fallback_logged`` signals whether a fallback record
+    was emitted (for example due to disabled audit logging, hashing failures,
+    or context factory errors), helping callers surface additional telemetry.
+    ``context_evaluated`` indicates whether fallback context resolution
+    completed—either because an eager mapping was already available, the
+    factory executed, or there was no factory to invoke—allowing callers to
     detect when expensive context builders were triggered.
     """
 
@@ -567,6 +570,7 @@ class AuditLogResult:
     log_error: Optional[Exception] = None
     context_error: Optional[Exception] = None
     context_evaluated: bool = False
+    fallback_logged: bool = False
 
     def __bool__(self) -> bool:  # pragma: no cover - exercised implicitly via truthiness
         return self.handled
@@ -675,6 +679,7 @@ class AuditHooks:
                 hash_fallback=resolved.fallback,
                 hash_error=resolved.error,
                 context_evaluated=False,
+                fallback_logged=False,
             )
 
         computed_resolved = False
@@ -686,6 +691,7 @@ class AuditHooks:
                 ip_hash=ip_hash,
             )
 
+        fallback_logged = False
         if resolved.error is not None and computed_resolved:
             LOGGER.error(
                 "Audit hash_ip callable failed; using fallback hash.",
@@ -707,6 +713,7 @@ class AuditHooks:
                     resolved.error.__traceback__,
                 ),
             )
+            fallback_logged = True
 
         log_callable(
             actor=actor,
@@ -722,6 +729,7 @@ class AuditHooks:
             hash_fallback=resolved.fallback,
             hash_error=resolved.error,
             context_evaluated=False,
+            fallback_logged=fallback_logged,
         )
 
 
@@ -970,10 +978,12 @@ def log_event_with_fallback(
         or (resolved_context.evaluated if resolved_context is not None else False)
     )
     context_error_logged = False
+    fallback_logged = False
 
     def ensure_log_extra() -> Mapping[str, Any]:
         nonlocal log_extra, context_value, context_evaluated
         nonlocal context_error, context_error_logged, effective_context_factory
+        nonlocal fallback_logged
         if log_extra is None:
             if not context_evaluated and effective_context_factory is not None:
                 try:
@@ -1008,6 +1018,7 @@ def log_event_with_fallback(
                     ),
                 )
                 context_error_logged = True
+                fallback_logged = True
         return log_extra
 
     if resolved.error is not None:
@@ -1020,6 +1031,7 @@ def log_event_with_fallback(
                 resolved.error.__traceback__,
             ),
         )
+        fallback_logged = True
 
     try:
         result = hooks.log_event(
@@ -1043,10 +1055,12 @@ def log_event_with_fallback(
             log_error=exc,
             context_error=context_error,
             context_evaluated=context_evaluated,
+            fallback_logged=True,
         )
 
     if not result.handled and disabled_message is not None:
         logger.log(disabled_level, disabled_message, extra=ensure_log_extra())
+        fallback_logged = True
 
     combined_hash_fallback = resolved.fallback or result.hash_fallback
     combined_hash_error = resolved.error or result.hash_error
@@ -1067,6 +1081,7 @@ def log_event_with_fallback(
         log_error=result.log_error,
         context_error=result.context_error or context_error,
         context_evaluated=result.context_evaluated or context_evaluated,
+        fallback_logged=result.fallback_logged or fallback_logged,
     )
 
 

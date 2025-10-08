@@ -80,6 +80,7 @@ def test_log_event_skips_when_logger_missing():
     assert result.hash_fallback is False
     assert result.hash_error is None
     assert result.context_evaluated is False
+    assert result.fallback_logged is False
     assert not result
 
 
@@ -106,6 +107,7 @@ def test_log_event_records_with_ip_hash():
     assert result.hash_error is None
     assert result.log_error is None
     assert result.context_evaluated is False
+    assert result.fallback_logged is False
     assert result
     assert calls == [
         {
@@ -142,6 +144,7 @@ def test_log_event_respects_explicit_ip_hash():
     assert result.hash_fallback is False
     assert result.hash_error is None
     assert result.context_evaluated is False
+    assert result.fallback_logged is False
 
 
 def test_audit_log_result_truthiness():
@@ -150,6 +153,7 @@ def test_audit_log_result_truthiness():
         ip_hash="hash",
         hash_fallback=False,
         hash_error=None,
+        fallback_logged=False,
     )
     failure = audit_hooks.AuditLogResult(
         handled=False,
@@ -157,6 +161,7 @@ def test_audit_log_result_truthiness():
         hash_fallback=False,
         hash_error=None,
         log_error=None,
+        fallback_logged=False,
     )
 
     assert success
@@ -187,6 +192,7 @@ def test_log_event_with_fallback_logs_when_disabled(caplog: pytest.LogCaptureFix
     assert result.log_error is None
     assert result.context is None
     assert result.context_evaluated is True
+    assert result.fallback_logged is True
     assert not result
     record = next(record for record in caplog.records if record.message == "audit disabled")
     assert record.audit == {
@@ -229,6 +235,7 @@ def test_log_event_with_fallback_context_factory_skips_when_unused():
     assert result.context is None
     assert result.context_evaluated is False
     assert factory_calls == []
+    assert result.fallback_logged is False
 
 
 def test_log_event_with_fallback_context_factory_failure_records_metadata(
@@ -264,6 +271,7 @@ def test_log_event_with_fallback_context_factory_failure_records_metadata(
     assert isinstance(result.context_error, RuntimeError)
     assert str(result.context_error) == "context boom"
     assert result.context_evaluated is True
+    assert result.fallback_logged is True
 
     context_error_records = [
         record
@@ -313,6 +321,7 @@ def test_log_event_with_fallback_context_factory_used_for_fallback(
     assert factory_calls == [1]
     assert result.context == {"audit": {"source": "factory"}}
     assert result.context_evaluated is True
+    assert result.fallback_logged is True
     record = next(
         entry
         for entry in caplog.records
@@ -354,6 +363,7 @@ def test_log_audit_event_with_fallback_event_context_factory_skips_when_unused()
     assert result.context is None
     assert result.context_evaluated is False
     assert factory_calls == []
+    assert result.fallback_logged is False
 
 
 def test_log_audit_event_with_fallback_event_context_factory_used_for_fallback(
@@ -389,6 +399,7 @@ def test_log_audit_event_with_fallback_event_context_factory_used_for_fallback(
     assert result.context == {"audit": {"source": "event"}}
     assert factory_calls == [1]
     assert result.context_evaluated is True
+    assert result.fallback_logged is True
     record = next(
         entry
         for entry in caplog.records
@@ -435,6 +446,7 @@ def test_log_audit_event_with_fallback_reuses_resolved_context(
     assert result.context_error is None
     assert result.context_evaluated is True
     assert calls == [1]
+    assert result.fallback_logged is True
     record = next(
         entry
         for entry in caplog.records
@@ -480,6 +492,7 @@ def test_log_audit_event_with_fallback_resolved_context_error_logged_once(
     assert result.handled is False
     assert result.context is None
     assert result.context_error is resolved_context.error
+    assert result.fallback_logged is True
     failure_records = [
         entry
         for entry in caplog.records
@@ -521,6 +534,7 @@ def test_log_event_with_fallback_handles_exceptions(caplog: pytest.LogCaptureFix
     assert result.hash_fallback is False
     assert result.hash_error is None
     assert result.context is None
+    assert result.fallback_logged is True
     error_record = next(
         record
         for record in caplog.records
@@ -568,6 +582,7 @@ def test_log_event_with_fallback_uses_fallback_hash_on_error(caplog: pytest.LogC
     assert isinstance(result.hash_error, RuntimeError)
     assert result.log_error is None
     assert result.context is None
+    assert result.fallback_logged is True
     expected_hash = audit_hooks._hash_ip_fallback("192.168.0.10")
     assert calls == [
         {
@@ -628,6 +643,7 @@ def test_log_event_with_fallback_reuses_resolved_hash(caplog: pytest.LogCaptureF
     assert result.ip_hash == "hash:203.0.113.5"
     assert hash_calls["count"] == 1
     assert result.context is None
+    assert result.fallback_logged is False
     assert captured == [
         {
             "actor": "kelly",
@@ -679,6 +695,7 @@ def test_log_event_with_fallback_accepts_pre_resolved_hash(caplog: pytest.LogCap
     assert result.ip_hash == "hash:198.51.100.10"
     assert hash_calls["count"] == 1
     assert result.context is None
+    assert result.fallback_logged is False
     assert captured == [
         {
             "actor": "lisa",
@@ -724,6 +741,7 @@ def test_log_event_falls_back_when_hash_raises(caplog: pytest.LogCaptureFixture)
     )
     assert module_record.levelno == logging.ERROR
     assert module_record.audit["hash_error"] == {"type": "RuntimeError", "message": "hash failure"}
+    assert result.fallback_logged is True
 
 
 def test_log_event_with_fallback_allows_custom_context(caplog: pytest.LogCaptureFixture):
@@ -758,6 +776,7 @@ def test_log_event_with_fallback_allows_custom_context(caplog: pytest.LogCapture
     record = next(record for record in caplog.records if record.message == "audit disabled")
     assert record.audit == context["audit"]
     assert record.extra_field == "value"
+    assert result.fallback_logged is True
 
 
 class _TrackingMapping(Mapping[str, object]):
@@ -818,6 +837,7 @@ def test_log_event_with_fallback_defers_extra_until_needed(caplog: pytest.LogCap
     ]
     assert context.accessed is False
     assert not caplog.records
+    assert result.fallback_logged is False
 
 
 def test_log_audit_event_with_fallback_logs_event_payload():
@@ -854,6 +874,7 @@ def test_log_audit_event_with_fallback_logs_event_payload():
         "after": {"after": True},
         "ip_hash": "hash:10.1.2.3",
     }
+    assert result.fallback_logged is False
 
 
 def test_log_audit_event_with_fallback_uses_event_context(caplog: pytest.LogCaptureFixture):
@@ -882,6 +903,7 @@ def test_log_audit_event_with_fallback_uses_event_context(caplog: pytest.LogCapt
     assert result.context is not event.context
     assert result.context_evaluated is True
     assert len(caplog.records) == 1
+    assert result.fallback_logged is True
     record = caplog.records[0]
     assert record.message == "Audit logging disabled"
     assert getattr(record, "request_id", None) == "req-123"
@@ -903,6 +925,7 @@ def test_audit_event_log_with_fallback_method_delegates(monkeypatch):
         ip_hash=None,
         hash_fallback=False,
         hash_error=None,
+        fallback_logged=False,
     )
     captured: dict[str, object] = {}
 
@@ -952,6 +975,7 @@ def test_audit_event_log_with_fallback_infers_event_context(monkeypatch):
         ip_hash=None,
         hash_fallback=False,
         hash_error=None,
+        fallback_logged=False,
     )
     captured: dict[str, object] = {}
 
@@ -987,6 +1011,7 @@ def test_audit_event_log_with_fallback_forwards_context_factory(monkeypatch):
         ip_hash=None,
         hash_fallback=False,
         hash_error=None,
+        fallback_logged=False,
     )
     captured: dict[str, object] = {}
 
@@ -1042,6 +1067,7 @@ def test_audit_event_log_with_fallback_uses_event_context_factory(monkeypatch):
         ip_hash=None,
         hash_fallback=False,
         hash_error=None,
+        fallback_logged=False,
     )
     captured: dict[str, object] = {}
 
