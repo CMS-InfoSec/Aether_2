@@ -12,22 +12,65 @@ from __future__ import annotations
 
 import enum
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
-from typing import Generator, Optional
+from typing import Any, Dict, Generator, Iterable, Optional
 
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
-from sqlalchemy import Column, DateTime, Integer, Numeric, String, create_engine, select, func
-from sqlalchemy.engine import Engine
-from sqlalchemy.engine.url import URL, make_url
-from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
-from sqlalchemy.pool import StaticPool
-from sqlalchemy.types import TypeDecorator
+_SQLALCHEMY_AVAILABLE = True
+
+try:  # pragma: no cover - exercised in environments with SQLAlchemy installed
+    from sqlalchemy import Column, DateTime, Integer, Numeric, String, create_engine, func, select
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.engine.url import URL, make_url
+    from sqlalchemy.orm import Session, declarative_base, sessionmaker
+    from sqlalchemy.pool import StaticPool
+    from sqlalchemy.types import TypeDecorator
+except Exception:  # pragma: no cover - exercised when SQLAlchemy is unavailable
+    _SQLALCHEMY_AVAILABLE = False
+    Column = DateTime = Integer = Numeric = String = None  # type: ignore[assignment]
+    Engine = Any  # type: ignore[assignment]
+    Session = Any  # type: ignore[assignment]
+    StaticPool = object  # type: ignore[assignment]
+    TypeDecorator = object  # type: ignore[assignment]
+
+    class URL:  # type: ignore[override]
+        """Lightweight URL representation used when SQLAlchemy is absent."""
+
+        def __init__(self, raw_url: str) -> None:
+            self._raw = raw_url
+            driver, _, remainder = raw_url.partition("://")
+            self.drivername = driver or raw_url
+            self._remainder = remainder
+
+        def set(self, drivername: str) -> "URL":
+            if self._remainder:
+                return URL(f"{drivername}://{self._remainder}")
+            return URL(drivername)
+
+        def render_as_string(self, hide_password: bool = False) -> str:
+            del hide_password
+            return self._raw
+
+    def make_url(raw_url: str) -> URL:  # type: ignore[override]
+        return URL(raw_url)
+
+    class _FuncNamespace:
+        @staticmethod
+        def lower(value: str) -> str:
+            return value.lower()
+
+    func = _FuncNamespace()
+
+    def select(*_: object, **__: object) -> None:  # type: ignore[override]
+        raise RuntimeError("SQLAlchemy is unavailable in this environment")
+
 
 
 from services.common.security import require_admin_account
@@ -44,41 +87,51 @@ def _quantize(value: Decimal) -> Decimal:
     return value.quantize(_QUANT, rounding=ROUND_HALF_EVEN)
 
 
-class PreciseDecimal(TypeDecorator):
-    """Type decorator storing high-precision decimals losslessly on SQLite."""
+if _SQLALCHEMY_AVAILABLE:
 
-    impl = Numeric
-    cache_ok = True
+    class PreciseDecimal(TypeDecorator):
+        """Type decorator storing high-precision decimals losslessly on SQLite."""
 
-    def __init__(self, precision: int, scale: int, **kwargs):
-        super().__init__(**kwargs)
-        self.precision = precision
-        self.scale = scale
-        self._numeric = Numeric(precision, scale, asdecimal=True)
+        impl = Numeric
+        cache_ok = True
 
-    @property
-    def python_type(self) -> type[Decimal]:  # pragma: no cover - SQLAlchemy hook
-        return Decimal
+        def __init__(self, precision: int, scale: int, **kwargs):
+            super().__init__(**kwargs)
+            self.precision = precision
+            self.scale = scale
+            self._numeric = Numeric(precision, scale, asdecimal=True)
 
-    def load_dialect_impl(self, dialect):
-        if dialect.name == "sqlite":
-            return dialect.type_descriptor(String(self.precision + self.scale + 2))
-        return dialect.type_descriptor(self._numeric)
+        @property
+        def python_type(self) -> type[Decimal]:  # pragma: no cover - SQLAlchemy hook
+            return Decimal
 
-    def process_bind_param(self, value, dialect):
-        if value is None:
-            return None
-        if not isinstance(value, Decimal):
-            value = Decimal(str(value))
-        value = _quantize(value)
-        if dialect.name == "sqlite":
-            return format(value, f".{self.scale}f")
-        return value
+        def load_dialect_impl(self, dialect):
+            if dialect.name == "sqlite":
+                return dialect.type_descriptor(String(self.precision + self.scale + 2))
+            return dialect.type_descriptor(self._numeric)
 
-    def process_result_value(self, value, dialect):
-        if value is None:
-            return None
-        return _quantize(Decimal(str(value)))
+        def process_bind_param(self, value, dialect):
+            if value is None:
+                return None
+            if not isinstance(value, Decimal):
+                value = Decimal(str(value))
+            value = _quantize(value)
+            if dialect.name == "sqlite":
+                return format(value, f".{self.scale}f")
+            return value
+
+        def process_result_value(self, value, dialect):
+            if value is None:
+                return None
+            return _quantize(Decimal(str(value)))
+
+else:
+
+    class PreciseDecimal:  # pragma: no cover - lightweight stand-in
+        """Placeholder used when SQLAlchemy's type system is unavailable."""
+
+        def __init__(self, precision: int, scale: int, **kwargs: object) -> None:
+            del precision, scale, kwargs
 
 # ---------------------------------------------------------------------------
 # Database setup
@@ -102,14 +155,19 @@ def _require_database_url() -> str:
 
     raw_url = os.getenv(_DATABASE_ENV)
     if not raw_url:
-        raise RuntimeError(
-            "CAPITAL_FLOW_DATABASE_URL must be set to a managed PostgreSQL/TimescaleDB DSN."
-        )
+        if _SQLALCHEMY_AVAILABLE:
+            raise RuntimeError(
+                "CAPITAL_FLOW_DATABASE_URL must be set to a managed PostgreSQL/TimescaleDB DSN."
+            )
+        return "memory://capital-flow"
 
     try:
         url: URL = make_url(raw_url)
     except Exception as exc:  # pragma: no cover - defensive validation
         raise RuntimeError(f"Invalid CAPITAL_FLOW_DATABASE_URL '{raw_url}': {exc}") from exc
+
+    if not _SQLALCHEMY_AVAILABLE:
+        return raw_url.strip()
 
     driver = url.drivername.replace("timescale", "postgresql")
     if driver in {"postgresql", "postgres"}:
@@ -164,10 +222,117 @@ def _create_engine(database_url: str) -> Engine:
 
 
 DATABASE_URL = _require_database_url()
-ENGINE = _create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
 
-Base = declarative_base()
+if _SQLALCHEMY_AVAILABLE:
+    ENGINE = _create_engine(DATABASE_URL)
+    SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
+    Base = declarative_base()
+else:
+
+    class _InMemoryStore:
+        """Shared in-memory persistence used when SQLAlchemy is unavailable."""
+
+        def __init__(self) -> None:
+            self.flows: list[CapitalFlowRecord] = []
+            self.baselines: Dict[str, NavBaselineRecord] = {}
+            self._next_id = 1
+
+        def reset(self) -> None:
+            self.flows.clear()
+            self.baselines.clear()
+            self._next_id = 1
+
+        def snapshot(self) -> tuple[Dict[str, NavBaselineRecord], int, int]:
+            return ({key: replace(value) for key, value in self.baselines.items()}, len(self.flows), self._next_id)
+
+        def restore(self, snapshot: tuple[Dict[str, NavBaselineRecord], int, int]) -> None:
+            baselines, flow_len, next_id = snapshot
+            self.baselines = {key: replace(value) for key, value in baselines.items()}
+            self.flows = self.flows[:flow_len]
+            self._next_id = next_id
+
+        def add_flow(self, record: "CapitalFlowRecord") -> None:
+            if getattr(record, "id", 0) in (0, None):
+                record.id = self._next_id
+                self._next_id += 1
+            self.flows.append(record)
+
+
+    _IN_MEMORY_STORES: Dict[str, _InMemoryStore] = {}
+
+
+    def _resolve_store(url: str) -> _InMemoryStore:
+        store = _IN_MEMORY_STORES.get(url)
+        if store is None:
+            store = _InMemoryStore()
+            _IN_MEMORY_STORES[url] = store
+        return store
+
+
+    class _InMemoryEngine:
+        def __init__(self, store: _InMemoryStore) -> None:
+            self._store = store
+
+        def dispose(self) -> None:
+            self._store.reset()
+
+
+    class _InMemorySession:
+        def __init__(self, store: _InMemoryStore) -> None:
+            self._store = store
+            self._snapshot = store.snapshot()
+
+        def get(self, model: type, key: str) -> Optional[NavBaselineRecord]:
+            if model is NavBaselineRecord:
+                return self._store.baselines.get(key)
+            return None
+
+        def add(self, obj: object) -> None:
+            if isinstance(obj, NavBaselineRecord):
+                self._store.baselines[obj.account_id] = obj
+            elif isinstance(obj, CapitalFlowRecord):
+                self._store.add_flow(obj)
+            else:  # pragma: no cover - defensive guard
+                raise TypeError(f"Unsupported object type {type(obj)!r}")
+
+        def flush(self) -> None:  # pragma: no cover - present for API parity
+            return None
+
+        def commit(self) -> None:
+            self._snapshot = self._store.snapshot()
+
+        def rollback(self) -> None:
+            self._store.restore(self._snapshot)
+
+        def close(self) -> None:  # pragma: no cover - included for parity
+            return None
+
+        def list_flows(self, normalized_account: str, limit: int) -> list[CapitalFlowRecord]:
+            flows = [flow for flow in self._store.flows if flow.account_id.lower() == normalized_account]
+            flows.sort(key=lambda record: record.ts, reverse=True)
+            return flows[:limit]
+
+        def baselines_for(self, account_ids: Iterable[str]) -> Dict[str, Decimal]:
+            lookup: Dict[str, Decimal] = {}
+            for account_id in account_ids:
+                record = self._store.baselines.get(account_id)
+                if record is not None:
+                    lookup[account_id] = record.baseline
+            return lookup
+
+
+    class _SessionFactory:
+        def __init__(self, store: _InMemoryStore) -> None:
+            self._store = store
+
+        def __call__(self) -> _InMemorySession:
+            return _InMemorySession(self._store)
+
+
+    _store = _resolve_store(DATABASE_URL)
+    ENGINE = _InMemoryEngine(_store)
+    SessionLocal = _SessionFactory(_store)
+    Base = object  # type: ignore[assignment]
 
 
 class CapitalFlowType(str, enum.Enum):
@@ -177,35 +342,56 @@ class CapitalFlowType(str, enum.Enum):
     WITHDRAW = "withdraw"
 
 
-class CapitalFlowRecord(Base):
-    """ORM model for persisted capital flows."""
+if _SQLALCHEMY_AVAILABLE:
 
-    __tablename__ = "capital_flows"
+    class CapitalFlowRecord(Base):
+        """ORM model for persisted capital flows."""
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    account_id = Column(String, nullable=False, index=True)
-    type = Column(String, nullable=False)
-    amount = Column(PreciseDecimal(_DECIMAL_PRECISION, _DECIMAL_SCALE), nullable=False)
-    currency = Column(String, nullable=False)
-    ts = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+        __tablename__ = "capital_flows"
 
-
-class NavBaselineRecord(Base):
-    """Per-account NAV baseline state."""
-
-    __tablename__ = "nav_baselines"
-
-    account_id = Column(String, primary_key=True)
-    currency = Column(String, nullable=False)
-    baseline = Column(
-        PreciseDecimal(_DECIMAL_PRECISION, _DECIMAL_SCALE),
-        nullable=False,
-        default=ZERO,
-    )
-    updated_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+        id = Column(Integer, primary_key=True, autoincrement=True)
+        account_id = Column(String, nullable=False, index=True)
+        type = Column(String, nullable=False)
+        amount = Column(PreciseDecimal(_DECIMAL_PRECISION, _DECIMAL_SCALE), nullable=False)
+        currency = Column(String, nullable=False)
+        ts = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
 
-Base.metadata.create_all(bind=ENGINE)
+    class NavBaselineRecord(Base):
+        """Per-account NAV baseline state."""
+
+        __tablename__ = "nav_baselines"
+
+        account_id = Column(String, primary_key=True)
+        currency = Column(String, nullable=False)
+        baseline = Column(
+            PreciseDecimal(_DECIMAL_PRECISION, _DECIMAL_SCALE),
+            nullable=False,
+            default=ZERO,
+        )
+        updated_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+
+    Base.metadata.create_all(bind=ENGINE)
+
+else:
+
+    @dataclass(slots=True)
+    class CapitalFlowRecord:
+        account_id: str
+        type: str
+        amount: Decimal
+        currency: str
+        ts: datetime
+        id: int = 0
+
+
+    @dataclass(slots=True)
+    class NavBaselineRecord:
+        account_id: str
+        currency: str
+        baseline: Decimal
+        updated_at: datetime
 
 
 # ---------------------------------------------------------------------------
@@ -412,6 +598,20 @@ def _serialize_flow(record: CapitalFlowRecord, baseline_lookup: dict[str, Decima
     )
 
 
+def _response_payload(response: CapitalFlowResponse) -> dict[str, Any]:
+    """Convert a ``CapitalFlowResponse`` into a JSON-compatible mapping."""
+
+    data = response.model_dump()
+    data["amount"] = format(response.amount, "f")
+    data["nav_baseline"] = format(response.nav_baseline, "f")
+    if isinstance(response.type, CapitalFlowType):
+        data["type"] = response.type.value
+    ts = response.ts
+    if isinstance(ts, datetime):
+        data["ts"] = ts.isoformat()
+    return data
+
+
 # ---------------------------------------------------------------------------
 # FastAPI wiring
 # ---------------------------------------------------------------------------
@@ -430,11 +630,12 @@ def record_deposit(
     payload: CapitalFlowRequest,
     session: Session = Depends(get_session),
     caller: str = Depends(require_admin_account),
-) -> CapitalFlowResponse:
+) -> JSONResponse:
     """Persist a deposit and update the NAV baseline."""
 
     _ensure_caller_matches_account(caller, payload.account_id)
-    return _record_flow(session, payload, CapitalFlowType.DEPOSIT)
+    result = _record_flow(session, payload, CapitalFlowType.DEPOSIT)
+    return JSONResponse(content=_response_payload(result), status_code=status.HTTP_201_CREATED)
 
 
 @app.post(
@@ -447,11 +648,12 @@ def record_withdrawal(
     payload: CapitalFlowRequest,
     session: Session = Depends(get_session),
     caller: str = Depends(require_admin_account),
-) -> CapitalFlowResponse:
+) -> JSONResponse:
     """Persist a withdrawal and update the NAV baseline."""
 
     _ensure_caller_matches_account(caller, payload.account_id)
-    return _record_flow(session, payload, CapitalFlowType.WITHDRAW)
+    result = _record_flow(session, payload, CapitalFlowType.WITHDRAW)
+    return JSONResponse(content=_response_payload(result), status_code=status.HTTP_201_CREATED)
 
 
 @app.get(
@@ -464,28 +666,38 @@ def list_flows(
     limit: int = Query(100, ge=1, le=1000, description="Maximum number of records to return"),
     session: Session = Depends(get_session),
     caller: str = Depends(require_admin_account),
-) -> FlowHistoryResponse:
+) -> JSONResponse:
     """Return recent capital flows with their resulting NAV baselines."""
 
     _, normalized_filter = _resolve_account_scope(caller, account_id)
 
-    stmt = (
-        select(CapitalFlowRecord)
-        .order_by(CapitalFlowRecord.ts.desc())
-        .limit(limit)
-        .where(func.lower(CapitalFlowRecord.account_id) == normalized_filter)
-    )
+    if _SQLALCHEMY_AVAILABLE:
+        stmt = (
+            select(CapitalFlowRecord)
+            .order_by(CapitalFlowRecord.ts.desc())
+            .limit(limit)
+            .where(func.lower(CapitalFlowRecord.account_id) == normalized_filter)
+        )
 
-    records = list(session.execute(stmt).scalars())
-    account_ids = {record.account_id for record in records}
-    baseline_lookup: dict[str, Decimal] = {}
-    if account_ids:
-        baseline_stmt = select(NavBaselineRecord).where(NavBaselineRecord.account_id.in_(account_ids))
-        for baseline_record in session.execute(baseline_stmt).scalars():
-            baseline_lookup[baseline_record.account_id] = _quantize(baseline_record.baseline)
+        records = list(session.execute(stmt).scalars())
+        account_ids = {record.account_id for record in records}
+        baseline_lookup: dict[str, Decimal] = {}
+        if account_ids:
+            baseline_stmt = select(NavBaselineRecord).where(NavBaselineRecord.account_id.in_(account_ids))
+            for baseline_record in session.execute(baseline_stmt).scalars():
+                baseline_lookup[baseline_record.account_id] = _quantize(baseline_record.baseline)
+    else:
+        records = session.list_flows(normalized_filter, limit)
+        baseline_lookup = {
+            account_id: _quantize(baseline)
+            for account_id, baseline in session.baselines_for({record.account_id for record in records}).items()
+        }
 
     flows = [_serialize_flow(record, baseline_lookup) for record in records]
-    return FlowHistoryResponse(flows=flows)
+    return JSONResponse(
+        content={"flows": [_response_payload(flow) for flow in flows]},
+        status_code=status.HTTP_200_OK,
+    )
 
 
 @app.get("/health", include_in_schema=False)

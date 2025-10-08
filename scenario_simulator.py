@@ -11,13 +11,17 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Iterable, Mapping, Set
+from typing import Any, Dict, Iterable, List, Mapping, Sequence, Set
 
-import numpy as np
-import pandas as pd
+try:  # pragma: no cover - numpy is optional in some environments
+    import numpy as np
+except Exception:  # pragma: no cover - exercised when numpy is unavailable
+    np = None  # type: ignore[assignment]
+
 from fastapi import Depends, FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
 
@@ -92,8 +96,18 @@ INSERT INTO scenario_runs (
 class ScenarioRunRequest(BaseModel):
     """Request payload describing the scenario shock configuration."""
 
-    shock_pct: float = Field(..., ge=-1.0, le=1.0, description="Relative price move applied to all instruments")
-    vol_multiplier: float = Field(..., ge=0.0, le=10.0, description="Multiplier applied to historical volatility")
+    shock_pct: float = Field(
+        ...,
+        ge=-1.0,
+        le=1.0,
+        description="Relative price move applied to all instruments",
+    )
+    vol_multiplier: float = Field(
+        ...,
+        ge=0.0,
+        le=10.0,
+        description="Multiplier applied to historical volatility",
+    )
 
 
 class ScenarioRunResponse(BaseModel):
@@ -171,18 +185,58 @@ def startup_event() -> None:
     _ensure_tables_for_session(session)
 
 
-def _fetch_positions(conn: psycopg.Connection, account_id: str) -> pd.DataFrame:
+def _row_to_mapping(row: Any, columns: Sequence[str]) -> Dict[str, Any]:
+    if isinstance(row, Mapping):
+        return dict(row)
+    try:
+        return {columns[idx]: row[idx] for idx in range(len(columns))}
+    except Exception:  # pragma: no cover - defensive conversion for unexpected rows
+        return {column: getattr(row, column, None) for column in columns}
+
+
+def _coerce_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    if isinstance(value, str):
+        candidate = value.strip()
+        if not candidate:
+            return None
+        if candidate.endswith("Z"):
+            candidate = candidate[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(candidate)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        else:
+            parsed = parsed.astimezone(timezone.utc)
+        return parsed
+    return None
+
+
+def _fetch_positions(conn: psycopg.Connection, account_id: str) -> list[Dict[str, Any]]:
     with conn.cursor() as cur:
         cur.execute(POSITIONS_QUERY, {"account_id": account_id})
         rows = cur.fetchall()
-    frame = pd.DataFrame(rows, columns=["market", "quantity", "entry_price"])
-    return _normalize_spot_positions(frame)
+
+    records = [_row_to_mapping(row, ["market", "quantity", "entry_price"]) for row in rows]
+    return _normalize_spot_positions(records)
 
 
-def _fetch_price_history(conn: psycopg.Connection, markets: Iterable[str]) -> pd.DataFrame:
+def _fetch_price_history(conn: psycopg.Connection, markets: Iterable[str]) -> list[Dict[str, Any]]:
     symbols = _canonical_spot_markets(markets)
     if not symbols:
-        return pd.DataFrame(columns=["market", "bucket_start", "close"])
+        return []
 
     start = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
     with conn.cursor() as cur:
@@ -192,24 +246,29 @@ def _fetch_price_history(conn: psycopg.Connection, markets: Iterable[str]) -> pd
         )
         rows = cur.fetchall()
     if not rows:
-        return pd.DataFrame(columns=["market", "bucket_start", "close"])
-    frame = pd.DataFrame(rows)
-    if not frame.empty:
-        frame["market"] = [normalize_spot_symbol(market) for market in frame["market"]]
-    frame["bucket_start"] = pd.to_datetime(frame["bucket_start"], utc=True)
-    return frame
+        return []
+
+    history: list[Dict[str, Any]] = []
+    for raw in rows:
+        record = _row_to_mapping(raw, ["market", "bucket_start", "close"])
+        market = normalize_spot_symbol(record.get("market"))
+        if not market or not is_spot_symbol(market):
+            continue
+        bucket = _coerce_datetime(record.get("bucket_start"))
+        price = _coerce_float(record.get("close"))
+        if bucket is None or price is None:
+            continue
+        history.append({"market": market, "bucket_start": bucket, "close": price})
+    return history
 
 
 def _canonical_spot_markets(markets: Iterable[object]) -> list[str]:
     return filter_spot_symbols(markets, logger=LOGGER)
 
 
-def _normalize_spot_positions(frame: pd.DataFrame) -> pd.DataFrame:
-    if frame.empty:
-        return pd.DataFrame(columns=["market", "quantity", "entry_price"])
-
-    normalized_rows = []
-    for record in frame.to_dict("records"):
+def _normalize_spot_positions(rows: Iterable[Mapping[str, Any]]) -> list[Dict[str, Any]]:
+    normalized: list[Dict[str, Any]] = []
+    for record in rows:
         raw_market = record.get("market")
         canonical = normalize_spot_symbol(raw_market)
         if not canonical or not is_spot_symbol(canonical):
@@ -218,107 +277,181 @@ def _normalize_spot_positions(frame: pd.DataFrame) -> pd.DataFrame:
             )
             continue
 
-        normalized_rows.append(
-            {
-                "market": canonical,
-                "quantity": record.get("quantity"),
-                "entry_price": record.get("entry_price"),
+        quantity = _coerce_float(record.get("quantity")) or 0.0
+        entry_price = _coerce_float(record.get("entry_price")) or 0.0
+        normalized.append({"market": canonical, "quantity": quantity, "entry_price": entry_price})
+
+    if not normalized:
+        return []
+
+    aggregated: Dict[str, Dict[str, float]] = {}
+    for row in normalized:
+        market = row["market"]
+        if market not in aggregated:
+            aggregated[market] = {
+                "market": market,
+                "quantity": 0.0,
+                "entry_price": row["entry_price"],
             }
-        )
-
-    if not normalized_rows:
-        return pd.DataFrame(columns=["market", "quantity", "entry_price"])
-
-    normalized = pd.DataFrame(normalized_rows)
-    normalized["quantity"] = pd.to_numeric(normalized["quantity"], errors="coerce").fillna(0.0)
-    normalized["entry_price"] = pd.to_numeric(normalized["entry_price"], errors="coerce").fillna(0.0)
-
-    aggregated = (
-        normalized.groupby("market", as_index=False)
-        .agg(quantity=("quantity", "sum"), entry_price=("entry_price", "last"))
-        .reindex(columns=["market", "quantity", "entry_price"])
-    )
-
-    return aggregated.astype({"quantity": float, "entry_price": float})
+        aggregated_row = aggregated[market]
+        aggregated_row["quantity"] += row["quantity"]
+        aggregated_row["entry_price"] = row["entry_price"]
+    return [dict(value) for value in aggregated.values()]
 
 
-def _latest_prices(price_frame: pd.DataFrame) -> Mapping[str, float]:
-    if price_frame.empty:
-        return {}
-    latest = price_frame.sort_values("bucket_start").groupby("market").tail(1)
-    return {row["market"]: float(row["close"]) for row in latest.to_dict("records")}
-
-
-def _portfolio_exposures(positions: pd.DataFrame, prices: Mapping[str, float]) -> pd.Series:
-    if positions.empty or not prices:
-        return pd.Series(dtype=float)
-    exposures: Dict[str, float] = {}
-    for record in positions.to_dict("records"):
+def _latest_prices(price_rows: Sequence[Mapping[str, Any]]) -> Mapping[str, float]:
+    latest: Dict[str, tuple[datetime, float]] = {}
+    for record in price_rows:
         market = record.get("market")
-        quantity = record.get("quantity")
-        if market not in prices:
+        bucket = record.get("bucket_start")
+        price = _coerce_float(record.get("close"))
+        if not isinstance(market, str) or not isinstance(bucket, datetime) or price is None:
             continue
-        try:
-            qty = float(quantity)
-            exposures[market] = qty * float(prices[market])
-        except (TypeError, ValueError):
+        existing = latest.get(market)
+        if existing is None or bucket > existing[0]:
+            latest[market] = (bucket, price)
+    return {market: value for market, (_, value) in latest.items()}
+
+
+def _portfolio_exposures(
+    positions: Sequence[Mapping[str, Any]],
+    prices: Mapping[str, float],
+) -> Dict[str, float]:
+    if not positions or not prices:
+        return {}
+    exposures: Dict[str, float] = {}
+    for record in positions:
+        market = record.get("market")
+        if not isinstance(market, str) or market not in prices:
             continue
-    return pd.Series(exposures, dtype=float)
+        quantity = _coerce_float(record.get("quantity"))
+        if quantity is None:
+            continue
+        exposures[market] = quantity * float(prices[market])
+    return exposures
+
+
+def _compute_returns(price_history: Sequence[Mapping[str, Any]]) -> list[Dict[str, Any]]:
+    if not price_history:
+        return []
+
+    grouped: Dict[str, List[tuple[datetime, float]]] = {}
+    for record in price_history:
+        market = record.get("market")
+        bucket = record.get("bucket_start")
+        price = _coerce_float(record.get("close"))
+        if not isinstance(market, str) or not isinstance(bucket, datetime) or price is None:
+            continue
+        grouped.setdefault(market, []).append((bucket, price))
+
+    returns: list[Dict[str, Any]] = []
+    for market, entries in grouped.items():
+        entries.sort(key=lambda item: item[0])
+        previous_price: float | None = None
+        for bucket, price in entries:
+            if previous_price is None:
+                previous_price = price
+                continue
+            if previous_price == 0:
+                previous_price = price
+                continue
+            change = (price / previous_price) - 1.0
+            previous_price = price
+            if math.isnan(change) or math.isinf(change):
+                continue
+            returns.append({"bucket_start": bucket, "market": market, "return": change})
+
+    returns.sort(key=lambda item: item["bucket_start"])
+    return returns
 
 
 def _scenario_pnl_series(
-    returns_frame: pd.DataFrame,
-    exposures: pd.Series,
+    returns_rows: Sequence[Mapping[str, Any]],
+    exposures: Mapping[str, float],
     *,
     shock_pct: float,
     vol_multiplier: float,
-) -> pd.Series:
-    if exposures.empty:
-        return pd.Series([0.0])
-    if returns_frame.empty:
-        immediate = float((exposures * shock_pct).sum())
-        return pd.Series([immediate])
+) -> List[float]:
+    if not exposures:
+        return []
 
-    pivot = returns_frame.pivot(index="bucket_start", columns="market", values="return")
-    pivot = pivot.fillna(0.0)
-    scenario_returns = shock_pct + (vol_multiplier * pivot)
-    pnl_series = scenario_returns.mul(exposures, axis=1).sum(axis=1)
-    if pnl_series.empty:
-        immediate = float((exposures * shock_pct).sum())
-        return pd.Series([immediate])
-    return pnl_series.sort_index()
+    total_exposure = sum(exposures.values())
+    if not returns_rows:
+        return [total_exposure * shock_pct] if total_exposure else []
+
+    timeline: Dict[datetime, float] = {}
+    for record in returns_rows:
+        bucket = record.get("bucket_start")
+        market = record.get("market")
+        ret_value = _coerce_float(record.get("return"))
+        if not isinstance(bucket, datetime) or not isinstance(market, str) or ret_value is None:
+            continue
+        if market not in exposures:
+            continue
+        if bucket not in timeline:
+            timeline[bucket] = total_exposure * shock_pct
+        timeline[bucket] += vol_multiplier * exposures[market] * ret_value
+
+    if not timeline:
+        return [total_exposure * shock_pct] if total_exposure else []
+
+    ordered = [timeline[bucket] for bucket in sorted(timeline)]
+    return ordered
 
 
-def _compute_returns(price_history: pd.DataFrame) -> pd.DataFrame:
-    if price_history.empty:
-        return price_history
-    pivot = price_history.pivot(index="bucket_start", columns="market", values="close").sort_index()
-    returns = pivot.pct_change().dropna(how="all")
-    if returns.empty:
-        return pd.DataFrame(columns=["bucket_start", "market", "return"])
-    tidy = returns.reset_index().melt(id_vars="bucket_start", var_name="market", value_name="return")
-    tidy.dropna(subset=["return"], inplace=True)
-    return tidy
+def _quantile(values: Sequence[float], q: float) -> float:
+    if not values:
+        return 0.0
+    if np is not None:  # pragma: no cover - exercised when numpy available
+        return float(np.quantile(values, q))
+
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return float(ordered[0])
+    position = (len(ordered) - 1) * q
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return float(ordered[int(position)])
+    lower_value = ordered[lower]
+    upper_value = ordered[upper]
+    weight = position - lower
+    return float(lower_value + weight * (upper_value - lower_value))
 
 
-def _aggregate_metrics(pnl_series: pd.Series, exposures: pd.Series, shock_pct: float) -> Dict[str, float]:
-    projected = float((exposures * shock_pct).sum()) if not exposures.empty else 0.0
-    if pnl_series.empty:
+def _aggregate_metrics(
+    pnl_values: Sequence[float],
+    exposures: Mapping[str, float],
+    shock_pct: float,
+) -> Dict[str, float]:
+    total_exposure = sum(exposures.values()) if exposures else 0.0
+    projected = total_exposure * shock_pct
+    if not pnl_values:
         return {"projected_pnl": projected, "var95": 0.0, "cvar95": 0.0, "drawdown": 0.0}
 
-    losses = pnl_series.values
-    if losses.size == 0:
+    losses = list(pnl_values)
+    if not losses:
         return {"projected_pnl": projected, "var95": 0.0, "cvar95": 0.0, "drawdown": 0.0}
 
-    var_threshold = float(np.quantile(losses, 0.05))
+    var_threshold = _quantile(losses, 0.05)
     var95 = max(0.0, -var_threshold)
-    tail_losses = losses[losses <= var_threshold]
-    cvar95 = max(0.0, -float(tail_losses.mean())) if tail_losses.size else 0.0
+    tail_losses = [value for value in losses if value <= var_threshold]
+    if tail_losses:
+        tail_average = sum(tail_losses) / len(tail_losses)
+        cvar95 = max(0.0, -tail_average)
+    else:
+        cvar95 = 0.0
 
-    cumulative = pnl_series.cumsum()
-    running_max = cumulative.cummax()
-    drawdowns = cumulative - running_max
-    max_drawdown = float(-drawdowns.min()) if not drawdowns.empty else 0.0
+    cumulative = 0.0
+    running_max = -math.inf
+    max_drawdown = 0.0
+    for value in losses:
+        cumulative += value
+        if cumulative > running_max:
+            running_max = cumulative
+        drawdown = cumulative - running_max
+        if drawdown < 0 and -drawdown > max_drawdown:
+            max_drawdown = -drawdown
 
     return {
         "projected_pnl": projected,
@@ -358,17 +491,18 @@ def run_scenario(
     try:
         with _open_conn(session) as conn:
             positions = _fetch_positions(conn, actor_account)
-            price_history = _fetch_price_history(conn, positions["market"].tolist())
+            markets = [row["market"] for row in positions if isinstance(row.get("market"), str)]
+            price_history = _fetch_price_history(conn, markets)
             prices = _latest_prices(price_history)
             exposures = _portfolio_exposures(positions, prices)
             returns = _compute_returns(price_history)
-            pnl_series = _scenario_pnl_series(
+            pnl_values = _scenario_pnl_series(
                 returns,
                 exposures,
                 shock_pct=payload.shock_pct,
                 vol_multiplier=payload.vol_multiplier,
             )
-            metrics = _aggregate_metrics(pnl_series, exposures, payload.shock_pct)
+            metrics = _aggregate_metrics(pnl_values, exposures, payload.shock_pct)
             _store_run(conn, metrics, payload, actor_account)
     except HTTPException:
         raise
