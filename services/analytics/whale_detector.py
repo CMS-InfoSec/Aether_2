@@ -6,10 +6,44 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from threading import Lock
-from typing import Deque, Dict, Iterable, Literal, Optional
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Deque,
+    Dict,
+    Iterable,
+    Literal,
+    Optional,
+    TypeVar,
+    cast,
+)
 
-from fastapi import Depends, FastAPI, Query
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+if TYPE_CHECKING:  # pragma: no cover - imported for type checking only
+    from fastapi import Depends, FastAPI, Query
+else:  # pragma: no cover - runtime fallback when FastAPI is optional
+    try:
+        from fastapi import Depends, FastAPI, Query
+    except ModuleNotFoundError:  # pragma: no cover - minimal stub for optional dependency
+        class FastAPI:  # pragma: no cover - decorator-friendly shim
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                del args, kwargs
+
+            def get(
+                self, *args: object, **kwargs: object
+            ) -> Callable[[Callable[..., object]], Callable[..., object]]:
+                def decorator(func: Callable[..., object]) -> Callable[..., object]:
+                    return func
+
+                return decorator
+
+        def Depends(dependency: Callable[..., object]) -> Callable[..., object]:  # type: ignore[misc]
+            return dependency
+
+        def Query(*args: object, **kwargs: object) -> object:  # type: ignore[misc]
+            del args, kwargs
+            return None
+
+from shared.pydantic_compat import BaseModel, ConfigDict, Field, field_validator
 
 from services.common.security import require_admin_account
 from services.common.spot import require_spot_http
@@ -74,13 +108,17 @@ class TradeObservation(BaseModel):
     def _validate_symbol(cls, value: str) -> str:
         """Normalise and enforce USD spot instruments for inbound trades."""
 
-        return require_spot_symbol(value)
+        return cast(str, require_spot_symbol(value))
 
 
 class WhaleEventResponse(BaseModel):
     """API response model for recently detected whale trades."""
 
     model_config = ConfigDict(from_attributes=True)
+
+    if TYPE_CHECKING:  # pragma: no cover - static analysis helper for mypy
+        @classmethod
+        def model_validate(cls, obj: object) -> "WhaleEventResponse": ...
 
     symbol: str
     size: float
@@ -250,7 +288,16 @@ detector = WhaleDetector()
 app = FastAPI(title="Whale Detector Service", version="1.0.0")
 
 
-@app.get("/whales/recent", response_model=list[WhaleEventResponse])
+RouteFn = TypeVar("RouteFn", bound=Callable[..., object])
+
+
+def _app_get(*args: object, **kwargs: object) -> Callable[[RouteFn], RouteFn]:
+    """Typed wrapper around :meth:`FastAPI.get` for strict type checking."""
+
+    return cast(Callable[[RouteFn], RouteFn], app.get(*args, **kwargs))
+
+
+@_app_get("/whales/recent", response_model=list[WhaleEventResponse])
 async def recent_whales(
     symbol: Optional[str] = Query(default=None, description="Filter by symbol"),
     limit: int = Query(

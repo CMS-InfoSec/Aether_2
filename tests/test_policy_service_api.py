@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import sys
-import time
 import types
 import contextlib
-from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 
 from typing import List

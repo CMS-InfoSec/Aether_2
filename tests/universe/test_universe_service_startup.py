@@ -7,8 +7,6 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.engine.url import make_url
 
-from services.universe import universe_service
-
 
 pytest.importorskip("sqlalchemy")
 
@@ -37,14 +35,14 @@ def test_universe_service_starts_with_default_psycopg2(monkeypatch):
         raising=False,
     )
 
-    universe_service = _reload_universe_service()
-    monkeypatch.setattr(universe_service, "run_migrations", lambda url=None: None)
+    module = _reload_universe_service()
+    monkeypatch.setattr(module, "run_migrations", lambda url=None: None)
 
-    with TestClient(universe_service.app):
+    with TestClient(module.app):
         pass
 
-    assert universe_service.ENGINE is not None
-    assert universe_service.ENGINE.url.drivername == "postgresql+psycopg2"
+    assert module.ENGINE is not None
+    assert module.ENGINE.url.drivername == "postgresql+psycopg2"
 
 
 def test_universe_service_normalises_postgresql_urls(monkeypatch):
@@ -64,10 +62,10 @@ def test_universe_service_normalises_postgresql_urls(monkeypatch):
         raising=False,
     )
 
-    universe_service = _reload_universe_service()
-    monkeypatch.setattr(universe_service, "run_migrations", lambda url=None: None)
+    module = _reload_universe_service()
+    monkeypatch.setattr(module, "run_migrations", lambda url=None: None)
 
-    universe_service.ensure_database()
+    module.ensure_database()
 
-    assert universe_service.ENGINE is not None
-    assert universe_service.ENGINE.url.drivername == "postgresql+psycopg2"
+    assert module.ENGINE is not None
+    assert module.ENGINE.url.drivername == "postgresql+psycopg2"
