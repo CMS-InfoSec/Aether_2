@@ -26,10 +26,21 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
 
-import numpy as np
-import pandas as pd
+try:  # Optional dependency – numpy may be unavailable in lightweight environments.
+    import numpy as _NUMPY  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover - graceful degradation when numpy missing.
+    _NUMPY = None  # type: ignore[assignment]
+
+try:  # Optional dependency – pandas may be unavailable in CI or slim installs.
+    import pandas as _PANDAS  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover - graceful degradation when pandas missing.
+    _PANDAS = None  # type: ignore[assignment]
+
+if TYPE_CHECKING:  # pragma: no cover - imported only for static analysis.
+    import numpy as np
+    import pandas as pd
 
 from ml.experiment_tracking.model_registry import get_latest_model
 from shared.models.registry import ModelEnsemble, ModelPrediction, get_model_registry
@@ -42,15 +53,39 @@ except Exception:  # pragma: no cover - graceful degradation when mlflow missing
 LOGGER = logging.getLogger(__name__)
 
 
+class MissingDependencyError(RuntimeError):
+    """Raised when distillation functionality requires an optional dependency."""
+
+
+def _require_numpy() -> "np":
+    """Return the numpy module or raise an informative error."""
+
+    if _NUMPY is None:
+        raise MissingDependencyError(
+            "numpy is required for the model distillation workflow"
+        )
+    return _NUMPY  # type: ignore[return-value]
+
+
+def _require_pandas() -> "pd":
+    """Return the pandas module or raise an informative error."""
+
+    if _PANDAS is None:
+        raise MissingDependencyError(
+            "pandas is required to prepare frames for MLflow pyfunc models"
+        )
+    return _PANDAS  # type: ignore[return-value]
+
+
 @dataclass(frozen=True)
 class DistillationDataset:
     """Container holding synthetic market data used for distillation."""
 
-    features: np.ndarray
+    features: Any
     feature_names: Tuple[str, ...]
     book_snapshots: Tuple[Mapping[str, float], ...]
     states: Tuple[Mapping[str, float], ...]
-    labels: np.ndarray
+    labels: Any
 
     def __post_init__(self) -> None:  # pragma: no cover - defensive checks.
         if len(self.features) != len(self.book_snapshots):
@@ -73,8 +108,8 @@ class DistillationDataset:
 class TeacherResult:
     """Outputs produced by the teacher model for a dataset."""
 
-    edges: np.ndarray
-    confidence: Optional[np.ndarray] = None
+    edges: Any
+    confidence: Optional[Any] = None
 
 
 @dataclass(frozen=True)
@@ -111,9 +146,10 @@ class TeacherPredictor:
             self._ensemble = None
 
     def predict(self, dataset: DistillationDataset) -> TeacherResult:
+        numpy = _require_numpy()
         if self._pyfunc_model is not None:
             frame = _build_pyfunc_frame(dataset)
-            predictions = np.asarray(self._pyfunc_model.predict(frame), dtype=float).reshape(-1)
+            predictions = numpy.asarray(self._pyfunc_model.predict(frame), dtype=float).reshape(-1)
             return TeacherResult(edges=predictions, confidence=None)
 
         assert self._ensemble is not None  # for type-checkers
@@ -127,7 +163,10 @@ class TeacherPredictor:
             )
             edges.append(prediction.edge_bps)
             confidences.append(prediction.confidence.get("model_confidence", 0.0))
-        return TeacherResult(edges=np.asarray(edges, dtype=float), confidence=np.asarray(confidences, dtype=float))
+        return TeacherResult(
+            edges=numpy.asarray(edges, dtype=float),
+            confidence=numpy.asarray(confidences, dtype=float),
+        )
 
     def _maybe_load_mlflow_model(self) -> Optional[object]:
         if pyfunc is None or not self.teacher_id:
@@ -163,21 +202,22 @@ class StudentRegressor:
 
     def __init__(self, config: StudentSizeConfig) -> None:
         self.config = config
-        self._mean: Optional[np.ndarray] = None
-        self._scale: Optional[np.ndarray] = None
-        self._weights: Optional[np.ndarray] = None
+        self._mean: Optional[Any] = None
+        self._scale: Optional[Any] = None
+        self._weights: Optional[Any] = None
 
-    def fit(self, dataset: DistillationDataset, targets: np.ndarray) -> None:
+    def fit(self, dataset: DistillationDataset, targets: Any) -> None:
+        numpy = _require_numpy()
         rows = self._build_raw_rows(dataset)
         mean = rows.mean(axis=0)
         scale = rows.std(axis=0)
         scale[scale == 0.0] = 1.0
         standardized = (rows - mean) / scale
-        design = np.hstack([standardized, np.ones((rows.shape[0], 1))])
-        lambda_identity = self.config.l2_penalty * np.eye(design.shape[1])
+        design = numpy.hstack([standardized, numpy.ones((rows.shape[0], 1))])
+        lambda_identity = self.config.l2_penalty * numpy.eye(design.shape[1])
         normal_matrix = design.T @ design + lambda_identity
         normal_target = design.T @ targets
-        self._weights = np.linalg.solve(normal_matrix, normal_target)
+        self._weights = numpy.linalg.solve(normal_matrix, normal_target)
         self._mean = mean
         self._scale = scale
         LOGGER.info(
@@ -185,12 +225,13 @@ class StudentRegressor:
             design.shape[1],
         )
 
-    def predict(self, dataset: DistillationDataset) -> np.ndarray:
+    def predict(self, dataset: DistillationDataset) -> Any:
         if self._weights is None or self._mean is None or self._scale is None:
             raise RuntimeError("Student has not been trained yet")
         rows = self._build_raw_rows(dataset)
         standardized = (rows - self._mean) / self._scale
-        design = np.hstack([standardized, np.ones((rows.shape[0], 1))])
+        numpy = _require_numpy()
+        design = numpy.hstack([standardized, numpy.ones((rows.shape[0], 1))])
         return design @ self._weights
 
     def predict_single(
@@ -202,9 +243,10 @@ class StudentRegressor:
     ) -> float:
         if self._weights is None or self._mean is None or self._scale is None:
             raise RuntimeError("Student has not been trained yet")
+        numpy = _require_numpy()
         row = self._transform_row(features, book_snapshot, state)
         standardized = (row - self._mean) / self._scale
-        extended = np.append(standardized, 1.0)
+        extended = numpy.append(standardized, 1.0)
         return float(extended @ self._weights)
 
     def metadata(self) -> Dict[str, float]:
@@ -215,25 +257,27 @@ class StudentRegressor:
             "l2_penalty": float(self.config.l2_penalty),
         }
 
-    def _build_raw_rows(self, dataset: DistillationDataset) -> np.ndarray:
+    def _build_raw_rows(self, dataset: DistillationDataset) -> Any:
+        numpy = _require_numpy()
         rows = [
             self._transform_row(features, book_snapshot, state)
             for features, book_snapshot, state in zip(
                 dataset.features, dataset.book_snapshots, dataset.states
             )
         ]
-        return np.asarray(rows, dtype=float)
+        return numpy.asarray(rows, dtype=float)
 
     def _transform_row(
         self,
         features: Sequence[float],
         book_snapshot: Mapping[str, float],
         state: Mapping[str, float],
-    ) -> np.ndarray:
-        feature_array = np.asarray(features, dtype=float)
+    ) -> Any:
+        numpy = _require_numpy()
+        feature_array = numpy.asarray(features, dtype=float)
         if self.config.max_features is not None:
             feature_array = feature_array[: self.config.max_features]
-        extras = np.array(
+        extras = numpy.array(
             [
                 float(book_snapshot.get("spread_bps", 0.0)),
                 float(book_snapshot.get("imbalance", 0.0)),
@@ -242,13 +286,13 @@ class StudentRegressor:
             ],
             dtype=float,
         )
-        components: List[np.ndarray] = [feature_array, extras]
+        components: List[Any] = [feature_array, extras]
         if self.config.include_interactions:
-            interactions = np.hstack([feature_array * extras[0], feature_array * extras[1]])
+            interactions = numpy.hstack([feature_array * extras[0], feature_array * extras[1]])
             components.append(interactions)
         if self.config.include_quadratic:
             components.append(feature_array ** 2)
-        return np.concatenate(components)
+        return numpy.concatenate(components)
 
 
 class DistilledModel(ModelEnsemble):
@@ -341,38 +385,39 @@ class DistillationMetrics:
 
 def evaluate_distillation(
     *,
-    teacher_edges: np.ndarray,
-    student_edges: np.ndarray,
-    labels: np.ndarray,
+    teacher_edges: Any,
+    student_edges: Any,
+    labels: Any,
 ) -> DistillationMetrics:
+    numpy = _require_numpy()
     if len(teacher_edges) != len(student_edges):
         raise ValueError("Teacher and student predictions must have the same length")
     if len(labels) != len(teacher_edges):
         raise ValueError("Labels and predictions must have the same length")
 
     residuals = teacher_edges - student_edges
-    mae = float(np.mean(np.abs(residuals)))
-    rmse = float(np.sqrt(np.mean(residuals ** 2)))
+    mae = float(numpy.mean(numpy.abs(residuals)))
+    rmse = float(numpy.sqrt(numpy.mean(residuals ** 2)))
 
     teacher_centered = teacher_edges - teacher_edges.mean()
-    denominator = float(np.sum(teacher_centered ** 2))
-    r2 = float(1.0 - np.sum(residuals ** 2) / denominator) if denominator > 0 else 0.0
+    denominator = float(numpy.sum(teacher_centered ** 2))
+    r2 = float(1.0 - numpy.sum(residuals ** 2) / denominator) if denominator > 0 else 0.0
 
-    with np.errstate(invalid="ignore"):
-        correlation = float(np.corrcoef(teacher_edges, student_edges)[0, 1])
-    if not np.isfinite(correlation):
+    with numpy.errstate(invalid="ignore"):
+        correlation = float(numpy.corrcoef(teacher_edges, student_edges)[0, 1])
+    if not numpy.isfinite(correlation):
         correlation = 0.0
 
-    teacher_sign = np.sign(teacher_edges)
-    student_sign = np.sign(student_edges)
-    label_sign = np.sign(labels)
-    agreement = float(np.mean(teacher_sign == student_sign))
+    teacher_sign = numpy.sign(teacher_edges)
+    student_sign = numpy.sign(student_edges)
+    label_sign = numpy.sign(labels)
+    agreement = float(numpy.mean(teacher_sign == student_sign))
 
-    teacher_return = float(np.mean(labels * teacher_sign))
-    student_return = float(np.mean(labels * student_sign))
+    teacher_return = float(numpy.mean(labels * teacher_sign))
+    student_return = float(numpy.mean(labels * student_sign))
 
-    teacher_directional_accuracy = float(np.mean(teacher_sign == label_sign))
-    student_directional_accuracy = float(np.mean(student_sign == label_sign))
+    teacher_directional_accuracy = float(numpy.mean(teacher_sign == label_sign))
+    student_directional_accuracy = float(numpy.mean(student_sign == label_sign))
 
     performance_gap = teacher_return - student_return
     fidelity = agreement
@@ -398,7 +443,8 @@ def generate_synthetic_dataset(
     num_features: int,
     seed: int = 17,
 ) -> DistillationDataset:
-    rng = np.random.default_rng(seed)
+    numpy = _require_numpy()
+    rng = numpy.random.default_rng(seed)
     features = rng.normal(0.0, 1.0, size=(num_samples, num_features))
     spread = rng.normal(8.0, 2.0, size=num_samples).clip(0.5, 25.0)
     imbalance = rng.normal(0.0, 0.3, size=num_samples).clip(-1.0, 1.0)
@@ -442,7 +488,8 @@ def generate_synthetic_dataset(
     )
 
 
-def _build_pyfunc_frame(dataset: DistillationDataset) -> pd.DataFrame:
+def _build_pyfunc_frame(dataset: DistillationDataset) -> Any:
+    pandas = _require_pandas()
     data: Dict[str, Iterable[float]] = {
         name: dataset.features[:, idx]
         for idx, name in enumerate(dataset.feature_names)
@@ -455,7 +502,7 @@ def _build_pyfunc_frame(dataset: DistillationDataset) -> pd.DataFrame:
             "liquidity_score": [state["liquidity_score"] for state in dataset.states],
         }
     )
-    return pd.DataFrame(data)
+    return pandas.DataFrame(data)
 
 
 def maybe_register_student(

@@ -3,32 +3,58 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import sys
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from threading import Lock
-from typing import Dict, Iterable, Iterator, List, Mapping, Sequence
+from typing import Dict, Iterable, Iterator, List, Mapping, MutableMapping, Sequence
 
-import pandas as pd
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import (
-    Column,
-    DateTime,
-    Float,
-    Integer,
-    String,
-    UniqueConstraint,
-    create_engine,
-    select,
-    text,
-)
-from sqlalchemy.engine import Engine
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session, declarative_base, sessionmaker
-from sqlalchemy.pool import StaticPool
+
+try:  # pragma: no cover - optional dependency
+    from sqlalchemy import (
+        Column,
+        DateTime,
+        Float,
+        Integer,
+        String,
+        UniqueConstraint,
+        create_engine,
+        select,
+        text,
+    )
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.exc import SQLAlchemyError
+    from sqlalchemy.orm import Session, declarative_base, sessionmaker
+    from sqlalchemy.pool import StaticPool
+
+    SQLALCHEMY_AVAILABLE = True
+except Exception:  # pragma: no cover - executed when SQLAlchemy missing
+    Column = DateTime = Float = Integer = String = UniqueConstraint = object  # type: ignore[assignment]
+    Engine = object  # type: ignore[assignment]
+    SQLAlchemyError = Exception  # type: ignore[assignment]
+
+    def create_engine(*_args, **_kwargs):  # type: ignore[override]
+        raise RuntimeError("sqlalchemy is required for correlation persistence")
+
+    def select(*_args, **_kwargs):  # type: ignore[override]
+        raise RuntimeError("sqlalchemy is required for correlation persistence")
+
+    def text(query: str) -> str:  # type: ignore[override]
+        return query
+
+    def declarative_base():  # type: ignore[override]
+        raise RuntimeError("sqlalchemy is required for correlation persistence")
+
+    sessionmaker = object  # type: ignore[assignment]
+    StaticPool = object  # type: ignore[assignment]
+    Session = object  # type: ignore[assignment]
+    SQLALCHEMY_AVAILABLE = False
 
 from services.alert_manager import AlertManager, RiskEvent, get_alert_metrics
 from shared.postgres import normalize_sqlalchemy_dsn
@@ -83,27 +109,144 @@ def _engine_options(url: str) -> dict[str, object]:
     return options
 
 
-_DB_URL = _database_url()
-ENGINE: Engine = create_engine(_DB_URL, **_engine_options(_DB_URL))
-SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
+if SQLALCHEMY_AVAILABLE:
+    _DB_URL: str | None = None
+    _ENGINE: Engine | None = None
+    SessionLocal: sessionmaker | None = None
 
-Base = declarative_base()
+    Base = declarative_base()
+
+    class CorrelationRecord(Base):
+        """Persistence model capturing a correlation observation."""
+
+        __tablename__ = "correlations"
+
+        id = Column(Integer, primary_key=True, autoincrement=True)
+        timestamp = Column(DateTime(timezone=True), index=True, nullable=False)
+        symbol1 = Column(String(32), nullable=False)
+        symbol2 = Column(String(32), nullable=False)
+        correlation = Column(Float, nullable=False)
+
+        __table_args__ = (
+            UniqueConstraint("timestamp", "symbol1", "symbol2", name="uq_correlation_pair"),
+        )
+
+    def _ensure_engine() -> tuple[Engine, sessionmaker]:
+        global _DB_URL, _ENGINE, SessionLocal
+
+        if _ENGINE is None or SessionLocal is None:
+            url = _database_url()
+            _DB_URL = url
+            _ENGINE = create_engine(url, **_engine_options(url))
+            SessionLocal = sessionmaker(
+                bind=_ENGINE, autoflush=False, expire_on_commit=False, future=True
+            )
+        assert _ENGINE is not None
+        assert SessionLocal is not None
+        return _ENGINE, SessionLocal
+
+else:
+    Base = None  # type: ignore[assignment]
 
 
-class CorrelationRecord(Base):
-    """Persistence model capturing a correlation observation."""
+class _CorrelationPersistence:
+    """Interface for correlation persistence backends."""
 
-    __tablename__ = "correlations"
+    def create_schema(self) -> None:
+        raise NotImplementedError
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    timestamp = Column(DateTime(timezone=True), index=True, nullable=False)
-    symbol1 = Column(String(32), nullable=False)
-    symbol2 = Column(String(32), nullable=False)
-    correlation = Column(Float, nullable=False)
+    def session(self) -> Iterator[object]:
+        raise NotImplementedError
 
-    __table_args__ = (
-        UniqueConstraint("timestamp", "symbol1", "symbol2", name="uq_correlation_pair"),
-    )
+    def persist(self, session: object, *, timestamp: datetime, matrix: Mapping[str, Mapping[str, float]]) -> None:
+        raise NotImplementedError
+
+
+class _InMemoryPersistence(_CorrelationPersistence):
+    """Lightweight persistence fallback used when SQLAlchemy is unavailable."""
+
+    def __init__(self) -> None:
+        self._records: MutableMapping[tuple[datetime, str, str], float] = {}
+
+    def create_schema(self) -> None:  # pragma: no cover - nothing to initialise
+        return
+
+    @contextmanager
+    def session(self) -> Iterator[object]:  # pragma: no cover - simple context manager
+        yield self
+
+    def persist(
+        self,
+        _session: object,
+        *,
+        timestamp: datetime,
+        matrix: Mapping[str, Mapping[str, float]],
+    ) -> None:
+        for symbol_a, row in matrix.items():
+            for symbol_b, value in row.items():
+                sym1, sym2 = _canonical_pair(symbol_a, symbol_b)
+                self._records[(timestamp, sym1, sym2)] = float(value)
+
+    def snapshot(self) -> Mapping[tuple[datetime, str, str], float]:
+        return dict(self._records)
+
+
+if SQLALCHEMY_AVAILABLE:
+
+    class _SQLAlchemyPersistence(_CorrelationPersistence):
+        def create_schema(self) -> None:
+            engine, _ = _ensure_engine()
+            Base.metadata.create_all(bind=engine)
+
+        @contextmanager
+        def session(self) -> Iterator[Session]:
+            _, factory = _ensure_engine()
+            session = factory()
+            try:
+                yield session
+            finally:
+                session.close()
+
+        def persist(
+            self,
+            session: Session,
+            *,
+            timestamp: datetime,
+            matrix: Mapping[str, Mapping[str, float]],
+        ) -> None:
+            records: list[CorrelationRecord] = []
+            for symbol_a, row in matrix.items():
+                for symbol_b, value in row.items():
+                    if symbol_a > symbol_b:
+                        continue
+                    sym1, sym2 = _canonical_pair(symbol_a, symbol_b)
+                    existing = session.execute(
+                        select(CorrelationRecord).where(
+                            CorrelationRecord.timestamp == timestamp,
+                            CorrelationRecord.symbol1 == sym1,
+                            CorrelationRecord.symbol2 == sym2,
+                        )
+                    ).scalar_one_or_none()
+                    if existing:
+                        existing.correlation = float(value)
+                        continue
+                    records.append(
+                        CorrelationRecord(
+                            timestamp=timestamp,
+                            symbol1=sym1,
+                            symbol2=sym2,
+                            correlation=float(value),
+                        )
+                    )
+
+            if records:
+                session.add_all(records)
+            session.commit()
+
+
+    correlation_persistence: _CorrelationPersistence = _SQLAlchemyPersistence()
+else:
+    correlation_persistence = _InMemoryPersistence()
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +310,8 @@ def _marketdata_url() -> str:
 
 
 def _marketdata_engine() -> Engine:
+    if not SQLALCHEMY_AVAILABLE:
+        raise RuntimeError("sqlalchemy is required to query market data history")
     global _MARKETDATA_ENGINE
     if _MARKETDATA_ENGINE is not None:
         return _MARKETDATA_ENGINE
@@ -262,34 +407,50 @@ class PriceHistoryStore:
     # ------------------------------------------------------------------
     # Query helpers
     # ------------------------------------------------------------------
-    def price_frame(self, window: int) -> pd.DataFrame:
-        """Return a price dataframe with aligned timestamps across symbols."""
+    def aligned_prices(
+        self, window: int
+    ) -> tuple[list[datetime], dict[str, list[float]]]:
+        """Return aligned price series for the requested rolling window."""
 
         if window < 2:
             raise ValueError("window must be at least 2 to compute returns")
 
         with self._lock:
-            frames: list[pd.Series] = []
+            trimmed: dict[str, list[PricePoint]] = {}
             for symbol, series in self._prices.items():
                 if len(series) < window + 1:
                     continue
-                trimmed = series[-(window + 1) :]
-                index = pd.Index([point.timestamp for point in trimmed], name="timestamp")
-                values = [point.price for point in trimmed]
-                frames.append(pd.Series(values, index=index, name=symbol))
+                trimmed[symbol] = series[-(window + 1) :]
 
-        if not frames:
-            return pd.DataFrame()
+        if not trimmed:
+            return [], {}
 
-        frame = pd.concat(frames, axis=1).sort_index()
-        frame = frame.dropna(how="any")
-        return frame
+        common: set[datetime] | None = None
+        for points in trimmed.values():
+            timestamps = {point.timestamp for point in points}
+            common = timestamps if common is None else common & timestamps
+            if not common:
+                return [], {}
+
+        assert common is not None
+        aligned_timestamps = sorted(common)[-(window + 1) :]
+        if len(aligned_timestamps) < window + 1:
+            return [], {}
+
+        prices: dict[str, list[float]] = {}
+        for symbol, points in trimmed.items():
+            by_timestamp = {point.timestamp: float(point.price) for point in points}
+            prices[symbol] = [by_timestamp[ts] for ts in aligned_timestamps]
+
+        return aligned_timestamps, prices
 
 
 price_store = PriceHistoryStore()
 
 
 def _fetch_price_history(*, symbols: Sequence[str], lookback: int) -> Mapping[str, List[PricePoint]]:
+    if not SQLALCHEMY_AVAILABLE:
+        raise RuntimeError("sqlalchemy is required to fetch market data history")
     engine = _marketdata_engine()
     table = _marketdata_table()
     history: dict[str, List[PricePoint]] = {}
@@ -335,6 +496,12 @@ def _fetch_price_history(*, symbols: Sequence[str], lookback: int) -> Mapping[st
 
 
 def _prime_price_cache(*, symbols: Sequence[str], lookback: int) -> None:
+    if not SQLALCHEMY_AVAILABLE:
+        logger.warning(
+            "sqlalchemy not available; skipping market data preload for correlation service"
+        )
+        return
+
     history = _fetch_price_history(symbols=symbols, lookback=lookback)
     if not history:
         raise RuntimeError("Market data warehouse returned no history for configured symbols")
@@ -421,9 +588,14 @@ alert_manager = AlertManager(metrics=get_alert_metrics())
 
 @app.on_event("startup")
 def _on_startup() -> None:
-    """Ensure the database is ready and cache market data history."""
+    """Ensure the persistence backend is ready and cache market data history."""
 
-    Base.metadata.create_all(bind=ENGINE)
+    try:
+        correlation_persistence.create_schema()
+    except Exception:  # pragma: no cover - defensive guard
+        logger.exception("Failed to initialise correlation persistence backend")
+        raise
+
     symbols = _tracked_symbols()
     lookback = int(os.getenv("RISK_MARKETDATA_LOOKBACK", "240"))
 
@@ -434,14 +606,11 @@ def _on_startup() -> None:
         raise
 
 
-def get_session() -> Iterator[Session]:
-    """FastAPI dependency that yields a SQLAlchemy session."""
+def get_session() -> Iterator[object]:
+    """FastAPI dependency that yields a persistence session/context."""
 
-    session = SessionLocal()
-    try:
+    with correlation_persistence.session() as session:
         yield session
-    finally:
-        session.close()
 
 
 # ---------------------------------------------------------------------------
@@ -449,8 +618,21 @@ def get_session() -> Iterator[Session]:
 # ---------------------------------------------------------------------------
 
 
-def _returns_from_prices(prices: pd.DataFrame) -> pd.DataFrame:
-    returns = prices.pct_change().dropna(how="any")
+def _returns_from_prices(prices: Mapping[str, Sequence[float]]) -> Dict[str, List[float]]:
+    returns: Dict[str, List[float]] = {}
+    for symbol, series in prices.items():
+        if len(series) < 2:
+            continue
+        prev = series[0]
+        symbol_returns: List[float] = []
+        for price in series[1:]:
+            if prev == 0:
+                raise ValueError("cannot compute returns when a previous price is zero")
+            change = (price - prev) / prev
+            symbol_returns.append(change)
+            prev = price
+        if symbol_returns:
+            returns[symbol] = symbol_returns
     return returns
 
 
@@ -458,53 +640,67 @@ def _canonical_pair(symbol_a: str, symbol_b: str) -> tuple[str, str]:
     return tuple(sorted((symbol_a, symbol_b)))
 
 
+def _pearson_correlation(series_a: Sequence[float], series_b: Sequence[float]) -> float:
+    if len(series_a) != len(series_b):
+        raise ValueError("correlation series must have matching lengths")
+    if len(series_a) < 2:
+        raise ValueError("at least two observations are required to compute correlation")
+
+    mean_a = sum(series_a) / len(series_a)
+    mean_b = sum(series_b) / len(series_b)
+
+    diff_a = [value - mean_a for value in series_a]
+    diff_b = [value - mean_b for value in series_b]
+
+    numerator = sum(a * b for a, b in zip(diff_a, diff_b))
+    denom_a = sum(value * value for value in diff_a)
+    denom_b = sum(value * value for value in diff_b)
+
+    if denom_a <= 0 or denom_b <= 0:
+        return 0.0
+
+    value = numerator / math.sqrt(denom_a * denom_b)
+    if math.isnan(value):  # pragma: no cover - defensive guard
+        return 0.0
+    return max(-1.0, min(1.0, value))
+
+
+def _compute_correlation_matrix(returns: Mapping[str, Sequence[float]]) -> Dict[str, Dict[str, float]]:
+    symbols = sorted(returns.keys())
+    if not symbols:
+        return {}
+
+    expected_length = {len(returns[symbol]) for symbol in symbols}
+    if len(expected_length) != 1:
+        raise ValueError("return series must have consistent lengths")
+
+    matrix: Dict[str, Dict[str, float]] = {}
+    for symbol_a in symbols:
+        row: Dict[str, float] = {}
+        for symbol_b in symbols:
+            if symbol_a == symbol_b:
+                row[symbol_b] = 1.0
+            else:
+                row[symbol_b] = _pearson_correlation(returns[symbol_a], returns[symbol_b])
+        matrix[symbol_a] = row
+    return matrix
+
+
 def _persist_matrix(
-    session: Session, *, timestamp: datetime, matrix: pd.DataFrame
+    session: object, *, timestamp: datetime, matrix: Mapping[str, Mapping[str, float]]
 ) -> None:
-    records: list[CorrelationRecord] = []
-    for symbol_a in matrix.columns:
-        for symbol_b in matrix.columns:
-            if symbol_a > symbol_b:
-                continue
-            value = float(matrix.at[symbol_a, symbol_b])
-            sym1, sym2 = _canonical_pair(symbol_a, symbol_b)
-            existing = session.execute(
-                select(CorrelationRecord).where(
-                    CorrelationRecord.timestamp == timestamp,
-                    CorrelationRecord.symbol1 == sym1,
-                    CorrelationRecord.symbol2 == sym2,
-                )
-            ).scalar_one_or_none()
-            if existing:
-                existing.correlation = value
-                continue
-            records.append(
-                CorrelationRecord(
-                    timestamp=timestamp,
-                    symbol1=sym1,
-                    symbol2=sym2,
-                    correlation=value,
-                )
-            )
-
-    if records:
-        session.add_all(records)
-    session.commit()
+    correlation_persistence.persist(session, timestamp=timestamp, matrix=matrix)
 
 
-def _matrix_to_nested_dict(matrix: pd.DataFrame) -> Dict[str, Dict[str, float]]:
-    nested: Dict[str, Dict[str, float]] = {}
-    for symbol, row in matrix.iterrows():
-        nested[symbol] = {col: float(row[col]) for col in matrix.columns}
-    return nested
-
-
-def _trigger_breakdown_alert(matrix: pd.DataFrame, threshold: float = 0.2) -> None:
+def _trigger_breakdown_alert(
+    matrix: Mapping[str, Mapping[str, float]], threshold: float = 0.2
+) -> None:
     symbol_a, symbol_b = "BTC-USD", "ETH-USD"
-    if symbol_a not in matrix.columns or symbol_b not in matrix.columns:
+    row = matrix.get(symbol_a)
+    if not row or symbol_b not in row:
         return
 
-    value = float(matrix.at[symbol_a, symbol_b])
+    value = float(row[symbol_b])
     if value >= threshold:
         return
 
@@ -536,37 +732,55 @@ def _trigger_breakdown_alert(matrix: pd.DataFrame, threshold: float = 0.2) -> No
 @app.get("/correlations/matrix", response_model=CorrelationMatrixResponse)
 def correlation_matrix(
     window: int = Query(30, ge=2, le=500, description="Rolling window length in observations"),
-    session: Session = Depends(get_session),
+    session: object = Depends(get_session),
 ) -> CorrelationMatrixResponse:
     symbols = _tracked_symbols()
     _ensure_market_data(symbols, window)
 
-    prices = price_store.price_frame(window)
-    if prices.empty:
+    _, prices = price_store.aligned_prices(window)
+    if not prices:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Insufficient price history to compute correlations for the requested window.",
         )
 
-    returns = _returns_from_prices(prices)
-    if returns.empty or len(returns) < 1:
+    try:
+        returns = _returns_from_prices(prices)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+
+    if not returns:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Unable to compute returns for the requested window.",
         )
 
-    correlation_matrix = returns.corr()
+    try:
+        matrix = _compute_correlation_matrix(returns)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+
+    if not matrix:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Unable to compute correlation matrix for the requested window.",
+        )
     timestamp = datetime.now(timezone.utc)
 
-    _persist_matrix(session, timestamp=timestamp, matrix=correlation_matrix)
-    _trigger_breakdown_alert(correlation_matrix)
+    _persist_matrix(session, timestamp=timestamp, matrix=matrix)
+    _trigger_breakdown_alert(matrix)
 
-    nested = _matrix_to_nested_dict(correlation_matrix)
     return CorrelationMatrixResponse(
         timestamp=timestamp,
         window=window,
-        symbols=list(correlation_matrix.columns),
-        matrix=nested,
+        symbols=list(matrix.keys()),
+        matrix={symbol: dict(row) for symbol, row in matrix.items()},
     )
 
 
