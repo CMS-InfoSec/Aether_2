@@ -3,25 +3,190 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
+from types import SimpleNamespace
 
-import numpy as np
+try:  # numpy is optional during local testing environments.
+    import numpy as np  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover - executed when numpy is unavailable.
+    np = None  # type: ignore[assignment]
+
+_SQLALCHEMY_AVAILABLE = True
+
+try:  # pragma: no cover - SQLAlchemy may be absent in lightweight environments.
+    from sqlalchemy import JSON, Column, DateTime, Integer, String, create_engine, select
+    from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.orm import Session, declarative_base, sessionmaker
+    from sqlalchemy.pool import StaticPool
+except Exception:  # pragma: no cover - executed when SQLAlchemy isn't installed.
+    _SQLALCHEMY_AVAILABLE = False
+    JSON = Column = DateTime = Integer = String = None  # type: ignore[assignment]
+    IntegrityError = RuntimeError  # type: ignore[assignment]
+    Session = Any  # type: ignore[assignment]
+    StaticPool = type("StaticPool", (), {})  # type: ignore[assignment]
+
+    def create_engine(*args: object, **kwargs: object) -> "_MemoryEngine":  # type: ignore[override]
+        return _MemoryEngine(str(args[0]) if args else str(kwargs.get("url", "memory")))
+
+    def declarative_base(*args: object, **kwargs: object) -> type:  # type: ignore[override]
+        return _MemoryBase
+
+    def sessionmaker(*, bind: object | None = None, **__: object) -> "_MemorySessionFactory":  # type: ignore[override]
+        return _MemorySessionFactory(str(getattr(bind, "_bind_key", bind)))
+
+    def select(*args: object, **kwargs: object) -> None:  # type: ignore[override]
+        raise RuntimeError("SQLAlchemy is unavailable in this environment")
+else:
+    if not getattr(select, "__module__", "").startswith("sqlalchemy"):
+        _SQLALCHEMY_AVAILABLE = False
+
+if not _SQLALCHEMY_AVAILABLE:
+    JSON = Column = DateTime = Integer = String = None  # type: ignore[assignment]
+    IntegrityError = RuntimeError  # type: ignore[assignment]
+    Session = Any  # type: ignore[assignment]
+    StaticPool = type("StaticPool", (), {})  # type: ignore[assignment]
+
+    def create_engine(*args: object, **kwargs: object) -> "_MemoryEngine":  # type: ignore[override]
+        return _MemoryEngine(str(args[0]) if args else str(kwargs.get("url", "memory")))
+
+    def declarative_base(*args: object, **kwargs: object) -> type:  # type: ignore[override]
+        return _MemoryBase
+
+    def sessionmaker(*, bind: object | None = None, **__: object) -> "_MemorySessionFactory":  # type: ignore[override]
+        return _MemorySessionFactory(str(getattr(bind, "_bind_key", bind)))
+
+    def select(*args: object, **kwargs: object) -> None:  # type: ignore[override]
+        raise RuntimeError("SQLAlchemy is unavailable in this environment")
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, model_validator
-from sqlalchemy import JSON, Column, DateTime, Integer, String, create_engine, select
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, declarative_base, sessionmaker
-from sqlalchemy.pool import StaticPool
 
 from shared.postgres import normalize_sqlalchemy_dsn
 
 DATA_PATH = Path("data/capital_opt_runs.json")
 _SQLITE_FALLBACK = "sqlite+pysqlite:///:memory:"
+
+
+class _MemoryMetadata:
+    def create_all(self, bind: object | None = None) -> None:  # pragma: no cover - noop
+        del bind
+
+
+class _MemoryBase:
+    metadata = _MemoryMetadata()
+
+
+class _MemoryEngine:
+    """Lightweight engine stand-in used when SQLAlchemy is unavailable."""
+
+    def __init__(self, url: str) -> None:
+        self._bind_key = url or "memory"
+        self._aether_url = self._bind_key
+
+    def dispose(self) -> None:  # pragma: no cover - noop
+        return None
+
+
+class _MemoryTransaction:
+    def __init__(self, session: "_MemorySession") -> None:
+        self._session = session
+
+    def __enter__(self) -> "_MemorySession":
+        return self._session
+
+    def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[override]
+        return None
+
+
+class _MemorySession:
+    """Minimal session implementation backing the in-memory repository."""
+
+    def __init__(self, store_key: str) -> None:
+        self._store_key = store_key or "memory"
+        self._bind_identifier = self._store_key
+
+    def __enter__(self) -> "_MemorySession":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[override]
+        self.close()
+
+    def begin(self) -> _MemoryTransaction:
+        return _MemoryTransaction(self)
+
+    def close(self) -> None:  # pragma: no cover - noop
+        return None
+
+    def commit(self) -> None:  # pragma: no cover - noop
+        return None
+
+    def rollback(self) -> None:  # pragma: no cover - noop
+        return None
+
+    def add(self, obj: object) -> None:  # pragma: no cover - noop
+        del obj
+
+    def flush(self) -> None:  # pragma: no cover - noop
+        return None
+
+    def execute(self, *args: object, **kwargs: object) -> SimpleNamespace:  # pragma: no cover - noop
+        return SimpleNamespace(
+            scalars=lambda: SimpleNamespace(all=lambda: []),
+            scalar_one_or_none=lambda: None,
+        )
+
+    def get(self, *args: object, **kwargs: object) -> None:  # pragma: no cover - noop
+        return None
+
+
+class _MemorySessionFactory:
+    def __init__(self, key: str | None) -> None:
+        self._key = str(key or "memory")
+
+    def __call__(self) -> _MemorySession:
+        return _MemorySession(self._key)
+
+
+@dataclass
+class _MemoryRunRecord:
+    id: int
+    run_id: str
+    method: str
+    inputs: Dict[str, object]
+    outputs: Dict[str, object]
+    ts: datetime
+
+
+_MemoryRunRecord.id = "id"  # type: ignore[assignment]
+_MemoryRunRecord.run_id = "run_id"  # type: ignore[assignment]
+_MemoryRunRecord.method = "method"  # type: ignore[assignment]
+_MemoryRunRecord.inputs = "inputs"  # type: ignore[assignment]
+_MemoryRunRecord.outputs = "outputs"  # type: ignore[assignment]
+_MemoryRunRecord.ts = "ts"  # type: ignore[assignment]
+
+
+_MEMORY_RUN_STORES: Dict[str, List[_MemoryRunRecord]] = {}
+_MEMORY_RUN_COUNTERS: Dict[str, int] = {}
+
+
+def _memory_store_key(session: Session) -> str:
+    identifier = getattr(session, "_bind_identifier", None)
+    if not identifier:
+        identifier = getattr(session, "_store_key", "memory")
+    return str(identifier or "memory")
+
+
+def _memory_store_for_session(session: Session) -> List[_MemoryRunRecord]:
+    key = _memory_store_key(session)
+    store = _MEMORY_RUN_STORES.setdefault(key, [])
+    setattr(session, "_memory_runs", store)
+    return store
 
 
 def _database_url() -> str:
@@ -83,19 +248,23 @@ SessionFactory = sessionmaker(
 Base = declarative_base()
 
 
-class CapitalOptimizationRun(Base):
-    __tablename__ = "capital_optimizer_runs"
+if _SQLALCHEMY_AVAILABLE:
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    run_id = Column(String, nullable=False, unique=True, index=True)
-    method = Column(String, nullable=False)
-    inputs = Column(JSON, nullable=False)
-    outputs = Column(JSON, nullable=False)
-    ts = Column(DateTime(timezone=True), nullable=False, index=True)
+    class CapitalOptimizationRun(Base):
+        __tablename__ = "capital_optimizer_runs"
+
+        id = Column(Integer, primary_key=True, autoincrement=True)
+        run_id = Column(String, nullable=False, unique=True, index=True)
+        method = Column(String, nullable=False)
+        inputs = Column(JSON, nullable=False)
+        outputs = Column(JSON, nullable=False)
+        ts = Column(DateTime(timezone=True), nullable=False, index=True)
 
 
-if _DB_URL.startswith("sqlite"):
-    Base.metadata.create_all(bind=_ENGINE)
+    if _DB_URL.startswith("sqlite"):
+        Base.metadata.create_all(bind=_ENGINE)
+else:
+    CapitalOptimizationRun = _MemoryRunRecord  # type: ignore[assignment]
 
 
 app = FastAPI(title="Capital Optimizer", version="1.0.0")
@@ -106,14 +275,27 @@ class RunRepository:
 
     def __init__(self, session: Session) -> None:
         self._session = session
+        self._use_memory = not _SQLALCHEMY_AVAILABLE or not hasattr(session, "execute")
 
     def latest(self) -> Optional[CapitalOptimizationRun]:
+        if self._use_memory:
+            store = _memory_store_for_session(self._session)
+            if not store:
+                return None
+            return max(store, key=lambda record: record.ts)
         stmt = (
             select(CapitalOptimizationRun)
             .order_by(CapitalOptimizationRun.ts.desc())
             .limit(1)
         )
-        return self._session.execute(stmt).scalar_one_or_none()
+        result = self._session.execute(stmt)
+        scalar_one_or_none = getattr(result, "scalar_one_or_none", None)
+        if callable(scalar_one_or_none):
+            return scalar_one_or_none()
+        scalars = getattr(result, "scalars", None)
+        if callable(scalars):
+            return scalars().first()  # type: ignore[return-value]
+        return None
 
     def create(
         self,
@@ -128,11 +310,32 @@ class RunRepository:
             timestamp = timestamp.replace(tzinfo=timezone.utc)
         else:
             timestamp = timestamp.astimezone(timezone.utc)
+        serialised_inputs = json.loads(json.dumps(inputs))
+        serialised_outputs = json.loads(json.dumps(outputs))
+        if self._use_memory:
+            store = _memory_store_for_session(self._session)
+            if any(existing.run_id == run_id for existing in store):
+                raise RuntimeError(f"Run with id '{run_id}' already exists")
+            key = _memory_store_key(self._session)
+            counter = _MEMORY_RUN_COUNTERS.get(key, 0) + 1
+            _MEMORY_RUN_COUNTERS[key] = counter
+            record = _MemoryRunRecord(
+                id=counter,
+                run_id=str(run_id),
+                method=str(method),
+                inputs=serialised_inputs,
+                outputs=serialised_outputs,
+                ts=timestamp,
+            )
+            store.append(record)
+            store.sort(key=lambda entry: entry.ts)
+            return record
+
         record = CapitalOptimizationRun(
             run_id=str(run_id),
             method=str(method),
-            inputs=json.loads(json.dumps(inputs)),
-            outputs=json.loads(json.dumps(outputs)),
+            inputs=serialised_inputs,
+            outputs=serialised_outputs,
             ts=timestamp,
         )
         self._session.add(record)
@@ -142,8 +345,21 @@ class RunRepository:
             raise RuntimeError(f"Run with id '{run_id}' already exists") from exc
         return record
 
+    def all(self) -> List[CapitalOptimizationRun | _MemoryRunRecord]:
+        if self._use_memory:
+            return list(_memory_store_for_session(self._session))
+        result = self._session.execute(select(CapitalOptimizationRun))
+        scalars = getattr(result, "scalars", None)
+        if callable(scalars):
+            return list(scalars())
+        return []
 
-def _to_allocation_result(record: CapitalOptimizationRun) -> "AllocationResult":
+    @property
+    def is_memory_backend(self) -> bool:
+        return self._use_memory
+
+
+def _to_allocation_result(record: CapitalOptimizationRun | _MemoryRunRecord) -> "AllocationResult":
     return AllocationResult(
         run_id=record.run_id,
         timestamp=record.ts,
@@ -179,9 +395,12 @@ def migrate_runs_from_file(
     with factory() as session:
         with session.begin():
             repo = RunRepository(session)
-            existing_ids = set(
-                session.execute(select(CapitalOptimizationRun.run_id)).scalars()
-            )
+            if repo.is_memory_backend:
+                existing_ids = {record.run_id for record in repo.all()}
+            else:
+                result = session.execute(select(CapitalOptimizationRun.run_id))
+                scalars = getattr(result, "scalars", None)
+                existing_ids = set(scalars()) if callable(scalars) else set()
             for raw in sorted(payload, key=lambda item: item.get("ts", "")):
                 run_id = str(raw.get("run_id", "")).strip()
                 if not run_id or run_id in existing_ids:
@@ -281,40 +500,47 @@ class AllocationResult(BaseModel):
     strategy_allocations: Mapping[str, float]
 
 
-def _compute_returns(pnl_curve: Iterable[float]) -> np.ndarray:
-    series = np.asarray(list(pnl_curve), dtype=float)
-    diffs = np.diff(series)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        baseline = series[:-1]
-        returns = np.divide(
-            diffs,
-            np.where(baseline == 0, 1.0, np.abs(baseline)),
-            out=np.zeros_like(diffs, dtype=float),
-            where=True,
-        )
+def _compute_returns(pnl_curve: Iterable[float]) -> List[float]:
+    series = [float(value) for value in pnl_curve]
+    if len(series) < 2:
+        return []
+    returns: List[float] = []
+    previous = series[0]
+    for value in series[1:]:
+        baseline = abs(previous) if previous != 0 else 1.0
+        returns.append((value - previous) / baseline)
+        previous = value
     return returns
 
 
-def _max_drawdown(curve: np.ndarray) -> float:
-    if curve.size == 0:
+def _max_drawdown(curve: Sequence[float]) -> float:
+    values = [float(value) for value in curve]
+    if not values:
         return 0.0
-    running_max = np.maximum.accumulate(curve)
-    peak = np.where(running_max == 0, 1.0, running_max)
-    drawdowns = (running_max - curve) / peak
-    return float(np.max(drawdowns))
+    running_max = values[0]
+    worst = 0.0
+    for value in values:
+        running_max = max(running_max, value)
+        peak = running_max if running_max != 0 else 1.0
+        drawdown = (running_max - value) / peak
+        if drawdown > worst:
+            worst = drawdown
+    return worst
 
 
 @dataclass(slots=True)
 class _StrategyContext:
     account_id: str
     strategy_id: str
-    returns: np.ndarray
+    returns: List[float]
     compliance_cap: float
 
 
-def _prepare_context(request: RebalanceRequest) -> Tuple[List[_StrategyContext], np.ndarray]:
+def _prepare_context(
+    request: RebalanceRequest,
+) -> Tuple[List[_StrategyContext], Sequence[Sequence[float]]]:
     contexts: List[_StrategyContext] = []
-    returns_matrix: List[np.ndarray] = []
+    returns_matrix: List[List[float]] = []
     for account in request.accounts:
         for strategy in account.strategies:
             returns = _compute_returns(strategy.pnl_curve)
@@ -322,87 +548,171 @@ def _prepare_context(request: RebalanceRequest) -> Tuple[List[_StrategyContext],
                 _StrategyContext(
                     account_id=account.account_id,
                     strategy_id=strategy.strategy_id,
-                    returns=returns,
+                    returns=list(returns),
                     compliance_cap=float(strategy.compliance_max_allocation),
                 )
             )
-            returns_matrix.append(returns)
+            returns_matrix.append(list(returns))
     if not contexts:
         raise ValueError("no strategies available for optimization")
     lengths = {len(ctx.returns) for ctx in contexts}
     if len(lengths) != 1:
         raise ValueError("all pnl_curves must have the same length across strategies")
-    matrix = np.vstack(returns_matrix)
+    if np is not None:
+        matrix: Sequence[Sequence[float]] = np.asarray(returns_matrix, dtype=float)
+    else:
+        matrix = returns_matrix
     return contexts, matrix
+
+
+def _to_list(values: Sequence[float] | Iterable[float]) -> List[float]:
+    if np is not None and isinstance(values, np.ndarray):  # type: ignore[arg-type]
+        return values.astype(float).tolist()
+    return [float(value) for value in values]
+
+
+def _from_list(values: Sequence[float], template: Sequence[float] | Iterable[float]) -> Sequence[float]:
+    if np is not None and isinstance(template, np.ndarray):  # type: ignore[arg-type]
+        return np.asarray(values, dtype=float)
+    return list(values)
+
+
+def _matrix_as_list(matrix: Sequence[Sequence[float]]) -> List[List[float]]:
+    if np is not None and isinstance(matrix, np.ndarray):  # type: ignore[arg-type]
+        return matrix.astype(float).tolist()
+    return [list(map(float, row)) for row in matrix]
+
+
+def _safe_mean(values: Sequence[float]) -> float:
+    if not values:
+        return 0.0
+    return float(sum(values) / len(values))
+
+
+def _safe_variance(values: Sequence[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    average = _safe_mean(values)
+    return float(sum((value - average) ** 2 for value in values) / len(values))
+
+
+def _percentile(values: Sequence[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(float(value) for value in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    rank = (percentile / 100.0) * (len(ordered) - 1)
+    lower = int(math.floor(rank))
+    upper = int(math.ceil(rank))
+    if lower == upper:
+        return ordered[lower]
+    weight = rank - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * weight
 
 
 def _mean_variance_optimize(
     contexts: List[_StrategyContext],
-    returns_matrix: np.ndarray,
+    returns_matrix: Sequence[Sequence[float]],
     risk_aversion: float,
     account_limits: Mapping[str, float],
-) -> np.ndarray:
-    mu = returns_matrix.mean(axis=1)
-    cov = np.cov(returns_matrix)
-    if cov.ndim == 0:
-        cov = np.array([[float(cov) + 1e-6]])
-    else:
-        cov = np.asarray(cov, dtype=float)
-        cov += np.eye(cov.shape[0]) * 1e-6
-    scaled_cov = cov * risk_aversion
-    try:
-        inv_cov = np.linalg.inv(scaled_cov)
-    except np.linalg.LinAlgError:
-        inv_cov = np.linalg.pinv(scaled_cov)
-    raw_weights = inv_cov @ mu
-    if np.allclose(raw_weights, 0.0):
-        raw_weights = np.ones_like(raw_weights)
-    weights = _project_simplex(raw_weights)
+) -> Sequence[float]:
+    if np is not None and isinstance(returns_matrix, np.ndarray):  # type: ignore[arg-type]
+        mu = returns_matrix.mean(axis=1)
+        cov = np.cov(returns_matrix)
+        if getattr(cov, "ndim", 0) == 0:
+            cov = np.array([[float(cov) + 1e-6]])
+        else:
+            cov = np.asarray(cov, dtype=float)
+            cov += np.eye(cov.shape[0]) * 1e-6
+        scaled_cov = cov * risk_aversion
+        try:
+            inv_cov = np.linalg.inv(scaled_cov)
+        except np.linalg.LinAlgError:
+            inv_cov = np.linalg.pinv(scaled_cov)
+        raw_weights = inv_cov @ mu
+        if np.allclose(raw_weights, 0.0):
+            raw_weights = np.ones_like(raw_weights)
+        weights = _project_simplex(raw_weights)
+        weights = _enforce_compliance_caps(weights, contexts)
+        weights = _enforce_account_limits(weights, contexts, returns_matrix, account_limits)
+        return weights
+
+    rows = _matrix_as_list(returns_matrix)
+    means = [_safe_mean(row) for row in rows]
+    variances = [_safe_variance(row) for row in rows]
+    epsilon = 1e-9
+    raw_scores: List[float] = []
+    for mean_value, variance in zip(means, variances):
+        penalty = variance * max(risk_aversion, epsilon) + epsilon
+        raw_scores.append(mean_value / penalty if penalty else mean_value)
+    if all(abs(score) < 1e-9 for score in raw_scores):
+        raw_scores = [1.0 for _ in raw_scores]
+    weights = _project_simplex(raw_scores)
     weights = _enforce_compliance_caps(weights, contexts)
-    weights = _enforce_account_limits(weights, contexts, returns_matrix, account_limits)
+    weights = _enforce_account_limits(weights, contexts, rows, account_limits)
     return weights
 
 
 def _cvar_optimize(
     contexts: List[_StrategyContext],
-    returns_matrix: np.ndarray,
+    returns_matrix: Sequence[Sequence[float]],
     account_limits: Mapping[str, float],
-) -> np.ndarray:
+) -> Sequence[float]:
     percentile = 5
-    tail_losses = np.percentile(returns_matrix, percentile, axis=1)
-    cvar_scores = returns_matrix.mean(axis=1) - np.abs(tail_losses)
-    if np.allclose(cvar_scores, 0.0):
-        cvar_scores = np.ones_like(cvar_scores)
+    if np is not None and isinstance(returns_matrix, np.ndarray):  # type: ignore[arg-type]
+        tail_losses = np.percentile(returns_matrix, percentile, axis=1)
+        cvar_scores = returns_matrix.mean(axis=1) - np.abs(tail_losses)
+        if np.allclose(cvar_scores, 0.0):
+            cvar_scores = np.ones_like(cvar_scores)
+        weights = _project_simplex(cvar_scores)
+        weights = _enforce_compliance_caps(weights, contexts)
+        weights = _enforce_account_limits(weights, contexts, returns_matrix, account_limits)
+        return weights
+
+    rows = _matrix_as_list(returns_matrix)
+    tail_losses = [_percentile(row, percentile) for row in rows]
+    means = [_safe_mean(row) for row in rows]
+    cvar_scores = [mean - abs(tail) for mean, tail in zip(means, tail_losses)]
+    if all(abs(score) < 1e-9 for score in cvar_scores):
+        cvar_scores = [1.0 for _ in cvar_scores]
     weights = _project_simplex(cvar_scores)
     weights = _enforce_compliance_caps(weights, contexts)
-    weights = _enforce_account_limits(weights, contexts, returns_matrix, account_limits)
+    weights = _enforce_account_limits(weights, contexts, rows, account_limits)
     return weights
 
 
-def _project_simplex(vector: np.ndarray, z: float = 1.0) -> np.ndarray:
-    v = np.asarray(vector, dtype=float)
-    if v.ndim != 1:
-        v = v.reshape(-1)
-    n = v.size
-    if n == 0:
-        return v
-    u = np.sort(v)[::-1]
-    cssv = np.cumsum(u)
-    rho = np.nonzero(u * np.arange(1, n + 1) > (cssv - z))[0]
-    if rho.size == 0:
-        theta = 0.0
-    else:
-        rho_index = rho[-1]
-        theta = (cssv[rho_index] - z) / (rho_index + 1)
-    w = np.maximum(v - theta, 0.0)
-    total = w.sum()
+def _project_simplex(
+    vector: Sequence[float] | Iterable[float], z: float = 1.0
+) -> Sequence[float]:
+    values = _to_list(vector)
+    if not values:
+        return _from_list(values, vector)
+    sorted_values = sorted(values, reverse=True)
+    cumulative: List[float] = []
+    running_total = 0.0
+    for value in sorted_values:
+        running_total += value
+        cumulative.append(running_total)
+    rho = -1
+    for index, value in enumerate(sorted_values):
+        if value * (index + 1) > (cumulative[index] - z):
+            rho = index
+    theta = (cumulative[rho] - z) / (rho + 1) if rho >= 0 else 0.0
+    projected = [max(value - theta, 0.0) for value in values]
+    total = sum(projected)
     if total <= 0:
-        return np.full_like(w, 1.0 / n)
-    return w / total
+        uniform = 1.0 / len(projected) if projected else 0.0
+        projected = [uniform for _ in projected]
+    else:
+        projected = [value / total for value in projected]
+    return _from_list(projected, vector)
 
 
-def _enforce_compliance_caps(weights: np.ndarray, contexts: List[_StrategyContext]) -> np.ndarray:
-    adjusted = weights.copy()
+def _enforce_compliance_caps(
+    weights: Sequence[float] | Iterable[float], contexts: List[_StrategyContext]
+) -> Sequence[float]:
+    adjusted = _to_list(weights)
     total = 0.0
     for idx, ctx in enumerate(contexts):
         cap = max(0.0, min(1.0, ctx.compliance_cap))
@@ -410,42 +720,53 @@ def _enforce_compliance_caps(weights: np.ndarray, contexts: List[_StrategyContex
             adjusted[idx] = cap
         total += adjusted[idx]
     if total == 0:
-        return _project_simplex(np.ones_like(adjusted))
-    return adjusted / total
+        return _from_list(_project_simplex([1.0] * len(adjusted)), weights)
+    normalised = [value / total for value in adjusted]
+    return _from_list(normalised, weights)
 
 
 def _enforce_account_limits(
-    weights: np.ndarray,
+    weights: Sequence[float] | Iterable[float],
     contexts: List[_StrategyContext],
-    returns_matrix: np.ndarray,
+    returns_matrix: Sequence[Sequence[float]],
     account_limits: Mapping[str, float],
-) -> np.ndarray:
-    adjusted = weights.copy()
+) -> Sequence[float]:
+    adjusted = _to_list(weights)
+    rows = _matrix_as_list(returns_matrix)
     updated = False
     for account_id, limit in account_limits.items():
         indices = [idx for idx, ctx in enumerate(contexts) if ctx.account_id == account_id]
         if not indices:
             continue
-        account_returns = returns_matrix[indices, :]
-        combined_returns = np.sum(adjusted[indices, None] * account_returns, axis=0)
-        pnl_curve = np.concatenate(([0.0], np.cumsum(combined_returns)))
+        if not rows:
+            continue
+        periods = len(rows[0])
+        combined_returns: List[float] = []
+        for column in range(periods):
+            total = 0.0
+            for idx in indices:
+                total += adjusted[idx] * rows[idx][column]
+            combined_returns.append(total)
+        pnl_curve = [0.0]
+        for value in combined_returns:
+            pnl_curve.append(pnl_curve[-1] + value)
         drawdown = _max_drawdown(pnl_curve)
         if drawdown > limit > 0:
-            factor = limit / drawdown
+            factor = limit / drawdown if drawdown else 0.0
             for idx in indices:
                 adjusted[idx] *= factor
             updated = True
     if updated:
-        adjusted = _project_simplex(adjusted)
-    return adjusted
+        adjusted = _to_list(_project_simplex(adjusted))
+    return _from_list(adjusted, weights)
 
 
 def _aggregate_allocations(
-    weights: np.ndarray, contexts: List[_StrategyContext]
+    weights: Sequence[float] | Iterable[float], contexts: List[_StrategyContext]
 ) -> Tuple[Dict[str, float], Dict[str, float]]:
     account_allocations: Dict[str, float] = {}
     strategy_allocations: Dict[str, float] = {}
-    for weight, ctx in zip(weights.tolist(), contexts):
+    for weight, ctx in zip(_to_list(weights), contexts):
         strategy_allocations[ctx.strategy_id] = round(float(weight), 6)
         account_allocations.setdefault(ctx.account_id, 0.0)
         account_allocations[ctx.account_id] += float(weight)

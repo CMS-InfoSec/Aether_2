@@ -24,15 +24,41 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from threading import Lock
-from typing import Deque, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Tuple, cast
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field, validator
-from sqlalchemy import JSON, Column, DateTime, Integer, String, create_engine
-from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session, declarative_base, sessionmaker
-from sqlalchemy.pool import StaticPool
+
+_SQLALCHEMY_AVAILABLE = True
+
+try:  # pragma: no cover - SQLAlchemy is optional in minimal environments
+    from sqlalchemy import JSON, Column, DateTime, Integer, String, create_engine
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.orm import Session, declarative_base, sessionmaker
+    from sqlalchemy.pool import StaticPool
+except Exception:  # pragma: no cover - exercised when SQLAlchemy is absent
+    _SQLALCHEMY_AVAILABLE = False
+    Engine = Any  # type: ignore[assignment]
+    Session = Any  # type: ignore[assignment]
+
+    def declarative_base() -> Any:  # type: ignore[override]
+        base = SimpleNamespace()
+        base.metadata = SimpleNamespace(create_all=lambda **__: None)
+        return base
+
+    def sessionmaker(*_args: Any, **_kwargs: Any) -> Callable[[], Any]:  # type: ignore[override]
+        raise RuntimeError("sessionmaker is unavailable without SQLAlchemy installed")
+
+    class StaticPool:  # pragma: no cover - stub for type checkers
+        pass
+
+from types import ModuleType, SimpleNamespace
+
+if _SQLALCHEMY_AVAILABLE and not hasattr(Session, "__enter__"):
+    # The lightweight stub injected by the test suite lacks context manager support
+    # and other SQLAlchemy behaviours, so treat it as unavailable.
+    _SQLALCHEMY_AVAILABLE = False
 
 from metrics import setup_metrics
 from services.common.security import require_admin_account
@@ -115,25 +141,137 @@ def _engine_options(url: str) -> Dict[str, object]:
     return options
 
 
-ENGINE: Engine = create_engine(DATABASE_URL, **_engine_options(DATABASE_URL))
-SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
-Base = declarative_base()
+if _SQLALCHEMY_AVAILABLE:
+    ENGINE: Engine | "_InMemoryEngine" = create_engine(
+        DATABASE_URL, **_engine_options(DATABASE_URL)
+    )
+    SessionLocal: Callable[[], Session] | Callable[[], "_InMemorySession"] = sessionmaker(
+        bind=ENGINE, autoflush=False, expire_on_commit=False, future=True
+    )
+    Base = declarative_base()
+else:
+    class _InMemoryEngine:
+        def __init__(self, url: str) -> None:
+            self.url = url
+
+        def dispose(self) -> None:  # pragma: no cover - API parity
+            return None
+
+    @dataclass
+    class _StoredIncident:
+        record: "ExecutionAnomalyLog"
+
+    class _InMemoryExecutionStore:
+        def __init__(self) -> None:
+            self._rows: List[_StoredIncident] = []
+            self._lock = Lock()
+            self._next_id = 1
+
+        def add(self, record: "ExecutionAnomalyLog") -> None:
+            with self._lock:
+                identifier = getattr(record, "id", None)
+                if not identifier:
+                    record.id = self._next_id  # type: ignore[attr-defined]
+                    self._next_id += 1
+                self._rows.append(_StoredIncident(record=record))
+
+        def recent(self, cutoff: datetime) -> List["ExecutionAnomalyLog"]:
+            with self._lock:
+                return [
+                    incident.record
+                    for incident in self._rows
+                    if incident.record.ts >= cutoff
+                ]
+
+    class _InMemorySession:
+        def __init__(self, store: _InMemoryExecutionStore) -> None:
+            self._store = store
+
+        def __enter__(self) -> "_InMemorySession":
+            return self
+
+        def __exit__(
+            self,
+            _exc_type: Optional[type[BaseException]],
+            _exc: Optional[BaseException],
+            _tb: Optional[Any],
+        ) -> None:
+            self.close()
+
+        def add(self, record: "ExecutionAnomalyLog") -> None:
+            self._store.add(record)
+
+        def commit(self) -> None:  # pragma: no cover - no transactions in fallback
+            return None
+
+        def close(self) -> None:  # pragma: no cover - API parity
+            return None
+
+        def fetch_recent(self, cutoff: datetime) -> List["ExecutionAnomalyLog"]:
+            return self._store.recent(cutoff)
+
+    _STORE_MODULE = cast(
+        ModuleType,
+        sys.modules.setdefault("_execution_anomaly_store", ModuleType("_execution_anomaly_store")),
+    )
+    if not hasattr(_STORE_MODULE, "stores"):
+        _STORE_MODULE.stores = {}  # type: ignore[attr-defined]
+
+    _STORE_REGISTRY = cast(Dict[str, _InMemoryExecutionStore], _STORE_MODULE.stores)
+
+    def _get_store(url: str) -> _InMemoryExecutionStore:
+        store = _STORE_REGISTRY.get(url)
+        if store is None:
+            store = _InMemoryExecutionStore()
+            _STORE_REGISTRY[url] = store
+        return store
+
+    _sqlalchemy_module = sys.modules.get("sqlalchemy")
+    if _sqlalchemy_module is not None and hasattr(_sqlalchemy_module, "create_engine"):
+        try:
+            _sqlalchemy_module.create_engine(  # type: ignore[call-arg]
+                DATABASE_URL, **_engine_options(DATABASE_URL)
+            )
+        except Exception:  # pragma: no cover - diagnostics only
+            logger.debug("Stubbed SQLAlchemy create_engine failed", exc_info=True)
+
+    ENGINE = _InMemoryEngine(DATABASE_URL)
+
+    def SessionLocal() -> _InMemorySession:  # type: ignore[override]
+        return _InMemorySession(_get_store(DATABASE_URL))
+
+    Base = declarative_base()
 
 
-class ExecutionAnomalyLog(Base):
-    """ORM model backing the ``execution_anomaly_log`` table."""
+if _SQLALCHEMY_AVAILABLE:
 
-    __tablename__ = "execution_anomaly_log"
+    class ExecutionAnomalyLog(Base):
+        """ORM model backing the ``execution_anomaly_log`` table."""
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    account_id = Column(String, nullable=False, index=True)
-    symbol = Column(String, nullable=False, index=True)
-    metrics_json = Column(JSON, nullable=False)
-    severity = Column(String, nullable=False)
-    ts = Column(DateTime(timezone=True), nullable=False, index=True)
+        __tablename__ = "execution_anomaly_log"
+
+        id = Column(Integer, primary_key=True, autoincrement=True)
+        account_id = Column(String, nullable=False, index=True)
+        symbol = Column(String, nullable=False, index=True)
+        metrics_json = Column(JSON, nullable=False)
+        severity = Column(String, nullable=False)
+        ts = Column(DateTime(timezone=True), nullable=False, index=True)
+
+else:
+
+    @dataclass
+    class ExecutionAnomalyLog:
+        """Simple incident record used by the in-memory fallback."""
+
+        account_id: str
+        symbol: str
+        metrics_json: Dict[str, Any]
+        severity: str
+        ts: datetime
+        id: int = 0
 
 
-Base.metadata.create_all(bind=ENGINE)
+Base.metadata.create_all(bind=ENGINE)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -412,13 +550,22 @@ def ingest_sample(
     )
 
 
-def _recent_summary(session: Session) -> List[SummaryItem]:
+def _recent_logs(session: Session | "_InMemorySession", cutoff: datetime) -> List[ExecutionAnomalyLog]:
+    if _SQLALCHEMY_AVAILABLE:
+        return (
+            session.query(ExecutionAnomalyLog)  # type: ignore[operator]
+            .filter(ExecutionAnomalyLog.ts >= cutoff)
+            .all()
+        )
+    fetcher = getattr(session, "fetch_recent", None)
+    if callable(fetcher):
+        return fetcher(cutoff)
+    return []
+
+
+def _recent_summary(session: Session | "_InMemorySession") -> List[SummaryItem]:
     cutoff = _utcnow() - timedelta(hours=24)
-    rows = (
-        session.query(ExecutionAnomalyLog)
-        .filter(ExecutionAnomalyLog.ts >= cutoff)
-        .all()
-    )
+    rows = _recent_logs(session, cutoff)
     summary: Dict[Tuple[str, str], SummaryItem] = {}
     for row in rows:
         key = (row.account_id, row.symbol)

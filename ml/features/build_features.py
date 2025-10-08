@@ -9,14 +9,95 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from functools import lru_cache
+from typing import TYPE_CHECKING, Any, Iterable, Mapping
 
-import numpy as np
-import pandas as pd
-from sqlalchemy import Column, DateTime, MetaData, String, Table, create_engine, text
-from sqlalchemy.engine import Engine
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+if TYPE_CHECKING:  # pragma: no cover - imported only for static analysis.
+    import numpy as np
+    import pandas as pd
+else:  # pragma: no cover - runtime placeholders when optional deps are absent.
+    np = None  # type: ignore[assignment]
+    pd = None  # type: ignore[assignment]
+
+
+class MissingDependencyError(RuntimeError):
+    """Raised when optional dependencies for the feature build pipeline are unavailable."""
+
+
+@lru_cache(maxsize=1)
+def _require_numpy() -> "np":
+    try:
+        import numpy as numpy_module  # type: ignore import-not-found
+    except ModuleNotFoundError as exc:  # pragma: no cover - exercised in optional-deps tests
+        raise MissingDependencyError("numpy is required for the feature build pipeline") from exc
+    return numpy_module
+
+
+@lru_cache(maxsize=1)
+def _require_pandas() -> "pd":
+    try:
+        import pandas as pandas_module  # type: ignore import-not-found
+    except ModuleNotFoundError as exc:  # pragma: no cover - exercised in optional-deps tests
+        raise MissingDependencyError("pandas is required for the feature build pipeline") from exc
+    return pandas_module
+
+
+_NUMPY: "np" | None = None
+_PANDAS: "pd" | None = None
+
+
+def _ensure_numpy() -> "np":
+    global _NUMPY
+    if _NUMPY is None:
+        _NUMPY = _require_numpy()
+    return _NUMPY
+
+
+def _ensure_pandas() -> "pd":
+    global _PANDAS
+    if _PANDAS is None:
+        _PANDAS = _require_pandas()
+    return _PANDAS
+
+
+_SQLALCHEMY_IMPORT_ERROR: BaseException | None = None
+
+try:  # pragma: no cover - SQLAlchemy is optional in lightweight environments.
+    from sqlalchemy import Column, DateTime, MetaData, String, Table, create_engine, text
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.exc import SQLAlchemyError
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+except ModuleNotFoundError as exc:  # pragma: no cover - exercised via optional-deps tests
+    _SQLALCHEMY_IMPORT_ERROR = exc
+
+    Engine = Any  # type: ignore[assignment]
+    SQLAlchemyError = Exception  # type: ignore[assignment]
+
+    def create_engine(*_args: Any, **_kwargs: Any):  # type: ignore[override]
+        raise MissingDependencyError("SQLAlchemy is required for the feature build pipeline") from exc
+
+    def text(query: str) -> str:  # type: ignore[override]
+        raise MissingDependencyError("SQLAlchemy is required for the feature build pipeline") from exc
+
+    def pg_insert(*_args: Any, **_kwargs: Any):  # type: ignore[override]
+        raise MissingDependencyError("SQLAlchemy is required for the feature build pipeline") from exc
+
+    def Column(*_args: Any, **_kwargs: Any):  # type: ignore[override]
+        raise MissingDependencyError("SQLAlchemy is required for the feature build pipeline") from exc
+
+    def DateTime(*_args: Any, **_kwargs: Any):  # type: ignore[override]
+        raise MissingDependencyError("SQLAlchemy is required for the feature build pipeline") from exc
+
+    def MetaData(*_args: Any, **_kwargs: Any):  # type: ignore[override]
+        raise MissingDependencyError("SQLAlchemy is required for the feature build pipeline") from exc
+
+    def String(*_args: Any, **_kwargs: Any):  # type: ignore[override]
+        raise MissingDependencyError("SQLAlchemy is required for the feature build pipeline") from exc
+
+    def Table(*_args: Any, **_kwargs: Any):  # type: ignore[override]
+        raise MissingDependencyError("SQLAlchemy is required for the feature build pipeline") from exc
+else:  # pragma: no cover - when SQLAlchemy is available.
+    _SQLALCHEMY_IMPORT_ERROR = None
 
 try:  # Optional dependency
     from feast import FeatureStore
@@ -49,6 +130,11 @@ ENTITY_COLUMN = os.getenv("FEATURE_ENTITY_COLUMN", "market")
 EVENT_TIMESTAMP_COLUMN = os.getenv("FEATURE_EVENT_TIMESTAMP", "event_timestamp")
 CREATED_AT_COLUMN = os.getenv("FEATURE_CREATED_AT", "created_at")
 FEATURE_VERSION_TABLE = os.getenv("FEATURE_VERSION_TABLE", "feature_versions")
+
+
+def _require_sqlalchemy() -> None:
+    if _SQLALCHEMY_IMPORT_ERROR is not None:  # pragma: no cover - exercised in optional-deps tests
+        raise MissingDependencyError("SQLAlchemy is required for the feature build pipeline") from _SQLALCHEMY_IMPORT_ERROR
 
 
 @dataclass(frozen=True)
@@ -97,28 +183,32 @@ def _parse_optional_ts(raw: str | None) -> datetime | None:
     return parsed
 
 
-def _granularity_to_timedelta(granularity: str) -> pd.Timedelta:
+def _granularity_to_timedelta(granularity: str) -> "pd.Timedelta":
+    pandas = _ensure_pandas()
     try:
-        delta = pd.to_timedelta(granularity)
+        delta = pandas.to_timedelta(granularity)
     except ValueError:
         LOGGER.warning("Unable to parse granularity '%s'; defaulting to 1 minute", granularity)
-        return pd.Timedelta("1min")
-    if delta <= pd.Timedelta(0):
+        return pandas.Timedelta("1min")
+    if delta <= pandas.Timedelta(0):
         LOGGER.warning("Non-positive granularity '%s'; defaulting to 1 minute", granularity)
-        return pd.Timedelta("1min")
+        return pandas.Timedelta("1min")
     return delta
 
 
 def _resolve_engine() -> Engine:
+    _require_sqlalchemy()
     LOGGER.debug("Connecting to TimescaleDB using %s", DEFAULT_DATABASE_URL)
     return create_engine(DEFAULT_DATABASE_URL)
 
 
 def _load_dataframe(engine: Engine, stmt: Any, params: Mapping[str, object]) -> pd.DataFrame:
+    _require_sqlalchemy()
+    pandas = _ensure_pandas()
     try:
         with engine.connect() as connection:
             result = connection.execute(stmt, params)
-            df = pd.DataFrame(result.fetchall(), columns=result.keys())
+            df = pandas.DataFrame(result.fetchall(), columns=result.keys())
     except SQLAlchemyError as exc:  # pragma: no cover - database failure
         raise RuntimeError("Failed to fetch data from TimescaleDB") from exc
     if df.empty:
@@ -134,6 +224,7 @@ def _fetch_ohlcv(
     start: datetime | None,
     end: datetime | None,
 ) -> pd.DataFrame:
+    pandas = _ensure_pandas()
     query = text(
         f"""
         SELECT
@@ -156,7 +247,7 @@ def _fetch_ohlcv(
     frame = _load_dataframe(engine, query, params)
     if frame.empty:
         return frame
-    frame[EVENT_TIMESTAMP_COLUMN] = pd.to_datetime(frame[EVENT_TIMESTAMP_COLUMN], utc=True)
+    frame[EVENT_TIMESTAMP_COLUMN] = pandas.to_datetime(frame[EVENT_TIMESTAMP_COLUMN], utc=True)
     frame = frame.set_index(EVENT_TIMESTAMP_COLUMN).sort_index()
     return frame
 
@@ -169,6 +260,7 @@ def _fetch_microstructure(
     start: datetime | None,
     end: datetime | None,
 ) -> pd.DataFrame:
+    pandas = _ensure_pandas()
     query = text(
         f"""
         SELECT
@@ -192,26 +284,28 @@ def _fetch_microstructure(
     frame = _load_dataframe(engine, query, params)
     if frame.empty:
         return frame
-    frame[EVENT_TIMESTAMP_COLUMN] = pd.to_datetime(frame[EVENT_TIMESTAMP_COLUMN], utc=True)
+    frame[EVENT_TIMESTAMP_COLUMN] = pandas.to_datetime(frame[EVENT_TIMESTAMP_COLUMN], utc=True)
     frame = frame.set_index(EVENT_TIMESTAMP_COLUMN).sort_index()
     return frame
 
 
 def _compute_technical_features(ohlcv: pd.DataFrame) -> pd.DataFrame:
+    pandas = _ensure_pandas()
+    numpy = _ensure_numpy()
     if ohlcv.empty:
-        return pd.DataFrame()
+        return pandas.DataFrame()
 
-    features = pd.DataFrame(index=ohlcv.index)
+    features = pandas.DataFrame(index=ohlcv.index)
     close = ohlcv["close"]
     high = ohlcv["high"]
     low = ohlcv["low"]
-    volume = ohlcv["volume"].replace(0, np.nan)
+    volume = ohlcv["volume"].replace(0, numpy.nan)
 
     for window in (1, 5, 15):
         features[f"momentum_{window}"] = close.pct_change(window)
 
     prev_close = close.shift(1)
-    tr_components = pd.concat([
+    tr_components = pandas.concat([
         (high - low),
         (high - prev_close).abs(),
         (low - prev_close).abs(),
@@ -219,10 +313,10 @@ def _compute_technical_features(ohlcv: pd.DataFrame) -> pd.DataFrame:
     true_range = tr_components.max(axis=1)
     features["atr_14"] = true_range.rolling(window=14, min_periods=1).mean()
 
-    log_returns = np.log(close).diff().fillna(0.0)
+    log_returns = numpy.log(close).diff().fillna(0.0)
     window = 30
     features["realized_vol_30"] = log_returns.rolling(window=window, min_periods=5).apply(
-        lambda vals: float(np.sqrt(np.sum(vals**2))), raw=True
+        lambda vals: float(numpy.sqrt(numpy.sum(vals**2))), raw=True
     )
 
     rolling_mean = close.rolling(window=20, min_periods=5).mean()
@@ -234,7 +328,7 @@ def _compute_technical_features(ohlcv: pd.DataFrame) -> pd.DataFrame:
     losses = -delta.clip(upper=0.0)
     avg_gain = gains.rolling(window=14, min_periods=14).mean()
     avg_loss = losses.rolling(window=14, min_periods=14).mean()
-    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    rs = avg_gain / avg_loss.replace(0.0, numpy.nan)
     features["rsi_14"] = 100 - (100 / (1 + rs))
 
     ema_fast = close.ewm(span=12, adjust=False).mean()
@@ -253,7 +347,7 @@ def _compute_technical_features(ohlcv: pd.DataFrame) -> pd.DataFrame:
         vwap = (typical_price * volume).cumsum() / cumulative_volume
     features["vwap_divergence"] = close - vwap
 
-    features.replace([-np.inf, np.inf], np.nan, inplace=True)
+    features.replace([-numpy.inf, numpy.inf], numpy.nan, inplace=True)
     return features
 
 
@@ -262,36 +356,38 @@ def _compute_microstructure_features(
     ohlcv: pd.DataFrame,
     tolerance: pd.Timedelta,
 ) -> pd.DataFrame:
+    pandas = _ensure_pandas()
+    numpy = _ensure_numpy()
     if micro.empty:
-        index = ohlcv.index if not ohlcv.empty else pd.Index([], name=EVENT_TIMESTAMP_COLUMN)
-        return pd.DataFrame(
+        index = ohlcv.index if not ohlcv.empty else pandas.Index([], name=EVENT_TIMESTAMP_COLUMN)
+        return pandas.DataFrame(
             index=index,
             data={
-                "trade_count": np.nan,
-                "order_imbalance": np.nan,
-                "volume_imbalance": np.nan,
-                "avg_trade_size": np.nan,
-                "vwap_micro_divergence": np.nan,
+                "trade_count": numpy.nan,
+                "order_imbalance": numpy.nan,
+                "volume_imbalance": numpy.nan,
+                "avg_trade_size": numpy.nan,
+                "vwap_micro_divergence": numpy.nan,
             },
         )
 
     features = micro.copy()
     if "trade_count" not in features:
-        features["trade_count"] = np.nan
-    buy_volume = features.get("buy_volume", pd.Series(index=features.index, dtype=float))
-    sell_volume = features.get("sell_volume", pd.Series(index=features.index, dtype=float))
+        features["trade_count"] = numpy.nan
+    buy_volume = features.get("buy_volume", pandas.Series(index=features.index, dtype=float))
+    sell_volume = features.get("sell_volume", pandas.Series(index=features.index, dtype=float))
     features["total_volume"] = buy_volume.add(sell_volume, fill_value=0.0)
     net_volume = buy_volume.sub(sell_volume, fill_value=0.0)
-    features["order_imbalance"] = net_volume.divide(features["total_volume"].replace(0.0, np.nan))
+    features["order_imbalance"] = net_volume.divide(features["total_volume"].replace(0.0, numpy.nan))
     features["volume_imbalance"] = net_volume
     if "avg_trade_size" not in features or features["avg_trade_size"].isna().all():
-        features["avg_trade_size"] = features["total_volume"].divide(features["trade_count"].replace(0, np.nan))
+        features["avg_trade_size"] = features["total_volume"].divide(features["trade_count"].replace(0, numpy.nan))
 
     if "trade_vwap" in features:
-        price_reference = ohlcv["close"].reindex(features.index, method="nearest") if not ohlcv.empty else np.nan
+        price_reference = ohlcv["close"].reindex(features.index, method="nearest") if not ohlcv.empty else numpy.nan
         features["vwap_micro_divergence"] = price_reference - features["trade_vwap"]
     else:
-        features["vwap_micro_divergence"] = np.nan
+        features["vwap_micro_divergence"] = numpy.nan
 
     projected = features[[
         "trade_count",
@@ -300,7 +396,7 @@ def _compute_microstructure_features(
         "avg_trade_size",
         "vwap_micro_divergence",
     ]].copy()
-    projected.replace([-np.inf, np.inf], np.nan, inplace=True)
+    projected.replace([-numpy.inf, numpy.inf], numpy.nan, inplace=True)
     if not ohlcv.empty:
         projected = projected.reindex(ohlcv.index, method="nearest", tolerance=tolerance)
     return projected
@@ -313,14 +409,15 @@ def _combine_features(
     technical: pd.DataFrame,
     micro: pd.DataFrame,
 ) -> pd.DataFrame:
+    pandas = _ensure_pandas()
     if ohlcv.empty or technical.empty:
         LOGGER.warning("Skipping symbol %s due to insufficient OHLCV data", symbol)
-        return pd.DataFrame()
+        return pandas.DataFrame()
 
     combined = technical.join(micro, how="left")
     combined.reset_index(inplace=True)
     combined[ENTITY_COLUMN] = symbol
-    combined[CREATED_AT_COLUMN] = pd.Timestamp.now(tz=timezone.utc)
+    combined[CREATED_AT_COLUMN] = pandas.Timestamp.now(tz=timezone.utc)
     combined["feature_version"] = version
     ordered_cols = [EVENT_TIMESTAMP_COLUMN, ENTITY_COLUMN, CREATED_AT_COLUMN, "feature_version"] + [
         col for col in combined.columns
@@ -342,6 +439,7 @@ def _write_to_feast(store: FeatureStore | None, feature_view: str, frame: pd.Dat
 
 
 def _ensure_version_table(engine: Engine) -> Table:
+    _require_sqlalchemy()
     metadata = MetaData()
     table = Table(
         FEATURE_VERSION_TABLE,
@@ -355,6 +453,7 @@ def _ensure_version_table(engine: Engine) -> Table:
 
 
 def _record_version(engine: Engine, table: Table, version: str, changelog: str) -> None:
+    _require_sqlalchemy()
     LOGGER.info("Recording feature version %s", version)
     created_at = datetime.now(timezone.utc)
     stmt = pg_insert(table).values(version=version, created_at=created_at, changelog=changelog)
@@ -438,6 +537,7 @@ def _run_expectations(frame: pd.DataFrame, *, version: str) -> None:
 
 
 def materialise_features(config: FeatureBuildConfig) -> pd.DataFrame:
+    pandas = _ensure_pandas()
     config.validate()
     engine = _resolve_engine()
     feature_store = (
@@ -446,7 +546,7 @@ def materialise_features(config: FeatureBuildConfig) -> pd.DataFrame:
         else None
     )
 
-    frames: list[pd.DataFrame] = []
+    frames: list[pandas.DataFrame] = []
     tolerance = _granularity_to_timedelta(config.granularity)
     for symbol in config.symbols:
         LOGGER.info("Processing %s", symbol)
@@ -466,9 +566,9 @@ def materialise_features(config: FeatureBuildConfig) -> pd.DataFrame:
 
     if not frames:
         LOGGER.warning("No features computed for requested symbols")
-        return pd.DataFrame()
+        return pandas.DataFrame()
 
-    combined = pd.concat(frames, ignore_index=True)
+    combined = pandas.concat(frames, ignore_index=True)
     combined.sort_values(by=[EVENT_TIMESTAMP_COLUMN, ENTITY_COLUMN], inplace=True)
 
     _run_expectations(combined, version=config.version)
