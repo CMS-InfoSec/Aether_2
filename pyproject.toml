@@ -91,7 +91,6 @@ minversion = "7.0"
 addopts = "-ra"
 testpaths = ["tests"]
 
-asyncio_mode = "auto"
 markers = [
     "unit: unit test suite",
     "integration: integration test suite",
