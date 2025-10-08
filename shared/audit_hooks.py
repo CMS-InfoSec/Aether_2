@@ -339,6 +339,48 @@ class AuditEvent:
 
         return replace(self, context=None, context_factory=context_factory)
 
+    def with_fallback_extra(
+        self,
+        fallback_extra: Optional[Mapping[str, Any]],
+        *,
+        merge: bool = True,
+    ) -> "AuditEvent":
+        """Return a copy of the event with updated fallback metadata."""
+
+        if fallback_extra is None:
+            if merge:
+                return self
+            return replace(self, fallback_extra=None)
+
+        if not merge or self.fallback_extra is None:
+            return replace(self, fallback_extra=fallback_extra)
+
+        merged_extra = dict(self.fallback_extra)
+        merged_extra.update(fallback_extra)
+        return replace(self, fallback_extra=merged_extra)
+
+    def with_fallback_extra_factory(
+        self,
+        fallback_extra_factory: FallbackExtraFactory | None,
+        *,
+        preserve_fallback_extra: bool = False,
+    ) -> "AuditEvent":
+        """Return a copy of the event with an updated fallback extra factory."""
+
+        if fallback_extra_factory is self.fallback_extra_factory:
+            if preserve_fallback_extra or self.fallback_extra is None:
+                return self
+            return replace(self, fallback_extra=None)
+
+        if preserve_fallback_extra:
+            return replace(self, fallback_extra_factory=fallback_extra_factory)
+
+        return replace(
+            self,
+            fallback_extra=None,
+            fallback_extra_factory=fallback_extra_factory,
+        )
+
     def _resolve_context_internal(
         self,
         *,

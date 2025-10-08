@@ -1684,6 +1684,102 @@ def test_audit_event_with_context_factory_optionally_preserves_context():
     assert cleared.context is None
 
 
+def test_audit_event_with_fallback_extra_merges_without_mutating_original():
+    original_extra = {"existing": True, "audit": {"hash_fallback": False}}
+    event = audit_hooks.AuditEvent(
+        actor="mina",
+        action="demo.fallback.merge",
+        entity="resource",
+        before={},
+        after={},
+        fallback_extra=original_extra,
+    )
+
+    merged = event.with_fallback_extra({"extra": "value"})
+
+    assert merged is not event
+    assert merged.fallback_extra is not original_extra
+    assert merged.fallback_extra == {
+        "existing": True,
+        "audit": {"hash_fallback": False},
+        "extra": "value",
+    }
+    assert event.fallback_extra is original_extra
+    assert event.fallback_extra == {"existing": True, "audit": {"hash_fallback": False}}
+
+
+def test_audit_event_with_fallback_extra_replaces_or_clears():
+    event = audit_hooks.AuditEvent(
+        actor="nate",
+        action="demo.fallback.replace",
+        entity="resource",
+        before={},
+        after={},
+        fallback_extra={"initial": True},
+    )
+
+    replaced = event.with_fallback_extra({"replacement": True}, merge=False)
+    assert replaced.fallback_extra == {"replacement": True}
+
+    cleared = replaced.with_fallback_extra(None, merge=False)
+    assert cleared.fallback_extra is None
+
+    unchanged = event.with_fallback_extra(None)
+    assert unchanged is event
+
+
+def test_audit_event_with_fallback_extra_factory_clears_extra_by_default():
+    def original_factory() -> Mapping[str, str]:
+        return {"factory": "original"}
+
+    def new_factory() -> Mapping[str, str]:
+        return {"factory": "new"}
+
+    event = audit_hooks.AuditEvent(
+        actor="olga",
+        action="demo.fallback.factory",
+        entity="resource",
+        before={},
+        after={},
+        fallback_extra={"cached": True},
+        fallback_extra_factory=original_factory,
+    )
+
+    updated = event.with_fallback_extra_factory(new_factory)
+
+    assert updated is not event
+    assert updated.fallback_extra is None
+    assert updated.fallback_extra_factory is new_factory
+    assert event.fallback_extra == {"cached": True}
+    assert event.fallback_extra_factory is original_factory
+
+
+def test_audit_event_with_fallback_extra_factory_optionally_preserves_extra():
+    def factory() -> Mapping[str, str]:
+        return {"factory": "value"}
+
+    event = audit_hooks.AuditEvent(
+        actor="pilar",
+        action="demo.fallback.factory.preserve",
+        entity="resource",
+        before={},
+        after={},
+        fallback_extra={"cached": True},
+        fallback_extra_factory=None,
+    )
+
+    preserved = event.with_fallback_extra_factory(factory, preserve_fallback_extra=True)
+
+    assert preserved.fallback_extra_factory is factory
+    assert preserved.fallback_extra == {"cached": True}
+
+    same = preserved.with_fallback_extra_factory(factory, preserve_fallback_extra=True)
+    assert same is preserved
+
+    cleared = preserved.with_fallback_extra_factory(factory)
+    assert cleared.fallback_extra is None
+
+
 def test_audit_event_resolve_context_reuses_stored_mapping():
     context = {"source": "stored"}
     event = audit_hooks.AuditEvent(
