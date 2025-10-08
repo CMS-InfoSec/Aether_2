@@ -649,8 +649,16 @@ def register(
         log_store=log_store,
     )
     _RECONCILER = reconciler
-    app.add_event_handler("startup", reconciler.start)
-    app.add_event_handler("shutdown", reconciler.stop)
+    for event, handler in (("startup", reconciler.start), ("shutdown", reconciler.stop)):
+        register = getattr(app, "add_event_handler", None)
+        if callable(register):
+            register(event, handler)
+            continue
+        on_event = getattr(app, "on_event", None)
+        if callable(on_event):
+            decorator = on_event(event)
+            if callable(decorator):  # pragma: no branch - defensive
+                decorator(handler)
     app.include_router(router)
     return reconciler
 

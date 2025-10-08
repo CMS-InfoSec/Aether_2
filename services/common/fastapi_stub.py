@@ -61,6 +61,7 @@ __all__ = [
     "StreamingResponse",
     "UploadFile",
     "status",
+    "request_validation_exception_handler",
 ]
 
 
@@ -424,6 +425,25 @@ class FastAPI:
             return func
 
         return decorator
+
+
+async def request_validation_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Return a JSON response mirroring FastAPI's validation error payload."""
+
+    if isinstance(exc, RequestValidationError):
+        errors = exc.errors
+    elif hasattr(exc, "errors"):
+        try:
+            errors = exc.errors()  # type: ignore[call-arg]
+        except Exception:  # pragma: no cover - defensive fallback
+            errors = getattr(exc, "errors", [])  # type: ignore[attr-defined]
+    else:
+        errors = [{"msg": str(exc)}]
+
+    return JSONResponse(
+        {"detail": list(errors)},
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+    )
 
 
 status = SimpleNamespace(
