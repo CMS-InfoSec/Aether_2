@@ -161,7 +161,19 @@ if _SQLALCHEMY_AVAILABLE:
     class OhlcvBar(OhlcvBase):
         """Minimal OHLCV representation backed by the historical bars table."""
 
-        __tablename__ = "ohlcv_bars"
+if TYPE_CHECKING:
+    class _DeclarativeBase:
+        """Typed stub mirroring SQLAlchemy's declarative base attributes."""
+
+        metadata: Any
+        registry: Any
+
+
+    OhlcvBase = _DeclarativeBase
+    MetricsBase = _DeclarativeBase
+else:  # pragma: no cover - runtime declarative bases when SQLAlchemy is available
+    OhlcvBase = declarative_base()
+    MetricsBase = declarative_base()
 
         market = Column(String, primary_key=True)
         bucket_start = Column(DateTime(timezone=True), primary_key=True)
@@ -547,9 +559,8 @@ def _dispose_database(application: FastAPI) -> None:
     global SessionLocal
 
     engine = getattr(application.state, ENGINE_STATE_KEY, None)
-    dispose = getattr(engine, "dispose", None)
-    if callable(dispose):
-        dispose()
+    if isinstance(engine, Engine):
+        engine.dispose()
 
     for key in (ENGINE_STATE_KEY, SESSIONMAKER_STATE_KEY):
         if hasattr(application.state, key):

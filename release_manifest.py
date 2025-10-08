@@ -247,6 +247,12 @@ DEFAULT_MANIFEST_MARKDOWN = Path("release_manifest_current.md")
 if _SQLALCHEMY_AVAILABLE:
     Base = declarative_base()
 
+
+class Base(DeclarativeBase):
+    """Declarative base for the release manifest ORM model."""
+
+    pass
+
     class ReleaseManifest(Base):
         """ORM model for persisted release manifests."""
 

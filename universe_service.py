@@ -191,12 +191,6 @@ else:  # pragma: no cover - runtime base when SQLAlchemy is available
             metadata: Any
             registry: Any
 
-        metadata: Any  # pragma: no cover - provided by SQLAlchemy
-        registry: Any  # pragma: no cover - provided by SQLAlchemy
-else:  # pragma: no cover - runtime base when SQLAlchemy is available
-    try:
-        from sqlalchemy.orm import declarative_base
-
 if SQLALCHEMY_AVAILABLE:
 
 if SQLALCHEMY_AVAILABLE:
