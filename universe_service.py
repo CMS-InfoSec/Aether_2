@@ -15,67 +15,92 @@ import os
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from threading import RLock
-from typing import Any, Dict, Iterable, Iterator, List, MutableMapping, Optional, Tuple
-
-try:  # pragma: no cover - requests is optional during local testing
-    import requests  # type: ignore[import-not-found]
-except ModuleNotFoundError:  # pragma: no cover - degrade when requests missing
-    requests = None  # type: ignore[assignment]
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+    TypeVar,
+    cast,
+)
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
-from pydantic import BaseModel, Field
+from shared.pydantic_compat import BaseModel, Field
+from shared.postgres import normalize_sqlalchemy_dsn
 
-try:  # pragma: no cover - SQLAlchemy is optional in lightweight environments
-    from sqlalchemy import JSON, Boolean, Column, DateTime, Integer, String, create_engine, select
+if TYPE_CHECKING:  # pragma: no cover - typing only imports
+    from sqlalchemy import JSON, Boolean, DateTime, Integer, String, create_engine, select
     from sqlalchemy.engine import Engine
     from sqlalchemy.exc import SQLAlchemyError
-    from sqlalchemy.orm import Session, declarative_base, sessionmaker
-    from sqlalchemy.pool import StaticPool
-    SQLALCHEMY_AVAILABLE = True
-except ModuleNotFoundError:  # pragma: no cover - allow import without SQLAlchemy
-    JSON = Boolean = Column = DateTime = Integer = String = object  # type: ignore[assignment]
+    from sqlalchemy.orm import DeclarativeBase, Mapped, Session
+    from sqlalchemy.orm import mapped_column as mapped_column
+    from sqlalchemy.orm import sessionmaker as Sessionmaker
+    from sqlalchemy.orm import sessionmaker as sessionmaker
+    from sqlalchemy.sql import Select
+else:  # pragma: no cover - runtime imports with graceful fallbacks
+    try:
+        from sqlalchemy import JSON, Boolean, DateTime, Integer, String, create_engine, select
+        from sqlalchemy.engine import Engine
+        from sqlalchemy.exc import SQLAlchemyError
+        from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
+        from sqlalchemy.sql import Select
+    except Exception:  # pragma: no cover - degraded runtime behaviour without SQLAlchemy
+        JSON = Boolean = DateTime = Integer = String = object  # type: ignore[assignment]
 
-    class Engine:  # type: ignore[override]
-        """Placeholder to satisfy type annotations when SQLAlchemy is absent."""
+        class SQLAlchemyError(Exception):
+            """Fallback error raised when SQLAlchemy is unavailable."""
 
-    class SQLAlchemyError(Exception):  # type: ignore[override]
-        pass
+        class DeclarativeBase:  # pragma: no cover - runtime stub
+            metadata: Any
+            registry: Any
 
-    class StaticPool:  # type: ignore[override]
-        pass
+        class Session:  # pragma: no cover - runtime stub
+            def execute(self, *_: Any, **__: Any) -> Any:
+                raise RuntimeError("sqlalchemy is required to use the universe service")
 
-    Session = "InMemorySession"  # type: ignore[assignment]
+            def get(self, *_: Any, **__: Any) -> Any:
+                raise RuntimeError("sqlalchemy is required to use the universe service")
 
-    def declarative_base() -> type:  # type: ignore[override]
-        class _Metadata:
-            def create_all(self, bind: Any = None) -> None:  # pragma: no cover - noop fallback
-                del bind
+            def add(self, *_: Any, **__: Any) -> None:
+                raise RuntimeError("sqlalchemy is required to use the universe service")
 
-            def drop_all(self, bind: Any = None) -> None:  # pragma: no cover - noop fallback
-                del bind
+            def commit(self) -> None:
+                raise RuntimeError("sqlalchemy is required to use the universe service")
 
-        return type("Base", (), {"metadata": _Metadata()})
+            def close(self) -> None:
+                raise RuntimeError("sqlalchemy is required to use the universe service")
 
-    create_engine = None  # type: ignore[assignment]
-    sessionmaker = None  # type: ignore[assignment]
-    select = None  # type: ignore[assignment]
-    SQLALCHEMY_AVAILABLE = False
+        class Mapped(Protocol[Any]):  # pragma: no cover - typing shim
+            def desc(self) -> Any:
+                ...
 
+        def mapped_column(*_: Any, **__: Any) -> Any:
+            raise RuntimeError("sqlalchemy is required to use the universe service")
 
-if SQLALCHEMY_AVAILABLE:
-    USE_SQLALCHEMY = bool(create_engine and sessionmaker and select)
-    if USE_SQLALCHEMY:
-        try:  # pragma: no cover - safety when stubs are installed
-            _probe = select(1)
-            USE_SQLALCHEMY = hasattr(_probe, "where")
-        except Exception:
-            USE_SQLALCHEMY = False
-else:
-    USE_SQLALCHEMY = False
+        def sessionmaker(*_: Any, **__: Any) -> Callable[..., Session]:
+            raise RuntimeError("sqlalchemy is required to use the universe service")
 
-if not USE_SQLALCHEMY:
-    SQLALCHEMY_AVAILABLE = False
+        def create_engine(*_: Any, **__: Any) -> Any:
+            raise RuntimeError("sqlalchemy is required to use the universe service")
+
+        def select(*_: Any, **__: Any) -> Any:
+            raise RuntimeError("sqlalchemy is required to use the universe service")
+
+        Engine = Any  # type: ignore[assignment]
+        Select = Any  # type: ignore[assignment]
+
+    from sqlalchemy.orm import sessionmaker  # type: ignore[assignment]
+    from sqlalchemy.orm import mapped_column  # type: ignore[assignment]
+
+from sqlalchemy.pool import StaticPool
 
 from services.common.security import require_admin_account
 
@@ -160,9 +185,6 @@ def _database_url() -> str:
     return normalized
 
 
-_DB_URL = _database_url()
-
-
 def _engine_options(url: str) -> dict[str, object]:
     options: dict[str, object] = {"future": True}
     if url.startswith("sqlite://"):
@@ -197,6 +219,36 @@ else:  # pragma: no cover - runtime base when SQLAlchemy is available
     try:
         from sqlalchemy.orm import declarative_base
 
+        Base = declarative_base()
+        Base.__doc__ = "Declarative base for the local universe service models."
+    except Exception:  # pragma: no cover - degraded runtime base without SQLAlchemy
+        class Base:  # type: ignore[too-many-ancestors]
+            """Fallback base exposing SQLAlchemy attributes when SQLAlchemy is absent."""
+
+            metadata: Any
+            registry: Any
+
+    if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
+        __table__: Any
+
+        def __init__(
+            self,
+            *,
+            symbol: str,
+            enabled: bool = ...,
+            metrics_json: Dict[str, float] | None = ...,
+            ts: datetime | None = ...,
+        ) -> None: ...
+
+    symbol: Mapped[str] = mapped_column(String, primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    metrics_json: Mapped[Dict[str, float]] = mapped_column(
+        JSON, nullable=False, default=_default_metrics
+    )
+    ts: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+    )
+
 if SQLALCHEMY_AVAILABLE:
 
 if SQLALCHEMY_AVAILABLE:
@@ -204,14 +256,25 @@ if SQLALCHEMY_AVAILABLE:
     class UniverseWhitelist(Base):
         """SQLAlchemy model storing the computed trading universe."""
 
-        __tablename__ = "universe_whitelist"
+    if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
+        __table__: Any
 
-        symbol: str = Column(String, primary_key=True)
-        enabled: bool = Column(Boolean, nullable=False, default=True)
-        metrics_json: Dict[str, float] = Column(JSON, nullable=False, default=dict)
-        ts: datetime = Column(
-            DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
-        )
+        def __init__(
+            self,
+            *,
+            symbol: str,
+            enabled: bool,
+            reason: str,
+            created_at: datetime | None = ...,
+        ) -> None: ...
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    reason: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+    )
 
 
     class AuditLog(Base):
@@ -241,83 +304,10 @@ else:
     class UniverseWhitelist:  # type: ignore[no-redef]
         """In-memory representation of the computed trading universe."""
 
-        symbol: str
-        enabled: bool = True
-        metrics_json: Dict[str, float] = field(default_factory=dict)
-        ts: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-
-
-    @dataclass
-    class AuditLog:  # type: ignore[no-redef]
-        """In-memory audit record for manual overrides."""
-
-        symbol: str
-        enabled: bool
-        reason: str
-        id: Optional[int] = None
-        created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-
-
-    _IN_MEMORY_UNIVERSE: MutableMapping[str, UniverseWhitelist] = {}
-    _IN_MEMORY_AUDIT_LOG: List[AuditLog] = []
-    _IN_MEMORY_LOCK = RLock()
-    _NEXT_AUDIT_ID = 1
-
-    class InMemorySession:
-        """Tiny transactional layer mimicking the SQLAlchemy session API."""
-
-        def __init__(self) -> None:
-            self._closed = False
-            self._lock = _IN_MEMORY_LOCK
-            self._lock.acquire()
-
-        # ------------------------------------------------------------------
-        # Context manager support
-        # ------------------------------------------------------------------
-        def __enter__(self) -> "InMemorySession":
-            return self
-
-        def __exit__(self, exc_type, exc, tb) -> None:  # pragma: no cover - no exceptions expected
-            self.close()
-
-        # ------------------------------------------------------------------
-        # Session API
-        # ------------------------------------------------------------------
-        def close(self) -> None:
-            if not self._closed:
-                self._closed = True
-                self._lock.release()
-
-        def get(self, model: Any, key: Any) -> Optional[Any]:
-            if model is UniverseWhitelist:
-                return _IN_MEMORY_UNIVERSE.get(str(key).upper())
-            return None
-
-        def add(self, instance: Any) -> None:
-            global _NEXT_AUDIT_ID
-            if isinstance(instance, UniverseWhitelist):
-                _IN_MEMORY_UNIVERSE[instance.symbol.upper()] = instance
-            elif isinstance(instance, AuditLog):
-                if instance.id is None:  # pragma: no cover - defensive
-                    instance.id = _NEXT_AUDIT_ID
-                    _NEXT_AUDIT_ID += 1
-                else:
-                    _NEXT_AUDIT_ID = max(_NEXT_AUDIT_ID, instance.id + 1)
-                _IN_MEMORY_AUDIT_LOG.append(instance)
-
-        def commit(self) -> None:  # pragma: no cover - commits are implicit
-            return None
-
-        def __del__(self) -> None:  # pragma: no cover - ensure locks are released
-            self.close()
-
-    Engine = Engine  # type: ignore[assignment]
-    Session = InMemorySession  # type: ignore[assignment]
-
-    def SessionLocal() -> InMemorySession:  # type: ignore[override]
-        return InMemorySession()
-
-    ENGINE = None
+ENGINE = _create_engine()
+SessionLocal: "Sessionmaker[Session]" = sessionmaker(
+    bind=ENGINE, autoflush=False, expire_on_commit=False, future=True
+)
 
 
 def get_session() -> Iterator[Session]:
@@ -416,18 +406,15 @@ def fetch_coingecko_market_data() -> Dict[str, Dict[str, float]]:
     the uppercase asset symbol.
     """
 
-    if requests is None:  # pragma: no cover - exercised when dependency missing
-        LOGGER.info("requests is unavailable; using static CoinGecko sample data")
-        return dict(_STATIC_COINGECKO_DATA)
-
-    url = "https://api.coingecko.com/api/v3/coins/markets"
-    params = {
-        "vs_currency": "usd",
-        "order": "market_cap_desc",
-        "per_page": 250,
-        "page": 1,
-        "price_change_percentage": "24h",
-    }
+    if REQUESTS is not None:
+        url = "https://api.coingecko.com/api/v3/coins/markets"
+        params = {
+            "vs_currency": "usd",
+            "order": "market_cap_desc",
+            "per_page": 250,
+            "page": 1,
+            "price_change_percentage": "24h",
+        }
 
         try:
             response = REQUESTS.get(url, params=params, timeout=15)
@@ -485,27 +472,11 @@ def _latest_manual_overrides(
 
     overrides: Dict[str, Tuple[bool, str, datetime]] = {}
 
-    if SQLALCHEMY_AVAILABLE and select is not None:
-        try:
-            stmt = (
-                select(AuditLog.symbol, AuditLog.enabled, AuditLog.reason, AuditLog.created_at)
-                .where(AuditLog.symbol.in_(symbol_list))
-                .order_by(AuditLog.symbol, AuditLog.created_at.desc())
-            )
-
-            for symbol, enabled, reason, created_at in session.execute(stmt):
-                if symbol not in overrides:
-                    overrides[symbol] = (enabled, reason, created_at)
-            return overrides
-        except AttributeError:
-            overrides.clear()
-
-    seen: set[str] = set()
-    for entry in reversed(_IN_MEMORY_AUDIT_LOG):
-        canonical_symbol = entry.symbol.upper()
-        if canonical_symbol in symbol_list and canonical_symbol not in seen:
-            overrides[canonical_symbol] = (entry.enabled, entry.reason, entry.created_at)
-            seen.add(canonical_symbol)
+    rows = session.execute(stmt).all()
+    typed_rows = cast(Sequence[Tuple[str, bool, str, datetime]], rows)
+    for symbol, enabled, reason, created_at in typed_rows:
+        if symbol not in overrides:
+            overrides[symbol] = (enabled, reason, created_at)
 
     return overrides
 
