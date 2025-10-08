@@ -6,13 +6,15 @@ from collections import Counter, deque
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from threading import Lock
-from typing import TYPE_CHECKING, Deque, Dict, MutableMapping, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, MutableMapping, Protocol, TypeVar, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel
 
 from services.common.security import require_admin_account
 from shared.spot import is_spot_symbol, normalize_spot_symbol
+from shared.pydantic_compat import BaseModel
+
+RouteFn = TypeVar("RouteFn", bound=Callable[..., Any])
 
 __all__ = [
     "OrderContext",
@@ -615,7 +617,13 @@ class PretradeStatusResponse(BaseModel):
 router = APIRouter()
 
 
-@router.get("/risk/pretrade/status", response_model=PretradeStatusResponse)
+def _router_get(*args: Any, **kwargs: Any) -> Callable[[RouteFn], RouteFn]:
+    """Typed wrapper around ``router.get`` to appease strict mypy."""
+
+    return cast(Callable[[RouteFn], RouteFn], router.get(*args, **kwargs))
+
+
+@_router_get("/risk/pretrade/status", response_model=PretradeStatusResponse)
 def get_pretrade_status(
     account_id: str = Query(..., description="Trading account identifier"),
     limit: int = Query(20, ge=1, le=200, description="Maximum recent failures to return"),
