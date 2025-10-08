@@ -1,16 +1,65 @@
-
 """Supervised learning trainers for portfolio forecasting models."""
+
 from __future__ import annotations
 
 import abc
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 
-import numpy as np
-import pandas as pd
+class MissingDependencyError(RuntimeError):
+    """Raised when a required third-party dependency is unavailable."""
+
+
+_NUMPY_MODULE: Any | None
+_NUMPY_ERROR: Exception | None
+try:  # pragma: no cover - exercised only when numpy is unavailable
+    import numpy as _NUMPY_MODULE  # type: ignore[assignment]
+except Exception as exc:  # pragma: no cover - optional dependency
+    _NUMPY_MODULE = None
+    _NUMPY_ERROR = exc
+else:  # pragma: no cover - trivial happy path
+    _NUMPY_ERROR = None
+
+
+_PANDAS_MODULE: Any | None
+_PANDAS_ERROR: Exception | None
+try:  # pragma: no cover - exercised only when pandas is unavailable
+    import pandas as _PANDAS_MODULE  # type: ignore[assignment]
+except Exception as exc:  # pragma: no cover - optional dependency
+    _PANDAS_MODULE = None
+    _PANDAS_ERROR = exc
+else:  # pragma: no cover - trivial happy path
+    _PANDAS_ERROR = None
+
+
+if TYPE_CHECKING:  # pragma: no cover - type-checking only
+    import numpy as np  # type: ignore
+    import pandas as pd  # type: ignore
+else:  # pragma: no cover - executed at runtime
+    np = _NUMPY_MODULE  # type: ignore[assignment]
+    pd = _PANDAS_MODULE  # type: ignore[assignment]
+
+
+def _require_numpy() -> Any:
+    """Return the numpy module or raise a descriptive error if absent."""
+
+    if _NUMPY_MODULE is None:
+        raise MissingDependencyError(
+            "numpy is required for supervised training operations"
+        ) from _NUMPY_ERROR
+    return _NUMPY_MODULE
+
+
+def _require_pandas() -> None:
+    """Ensure pandas is available before accepting dataframe inputs."""
+
+    if _PANDAS_MODULE is None:
+        raise MissingDependencyError(
+            "pandas is required for supervised training operations"
+        ) from _PANDAS_ERROR
 
 
 from ml.experiment_tracking.mlflow_utils import MLFlowExperiment
@@ -26,6 +75,8 @@ class SupervisedDataset:
     labels: pd.Series
 
     def to_numpy(self) -> Tuple[np.ndarray, np.ndarray]:
+        _require_pandas()
+        _require_numpy()
         return self.features.to_numpy(), self.labels.to_numpy()
 
 
@@ -86,6 +137,8 @@ class LightGBMTrainer(SupervisedTrainer):
     def predict(self, features: pd.DataFrame) -> np.ndarray:  # type: ignore[override]
         if self._model is None:
             raise RuntimeError("Model has not been trained yet")
+        _require_pandas()
+        _require_numpy()
         return self._model.predict(features)
 
     def save(self, path: Path) -> None:  # type: ignore[override]
@@ -123,6 +176,8 @@ class XGBoostTrainer(SupervisedTrainer):
     def predict(self, features: pd.DataFrame) -> np.ndarray:  # type: ignore[override]
         if self._model is None:
             raise RuntimeError("Model has not been trained yet")
+        _require_pandas()
+        _require_numpy()
         import xgboost as xgb  # Safe import – only executed after fit.
 
         dmatrix = xgb.DMatrix(features)
@@ -237,6 +292,8 @@ class TemporalConvNetTrainer(SupervisedTrainer):
             raise RuntimeError("Model has not been trained yet")
         import torch
 
+        _require_pandas()
+        _require_numpy()
         self._model.eval()
         tensor = torch.tensor(features.to_numpy(), dtype=torch.float32)
         with torch.no_grad():
@@ -303,13 +360,14 @@ class TransformerTrainer(SupervisedTrainer):
         features, labels = dataset.to_numpy()
         if features.shape[0] < sequence_length:
             raise ValueError("Not enough samples to form sequences of the requested length")
+        numpy = _require_numpy()
         sequences = []
         targets = []
         for idx in range(sequence_length, len(features)):
             sequences.append(features[idx - sequence_length : idx])
             targets.append(labels[idx])
-        seq_tensor = torch.tensor(np.stack(sequences), dtype=torch.float32)
-        label_tensor = torch.tensor(np.array(targets), dtype=torch.float32)
+        seq_tensor = torch.tensor(numpy.stack(sequences), dtype=torch.float32)
+        label_tensor = torch.tensor(numpy.array(targets), dtype=torch.float32)
         ds = TensorDataset(seq_tensor, label_tensor)
         loader = DataLoader(ds, batch_size=self.batch_size, shuffle=True)
 
@@ -349,13 +407,15 @@ class TransformerTrainer(SupervisedTrainer):
             raise RuntimeError("Model has not been trained yet")
         import torch
 
+        _require_pandas()
+        numpy = _require_numpy()
         feature_array = features.to_numpy()
         if feature_array.shape[0] < sequence_length:
             raise ValueError("Not enough samples to form sequences of the requested length")
         sequences = []
         for idx in range(sequence_length, len(feature_array) + 1):
             sequences.append(feature_array[idx - sequence_length : idx])
-        seq_tensor = torch.tensor(np.stack(sequences), dtype=torch.float32)
+        seq_tensor = torch.tensor(numpy.stack(sequences), dtype=torch.float32)
         self._model.eval()
         with torch.no_grad():
             preds = self._model(seq_tensor)
