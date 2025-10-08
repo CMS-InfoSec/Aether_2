@@ -12,7 +12,6 @@ from fastapi.testclient import TestClient
 from auth.service import InMemoryAdminRepository
 
 from app import create_app
-from auth.service import InMemorySessionStore
 from policy_service import RegimeSnapshot, _reset_regime_state, regime_classifier
 from services.models.meta_learner import get_meta_learner, meta_governance_log
 
