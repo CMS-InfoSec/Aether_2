@@ -41,6 +41,12 @@ class CollectorRegistry:
         if metric not in self._collectors:
             self._collectors.append(metric)
 
+    def unregister(self, metric: "_MetricBase") -> None:
+        try:
+            self._collectors.remove(metric)
+        except ValueError:
+            pass
+
     def collect(self) -> List["_MetricBase"]:
         return list(self._collectors)
 

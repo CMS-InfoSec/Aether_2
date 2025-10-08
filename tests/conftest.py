@@ -237,6 +237,9 @@ def _install_sqlalchemy_stub() -> None:
             self.kwargs = kwargs
             metadata.tables[name] = self
 
+        def insert(self, *args: object, **kwargs: object) -> "_Insert":
+            return _Insert(self)
+
     class _Insert:
         def __init__(self, table: Table) -> None:
             self.table = table
@@ -297,9 +300,16 @@ def _install_sqlalchemy_stub() -> None:
             def execute(self, *c_args: object, **c_kwargs: object) -> SimpleNamespace:
                 return SimpleNamespace(
                     fetchall=lambda: [],
+                    all=lambda: [],
                     scalar=lambda: None,
                     scalars=lambda: SimpleNamespace(all=lambda: []),
                 )
+
+            def __enter__(self) -> "_Connection":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[override]
+                return None
 
         class _BeginContext:
             def __enter__(self) -> _Connection:
