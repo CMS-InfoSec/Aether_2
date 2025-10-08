@@ -76,7 +76,6 @@ class _StubTimescaleAdapter:
 
 
 adapters_module.TimescaleAdapter = _StubTimescaleAdapter  # type: ignore[attr-defined]
-TimescaleAdapter = _StubTimescaleAdapter  # type: ignore[assignment]
 
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
