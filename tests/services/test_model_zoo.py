@@ -2,13 +2,9 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from fastapi.testclient import TestClient
-
 from auth.service import InMemoryAdminRepository
 
 from app import create_app
-from auth.service import InMemorySessionStore
-from services.common.security import require_admin_account
 from services.models import model_zoo
 
 
