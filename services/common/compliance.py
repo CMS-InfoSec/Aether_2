@@ -3,49 +3,39 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Final
+from dataclasses import dataclass
+from typing import Set
 
-from sqlalchemy import DateTime, PrimaryKeyConstraint, String
-from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Mapped, declarative_base, mapped_column
+try:  # pragma: no cover - optional dependency
+    from sqlalchemy import Column, DateTime, PrimaryKeyConstraint, String
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.orm import declarative_base
+except Exception:  # pragma: no cover - executed when SQLAlchemy unavailable
+    Column = DateTime = PrimaryKeyConstraint = String = None  # type: ignore[assignment]
+    Engine = object  # type: ignore[assignment]
+    SQLALCHEMY_AVAILABLE = False
+else:  # pragma: no cover - exercised in environments with SQLAlchemy installed
+    SQLALCHEMY_AVAILABLE = getattr(Column, "__module__", "").startswith("sqlalchemy")
 
 
-def _utcnow() -> datetime:
-    """Return a timezone-aware timestamp for default column values."""
-
-    return datetime.now(timezone.utc)
-
-
-if TYPE_CHECKING:
-
-    class SanctionsBase:
-        """Static typing shim for the sanctions declarative base."""
-
-        metadata: Any  # pragma: no cover - attribute injected by SQLAlchemy
-        registry: Any  # pragma: no cover - attribute injected by SQLAlchemy
-
-else:  # pragma: no cover - executed at runtime when SQLAlchemy is available
-
+if SQLALCHEMY_AVAILABLE:
     SanctionsBase = declarative_base()
-    SanctionsBase.__doc__ = "Typed declarative base for sanctions metadata."
 
+    class SanctionRecord(SanctionsBase):
+        """ORM mapping for sanctions sourced from regulatory watchlists."""
 
-class SanctionRecord(SanctionsBase):
-    """ORM mapping for sanctions sourced from regulatory watchlists."""
+        __tablename__ = "sanctions"
 
-    __tablename__ = "sanctions"
+        symbol = Column(String, nullable=False)
+        status = Column(String, nullable=False)
+        source = Column(String, nullable=False)
+        ts = Column(
+            DateTime(timezone=True),
+            nullable=False,
+            default=lambda: datetime.now(timezone.utc),
+        )
 
-    if TYPE_CHECKING:  # pragma: no cover - populated by SQLAlchemy at runtime
-        __table__: Any
-
-    symbol: Mapped[str] = mapped_column(String, nullable=False)
-    status: Mapped[str] = mapped_column(String, nullable=False)
-    source: Mapped[str] = mapped_column(String, nullable=False)
-    ts: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        nullable=False,
-        default=_utcnow,
-    )
+        __table_args__ = (PrimaryKeyConstraint("symbol", "source", name="pk_sanctions"),)
 
         def __repr__(self) -> str:  # pragma: no cover - debugging helper
             return (
@@ -67,7 +57,7 @@ else:
     Engine = object  # type: ignore[assignment]
 
 
-BLOCKING_STATUSES: Final[set[str]] = {
+BLOCKING_STATUSES: Set[str] = {
     "sanctioned",
     "blocked",
     "denied",
