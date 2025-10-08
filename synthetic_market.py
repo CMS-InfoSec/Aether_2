@@ -28,13 +28,29 @@ import json
 import logging
 import math
 import os
+import random
+import statistics
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence
+from types import SimpleNamespace
+from typing import Dict, Iterable, List, Optional, Sequence, Union
 
-import numpy as np
-import pandas as pd
+try:  # pragma: no cover - numpy is optional
+    import numpy as np
+
+    NUMPY_AVAILABLE = True
+except Exception:  # pragma: no cover - handled gracefully at runtime
+    np = None  # type: ignore
+    NUMPY_AVAILABLE = False
+
+try:  # pragma: no cover - pandas is optional
+    import pandas as pd
+
+    PANDAS_AVAILABLE = True
+except Exception:  # pragma: no cover - handled gracefully at runtime
+    pd = None  # type: ignore
+    PANDAS_AVAILABLE = False
 
 try:  # pragma: no cover - handled gracefully if torch is unavailable
     import torch
@@ -43,8 +59,21 @@ try:  # pragma: no cover - handled gracefully if torch is unavailable
 
     TORCH_AVAILABLE = True
 except Exception:  # pragma: no cover - torch is optional for this module
+    class _NoOpLayer:
+        def __init__(self, *args, **kwargs) -> None:  # pragma: no cover - trivial
+            pass
+
+        def __call__(self, *args, **kwargs):  # pragma: no cover - trivial
+            return args[0] if args else None
+
     torch = None  # type: ignore
-    nn = object  # type: ignore
+    nn = SimpleNamespace(  # type: ignore
+        Module=type("Module", (), {"__init__": lambda self, *a, **k: None}),
+        Linear=_NoOpLayer,
+        LeakyReLU=_NoOpLayer,
+        Sigmoid=_NoOpLayer,
+        Sequential=_NoOpLayer,
+    )
     DataLoader = object  # type: ignore
     TensorDataset = object  # type: ignore
     TORCH_AVAILABLE = False
@@ -57,6 +86,62 @@ DEFAULT_DATA_LOCATIONS: Sequence[Path] = (
     Path("data/ingest/kraken_orderbook.parquet"),
     Path("data/ingest/kraken_orderbook.csv"),
 )
+
+
+class _RecordBatch:
+    """Lightweight stand-in for a pandas DataFrame."""
+
+    def __init__(self, records: Sequence[Dict[str, float]], columns: Sequence[str]):
+        self._records = [dict(row) for row in records]
+        self.columns = list(columns)
+
+    @property
+    def empty(self) -> bool:
+        return not self._records
+
+    def to_dict(self, orient: str = "records") -> List[Dict[str, float]]:
+        if orient != "records":  # pragma: no cover - only records orientation used
+            raise ValueError("_RecordBatch only supports orient='records'")
+        return [dict(row) for row in self._records]
+
+
+DataFrameLike = Union["pd.DataFrame", _RecordBatch]
+
+
+def _normal_sample(mean: float, std_dev: float) -> float:
+    if NUMPY_AVAILABLE:
+        return float(np.random.normal(mean, std_dev))
+    return random.gauss(mean, std_dev)
+
+
+def _normal_sequence(mean: float, std_dev: float, size: int) -> List[float]:
+    return [_normal_sample(mean, std_dev) for _ in range(size)]
+
+
+def _uniform_sequence(low: float, high: float, size: int) -> List[float]:
+    if NUMPY_AVAILABLE:
+        return list(np.random.uniform(low, high, size=size))
+    return [random.uniform(low, high) for _ in range(size)]
+
+
+def _lognormal_sequence(mean: float, sigma: float, size: int) -> List[float]:
+    if NUMPY_AVAILABLE:
+        return list(np.random.lognormal(mean=mean, sigma=sigma, size=size))
+    return [random.lognormvariate(mean, sigma) for _ in range(size)]
+
+
+def _lognormal_sample(mean: float, sigma: float) -> float:
+    if NUMPY_AVAILABLE:
+        return float(np.random.lognormal(mean=mean, sigma=sigma))
+    return random.lognormvariate(mean, sigma)
+
+
+def _choice(options: Sequence[str], weights: Optional[Sequence[float]] = None) -> str:
+    if NUMPY_AVAILABLE:
+        return str(np.random.choice(options, p=weights))
+    if weights is None:
+        return random.choice(list(options))
+    return random.choices(list(options), weights=weights)[0]
 
 
 def _discover_dataset(custom_path: Optional[str]) -> Optional[Path]:
@@ -86,13 +171,16 @@ def _discover_dataset(custom_path: Optional[str]) -> Optional[Path]:
     return None
 
 
-def _load_dataset(path: Path) -> pd.DataFrame:
+def _load_dataset(path: Path) -> "pd.DataFrame":
     """Load historical Kraken order book data from ``path``.
 
     The loader supports CSV and Parquet formats. Only numeric columns are kept
     as GAN features. Timestamps (if present) are used solely for ordering the
     data.
     """
+
+    if not PANDAS_AVAILABLE or pd is None:
+        raise RuntimeError("pandas is required to load historical datasets")
 
     if path.suffix == ".csv":
         df = pd.read_csv(path)
@@ -108,7 +196,10 @@ def _load_dataset(path: Path) -> pd.DataFrame:
     if timestamp_cols:
         df = df.sort_values(timestamp_cols[0])
 
-    numeric_df = df.select_dtypes(include=[np.number]).copy()
+    if NUMPY_AVAILABLE:
+        numeric_df = df.select_dtypes(include=[np.number]).copy()
+    else:  # pragma: no cover - pandas normally requires numpy but handle defensively
+        numeric_df = df.select_dtypes(include=[int, float]).copy()
     if numeric_df.empty:
         raise ValueError(
             "Dataset does not contain numeric columns required for GAN training"
@@ -285,7 +376,7 @@ def _agent_based_simulation(
     frequency_per_hour: int,
     base_price: float,
     columns: Sequence[str],
-) -> pd.DataFrame:
+) -> DataFrameLike:
     """Fallback agent-based generator.
 
     Simulates a mean reverting price process with stochastic spreads and volume
@@ -301,49 +392,52 @@ def _agent_based_simulation(
     volatility = 0.02
 
     for _ in range(1, n_steps):
-        shock = np.random.normal(0.0, volatility * math.sqrt(dt))
+        shock = _normal_sample(0.0, volatility * math.sqrt(dt))
         drift = kappa * (mean_price - prices[-1]) * dt
         prices.append(max(0.0, prices[-1] + drift + shock))
 
-    prices = np.array(prices)
-    spread = np.random.uniform(0.5, 1.5, size=n_steps)
-    bid_prices = prices - spread / 2
-    ask_prices = prices + spread / 2
-    bid_sizes = np.random.lognormal(mean=1.0, sigma=0.5, size=n_steps)
-    ask_sizes = np.random.lognormal(mean=1.0, sigma=0.5, size=n_steps)
+    spreads = _uniform_sequence(0.5, 1.5, n_steps)
+    bid_sizes = _lognormal_sequence(mean=1.0, sigma=0.5, size=n_steps)
+    ask_sizes = _lognormal_sequence(mean=1.0, sigma=0.5, size=n_steps)
 
-    base_df = pd.DataFrame(
-        {
-            "mid_price": prices,
-            "bid_price": bid_prices,
-            "ask_price": ask_prices,
-            "bid_size": bid_sizes,
-            "ask_size": ask_sizes,
+    records: List[Dict[str, float]] = []
+    price_std = statistics.pstdev(prices) if len(prices) > 1 else 0.0
+    noise_scale = price_std or max(base_price * 0.01, 1.0)
+
+    for idx in range(n_steps):
+        spread = spreads[idx]
+        mid_price = prices[idx]
+        row: Dict[str, float] = {
+            "mid_price": mid_price,
+            "bid_price": max(0.0, mid_price - spread / 2),
+            "ask_price": max(0.0, mid_price + spread / 2),
+            "bid_size": max(0.0, bid_sizes[idx]),
+            "ask_size": max(0.0, ask_sizes[idx]),
         }
-    )
 
-    # If the historical dataset provided more columns, fill them with noise
-    # using matching magnitudes.
-    for extra in columns:
-        if extra in base_df.columns:
-            continue
-        scale = np.std(base_df["mid_price"])
-        base_df[extra] = np.random.normal(0, scale, size=n_steps)
+        for extra in columns:
+            if extra in row:
+                continue
+            row[extra] = _normal_sample(0.0, noise_scale)
 
-    return base_df[columns]
+        records.append(row)
+
+    if PANDAS_AVAILABLE and pd is not None:
+        return pd.DataFrame(records, columns=columns)
+    return _RecordBatch(records, columns)
 
 
 def _train_or_fallback(
     hours: int,
     dataset_path: Optional[str],
     gan_config: GANConfig,
-) -> pd.DataFrame:
+) -> DataFrameLike:
     """Train a GAN if possible otherwise fall back to agent-based simulation."""
 
     dataset_file = _discover_dataset(dataset_path)
     frequency_per_hour = 60  # Assume one sample per minute
 
-    if dataset_file is None:
+    if dataset_file is None or not PANDAS_AVAILABLE or pd is None:
         LOGGER.warning("No Kraken dataset found, using agent-based simulation")
         columns = [
             "mid_price",
@@ -367,8 +461,13 @@ def _train_or_fallback(
 
     n_samples = hours * frequency_per_hour
     synthetic = gan.sample(n_samples)
-    synthetic_df = pd.DataFrame(synthetic, columns=columns)
-    return synthetic_df
+    if PANDAS_AVAILABLE and pd is not None:
+        return pd.DataFrame(synthetic, columns=columns)
+    records = [
+        {column: float(row[idx]) for idx, column in enumerate(columns)}
+        for row in synthetic
+    ]
+    return _RecordBatch(records, columns)
 
 
 def _build_trade_event(
@@ -386,17 +485,17 @@ def _build_trade_event(
     spread = float(
         abs(book_row.get("ask_price", mid_price) - book_row.get("bid_price", mid_price))
     )
-    side = np.random.choice(["buy", "sell"])
-    price_noise = np.random.normal(0, max(spread / 4, 1e-3))
+    side = _choice(["buy", "sell"])
+    price_noise = _normal_sample(0.0, max(spread / 4, 1e-3))
     price = max(0.0, mid_price + (price_noise if side == "buy" else -price_noise))
-    size = float(np.random.lognormal(mean=0.0, sigma=0.5))
+    size = float(_lognormal_sample(mean=0.0, sigma=0.5))
 
     trade = {
         "timestamp": timestamp.isoformat(),
         "side": side,
         "price": price,
         "size": size,
-        "liquidity": np.random.choice(["maker", "taker"], p=[0.4, 0.6]),
+        "liquidity": _choice(["maker", "taker"], weights=[0.4, 0.6]),
     }
     return trade
 
