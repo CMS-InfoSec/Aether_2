@@ -3,25 +3,7 @@ from __future__ import annotations
 import inspect
 import os
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Optional, Tuple
-
-try:  # pragma: no cover - FastAPI is optional in some unit tests
-    from fastapi import Header, HTTPException, Request, status
-except ImportError:  # pragma: no cover - fallback when FastAPI is stubbed out
-    from services.common.fastapi_stub import (  # type: ignore[misc]
-        Header,
-        HTTPException,
-        Request,
-        status,
-    )
-
-try:  # pragma: no cover - auth service dependencies may be unavailable
-    from auth.service import Session, SessionStoreProtocol
-except Exception:  # pragma: no cover - provide minimal stand-ins
-    @dataclass
-    class Session:  # type: ignore[override]
-        token: str
-        admin_id: str
+from typing import Iterable, List, Optional, Tuple, cast
 
     class SessionStoreProtocol:  # type: ignore[override]
         def get(self, token: str) -> Session | None:  # pragma: no cover - simple stub
@@ -147,7 +129,7 @@ def _get_session_store(request: Request) -> SessionStoreProtocol:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Configured session store does not implement the required interface.",
         )
-    return store  # type: ignore[return-value]
+    return cast(SessionStoreProtocol, store)
 
 
 def _extract_token(raw_value: Optional[str], *, header_name: str) -> str:
