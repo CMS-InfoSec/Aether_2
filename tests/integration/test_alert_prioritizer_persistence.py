@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
+import importlib
 import sys
 import types
 
@@ -32,7 +33,7 @@ def _install_security_stub() -> None:
 
 
 try:  # pragma: no cover - prefer the real module when available
-    import services.common.security  # type: ignore[unused-ignore]
+    importlib.import_module("services.common.security")
 except ModuleNotFoundError:  # pragma: no cover - stub fallback for test environment
     _install_security_stub()
 
