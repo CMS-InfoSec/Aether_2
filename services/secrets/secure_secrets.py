@@ -11,7 +11,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, ClassVar, Dict, Iterable, List, Optional, Tuple
+from typing import Any, ClassVar, Dict, Iterable, List, Optional, Tuple, cast
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -172,12 +172,15 @@ class LocalKMSEmulator:
         rotation_interval: Optional[timedelta] = None,
         persistence: Optional[MasterKeyPersistence] = None,
     ) -> None:
-        self.key_id = key_id or os.getenv("LOCAL_KMS_KEY_ID", self.default_key_id)
+        env_key_id = os.getenv("LOCAL_KMS_KEY_ID")
+        self.key_id: str = key_id or env_key_id or self.default_key_id
         self._rotation_interval = rotation_interval or timedelta(days=90)
         self._master_keys: Dict[str, bytes] = {}
         self._master_key_history: List[MasterKeyRecord] = []
         self._current_version = 0
-        self._persistence = persistence or MasterKeyPersistence()
+        self._current_master_key_id: str | None = None
+        self._last_rotated: datetime | None = None
+        self._persistence: MasterKeyPersistence = persistence or MasterKeyPersistence()
         self._load_persisted_master_keys()
         if self._master_keys:
             return
@@ -198,7 +201,9 @@ class LocalKMSEmulator:
         try:
             records = self._persistence.load(self.key_id)
         except MasterKeyPersistenceError as exc:
-            LOGGER.error("Failed to load persisted master keys for %s", self.key_id)
+            LOGGER.error(
+                "Failed to load persisted master keys for %s: %s", self.key_id, exc
+            )
             raise
         for record, master_key in records:
             self._master_keys[record.master_key_id] = master_key
@@ -221,8 +226,7 @@ class LocalKMSEmulator:
             rotated_at=rotated_at,
             version=next_version,
         )
-        if self._persistence is not None:
-            self._persistence.persist(key_id=self.key_id, record=record, master_key=master_key)
+        self._persistence.persist(key_id=self.key_id, record=record, master_key=master_key)
         self._current_version = next_version
         self._master_keys[master_key_id] = master_key
         self._current_master_key_id = master_key_id
@@ -231,6 +235,8 @@ class LocalKMSEmulator:
 
     def _aesgcm(self, *, master_key_id: Optional[str] = None) -> AESGCM:
         key_id = master_key_id or self._current_master_key_id
+        if key_id is None:
+            raise EncryptionError("No active master key is available for encryption")
         key = self._master_keys[key_id]
         return AESGCM(key)
 
@@ -269,6 +275,8 @@ class LocalKMSEmulator:
         nonce = os.urandom(12)
         aesgcm = self._aesgcm()
         encrypted = nonce + aesgcm.encrypt(nonce, plaintext, context_bytes)
+        if self._current_master_key_id is None or self._last_rotated is None:
+            raise EncryptionError("Local KMS emulator has not been initialised")
         return DataKey(
             plaintext=plaintext,
             encrypted=encrypted,
@@ -289,7 +297,7 @@ class LocalKMSEmulator:
         nonce, ciphertext = encrypted[:12], encrypted[12:]
         key_id = master_key_id or self._current_master_key_id
         aesgcm = self._aesgcm(master_key_id=key_id)
-        return aesgcm.decrypt(nonce, ciphertext, context_bytes)
+        return cast(bytes, aesgcm.decrypt(nonce, ciphertext, context_bytes))
 
 
 @dataclass
