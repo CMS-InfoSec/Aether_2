@@ -32,8 +32,7 @@ def _ensure_alert_manager_stub(monkeypatch: pytest.MonkeyPatch) -> None:
     except Exception:
         pass
 
-    services_pkg = _ensure_package(monkeypatch, "services")
-
+    _ensure_package(monkeypatch, "services")
     stub_module = ModuleType("services.alert_manager")
 
     class _RiskEvent:  # pragma: no cover - trivial container
