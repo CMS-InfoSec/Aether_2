@@ -22,7 +22,7 @@ def sim_mode_loader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     original_create_engine = create_engine
 
     try:  # pragma: no cover - real adapters may not be available in CI
-        import services.common.adapters  # type: ignore[unused-ignore]
+        importlib.import_module("services.common.adapters")
     except Exception:
         adapters_stub = types.ModuleType("services.common.adapters")
 
