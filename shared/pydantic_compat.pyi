@@ -1,4 +1,4 @@
-from typing import Any, Dict
+from typing import Any, Callable, Dict
 
 class BaseModel:
     model_config: Dict[str, Any]
@@ -11,5 +11,11 @@ class BaseModel:
 
 
 def Field(default: Any = ..., **kwargs: Any) -> Any: ...
+
+def field_validator(*fields: str, **kwargs: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]: ...
+
+def model_validator(*, mode: str | None = ...) -> Callable[[Callable[..., Any]], Callable[..., Any]]: ...
+
+def model_serializer(*, mode: str | None = ...) -> Callable[[Callable[..., Any]], Callable[..., Any]]: ...
 
 ConfigDict = Dict[str, Any]
