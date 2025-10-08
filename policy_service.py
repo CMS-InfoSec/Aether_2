@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 
-import asyncio
 import logging
 import math
 import os
@@ -58,7 +57,7 @@ from metrics import (
     record_drift_score,
     setup_metrics,
 )
-from services.common.security import ADMIN_ACCOUNTS, require_admin_account
+from services.common.security import require_admin_account
 from shared.session_config import load_session_ttl_minutes
 from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
 from services.common.spot import require_spot_http
@@ -378,7 +377,6 @@ def _reset_regime_state() -> None:
 
 
 async def _resolve_precision(symbol: str) -> Dict[str, Decimal | str]:
-    native = symbol.replace("-", "/") if symbol else symbol
     try:
         metadata = await precision_provider.require(symbol)
 

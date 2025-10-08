@@ -389,7 +389,7 @@ class IdempotencyCache:
 
     @staticmethod
     def _default_redis_factory(account_id: str) -> Any:
-        from redis.asyncio import Redis  # type: ignore import-not-found
+        from redis.asyncio import Redis  # type: ignore[import-not-found]
 
         from services.common.config import get_redis_client
 
@@ -644,7 +644,7 @@ class KrakenSession:
         )
         try:
             ack = await self._ws_client.add_order(payload)
-        except (KrakenWSError, KrakenWSTimeout) as exc:
+        except (KrakenWSError, KrakenWSTimeout):
             await self._rate_limit_guard.release(
                 self.account_id,
                 transport="websocket",

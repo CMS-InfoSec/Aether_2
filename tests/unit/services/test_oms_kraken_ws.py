@@ -6,7 +6,6 @@ import importlib.util
 import sys
 import time
 import types
-from decimal import Decimal
 
 import pytest
 
