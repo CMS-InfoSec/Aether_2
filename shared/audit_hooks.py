@@ -510,6 +510,7 @@ class AuditEvent:
         *,
         use_factory: bool,
         drop_factory: bool,
+        drop_extra: bool,
         refresh: bool,
         capture_errors: bool,
     ) -> tuple["AuditEvent", Optional[Mapping[str, Any]], Optional[Exception], bool]:
@@ -542,10 +543,15 @@ class AuditEvent:
         elif capture_errors and (not use_factory):
             evaluated = True
 
+        returned_extra = extra_value
+
         if drop_factory and new_factory is not None:
             new_factory = None
 
         updates: dict[str, Any] = {}
+
+        if drop_extra and extra_value is not None:
+            extra_value = None
 
         if refresh:
             if self.fallback_extra is not extra_value:
@@ -564,20 +570,27 @@ class AuditEvent:
         if capture_errors and (factory is None):
             evaluated = True
 
-        return updated_event, extra_value, error, evaluated
+        return updated_event, returned_extra, error, evaluated
 
     def resolve_fallback_extra(
         self,
         *,
         use_factory: bool = True,
         drop_factory: bool = False,
+        drop_extra: bool = False,
         refresh: bool = False,
     ) -> tuple["AuditEvent", Optional[Mapping[str, Any]]]:
-        """Return an updated event alongside the resolved fallback metadata."""
+        """Return an updated event alongside the resolved fallback metadata.
+
+        When ``drop_extra`` is ``True`` the resolved mapping is returned but
+        cleared from the event, allowing callers to capture the payload once
+        without retaining it on the instance.
+        """
 
         updated_event, extra_value, _, _ = self._resolve_fallback_extra_internal(
             use_factory=use_factory,
             drop_factory=drop_factory,
+            drop_extra=drop_extra,
             refresh=refresh,
             capture_errors=False,
         )
@@ -589,13 +602,20 @@ class AuditEvent:
         *,
         use_factory: bool = True,
         drop_factory: bool = False,
+        drop_extra: bool = False,
         refresh: bool = False,
     ) -> tuple["AuditEvent", "ResolvedFallbackExtra"]:
-        """Return an updated event and structured fallback extra metadata."""
+        """Return an updated event and structured fallback extra metadata.
+
+        ``drop_extra=True`` mirrors :meth:`resolve_fallback_extra` by clearing
+        the stored mapping after resolution while still returning the value via
+        :class:`ResolvedFallbackExtra`.
+        """
 
         updated_event, extra_value, error, evaluated = self._resolve_fallback_extra_internal(
             use_factory=use_factory,
             drop_factory=drop_factory,
+            drop_extra=drop_extra,
             refresh=refresh,
             capture_errors=True,
         )

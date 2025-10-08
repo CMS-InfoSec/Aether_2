@@ -1931,6 +1931,58 @@ def test_audit_event_resolve_fallback_extra_evaluates_factory_once():
     assert calls == [0]
 
 
+def test_audit_event_resolve_fallback_extra_drop_extra_clears_mapping():
+    extra = {"trace": "token"}
+    event = audit_hooks.AuditEvent(
+        actor="casey",
+        action="demo.fallback.resolve.drop", 
+        entity="resource",
+        before={},
+        after={},
+        fallback_extra=extra,
+    )
+
+    updated, resolved = event.resolve_fallback_extra(drop_extra=True)
+
+    assert resolved is extra
+    assert updated is not event
+    assert updated.fallback_extra is None
+    assert updated.fallback_extra_factory is None
+
+    updated_again, resolved_again = updated.resolve_fallback_extra()
+
+    assert updated_again is updated
+    assert resolved_again is None
+
+
+def test_audit_event_resolve_fallback_extra_metadata_drop_extra_preserves_value():
+    calls: list[int] = []
+
+    def factory() -> Mapping[str, str]:
+        calls.append(len(calls))
+        return {"request_id": "xyz"}
+
+    event = audit_hooks.AuditEvent(
+        actor="drew",
+        action="demo.fallback.resolve.drop-metadata",
+        entity="resource",
+        before={},
+        after={},
+        fallback_extra_factory=factory,
+    )
+
+    updated, resolved = event.resolve_fallback_extra_metadata(
+        drop_extra=True
+    )
+
+    assert calls == [0]
+    assert resolved.value == {"request_id": "xyz"}
+    assert resolved.evaluated is True
+    assert resolved.error is None
+    assert updated.fallback_extra is None
+    # Factory remains so subsequent resolutions can rebuild the payload unless dropped.
+    assert updated.fallback_extra_factory is factory
+
 def test_audit_event_resolve_fallback_extra_metadata_captures_error():
     def factory() -> Mapping[str, str]:
         raise RuntimeError("extra boom")
