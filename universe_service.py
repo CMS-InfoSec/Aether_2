@@ -185,9 +185,6 @@ def _database_url() -> str:
     return normalized
 
 
-_DB_URL = _database_url()
-
-
 def _engine_options(url: str) -> dict[str, object]:
     options: dict[str, object] = {"future": True}
     if url.startswith("sqlite://"):
@@ -216,11 +213,20 @@ else:  # pragma: no cover - runtime base when SQLAlchemy is available
             metadata: Any
             registry: Any
 
-
-if SQLALCHEMY_AVAILABLE:
-
     class UniverseWhitelist(Base):
         """SQLAlchemy model storing the computed trading universe."""
+
+    if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
+        __table__: Any
+
+        def __init__(
+            self,
+            *,
+            symbol: str,
+            enabled: bool = ...,
+            metrics_json: Dict[str, float] | None = ...,
+            ts: datetime | None = ...,
+        ) -> None: ...
 
     if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
         __table__: Any
@@ -253,6 +259,9 @@ if SQLALCHEMY_AVAILABLE:
 
     class AuditLog(Base):
         """Audit log entry capturing manual overrides."""
+
+    if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
+        __table__: Any
 
     if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
         __table__: Any
