@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib.util
-import os
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -78,7 +77,7 @@ def test_anomaly_service_normalizes_timescale_urls(monkeypatch: pytest.MonkeyPat
     _stub_create_engine(monkeypatch, captured)
 
     module_name = "tests.anomaly_timescale_config"
-    module = _load_module(module_name)
+    _load_module(module_name)
     try:
         assert str(captured["url"]).startswith("postgresql+psycopg2://")
     finally:
@@ -113,7 +112,7 @@ def test_anomaly_service_allows_sqlite_during_tests(monkeypatch: pytest.MonkeyPa
     _stub_create_engine(monkeypatch, captured)
 
     module_name = "tests.anomaly_sqlite_allowed"
-    module = _load_module(module_name)
+    _load_module(module_name)
     try:
         assert str(captured["url"]).startswith("sqlite+pysqlite:///:memory:")
     finally:
