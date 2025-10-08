@@ -13,6 +13,7 @@ import importlib
 import logging
 import os
 import sys
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import (
     TYPE_CHECKING,
@@ -212,11 +213,20 @@ else:  # pragma: no cover - runtime base when SQLAlchemy is available
             metadata: Any
             registry: Any
 
+        metadata: Any  # pragma: no cover - provided by SQLAlchemy
+        registry: Any  # pragma: no cover - provided by SQLAlchemy
+else:  # pragma: no cover - runtime base when SQLAlchemy is available
+    try:
+        from sqlalchemy.orm import declarative_base
 
-class UniverseWhitelist(Base):
-    """SQLAlchemy model storing the computed trading universe."""
+        Base = declarative_base()
+        Base.__doc__ = "Declarative base for the local universe service models."
+    except Exception:  # pragma: no cover - degraded runtime base without SQLAlchemy
+        class Base:  # type: ignore[too-many-ancestors]
+            """Fallback base exposing SQLAlchemy attributes when SQLAlchemy is absent."""
 
-    __tablename__ = "universe_whitelist"
+            metadata: Any
+            registry: Any
 
     if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
         __table__: Any
@@ -239,11 +249,12 @@ class UniverseWhitelist(Base):
         DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
     )
 
+if SQLALCHEMY_AVAILABLE:
 
-class AuditLog(Base):
-    """Audit log entry capturing manual overrides."""
+if SQLALCHEMY_AVAILABLE:
 
-    __tablename__ = "audit_log"
+    class UniverseWhitelist(Base):
+        """SQLAlchemy model storing the computed trading universe."""
 
     if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
         __table__: Any
@@ -266,12 +277,32 @@ class AuditLog(Base):
     )
 
 
-_DB_URL = _database_url()
+    class AuditLog(Base):
+        """Audit log entry capturing manual overrides."""
+
+        __tablename__ = "audit_log"
+
+        id: int = Column(Integer, primary_key=True, autoincrement=True)
+        symbol: str = Column(String, nullable=False)
+        enabled: bool = Column(Boolean, nullable=False)
+        reason: str = Column(String, nullable=False)
+        created_at: datetime = Column(
+            DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+        )
 
 
-def _create_engine() -> Engine:
-    return create_engine(_DB_URL, **_engine_options(_DB_URL))
+    def _create_engine() -> Engine:
+        return create_engine(_DB_URL, **_engine_options(_DB_URL))
 
+
+    ENGINE = _create_engine()
+    SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
+
+else:
+
+    @dataclass
+    class UniverseWhitelist:  # type: ignore[no-redef]
+        """In-memory representation of the computed trading universe."""
 
 ENGINE = _create_engine()
 SessionLocal: "Sessionmaker[Session]" = sessionmaker(
@@ -344,7 +375,27 @@ class OverrideRequest(BaseModel):
 
 
 def _initialise_database() -> None:
-    Base.metadata.create_all(bind=ENGINE)
+    """Ensure persistence backend is ready for use."""
+
+    if SQLALCHEMY_AVAILABLE:
+        if ENGINE is None:
+            raise RuntimeError("Universe database engine has not been initialised")
+        Base.metadata.create_all(bind=ENGINE)
+        return
+
+    # Reset the in-memory store for deterministic tests when SQLAlchemy is absent.
+    with _IN_MEMORY_LOCK:
+        _IN_MEMORY_UNIVERSE.clear()
+        _IN_MEMORY_AUDIT_LOG.clear()
+        global _NEXT_AUDIT_ID
+        _NEXT_AUDIT_ID = 1
+
+
+_STATIC_COINGECKO_DATA: Dict[str, Dict[str, float]] = {
+    "BTC": {"market_cap": 400_000_000_000.0, "global_volume": 150_000_000_000.0},
+    "ETH": {"market_cap": 200_000_000_000.0, "global_volume": 80_000_000_000.0},
+    "DOGE": {"market_cap": 12_000_000_000.0, "global_volume": 5_000_000_000.0},
+}
 
 
 def fetch_coingecko_market_data() -> Dict[str, Dict[str, float]]:
@@ -391,11 +442,7 @@ def fetch_coingecko_market_data() -> Dict[str, Dict[str, float]]:
 
     # deterministic fallback ensures the service remains functional without
     # external connectivity.
-    return {
-        "BTC": {"market_cap": 400_000_000_000.0, "global_volume": 150_000_000_000.0},
-        "ETH": {"market_cap": 200_000_000_000.0, "global_volume": 80_000_000_000.0},
-        "DOGE": {"market_cap": 12_000_000_000.0, "global_volume": 5_000_000_000.0},
-    }
+    return dict(_STATIC_COINGECKO_DATA)
 
 
 def fetch_kraken_volume(symbols: Iterable[str]) -> Dict[str, float]:
@@ -424,11 +471,6 @@ def _latest_manual_overrides(
         return {}
 
     overrides: Dict[str, Tuple[bool, str, datetime]] = {}
-    stmt = (
-        select(AuditLog.symbol, AuditLog.enabled, AuditLog.reason, AuditLog.created_at)
-        .where(AuditLog.symbol.in_(symbol_list))
-        .order_by(AuditLog.symbol, AuditLog.created_at.desc())
-    )
 
     rows = session.execute(stmt).all()
     typed_rows = cast(Sequence[Tuple[str, bool, str, datetime]], rows)
@@ -495,9 +537,12 @@ def _refresh_universe_periodically() -> None:
     async def _run() -> None:
         while True:
             try:
-                with SessionLocal() as session:
+                session = SessionLocal()
+                try:
                     _compute_universe(session)
-            except SQLAlchemyError as exc:  # pragma: no cover - defensive logging
+                finally:
+                    session.close()
+            except Exception as exc:  # pragma: no cover - defensive logging
                 LOGGER.exception("Failed to refresh trading universe: %s", exc)
             await asyncio.sleep(timedelta(days=1).total_seconds())
 
@@ -509,8 +554,11 @@ async def _startup_event() -> None:
     """Initialise the database schema and compute the first universe."""
 
     _initialise_database()
-    with SessionLocal() as session:
+    session = SessionLocal()
+    try:
         _compute_universe(session)
+    finally:
+        session.close()
     _refresh_universe_periodically()
 
 
@@ -521,14 +569,29 @@ def get_universe(
 ) -> UniverseResponse:
     """Return the currently approved trading universe."""
 
-    entries = session.execute(
-        select(UniverseWhitelist).where(UniverseWhitelist.enabled.is_(True))
-    ).scalars()
-    symbols = sorted({entry.symbol for entry in entries})
+    if SQLALCHEMY_AVAILABLE and select is not None:
+        try:
+            entries = session.execute(
+                select(UniverseWhitelist).where(UniverseWhitelist.enabled.is_(True))
+            ).scalars()
+            symbols = sorted({entry.symbol for entry in entries})
 
-    latest_generated = session.execute(
-        select(UniverseWhitelist.ts).order_by(UniverseWhitelist.ts.desc())
-    ).scalars().first()
+            latest_generated = session.execute(
+                select(UniverseWhitelist.ts).order_by(UniverseWhitelist.ts.desc())
+            ).scalars().first()
+        except AttributeError:
+            symbols = []
+            latest_generated = None
+    else:
+        symbols = sorted(
+            symbol
+            for symbol, entry in _IN_MEMORY_UNIVERSE.items()
+            if entry.enabled
+        )
+        latest_generated = max(
+            (entry.ts for entry in _IN_MEMORY_UNIVERSE.values()),
+            default=None,
+        )
 
     if latest_generated is None:
         raise HTTPException(status_code=404, detail="Universe has not been generated yet.")
