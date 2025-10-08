@@ -178,6 +178,41 @@ class AuditEvent:
             drop_ip_address=drop_ip_address,
         ), resolved
 
+    def ensure_resolved_metadata(
+        self,
+        hooks: "AuditHooks",
+        *,
+        drop_ip_address: bool = False,
+        use_context_factory: bool = True,
+        drop_context_factory: bool = False,
+        refresh_context: bool = False,
+    ) -> tuple["AuditEvent", "ResolvedIpHash", "ResolvedContext"]:
+        """Return an updated event with resolved hash and context metadata.
+
+        The helper combines :meth:`ensure_resolved_ip_hash` and
+        :meth:`resolve_context_metadata` so callers that need both outcomes can
+        update the event once and receive the structured metadata required for
+        logging.  Keyword arguments mirror the underlying helpers, allowing
+        callers to drop the raw IP address, control whether context factories
+        execute, refresh cached context, or discard factories after use.  The
+        resulting event reflects any requested updates (such as clearing the IP
+        address or context factory) and is returned alongside the resolved hash
+        and context metadata.
+        """
+
+        updated_event, resolved_hash = self.ensure_resolved_ip_hash(
+            hooks,
+            drop_ip_address=drop_ip_address,
+        )
+
+        updated_event, resolved_context = updated_event.resolve_context_metadata(
+            use_factory=use_context_factory,
+            drop_factory=drop_context_factory,
+            refresh=refresh_context,
+        )
+
+        return updated_event, resolved_hash, resolved_context
+
     def log_with_fallback(
         self,
         hooks: "AuditHooks",

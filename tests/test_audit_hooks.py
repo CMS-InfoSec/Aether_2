@@ -1915,6 +1915,120 @@ def test_audit_event_ensure_resolved_ip_hash_returns_self_when_no_change():
     assert resolved.error is None
 
 
+def test_audit_event_ensure_resolved_metadata_updates_event_and_returns_results():
+    hash_calls: List[Optional[str]] = []
+    context_calls = {"count": 0}
+
+    def tracking_hash(value: Optional[str]) -> Optional[str]:
+        hash_calls.append(value)
+        return f"hashed:{value}"
+
+    def context_factory() -> Mapping[str, int]:
+        context_calls["count"] += 1
+        return {"factory_calls": context_calls["count"]}
+
+    hooks = audit_hooks.AuditHooks(log=None, hash_ip=tracking_hash)
+
+    event = audit_hooks.AuditEvent(
+        actor="vera",
+        action="demo.ensure.metadata",
+        entity="resource",
+        before={},
+        after={},
+        ip_address="203.0.113.90",
+        context_factory=context_factory,
+    )
+
+    updated, resolved_hash, resolved_context = event.ensure_resolved_metadata(hooks)
+
+    assert updated is not event
+    assert updated.ip_hash == "hashed:203.0.113.90"
+    assert updated.ip_address == "203.0.113.90"
+    assert updated.context == {"factory_calls": 1}
+    assert updated.context_factory is context_factory
+    assert resolved_hash.value == "hashed:203.0.113.90"
+    assert resolved_hash.fallback is False
+    assert resolved_hash.error is None
+    assert resolved_context.value == {"factory_calls": 1}
+    assert resolved_context.error is None
+    assert resolved_context.evaluated is True
+    assert hash_calls == ["203.0.113.90"]
+    assert context_calls == {"count": 1}
+
+
+def test_audit_event_ensure_resolved_metadata_can_drop_ip_and_factory_on_error():
+    def failing_hash(value: Optional[str]) -> Optional[str]:
+        raise RuntimeError("hash failure")
+
+    context_calls = {"count": 0}
+
+    def failing_context() -> Mapping[str, str]:
+        context_calls["count"] += 1
+        raise ValueError("context failure")
+
+    hooks = audit_hooks.AuditHooks(log=None, hash_ip=failing_hash)
+
+    event = audit_hooks.AuditEvent(
+        actor="will",
+        action="demo.ensure.metadata.failure",
+        entity="resource",
+        before={},
+        after={},
+        ip_address="198.51.100.55",
+        context_factory=failing_context,
+    )
+
+    updated, resolved_hash, resolved_context = event.ensure_resolved_metadata(
+        hooks,
+        drop_ip_address=True,
+        drop_context_factory=True,
+    )
+
+    fallback_hash = audit_hooks._hash_ip_fallback("198.51.100.55")
+    assert updated.ip_address is None
+    assert updated.ip_hash == fallback_hash
+    assert updated.context is None
+    assert updated.context_factory is None
+    assert isinstance(resolved_hash.error, RuntimeError)
+    assert resolved_hash.value == fallback_hash
+    assert resolved_hash.fallback is True
+    assert resolved_context.value is None
+    assert isinstance(resolved_context.error, ValueError)
+    assert resolved_context.evaluated is True
+    assert context_calls == {"count": 1}
+
+
+def test_audit_event_ensure_resolved_metadata_returns_self_when_cached():
+    hooks = audit_hooks.AuditHooks(
+        log=None,
+        hash_ip=lambda value: pytest.fail("hash_ip should not run"),
+    )
+
+    context = {"cached": True}
+    event = audit_hooks.AuditEvent(
+        actor="ximena",
+        action="demo.ensure.metadata.cached",
+        entity="resource",
+        before={},
+        after={},
+        ip_hash="cached-hash",
+        context=context,
+    )
+
+    updated, resolved_hash, resolved_context = event.ensure_resolved_metadata(
+        hooks,
+        use_context_factory=False,
+    )
+
+    assert updated is event
+    assert resolved_hash.value == "cached-hash"
+    assert resolved_hash.fallback is False
+    assert resolved_hash.error is None
+    assert resolved_context.value is context
+    assert resolved_context.error is None
+    assert resolved_context.evaluated is True
+
+
 def test_audit_event_resolve_ip_hash_preserves_fallback_metadata():
     def failing_hash(value: Optional[str]) -> Optional[str]:
         raise RuntimeError("hash failure")
