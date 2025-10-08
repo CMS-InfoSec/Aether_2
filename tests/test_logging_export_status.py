@@ -10,7 +10,6 @@ from fastapi.testclient import TestClient
 from auth.service import InMemoryAdminRepository
 
 from app import create_app
-from auth.service import InMemorySessionStore
 from logging_export import ExportResult
 
 
