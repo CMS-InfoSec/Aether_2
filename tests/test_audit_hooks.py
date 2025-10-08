@@ -171,6 +171,84 @@ def test_audit_log_result_truthiness():
     assert not failure
 
 
+def test_audit_log_result_to_metadata_includes_structured_errors():
+    context: Mapping[str, Any] = {"scope": "fallback"}
+    fallback_extra: Mapping[str, Any] = {"correlation_id": "abc-123"}
+
+    result = audit_hooks.AuditLogResult(
+        handled=False,
+        ip_hash="hash-1",
+        hash_fallback=True,
+        hash_error=ValueError("hash boom"),
+        context=context,
+        log_error=RuntimeError("logger offline"),
+        context_error=KeyError("missing"),
+        context_evaluated=True,
+        fallback_logged=True,
+        fallback_extra=fallback_extra,
+        fallback_extra_error=LookupError("fallback extra failed"),
+        fallback_extra_evaluated=True,
+    )
+
+    metadata = result.to_metadata(include_fallback_extra=True)
+
+    assert metadata == {
+        "handled": False,
+        "ip_hash": "hash-1",
+        "hash_fallback": True,
+        "fallback_logged": True,
+        "context_evaluated": True,
+        "fallback_extra_evaluated": True,
+        "context": {"scope": "fallback"},
+        "fallback_extra": {"correlation_id": "abc-123"},
+        "hash_error": {"type": "ValueError", "message": "hash boom"},
+        "log_error": {"type": "RuntimeError", "message": "logger offline"},
+        "context_error": {"type": "KeyError", "message": "'missing'"},
+        "fallback_extra_error": {
+            "type": "LookupError",
+            "message": "fallback extra failed",
+        },
+    }
+
+
+def test_audit_log_result_to_metadata_copy_controls():
+    context: Mapping[str, Any] = {"foo": "bar"}
+    fallback_extra: Mapping[str, Any] = {"trace": "value"}
+
+    result = audit_hooks.AuditLogResult(
+        handled=True,
+        ip_hash="hash-2",
+        hash_fallback=False,
+        hash_error=None,
+        context=context,
+        context_evaluated=True,
+        fallback_logged=True,
+        fallback_extra=fallback_extra,
+        fallback_extra_evaluated=True,
+    )
+
+    copied = result.to_metadata(include_fallback_extra=True)
+    assert copied["context"] == context
+    assert copied["context"] is not context
+    assert copied["fallback_extra"] == fallback_extra
+    assert copied["fallback_extra"] is not fallback_extra
+    assert "hash_error" in copied and copied["hash_error"] is None
+
+    shared = result.to_metadata(
+        include_fallback_extra=True,
+        copy_context=False,
+        copy_fallback_extra=False,
+        include_errors=False,
+    )
+
+    assert shared["context"] is context
+    assert shared["fallback_extra"] is fallback_extra
+    assert "hash_error" not in shared
+    assert "log_error" not in shared
+    assert "context_error" not in shared
+    assert "fallback_extra_error" not in shared
+
+
 def test_log_event_with_fallback_logs_when_disabled(caplog: pytest.LogCaptureFixture):
     hooks = audit_hooks.AuditHooks(log=None, hash_ip=lambda value: "hash")
 

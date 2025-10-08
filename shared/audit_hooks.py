@@ -934,6 +934,73 @@ class AuditLogResult:
     def __bool__(self) -> bool:  # pragma: no cover - exercised implicitly via truthiness
         return self.handled
 
+    def to_metadata(
+        self,
+        *,
+        include_context: bool = True,
+        copy_context: bool = True,
+        include_errors: bool = True,
+        include_fallback_extra: bool = False,
+        copy_fallback_extra: bool = True,
+    ) -> dict[str, Any]:
+        """Return a serialisable summary of the logging attempt.
+
+        The metadata exposes the high-level outcome flags alongside the
+        resolved hash so callers can persist or emit additional telemetry
+        without serialising the full :class:`AuditLogResult` instance.  When
+        ``include_context`` is ``True`` any captured fallback context payload is
+        returned, optionally copied to avoid sharing mutable mappings with the
+        caller.  ``include_fallback_extra`` mirrors this behaviour for fallback
+        logging metadata.  Error fields are converted into lightweight
+        dictionaries via :func:`_describe_exception` so the summary remains JSON
+        friendly; pass ``include_errors=False`` to omit them entirely.
+        """
+
+        metadata: dict[str, Any] = {
+            "handled": self.handled,
+            "ip_hash": self.ip_hash,
+            "hash_fallback": self.hash_fallback,
+            "fallback_logged": self.fallback_logged,
+            "context_evaluated": self.context_evaluated,
+            "fallback_extra_evaluated": self.fallback_extra_evaluated,
+        }
+
+        if include_context:
+            metadata["context"] = _snapshot_context_mapping(
+                self.context,
+                copy=copy_context,
+            )
+
+        if include_fallback_extra:
+            metadata["fallback_extra"] = _snapshot_context_mapping(
+                self.fallback_extra,
+                copy=copy_fallback_extra,
+            )
+
+        if include_errors:
+            metadata["hash_error"] = (
+                None
+                if self.hash_error is None
+                else _build_hash_error_metadata(self.hash_error)
+            )
+            metadata["log_error"] = (
+                None
+                if self.log_error is None
+                else _describe_exception(self.log_error)
+            )
+            metadata["context_error"] = (
+                None
+                if self.context_error is None
+                else _describe_exception(self.context_error)
+            )
+            metadata["fallback_extra_error"] = (
+                None
+                if self.fallback_extra_error is None
+                else _describe_exception(self.fallback_extra_error)
+            )
+
+        return metadata
+
 
 @dataclass(frozen=True)
 class ResolvedContext:
