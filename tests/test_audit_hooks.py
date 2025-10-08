@@ -1065,6 +1065,130 @@ def test_audit_event_with_context_factory_optionally_preserves_context():
     assert cleared.context is None
 
 
+def test_audit_event_resolve_context_reuses_stored_mapping():
+    context = {"source": "stored"}
+    event = audit_hooks.AuditEvent(
+        actor="maya",
+        action="demo.context.resolve",
+        entity="resource",
+        before={},
+        after={},
+        context=context,
+        context_factory=lambda: pytest.fail("factory should not run"),
+    )
+
+    updated, resolved = event.resolve_context()
+
+    assert updated is event
+    assert resolved is context
+
+
+def test_audit_event_resolve_context_evaluates_factory_once():
+    calls = {"count": 0}
+
+    def factory() -> Mapping[str, str]:
+        calls["count"] += 1
+        return {"factory": calls["count"]}
+
+    event = audit_hooks.AuditEvent(
+        actor="nina",
+        action="demo.context.factory",
+        entity="resource",
+        before={},
+        after={},
+        context_factory=factory,
+    )
+
+    updated, resolved = event.resolve_context()
+
+    assert calls["count"] == 1
+    assert resolved == {"factory": 1}
+    assert updated is not event
+    assert updated.context == {"factory": 1}
+    # The factory is retained by default so callers can refresh later.
+    assert updated.context_factory is factory
+
+
+def test_audit_event_resolve_context_can_drop_factory_after_resolution():
+    def factory() -> Mapping[str, str]:
+        return {"factory": "value"}
+
+    event = audit_hooks.AuditEvent(
+        actor="oliver",
+        action="demo.context.drop",
+        entity="resource",
+        before={},
+        after={},
+        context_factory=factory,
+    )
+
+    updated, resolved = event.resolve_context(drop_factory=True)
+
+    assert resolved == {"factory": "value"}
+    assert updated.context == {"factory": "value"}
+    assert updated.context_factory is None
+
+
+def test_audit_event_resolve_context_refreshes_cached_mapping():
+    calls = {"count": 0}
+
+    def factory() -> Mapping[str, int]:
+        calls["count"] += 1
+        return {"refresh": calls["count"]}
+
+    event = audit_hooks.AuditEvent(
+        actor="piper",
+        action="demo.context.refresh",
+        entity="resource",
+        before={},
+        after={},
+        context={"refresh": 0},
+        context_factory=factory,
+    )
+
+    updated, resolved = event.resolve_context(refresh=True)
+
+    assert calls["count"] == 1
+    assert resolved == {"refresh": 1}
+    assert updated.context == {"refresh": 1}
+    assert updated.context_factory is factory
+
+
+def test_audit_event_resolve_context_allows_clearing_context_without_factory():
+    event = audit_hooks.AuditEvent(
+        actor="quinn",
+        action="demo.context.clear",
+        entity="resource",
+        before={},
+        after={},
+        context={"cached": True},
+    )
+
+    updated, resolved = event.resolve_context(use_factory=False, refresh=True)
+
+    assert resolved is None
+    assert updated.context is None
+    assert updated is not event
+
+
+def test_audit_event_resolve_context_drops_factory_without_invocation():
+    event = audit_hooks.AuditEvent(
+        actor="riley",
+        action="demo.context.drop_only",
+        entity="resource",
+        before={},
+        after={},
+        context={"cached": True},
+        context_factory=lambda: pytest.fail("factory should not run"),
+    )
+
+    updated, resolved = event.resolve_context(use_factory=False, drop_factory=True)
+
+    assert resolved == {"cached": True}
+    assert updated.context == {"cached": True}
+    assert updated.context_factory is None
+
+
 def test_audit_event_with_actor_updates_when_changed():
     event = audit_hooks.AuditEvent(
         actor="logan",

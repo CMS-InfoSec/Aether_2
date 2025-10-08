@@ -277,6 +277,60 @@ class AuditEvent:
 
         return replace(self, context=None, context_factory=context_factory)
 
+    def resolve_context(
+        self,
+        *,
+        use_factory: bool = True,
+        drop_factory: bool = False,
+        refresh: bool = False,
+    ) -> tuple["AuditEvent", Optional[Mapping[str, Any]]]:
+        """Return an updated event alongside the resolved structured context.
+
+        The method ensures the event has an eagerly stored context mapping and
+        returns the value that should be used when logging or serialising the
+        event.  When ``refresh`` is ``True`` any cached context is cleared prior
+        to resolution so the factory can be re-evaluated.  Context factories are
+        invoked lazily—only when ``use_factory`` is ``True`` and there is no
+        stored mapping.  Pass ``drop_factory=True`` to clear the factory on the
+        returned event after it has been evaluated (or skipped), which is useful
+        when callers want to avoid repeated work after capturing the context
+        once.  The original instance is returned when no state changes are
+        required.
+        """
+
+        context_value: Optional[Mapping[str, Any]]
+        if refresh:
+            context_value = None
+        else:
+            context_value = self.context
+
+        factory = self.context_factory
+        new_factory = factory
+
+        if use_factory and context_value is None and factory is not None:
+            context_value = factory()
+
+        if drop_factory and new_factory is not None:
+            new_factory = None
+
+        updates: dict[str, Any] = {}
+
+        if refresh:
+            if self.context is not context_value:
+                updates["context"] = context_value
+        elif context_value is not self.context:
+            updates["context"] = context_value
+
+        if new_factory is not factory:
+            updates["context_factory"] = new_factory
+
+        if updates:
+            updated_event = replace(self, **updates)
+        else:
+            updated_event = self
+
+        return updated_event, context_value
+
     def with_actor(self, actor: str) -> "AuditEvent":
         """Return a copy of the event with an updated actor value."""
 
