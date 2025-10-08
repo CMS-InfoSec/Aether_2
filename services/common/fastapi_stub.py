@@ -53,6 +53,7 @@ __all__ = [
     "Form",
     "Header",
     "HTTPException",
+    "HTMLResponse",
     "JSONResponse",
     "Path",
     "Query",
@@ -281,6 +282,20 @@ class JSONResponse(Response):
         *,
         status_code: int = 200,
         media_type: str = "application/json",
+        headers: Optional[Dict[str, str]] = None,
+    ) -> None:
+        super().__init__(content, status_code=status_code, media_type=media_type, headers=headers)
+
+
+class HTMLResponse(Response):
+    """HTML response placeholder matching FastAPI's response helpers."""
+
+    def __init__(
+        self,
+        content: Any,
+        *,
+        status_code: int = 200,
+        media_type: str = "text/html",
         headers: Optional[Dict[str, str]] = None,
     ) -> None:
         super().__init__(content, status_code=status_code, media_type=media_type, headers=headers)

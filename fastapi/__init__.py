@@ -28,6 +28,7 @@ _submodules = {
     "fastapi.responses": {
         "Response": getattr(_stub, "Response", None),
         "JSONResponse": getattr(_stub, "JSONResponse", None),
+        "HTMLResponse": getattr(_stub, "HTMLResponse", None),
         "StreamingResponse": getattr(_stub, "StreamingResponse", None),
     },
     "fastapi.exception_handlers": {
