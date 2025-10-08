@@ -146,7 +146,7 @@ if TYPE_CHECKING:  # pragma: no cover - mypy fallback when models are unavailabl
 else:  # pragma: no cover - optional runtime import
     try:
         _loaded_models = import_module("services.policy.models")
-    except ImportError:
+    except ModuleNotFoundError:
         _loaded_models = None
     MODELS = cast(ModelsModule, _loaded_models)
 
