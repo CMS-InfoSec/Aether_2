@@ -37,6 +37,14 @@ def normalize_spot_symbol(symbol: object) -> str:
         return ""
 
     normalized = candidate.replace("/", "-").replace("_", "-").upper()
+
+    if "-" not in normalized:
+        for quote in _ALLOWED_QUOTES:
+            if normalized.endswith(quote):
+                base = normalized[: -len(quote)]
+                if base:
+                    normalized = f"{base}-{quote}"
+                break
     return normalized
 
 
