@@ -29,6 +29,7 @@ _submodules = {
         "JSONResponse": getattr(_stub, "JSONResponse", None),
         "StreamingResponse": getattr(_stub, "StreamingResponse", None),
     },
+    "fastapi.applications": {"FastAPI": getattr(_stub, "FastAPI", None)},
     "fastapi.exceptions": {
         "HTTPException": getattr(_stub, "HTTPException", None),
         "RequestValidationError": getattr(_stub, "RequestValidationError", None),

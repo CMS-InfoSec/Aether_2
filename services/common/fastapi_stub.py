@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import json
+from datetime import date, datetime, timezone
 from collections.abc import MutableMapping
 from contextlib import ExitStack, asynccontextmanager
 from dataclasses import dataclass
@@ -560,15 +561,30 @@ def _extract_validation_errors(exc: Exception) -> List[Dict[str, Any]]:
     return list(errors)
 
 
+def _to_json_compatible(value: Any) -> Any:
+    if isinstance(value, datetime):
+        candidate = value.astimezone(timezone.utc)
+        return candidate.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+    if isinstance(value, date):
+        return value.isoformat()
+    if hasattr(value, "model_dump"):
+        return _to_json_compatible(value.model_dump())  # type: ignore[arg-type]
+    if isinstance(value, dict):
+        return {key: _to_json_compatible(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_to_json_compatible(item) for item in value]
+    return value
+
+
 def _dump_response_payload(value: Any) -> Any:
     if hasattr(value, "model_dump"):
-        return value.model_dump()  # type: ignore[no-any-return]
+        return _to_json_compatible(value.model_dump())
     if hasattr(value, "dict"):
         try:
-            return value.dict()  # type: ignore[no-any-return]
+            return _to_json_compatible(value.dict())
         except TypeError:
-            return value
-    return value
+            return _to_json_compatible(value)
+    return _to_json_compatible(value)
 
 
 def _is_mapping_annotation(annotation: Any) -> bool:
@@ -694,11 +710,34 @@ async def _call_endpoint(
 
 
 class _ClientResponse:
-    def __init__(self, *, status_code: int, payload: Any) -> None:
+    def __init__(
+        self,
+        *,
+        status_code: int,
+        payload: Any,
+        headers: Optional[Dict[str, str]] = None,
+        media_type: str | None = None,
+    ) -> None:
         self.status_code = status_code
         self._payload = payload
+        self.headers = dict(headers or {})
+        self.media_type = media_type
+        if isinstance(payload, (bytes, bytearray)):
+            try:
+                self.text = payload.decode()
+            except Exception:  # pragma: no cover - defensive fallback
+                self.text = ""
+        elif isinstance(payload, str):
+            self.text = payload
+        else:
+            self.text = ""
 
     def json(self) -> Any:
+        if isinstance(self._payload, (bytes, bytearray)):
+            try:
+                return json.loads(self._payload.decode())
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                raise ValueError("Response payload is not valid JSON") from exc
         return self._payload
 
 
@@ -783,18 +822,38 @@ class TestClient:
             status_code = getattr(payload, "status_code", status.HTTP_200_OK)
             if isinstance(payload, Response):
                 content = payload.content
-                if isinstance(payload, JSONResponse):
-                    content = payload.content
-                return _ClientResponse(status_code=status_code, payload=content)
-            return _ClientResponse(status_code=status_code, payload=_dump_response_payload(payload))
+                headers = dict(payload.headers)
+                if payload.media_type and "content-type" not in {
+                    key.lower() for key in headers.keys()
+                }:
+                    headers["content-type"] = payload.media_type
+                return _ClientResponse(
+                    status_code=status_code,
+                    payload=content,
+                    headers=headers,
+                    media_type=payload.media_type,
+                )
+            return _ClientResponse(
+                status_code=status_code,
+                payload=_dump_response_payload(payload),
+                headers={"content-type": "application/json"},
+                media_type="application/json",
+            )
         except RequestValidationError as exc:
             return _ClientResponse(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 payload={"detail": exc.errors},
+                headers={"content-type": "application/json"},
+                media_type="application/json",
             )
         except HTTPException as exc:
             detail = exc.detail if exc.detail is not None else ""
-            return _ClientResponse(status_code=exc.status_code, payload={"detail": detail})
+            return _ClientResponse(
+                status_code=exc.status_code,
+                payload={"detail": detail},
+                headers={"content-type": "application/json"},
+                media_type="application/json",
+            )
 
     def get(
         self,
@@ -811,8 +870,9 @@ class TestClient:
         *,
         json: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
+        params: Optional[Dict[str, Any]] = None,
     ) -> _ClientResponse:
-        return self.request("POST", path, json=json, headers=headers)
+        return self.request("POST", path, json=json, headers=headers, params=params)
 
     def delete(
         self,
