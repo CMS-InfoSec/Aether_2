@@ -44,6 +44,7 @@ class AuditEvent:
     after: Mapping[str, Any]
     ip_address: Optional[str] = None
     ip_hash: Optional[str] = None
+    resolved_ip_hash: "ResolvedIpHash | None" = None
     context: Optional[Mapping[str, Any]] = None
     context_factory: ContextFactory | None = None
 
@@ -57,6 +58,9 @@ class AuditEvent:
         present, avoiding redundant hashing, while ``ip_address`` is hashed on
         demand and retains the shared error-handling semantics.
         """
+
+        if self.resolved_ip_hash is not None:
+            return self.resolved_ip_hash
 
         return hooks.resolve_ip_hash(
             ip_address=self.ip_address,
@@ -73,44 +77,32 @@ class AuditEvent:
 
         The helper is useful when callers pre-compute hashed IP metadata via
         :meth:`resolve_ip_hash` and wish to persist the result before logging.
+        The full :class:`ResolvedIpHash` payload—including fallback metadata
+        and error state—is stored so later calls to :meth:`log_with_fallback`
+        retain the original hashing outcome when the raw IP has been dropped.
         Supplying ``drop_ip_address=True`` clears the raw address from the
         event so only the hashed value remains, which can help avoid retaining
-        sensitive data in long-lived structures.  When the resolved value and
-        resulting IP address match the current state the original instance is
-        returned to preserve object identity.
+        sensitive data in long-lived structures.  When the resolved value,
+        resulting IP address, and stored metadata all match the current state
+        the original instance is returned to preserve object identity.
         """
 
         next_hash = resolved.value
         next_ip = None if drop_ip_address else self.ip_address
 
-        if next_hash == self.ip_hash and next_ip == self.ip_address:
+        if (
+            next_hash == self.ip_hash
+            and next_ip == self.ip_address
+            and self.resolved_ip_hash == resolved
+        ):
             return self
 
-        return replace(self, ip_hash=next_hash, ip_address=next_ip)
-
-    def ensure_resolved_ip_hash(
-        self,
-        hooks: "AuditHooks",
-        *,
-        drop_ip_address: bool = False,
-    ) -> tuple["AuditEvent", "ResolvedIpHash"]:
-        """Return an updated event alongside the resolved IP hash metadata.
-
-        The helper delegates to :meth:`resolve_ip_hash` to compute the hashed
-        address (including fallback metadata) and persists the result on the
-        event via :meth:`with_resolved_ip_hash`.  Callers can request that the
-        raw IP address be cleared after hashing by supplying
-        ``drop_ip_address=True``—useful when the event should avoid retaining
-        the unhashed value beyond the resolution step.  The original event is
-        returned when no state changes are required, preserving object
-        identity.
-        """
-
-        resolved = self.resolve_ip_hash(hooks)
-        return self.with_resolved_ip_hash(
-            resolved,
-            drop_ip_address=drop_ip_address,
-        ), resolved
+        return replace(
+            self,
+            ip_hash=next_hash,
+            ip_address=next_ip,
+            resolved_ip_hash=resolved,
+        )
 
     def log_with_fallback(
         self,
@@ -144,6 +136,10 @@ class AuditEvent:
         else:
             context_mapping = cast(Optional[Mapping[str, Any]], context)
 
+        effective_resolved = resolved_ip_hash
+        if effective_resolved is None:
+            effective_resolved = self.resolved_ip_hash
+
         return log_audit_event_with_fallback(
             hooks,
             logger,
@@ -153,7 +149,7 @@ class AuditEvent:
             disabled_level=disabled_level,
             context=context_mapping,
             context_factory=effective_factory,
-            resolved_ip_hash=resolved_ip_hash,
+            resolved_ip_hash=effective_resolved,
         )
 
     def with_context(
@@ -306,10 +302,15 @@ class AuditEvent:
         if ip_address == self.ip_address:
             if preserve_hash or self.ip_hash is None:
                 return self
-            return replace(self, ip_hash=None)
+            return replace(self, ip_hash=None, resolved_ip_hash=None)
 
         next_hash = self.ip_hash if preserve_hash else None
-        return replace(self, ip_address=ip_address, ip_hash=next_hash)
+        return replace(
+            self,
+            ip_address=ip_address,
+            ip_hash=next_hash,
+            resolved_ip_hash=None,
+        )
 
     def with_ip_hash(self, ip_hash: Optional[str]) -> "AuditEvent":
         """Return a copy of the event with an updated IP hash."""
@@ -317,7 +318,7 @@ class AuditEvent:
         if ip_hash == self.ip_hash:
             return self
 
-        return replace(self, ip_hash=ip_hash)
+        return replace(self, ip_hash=ip_hash, resolved_ip_hash=None)
 
 
 @dataclass(frozen=True)
@@ -754,6 +755,10 @@ def log_audit_event_with_fallback(
     else:
         context_mapping = cast(Optional[Mapping[str, Any]], context)
 
+    effective_resolved = resolved_ip_hash
+    if effective_resolved is None:
+        effective_resolved = event.resolved_ip_hash
+
     return log_event_with_fallback(
         hooks,
         logger,
@@ -769,7 +774,7 @@ def log_audit_event_with_fallback(
         disabled_level=disabled_level,
         context=context_mapping,
         context_factory=effective_factory,
-        resolved_ip_hash=resolved_ip_hash,
+        resolved_ip_hash=effective_resolved,
     )
 
 
