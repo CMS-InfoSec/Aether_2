@@ -8,9 +8,7 @@ from typing import Any, Dict
 import pytest
 
 pytest.importorskip("fastapi", reason="fastapi is required for Scenario Simulator tests")
-pytest.importorskip("pandas", reason="pandas is required for Scenario Simulator tests")
 
-import pandas as pd
 from fastapi.testclient import TestClient
 
 
@@ -50,7 +48,8 @@ def simulator_client(monkeypatch: pytest.MonkeyPatch):
     sys.modules.pop("scenario_simulator", None)
     module = importlib.import_module("scenario_simulator")
 
-    monkeypatch.setattr(module, "_get_conn", lambda: _DummyConnection())
+    monkeypatch.setattr(module, "_open_conn", lambda *_: _DummyConnection())
+    monkeypatch.setattr(module, "_ensure_tables_for_session", lambda *_: None)
 
     client = TestClient(module.app)
     try:
@@ -74,20 +73,16 @@ def test_run_scenario_requires_admin_account(simulator_client) -> None:
 def test_run_scenario_uses_verified_actor(monkeypatch: pytest.MonkeyPatch, simulator_client) -> None:
     client, module = simulator_client
 
-    positions = pd.DataFrame(
-        [
-            {"market": "BTC-USD", "quantity": 2.0, "entry_price": 25000.0},
-            {"market": "ETH-USD", "quantity": 5.0, "entry_price": 1500.0},
-        ]
-    )
-    price_history = pd.DataFrame(
-        [
-            {"market": "BTC-USD", "bucket_start": datetime(2024, 1, 1, tzinfo=timezone.utc), "close": 100.0},
-            {"market": "BTC-USD", "bucket_start": datetime(2024, 1, 2, tzinfo=timezone.utc), "close": 105.0},
-            {"market": "ETH-USD", "bucket_start": datetime(2024, 1, 1, tzinfo=timezone.utc), "close": 50.0},
-            {"market": "ETH-USD", "bucket_start": datetime(2024, 1, 2, tzinfo=timezone.utc), "close": 52.0},
-        ]
-    )
+    positions = [
+        {"market": "BTC-USD", "quantity": 2.0, "entry_price": 25000.0},
+        {"market": "ETH-USD", "quantity": 5.0, "entry_price": 1500.0},
+    ]
+    price_history = [
+        {"market": "BTC-USD", "bucket_start": datetime(2024, 1, 1, tzinfo=timezone.utc), "close": 100.0},
+        {"market": "BTC-USD", "bucket_start": datetime(2024, 1, 2, tzinfo=timezone.utc), "close": 105.0},
+        {"market": "ETH-USD", "bucket_start": datetime(2024, 1, 1, tzinfo=timezone.utc), "close": 50.0},
+        {"market": "ETH-USD", "bucket_start": datetime(2024, 1, 2, tzinfo=timezone.utc), "close": 52.0},
+    ]
 
     monkeypatch.setattr(module, "_fetch_positions", lambda *_: positions)
     monkeypatch.setattr(module, "_fetch_price_history", lambda *_, **__: price_history)
@@ -196,11 +191,11 @@ def test_run_scenario_filters_non_spot_positions(
     monkeypatch.setattr(module, "_ensure_tables_for_session", lambda *_: None)
     monkeypatch.setattr(module, "_open_conn", lambda *_: connection)
 
-    captured_positions: list[pd.DataFrame] = []
+    captured_positions: list[list[Dict[str, Any]]] = []
     original_portfolio = module._portfolio_exposures
 
-    def _capture_portfolio(positions_frame: pd.DataFrame, prices: Dict[str, float]):
-        captured_positions.append(positions_frame.copy())
+    def _capture_portfolio(positions_frame: list[Dict[str, Any]], prices: Dict[str, float]):
+        captured_positions.append([dict(row) for row in positions_frame])
         return original_portfolio(positions_frame, prices)
 
     monkeypatch.setattr(module, "_portfolio_exposures", _capture_portfolio)
@@ -219,5 +214,5 @@ def test_run_scenario_filters_non_spot_positions(
     assert connection.requested_markets == ["ETH-USD"]
     assert captured_positions, "Expected portfolio exposures to be evaluated"
     filtered = captured_positions[0]
-    assert list(filtered["market"]) == ["ETH-USD"]
-    assert filtered.iloc[0]["quantity"] == pytest.approx(3.5)
+    assert [row["market"] for row in filtered] == ["ETH-USD"]
+    assert filtered[0]["quantity"] == pytest.approx(3.5)
