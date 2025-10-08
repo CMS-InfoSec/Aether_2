@@ -58,6 +58,7 @@ from services.common import security
 from services.common.security import require_admin_account
 from services.common.spot import require_spot_http
 from shared.session_config import load_session_ttl_minutes
+from shared.pydantic_compat import BaseModel, Field
 
 def _symbol_key(symbol: str) -> str:
     return symbol.replace("-", "").replace("/", "").upper()
@@ -116,6 +117,9 @@ def _require_database_url() -> str:
         "Seasonality service requires a PostgreSQL/Timescale DSN (SQLite is permitted for tests)."
     )
 
+def _engine_options(url: str) -> Dict[str, Any]:
+    if not _SQLALCHEMY_AVAILABLE:
+        return {}
 
 def _engine_options(url: str) -> Dict[str, Any]:
     if not _SQLALCHEMY_AVAILABLE:
@@ -486,15 +490,17 @@ SESSION_WINDOWS: Dict[str, range] = {
 
 
 def get_session(request: Request) -> Iterator[Session]:
-
-    session_factory = getattr(request.app.state, SESSIONMAKER_STATE_KEY, None)
-    if session_factory is None:
+    session_factory_obj = getattr(request.app.state, SESSIONMAKER_STATE_KEY, None)
+    session_factory: SessionFactory | None
+    if callable(session_factory_obj):
+        session_factory = cast(SessionFactory, session_factory_obj)
+    else:
         session_factory = SessionLocal
+
     if session_factory is None:
         raise RuntimeError(
             "Seasonality database session maker is not initialised. "
             "Ensure the application startup hook has run successfully."
-
         )
 
     session = session_factory()
@@ -528,6 +534,9 @@ def _configure_database_for_app(application: FastAPI) -> None:
 
     setattr(application.state, ENGINE_STATE_KEY, engine)
     setattr(application.state, SESSIONMAKER_STATE_KEY, session_factory)
+    setattr(application.state, "seasonality_database_url", database_url)
+    setattr(application.state, "seasonality_engine", engine)
+    setattr(application.state, "seasonality_sessionmaker", session_factory)
 
     ENGINE = engine
     SessionLocal = session_factory
@@ -835,19 +844,19 @@ except RuntimeError:
     SESSION_STORE = None
 
 
-@app.on_event("startup")
+@_app_on_event("startup")
 def _on_startup() -> None:
     _configure_database_for_app(app)
     _configure_session_store(app)
 
 
-@app.on_event("shutdown")
+@_app_on_event("shutdown")
 def _on_shutdown() -> None:
     _dispose_database(app)
 
 
 
-@app.get("/seasonality/dayofweek", response_model=DayOfWeekResponse)
+@_app_get("/seasonality/dayofweek", response_model=DayOfWeekResponse)
 def day_of_week(
     *,
     symbol: str = Query(..., description="Market symbol", example="BTC/USD"),
@@ -886,7 +895,7 @@ def day_of_week(
     return DayOfWeekResponse(symbol=symbol_key, generated_at=now, metrics=response_metrics)
 
 
-@app.get("/seasonality/hourofday", response_model=HourOfDayResponse)
+@_app_get("/seasonality/hourofday", response_model=HourOfDayResponse)
 def hour_of_day(
     *,
     symbol: str = Query(..., description="Market symbol", example="BTC/USD"),
@@ -925,7 +934,7 @@ def hour_of_day(
     return HourOfDayResponse(symbol=symbol_key, generated_at=now, metrics=response_metrics)
 
 
-@app.get("/seasonality/session_liquidity", response_model=SessionLiquidityResponse)
+@_app_get("/seasonality/session_liquidity", response_model=SessionLiquidityResponse)
 def session_liquidity(
     *,
     symbol: str = Query(..., description="Market symbol", example="BTC/USD"),
@@ -964,7 +973,7 @@ def session_liquidity(
     return SessionLiquidityResponse(symbol=symbol_key, generated_at=now, metrics=response_metrics)
 
 
-@app.get("/seasonality/current_session", response_model=CurrentSessionResponse)
+@_app_get("/seasonality/current_session", response_model=CurrentSessionResponse)
 def current_session(
     *,
     session: Session = Depends(get_session),
