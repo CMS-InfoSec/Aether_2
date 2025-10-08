@@ -950,23 +950,29 @@ class TestClient:
             security_module = None
 
         store = getattr(self.app.state, "session_store", None)
-        if store is None and security_module is not None:
-            store = getattr(security_module, "_DEFAULT_SESSION_STORE", None)
-            if store is not None:
-                self.app.state.session_store = store
-        if store is None:
-            try:
-                from auth.service import InMemorySessionStore  # type: ignore[import]
-            except Exception:  # pragma: no cover - auth service is optional in some suites
-                store = None
-            else:
-                store = InMemorySessionStore()
-                self.app.state.session_store = store
-                if security_module is not None:
-                    try:
-                        security_module.set_default_session_store(store)
-                    except Exception:  # pragma: no cover - defensive guard
-                        pass
+        override_present = False
+        if security_module is not None:
+            dependency = getattr(security_module, "require_admin_account", None)
+            if dependency in self.app.dependency_overrides:
+                override_present = True
+        if not override_present:
+            if store is None and security_module is not None:
+                store = getattr(security_module, "_DEFAULT_SESSION_STORE", None)
+                if store is not None:
+                    self.app.state.session_store = store
+            if store is None:
+                try:
+                    from auth.service import InMemorySessionStore  # type: ignore[import]
+                except Exception:  # pragma: no cover - auth service is optional in some suites
+                    store = None
+                else:
+                    store = InMemorySessionStore()
+                    self.app.state.session_store = store
+                    if security_module is not None:
+                        try:
+                            security_module.set_default_session_store(store)
+                        except Exception:  # pragma: no cover - defensive guard
+                            pass
         account_id = headers.get("X-Account-ID")
         if account_id is None and isinstance(json, dict):
             account_id = json.get("account_id")
@@ -981,34 +987,35 @@ class TestClient:
         if account_id and provided_auth and "x-account-id" not in lower_header_keys:
             headers["X-Account-ID"] = str(account_id)
             lower_header_keys.add("x-account-id")
-        if account_id and security_module is not None:
-            try:
-                existing = set(getattr(security_module, "ADMIN_ACCOUNTS", set()))
-                candidates = {str(account_id)}
-                subject = _extract_jwt_subject(token) if token else None
-                if subject:
-                    candidates.add(subject)
-                if not candidates.issubset(existing):
-                    existing.update(candidates)
-                    security_module.reload_admin_accounts(existing)
-            except Exception:  # pragma: no cover - defensive guard for minimal stubs
-                pass
-        if store is None and security_module is not None:
-            store = getattr(security_module, "_DEFAULT_SESSION_STORE", None)
-            if store is not None:
-                self.app.state.session_store = store
-        if store is not None and account_id:
-            if token:
-                session = store.get(token)
-                if session is None:
-                    session_account = _extract_jwt_subject(token) or str(account_id)
-                    session = store.create(str(session_account))
+        if not override_present:
+            if account_id and security_module is not None:
+                try:
+                    existing = set(getattr(security_module, "ADMIN_ACCOUNTS", set()))
+                    candidates = {str(account_id)}
+                    subject = _extract_jwt_subject(token) if token else None
+                    if subject:
+                        candidates.add(subject)
+                    if not candidates.issubset(existing):
+                        existing.update(candidates)
+                        security_module.reload_admin_accounts(existing)
+                except Exception:  # pragma: no cover - defensive guard for minimal stubs
+                    pass
+            if store is None and security_module is not None:
+                store = getattr(security_module, "_DEFAULT_SESSION_STORE", None)
+                if store is not None:
+                    self.app.state.session_store = store
+            if store is not None and account_id:
+                if token:
+                    session = store.get(token)
+                    if session is None:
+                        session_account = _extract_jwt_subject(token) or str(account_id)
+                        session = store.create(str(session_account))
+                        headers["Authorization"] = f"Bearer {session.token}"
+                elif provided_auth:
+                    headers["Authorization"] = str(provided_auth)
+                elif header_account_present and normalized_method == "GET":
+                    session = store.create(str(account_id))
                     headers["Authorization"] = f"Bearer {session.token}"
-            elif provided_auth:
-                headers["Authorization"] = str(provided_auth)
-            elif header_account_present and normalized_method == "GET":
-                session = store.create(str(account_id))
-                headers["Authorization"] = f"Bearer {session.token}"
         return self._handle_call(normalized_method, url, json=json, headers=headers, params=params)
 
 

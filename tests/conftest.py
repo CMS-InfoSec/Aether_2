@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib
 import asyncio
 import base64
 import inspect
@@ -198,11 +199,18 @@ def _configure_session_backend(monkeypatch: pytest.MonkeyPatch) -> None:
         backend.flushall()
 
 
+from importlib.machinery import ModuleSpec
+
+
 def _install_sqlalchemy_stub() -> None:
     if "sqlalchemy" in sys.modules:
         return
 
     sa = ModuleType("sqlalchemy")
+    sa.__spec__ = ModuleSpec("sqlalchemy", loader=None)
+    if sa.__spec__ is not None:
+        sa.__spec__.submodule_search_locations = []
+    sa.__path__ = []  # type: ignore[attr-defined]
 
     class _Column:
         def __init__(self, *args: object, **kwargs: object) -> None:
@@ -290,8 +298,21 @@ def _install_sqlalchemy_stub() -> None:
 
     sys.modules["sqlalchemy"] = sa
 
-    orm = ModuleType("sqlalchemy.orm")
+    original_find_spec = getattr(importlib.util, "_sqlalchemy_original_find_spec", None)
+    if original_find_spec is None:
+        original_find_spec = importlib.util.find_spec
 
+        def _find_spec(name: str, package: str | None = None):  # type: ignore[override]
+            if name == "sqlalchemy":
+                return None
+            return original_find_spec(name, package)
+
+        importlib.util._sqlalchemy_original_find_spec = original_find_spec  # type: ignore[attr-defined]
+        importlib.util.find_spec = _find_spec  # type: ignore[assignment]
+
+    orm = ModuleType("sqlalchemy.orm")
+    orm.__spec__ = ModuleSpec("sqlalchemy.orm", loader=None)
+    
     class Session(SimpleNamespace):
         def execute(self, *args: object, **kwargs: object) -> SimpleNamespace:
             return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: []))
@@ -335,21 +356,26 @@ def _install_sqlalchemy_stub() -> None:
     sys.modules["sqlalchemy.orm"] = orm
 
     engine = ModuleType("sqlalchemy.engine")
+    engine.__spec__ = ModuleSpec("sqlalchemy.engine", loader=None)
     engine.Engine = SimpleNamespace
     sys.modules["sqlalchemy.engine"] = engine
 
     exc = ModuleType("sqlalchemy.exc")
+    exc.__spec__ = ModuleSpec("sqlalchemy.exc", loader=None)
     exc.SQLAlchemyError = Exception
     sys.modules["sqlalchemy.exc"] = exc
 
     pool = ModuleType("sqlalchemy.pool")
+    pool.__spec__ = ModuleSpec("sqlalchemy.pool", loader=None)
     pool.NullPool = object
     pool.StaticPool = object
     sa.pool = pool
     sys.modules["sqlalchemy.pool"] = pool
 
     dialects = ModuleType("sqlalchemy.dialects")
+    dialects.__spec__ = ModuleSpec("sqlalchemy.dialects", loader=None)
     postgresql = ModuleType("sqlalchemy.dialects.postgresql")
+    postgresql.__spec__ = ModuleSpec("sqlalchemy.dialects.postgresql", loader=None)
 
     class JSONB:  # pragma: no cover - simple placeholder
         def __init__(self, *args: object, **kwargs: object) -> None:
@@ -368,9 +394,11 @@ def _install_sqlalchemy_stub() -> None:
     sys.modules["sqlalchemy.dialects.postgresql"] = postgresql
 
     ext = ModuleType("sqlalchemy.ext")
+    ext.__spec__ = ModuleSpec("sqlalchemy.ext", loader=None)
     sys.modules["sqlalchemy.ext"] = ext
 
     ext_asyncio = ModuleType("sqlalchemy.ext.asyncio")
+    ext_asyncio.__spec__ = ModuleSpec("sqlalchemy.ext.asyncio", loader=None)
 
     class _AsyncConnection(SimpleNamespace):
         async def execute(self, *args: object, **kwargs: object) -> SimpleNamespace:
@@ -398,6 +426,7 @@ def _install_sqlalchemy_stub() -> None:
     sys.modules["sqlalchemy.ext.asyncio"] = ext_asyncio
 
     ext_compiler = ModuleType("sqlalchemy.ext.compiler")
+    ext_compiler.__spec__ = ModuleSpec("sqlalchemy.ext.compiler", loader=None)
 
     def compiles(*args: object, **kwargs: object):
         def decorator(func):

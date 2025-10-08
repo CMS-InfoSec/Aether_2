@@ -17,6 +17,7 @@ except Exception:  # pragma: no cover - defensive fallback
 __all__ = [
     "ASGITransport",
     "AsyncClient",
+    "Client",
     "HTTPError",
     "HTTPStatusError",
     "Request",
@@ -267,3 +268,39 @@ class AsyncClient:
 
 
 _MISSING = object()
+
+
+class Client:
+    """Synchronous wrapper around :class:`AsyncClient` for the stub."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str | None = None,
+        transport: ASGITransport | None = None,
+        timeout: float | Timeout | None = None,
+    ) -> None:
+        self._async_client = AsyncClient(
+            base_url=base_url, transport=transport, timeout=timeout
+        )
+
+    def __enter__(self) -> "Client":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def close(self) -> None:
+        asyncio.run(self._async_client.aclose())
+
+    def get(self, url: str, **kwargs: Any) -> Response:
+        return asyncio.run(self._async_client.get(url, **kwargs))
+
+    def post(self, url: str, **kwargs: Any) -> Response:
+        return asyncio.run(self._async_client.post(url, **kwargs))
+
+    def put(self, url: str, **kwargs: Any) -> Response:
+        return asyncio.run(self._async_client.put(url, **kwargs))
+
+    def delete(self, url: str, **kwargs: Any) -> Response:
+        return asyncio.run(self._async_client.delete(url, **kwargs))
