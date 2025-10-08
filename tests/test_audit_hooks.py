@@ -81,7 +81,7 @@ def test_log_event_skips_when_logger_missing():
     assert result.hash_error is None
     assert result.context_evaluated is False
     assert result.fallback_logged is False
-    assert result.fallback_extra is None
+    assert_no_fallback_extra(result)
     assert not result
 
 
@@ -109,7 +109,7 @@ def test_log_event_records_with_ip_hash():
     assert result.log_error is None
     assert result.context_evaluated is False
     assert result.fallback_logged is False
-    assert result.fallback_extra is None
+    assert_no_fallback_extra(result)
     assert result
     assert calls == [
         {
@@ -147,7 +147,7 @@ def test_log_event_respects_explicit_ip_hash():
     assert result.hash_error is None
     assert result.context_evaluated is False
     assert result.fallback_logged is False
-    assert result.fallback_extra is None
+    assert_no_fallback_extra(result)
 
 
 def test_audit_log_result_truthiness():
@@ -208,6 +208,8 @@ def test_log_event_with_fallback_logs_when_disabled(caplog: pytest.LogCaptureFix
             "hash_fallback": False,
         }
     }
+    assert result.fallback_extra_error is None
+    assert result.fallback_extra_evaluated is True
     assert not result
     record = next(record for record in caplog.records if record.message == "audit disabled")
     assert record.audit == {
@@ -251,7 +253,7 @@ def test_log_event_with_fallback_context_factory_skips_when_unused():
     assert result.context_evaluated is False
     assert factory_calls == []
     assert result.fallback_logged is False
-    assert result.fallback_extra is None
+    assert_no_fallback_extra(result)
 
 
 def test_log_event_with_fallback_context_factory_failure_records_metadata(
@@ -294,6 +296,8 @@ def test_log_event_with_fallback_context_factory_failure_records_metadata(
         "type": "RuntimeError",
         "message": "context boom",
     }
+    assert result.fallback_extra_error is None
+    assert result.fallback_extra_evaluated is True
 
     context_error_records = [
         record
@@ -345,6 +349,8 @@ def test_log_event_with_fallback_context_factory_used_for_fallback(
     assert result.context_evaluated is True
     assert result.fallback_logged is True
     assert result.fallback_extra == {"audit": {"source": "factory"}}
+    assert result.fallback_extra_error is None
+    assert result.fallback_extra_evaluated is True
     record = next(
         entry
         for entry in caplog.records
@@ -387,7 +393,7 @@ def test_log_audit_event_with_fallback_event_context_factory_skips_when_unused()
     assert result.context_evaluated is False
     assert factory_calls == []
     assert result.fallback_logged is False
-    assert result.fallback_extra is None
+    assert_no_fallback_extra(result)
 
 
 def test_log_audit_event_with_fallback_event_context_factory_used_for_fallback(
@@ -425,6 +431,8 @@ def test_log_audit_event_with_fallback_event_context_factory_used_for_fallback(
     assert result.context_evaluated is True
     assert result.fallback_logged is True
     assert result.fallback_extra == {"audit": {"source": "event"}}
+    assert result.fallback_extra_error is None
+    assert result.fallback_extra_evaluated is True
     record = next(
         entry
         for entry in caplog.records
@@ -473,6 +481,8 @@ def test_log_audit_event_with_fallback_reuses_resolved_context(
     assert calls == [1]
     assert result.fallback_logged is True
     assert result.fallback_extra == {"audit": {"source": "call-1"}}
+    assert result.fallback_extra_error is None
+    assert result.fallback_extra_evaluated is True
     record = next(
         entry
         for entry in caplog.records
@@ -524,6 +534,8 @@ def test_log_audit_event_with_fallback_resolved_context_error_logged_once(
         "type": "RuntimeError",
         "message": "context failure",
     }
+    assert result.fallback_extra_error is None
+    assert result.fallback_extra_evaluated is True
     failure_records = [
         entry
         for entry in caplog.records
@@ -578,6 +590,8 @@ def test_log_event_with_fallback_handles_exceptions(caplog: pytest.LogCaptureFix
             "hash_fallback": False,
         }
     }
+    assert result.fallback_extra_error is None
+    assert result.fallback_extra_evaluated is True
     error_record = next(
         record
         for record in caplog.records
@@ -640,6 +654,8 @@ def test_log_event_with_fallback_uses_fallback_hash_on_error(caplog: pytest.LogC
             "hash_error": {"type": "RuntimeError", "message": "hash failure"},
         }
     }
+    assert result.fallback_extra_error is None
+    assert result.fallback_extra_evaluated is True
     assert calls == [
         {
             "actor": "ivy",
@@ -700,7 +716,7 @@ def test_log_event_with_fallback_reuses_resolved_hash(caplog: pytest.LogCaptureF
     assert hash_calls["count"] == 1
     assert result.context is None
     assert result.fallback_logged is False
-    assert result.fallback_extra is None
+    assert_no_fallback_extra(result)
     assert captured == [
         {
             "actor": "kelly",
@@ -753,7 +769,7 @@ def test_log_event_with_fallback_accepts_pre_resolved_hash(caplog: pytest.LogCap
     assert hash_calls["count"] == 1
     assert result.context is None
     assert result.fallback_logged is False
-    assert result.fallback_extra is None
+    assert_no_fallback_extra(result)
     assert captured == [
         {
             "actor": "lisa",
@@ -813,6 +829,8 @@ def test_log_event_falls_back_when_hash_raises(caplog: pytest.LogCaptureFixture)
             "hash_error": {"type": "RuntimeError", "message": "hash failure"},
         }
     }
+    assert result.fallback_extra_error is None
+    assert result.fallback_extra_evaluated is True
 
 
 def test_log_event_with_fallback_allows_custom_context(caplog: pytest.LogCaptureFixture):
@@ -852,6 +870,8 @@ def test_log_event_with_fallback_allows_custom_context(caplog: pytest.LogCapture
         "audit": {"actor": "frank", "action": "demo.context"},
         "extra_field": "value",
     }
+    assert result.fallback_extra_error is None
+    assert result.fallback_extra_evaluated is True
 
 
 class _TrackingMapping(Mapping[str, object]):
@@ -913,8 +933,115 @@ def test_log_event_with_fallback_defers_extra_until_needed(caplog: pytest.LogCap
     assert context.accessed is False
     assert not caplog.records
     assert result.fallback_logged is False
-    assert result.fallback_extra is None
+    assert_no_fallback_extra(result)
 
+
+def test_log_event_with_fallback_fallback_extra_factory_skips_when_unused():
+    hooks = audit_hooks.AuditHooks(log=lambda **payload: None, hash_ip=lambda value: value)
+    logger = logging.getLogger("test.audit.fallback_extra.success")
+    factory_calls: List[int] = []
+
+    def extra_factory() -> Mapping[str, str]:
+        factory_calls.append(1)
+        return {"request_id": "abc"}
+
+    result = audit_hooks.log_event_with_fallback(
+        hooks,
+        logger,
+        actor="nina",
+        action="demo.extra.success",
+        entity="resource",
+        before={},
+        after={},
+        failure_message="should not trigger",
+        fallback_extra_factory=extra_factory,
+    )
+
+    assert result.handled is True
+    assert factory_calls == []
+    assert_no_fallback_extra(result)
+
+
+def test_log_event_with_fallback_fallback_extra_factory_used_for_fallback(
+    caplog: pytest.LogCaptureFixture,
+):
+    hooks = audit_hooks.AuditHooks(log=None, hash_ip=lambda value: value)
+    logger = logging.getLogger("test.audit.fallback_extra.fallback")
+    factory_calls: List[str] = []
+
+    def extra_factory() -> Mapping[str, str]:
+        factory_calls.append("called")
+        return {"request_id": "req-789"}
+
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        result = audit_hooks.log_event_with_fallback(
+            hooks,
+            logger,
+            actor="oliver",
+            action="demo.extra.disabled",
+            entity="resource",
+            before={},
+            after={},
+            failure_message="should not trigger",
+            disabled_message="audit disabled",
+            disabled_level=logging.INFO,
+            fallback_extra_factory=extra_factory,
+        )
+
+    assert factory_calls == ["called"]
+    assert result.handled is False
+    assert result.fallback_logged is True
+    assert result.fallback_extra is not None
+    assert result.fallback_extra["request_id"] == "req-789"
+    assert result.fallback_extra["audit"]["actor"] == "oliver"
+    assert result.fallback_extra_error is None
+    assert result.fallback_extra_evaluated is True
+    disabled_record = next(record for record in caplog.records if record.message == "audit disabled")
+    assert disabled_record.request_id == "req-789"
+
+
+def test_log_event_with_fallback_fallback_extra_factory_failure(
+    caplog: pytest.LogCaptureFixture,
+):
+    hooks = audit_hooks.AuditHooks(log=None, hash_ip=lambda value: value)
+    logger = logging.getLogger("test.audit.fallback_extra.failure")
+    factory_calls: List[str] = []
+
+    def failing_factory() -> Mapping[str, str]:
+        factory_calls.append("called")
+        raise RuntimeError("fallback extra boom")
+
+    with caplog.at_level(logging.ERROR, logger=logger.name):
+        result = audit_hooks.log_event_with_fallback(
+            hooks,
+            logger,
+            actor="piper",
+            action="demo.extra.failure",
+            entity="resource",
+            before={},
+            after={},
+            failure_message="should not trigger",
+            disabled_message="audit disabled",
+            fallback_extra_factory=failing_factory,
+        )
+
+    assert factory_calls == ["called"]
+    assert result.handled is False
+    assert result.fallback_logged is True
+    assert result.fallback_extra is not None
+    assert "audit_fallback_extra_error" in result.fallback_extra
+    assert isinstance(result.fallback_extra_error, RuntimeError)
+    assert str(result.fallback_extra_error) == "fallback extra boom"
+    assert result.fallback_extra_evaluated is True
+    failure_record = next(
+        record
+        for record in caplog.records
+        if record.message == "Audit fallback extra factory raised; omitting custom metadata."
+    )
+    assert getattr(failure_record, "audit_fallback_extra_error") == {
+        "type": "RuntimeError",
+        "message": "fallback extra boom",
+    }
 
 def test_log_audit_event_with_fallback_logs_event_payload():
     captured: dict[str, object] = {}
@@ -951,7 +1078,7 @@ def test_log_audit_event_with_fallback_logs_event_payload():
         "ip_hash": "hash:10.1.2.3",
     }
     assert result.fallback_logged is False
-    assert result.fallback_extra is None
+    assert_no_fallback_extra(result)
 
 
 def test_log_audit_event_with_fallback_uses_event_context(caplog: pytest.LogCaptureFixture):
@@ -982,6 +1109,8 @@ def test_log_audit_event_with_fallback_uses_event_context(caplog: pytest.LogCapt
     assert len(caplog.records) == 1
     assert result.fallback_logged is True
     assert result.fallback_extra == {"request_id": "req-123"}
+    assert result.fallback_extra_error is None
+    assert result.fallback_extra_evaluated is True
     record = caplog.records[0]
     assert record.message == "Audit logging disabled"
     assert getattr(record, "request_id", None) == "req-123"
@@ -1021,6 +1150,8 @@ def test_log_event_with_fallback_includes_custom_extra(caplog: pytest.LogCapture
     audit_payload = result.fallback_extra["audit"]
     assert audit_payload["actor"] == "lea"
     assert audit_payload["flow"] == "demo"
+    assert result.fallback_extra_error is None
+    assert result.fallback_extra_evaluated is True
     record = caplog.records[0]
     assert record.message == "Audit logging disabled"
     assert getattr(record, "request_id", None) == "req-456"
@@ -1063,6 +1194,7 @@ def test_log_event_with_fallback_merges_result_and_wrapper_extra(
             hash_error=resolved.error,
             fallback_logged=True,
             fallback_extra=hook_extra,
+            fallback_extra_evaluated=True,
         )
 
     monkeypatch.setattr(
@@ -1097,6 +1229,8 @@ def test_log_event_with_fallback_merges_result_and_wrapper_extra(
     assert result.fallback_extra["audit"]["ip_hash"] == "hash:10.2.3.4"
     assert result.fallback_extra["audit"]["before"] == {"before": True}
     assert result.fallback_extra["audit"]["after"] == {"after": True}
+    assert result.fallback_extra_error is None
+    assert result.fallback_extra_evaluated is True
     assert len(caplog.records) == 1
     record = caplog.records[0]
     assert record.message == "Audit logging disabled"
@@ -1152,6 +1286,7 @@ def test_audit_event_log_with_fallback_method_delegates(monkeypatch):
         "resolved_ip_hash": None,
         "resolved_context": None,
         "fallback_extra": fallback_extra,
+        "fallback_extra_factory": None,
     }
 
 
@@ -1192,6 +1327,7 @@ def test_audit_event_log_with_fallback_infers_event_context(monkeypatch):
     assert result is expected
     assert captured["kwargs"]["context"] == {"source": "controller"}
     assert captured["kwargs"]["context_factory"] is None
+    assert captured["kwargs"]["fallback_extra_factory"] is None
 
 
 def test_audit_event_log_with_fallback_forwards_context_factory(monkeypatch):
@@ -1235,6 +1371,7 @@ def test_audit_event_log_with_fallback_forwards_context_factory(monkeypatch):
     assert result is expected
     assert captured["kwargs"]["context"] is None
     assert captured["kwargs"]["context_factory"] is context_factory
+    assert captured["kwargs"]["fallback_extra_factory"] is None
     assert factory_calls == []
 
 
@@ -1283,6 +1420,90 @@ def test_audit_event_log_with_fallback_uses_event_context_factory(monkeypatch):
     assert result is expected
     assert captured["kwargs"]["context"] is None
     assert captured["kwargs"]["context_factory"] is context_factory
+    assert captured["kwargs"]["fallback_extra_factory"] is None
+    assert factory_calls == []
+
+
+def test_audit_event_log_with_fallback_uses_event_fallback_extra(monkeypatch):
+    hooks = audit_hooks.AuditHooks(log=lambda **_: None, hash_ip=lambda value: value)
+    logger = logging.getLogger("tests.audit.event_fallback_extra")
+    event = audit_hooks.AuditEvent(
+        actor="max",
+        action="demo.event.extra",
+        entity="resource",
+        before={},
+        after={},
+        fallback_extra={"request_id": "evt-123"},
+    )
+
+    expected = audit_hooks.AuditLogResult(
+        handled=True,
+        ip_hash=None,
+        hash_fallback=False,
+        hash_error=None,
+        fallback_logged=False,
+    )
+    captured: dict[str, object] = {}
+
+    def fake_helper(*args: object, **kwargs: object) -> audit_hooks.AuditLogResult:
+        captured["kwargs"] = kwargs
+        return expected
+
+    monkeypatch.setattr(audit_hooks, "log_audit_event_with_fallback", fake_helper)
+
+    result = event.log_with_fallback(
+        hooks,
+        logger,
+        failure_message="failure",
+    )
+
+    assert result is expected
+    assert captured["kwargs"]["fallback_extra"] == {"request_id": "evt-123"}
+    assert captured["kwargs"]["fallback_extra_factory"] is None
+
+
+def test_audit_event_log_with_fallback_uses_event_fallback_extra_factory(monkeypatch):
+    hooks = audit_hooks.AuditHooks(log=lambda **_: None, hash_ip=lambda value: value)
+    logger = logging.getLogger("tests.audit.event_fallback_factory")
+    factory_calls: List[int] = []
+
+    def fallback_extra_factory() -> Mapping[str, str]:
+        factory_calls.append(1)
+        return {"request_id": "evt-456"}
+
+    event = audit_hooks.AuditEvent(
+        actor="nora",
+        action="demo.event.fallback_factory",
+        entity="resource",
+        before={},
+        after={},
+        fallback_extra_factory=fallback_extra_factory,
+    )
+
+    expected = audit_hooks.AuditLogResult(
+        handled=True,
+        ip_hash=None,
+        hash_fallback=False,
+        hash_error=None,
+        fallback_logged=False,
+    )
+    captured: dict[str, object] = {}
+
+    def fake_helper(*args: object, **kwargs: object) -> audit_hooks.AuditLogResult:
+        captured["kwargs"] = kwargs
+        return expected
+
+    monkeypatch.setattr(audit_hooks, "log_audit_event_with_fallback", fake_helper)
+
+    result = event.log_with_fallback(
+        hooks,
+        logger,
+        failure_message="failure",
+    )
+
+    assert result is expected
+    assert captured["kwargs"]["fallback_extra"] is None
+    assert captured["kwargs"]["fallback_extra_factory"] is fallback_extra_factory
     assert factory_calls == []
 
 
@@ -2298,3 +2519,12 @@ def test_audit_event_resolve_ip_hash_preserves_fallback_metadata():
     assert resolved.value == audit_hooks._hash_ip_fallback("198.51.100.9")
     assert resolved.fallback is True
     assert isinstance(resolved.error, RuntimeError)
+
+
+def assert_no_fallback_extra(result: audit_hooks.AuditLogResult) -> None:
+    """Assert that no fallback extra metadata was produced."""
+
+    assert result.fallback_extra is None
+    assert result.fallback_extra_error is None
+    assert result.fallback_extra_evaluated is False
+
