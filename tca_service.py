@@ -29,7 +29,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from typing import Any, Iterable, Mapping, MutableMapping, Sequence
+from typing import Any, Iterable, Iterator, Mapping, MutableMapping, Sequence
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -50,7 +50,7 @@ if _SQLALCHEMY_AVAILABLE:
     from sqlalchemy.orm import Session, declarative_base, sessionmaker
     from sqlalchemy.pool import StaticPool
 else:  # pragma: no cover - lightweight fallback when SQLAlchemy absent
-    from types import SimpleNamespace
+    from types import MappingProxyType, SimpleNamespace
     from typing import Any, Callable
 
     Column = DateTime = Numeric = String = object  # type: ignore[assignment]
@@ -264,7 +264,32 @@ else:
                 def all(self) -> list["TCAReport"]:  # pragma: no cover - parity helper
                     return sorted(self._reports, key=lambda record: record.ts, reverse=True)
 
+            class _Row:
+                __slots__ = ("_mapping", "_values")
+
+                def __init__(self, mapping: Mapping[str, Any] | None = None) -> None:
+                    data = dict(mapping or {})
+                    self._mapping = MappingProxyType(data)
+                    self._values = tuple(data[key] for key in data)
+
+                def __iter__(self) -> Iterator[Any]:
+                    return iter(self._values)
+
             class _Result:
+                __slots__ = ("_rows",)
+
+                def __init__(self, rows: Iterable[Mapping[str, Any]] | None = None) -> None:
+                    self._rows = tuple(_Row(row) for row in (rows or ()))
+
+                def __iter__(self) -> Iterator[_Row]:
+                    return iter(self._rows)
+
+                def __len__(self) -> int:
+                    return len(self._rows)
+
+                def __bool__(self) -> bool:
+                    return bool(self._rows)
+
                 def scalars(self) -> _ScalarResult:
                     return _ScalarResult(store.reports)
 
