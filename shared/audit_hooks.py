@@ -60,6 +60,10 @@ class AuditEvent:
         resolved_ip_hash: "ResolvedIpHash" | None = None,
         use_context_factory: bool = False,
         include_hash_metadata: bool = False,
+        include_fallback_extra: bool = False,
+        use_fallback_extra_factory: bool = False,
+        resolved_fallback_extra: "ResolvedFallbackExtra" | None = None,
+        include_fallback_extra_metadata: bool = False,
     ) -> dict[str, Any]:
         """Return a serialisable representation of the audit event.
 
@@ -80,6 +84,20 @@ class AuditEvent:
         accurate metadata callers should supply ``resolved_ip_hash`` from
         :meth:`AuditHooks.resolve_ip_hash` (or a compatible pre-computed
         result); otherwise the hash metadata defaults to a non-fallback state.
+
+        Additional structured metadata that is only required for fallback
+        logging can be included via ``include_fallback_extra``.  The returned
+        mapping is copied so callers do not mutate the stored payload, and
+        ``use_fallback_extra_factory`` controls whether the optional
+        :attr:`fallback_extra_factory` should run when no eager mapping is
+        available.  Supplying ``resolved_fallback_extra`` allows callers to
+        reuse previously captured fallback extra metadata—such as from
+        :meth:`resolve_fallback_extra_metadata`—without re-evaluating factories.
+        When ``include_fallback_extra_metadata`` is ``True`` the payload
+        includes whether fallback extra resolution was evaluated and any
+        associated error metadata.  Factory execution is still opt-in via
+        ``use_fallback_extra_factory`` so callers remain in control of expensive
+        metadata generation.
         """
 
         resolved_hash = self.ip_hash if resolved_ip_hash is None else resolved_ip_hash.value
@@ -115,6 +133,47 @@ class AuditEvent:
             payload["hash_fallback"] = resolved_metadata.fallback
             if resolved_metadata.error is not None:
                 payload["hash_error"] = _build_hash_error_metadata(resolved_metadata.error)
+
+        fallback_extra_value: Optional[Mapping[str, Any]] = self.fallback_extra
+        fallback_extra_error: Optional[Exception] = None
+        fallback_extra_evaluated = fallback_extra_value is not None
+
+        if resolved_fallback_extra is not None:
+            if fallback_extra_value is None:
+                fallback_extra_value = resolved_fallback_extra.value
+            fallback_extra_error = resolved_fallback_extra.error
+            fallback_extra_evaluated = (
+                fallback_extra_evaluated or resolved_fallback_extra.evaluated
+            )
+        elif (
+            (include_fallback_extra or include_fallback_extra_metadata)
+            and fallback_extra_value is None
+            and use_fallback_extra_factory
+            and self.fallback_extra_factory is not None
+        ):
+            try:
+                fallback_extra_value = self.fallback_extra_factory()
+            except Exception as exc:  # pragma: no cover - exercised via tests
+                fallback_extra_error = exc
+                fallback_extra_value = None
+            finally:
+                fallback_extra_evaluated = True
+
+        if include_fallback_extra and fallback_extra_value is not None:
+            payload["fallback_extra"] = dict(fallback_extra_value)
+
+        if include_fallback_extra_metadata:
+            metadata = resolved_fallback_extra
+            if metadata is None:
+                metadata = ResolvedFallbackExtra(
+                    value=fallback_extra_value,
+                    error=fallback_extra_error,
+                    evaluated=fallback_extra_evaluated,
+                )
+
+            payload["fallback_extra_evaluated"] = metadata.evaluated
+            if metadata.error is not None:
+                payload["fallback_extra_error"] = _describe_exception(metadata.error)
 
         return payload
 

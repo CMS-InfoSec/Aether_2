@@ -2580,6 +2580,134 @@ def test_audit_event_to_payload_defaults_hash_metadata_when_not_provided():
     assert "hash_error" not in payload
 
 
+def test_audit_event_to_payload_can_include_fallback_extra_mapping():
+    event = audit_hooks.AuditEvent(
+        actor="uma",
+        action="demo.event.fallback.extra",
+        entity="resource",
+        before={},
+        after={},
+        fallback_extra={"correlation_id": "abc"},
+    )
+
+    payload = event.to_payload(include_fallback_extra=True)
+
+    assert payload["fallback_extra"] == {"correlation_id": "abc"}
+    assert payload["fallback_extra"] is not event.fallback_extra
+
+
+def test_audit_event_to_payload_can_use_fallback_extra_factory():
+    calls: list[str] = []
+
+    def build_extra() -> Mapping[str, Any]:
+        calls.append("called")
+        return {"correlation_id": "xyz"}
+
+    event = audit_hooks.AuditEvent(
+        actor="vale",
+        action="demo.event.fallback.extra.factory",
+        entity="resource",
+        before={},
+        after={},
+        fallback_extra_factory=build_extra,
+    )
+
+    payload = event.to_payload(
+        include_fallback_extra=True,
+        use_fallback_extra_factory=True,
+    )
+
+    assert payload["fallback_extra"] == {"correlation_id": "xyz"}
+    assert calls == ["called"]
+
+    assert "fallback_extra" not in event.to_payload()
+    assert calls == ["called"]
+
+
+def test_audit_event_to_payload_includes_fallback_extra_metadata_from_resolved():
+    event = audit_hooks.AuditEvent(
+        actor="wren",
+        action="demo.event.fallback.extra.metadata",
+        entity="resource",
+        before={},
+        after={},
+    )
+    resolved = audit_hooks.ResolvedFallbackExtra(
+        value=None,
+        error=RuntimeError("factory failed"),
+        evaluated=True,
+    )
+
+    payload = event.to_payload(
+        include_fallback_extra_metadata=True,
+        resolved_fallback_extra=resolved,
+    )
+
+    assert payload["fallback_extra_evaluated"] is True
+    assert payload["fallback_extra_error"] == {
+        "type": "RuntimeError",
+        "message": "factory failed",
+    }
+    assert "fallback_extra" not in payload
+
+
+def test_audit_event_to_payload_resolves_fallback_extra_factory_for_metadata():
+    calls: list[str] = []
+
+    def build_extra() -> Mapping[str, Any]:
+        calls.append("called")
+        return {"correlation_id": "xyz"}
+
+    event = audit_hooks.AuditEvent(
+        actor="xander",
+        action="demo.event.fallback.extra.metadata.factory",
+        entity="resource",
+        before={},
+        after={},
+        fallback_extra_factory=build_extra,
+    )
+
+    payload = event.to_payload(
+        include_fallback_extra_metadata=True,
+        use_fallback_extra_factory=True,
+    )
+
+    assert payload["fallback_extra_evaluated"] is True
+    assert "fallback_extra_error" not in payload
+    assert "fallback_extra" not in payload
+    assert calls == ["called"]
+
+
+def test_audit_event_to_payload_records_fallback_extra_factory_errors():
+    calls: list[str] = []
+
+    def build_extra() -> Mapping[str, Any]:
+        calls.append("called")
+        raise ValueError("boom")
+
+    event = audit_hooks.AuditEvent(
+        actor="yasmin",
+        action="demo.event.fallback.extra.metadata.error",
+        entity="resource",
+        before={},
+        after={},
+        fallback_extra_factory=build_extra,
+    )
+
+    payload = event.to_payload(
+        include_fallback_extra_metadata=True,
+        use_fallback_extra_factory=True,
+    )
+
+    assert payload["fallback_extra_evaluated"] is True
+    assert payload["fallback_extra_error"] == {
+        "type": "ValueError",
+        "message": "boom",
+    }
+    assert "fallback_extra" not in payload
+    assert calls == ["called"]
+
+
 def test_audit_event_with_resolved_ip_hash_updates_hash_without_dropping_ip():
     event = audit_hooks.AuditEvent(
         actor="owen",
