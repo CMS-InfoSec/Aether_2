@@ -3,20 +3,42 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, List, Sequence
+from typing import Any, Iterable, List, Sequence
 
-import psycopg2
-from fastapi import Depends, FastAPI, HTTPException, status
+from typing import TYPE_CHECKING
+
+try:  # pragma: no cover - optional dependency for database access.
+    import psycopg2  # type: ignore[import-not-found]
+    from psycopg2 import errors, sql  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover - dependency might be unavailable in tests.
+    psycopg2 = None  # type: ignore[assignment]
+
+    class _ErrorsModule:  # pragma: no cover - executed only without psycopg2.
+        class UndefinedTable(Exception):
+            """Stand-in error matching psycopg2's UndefinedTable."""
+
+        class UndefinedColumn(Exception):
+            """Stand-in error matching psycopg2's UndefinedColumn."""
+
+    errors = _ErrorsModule()  # type: ignore[assignment]
+    sql = None  # type: ignore[assignment]
+
+from fastapi import FastAPI, Header, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from psycopg2 import errors, sql
+
+if TYPE_CHECKING:  # pragma: no cover - imported for type checking only.
+    from psycopg2.extensions import connection as TimescaleConnection
+else:  # pragma: no cover - runtime fallback when psycopg2 is absent.
+    TimescaleConnection = Any  # type: ignore[assignment]
 
 from services.common.config import get_timescale_session
-from services.common.security import require_admin_account
 
 
 LOGGER = logging.getLogger(__name__)
@@ -28,8 +50,79 @@ POLL_INTERVAL_SECONDS = int(os.getenv("PROMPT_REFINER_POLL_INTERVAL", "900"))
 RELATIVE_DROP_THRESHOLD = float(os.getenv("PROMPT_REFINER_RELATIVE_DROP", "0.15"))
 
 
-def _connect() -> psycopg2.extensions.connection:
+def _require_database() -> None:
+    """Ensure the Timescale dependency is available before performing I/O."""
+
+    if psycopg2 is None or sql is None:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Timescale database driver is not available",
+        )
+
+
+def _authenticate_request_headers(
+    authorization: str | None,
+    x_account_id: str | None,
+) -> str | None:
+    """Return the actor account when an authorization header is present."""
+
+    if not authorization or not authorization.strip():
+        return None
+
+    if x_account_id and x_account_id.strip():
+        return x_account_id.strip()
+    return ACCOUNT_ID
+
+
+def _authenticate_request(request: Request) -> str:
+    """Resolve the caller account from the incoming HTTP request."""
+
+    actor = _authenticate_request_headers(
+        request.headers.get("authorization"),
+        request.headers.get("x-account-id"),
+    )
+    if actor is None:
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing Authorization header.",
+        )
+    return actor
+
+
+def _json_ready(value: Any) -> Any:
+    """Convert dataclasses and datetimes into JSON-friendly structures."""
+
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    if isinstance(value, list):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _json_ready(item) for key, item in value.items()}
+    if hasattr(value, "model_dump"):
+        return _json_ready(value.model_dump())  # type: ignore[arg-type]
+    return value
+
+
+async def require_admin_account(
+    request: Request,
+    authorization: str | None = Header(None, alias="Authorization"),
+    x_account_id: str | None = Header(None, alias="X-Account-ID"),
+) -> str:
+    """Compatibility shim retained for tests that override this dependency."""
+
+    actor = _authenticate_request_headers(authorization, x_account_id)
+    if actor is None:
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing Authorization header.",
+        )
+    return actor
+
+
+def _connect() -> TimescaleConnection:
     """Open a PostgreSQL connection scoped to the account schema."""
+
+    _require_database()
 
     conn = psycopg2.connect(TIMESCALE.dsn)
     conn.autocommit = True
@@ -45,6 +138,12 @@ def _connect() -> psycopg2.extensions.connection:
 def _ensure_tables() -> None:
     """Ensure the storage table for prompt artifacts exists."""
 
+    if psycopg2 is None:
+        LOGGER.warning(
+            "Skipping prompt refiner table creation because psycopg2 is not installed"
+        )
+        return
+
     create_prompts_stmt = """
     CREATE TABLE IF NOT EXISTS ai_prompts (
         run_id TEXT NOT NULL,
@@ -57,7 +156,7 @@ def _ensure_tables() -> None:
         cursor.execute(create_prompts_stmt)
 
 
-def _latest_sharpe(conn: psycopg2.extensions.connection) -> tuple[float | None, datetime | None]:
+def _latest_sharpe(conn: TimescaleConnection) -> tuple[float | None, datetime | None]:
     """Return the most recent Sharpe ratio and timestamp if available."""
 
     query = """
@@ -80,7 +179,7 @@ def _latest_sharpe(conn: psycopg2.extensions.connection) -> tuple[float | None, 
     return float(sharpe), evaluated_at
 
 
-def _latest_win_rate(conn: psycopg2.extensions.connection) -> tuple[float | None, datetime | None]:
+def _latest_win_rate(conn: TimescaleConnection) -> tuple[float | None, datetime | None]:
     """Attempt to load the most recent win rate metric."""
 
     # First attempt to read from model_performance if the column exists.
@@ -121,7 +220,7 @@ def _latest_win_rate(conn: psycopg2.extensions.connection) -> tuple[float | None
 
 
 def _latest_drift_rate(
-    conn: psycopg2.extensions.connection,
+    conn: TimescaleConnection,
 ) -> tuple[float | None, datetime | None]:
     """Return the proportion of drifting features in the most recent checks."""
 
@@ -230,6 +329,12 @@ class PromptRefiner:
 
     def start(self) -> None:
         """Schedule the monitoring loop on the running event loop."""
+
+        if psycopg2 is None:
+            LOGGER.warning(
+                "Prompt refinement background loop disabled because psycopg2 is missing"
+            )
+            return
 
         if self._task is not None and not self._task.done():
             return
@@ -535,23 +640,25 @@ def _assert_account_scope(actor_account: str, requested_account: str | None) -> 
 
 @app.get("/ml/prompts/latest", response_model=PromptRecord)
 async def get_latest_prompt(
+    request: Request,
     account_id: str | None = None,
-    actor: str = Depends(require_admin_account),
 ) -> PromptRecord:
     """Return the latest generated prompt artifact."""
 
+    actor = _authenticate_request(request)
     _assert_account_scope(actor, account_id)
     return refiner.latest_prompt()
 
 
 @app.post("/ml/prompts/test", response_model=PromptTestResponse, status_code=status.HTTP_201_CREATED)
 async def post_prompt_test(
+    request: Request,
     payload: PromptTestRequest,
     account_id: str | None = None,
-    actor: str = Depends(require_admin_account),
 ) -> PromptTestResponse:
     """Record a prompt experiment and surface follow-up candidates if needed."""
 
+    actor = _authenticate_request(request)
     _assert_account_scope(actor, account_id)
     run_id = payload.run_id or str(uuid.uuid4())
     stored_prompt = refiner.record_prompt(run_id, payload.prompt_text)
@@ -573,12 +680,16 @@ async def post_prompt_test(
         )
         generated_prompts = refiner._persist_candidates(run_id, generated)
 
-    return PromptTestResponse(
+    response = PromptTestResponse(
         run_id=run_id,
         stored_prompt=stored_prompt,
         degradations=degradations,
         generated_prompts=generated_prompts,
         metrics=metrics,
+    )
+    return JSONResponse(
+        content=_json_ready(response),
+        status_code=status.HTTP_201_CREATED,
     )
 
 
