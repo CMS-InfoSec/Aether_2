@@ -11,7 +11,7 @@ import logging
 import os
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import Callable, ClassVar, Mapping, Optional, Tuple
+from typing import Callable, ClassVar, Dict, Mapping, Optional, Tuple
 
 from cost_efficiency import CostEfficiencyMetrics, get_cost_metrics
 
@@ -22,7 +22,11 @@ try:  # pragma: no cover - SQLAlchemy is optional in some environments
     from sqlalchemy.orm import Session, sessionmaker
     from sqlalchemy.pool import StaticPool
 
-    SQLALCHEMY_AVAILABLE = True
+    SQLALCHEMY_AVAILABLE = getattr(Boolean, "__module__", "").startswith("sqlalchemy")
+    if not SQLALCHEMY_AVAILABLE:  # pragma: no cover - stubbed SQLAlchemy detected
+        Session = sessionmaker = object  # type: ignore[assignment]
+        select = create_engine = None  # type: ignore[assignment]
+        StaticPool = object  # type: ignore[assignment]
 except Exception:  # pragma: no cover - fall back gracefully when SQLAlchemy missing
     SQLALCHEMY_AVAILABLE = False
     Boolean = Column = DateTime = Float = Integer = MetaData = String = Table = object  # type: ignore[assignment]
@@ -100,239 +104,311 @@ class ThrottleHistoryEntry:
         }
 
 
-class ThrottleRepository:
-    """Persistence layer for throttle status and audit history."""
+if SQLALCHEMY_AVAILABLE:
 
-    _STATUS_TABLE_NAME: ClassVar[str] = "cost_throttle_status"
-    _HISTORY_TABLE_NAME: ClassVar[str] = "cost_throttle_history"
-    _metadata: ClassVar[MetaData | None] = None
-    _status_table: ClassVar[Table | None] = None
-    _history_table: ClassVar[Table | None] = None
+    class ThrottleRepository:
+        """Persistence layer for throttle status and audit history."""
 
-    def __init__(
-        self,
-        session_factory: Callable[[], Session] | sessionmaker | None = None,
-    ) -> None:
-        _ensure_sqlalchemy_available()
+        _STATUS_TABLE_NAME: ClassVar[str] = "cost_throttle_status"
+        _HISTORY_TABLE_NAME: ClassVar[str] = "cost_throttle_history"
+        _metadata: ClassVar[MetaData | None] = None
+        _status_table: ClassVar[Table | None] = None
+        _history_table: ClassVar[Table | None] = None
 
-        if session_factory is None:
-            session_factory = self._default_session_factory()
+        def __init__(
+            self,
+            session_factory: Callable[[], Session] | sessionmaker | None = None,
+        ) -> None:
+            _ensure_sqlalchemy_available()
 
-        if isinstance(session_factory, sessionmaker):
-            factory_callable: Callable[[], Session] = session_factory  # type: ignore[assignment]
-        else:
-            factory_callable = session_factory  # type: ignore[assignment]
+            if session_factory is None:
+                session_factory = self._default_session_factory()
 
-        probe_session = factory_callable()
-        try:
-            bind = getattr(probe_session, "get_bind", lambda: None)()
-            if bind is None:
-                raise RuntimeError(
-                    "session_factory must provide sessions bound to an engine",
-                )
-            engine = getattr(bind, "engine", bind)
-        finally:
-            close = getattr(probe_session, "close", None)
-            if callable(close):
-                close()
+            if isinstance(session_factory, sessionmaker):
+                factory_callable: Callable[[], Session] = session_factory  # type: ignore[assignment]
+            else:
+                factory_callable = session_factory  # type: ignore[assignment]
 
-        self._session_factory = factory_callable
-        self._engine = engine
-        self._ensure_schema()
-
-    @staticmethod
-    def _default_session_factory() -> sessionmaker:
-        database_url = os.getenv("COST_THROTTLE_DATABASE_URL")
-        if not database_url:
-            logger.warning(
-                "COST_THROTTLE_DATABASE_URL not configured; using transient in-memory SQLite store"
-            )
-            engine = create_engine(
-                "sqlite+pysqlite:///:memory:",
-                future=True,
-                connect_args={"check_same_thread": False},
-                poolclass=StaticPool,
-            )
-        else:
-            engine = create_engine(database_url, future=True)
-        return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True)
-
-    @classmethod
-    def _define_tables(cls) -> tuple[Table, Table]:
-        if cls._metadata is None:
-            cls._metadata = MetaData()
-            cls._status_table = Table(
-                cls._STATUS_TABLE_NAME,
-                cls._metadata,
-                Column("account_id", String, primary_key=True),
-                Column("active", Boolean, nullable=False),
-                Column("reason", String, nullable=True),
-                Column("action", String, nullable=True),
-                Column("cost_ratio", Float, nullable=True),
-                Column("infra_cost", Float, nullable=True),
-                Column("recent_pnl", Float, nullable=True),
-                Column("updated_at", DateTime(timezone=True), nullable=False),
-            )
-            cls._history_table = Table(
-                cls._HISTORY_TABLE_NAME,
-                cls._metadata,
-                Column("id", Integer, primary_key=True, autoincrement=True),
-                Column("account_id", String, nullable=False, index=True),
-                Column("active", Boolean, nullable=False),
-                Column("reason", String, nullable=True),
-                Column("action", String, nullable=True),
-                Column("cost_ratio", Float, nullable=True),
-                Column("infra_cost", Float, nullable=True),
-                Column("recent_pnl", Float, nullable=True),
-                Column("recorded_at", DateTime(timezone=True), nullable=False),
-            )
-        assert cls._status_table is not None
-        assert cls._history_table is not None
-        return cls._status_table, cls._history_table
-
-    def _ensure_schema(self) -> None:
-        status_table, history_table = self._define_tables()
-        assert self._engine is not None
-        with self._engine.begin() as connection:
-            metadata = status_table.metadata
-            assert metadata is not None
-            metadata.create_all(connection, tables=[status_table, history_table])
-
-    @property
-    def session_factory(self) -> Callable[[], Session]:
-        return self._session_factory
-
-    @staticmethod
-    def _normalize_datetime(value: datetime) -> datetime:
-        if value.tzinfo is None:
-            return value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc)
-
-    def _row_to_status(self, row: Mapping[str, object]) -> ThrottleStatus:
-        return ThrottleStatus(
-            active=bool(row["active"]),
-            reason=row.get("reason"),
-            action=row.get("action"),
-            cost_ratio=row.get("cost_ratio"),
-            infra_cost=row.get("infra_cost"),
-            recent_pnl=row.get("recent_pnl"),
-            updated_at=self._normalize_datetime(row["updated_at"]),
-        )
-
-    def get_status(self, account_id: str) -> Optional[ThrottleStatus]:
-        status_table, _ = self._define_tables()
-        with self._session_factory() as session:
-            row = session.execute(
-                select(status_table).where(status_table.c.account_id == account_id).limit(1)
-            ).mappings().first()
-        if row is None:
-            return None
-        return self._row_to_status(row)
-
-    def persist_evaluation(self, account_id: str, status: ThrottleStatus) -> Optional[ThrottleStatus]:
-        status_table, history_table = self._define_tables()
-        history_reason = status.reason or ("throttle_cleared" if not status.active else None)
-        recorded_at = self._normalize_datetime(status.updated_at)
-        status_payload = {
-            "account_id": account_id,
-            "active": status.active,
-            "reason": status.reason,
-            "action": status.action,
-            "cost_ratio": status.cost_ratio,
-            "infra_cost": status.infra_cost,
-            "recent_pnl": status.recent_pnl,
-            "updated_at": recorded_at,
-        }
-        history_payload = {
-            "account_id": account_id,
-            "active": status.active,
-            "reason": history_reason,
-            "action": status.action,
-            "cost_ratio": status.cost_ratio,
-            "infra_cost": status.infra_cost,
-            "recent_pnl": status.recent_pnl,
-            "recorded_at": recorded_at,
-        }
-
-        with self._session_factory() as session:
-            with session.begin():
-                previous_row = session.execute(
-                    select(status_table).where(status_table.c.account_id == account_id).limit(1)
-                ).mappings().first()
-                if previous_row is None:
-                    session.execute(status_table.insert().values(**status_payload))
-                else:
-                    session.execute(
-                        status_table.update()
-                        .where(status_table.c.account_id == account_id)
-                        .values(**status_payload)
+            probe_session = factory_callable()
+            try:
+                bind = getattr(probe_session, "get_bind", lambda: None)()
+                if bind is None:
+                    raise RuntimeError(
+                        "session_factory must provide sessions bound to an engine",
                     )
-                session.execute(history_table.insert().values(**history_payload))
+                engine = getattr(bind, "engine", bind)
+            finally:
+                close = getattr(probe_session, "close", None)
+                if callable(close):
+                    close()
 
-            if previous_row is None:
-                return None
-            return self._row_to_status(previous_row)
+            self._session_factory = factory_callable
+            self._engine = engine
+            self._ensure_schema()
 
-    def history(self, account_id: Optional[str] = None) -> list[ThrottleHistoryEntry]:
-        _, history_table = self._define_tables()
-        stmt = select(history_table).order_by(history_table.c.recorded_at.asc(), history_table.c.id.asc())
-        if account_id is not None:
-            stmt = stmt.where(history_table.c.account_id == account_id)
-        with self._session_factory() as session:
-            rows = session.execute(stmt).mappings().all()
-        return [
-            ThrottleHistoryEntry(
-                account_id=row["account_id"],
+        @staticmethod
+        def _default_session_factory() -> sessionmaker:
+            database_url = os.getenv("COST_THROTTLE_DATABASE_URL")
+            if not database_url:
+                logger.warning(
+                    "COST_THROTTLE_DATABASE_URL not configured; using transient in-memory SQLite store"
+                )
+                engine = create_engine(
+                    "sqlite+pysqlite:///:memory:",
+                    future=True,
+                    connect_args={"check_same_thread": False},
+                    poolclass=StaticPool,
+                )
+            else:
+                engine = create_engine(database_url, future=True)
+            return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True)
+
+        @classmethod
+        def _define_tables(cls) -> tuple[Table, Table]:
+            if cls._metadata is None:
+                cls._metadata = MetaData()
+                cls._status_table = Table(
+                    cls._STATUS_TABLE_NAME,
+                    cls._metadata,
+                    Column("account_id", String, primary_key=True),
+                    Column("active", Boolean, nullable=False),
+                    Column("reason", String, nullable=True),
+                    Column("action", String, nullable=True),
+                    Column("cost_ratio", Float, nullable=True),
+                    Column("infra_cost", Float, nullable=True),
+                    Column("recent_pnl", Float, nullable=True),
+                    Column("updated_at", DateTime(timezone=True), nullable=False),
+                )
+                cls._history_table = Table(
+                    cls._HISTORY_TABLE_NAME,
+                    cls._metadata,
+                    Column("id", Integer, primary_key=True, autoincrement=True),
+                    Column("account_id", String, nullable=False, index=True),
+                    Column("active", Boolean, nullable=False),
+                    Column("reason", String, nullable=True),
+                    Column("action", String, nullable=True),
+                    Column("cost_ratio", Float, nullable=True),
+                    Column("infra_cost", Float, nullable=True),
+                    Column("recent_pnl", Float, nullable=True),
+                    Column("recorded_at", DateTime(timezone=True), nullable=False),
+                )
+            assert cls._status_table is not None
+            assert cls._history_table is not None
+            return cls._status_table, cls._history_table
+
+        def _ensure_schema(self) -> None:
+            status_table, history_table = self._define_tables()
+            assert self._engine is not None
+            with self._engine.begin() as connection:
+                metadata = status_table.metadata
+                assert metadata is not None
+                metadata.create_all(connection, tables=[status_table, history_table])
+
+        @property
+        def session_factory(self) -> Callable[[], Session]:
+            return self._session_factory
+
+        @staticmethod
+        def _normalize_datetime(value: datetime) -> datetime:
+            if value.tzinfo is None:
+                return value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc)
+
+        def _row_to_status(self, row: Mapping[str, object]) -> ThrottleStatus:
+            return ThrottleStatus(
                 active=bool(row["active"]),
                 reason=row.get("reason"),
                 action=row.get("action"),
                 cost_ratio=row.get("cost_ratio"),
                 infra_cost=row.get("infra_cost"),
                 recent_pnl=row.get("recent_pnl"),
-                recorded_at=self._normalize_datetime(row["recorded_at"]),
+                updated_at=self._normalize_datetime(row["updated_at"]),
             )
-            for row in rows
-        ]
 
-    def record_manual_entry(self, account_id: str, *, reason: str, recorded_at: datetime) -> None:
-        _, history_table = self._define_tables()
-        normalized = self._normalize_datetime(recorded_at)
-        with self._session_factory() as session:
-            with session.begin():
-                session.execute(
-                    history_table.insert().values(
-                        account_id=account_id,
-                        active=reason != "throttle_cleared",
-                        reason=reason,
-                        action=None,
-                        cost_ratio=None,
-                        infra_cost=None,
-                        recent_pnl=None,
-                        recorded_at=normalized,
-                    )
+        def get_status(self, account_id: str) -> Optional[ThrottleStatus]:
+            status_table, _ = self._define_tables()
+            with self._session_factory() as session:
+                row = session.execute(
+                    select(status_table).where(status_table.c.account_id == account_id).limit(1)
+                ).mappings().first()
+            if row is None:
+                return None
+            return self._row_to_status(row)
+
+        def persist_evaluation(self, account_id: str, status: ThrottleStatus) -> Optional[ThrottleStatus]:
+            status_table, history_table = self._define_tables()
+            history_reason = status.reason or ("throttle_cleared" if not status.active else None)
+            recorded_at = self._normalize_datetime(status.updated_at)
+            status_payload = {
+                "account_id": account_id,
+                "active": status.active,
+                "reason": status.reason,
+                "action": status.action,
+                "cost_ratio": status.cost_ratio,
+                "infra_cost": status.infra_cost,
+                "recent_pnl": status.recent_pnl,
+                "updated_at": recorded_at,
+            }
+            history_payload = {
+                "account_id": account_id,
+                "active": status.active,
+                "reason": history_reason,
+                "action": status.action,
+                "cost_ratio": status.cost_ratio,
+                "infra_cost": status.infra_cost,
+                "recent_pnl": status.recent_pnl,
+                "recorded_at": recorded_at,
+            }
+
+            with self._session_factory() as session:
+                with session.begin():
+                    previous_row = session.execute(
+                        select(status_table).where(status_table.c.account_id == account_id).limit(1)
+                    ).mappings().first()
+                    if previous_row is None:
+                        session.execute(status_table.insert().values(**status_payload))
+                    else:
+                        session.execute(
+                            status_table.update()
+                            .where(status_table.c.account_id == account_id)
+                            .values(**status_payload)
+                        )
+                    session.execute(history_table.insert().values(**history_payload))
+
+                if previous_row is None:
+                    return None
+                return self._row_to_status(previous_row)
+
+        def history(self, account_id: Optional[str] = None) -> list[ThrottleHistoryEntry]:
+            _, history_table = self._define_tables()
+            stmt = select(history_table).order_by(history_table.c.recorded_at.asc(), history_table.c.id.asc())
+            if account_id is not None:
+                stmt = stmt.where(history_table.c.account_id == account_id)
+            with self._session_factory() as session:
+                rows = session.execute(stmt).mappings().all()
+            return [
+                ThrottleHistoryEntry(
+                    account_id=row["account_id"],
+                    active=bool(row["active"]),
+                    reason=row.get("reason"),
+                    action=row.get("action"),
+                    cost_ratio=row.get("cost_ratio"),
+                    infra_cost=row.get("infra_cost"),
+                    recent_pnl=row.get("recent_pnl"),
+                    recorded_at=self._normalize_datetime(row["recorded_at"]),
                 )
+                for row in rows
+            ]
 
-    def clear(self) -> None:
-        """Remove all status and history records. Intended for tests only."""
+        def record_manual_entry(self, account_id: str, *, reason: str, recorded_at: datetime) -> None:
+            _, history_table = self._define_tables()
+            normalized = self._normalize_datetime(recorded_at)
+            with self._session_factory() as session:
+                with session.begin():
+                    session.execute(
+                        history_table.insert().values(
+                            account_id=account_id,
+                            active=reason != "throttle_cleared",
+                            reason=reason,
+                            action=None,
+                            cost_ratio=None,
+                            infra_cost=None,
+                            recent_pnl=None,
+                            recorded_at=normalized,
+                        )
+                    )
 
-        status_table, history_table = self._define_tables()
-        with self._session_factory() as session:
-            with session.begin():
-                session.execute(history_table.delete())
-                session.execute(status_table.delete())
+        def clear(self) -> None:
+            """Remove all status and history records. Intended for tests only."""
 
-    def clear_account(self, account_id: str) -> None:
-        status_table, history_table = self._define_tables()
-        with self._session_factory() as session:
-            with session.begin():
-                session.execute(history_table.delete().where(history_table.c.account_id == account_id))
-                session.execute(status_table.delete().where(status_table.c.account_id == account_id))
+            status_table, history_table = self._define_tables()
+            with self._session_factory() as session:
+                with session.begin():
+                    session.execute(history_table.delete())
+                    session.execute(status_table.delete())
 
-    def clear_history(self) -> None:
-        _, history_table = self._define_tables()
-        with self._session_factory() as session:
-            with session.begin():
-                session.execute(history_table.delete())
+        def clear_account(self, account_id: str) -> None:
+            status_table, history_table = self._define_tables()
+            with self._session_factory() as session:
+                with session.begin():
+                    session.execute(history_table.delete().where(history_table.c.account_id == account_id))
+                    session.execute(status_table.delete().where(status_table.c.account_id == account_id))
+
+        def clear_history(self) -> None:
+            _, history_table = self._define_tables()
+            with self._session_factory() as session:
+                with session.begin():
+                    session.execute(history_table.delete())
+else:
+
+    class ThrottleRepository:
+        """In-memory fallback repository when SQLAlchemy is unavailable."""
+
+        def __init__(self, session_factory: Callable[[], object] | None = None) -> None:
+            del session_factory
+            self._status: Dict[str, ThrottleStatus] = {}
+            self._history: list[ThrottleHistoryEntry] = []
+
+        @staticmethod
+        def _normalize_datetime(value: datetime) -> datetime:
+            if value.tzinfo is None:
+                return value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc)
+
+        def get_status(self, account_id: str) -> Optional[ThrottleStatus]:
+            return self._status.get(account_id)
+
+        def persist_evaluation(self, account_id: str, status: ThrottleStatus) -> Optional[ThrottleStatus]:
+            previous = self._status.get(account_id)
+            normalized = self._normalize_datetime(status.updated_at)
+            current = replace(status, updated_at=normalized)
+            self._status[account_id] = current
+
+            history_reason = status.reason or ("throttle_cleared" if not status.active else None)
+            self._history.append(
+                ThrottleHistoryEntry(
+                    account_id=account_id,
+                    active=status.active,
+                    reason=history_reason,
+                    action=status.action,
+                    cost_ratio=status.cost_ratio,
+                    infra_cost=status.infra_cost,
+                    recent_pnl=status.recent_pnl,
+                    recorded_at=normalized,
+                )
+            )
+            return previous
+
+        def history(self, account_id: Optional[str] = None) -> list[ThrottleHistoryEntry]:
+            if account_id is None:
+                return list(self._history)
+            return [entry for entry in self._history if entry.account_id == account_id]
+
+        def record_manual_entry(self, account_id: str, *, reason: str, recorded_at: datetime) -> None:
+            normalized = self._normalize_datetime(recorded_at)
+            self._history.append(
+                ThrottleHistoryEntry(
+                    account_id=account_id,
+                    active=reason != "throttle_cleared",
+                    reason=reason,
+                    action=None,
+                    cost_ratio=None,
+                    infra_cost=None,
+                    recent_pnl=None,
+                    recorded_at=normalized,
+                )
+            )
+
+        def clear(self) -> None:
+            self._status.clear()
+            self._history.clear()
+
+        def clear_account(self, account_id: str) -> None:
+            self._status.pop(account_id, None)
+            self._history = [entry for entry in self._history if entry.account_id != account_id]
+
+        def clear_history(self) -> None:
+            self._history.clear()
 
 
 _DEFAULT_REPOSITORY: ThrottleRepository | None = None
