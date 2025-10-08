@@ -9,17 +9,305 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from urllib.parse import parse_qsl, urlparse, urlunparse
 
-from alembic import command
-from alembic.config import Config
+try:  # pragma: no cover - optional migrations dependency
+    from alembic import command
+    from alembic.config import Config
+except Exception:  # pragma: no cover - degrade gracefully when Alembic missing
+    command = None  # type: ignore[assignment]
+    Config = None  # type: ignore[assignment]
+
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field, ConfigDict, model_validator
-from sqlalchemy import Column, DateTime, Integer, Numeric, String, create_engine, text
-from sqlalchemy.engine import Engine, URL
-from sqlalchemy.engine.url import make_url
-from sqlalchemy.exc import ArgumentError, SQLAlchemyError
-from sqlalchemy.orm import Session, declarative_base, sessionmaker
-from sqlalchemy.pool import StaticPool
+
+_SQLALCHEMY_AVAILABLE = True
+
+try:  # pragma: no cover - SQLAlchemy may be absent in lightweight environments
+    from sqlalchemy import Column, DateTime, Integer, Numeric, String, create_engine, text
+    from sqlalchemy.engine import Engine, URL
+    from sqlalchemy.engine.url import make_url as _sa_make_url
+    from sqlalchemy.exc import ArgumentError, SQLAlchemyError
+    from sqlalchemy.orm import Session, declarative_base, sessionmaker
+    from sqlalchemy.pool import StaticPool
+except Exception:  # pragma: no cover - provide lightweight stand-ins
+    _SQLALCHEMY_AVAILABLE = False
+    Column = DateTime = Integer = Numeric = String = None  # type: ignore[assignment]
+    Engine = Any  # type: ignore[assignment]
+    Session = Any  # type: ignore[assignment]
+    StaticPool = type("StaticPool", (), {})  # type: ignore[assignment]
+
+    class SQLAlchemyError(Exception):  # type: ignore[override]
+        """Fallback SQLAlchemy error used in lightweight environments."""
+
+    class ArgumentError(SQLAlchemyError):  # type: ignore[override]
+        """Raised when connection URLs are malformed under the fallback."""
+
+    def text(query: str) -> str:  # type: ignore[override]
+        return query
+
+    _sa_make_url = None  # type: ignore[assignment]
+
+    class URL:  # type: ignore[override]
+        """Lightweight substitute for SQLAlchemy's URL type."""
+
+        def __init__(self, raw_url: str) -> None:
+            self._raw = raw_url
+            parsed = urlparse(raw_url)
+            if not parsed.scheme:
+                raise ArgumentError(f"Could not parse URL from string '{raw_url}'")
+            self._parsed = parsed
+            self.drivername = parsed.scheme
+            self.query = {key: value for key, value in parse_qsl(parsed.query)}
+            self.host = parsed.hostname
+
+        def render_as_string(self, hide_password: bool = False) -> str:
+            del hide_password
+            return self._raw
+
+
+    def create_engine(*_: object, **__: object) -> "_InMemoryEngine":  # type: ignore[override]
+        return _InMemoryEngine(_ALLOCATOR_STORE)
+
+
+    def declarative_base() -> Any:  # type: ignore[override]
+        class _Metadata:
+            def create_all(self, bind: Any = None) -> None:  # pragma: no cover - noop fallback
+                del bind
+
+            def drop_all(self, bind: Any = None) -> None:  # pragma: no cover - noop fallback
+                del bind
+
+        return type("Base", (), {"metadata": _Metadata()})
+
+
+    def sessionmaker(*, bind: Any = None, **__: object) -> "_SessionFactory":  # type: ignore[override]
+        store = getattr(bind, "_store", _ALLOCATOR_STORE)
+        return _SessionFactory(store)
+
+
+if _SQLALCHEMY_AVAILABLE:
+    make_url = _sa_make_url  # type: ignore[assignment]
+else:
+
+    class _FallbackURL(URL):
+        def set(self, drivername: str) -> "_FallbackURL":
+            parts = list(self._parsed)
+            parts[0] = drivername
+            return _FallbackURL(urlunparse(parts))
+
+    def make_url(raw_url: str) -> "_FallbackURL":  # type: ignore[override]
+        return _FallbackURL(raw_url)
+
+
+class _ResultProxy:
+    """Minimal result proxy that mimics SQLAlchemy's return value."""
+
+    def __init__(self, rows: Iterable[Mapping[str, Any]] | None = None, *, scalar: Any = None) -> None:
+        self._rows = list(rows or [])
+        self._scalar = scalar
+
+    def mappings(self) -> Iterable[Mapping[str, Any]]:
+        return iter(self._rows)
+
+    def scalar(self) -> Any:
+        if self._scalar is not None:
+            return self._scalar
+        if not self._rows:
+            return None
+        first = next(iter(self._rows))
+        if isinstance(first, Mapping):
+            return next(iter(first.values()), None)
+        return first
+
+
+class _AllocatorStore:
+    """In-memory persistence backend used when SQLAlchemy is unavailable."""
+
+    def __init__(self) -> None:
+        self.pnl_curves: List[Dict[str, Any]] = []
+        self.capital_allocations: List[Dict[str, Any]] = []
+
+    def reset(self) -> None:
+        self.pnl_curves.clear()
+        self.capital_allocations.clear()
+
+    def insert_pnl_curves(self, rows: Iterable[Mapping[str, Any]]) -> None:
+        for row in rows:
+            self.pnl_curves.append(dict(row))
+
+    def delete(self, table: str) -> None:
+        if table == "pnl_curves":
+            self.pnl_curves.clear()
+        elif table == "capital_allocations":
+            self.capital_allocations.clear()
+
+    def latest_navs(self) -> List[Dict[str, Any]]:
+        latest: Dict[str, Dict[str, Any]] = {}
+        for row in self.pnl_curves:
+            account_id = str(row.get("account_id", ""))
+            if not account_id:
+                continue
+            event_ts = (
+                row.get("curve_ts")
+                or row.get("valuation_ts")
+                or row.get("ts")
+                or row.get("created_at")
+                or ""
+            )
+            existing = latest.get(account_id)
+            if existing is None or str(event_ts) > str(existing.get("event_ts", "")):
+                latest[account_id] = {
+                    "account_id": account_id,
+                    "nav": (
+                        row.get("nav")
+                        or row.get("net_asset_value")
+                        or row.get("equity")
+                        or row.get("ending_balance")
+                        or row.get("balance")
+                        or 0.0
+                    ),
+                    "drawdown": (
+                        row.get("drawdown")
+                        or row.get("realized_drawdown")
+                        or row.get("drawdown_value")
+                        or row.get("max_drawdown")
+                        or 0.0
+                    ),
+                    "drawdown_limit": (
+                        row.get("drawdown_limit")
+                        or row.get("max_drawdown_limit")
+                        or row.get("drawdown_cap")
+                        or row.get("drawdown_threshold")
+                    ),
+                    "event_ts": event_ts,
+                }
+        return list(latest.values())
+
+    def latest_allocations(self) -> List[Dict[str, Any]]:
+        latest: Dict[str, Dict[str, Any]] = {}
+        for row in self.capital_allocations:
+            account_id = str(row.get("account_id", ""))
+            if not account_id:
+                continue
+            ts = row.get("ts")
+            existing = latest.get(account_id)
+            if existing is None or ts > existing.get("ts"):
+                latest[account_id] = {"account_id": account_id, "pct": row.get("pct", Decimal("0")), "ts": ts}
+        return [{"account_id": key, "pct": value.get("pct", Decimal("0"))} for key, value in latest.items()]
+
+    def add_allocation(self, record: Any) -> None:
+        pct = getattr(record, "pct", None)
+        if pct is None:
+            pct = getattr(record, "allocation_pct", Decimal("0"))
+        self.capital_allocations.append(
+            {
+                "account_id": str(getattr(record, "account_id")),
+                "pct": pct,
+                "ts": getattr(record, "ts"),
+            }
+        )
+
+    def execute(self, statement: object, params: Any = None) -> _ResultProxy:
+        if isinstance(params, list) and all(isinstance(row, Mapping) for row in params):
+            rows = [dict(row) for row in params]
+            self.insert_pnl_curves(rows)
+            return _ResultProxy([])
+
+        query = str(statement).strip()
+        upper = query.upper()
+        if upper.startswith("CREATE TABLE"):
+            return _ResultProxy([])
+        if upper.startswith("DELETE FROM"):
+            table = query.split()[2]
+            self.delete(table)
+            return _ResultProxy([])
+        if upper.startswith("INSERT INTO PNL_CURVES") and isinstance(params, Mapping):
+            self.insert_pnl_curves([params])
+            return _ResultProxy([])
+        if "SELECT COUNT(*) FROM CAPITAL_ALLOCATIONS" in upper:
+            return _ResultProxy([], scalar=len(self.capital_allocations))
+        if "FROM PNL_CURVES" in upper:
+            return _ResultProxy(self.latest_navs())
+        if "FROM CAPITAL_ALLOCATIONS" in upper:
+            return _ResultProxy(self.latest_allocations())
+        return _ResultProxy([])
+
+
+_ALLOCATOR_STORE = _AllocatorStore()
+
+
+class _InMemoryConnection:
+    def __init__(self, store: _AllocatorStore) -> None:
+        self._store = store
+
+    def __enter__(self) -> "_InMemoryConnection":  # pragma: no cover - trivial
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:  # pragma: no cover - trivial
+        return None
+
+    def execute(self, statement: object, params: Any = None) -> _ResultProxy:
+        return self._store.execute(statement, params)
+
+
+class _InMemoryEngine:
+    def __init__(self, store: _AllocatorStore) -> None:
+        self._store = store
+
+    def begin(self) -> _InMemoryConnection:
+        return _InMemoryConnection(self._store)
+
+    def connect(self) -> _InMemoryConnection:  # pragma: no cover - compatibility
+        return _InMemoryConnection(self._store)
+
+    def dispose(self) -> None:
+        self._store.reset()
+
+    def reset(self) -> None:
+        self._store.reset()
+
+
+class _InMemorySession:
+    def __init__(self, store: _AllocatorStore) -> None:
+        self._store = store
+        self._pending: List[Any] = []
+
+    def __enter__(self) -> "_InMemorySession":  # pragma: no cover - trivial
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:  # pragma: no cover - trivial
+        if exc_type:
+            self.rollback()
+        else:
+            self.close()
+
+    def close(self) -> None:
+        self._pending.clear()
+
+    def execute(self, statement: object, params: Any = None) -> _ResultProxy:
+        return self._store.execute(statement, params)
+
+    def add(self, record: Any) -> None:
+        self._pending.append(record)
+
+    def commit(self) -> None:
+        for record in self._pending:
+            self._store.add_allocation(record)
+        self._pending.clear()
+
+    def rollback(self) -> None:
+        self._pending.clear()
+
+
+class _SessionFactory:
+    def __init__(self, store: _AllocatorStore) -> None:
+        self._store = store
+
+    def __call__(self) -> _InMemorySession:
+        return _InMemorySession(self._store)
+
+
 
 from services.common.security import get_admin_accounts, require_admin_account
 
@@ -120,6 +408,9 @@ _MIGRATIONS_PATH = Path(__file__).resolve().parent / "data" / "migrations"
 def run_allocator_migrations() -> None:
     """Apply outstanding migrations for the capital allocator schema."""
 
+    if command is None or Config is None or not _SQLALCHEMY_AVAILABLE:
+        return
+
     config = Config()
     config.set_main_option("script_location", str(_MIGRATIONS_PATH))
     config.set_main_option("sqlalchemy.url", _DB_URL.render_as_string(hide_password=False))
@@ -194,15 +485,27 @@ def _env_decimal(key: str, default: Decimal, quant: Decimal) -> Decimal:
     return _quantize(value, quant)
 
 
-class CapitalAllocation(Base):
-    """Historical record of allocation decisions for an account."""
+if _SQLALCHEMY_AVAILABLE:
 
-    __tablename__ = "capital_allocations"
+    class CapitalAllocation(Base):
+        """Historical record of allocation decisions for an account."""
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    account_id = Column(String, nullable=False, index=True)
-    pct = Column(Numeric(18, _PCT_SCALE), nullable=False)
-    ts = Column(DateTime(timezone=True), nullable=False, index=True)
+        __tablename__ = "capital_allocations"
+
+        id = Column(Integer, primary_key=True, autoincrement=True)
+        account_id = Column(String, nullable=False, index=True)
+        pct = Column(Numeric(18, _PCT_SCALE), nullable=False)
+        ts = Column(DateTime(timezone=True), nullable=False, index=True)
+
+else:
+
+    @dataclass(slots=True)
+    class CapitalAllocation:  # type: ignore[override]
+        """Dataclass representation of capital allocations for the fallback store."""
+
+        account_id: str
+        pct: Decimal
+        ts: datetime
 
 
 @dataclass(slots=True)
@@ -399,8 +702,8 @@ def _apply_allocation_rules(
                 timestamp=None,
             ),
         )
-        desired = requested.get(account_id, _ZERO) or _ZERO
-        desired = max(_quantize_pct(desired), _ZERO)
+        raw_requested = requested.get(account_id, _ZERO) or _ZERO
+        desired = max(_quantize_pct(_to_decimal(raw_requested, _ZERO)), _ZERO)
         requested_total += desired
 
         limit_value = _effective_drawdown_limit(snapshot, default_limit_ratio)
