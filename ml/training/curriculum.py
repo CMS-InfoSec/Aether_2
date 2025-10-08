@@ -24,31 +24,74 @@ import json
 import logging
 from collections import Counter
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-import numpy as np
-import pandas as pd
-import torch
-from torch import Tensor, nn
-from torch.utils.data import DataLoader, Dataset
+if TYPE_CHECKING:  # pragma: no cover - imported for type checking only
+    import numpy as np
+    import pandas as pd
+    from torch import Tensor, nn
+    from torch.utils.data import DataLoader, Dataset
+else:  # pragma: no cover - runtime fallbacks when optional deps are missing
+    np = None  # type: ignore[assignment]
+    pd = None  # type: ignore[assignment]
+    Tensor = Any  # type: ignore[assignment]
+    nn = Any  # type: ignore[assignment]
+    DataLoader = Any  # type: ignore[assignment]
+    Dataset = Any  # type: ignore[assignment]
 
 from ml.experiment_tracking.mlflow_utils import MLFlowConfig, mlflow_run
 
 LOGGER = logging.getLogger(__name__)
 
 
+class MissingDependencyError(RuntimeError):
+    """Raised when optional curriculum training dependencies are unavailable."""
+
+
+@lru_cache(maxsize=1)
+def _require_numpy():
+    try:
+        import numpy as numpy_module  # type: ignore import-not-found
+    except ModuleNotFoundError as exc:  # pragma: no cover - exercised via tests
+        raise MissingDependencyError("numpy is required for the curriculum training workflow") from exc
+    return numpy_module
+
+
+@lru_cache(maxsize=1)
+def _require_pandas():
+    try:
+        import pandas as pandas_module  # type: ignore import-not-found
+    except ModuleNotFoundError as exc:  # pragma: no cover - exercised via tests
+        raise MissingDependencyError("pandas is required for the curriculum training workflow") from exc
+    return pandas_module
+
+
+@lru_cache(maxsize=1)
+def _require_torch():
+    try:
+        import torch as torch_module  # type: ignore import-not-found
+        from torch import nn as nn_module  # type: ignore import-not-found
+        from torch.utils.data import DataLoader as DataLoaderCls  # type: ignore import-not-found
+        from torch.utils.data import Dataset as DatasetCls  # type: ignore import-not-found
+    except ModuleNotFoundError as exc:  # pragma: no cover - exercised via tests
+        raise MissingDependencyError("torch is required for the curriculum training workflow") from exc
+    return torch_module, nn_module, DataLoaderCls, DatasetCls
+
+
 # ---------------------------------------------------------------------------
 # Data preparation utilities
 
 
-def _ensure_sorted(frame: pd.DataFrame, timestamp_column: str) -> pd.DataFrame:
+def _ensure_sorted(frame: "pd.DataFrame", timestamp_column: str) -> "pd.DataFrame":
     """Return a copy of ``frame`` sorted by the timestamp column."""
 
+    pandas = _require_pandas()
     if timestamp_column not in frame.columns:
         raise KeyError(f"Timestamp column '{timestamp_column}' not found in frame")
     sorted_frame = frame.sort_values(timestamp_column).reset_index(drop=True).copy()
-    sorted_frame[timestamp_column] = pd.to_datetime(sorted_frame[timestamp_column], utc=True)
+    sorted_frame[timestamp_column] = pandas.to_datetime(sorted_frame[timestamp_column], utc=True)
     return sorted_frame
 
 
@@ -59,7 +102,7 @@ def load_historical_data(
     label_column: str,
     *,
     synthetic_rows: int = 2048,
-) -> pd.DataFrame:
+) -> "pd.DataFrame":
     """Load historical data from disk or generate a synthetic dataset.
 
     Parameters
@@ -92,10 +135,12 @@ def load_historical_data(
     if not data_path.exists():
         raise FileNotFoundError(f"Historical data not found at '{data_path}'")
 
+    pandas = _require_pandas()
+
     if data_path.suffix.lower() in {".csv", ".txt"}:
-        frame = pd.read_csv(data_path)
+        frame = pandas.read_csv(data_path)
     elif data_path.suffix.lower() in {".parquet", ".pq"}:
-        frame = pd.read_parquet(data_path)
+        frame = pandas.read_parquet(data_path)
     else:
         raise ValueError(
             "Unsupported file format. Provide a CSV or Parquet file containing historical data."
@@ -115,29 +160,32 @@ def _generate_synthetic_dataset(
     timestamp_column: str,
     price_column: str,
     label_column: str,
-) -> pd.DataFrame:
+) -> "pd.DataFrame":
     """Create a reproducible synthetic market dataset."""
 
-    rng = np.random.default_rng(seed=42)
-    timestamps = pd.date_range(end=pd.Timestamp.utcnow(), periods=rows, freq="15min")
+    numpy = _require_numpy()
+    pandas = _require_pandas()
+
+    rng = numpy.random.default_rng(seed=42)
+    timestamps = pandas.date_range(end=pandas.Timestamp.utcnow(), periods=rows, freq="15min")
     # Build price paths with alternating volatility regimes.
     base_noise = rng.normal(0, 0.4, size=rows)
-    regime_indicator = np.sin(np.linspace(0, 12 * np.pi, rows))
-    volatility = np.interp(regime_indicator, [-1, 1], [0.2, 1.2])
+    regime_indicator = numpy.sin(numpy.linspace(0, 12 * numpy.pi, rows))
+    volatility = numpy.interp(regime_indicator, [-1, 1], [0.2, 1.2])
     shocks = base_noise * volatility
-    price = 100 + np.cumsum(shocks)
-    price = np.maximum(price, 1.0)
+    price = 100 + numpy.cumsum(shocks)
+    price = numpy.maximum(price, 1.0)
 
-    returns = pd.Series(price).pct_change().fillna(0.0)
+    returns = pandas.Series(price).pct_change().fillna(0.0)
     forward_return = returns.shift(-1).fillna(0.0)
 
-    frame = pd.DataFrame(
+    frame = pandas.DataFrame(
         {
             timestamp_column: timestamps,
             price_column: price,
             "feature_returns": returns.rolling(4, min_periods=1).mean(),
             "feature_volatility": returns.rolling(12, min_periods=1).std().fillna(0.0),
-            "feature_momentum": pd.Series(price).pct_change(periods=5).fillna(0.0),
+            "feature_momentum": pandas.Series(price).pct_change(periods=5).fillna(0.0),
             label_column: forward_return,
         }
     )
@@ -145,13 +193,13 @@ def _generate_synthetic_dataset(
 
 
 def split_regimes(
-    frame: pd.DataFrame,
+    frame: "pd.DataFrame",
     *,
     price_column: str,
     timestamp_column: str,
     volatility_window: int = 48,
     crash_drawdown: float = -0.2,
-) -> Dict[str, pd.DataFrame]:
+) -> Dict[str, "pd.DataFrame"]:
     """Split ``frame`` into stable, volatile, and crash regimes.
 
     The partitioning heuristic uses rolling volatility and drawdown derived from
@@ -159,6 +207,7 @@ def split_regimes(
     Rows with insufficient history to compute volatility estimates are discarded.
     """
 
+    numpy = _require_numpy()
     frame = _ensure_sorted(frame.copy(), timestamp_column)
     prices = frame[price_column].astype(float)
     returns = prices.pct_change().fillna(0.0)
@@ -168,7 +217,7 @@ def split_regimes(
     drawdown = (prices / running_max) - 1.0
 
     # Compute volatility thresholds.
-    lower, upper = np.quantile(rolling_vol.dropna(), [0.33, 0.66])
+    lower, upper = numpy.quantile(rolling_vol.dropna(), [0.33, 0.66])
 
     stable_mask = (rolling_vol <= lower) & (drawdown > crash_drawdown)
     crash_mask = drawdown <= crash_drawdown
@@ -189,11 +238,12 @@ def split_regimes(
     return regimes
 
 
-def infer_feature_columns(frame: pd.DataFrame, label_column: str, exclude: Iterable[str]) -> List[str]:
+def infer_feature_columns(frame: "pd.DataFrame", label_column: str, exclude: Iterable[str]) -> List[str]:
     """Infer numeric feature columns while excluding specific ones."""
 
+    numpy = _require_numpy()
     excluded = {label_column, *exclude}
-    numeric_cols = frame.select_dtypes(include=[np.number]).columns
+    numeric_cols = frame.select_dtypes(include=[numpy.number]).columns
     features = [col for col in numeric_cols if col not in excluded]
     if not features:
         raise ValueError("Unable to infer feature columns; specify them explicitly using --feature-columns")
@@ -205,20 +255,21 @@ def infer_feature_columns(frame: pd.DataFrame, label_column: str, exclude: Itera
 
 
 def build_sequences(
-    frame: pd.DataFrame,
+    frame: "pd.DataFrame",
     feature_columns: Sequence[str],
     label_column: str,
     sequence_length: int,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple["np.ndarray", "np.ndarray"]:
     """Transform ``frame`` into sliding window sequences."""
 
+    numpy = _require_numpy()
     if len(frame) <= sequence_length:
         raise ValueError("Frame must contain more rows than the sequence length")
 
-    features_matrix = frame.loc[:, feature_columns].to_numpy(dtype=np.float32)
-    labels_array = frame[label_column].to_numpy(dtype=np.float32)
+    features_matrix = frame.loc[:, feature_columns].to_numpy(dtype=numpy.float32)
+    labels_array = frame[label_column].to_numpy(dtype=numpy.float32)
 
-    sequences: List[np.ndarray] = []
+    sequences: List["np.ndarray"] = []
     targets: List[float] = []
     for idx in range(len(features_matrix) - sequence_length):
         window = features_matrix[idx : idx + sequence_length]
@@ -226,7 +277,7 @@ def build_sequences(
         if target_idx >= len(labels_array):
             break
         target = labels_array[target_idx]
-        if np.isnan(window).any() or np.isnan(target):
+        if numpy.isnan(window).any() or numpy.isnan(target):
             continue
         sequences.append(window)
         targets.append(float(target))
@@ -234,85 +285,42 @@ def build_sequences(
     if not sequences:
         raise RuntimeError("No valid sequences constructed; check for NaNs in the dataset")
 
-    return np.stack(sequences), np.asarray(targets, dtype=np.float32)
+    return numpy.stack(sequences), numpy.asarray(targets, dtype=numpy.float32)
 
 
-class SequenceDataset(Dataset):
-    """PyTorch dataset wrapping sliding window sequences."""
+@lru_cache(maxsize=1)
+def _sequence_dataset_cls():
+    torch_module, _, _, dataset_cls = _require_torch()
+    numpy = _require_numpy()
 
-    def __init__(self, sequences: np.ndarray, targets: np.ndarray) -> None:
-        self.sequences = torch.from_numpy(sequences).float()
-        self.targets = torch.from_numpy(targets).float().unsqueeze(-1)
+    class _SequenceDataset(dataset_cls):
+        """PyTorch dataset wrapping sliding window sequences."""
 
-    def __len__(self) -> int:  # pragma: no cover - trivial
-        return len(self.sequences)
+        def __init__(self, sequences: "np.ndarray", targets: "np.ndarray") -> None:
+            super().__init__()
+            self.sequences = torch_module.from_numpy(
+                numpy.asarray(sequences, dtype=numpy.float32)
+            ).float()
+            self.targets = torch_module.from_numpy(
+                numpy.asarray(targets, dtype=numpy.float32)
+            ).float().unsqueeze(-1)
 
-    def __getitem__(self, index: int) -> Tuple[Tensor, Tensor]:  # pragma: no cover - trivial
-        return self.sequences[index], self.targets[index]
+        def __len__(self) -> int:  # pragma: no cover - trivial
+            return len(self.sequences)
+
+        def __getitem__(self, index: int) -> Tuple[Any, Any]:  # pragma: no cover - trivial
+            return self.sequences[index], self.targets[index]
+
+    return _SequenceDataset
+
+
+def _build_sequence_dataset(sequences: "np.ndarray", targets: "np.ndarray") -> Any:
+    dataset_cls = _sequence_dataset_cls()
+    return dataset_cls(sequences, targets)
 
 
 # ---------------------------------------------------------------------------
 # Models
-
-
-class LSTMRegressor(nn.Module):
-    """Baseline LSTM regressor."""
-
-    def __init__(self, input_size: int, hidden_size: int, num_layers: int, dropout: float) -> None:
-        super().__init__()
-        self.lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=dropout if num_layers > 1 else 0.0,
-            batch_first=True,
-        )
-        self.dropout = nn.Dropout(dropout)
-        self.head = nn.Linear(hidden_size, 1)
-
-    def forward(self, inputs: Tensor) -> Tensor:  # pragma: no cover - straightforward
-        outputs, _ = self.lstm(inputs)
-        final_state = outputs[:, -1, :]
-        return self.head(self.dropout(final_state))
-
-
-class TransformerRegressor(nn.Module):
-    """Lightweight Transformer encoder for regression."""
-
-    def __init__(self, input_size: int, hidden_size: int, num_layers: int, dropout: float) -> None:
-        super().__init__()
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=input_size,
-            nhead=max(1, input_size // 4 or 1),
-            dim_feedforward=hidden_size,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.head = nn.Linear(input_size, 1)
-
-    def forward(self, inputs: Tensor) -> Tensor:  # pragma: no cover - straightforward
-        encoded = self.encoder(inputs)
-        return self.head(encoded[:, -1, :])
-
-
-class MLPRegressor(nn.Module):
-    """Simple multi-layer perceptron that treats the sequence as a flat vector."""
-
-    def __init__(self, input_size: int, hidden_size: int, dropout: float) -> None:
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_size, hidden_size),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size, hidden_size // 2 or 1),
-            nn.ReLU(),
-            nn.Linear(hidden_size // 2 or 1, 1),
-        )
-
-    def forward(self, inputs: Tensor) -> Tensor:  # pragma: no cover - straightforward
-        flat = inputs.flatten(start_dim=1)
-        return self.net(flat)
 
 
 def build_model(
@@ -322,21 +330,70 @@ def build_model(
     num_layers: int,
     dropout: float,
     sequence_length: int,
-) -> nn.Module:
+) -> Any:
     """Instantiate a supported model type."""
 
+    _, nn_module, _, _ = _require_torch()
     model_type = model_type.lower()
     if model_type == "lstm":
-        return LSTMRegressor(input_size=input_size, hidden_size=hidden_size, num_layers=num_layers, dropout=dropout)
+        class _LSTMRegressor(nn_module.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.lstm = nn_module.LSTM(
+                    input_size=input_size,
+                    hidden_size=hidden_size,
+                    num_layers=num_layers,
+                    dropout=dropout if num_layers > 1 else 0.0,
+                    batch_first=True,
+                )
+                self.dropout = nn_module.Dropout(dropout)
+                self.head = nn_module.Linear(hidden_size, 1)
+
+            def forward(self, inputs: Any) -> Any:  # pragma: no cover - straightforward
+                outputs, _ = self.lstm(inputs)
+                final_state = outputs[:, -1, :]
+                return self.head(self.dropout(final_state))
+
+        return _LSTMRegressor()
     if model_type == "transformer":
-        return TransformerRegressor(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=dropout,
-        )
+        class _TransformerRegressor(nn_module.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                encoder_layer = nn_module.TransformerEncoderLayer(
+                    d_model=input_size,
+                    nhead=max(1, input_size // 4 or 1),
+                    dim_feedforward=hidden_size,
+                    dropout=dropout,
+                    batch_first=True,
+                )
+                self.encoder = nn_module.TransformerEncoder(encoder_layer, num_layers=num_layers)
+                self.head = nn_module.Linear(input_size, 1)
+
+            def forward(self, inputs: Any) -> Any:  # pragma: no cover - straightforward
+                encoded = self.encoder(inputs)
+                return self.head(encoded[:, -1, :])
+
+        return _TransformerRegressor()
     if model_type == "mlp":
-        return MLPRegressor(input_size=input_size * sequence_length, hidden_size=hidden_size, dropout=dropout)
+        class _MLPRegressor(nn_module.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                effective_input = input_size * sequence_length
+                hidden_mid = hidden_size // 2 or 1
+                self.net = nn_module.Sequential(
+                    nn_module.Linear(effective_input, hidden_size),
+                    nn_module.ReLU(),
+                    nn_module.Dropout(dropout),
+                    nn_module.Linear(hidden_size, hidden_mid),
+                    nn_module.ReLU(),
+                    nn_module.Linear(hidden_mid, 1),
+                )
+
+            def forward(self, inputs: Any) -> Any:  # pragma: no cover - straightforward
+                flat = inputs.flatten(start_dim=1)
+                return self.net(flat)
+
+        return _MLPRegressor()
     raise ValueError(f"Unsupported model type '{model_type}'. Choose from ['lstm', 'transformer', 'mlp'].")
 
 
@@ -349,8 +406,8 @@ class CurriculumStage:
     """Container describing a single curriculum stage."""
 
     name: str
-    dataset: SequenceDataset
-    frame: pd.DataFrame
+    dataset: Any
+    frame: "pd.DataFrame"
 
 
 @dataclass
@@ -370,7 +427,7 @@ class CurriculumTrainer:
 
     def __init__(
         self,
-        model: nn.Module,
+        model: Any,
         *,
         device: str = "cpu",
         learning_rate: float = 1e-3,
@@ -378,13 +435,18 @@ class CurriculumTrainer:
         weight_decay: float = 0.0,
         experiment=None,
     ) -> None:
+        torch_module, nn_module, data_loader_cls, _ = _require_torch()
+        self._torch = torch_module
+        self._nn = nn_module
+        self._data_loader_cls = data_loader_cls
+
         self.model = model.to(device)
-        self.device = torch.device(device)
+        self.device = torch_module.device(device)
         self.learning_rate = learning_rate
         self.batch_size = batch_size
         self.weight_decay = weight_decay
-        self.criterion = nn.MSELoss()
-        self.optimizer = torch.optim.Adam(
+        self.criterion = nn_module.MSELoss()
+        self.optimizer = torch_module.optim.Adam(
             self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
         )
         self.experiment = experiment
@@ -437,7 +499,7 @@ class CurriculumTrainer:
         return epochs
 
     def _train_stage(self, stage: CurriculumStage, epochs: int) -> StageResult:
-        dataloader = DataLoader(stage.dataset, batch_size=self.batch_size, shuffle=True)
+        dataloader = self._data_loader_cls(stage.dataset, batch_size=self.batch_size, shuffle=True)
 
         for epoch in range(epochs):
             self.model.train()
@@ -449,7 +511,7 @@ class CurriculumTrainer:
                 predictions = self.model(sequences)
                 loss = self.criterion(predictions, targets)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
+                self._torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
                 self.optimizer.step()
                 epoch_loss += loss.item() * sequences.size(0)
 
@@ -467,12 +529,12 @@ class CurriculumTrainer:
         )
 
     def _evaluate(self, stage: CurriculumStage) -> Dict[str, float]:
-        dataloader = DataLoader(stage.dataset, batch_size=self.batch_size, shuffle=False)
+        dataloader = self._data_loader_cls(stage.dataset, batch_size=self.batch_size, shuffle=False)
         self.model.eval()
 
-        predictions: List[Tensor] = []
-        targets: List[Tensor] = []
-        with torch.no_grad():
+        predictions: List[Any] = []
+        targets: List[Any] = []
+        with self._torch.no_grad():
             for sequences, batch_targets in dataloader:
                 sequences = sequences.to(self.device)
                 outputs = self.model(sequences).cpu()
@@ -482,11 +544,12 @@ class CurriculumTrainer:
         if not predictions:
             return {"loss": float("nan"), "rmse": float("nan"), "mae": float("nan")}
 
-        preds = torch.cat(predictions)
-        trues = torch.cat(targets)
-        mse = nn.functional.mse_loss(preds, trues).item()
-        mae = nn.functional.l1_loss(preds, trues).item()
-        return {"loss": mse, "rmse": float(np.sqrt(mse)), "mae": mae}
+        numpy = _require_numpy()
+        preds = self._torch.cat(predictions)
+        trues = self._torch.cat(targets)
+        mse = self._nn.functional.mse_loss(preds, trues).item()
+        mae = self._nn.functional.l1_loss(preds, trues).item()
+        return {"loss": mse, "rmse": float(numpy.sqrt(mse)), "mae": mae}
 
 
 # ---------------------------------------------------------------------------
@@ -494,7 +557,7 @@ class CurriculumTrainer:
 
 
 def build_curriculum_stages(
-    regimes: Dict[str, pd.DataFrame],
+    regimes: Dict[str, "pd.DataFrame"],
     feature_columns: Sequence[str],
     label_column: str,
     sequence_length: int,
@@ -513,7 +576,7 @@ def build_curriculum_stages(
         except (ValueError, RuntimeError) as exc:
             LOGGER.warning("Skipping regime '%s': %s", name, exc)
             continue
-        dataset = SequenceDataset(sequences, targets)
+        dataset = _build_sequence_dataset(sequences, targets)
         stages.append(CurriculumStage(name=name, dataset=dataset, frame=frame))
     return stages
 

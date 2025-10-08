@@ -29,6 +29,8 @@ def test_is_spot_symbol_rejects_leveraged_suffixes() -> None:
 def test_normalize_spot_symbol_handles_delimiters() -> None:
     assert spot.normalize_spot_symbol(" btc/usd ") == "BTC-USD"
     assert spot.normalize_spot_symbol("eth_usd") == "ETH-USD"
+    assert spot.normalize_spot_symbol("ethusd") == "ETH-USD"
+    assert spot.normalize_spot_symbol("BTCUSD") == "BTC-USD"
 
 
 def test_require_spot_symbol_returns_normalized_pair() -> None:
