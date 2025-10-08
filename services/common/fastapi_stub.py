@@ -625,7 +625,7 @@ async def _call_endpoint(
     func: Callable[..., Any],
     *,
     request: Request,
-    body: Dict[str, Any],
+    body: Any,
     query_params: Dict[str, Any],
     path_params: Dict[str, Any],
     dependency_stack: Optional[ExitStack] = None,
@@ -641,6 +641,10 @@ async def _call_endpoint(
         resolved_hints = get_type_hints(func, include_extras=True)
     except Exception:  # pragma: no cover - typing helpers may fail for local functions
         resolved_hints = {}
+
+    body_is_mapping = isinstance(body, dict)
+    body_mapping = body if body_is_mapping else {}
+    body_consumed = False
 
     for name, param in func_sig.parameters.items():
         annotation = resolved_hints.get(name, param.annotation)
@@ -674,14 +678,16 @@ async def _call_endpoint(
 
         if _is_pydantic_model(annotation):
             model_cls: Type[Any] = annotation
-            candidate = body.get(name, body)
+            candidate = body_mapping.get(name, body)
             try:
                 if isinstance(candidate, model_cls):
                     resolved_kwargs[name] = candidate
                 elif isinstance(candidate, dict):
                     resolved_kwargs[name] = model_cls(**candidate)
+                elif body_is_mapping and body_mapping:
+                    resolved_kwargs[name] = model_cls(**body_mapping)
                 else:
-                    resolved_kwargs[name] = model_cls(**body)
+                    resolved_kwargs[name] = model_cls(candidate)
             except Exception as exc:  # pragma: no cover - validation path
                 if _is_validation_error(exc):
                     raise RequestValidationError(errors=_extract_validation_errors(exc)) from exc
@@ -696,16 +702,24 @@ async def _call_endpoint(
             resolved_kwargs[name] = query_params[name]
             continue
 
-        if name in body:
-            resolved_kwargs[name] = body[name]
+        if name in body_mapping:
+            resolved_kwargs[name] = body_mapping[name]
             continue
 
         if _is_mapping_annotation(annotation):
-            resolved_kwargs[name] = dict(body)
+            if body_is_mapping:
+                resolved_kwargs[name] = dict(body_mapping)
+            else:
+                resolved_kwargs[name] = {}
             continue
 
         if default is not Parameter.empty:
             resolved_kwargs[name] = default
+            continue
+
+        if not body_consumed and not body_is_mapping:
+            resolved_kwargs[name] = body
+            body_consumed = True
             continue
 
         resolved_kwargs[name] = None
@@ -827,17 +841,17 @@ class TestClient:
                 return route, route.extract_path_params(path)
         raise HTTPException(status_code=404, detail=f"No route for {method} {path}")
 
-    def _prepare_body(self, json: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    def _prepare_body(self, json: Optional[Any]) -> Any:
         if json is None:
             return {}
-        return dict(json)
+        return json
 
     def _handle_call(
         self,
         method: str,
         path: str,
         *,
-        json: Optional[Dict[str, Any]] = None,
+        json: Optional[Any] = None,
         headers: Optional[Dict[str, str]] = None,
         params: Optional[Dict[str, Any]] = None,
     ) -> _ClientResponse:

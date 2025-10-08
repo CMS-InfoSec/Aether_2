@@ -37,6 +37,7 @@ _submodules = {
         )
     },
     "fastapi.applications": {"FastAPI": getattr(_stub, "FastAPI", None)},
+    "fastapi.routing": {"APIRouter": getattr(_stub, "APIRouter", None)},
     "fastapi.exceptions": {
         "HTTPException": getattr(_stub, "HTTPException", None),
         "RequestValidationError": getattr(_stub, "RequestValidationError", None),
