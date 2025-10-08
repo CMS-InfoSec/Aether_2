@@ -53,6 +53,8 @@ class AuditEvent:
         include_ip_address: bool = True,
         include_context: bool = False,
         resolved_ip_hash: "ResolvedIpHash" | None = None,
+        use_context_factory: bool = False,
+        include_hash_metadata: bool = False,
     ) -> dict[str, Any]:
         """Return a serialisable representation of the audit event.
 
@@ -62,9 +64,17 @@ class AuditEvent:
         and ``after`` mappings are copied into plain dictionaries to avoid
         exposing mutable references, and callers can opt out of including the
         raw IP address via ``include_ip_address``.  When ``include_context`` is
-        ``True`` any eagerly stored context mapping is duplicated as well.  A
-        pre-resolved hash can be supplied so the method reuses the computed
-        value instead of the event's cached ``ip_hash``.
+        ``True`` any eagerly stored context mapping is duplicated as well.  By
+        default the method only reuses eagerly stored context to avoid
+        triggering expensive lazy builders; pass ``use_context_factory=True`` to
+        evaluate :attr:`context_factory` when no stored mapping is available.
+        A pre-resolved hash can be supplied so the method reuses the computed
+        value instead of the event's cached ``ip_hash``.  When
+        ``include_hash_metadata`` is ``True`` the payload also includes whether
+        hashing required a fallback and any associated error metadata.  For
+        accurate metadata callers should supply ``resolved_ip_hash`` from
+        :meth:`AuditHooks.resolve_ip_hash` (or a compatible pre-computed
+        result); otherwise the hash metadata defaults to a non-fallback state.
         """
 
         resolved_hash = self.ip_hash if resolved_ip_hash is None else resolved_ip_hash.value
@@ -81,8 +91,25 @@ class AuditEvent:
         if include_ip_address:
             payload["ip_address"] = self.ip_address
 
-        if include_context and self.context is not None:
-            payload["context"] = dict(self.context)
+        if include_context:
+            context_mapping: Optional[Mapping[str, Any]] = self.context
+            if context_mapping is None and use_context_factory and self.context_factory is not None:
+                context_mapping = self.context_factory()
+            if context_mapping is not None:
+                payload["context"] = dict(context_mapping)
+
+        if include_hash_metadata:
+            resolved_metadata = resolved_ip_hash
+            if resolved_metadata is None:
+                resolved_metadata = ResolvedIpHash(
+                    value=resolved_hash,
+                    fallback=False,
+                    error=None,
+                )
+
+            payload["hash_fallback"] = resolved_metadata.fallback
+            if resolved_metadata.error is not None:
+                payload["hash_error"] = _build_hash_error_metadata(resolved_metadata.error)
 
         return payload
 
@@ -632,6 +659,11 @@ def _build_audit_log_extra(
                 extra.setdefault("hash_error", error_metadata)
         return extra
 
+    resolved_metadata = ResolvedIpHash(
+        value=ip_hash,
+        fallback=hash_fallback,
+        error=hash_error,
+    )
     audit_payload: dict[str, Any] = {
         "audit": AuditEvent(
             actor=actor,
@@ -641,12 +673,13 @@ def _build_audit_log_extra(
             after=after,
             ip_address=ip_address,
             ip_hash=ip_hash,
-        ).to_payload()
+        ).to_payload(
+            resolved_ip_hash=resolved_metadata,
+            include_hash_metadata=True,
+        )
     }
-    audit_payload["audit"]["hash_fallback"] = hash_fallback
     if error_metadata is not None:
-        audit_section = audit_payload["audit"]
-        audit_section.setdefault("hash_error", error_metadata)
+        audit_payload["audit"].setdefault("hash_error", error_metadata)
 
     return audit_payload
 

@@ -2,7 +2,7 @@ import builtins
 import hashlib
 import logging
 
-from typing import Iterator, List, Mapping, Optional
+from typing import Any, Iterator, List, Mapping, Optional
 
 import pytest
 
@@ -1318,6 +1318,93 @@ def test_audit_event_to_payload_can_skip_ip_address_and_include_context():
     assert payload["context"] == {"request_id": "abc"}
     assert payload["context"] is not event.context
     assert payload["ip_hash"] is None
+
+
+def test_audit_event_to_payload_can_use_context_factory_on_demand():
+    calls: list[str] = []
+    context_value: Mapping[str, Any] = {"request_id": "xyz"}
+
+    def build_context() -> Mapping[str, Any]:
+        calls.append("called")
+        return context_value
+
+    event = audit_hooks.AuditEvent(
+        actor="riley",
+        action="demo.event.context.factory",
+        entity="resource",
+        before={},
+        after={},
+        context_factory=build_context,
+    )
+
+    payload = event.to_payload(include_context=True, use_context_factory=True)
+
+    assert payload["context"] == {"request_id": "xyz"}
+    assert payload["context"] is not context_value
+    assert calls == ["called"]
+
+
+def test_audit_event_to_payload_skips_context_factory_when_not_included():
+    calls: list[str] = []
+
+    def build_context() -> Mapping[str, Any]:
+        calls.append("called")
+        return {"request_id": "xyz"}
+
+    event = audit_hooks.AuditEvent(
+        actor="sam",
+        action="demo.event.context.factory.skip",
+        entity="resource",
+        before={},
+        after={},
+        context_factory=build_context,
+    )
+
+    payload = event.to_payload(use_context_factory=True)
+
+    assert "context" not in payload
+    assert calls == []
+
+
+def test_audit_event_to_payload_can_include_hash_metadata():
+    event = audit_hooks.AuditEvent(
+        actor="sasha",
+        action="demo.event.hash.metadata",
+        entity="resource",
+        before={},
+        after={},
+    )
+    error = ValueError("hashing failed")
+    resolved = audit_hooks.ResolvedIpHash(value="fallback-hash", fallback=True, error=error)
+
+    payload = event.to_payload(
+        include_hash_metadata=True,
+        resolved_ip_hash=resolved,
+    )
+
+    assert payload["ip_hash"] == "fallback-hash"
+    assert payload["hash_fallback"] is True
+    assert payload["hash_error"] == {
+        "type": "ValueError",
+        "message": "hashing failed",
+    }
+
+
+def test_audit_event_to_payload_defaults_hash_metadata_when_not_provided():
+    event = audit_hooks.AuditEvent(
+        actor="taylor",
+        action="demo.event.hash.metadata.default",
+        entity="resource",
+        before={},
+        after={},
+        ip_hash="pre-resolved",
+    )
+
+    payload = event.to_payload(include_hash_metadata=True)
+
+    assert payload["ip_hash"] == "pre-resolved"
+    assert payload["hash_fallback"] is False
+    assert "hash_error" not in payload
 
 
 def test_audit_event_with_resolved_ip_hash_updates_hash_without_dropping_ip():
