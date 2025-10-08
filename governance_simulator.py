@@ -13,7 +13,34 @@ from uuid import uuid4
 from fastapi import Depends, FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
 
-from config_sandbox import _current_config, _deep_merge, _run_backtest
+LOGGER = logging.getLogger(__name__)
+
+try:  # pragma: no cover - configuration sandbox may be unavailable in tests
+    from config_sandbox import _current_config, _deep_merge, _run_backtest
+    _CONFIG_SANDBOX_AVAILABLE = True
+except Exception as exc:  # pragma: no cover - exercised when sandbox dependencies missing
+    LOGGER.warning("Config sandbox unavailable; governance simulator will operate in degraded mode: %s", exc)
+    _CONFIG_SANDBOX_AVAILABLE = False
+
+    def _current_config() -> Dict[str, Any]:  # type: ignore[override]
+        return {}
+
+    def _deep_merge(base: Mapping[str, Any], updates: Mapping[str, Any]) -> Dict[str, Any]:  # type: ignore[override]
+        merged: Dict[str, Any] = dict(base)
+        for key, value in updates.items():
+            existing = merged.get(key)
+            if isinstance(existing, Mapping) and isinstance(value, Mapping):
+                merged[key] = _deep_merge(existing, value)
+            else:
+                merged[key] = value
+        return merged
+
+    def _run_backtest(_: Mapping[str, Any]) -> Dict[str, float]:  # type: ignore[override]
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Configuration sandbox backend is unavailable in this environment.",
+        )
+
 from services.common.config import get_timescale_session
 from services.common.security import require_admin_account
 from shared.correlation import CorrelationIdMiddleware
@@ -27,8 +54,6 @@ except Exception:  # pragma: no cover - executed when psycopg missing
     sql = None  # type: ignore[assignment]
     dict_row = None  # type: ignore[assignment]
 
-
-LOGGER = logging.getLogger(__name__)
 
 ACCOUNT_ID = os.getenv("AETHER_ACCOUNT_ID", "default")
 TIMESCALE = get_timescale_session(ACCOUNT_ID)

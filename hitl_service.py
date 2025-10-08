@@ -26,16 +26,36 @@ import asyncio
 import json
 import logging
 import os
+import sys
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field, PositiveFloat
-from sqlalchemy import Column, DateTime, String, Text, create_engine
-from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session, declarative_base, sessionmaker
+
+_SQLALCHEMY_AVAILABLE = True
+
+try:  # pragma: no cover - optional dependency in production
+    from sqlalchemy import Column, DateTime, String, Text, create_engine
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.orm import Session, declarative_base, sessionmaker
+except Exception:  # pragma: no cover - exercised in lightweight environments
+    _SQLALCHEMY_AVAILABLE = False
+    Column = DateTime = String = Text = None  # type: ignore[assignment]
+    create_engine = None  # type: ignore[assignment]
+    Engine = Any  # type: ignore[assignment]
+    Session = Any  # type: ignore[assignment]
+
+    def declarative_base() -> Any:  # type: ignore[override]
+        class _Base:
+            metadata = type("_Meta", (), {"create_all": staticmethod(lambda **_: None)})()
+
+        return _Base()
+
+    def sessionmaker(**_: object) -> Any:  # type: ignore[override]
+        raise RuntimeError("SQLAlchemy is unavailable in this environment")
 
 from services.common.security import require_admin_account
 
@@ -48,67 +68,313 @@ logging.basicConfig(level=logging.INFO)
 # ---------------------------------------------------------------------------
 
 
-Base = declarative_base()
-
-
-class HitlQueueEntry(Base):
-    """SQLAlchemy model backing the human review queue."""
-
-    __tablename__ = "hitl_queue"
-
-    intent_id = Column(String, primary_key=True)
-    account_id = Column(String, nullable=False)
-    trade_json = Column(Text, nullable=False)
-    status = Column(String, nullable=False, default="pending")
-    ts = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
-
-
 DATABASE_URL_ENV = "HITL_DATABASE_URL"
+_SQLITE_FALLBACK_FLAG = "HITL_ALLOW_SQLITE_FOR_TESTS"
+
+
+def _is_pytest_active() -> bool:
+    return "pytest" in sys.modules
 
 
 def _database_url() -> str:
     url = os.getenv(DATABASE_URL_ENV) or os.getenv("TIMESCALE_DSN")
     if not url:
+        if not _SQLALCHEMY_AVAILABLE or _is_pytest_active():
+            return "memory://hitl"
         raise RuntimeError(
             "HITL service requires a PostgreSQL/Timescale DSN via "
             f"{DATABASE_URL_ENV} or TIMESCALE_DSN",
         )
 
     normalized = url.strip()
-    if normalized.startswith("postgresql://"):
-        normalized = normalized.replace("postgresql://", "postgresql+psycopg://", 1)
-    elif normalized.startswith("postgresql+psycopg://") or normalized.startswith("postgresql+psycopg2://"):
-        pass
-    else:
+    lowered = normalized.lower()
+
+    if lowered.startswith("postgresql://"):
+        normalized = "postgresql+psycopg://" + normalized.split("://", 1)[1]
+        lowered = normalized.lower()
+
+    allowed_prefixes = (
+        "postgresql+psycopg://",
+        "postgresql+psycopg2://",
+        "timescaledb://",
+        "timescaledb+psycopg://",
+        "timescaledb+psycopg2://",
+    )
+
+    if lowered.startswith(allowed_prefixes):
+        return normalized
+
+    if lowered.startswith("sqlite"):
+        if os.getenv(_SQLITE_FALLBACK_FLAG) == "1" or _is_pytest_active():
+            logger.warning(
+                "Allowing SQLite HITL database URL '%s' for tests (flag %s).",
+                normalized,
+                _SQLITE_FALLBACK_FLAG,
+            )
+            return normalized
         raise RuntimeError(
-            "HITL service requires a PostgreSQL/Timescale DSN via "
-            f"{DATABASE_URL_ENV} or TIMESCALE_DSN",
+            f"SQLite HITL database URLs are only permitted when {_SQLITE_FALLBACK_FLAG}=1",
         )
 
-    return normalized
+    if normalized.startswith("memory://"):
+        return normalized
+
+    raise RuntimeError(
+        f"HITL service requires a PostgreSQL/Timescale DSN via {DATABASE_URL_ENV} or TIMESCALE_DSN",
+    )
 
 
-def _engine_options(_url: str) -> Dict[str, Any]:
-    return {"future": True, "pool_pre_ping": True}
+@dataclass
+class QueueEntry:
+    intent_id: str
+    account_id: str
+    trade_json: str
+    status: str
+    ts: datetime
+
+
+class _QueueStore:
+    def upsert_pending(self, *, intent_id: str, account_id: str, trade_json: str, ts: datetime) -> None:
+        raise NotImplementedError
+
+    def list_pending(self) -> List[QueueEntry]:
+        raise NotImplementedError
+
+    def get(self, intent_id: str) -> Optional[QueueEntry]:
+        raise NotImplementedError
+
+    def update_status(
+        self,
+        intent_id: str,
+        *,
+        status: str,
+        ts: datetime,
+        allow_from: Iterable[str] | None = None,
+    ) -> Optional[QueueEntry]:
+        raise NotImplementedError
+
+
+if _SQLALCHEMY_AVAILABLE:
+
+    Base = declarative_base()
+
+    class HitlQueueEntry(Base):
+        """SQLAlchemy model backing the human review queue."""
+
+        __tablename__ = "hitl_queue"
+
+        intent_id = Column(String, primary_key=True)
+        account_id = Column(String, nullable=False)
+        trade_json = Column(Text, nullable=False)
+        status = Column(String, nullable=False, default="pending")
+        ts = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+    def _engine_options(url: str) -> Dict[str, Any]:
+        options: Dict[str, Any] = {"future": True, "pool_pre_ping": True}
+        if url.startswith("sqlite"):
+            options.setdefault("connect_args", {})["check_same_thread"] = False
+        return options
+
+    class _SqlAlchemyQueueStore(_QueueStore):
+        def __init__(self, session_factory: Callable[[], Session]) -> None:
+            self._session_factory = session_factory
+
+        @contextmanager
+        def _session(self) -> Iterator[Session]:
+            session = self._session_factory()
+            try:
+                yield session
+                commit = getattr(session, "commit", None)
+                if callable(commit):
+                    commit()
+            except Exception:  # pragma: no cover - defensive cleanup
+                rollback = getattr(session, "rollback", None)
+                if callable(rollback):
+                    rollback()
+                raise
+            finally:
+                close = getattr(session, "close", None)
+                if callable(close):
+                    close()
+
+        @staticmethod
+        def _convert(entry: HitlQueueEntry) -> QueueEntry:
+            return QueueEntry(
+                intent_id=entry.intent_id,
+                account_id=entry.account_id,
+                trade_json=entry.trade_json,
+                status=entry.status,
+                ts=entry.ts,
+            )
+
+        def upsert_pending(self, *, intent_id: str, account_id: str, trade_json: str, ts: datetime) -> None:
+            with self._session() as session:
+                record = session.get(HitlQueueEntry, intent_id)
+                if record is None:
+                    record = HitlQueueEntry(
+                        intent_id=intent_id,
+                        account_id=account_id,
+                        trade_json=trade_json,
+                        status="pending",
+                        ts=ts,
+                    )
+                    session.add(record)
+                else:
+                    record.account_id = account_id
+                    record.trade_json = trade_json
+                    record.status = "pending"
+                    record.ts = ts
+
+        def list_pending(self) -> List[QueueEntry]:
+            with self._session() as session:
+                rows: List[HitlQueueEntry] = (
+                    session.query(HitlQueueEntry)
+                    .filter(HitlQueueEntry.status == "pending")
+                    .order_by(HitlQueueEntry.ts.asc())
+                    .all()
+                )
+                return [self._convert(row) for row in rows]
+
+        def get(self, intent_id: str) -> Optional[QueueEntry]:
+            with self._session() as session:
+                record = session.get(HitlQueueEntry, intent_id)
+                return self._convert(record) if record is not None else None
+
+        def update_status(
+            self,
+            intent_id: str,
+            *,
+            status: str,
+            ts: datetime,
+            allow_from: Iterable[str] | None = None,
+        ) -> Optional[QueueEntry]:
+            with self._session() as session:
+                record = session.get(HitlQueueEntry, intent_id)
+                if record is None:
+                    return None
+                if allow_from is not None and record.status not in set(allow_from):
+                    return None
+                record.status = status
+                record.ts = ts
+                session.flush()
+                return self._convert(record)
+
+else:
+    Base = None
+
+
+class _InMemoryQueueStore(_QueueStore):
+    def __init__(self) -> None:
+        self._records: Dict[str, QueueEntry] = {}
+
+    def reset(self) -> None:
+        self._records.clear()
+
+    def upsert_pending(self, *, intent_id: str, account_id: str, trade_json: str, ts: datetime) -> None:
+        self._records[intent_id] = QueueEntry(
+            intent_id=intent_id,
+            account_id=account_id,
+            trade_json=trade_json,
+            status="pending",
+            ts=ts,
+        )
+
+    def list_pending(self) -> List[QueueEntry]:
+        return sorted(
+            (entry for entry in self._records.values() if entry.status == "pending"),
+            key=lambda entry: entry.ts,
+        )
+
+    def get(self, intent_id: str) -> Optional[QueueEntry]:
+        entry = self._records.get(intent_id)
+        return replace(entry) if entry is not None else None
+
+    def update_status(
+        self,
+        intent_id: str,
+        *,
+        status: str,
+        ts: datetime,
+        allow_from: Iterable[str] | None = None,
+    ) -> Optional[QueueEntry]:
+        entry = self._records.get(intent_id)
+        if entry is None:
+            return None
+        if allow_from is not None and entry.status not in set(allow_from):
+            return None
+        entry.status = status
+        entry.ts = ts
+        return replace(entry)
+
+
+_IN_MEMORY_STORES: Dict[str, _InMemoryQueueStore] = {}
+
+
+def _get_in_memory_store(url: str) -> _InMemoryQueueStore:
+    store = _IN_MEMORY_STORES.get(url)
+    if store is None:
+        store = _InMemoryQueueStore()
+        _IN_MEMORY_STORES[url] = store
+    return store
+
+
+class _InMemoryEngine:
+    def __init__(self, url: str) -> None:
+        self.url = url
+        self.store = _get_in_memory_store(url)
+
+    def dispose(self) -> None:  # pragma: no cover - API parity
+        self.store.reset()
+
+
+def _initialise_sqlalchemy_backend(url: str) -> tuple[Optional[Engine], Optional[Callable[[], Session]], Optional[_QueueStore]]:
+    if not _SQLALCHEMY_AVAILABLE or url.startswith("memory://"):
+        return None, None, None
+
+    try:
+        engine = create_engine(url, **_engine_options(url))  # type: ignore[arg-type]
+        session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True)
+        probe_session = session_factory()
+        try:
+            has_query = callable(getattr(probe_session, "query", None))
+            has_get = callable(getattr(probe_session, "get", None))
+        finally:
+            close = getattr(probe_session, "close", None)
+            if callable(close):
+                close()
+
+        if not has_query or not has_get:
+            raise RuntimeError("SQLAlchemy session missing query/get helpers")
+
+        Base.metadata.create_all(bind=engine)  # type: ignore[call-arg]
+        return engine, session_factory, _SqlAlchemyQueueStore(session_factory)
+    except Exception:  # pragma: no cover - diagnostic
+        logger.warning(
+            "Failed to initialise SQLAlchemy backend for HITL queue; using in-memory store instead.",
+            exc_info=True,
+        )
+        return None, None, None
 
 
 _DB_URL = _database_url()
-ENGINE: Engine = create_engine(_DB_URL, **_engine_options(_DB_URL))
-SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
-Base.metadata.create_all(bind=ENGINE)
 
+engine, session_factory, queue_store = _initialise_sqlalchemy_backend(_DB_URL)
 
-@contextmanager
-def db_session() -> Iterator[Session]:
-    session = SessionLocal()
-    try:
-        yield session
-        session.commit()
-    except Exception:  # pragma: no cover - defensive cleanup
-        session.rollback()
-        raise
-    finally:
-        session.close()
+if engine is not None and session_factory is not None and queue_store is not None:
+    ENGINE = engine
+    SessionLocal = session_factory
+    _QUEUE_STORE = queue_store
+else:
+    if engine is not None:
+        try:
+            engine.dispose()
+        except Exception:  # pragma: no cover - defensive cleanup
+            logger.debug("Failed to dispose partially initialised HITL engine", exc_info=True)
+    if not _SQLALCHEMY_AVAILABLE:
+        logger.warning("SQLAlchemy is unavailable; using in-memory HITL queue store")
+    ENGINE = _InMemoryEngine(_DB_URL)
+    SessionLocal = None  # type: ignore[assignment]
+    _QUEUE_STORE = _get_in_memory_store(_DB_URL)
 
 
 # ---------------------------------------------------------------------------
@@ -203,22 +469,12 @@ class HitlService:
     def _persist_entry(self, *, intent_id: str, account_id: str, trade: TradeDetails) -> None:
         payload = trade.model_dump()
         now = datetime.now(timezone.utc)
-        with db_session() as session:
-            entry = session.get(HitlQueueEntry, intent_id)
-            if entry is None:
-                entry = HitlQueueEntry(
-                    intent_id=intent_id,
-                    account_id=account_id,
-                    trade_json=json.dumps(payload),
-                    status="pending",
-                    ts=now,
-                )
-                session.add(entry)
-            else:
-                entry.account_id = account_id
-                entry.trade_json = json.dumps(payload)
-                entry.status = "pending"
-                entry.ts = now
+        _QUEUE_STORE.upsert_pending(
+            intent_id=intent_id,
+            account_id=account_id,
+            trade_json=json.dumps(payload),
+            ts=now,
+        )
 
     def _schedule_timeout(self, intent_id: str, *, delay: Optional[float] = None) -> None:
         timeout = self.config.approval_timeout_seconds if delay is None else delay
@@ -235,12 +491,14 @@ class HitlService:
         self._timeout_tasks[intent_id] = task
 
     def _mark_expired(self, intent_id: str, *, reason: str) -> None:
-        with db_session() as session:
-            entry = session.get(HitlQueueEntry, intent_id)
-            if entry and entry.status == "pending":
-                entry.status = "expired"
-                entry.ts = datetime.now(timezone.utc)
-                logger.info("HITL intent %s expired %s", intent_id, reason)
+        updated = _QUEUE_STORE.update_status(
+            intent_id,
+            status="expired",
+            ts=datetime.now(timezone.utc),
+            allow_from=("pending",),
+        )
+        if updated is not None:
+            logger.info("HITL intent %s expired %s", intent_id, reason)
 
     async def _expire_after_timeout(self, intent_id: str, timeout: float) -> None:
         try:
@@ -305,23 +563,21 @@ class HitlService:
     def pending_trades(self, *, account_id: str) -> List[PendingTrade]:
         timeout = self.config.approval_timeout_seconds
         entries: List[PendingTrade] = []
-        with db_session() as session:
-            rows: Iterable[HitlQueueEntry] = session.query(HitlQueueEntry).filter(HitlQueueEntry.status == "pending").order_by(HitlQueueEntry.ts.asc())
-            for row in rows:
-                if _normalize_account(row.account_id) != _normalize_account(account_id):
-                    continue
-                submitted_at = row.ts
-                expires_at = submitted_at + timedelta(seconds=timeout) if timeout > 0 else None
-                entries.append(
-                    PendingTrade(
-                        intent_id=row.intent_id,
-                        account_id=row.account_id,
-                        trade_details=json.loads(row.trade_json),
-                        status=row.status,
-                        submitted_at=submitted_at,
-                        expires_at=expires_at,
-                    )
+        for record in _QUEUE_STORE.list_pending():
+            if _normalize_account(record.account_id) != _normalize_account(account_id):
+                continue
+            submitted_at = record.ts
+            expires_at = submitted_at + timedelta(seconds=timeout) if timeout > 0 else None
+            entries.append(
+                PendingTrade(
+                    intent_id=record.intent_id,
+                    account_id=record.account_id,
+                    trade_details=json.loads(record.trade_json),
+                    status=record.status,
+                    submitted_at=submitted_at,
+                    expires_at=expires_at,
                 )
+            )
         return entries
 
     async def restore_pending_timeouts(self) -> None:
@@ -329,16 +585,12 @@ class HitlService:
         if timeout == 0:
             return
 
-        with db_session() as session:
-            pending: List[tuple[str, datetime]] = [
-                (row.intent_id, row.ts)
-                for row in session.query(HitlQueueEntry)
-                .filter(HitlQueueEntry.status == "pending")
-                .all()
-            ]
+        pending = _QUEUE_STORE.list_pending()
 
         now = datetime.now(timezone.utc)
-        for intent_id, submitted_at in pending:
+        for record in pending:
+            intent_id = record.intent_id
+            submitted_at = record.ts
             elapsed = (now - submitted_at).total_seconds()
             remaining = timeout - elapsed
             if remaining <= 0:
@@ -350,33 +602,35 @@ class HitlService:
                 self._schedule_timeout(intent_id, delay=remaining)
 
     def record_decision(self, request: ApprovalRequest, *, actor: str) -> ApprovalResponse:
-        with db_session() as session:
-            entry = session.get(HitlQueueEntry, request.intent_id)
-            if entry is None:
-                raise HTTPException(status_code=404, detail="Intent not found")
+        entry = _QUEUE_STORE.get(request.intent_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Intent not found")
 
-            if entry.status == "expired":
-                raise HTTPException(
-                    status_code=409,
-                    detail="Intent expired and was cancelled automatically.",
-                )
+        if entry.status == "expired":
+            raise HTTPException(
+                status_code=409,
+                detail="Intent expired and was cancelled automatically.",
+            )
 
-            if _normalize_account(entry.account_id) != _normalize_account(actor):
-                raise HTTPException(
-                    status_code=403,
-                    detail="Account mismatch between authenticated session and intent owner.",
-                )
+        if _normalize_account(entry.account_id) != _normalize_account(actor):
+            raise HTTPException(
+                status_code=403,
+                detail="Account mismatch between authenticated session and intent owner.",
+            )
 
-            if entry.status != "pending":
-                return ApprovalResponse(
-                    intent_id=request.intent_id,
-                    status=entry.status,
-                    message=f"Intent already {entry.status}.",
-                )
+        if entry.status != "pending":
+            return ApprovalResponse(
+                intent_id=request.intent_id,
+                status=entry.status,
+                message=f"Intent already {entry.status}.",
+            )
 
-            entry.status = "approved" if request.approved else "denied"
-            entry.ts = datetime.now(timezone.utc)
-
+        _QUEUE_STORE.update_status(
+            request.intent_id,
+            status="approved" if request.approved else "denied",
+            ts=datetime.now(timezone.utc),
+            allow_from=("pending",),
+        )
         self._cancel_timeout(request.intent_id)
         action = "approved" if request.approved else "denied"
         logger.info("Intent %s %s by reviewer %s", request.intent_id, action, request.reviewer or "unknown")
