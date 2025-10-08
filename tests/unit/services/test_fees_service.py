@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
-from typing import Iterable
 
 import pytest
 from fastapi.testclient import TestClient
