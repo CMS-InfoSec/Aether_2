@@ -553,6 +553,7 @@ class AuditLogResult:
     ip_hash: Optional[str]
     hash_fallback: bool
     hash_error: Optional[Exception]
+    context: Optional[Mapping[str, Any]] = None
     log_error: Optional[Exception] = None
     context_error: Optional[Exception] = None
 
@@ -795,6 +796,22 @@ def _build_hash_error_metadata(hash_error: Exception) -> Mapping[str, str]:
     return _describe_exception(hash_error)
 
 
+def _snapshot_context_mapping(
+    context: Optional[Mapping[str, Any]],
+    *,
+    copy: bool,
+) -> Optional[Mapping[str, Any]]:
+    """Return structured context metadata, optionally copying the mapping."""
+
+    if context is None:
+        return None
+
+    if not copy:
+        return context
+
+    return dict(context)
+
+
 def _build_audit_log_extra(
     *,
     actor: str,
@@ -909,7 +926,10 @@ def log_event_with_fallback(
     required.  Supplying ``resolved_context`` allows callers to pre-resolve
     structured context metadata—including capturing factory exceptions—so the
     helper can reuse the outcome without re-invoking the factory during
-    fallback logging.
+    fallback logging.  The returned :class:`AuditLogResult` exposes the
+    structured context mapping that was resolved for fallback logging when one
+    is available, allowing callers to inspect the payload without re-evaluating
+    expensive factories.
     """
 
     resolved = resolved_ip_hash
@@ -1003,6 +1023,7 @@ def log_event_with_fallback(
             ip_hash=resolved.value,
             hash_fallback=resolved.fallback,
             hash_error=resolved.error,
+            context=_snapshot_context_mapping(context_value, copy=True),
             log_error=exc,
             context_error=context_error,
         )
@@ -1013,11 +1034,19 @@ def log_event_with_fallback(
     combined_hash_fallback = resolved.fallback or result.hash_fallback
     combined_hash_error = resolved.error or result.hash_error
 
+    context_snapshot = result.context
+    if context_snapshot is None and context_value is not None and context_evaluated:
+        context_snapshot = _snapshot_context_mapping(
+            context_value,
+            copy=log_extra is not None,
+        )
+
     return AuditLogResult(
         handled=result.handled,
         ip_hash=result.ip_hash or resolved.value,
         hash_fallback=combined_hash_fallback,
         hash_error=combined_hash_error,
+        context=context_snapshot,
         log_error=result.log_error,
         context_error=result.context_error or context_error,
     )
