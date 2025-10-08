@@ -10,19 +10,38 @@ import os
 import re
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
-from types import ModuleType
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    Dict,
-    List,
-    Optional,
-    Protocol,
-    Tuple,
-    TypeVar,
-    cast,
-)
+from typing import Any, Dict, List, Optional, Tuple
+
+try:  # pragma: no cover - FastAPI is optional in some unit tests
+    from fastapi import (
+        BackgroundTasks,
+        Depends,
+        FastAPI,
+        HTTPException,
+        Query,
+        Request,
+        Response,
+        status,
+    )
+    from fastapi.encoders import jsonable_encoder
+    from fastapi.exceptions import RequestValidationError
+    from fastapi.responses import JSONResponse
+except ImportError:  # pragma: no cover - fallback when FastAPI is stubbed out
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        BackgroundTasks,
+        Depends,
+        FastAPI,
+        HTTPException,
+        JSONResponse,
+        Query,
+        Request,
+        RequestValidationError,
+        Response,
+        jsonable_encoder,
+        status,
+    )
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from pydantic import BaseModel, Field, SecretStr, validator
 
 try:  # pragma: no cover - FastAPI is optional in some unit tests
     from fastapi import (
