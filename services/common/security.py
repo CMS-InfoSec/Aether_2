@@ -3,7 +3,25 @@ from __future__ import annotations
 import inspect
 import os
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple, cast
+from typing import Any, Iterable, List, Optional, Tuple
+
+try:  # pragma: no cover - FastAPI is optional in some unit tests
+    from fastapi import Header, HTTPException, Request, status
+except ImportError:  # pragma: no cover - fallback when FastAPI is stubbed out
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        Header,
+        HTTPException,
+        Request,
+        status,
+    )
+
+try:  # pragma: no cover - auth service dependencies may be unavailable
+    from auth.service import Session, SessionStoreProtocol
+except Exception:  # pragma: no cover - provide minimal stand-ins
+    @dataclass
+    class Session:  # type: ignore[override]
+        token: str
+        admin_id: str
 
     class SessionStoreProtocol:  # type: ignore[override]
         def get(self, token: str) -> Session | None:  # pragma: no cover - simple stub

@@ -7,58 +7,47 @@ import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Sequence, TypeVar, cast
+from threading import RLock
+from types import SimpleNamespace
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence
 
-if TYPE_CHECKING:  # pragma: no cover - imported for static analysis only
-    from fastapi import Depends, FastAPI, HTTPException, Query, Request
-else:  # pragma: no cover - runtime fallback when FastAPI is optional
-    try:
-        from fastapi import Depends, FastAPI, HTTPException, Query, Request
-    except ModuleNotFoundError:  # pragma: no cover - minimal stub for optional dependency
-        class HTTPException(Exception):
-            """Lightweight HTTP exception capturing status and detail."""
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from pydantic import BaseModel, Field
 
-            def __init__(self, status_code: int, detail: str) -> None:
-                super().__init__(detail)
-                self.status_code = status_code
-                self.detail = detail
+_SQLALCHEMY_AVAILABLE = True
 
-        class _State:  # pragma: no cover - generic container for state attributes
-            pass
+try:  # pragma: no cover - optional dependency in minimal environments
+    from sqlalchemy import Column, DateTime, Float, String, create_engine, func, select
+    from sqlalchemy.engine import Engine, URL
+    from sqlalchemy.engine.url import make_url
+    from sqlalchemy.exc import ArgumentError
+    from sqlalchemy.orm import Session, declarative_base, sessionmaker
+except Exception:  # pragma: no cover - exercised when SQLAlchemy is absent
+    _SQLALCHEMY_AVAILABLE = False
+    Column = DateTime = Float = String = None  # type: ignore[assignment]
+    Engine = Session = Any  # type: ignore[assignment]
+    URL = str  # type: ignore[assignment]
 
-        class FastAPI:  # pragma: no cover - decorator-friendly shim
-            def __init__(self, *args: Any, **kwargs: Any) -> None:
-                del args, kwargs
-                self.state = _State()
+    def make_url(url: str) -> str:  # type: ignore[override]
+        return url
 
-            def get(self, *args: Any, **kwargs: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-                def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
-                    return func
+    class ArgumentError(Exception):
+        """Placeholder for SQLAlchemy's ``ArgumentError``."""
 
-                return decorator
+    def declarative_base() -> SimpleNamespace:  # type: ignore[override]
+        return SimpleNamespace(metadata=SimpleNamespace(create_all=lambda **_: None))
 
-            def on_event(self, *_: Any, **__: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-                def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
-                    return func
+    def sessionmaker(*_args: Any, **_kwargs: Any) -> Callable[[], Any]:  # type: ignore[override]
+        raise RuntimeError("SQLAlchemy is required to create sessions in this environment")
 
-                return decorator
+    def select(*_args: Any, **_kwargs: Any) -> None:  # type: ignore[override]
+        raise RuntimeError("SQLAlchemy select is unavailable without the dependency")
 
-        class Request:  # pragma: no cover - simple stub exposing ``app`` and ``state``
-            def __init__(self) -> None:
-                self.app = FastAPI()
-                self.state = self.app.state
+    class _FuncNamespace(SimpleNamespace):
+        def upper(self, value: Any) -> Any:  # pragma: no cover - defensive fallback
+            return value
 
-        def Depends(dependency: Callable[..., Any]) -> Callable[..., Any]:  # type: ignore[misc]
-            return dependency
-
-        def Query(default: Any = None, **_: Any) -> Any:
-            return default
-
-from sqlalchemy import Column, DateTime, Float, String, create_engine, func, select
-from sqlalchemy.engine import Engine, URL
-from sqlalchemy.engine.url import make_url
-from sqlalchemy.exc import ArgumentError
-from sqlalchemy.orm import Session, declarative_base, sessionmaker
+    func = _FuncNamespace()
 
 from auth.service import (
     InMemorySessionStore,
@@ -71,16 +60,8 @@ from services.common.spot import require_spot_http
 from shared.session_config import load_session_ttl_minutes
 from shared.pydantic_compat import BaseModel, Field
 
-__all__ = ["app", "ENGINE", "SessionLocal", "SESSION_STORE"]
-
-
-ENGINE_STATE_KEY = "seasonality_engine"
-SESSIONMAKER_STATE_KEY = "seasonality_sessionmaker"
-
-ENGINE: Engine | None = None
-SessionFactory = Callable[[], Session]
-SessionLocal: SessionFactory | None = None
-SESSION_STORE: SessionStoreProtocol | None = None
+def _symbol_key(symbol: str) -> str:
+    return symbol.replace("-", "").replace("/", "").upper()
 
 
 def _normalise_database_url(url: str) -> str:
@@ -136,6 +117,9 @@ def _require_database_url() -> str:
         "Seasonality service requires a PostgreSQL/Timescale DSN (SQLite is permitted for tests)."
     )
 
+def _engine_options(url: str) -> Dict[str, Any]:
+    if not _SQLALCHEMY_AVAILABLE:
+        return {}
 
 def _engine_options(url: str) -> Dict[str, Any]:
     if not _SQLALCHEMY_AVAILABLE:
@@ -191,19 +175,13 @@ else:  # pragma: no cover - runtime declarative bases when SQLAlchemy is availab
     OhlcvBase = declarative_base()
     MetricsBase = declarative_base()
 
-if TYPE_CHECKING:
-    class _DeclarativeBase:
-        """Typed stub mirroring SQLAlchemy's declarative base attributes."""
-
-        metadata: Any
-        registry: Any
-
-
-    OhlcvBase = _DeclarativeBase
-    MetricsBase = _DeclarativeBase
-else:  # pragma: no cover - runtime declarative bases when SQLAlchemy is available
-    OhlcvBase = declarative_base()
-    MetricsBase = declarative_base()
+        market = Column(String, primary_key=True)
+        bucket_start = Column(DateTime(timezone=True), primary_key=True)
+        open = Column(Float)
+        high = Column(Float)
+        low = Column(Float)
+        close = Column(Float)
+        volume = Column(Float)
 
     class SeasonalityMetric(MetricsBase):
         """Persisted aggregate used to snapshot historical seasonality results."""
@@ -220,43 +198,8 @@ else:
     class _InMemoryBase:
         metadata = SimpleNamespace(create_all=lambda **_: None)
 
-    if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
-        __table__: Any
-
-        def __init__(
-            self,
-            *,
-            market: str,
-            bucket_start: datetime,
-            open: float,
-            high: float,
-            low: float,
-            close: float,
-            volume: float,
-        ) -> None: ...
-
-    if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
-        __table__: Any
-
-        def __init__(
-            self,
-            *,
-            market: str,
-            bucket_start: datetime,
-            open: float,
-            high: float,
-            low: float,
-            close: float,
-            volume: float,
-        ) -> None: ...
-
-    market = Column(String, primary_key=True)
-    bucket_start = Column(DateTime(timezone=True), primary_key=True)
-    open = Column(Float)
-    high = Column(Float)
-    low = Column(Float)
-    close = Column(Float)
-    volume = Column(Float)
+    OhlcvBase = _InMemoryBase  # type: ignore[assignment]
+    MetricsBase = _InMemoryBase  # type: ignore[assignment]
 
     @dataclass
     class OhlcvBar:  # type: ignore[override]
@@ -274,40 +217,15 @@ else:
     class SeasonalityMetric:  # type: ignore[override]
         """In-memory representation of computed seasonality metrics."""
 
-    if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
-        __table__: Any
+        symbol: str
+        period: str
+        avg_return: float
+        avg_vol: float
+        avg_volume: float
+        ts: datetime
 
-        def __init__(
-            self,
-            *,
-            symbol: str,
-            period: str,
-            avg_return: float,
-            avg_vol: float,
-            avg_volume: float,
-            ts: datetime,
-        ) -> None: ...
-
-    if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
-        __table__: Any
-
-        def __init__(
-            self,
-            *,
-            symbol: str,
-            period: str,
-            avg_return: float,
-            avg_vol: float,
-            avg_volume: float,
-            ts: datetime,
-        ) -> None: ...
-
-    symbol = Column(String, primary_key=True)
-    period = Column(String, primary_key=True)
-    avg_return = Column(Float, nullable=False)
-    avg_vol = Column(Float, nullable=False)
-    avg_volume = Column(Float, nullable=False)
-    ts = Column(DateTime(timezone=True), nullable=False)
+        __tablename__ = "seasonality_metrics"
+        __table__ = SimpleNamespace(create=lambda **_: None)
 
 
 @dataclass
@@ -615,15 +533,16 @@ def _configure_database_for_app(application: FastAPI) -> None:
             "TIMESCALE_DATABASE_URI, or DATABASE_URL."
         ) from exc
 
-    engine = create_engine(
-        database_url.render_as_string(hide_password=False),
-        **_engine_options(database_url),
-    )
-    session_factory = sessionmaker(
-        bind=engine, autoflush=False, expire_on_commit=False, future=True
-    )
-
-    SeasonalityMetric.__table__.create(bind=engine, checkfirst=True)
+    engine = _create_engine(database_url)
+    if _SQLALCHEMY_AVAILABLE:
+        session_factory = sessionmaker(
+            bind=engine, autoflush=False, expire_on_commit=False, future=True
+        )
+        OhlcvBase.metadata.create_all(bind=engine, checkfirst=True)
+        MetricsBase.metadata.create_all(bind=engine, checkfirst=True)
+    else:
+        _IN_MEMORY_STORE.reset()
+        session_factory = lambda: _InMemorySession(_IN_MEMORY_STORE)
 
     setattr(application.state, ENGINE_STATE_KEY, engine)
     setattr(application.state, SESSIONMAKER_STATE_KEY, session_factory)
@@ -643,13 +562,7 @@ def _dispose_database(application: FastAPI) -> None:
     if isinstance(engine, Engine):
         engine.dispose()
 
-    for key in (
-        ENGINE_STATE_KEY,
-        SESSIONMAKER_STATE_KEY,
-        "seasonality_database_url",
-        "seasonality_engine",
-        "seasonality_sessionmaker",
-    ):
+    for key in (ENGINE_STATE_KEY, SESSIONMAKER_STATE_KEY):
         if hasattr(application.state, key):
             delattr(application.state, key)
 
@@ -867,7 +780,10 @@ def _fetch_metrics(
 
 
 def _validate_symbol(symbol: str) -> str:
-    return cast(str, require_spot_http(symbol))
+    validated = require_spot_http(symbol)
+    if isinstance(validated, str):
+        return validated.replace("-", "/")
+    return str(validated)
 
 
 def _assert_data_available(bars: Sequence[Bar], symbol: str) -> None:
@@ -883,21 +799,6 @@ app = FastAPI(title="Seasonality Analytics Service")
 app.state.seasonality_database_url = None
 app.state.seasonality_engine = None
 app.state.seasonality_sessionmaker = None
-
-
-RouteFn = TypeVar("RouteFn", bound=Callable[..., Any])
-
-
-def _app_get(*args: Any, **kwargs: Any) -> Callable[[RouteFn], RouteFn]:
-    """Typed wrapper around :meth:`FastAPI.get` for strict type checking."""
-
-    return cast(Callable[[RouteFn], RouteFn], app.get(*args, **kwargs))
-
-
-def _app_on_event(event: str) -> Callable[[RouteFn], RouteFn]:
-    """Typed wrapper around :meth:`FastAPI.on_event` for static analysis."""
-
-    return cast(Callable[[RouteFn], RouteFn], app.on_event(event))
 
 
 def _resolve_session_store_dsn() -> str:

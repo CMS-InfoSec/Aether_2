@@ -34,26 +34,67 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Mapping, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, cast
+from urllib.parse import parse_qsl, unquote, urlparse, urlunparse
 
-from alembic import command
-from alembic.config import Config
-from sqlalchemy import (
-    JSON,
-    Column,
-    DateTime,
-    MetaData,
-    String,
-    Table,
-    create_engine,
-    func,
-    select,
-)
-from sqlalchemy.engine import Engine
-from sqlalchemy.engine.url import make_url
-from sqlalchemy.exc import ArgumentError, NoSuchTableError, SQLAlchemyError
-from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
-from sqlalchemy.pool import StaticPool
+try:  # pragma: no cover - alembic is optional in lightweight environments
+    from alembic import command
+    from alembic.config import Config
+except Exception:  # pragma: no cover - allow module import without alembic
+    command = None  # type: ignore[assignment]
+    Config = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - SQLAlchemy is optional for lightweight deployments
+    from sqlalchemy import (
+        JSON,
+        Column,
+        DateTime,
+        MetaData,
+        String,
+        Table,
+        create_engine,
+        func,
+        select,
+    )
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.engine.url import make_url as _sa_make_url
+    from sqlalchemy.exc import ArgumentError, NoSuchTableError, SQLAlchemyError
+    from sqlalchemy.orm import Session, declarative_base, sessionmaker
+    from sqlalchemy.pool import StaticPool
+    _SQLALCHEMY_AVAILABLE = True
+except Exception:  # pragma: no cover - provide lightweight stand-ins
+    JSON = Column = DateTime = MetaData = String = Table = None  # type: ignore[assignment]
+    Engine = Any  # type: ignore[assignment]
+    _sa_make_url = None  # type: ignore[assignment]
+    _SQLALCHEMY_AVAILABLE = False
+
+    class SQLAlchemyError(Exception):
+        pass
+
+
+    class ArgumentError(SQLAlchemyError):
+        pass
+
+
+    class NoSuchTableError(SQLAlchemyError):
+        pass
+
+
+    Session = Any  # type: ignore[assignment]
+
+    def declarative_base():  # type: ignore[override]
+        class _Base:
+            metadata = None
+
+        return _Base
+
+
+    def sessionmaker(**_: object):  # type: ignore[override]
+        raise RuntimeError("SQLAlchemy sessionmaker is unavailable in this environment")
+
+
+    class StaticPool:  # type: ignore[override]
+        pass
 
 from shared.yaml_compat import load_yaml_module
 
@@ -203,12 +244,8 @@ DEFAULT_MANIFEST_FILE = Path("release_manifest_current.json")
 DEFAULT_MANIFEST_MARKDOWN = Path("release_manifest_current.md")
 
 
-
-
-class Base(DeclarativeBase):
-    """Declarative base for the release manifest ORM model."""
-
-    pass
+if _SQLALCHEMY_AVAILABLE:
+    Base = declarative_base()
 
 
 class Base(DeclarativeBase):
