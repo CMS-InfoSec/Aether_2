@@ -9,57 +9,117 @@ import os
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+    TypeGuard,
+    TypeVar,
+    cast,
+)
 
-try:  # pragma: no cover - fastapi is optional for unit tests
+if TYPE_CHECKING:  # pragma: no cover - imported for type checking only
     from fastapi import APIRouter, Depends, FastAPI, HTTPException
-except ModuleNotFoundError:  # pragma: no cover - fallback stub for tests
-    class HTTPException(Exception):
-        def __init__(self, status_code: int, detail: str) -> None:
-            super().__init__(detail)
-            self.status_code = status_code
-            self.detail = detail
+else:  # pragma: no cover - runtime import with fallback stub
+    try:
+        from fastapi import APIRouter, Depends, FastAPI, HTTPException
+    except ModuleNotFoundError:
+        class HTTPException(Exception):
+            def __init__(self, status_code: int, detail: str) -> None:
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
 
-    class _RouterStub:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            self.routes: list[tuple[str, Any, Any]] = []
+        class _RouterStub:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                self.routes: list[tuple[str, Any, Any]] = []
 
-        def get(self, *args: Any, **kwargs: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-            def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
-                self.routes.append(("GET", args[0] if args else None, func))
-                return func
+            def get(self, *args: Any, **kwargs: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+                def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+                    self.routes.append(("GET", args[0] if args else None, func))
+                    return func
 
-            return decorator
+                return decorator
 
-    def Depends(dependency: Callable[..., Any]) -> Callable[..., Any]:
-        return dependency
+        def Depends(dependency: Callable[..., Any]) -> Callable[..., Any]:
+            return dependency
 
-    class FastAPI:  # type: ignore[no-redef]
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            self.state = type("State", (), {})()
+        class FastAPI:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                self.state = type("State", (), {})()
 
-        def on_event(self, *_: Any, **__: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-            def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
-                return func
+            def on_event(self, *_: Any, **__: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+                def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+                    return func
 
-            return decorator
+                return decorator
 
-        def include_router(self, *_: Any, **__: Any) -> None:
-            return None
+            def include_router(self, *_: Any, **__: Any) -> None:
+                return None
 
-    APIRouter = _RouterStub  # type: ignore[assignment]
+        APIRouter = _RouterStub
 
 from prometheus_client import CollectorRegistry, Counter
 
 from services.common.security import require_admin_account
 
-if TYPE_CHECKING:
-    import httpx
+
+RouteFn = TypeVar("RouteFn", bound=Callable[..., Any])
+
+
+class _HttpxResponseProtocol(Protocol):
+    def json(self) -> Any:
+        ...
+
+    def raise_for_status(self) -> None:
+        ...
+
+
+class _HttpxClientProtocol(Protocol):
+    async def get(self, url: str) -> _HttpxResponseProtocol:
+        ...
+
+    async def aclose(self) -> None:
+        ...
+
+
+class _HttpxModule(Protocol):
+    AsyncClient: Callable[..., _HttpxClientProtocol]
+    TimeoutException: type[Exception]
+    HTTPStatusError: type[Exception]
+    RequestError: type[Exception]
+
+
+FetchResult = Awaitable[Sequence[Mapping[str, Any]]] | Sequence[Mapping[str, Any]]
+
+
+def _is_awaitable_fetch(result: FetchResult) -> TypeGuard[Awaitable[Sequence[Mapping[str, Any]]]]:
+    return inspect.isawaitable(result)
 
 _DEFAULT_ALERTMANAGER_URL = os.getenv("ALERTMANAGER_URL", "http://alertmanager:9093")
 _ALERT_ENDPOINT = "/api/v2/alerts"
 
 router = APIRouter(prefix="/alerts", tags=["alerts"])
+
+
+# Typed decorator helpers -------------------------------------------------
+
+
+def _router_get(*args: Any, **kwargs: Any) -> Callable[[RouteFn], RouteFn]:
+    return cast(Callable[[RouteFn], RouteFn], router.get(*args, **kwargs))
+
+
+def _app_on_event(application: FastAPI, event: str) -> Callable[[RouteFn], RouteFn]:
+    return cast(Callable[[RouteFn], RouteFn], application.on_event(event))
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +189,7 @@ class AlertDedupeMetrics:
         )
 
 
-FetchCallable = Callable[[], Awaitable[Sequence[Mapping[str, Any]]]] | Callable[[], Sequence[Mapping[str, Any]]]
+FetchCallable = Callable[[], FetchResult]
 
 
 class AlertDedupeService:
@@ -147,30 +207,31 @@ class AlertDedupeService:
         self.alertmanager_url = alertmanager_url.rstrip("/")
         self.policy = policy or AlertPolicy()
         self.metrics = metrics or AlertDedupeMetrics()
-        self._fetcher = fetcher
-        self._client: Optional["httpx.AsyncClient"] = None
+        self._fetcher: Optional[FetchCallable] = fetcher
+        self._client: Optional[_HttpxClientProtocol] = None
         self._group_states: Dict[Tuple[str, str, str], AlertGroupState] = {}
         self._alert_index: Dict[str, Tuple[str, str, str]] = {}
         self._lock = asyncio.Lock()
         self._http_timeout = float(http_timeout)
-        self._httpx_module: Optional[Any] = None
+        self._httpx_module: Optional[_HttpxModule] = None
 
     # ------------------------------------------------------------------
     # HTTP helpers
     # ------------------------------------------------------------------
-    def _ensure_httpx(self):
+    def _ensure_httpx(self) -> _HttpxModule:
         if self._httpx_module is not None:
             return self._httpx_module
 
         try:
-            import httpx
+            import httpx as httpx_module
         except ImportError as exc:  # pragma: no cover - optional dependency
             raise RuntimeError("httpx is required to fetch alerts from Alertmanager") from exc
 
-        self._httpx_module = httpx
-        return httpx
+        module = cast(_HttpxModule, httpx_module)
+        self._httpx_module = module
+        return module
 
-    async def _get_client(self):
+    async def _get_client(self) -> _HttpxClientProtocol:
         httpx = self._ensure_httpx()
 
         if self._client is None:
@@ -203,16 +264,19 @@ class AlertDedupeService:
         if not isinstance(payload, list):
             raise HTTPException(status_code=502, detail="Unexpected alert payload structure")
 
-        return payload
+        return cast(Sequence[Mapping[str, Any]], payload)
 
     async def _fetch_alerts(self) -> Sequence[Mapping[str, Any]]:
         if self._fetcher is None:
             return await self._default_fetch()
 
         result = self._fetcher()
-        if inspect.isawaitable(result):
-            result = await result  # type: ignore[assignment]
-        return list(result)
+        resolved: Sequence[Mapping[str, Any]]
+        if _is_awaitable_fetch(result):
+            resolved = await result
+        else:
+            resolved = cast(Sequence[Mapping[str, Any]], result)
+        return list(resolved)
 
     # ------------------------------------------------------------------
     # Alert ingestion
@@ -360,7 +424,7 @@ def get_alert_dedupe_service() -> AlertDedupeService:
         return _service
 
 
-@router.get("/active")
+@_router_get("/active")
 async def get_active_alerts(
     _: str = Depends(require_admin_account),
     service: AlertDedupeService = Depends(get_alert_dedupe_service),
@@ -368,7 +432,7 @@ async def get_active_alerts(
     return await service.refresh()
 
 
-@router.get("/policies")
+@_router_get("/policies")
 def get_alert_policies(
     _: str = Depends(require_admin_account),
     service: AlertDedupeService = Depends(get_alert_dedupe_service),
@@ -376,19 +440,19 @@ def get_alert_policies(
     return service.policies()
 
 
-def setup_alert_dedupe(app, alertmanager_url: Optional[str] = None) -> None:
+def setup_alert_dedupe(app: FastAPI, alertmanager_url: Optional[str] = None) -> None:
     """Bind lifecycle hooks for the dedupe service on a FastAPI app."""
 
     if not isinstance(app, FastAPI):  # pragma: no cover - defensive guard
         raise TypeError("setup_alert_dedupe expects a FastAPI application")
 
-    @app.on_event("startup")
+    @_app_on_event(app, "startup")
     async def _configure_dedupe() -> None:  # pragma: no cover - FastAPI lifecycle
         service = AlertDedupeService(alertmanager_url=alertmanager_url or _DEFAULT_ALERTMANAGER_URL)
         configure_alert_dedupe_service(service)
         app.state.alert_dedupe_service = service
 
-    @app.on_event("shutdown")
+    @_app_on_event(app, "shutdown")
     async def _shutdown_dedupe() -> None:  # pragma: no cover - FastAPI lifecycle
         service = get_alert_dedupe_service()
         await service.aclose()
