@@ -165,7 +165,6 @@ if _oms_spec is not None and _oms_spec.loader is not None:
     _oms_spec.loader.exec_module(_oms_module)
 
 pytest.importorskip("fastapi")
-from fastapi.testclient import TestClient
 
 import exchange_adapter
 from auth.service import InMemorySessionStore
