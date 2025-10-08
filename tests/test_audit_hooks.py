@@ -79,6 +79,7 @@ def test_log_event_skips_when_logger_missing():
     assert result.ip_hash is None
     assert result.hash_fallback is False
     assert result.hash_error is None
+    assert result.context_evaluated is False
     assert not result
 
 
@@ -104,6 +105,7 @@ def test_log_event_records_with_ip_hash():
     assert result.hash_fallback is False
     assert result.hash_error is None
     assert result.log_error is None
+    assert result.context_evaluated is False
     assert result
     assert calls == [
         {
@@ -139,6 +141,7 @@ def test_log_event_respects_explicit_ip_hash():
     assert result.ip_hash == "explicit-hash"
     assert result.hash_fallback is False
     assert result.hash_error is None
+    assert result.context_evaluated is False
 
 
 def test_audit_log_result_truthiness():
@@ -183,6 +186,7 @@ def test_log_event_with_fallback_logs_when_disabled(caplog: pytest.LogCaptureFix
     assert result.hash_error is None
     assert result.log_error is None
     assert result.context is None
+    assert result.context_evaluated is True
     assert not result
     record = next(record for record in caplog.records if record.message == "audit disabled")
     assert record.audit == {
@@ -223,6 +227,7 @@ def test_log_event_with_fallback_context_factory_skips_when_unused():
 
     assert result.handled is True
     assert result.context is None
+    assert result.context_evaluated is False
     assert factory_calls == []
 
 
@@ -258,6 +263,7 @@ def test_log_event_with_fallback_context_factory_failure_records_metadata(
     assert result.context is None
     assert isinstance(result.context_error, RuntimeError)
     assert str(result.context_error) == "context boom"
+    assert result.context_evaluated is True
 
     context_error_records = [
         record
@@ -306,6 +312,7 @@ def test_log_event_with_fallback_context_factory_used_for_fallback(
     assert result.handled is False
     assert factory_calls == [1]
     assert result.context == {"audit": {"source": "factory"}}
+    assert result.context_evaluated is True
     record = next(
         entry
         for entry in caplog.records
@@ -345,6 +352,7 @@ def test_log_audit_event_with_fallback_event_context_factory_skips_when_unused()
 
     assert result.handled is True
     assert result.context is None
+    assert result.context_evaluated is False
     assert factory_calls == []
 
 
@@ -380,6 +388,7 @@ def test_log_audit_event_with_fallback_event_context_factory_used_for_fallback(
     assert result.handled is False
     assert result.context == {"audit": {"source": "event"}}
     assert factory_calls == [1]
+    assert result.context_evaluated is True
     record = next(
         entry
         for entry in caplog.records
@@ -424,6 +433,7 @@ def test_log_audit_event_with_fallback_reuses_resolved_context(
     assert result.handled is False
     assert result.context == {"audit": {"source": "call-1"}}
     assert result.context_error is None
+    assert result.context_evaluated is True
     assert calls == [1]
     record = next(
         entry
@@ -870,6 +880,7 @@ def test_log_audit_event_with_fallback_uses_event_context(caplog: pytest.LogCapt
     assert result.handled is False
     assert result.context == {"request_id": "req-123"}
     assert result.context is not event.context
+    assert result.context_evaluated is True
     assert len(caplog.records) == 1
     record = caplog.records[0]
     assert record.message == "Audit logging disabled"

@@ -547,7 +547,17 @@ class AuditEvent:
 
 @dataclass(frozen=True)
 class AuditLogResult:
-    """Structured metadata describing the outcome of an audit logging attempt."""
+    """Structured metadata describing the outcome of an audit logging attempt.
+
+    The result exposes whether the optional audit dependency handled the
+    request as well as the resolved hash metadata used during logging.  When
+    fallback logging occurs the ``context`` field contains the structured
+    payload that was emitted (if any) alongside any factory errors captured in
+    ``context_error``.  ``context_evaluated`` signals whether fallback context
+    resolution completed—either because an eager mapping was already available,
+    the factory executed, or there was no factory to invoke—allowing callers to
+    detect when expensive context builders were triggered.
+    """
 
     handled: bool
     ip_hash: Optional[str]
@@ -556,6 +566,7 @@ class AuditLogResult:
     context: Optional[Mapping[str, Any]] = None
     log_error: Optional[Exception] = None
     context_error: Optional[Exception] = None
+    context_evaluated: bool = False
 
     def __bool__(self) -> bool:  # pragma: no cover - exercised implicitly via truthiness
         return self.handled
@@ -663,6 +674,7 @@ class AuditHooks:
                 ip_hash=resolved.value,
                 hash_fallback=resolved.fallback,
                 hash_error=resolved.error,
+                context_evaluated=False,
             )
 
         computed_resolved = False
@@ -709,6 +721,7 @@ class AuditHooks:
             ip_hash=resolved.value,
             hash_fallback=resolved.fallback,
             hash_error=resolved.error,
+            context_evaluated=False,
         )
 
 
@@ -929,7 +942,10 @@ def log_event_with_fallback(
     fallback logging.  The returned :class:`AuditLogResult` exposes the
     structured context mapping that was resolved for fallback logging when one
     is available, allowing callers to inspect the payload without re-evaluating
-    expensive factories.
+    expensive factories.  ``context_evaluated`` reflects whether context
+    resolution completed (for example because a factory ran, eager context was
+    available, or no factory was provided), enabling callers to detect when
+    deferred work was triggered.
     """
 
     resolved = resolved_ip_hash
@@ -1026,6 +1042,7 @@ def log_event_with_fallback(
             context=_snapshot_context_mapping(context_value, copy=True),
             log_error=exc,
             context_error=context_error,
+            context_evaluated=context_evaluated,
         )
 
     if not result.handled and disabled_message is not None:
@@ -1049,6 +1066,7 @@ def log_event_with_fallback(
         context=context_snapshot,
         log_error=result.log_error,
         context_error=result.context_error or context_error,
+        context_evaluated=result.context_evaluated or context_evaluated,
     )
 
 
