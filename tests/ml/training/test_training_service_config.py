@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 import importlib.util
 import sys
 from pathlib import Path
@@ -295,5 +296,33 @@ def test_training_service_normalises_relative_artifact_root(
         expected = (tmp_path / "artifacts" / "runs").resolve()
         assert module.DEFAULT_ARTIFACT_ROOT == expected  # type: ignore[attr-defined]
         assert expected.exists()
+    finally:
+        _dispose_training_module(module_name)
+
+
+def test_training_service_imports_without_pandas(monkeypatch: pytest.MonkeyPatch) -> None:
+    module_name = "tests.ml.training.training_service_without_pandas"
+    monkeypatch.setenv("TRAINING_TIMESCALE_URI", "sqlite:///./training.db")
+    monkeypatch.setenv("TRAINING_ALLOW_SQLITE_FOR_TESTS", "1")
+    monkeypatch.delitem(sys.modules, "pandas", raising=False)
+
+    real_import = builtins.__import__
+
+    def _guarded_import(
+        name: str,
+        globals: object | None = None,
+        locals: object | None = None,
+        fromlist: tuple[str, ...] = (),
+        level: int = 0,
+    ):
+        if name == "pandas" or name.startswith("pandas."):
+            raise ModuleNotFoundError("No module named 'pandas'")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", _guarded_import)
+
+    module = _load_training_module(module_name)
+    try:
+        assert module is not None
     finally:
         _dispose_training_module(module_name)

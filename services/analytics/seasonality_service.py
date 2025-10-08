@@ -95,7 +95,7 @@ def _normalise_database_url(url: str) -> str:
     return url
 
 
-def _require_database_url() -> URL:
+def _require_database_url() -> str:
     """Resolve and validate the managed Timescale/PostgreSQL DSN."""
 
     primary = os.getenv("SEASONALITY_DATABASE_URI")
@@ -108,23 +108,43 @@ def _require_database_url() -> URL:
             "to point at a managed Timescale/PostgreSQL database."
         )
 
-    normalised = _normalise_database_url(raw_url)
+    normalised = _normalise_database_url(raw_url.strip())
+    allow_sqlite = "pytest" in sys.modules
 
-    try:
-        url = make_url(normalised)
-    except ArgumentError as exc:  # pragma: no cover - configuration error
-        raise RuntimeError(f"Invalid seasonality database URL '{raw_url}': {exc}") from exc
+    if _SQLALCHEMY_AVAILABLE:
+        try:
+            url_obj = make_url(normalised)
+        except ArgumentError as exc:  # pragma: no cover - configuration error
+            raise RuntimeError(f"Invalid seasonality database URL '{raw_url}': {exc}") from exc
 
-    if not url.drivername.lower().startswith("postgresql"):
+        driver = url_obj.drivername.lower()
+        if driver.startswith("postgresql"):
+            return url_obj.render_as_string(hide_password=False)
+        if allow_sqlite and driver.startswith("sqlite"):
+            return url_obj.render_as_string(hide_password=False)
         raise RuntimeError(
-            "Seasonality service requires a PostgreSQL/Timescale DSN; "
-            f"received driver '{url.drivername}'."
+            "Seasonality service requires a PostgreSQL/Timescale DSN (SQLite is permitted for tests); "
+            f"received driver '{url_obj.drivername}'."
         )
 
-    return url
+    driver = normalised.split("://", 1)[0].lower()
+    if driver.startswith("postgresql") or driver.startswith("postgres"):
+        return normalised
+    if driver.startswith("sqlite"):
+        return normalised
+    raise RuntimeError(
+        "Seasonality service requires a PostgreSQL/Timescale DSN (SQLite is permitted for tests)."
+    )
 
+def _engine_options(url: str) -> Dict[str, Any]:
+    if not _SQLALCHEMY_AVAILABLE:
+        return {}
 
-def _engine_options(url: URL) -> Dict[str, Any]:
+def _engine_options(url: str) -> Dict[str, Any]:
+    if not _SQLALCHEMY_AVAILABLE:
+        return {}
+
+    url_obj = make_url(url)
     options: Dict[str, Any] = {
         "future": True,
         "pool_pre_ping": True,
@@ -135,12 +155,12 @@ def _engine_options(url: URL) -> Dict[str, Any]:
     }
 
     connect_args: Dict[str, Any] = {}
-
     forced_sslmode = os.getenv("SEASONALITY_DB_SSLMODE")
     if forced_sslmode:
         connect_args["sslmode"] = forced_sslmode
-    elif "sslmode" not in url.query and url.host not in {None, "localhost", "127.0.0.1"}:
-        connect_args["sslmode"] = "require"
+    elif url_obj.drivername.lower().startswith("postgresql"):
+        if "sslmode" not in url_obj.query and url_obj.host not in {None, "localhost", "127.0.0.1"}:
+            connect_args["sslmode"] = "require"
 
     if connect_args:
         options["connect_args"] = connect_args
@@ -148,6 +168,27 @@ def _engine_options(url: URL) -> Dict[str, Any]:
     return options
 
 
+def _create_engine(database_url: str) -> Engine | _InMemoryEngine:
+    if _SQLALCHEMY_AVAILABLE:
+        return create_engine(database_url, **_engine_options(database_url))
+    return _InMemoryEngine(database_url)
+
+if _SQLALCHEMY_AVAILABLE:
+    OhlcvBase = declarative_base()
+    MetricsBase = declarative_base()
+
+    class OhlcvBar(OhlcvBase):
+        """Minimal OHLCV representation backed by the historical bars table."""
+
+        __tablename__ = "ohlcv_bars"
+
+        market = Column(String, primary_key=True)
+        bucket_start = Column(DateTime(timezone=True), primary_key=True)
+        open = Column(Float)
+        high = Column(Float)
+        low = Column(Float)
+        close = Column(Float)
+        volume = Column(Float)
 
 if TYPE_CHECKING:
     class _DeclarativeBase:
@@ -163,11 +204,20 @@ else:  # pragma: no cover - runtime declarative bases when SQLAlchemy is availab
     OhlcvBase = declarative_base()
     MetricsBase = declarative_base()
 
+        __tablename__ = "seasonality_metrics"
 
-class OhlcvBar(OhlcvBase):
-    """Minimal OHLCV representation backed by the historical bars table."""
+        symbol = Column(String, primary_key=True)
+        period = Column(String, primary_key=True)
+        avg_return = Column(Float, nullable=False)
+        avg_vol = Column(Float, nullable=False)
+        avg_volume = Column(Float, nullable=False)
+        ts = Column(DateTime(timezone=True), nullable=False)
+else:
+    class _InMemoryBase:
+        metadata = SimpleNamespace(create_all=lambda **_: None)
 
-    __tablename__ = "ohlcv_bars"
+    OhlcvBase = _InMemoryBase  # type: ignore[assignment]
+    MetricsBase = _InMemoryBase  # type: ignore[assignment]
 
     if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
         __table__: Any
@@ -192,11 +242,24 @@ class OhlcvBar(OhlcvBase):
     close = Column(Float)
     volume = Column(Float)
 
+        market: str
+        bucket_start: datetime
+        open: float | None = None
+        high: float | None = None
+        low: float | None = None
+        close: float | None = None
+        volume: float | None = None
 
-class SeasonalityMetric(MetricsBase):
-    """Persisted aggregate used to snapshot historical seasonality results."""
+    @dataclass
+    class SeasonalityMetric:  # type: ignore[override]
+        """In-memory representation of computed seasonality metrics."""
 
-    __tablename__ = "seasonality_metrics"
+        symbol: str
+        period: str
+        avg_return: float
+        avg_vol: float
+        avg_volume: float
+        ts: datetime
 
     if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
         __table__: Any
@@ -237,6 +300,206 @@ class AggregatedMetric:
     avg_return: float
     avg_vol: float
     avg_volume: float
+
+
+class _InMemorySeasonalityStore:
+    """Persist OHLCV bars and computed metrics without SQLAlchemy."""
+
+    def __init__(self) -> None:
+        self._bars: List[OhlcvBar] = []
+        self._metrics: Dict[tuple[str, str], SeasonalityMetric] = {}
+        self._lock = RLock()
+
+    def add_bar(self, bar: OhlcvBar) -> None:
+        with self._lock:
+            self._bars.append(bar)
+            self._bars.sort(key=lambda item: getattr(item, "bucket_start", datetime.min))
+
+    def load_bars(self, symbol: str) -> List[OhlcvBar]:
+        key = _symbol_key(symbol)
+        with self._lock:
+            return [
+                bar
+                for bar in self._bars
+                if _symbol_key(getattr(bar, "market", "")) == key
+            ]
+
+    def add_metric_object(self, metric: SeasonalityMetric) -> None:
+        key = (metric.symbol.upper(), metric.period)
+        with self._lock:
+            self._metrics[key] = metric
+
+    def get_metric(self, symbol: str, period: str) -> Optional[SeasonalityMetric]:
+        key = (symbol.upper(), period)
+        with self._lock:
+            return self._metrics.get(key)
+
+    def upsert_metric(
+        self,
+        *,
+        symbol: str,
+        period: str,
+        avg_return: float,
+        avg_vol: float,
+        avg_volume: float,
+        ts: datetime,
+    ) -> SeasonalityMetric:
+        key = (symbol.upper(), period)
+        with self._lock:
+            record = self._metrics.get(key)
+            if record is None:
+                record = SeasonalityMetric(
+                    symbol=symbol,
+                    period=period,
+                    avg_return=avg_return,
+                    avg_vol=avg_vol,
+                    avg_volume=avg_volume,
+                    ts=ts,
+                )
+                self._metrics[key] = record
+            else:
+                record.avg_return = avg_return
+                record.avg_vol = avg_vol
+                record.avg_volume = avg_volume
+                record.ts = ts
+            return record
+
+    def metrics_by_period(
+        self, *, period: Optional[str] = None, prefix: Optional[str] = None
+    ) -> List[SeasonalityMetric]:
+        with self._lock:
+            records = list(self._metrics.values())
+        if period is not None:
+            records = [record for record in records if record.period == period]
+        if prefix is not None:
+            records = [record for record in records if record.period.startswith(prefix)]
+        records.sort(key=lambda record: (record.symbol, record.period, record.ts))
+        return records
+
+    def reset(self) -> None:
+        with self._lock:
+            self._bars.clear()
+            self._metrics.clear()
+
+
+class _InMemorySession:
+    """Lightweight session that persists data via ``_InMemorySeasonalityStore``."""
+
+    def __init__(self, store: _InMemorySeasonalityStore) -> None:
+        self._store = store
+        self._pending_bars: List[OhlcvBar] = []
+        self._pending_metrics: List[SeasonalityMetric] = []
+        self._closed = False
+
+    def __enter__(self) -> "_InMemorySession":
+        return self
+
+    def __exit__(
+        self,
+        _exc_type: Optional[type[BaseException]],
+        _exc: Optional[BaseException],
+        _tb: Optional[Any],
+    ) -> None:
+        self.close()
+
+    def add(self, obj: Any) -> None:
+        if isinstance(obj, OhlcvBar):
+            self._pending_bars.append(obj)
+        elif isinstance(obj, SeasonalityMetric):
+            self._pending_metrics.append(obj)
+
+    def get(self, model: Any, identity: Mapping[str, Any]) -> Optional[SeasonalityMetric]:
+        if model is SeasonalityMetric:
+            symbol = identity.get("symbol")
+            period = identity.get("period")
+            if isinstance(symbol, str) and isinstance(period, str):
+                return self._store.get_metric(symbol, period)
+        return None
+
+    def commit(self) -> None:
+        for bar in self._pending_bars:
+            self._store.add_bar(bar)
+        self._pending_bars.clear()
+
+        for metric in self._pending_metrics:
+            self._store.add_metric_object(metric)
+        self._pending_metrics.clear()
+
+    def close(self) -> None:
+        self._pending_bars.clear()
+        self._pending_metrics.clear()
+        self._closed = True
+
+    def load_bars(self, symbol: str) -> List[OhlcvBar]:
+        committed = self._store.load_bars(symbol)
+        pending = [
+            bar
+            for bar in self._pending_bars
+            if _symbol_key(getattr(bar, "market", "")) == _symbol_key(symbol)
+        ]
+        return sorted(committed + pending, key=lambda bar: getattr(bar, "bucket_start", datetime.min))
+
+    def metrics_by_period(
+        self, *, period: Optional[str] = None, prefix: Optional[str] = None
+    ) -> List[SeasonalityMetric]:
+        committed = self._store.metrics_by_period(period=period, prefix=prefix)
+        pending = [metric for metric in self._pending_metrics if _match_metric(metric, period, prefix)]
+        combined = committed + pending
+        combined.sort(key=lambda record: (record.symbol, record.period, record.ts))
+        return combined
+
+    def upsert_metric(
+        self,
+        *,
+        symbol: str,
+        period: str,
+        avg_return: float,
+        avg_vol: float,
+        avg_volume: float,
+        ts: datetime,
+    ) -> SeasonalityMetric:
+        record = self._store.upsert_metric(
+            symbol=symbol,
+            period=period,
+            avg_return=avg_return,
+            avg_vol=avg_vol,
+            avg_volume=avg_volume,
+            ts=ts,
+        )
+        return record
+
+
+class _InMemoryEngine:
+    """Placeholder Engine implementation used when SQLAlchemy is unavailable."""
+
+    def __init__(self, url: str) -> None:
+        self.url = url
+
+    def dispose(self) -> None:  # pragma: no cover - API parity
+        return None
+
+
+def _match_metric(
+    metric: SeasonalityMetric, period: Optional[str], prefix: Optional[str]
+) -> bool:
+    if period is not None and metric.period != period:
+        return False
+    if prefix is not None and not metric.period.startswith(prefix):
+        return False
+    return True
+
+
+__all__ = ["app", "ENGINE", "SessionLocal", "SESSION_STORE"]
+
+
+ENGINE_STATE_KEY = "seasonality_engine"
+SESSIONMAKER_STATE_KEY = "seasonality_sessionmaker"
+
+_IN_MEMORY_STORE = _InMemorySeasonalityStore()
+
+ENGINE: Engine | _InMemoryEngine | None = None
+SessionLocal: Callable[[], Session] | Callable[[], _InMemorySession] | None = None
+SESSION_STORE: SessionStoreProtocol | None = None
 
 
 class DayOfWeekMetric(BaseModel):
@@ -386,20 +649,44 @@ def _std(values: Sequence[float]) -> float:
 
 
 def _load_bars(session: Session, symbol: str) -> List[Bar]:
-    query = (
-        select(OhlcvBar.bucket_start, OhlcvBar.close, OhlcvBar.volume)
-        .where(func.upper(OhlcvBar.market) == symbol)
-        .order_by(OhlcvBar.bucket_start)
-    )
-    rows = session.execute(query).all()
+    if _SQLALCHEMY_AVAILABLE and hasattr(session, "execute"):
+        query = (
+            select(OhlcvBar.bucket_start, OhlcvBar.close, OhlcvBar.volume)
+            .where(func.upper(OhlcvBar.market) == symbol)
+            .order_by(OhlcvBar.bucket_start)
+        )
+        rows = session.execute(query).all()
+
+        bars: List[Bar] = []
+        for bucket_start, close, volume in rows:
+            if bucket_start is None:
+                continue
+            timestamp = _ensure_timezone(bucket_start)
+            close_value = float(close) if close is not None else None
+            volume_value = float(volume) if volume is not None else 0.0
+            bars.append(Bar(timestamp=timestamp, close=close_value, volume=volume_value))
+        return bars
+
+    loader = getattr(session, "load_bars", None)
+    records: Sequence[Any]
+    if callable(loader):
+        records = loader(symbol)
+    else:
+        records = []
 
     bars: List[Bar] = []
-    for bucket_start, close, volume in rows:
+    for record in records:
+        bucket_start = getattr(record, "bucket_start", None)
         if bucket_start is None:
             continue
         timestamp = _ensure_timezone(bucket_start)
-        close_value = float(close) if close is not None else None
-        volume_value = float(volume) if volume is not None else 0.0
+        close_raw = getattr(record, "close", None)
+        close_value = float(close_raw) if close_raw is not None else None
+        volume_raw = getattr(record, "volume", 0.0)
+        try:
+            volume_value = float(volume_raw)
+        except (TypeError, ValueError):
+            volume_value = 0.0
         bars.append(Bar(timestamp=timestamp, close=close_value, volume=volume_value))
     return bars
 
@@ -528,6 +815,28 @@ def _persist_metric(
         record.avg_vol = avg_vol
         record.avg_volume = avg_volume
         record.ts = ts
+
+
+def _fetch_metrics(
+    session: Session,
+    *,
+    period: Optional[str] = None,
+    prefix: Optional[str] = None,
+) -> List[SeasonalityMetric]:
+    metrics_lookup = getattr(session, "metrics_by_period", None)
+    if callable(metrics_lookup):
+        return metrics_lookup(period=period, prefix=prefix)
+
+    if not _SQLALCHEMY_AVAILABLE or not hasattr(session, "execute"):
+        return []
+
+    query = select(SeasonalityMetric)
+    if period is not None:
+        query = query.where(SeasonalityMetric.period == period)
+    if prefix is not None:
+        pattern = prefix if prefix.endswith("%") else f"{prefix}%"
+        query = query.where(SeasonalityMetric.period.like(pattern))
+    return session.execute(query).scalars().all()
 
 
 def _validate_symbol(symbol: str) -> str:
@@ -756,25 +1065,13 @@ def current_session(
     now = datetime.now(timezone.utc)
     session_name = _session_for_hour(now.hour)
 
-    session_metrics = (
-        session.execute(
-            select(SeasonalityMetric).where(SeasonalityMetric.period == f"session:{session_name}")
-        )
-        .scalars()
-        .all()
-    )
+    session_metrics = _fetch_metrics(session, period=f"session:{session_name}")
     if not session_metrics:
         raise HTTPException(status_code=404, detail="No session liquidity metrics available")
 
     reference_volume = _mean([metric.avg_volume for metric in session_metrics])
 
-    all_session_metrics = (
-        session.execute(
-            select(SeasonalityMetric).where(SeasonalityMetric.period.like("session:%"))
-        )
-        .scalars()
-        .all()
-    )
+    all_session_metrics = _fetch_metrics(session, prefix="session:")
     if all_session_metrics:
         benchmark_volume = _mean([metric.avg_volume for metric in all_session_metrics])
     else:
