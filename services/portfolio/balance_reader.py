@@ -7,7 +7,7 @@ import logging
 import math
 import os
 from dataclasses import dataclass
-from typing import Any, Mapping, MutableMapping, Optional
+from typing import Any, Iterable, Mapping, MutableMapping, Optional
 
 import httpx
 
@@ -155,10 +155,11 @@ class BalanceReader:
     @staticmethod
     def _discover_stablecoins(monitor: StablecoinMonitor) -> set[str]:
         assets: set[str] = set()
-        try:
-            symbols = getattr(monitor, "config").monitored_symbols  # type: ignore[attr-defined]
-        except AttributeError:  # pragma: no cover - defensive guard
-            symbols = ()
+        config = getattr(monitor, "config", None)
+        if config is None:  # pragma: no cover - defensive guard
+            symbols: Iterable[Any] = ()
+        else:
+            symbols = getattr(config, "monitored_symbols", ())
         for symbol in symbols:
             if not isinstance(symbol, str):
                 continue

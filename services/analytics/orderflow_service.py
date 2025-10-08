@@ -19,7 +19,7 @@ import sys
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from threading import Lock
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query
 
@@ -40,13 +40,16 @@ from services.common.security import require_admin_account
 from shared.session_config import load_session_ttl_minutes
 from services.common.spot import require_spot_http
 from shared.postgres import normalize_sqlalchemy_dsn
+from shared.psycopg_compat import (
+    PsycopgConnection,
+    PsycopgModule,
+    SqlModule,
+    load_psycopg,
+)
 
-try:  # pragma: no cover - optional dependency during CI
-    import psycopg
-    from psycopg import sql
-except Exception:  # pragma: no cover - gracefully degrade without psycopg
-    psycopg = None  # type: ignore
-    sql = None  # type: ignore
+psycopg: PsycopgModule | None
+sql: SqlModule | None
+psycopg, sql = load_psycopg()
 
 
 LOGGER = logging.getLogger(__name__)
@@ -272,7 +275,7 @@ class OrderflowMetricsStore:
             )
             self._append_memory(record)
 
-    def _ensure_schema(self, conn: "psycopg.Connection[Any]", schema: str) -> None:
+    def _ensure_schema(self, conn: PsycopgConnection, schema: str) -> None:
         assert sql is not None  # nosec - guarded by caller
         with self._lock:
             if schema in self._initialized:
