@@ -631,6 +631,75 @@ def test_log_audit_event_with_fallback_resolved_context_error_logged_once(
     }
 
 
+def test_log_audit_event_with_fallback_accepts_resolved_metadata_bundle():
+    hash_calls = {"count": 0}
+    context_calls = {"count": 0}
+    fallback_extra_calls = {"count": 0}
+    captured: List[Mapping[str, Any]] = []
+
+    def tracking_hash(value: Optional[str]) -> Optional[str]:
+        hash_calls["count"] += 1
+        return f"hash:{value}"
+
+    def fake_log(**payload):
+        captured.append(payload)
+
+    def context_factory() -> Mapping[str, str]:
+        context_calls["count"] += 1
+        return {"source": f"context-{context_calls['count']}"}
+
+    def fallback_extra_factory() -> Mapping[str, str]:
+        fallback_extra_calls["count"] += 1
+        return {"extra": f"fallback-{fallback_extra_calls['count']}"}
+
+    hooks = audit_hooks.AuditHooks(log=fake_log, hash_ip=tracking_hash)
+    logger = logging.getLogger("test.audit.event_metadata")
+
+    event = audit_hooks.AuditEvent(
+        actor="nina",
+        action="demo.event.metadata.bundle",
+        entity="resource",
+        before={"before": True},
+        after={"after": True},
+        ip_address="198.51.100.21",
+        context_factory=context_factory,
+        fallback_extra_factory=fallback_extra_factory,
+    )
+
+    updated_event, metadata = event.ensure_resolved_all_metadata_bundle(hooks)
+
+    assert hash_calls == {"count": 1}
+    assert context_calls == {"count": 1}
+    assert fallback_extra_calls == {"count": 1}
+
+    result = audit_hooks.log_audit_event_with_fallback(
+        hooks,
+        logger,
+        updated_event,
+        failure_message="should not trigger",
+        resolved_metadata=metadata,
+    )
+
+    assert result.handled is True
+    assert result.ip_hash == "hash:198.51.100.21"
+    assert result.fallback_logged is False
+    assert result.context == {"source": "context-1"}
+    assert result.fallback_extra is None
+    assert hash_calls == {"count": 1}
+    assert context_calls == {"count": 1}
+    assert fallback_extra_calls == {"count": 1}
+    assert captured == [
+        {
+            "actor": "nina",
+            "action": "demo.event.metadata.bundle",
+            "entity": "resource",
+            "before": {"before": True},
+            "after": {"after": True},
+            "ip_hash": "hash:198.51.100.21",
+        }
+    ]
+
+
 def test_log_event_with_fallback_handles_exceptions(caplog: pytest.LogCaptureFixture):
     def failing_log(**payload):
         raise RuntimeError("boom")
@@ -859,6 +928,81 @@ def test_log_event_with_fallback_accepts_pre_resolved_hash(caplog: pytest.LogCap
         }
     ]
     assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+
+
+def test_log_event_with_fallback_accepts_resolved_metadata_bundle():
+    hash_calls = {"count": 0}
+    context_calls = {"count": 0}
+    fallback_extra_calls = {"count": 0}
+    captured: List[Mapping[str, Any]] = []
+
+    def tracking_hash(value: Optional[str]) -> Optional[str]:
+        hash_calls["count"] += 1
+        return f"hash:{value}"
+
+    def fake_log(**payload):
+        captured.append(payload)
+
+    def context_factory() -> Mapping[str, str]:
+        context_calls["count"] += 1
+        return {"source": f"context-{context_calls['count']}"}
+
+    def fallback_extra_factory() -> Mapping[str, str]:
+        fallback_extra_calls["count"] += 1
+        return {"extra": f"fallback-{fallback_extra_calls['count']}"}
+
+    hooks = audit_hooks.AuditHooks(log=fake_log, hash_ip=tracking_hash)
+    logger = logging.getLogger("test.audit.resolved_metadata")
+
+    event = audit_hooks.AuditEvent(
+        actor="mira",
+        action="demo.metadata.bundle",
+        entity="resource",
+        before={"before": True},
+        after={"after": True},
+        ip_address="198.51.100.20",
+        context_factory=context_factory,
+        fallback_extra_factory=fallback_extra_factory,
+    )
+
+    updated_event, metadata = event.ensure_resolved_all_metadata_bundle(hooks)
+
+    assert hash_calls == {"count": 1}
+    assert context_calls == {"count": 1}
+    assert fallback_extra_calls == {"count": 1}
+
+    result = audit_hooks.log_event_with_fallback(
+        hooks,
+        logger,
+        actor=updated_event.actor,
+        action=updated_event.action,
+        entity=updated_event.entity,
+        before=updated_event.before,
+        after=updated_event.after,
+        ip_address=updated_event.ip_address,
+        ip_hash=updated_event.ip_hash,
+        failure_message="should not trigger",
+        resolved_metadata=metadata,
+    )
+
+    assert result.handled is True
+    assert result.ip_hash == "hash:198.51.100.20"
+    assert result.fallback_logged is False
+    assert result.context == {"source": "context-1"}
+    assert result.fallback_extra is None
+    assert hash_calls == {"count": 1}
+    assert context_calls == {"count": 1}
+    assert fallback_extra_calls == {"count": 1}
+    assert captured == [
+        {
+            "actor": "mira",
+            "action": "demo.metadata.bundle",
+            "entity": "resource",
+            "before": {"before": True},
+            "after": {"after": True},
+            "ip_hash": "hash:198.51.100.20",
+        }
+    ]
 
 
 def test_log_event_falls_back_when_hash_raises(caplog: pytest.LogCaptureFixture):
@@ -1411,6 +1555,7 @@ def test_audit_event_log_with_fallback_method_delegates(monkeypatch):
         "disabled_level": logging.INFO,
         "context": {"request_id": "abc"},
         "context_factory": None,
+        "resolved_metadata": None,
         "resolved_ip_hash": None,
         "resolved_context": None,
         "fallback_extra": fallback_extra,
@@ -1687,6 +1832,67 @@ def test_audit_event_log_with_fallback_forwards_resolved_fallback_extra(monkeypa
     assert captured["kwargs"]["fallback_extra"] is None
     assert captured["kwargs"]["fallback_extra_factory"] is fallback_extra_factory
     assert factory_calls == ["called"]
+
+
+def test_audit_event_log_with_fallback_accepts_resolved_metadata_bundle(monkeypatch):
+    hooks = audit_hooks.AuditHooks(log=lambda **kwargs: kwargs, hash_ip=lambda value: f"hash:{value}")
+    logger = logging.getLogger("tests.audit.event_resolved_metadata")
+
+    context_calls = {"count": 0}
+    fallback_extra_calls = {"count": 0}
+
+    def context_factory() -> Mapping[str, int]:
+        context_calls["count"] += 1
+        return {"ctx": context_calls["count"]}
+
+    def fallback_extra_factory() -> Mapping[str, int]:
+        fallback_extra_calls["count"] += 1
+        return {"extra": fallback_extra_calls["count"]}
+
+    event = audit_hooks.AuditEvent(
+        actor="paz",
+        action="demo.event.resolved_metadata",
+        entity="resource",
+        before={"before": True},
+        after={"after": True},
+        ip_address="198.51.100.22",
+        context_factory=context_factory,
+        fallback_extra_factory=fallback_extra_factory,
+    )
+
+    updated_event, metadata = event.ensure_resolved_all_metadata_bundle(hooks)
+    assert context_calls == {"count": 1}
+    assert fallback_extra_calls == {"count": 1}
+
+    expected = audit_hooks.AuditLogResult(
+        handled=True,
+        ip_hash="hash:198.51.100.22",
+        hash_fallback=False,
+        hash_error=None,
+        fallback_logged=False,
+    )
+    captured: dict[str, object] = {}
+
+    def fake_helper(*args: object, **kwargs: object) -> audit_hooks.AuditLogResult:
+        captured["kwargs"] = kwargs
+        return expected
+
+    monkeypatch.setattr(audit_hooks, "log_audit_event_with_fallback", fake_helper)
+
+    result = updated_event.log_with_fallback(
+        hooks,
+        logger,
+        failure_message="failure",
+        resolved_metadata=metadata,
+    )
+
+    assert result is expected
+    assert captured["kwargs"]["resolved_metadata"] is metadata
+    assert captured["kwargs"]["resolved_ip_hash"] is None
+    assert captured["kwargs"]["resolved_context"] is None
+    assert captured["kwargs"]["resolved_fallback_extra"] is None
+    assert context_calls == {"count": 1}
+    assert fallback_extra_calls == {"count": 1}
 
 
 def test_resolve_ip_hash_prefers_explicit_hash():
@@ -3248,6 +3454,82 @@ def test_audit_event_ensure_resolved_all_metadata_honours_drop_and_failure_flags
     assert resolved_fallback_extra.evaluated is True
     assert context_calls == {"count": 1}
     assert fallback_extra_calls == {"count": 1}
+
+
+def test_audit_event_ensure_resolved_all_metadata_bundle_returns_reusable_metadata():
+    hash_calls = {"count": 0}
+    context_calls = {"count": 0}
+    fallback_extra_calls = {"count": 0}
+
+    def tracking_hash(value: Optional[str]) -> Optional[str]:
+        hash_calls["count"] += 1
+        return f"hashed:{value}"
+
+    def context_factory() -> Mapping[str, int]:
+        context_calls["count"] += 1
+        return {"context_calls": context_calls["count"]}
+
+    def fallback_extra_factory() -> Mapping[str, int]:
+        fallback_extra_calls["count"] += 1
+        return {"extra_calls": fallback_extra_calls["count"]}
+
+    hooks = audit_hooks.AuditHooks(log=None, hash_ip=tracking_hash)
+
+    event = audit_hooks.AuditEvent(
+        actor="yuki",
+        action="demo.ensure.bundle",
+        entity="resource",
+        before={},
+        after={},
+        ip_address="203.0.113.50",
+        context_factory=context_factory,
+        fallback_extra_factory=fallback_extra_factory,
+    )
+
+    updated_event, metadata = event.ensure_resolved_all_metadata_bundle(hooks)
+
+    assert updated_event.ip_hash == "hashed:203.0.113.50"
+    assert updated_event.context == {"context_calls": 1}
+    assert updated_event.fallback_extra == {"extra_calls": 1}
+    assert isinstance(metadata, audit_hooks.ResolvedAuditMetadata)
+    assert metadata.ip_hash.value == "hashed:203.0.113.50"
+    assert metadata.ip_hash.fallback is False
+    assert metadata.context.value == {"context_calls": 1}
+    assert metadata.context.evaluated is True
+    assert metadata.context.error is None
+    assert metadata.fallback_extra is not None
+    assert metadata.fallback_extra.value == {"extra_calls": 1}
+    assert metadata.fallback_extra.evaluated is True
+    assert metadata.fallback_extra.error is None
+    assert hash_calls == {"count": 1}
+    assert context_calls == {"count": 1}
+    assert fallback_extra_calls == {"count": 1}
+
+    extra_calls = {"count": 0}
+
+    def optional_fallback_extra() -> Mapping[str, str]:
+        extra_calls["count"] += 1
+        return {"evaluations": str(extra_calls["count"])}
+
+    optional_event = audit_hooks.AuditEvent(
+        actor="yuki",
+        action="demo.ensure.bundle.optional",
+        entity="resource",
+        before={},
+        after={},
+        ip_address="203.0.113.51",
+        context_factory=context_factory,
+        fallback_extra_factory=optional_fallback_extra,
+    )
+
+    optional_updated, optional_metadata = optional_event.ensure_resolved_all_metadata_bundle(
+        hooks,
+        include_fallback_extra=False,
+    )
+
+    assert optional_updated.fallback_extra is None
+    assert optional_metadata.fallback_extra is None
+    assert extra_calls == {"count": 0}
 
 
 def test_audit_event_resolve_ip_hash_preserves_fallback_metadata():

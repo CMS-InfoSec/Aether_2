@@ -377,6 +377,62 @@ class AuditEvent:
             resolved_fallback_extra,
         )
 
+    def ensure_resolved_all_metadata_bundle(
+        self,
+        hooks: "AuditHooks",
+        *,
+        drop_ip_address: bool = False,
+        use_context_factory: bool = True,
+        drop_context_factory: bool = False,
+        refresh_context: bool = False,
+        include_fallback_extra: bool = True,
+        use_fallback_extra_factory: bool = True,
+        drop_fallback_extra_factory: bool = False,
+        drop_fallback_extra: bool = False,
+        refresh_fallback_extra: bool = False,
+    ) -> tuple["AuditEvent", "ResolvedAuditMetadata"]:
+        """Return an updated event with bundled resolved audit metadata."""
+
+        if include_fallback_extra:
+            (
+                updated_event,
+                resolved_hash,
+                resolved_context,
+                resolved_fallback_extra,
+            ) = self.ensure_resolved_all_metadata(
+                hooks,
+                drop_ip_address=drop_ip_address,
+                use_context_factory=use_context_factory,
+                drop_context_factory=drop_context_factory,
+                refresh_context=refresh_context,
+                use_fallback_extra_factory=use_fallback_extra_factory,
+                drop_fallback_extra_factory=drop_fallback_extra_factory,
+                drop_fallback_extra=drop_fallback_extra,
+                refresh_fallback_extra=refresh_fallback_extra,
+            )
+        else:
+            (
+                updated_event,
+                resolved_hash,
+                resolved_context,
+            ) = self.ensure_resolved_metadata(
+                hooks,
+                drop_ip_address=drop_ip_address,
+                use_context_factory=use_context_factory,
+                drop_context_factory=drop_context_factory,
+                refresh_context=refresh_context,
+            )
+            resolved_fallback_extra = None
+
+        return (
+            updated_event,
+            ResolvedAuditMetadata(
+                ip_hash=resolved_hash,
+                context=resolved_context,
+                fallback_extra=resolved_fallback_extra,
+            ),
+        )
+
     def log_with_fallback(
         self,
         hooks: "AuditHooks",
@@ -387,6 +443,7 @@ class AuditEvent:
         disabled_level: int = logging.DEBUG,
         context: Optional[Mapping[str, Any]] | object = _EVENT_CONTEXT_SENTINEL,
         context_factory: ContextFactory | None = None,
+        resolved_metadata: "ResolvedAuditMetadata" | None = None,
         resolved_ip_hash: "ResolvedIpHash" | None = None,
         resolved_context: "ResolvedContext" | None = None,
         fallback_extra: Optional[Mapping[str, Any]] | object = _EVENT_FALLBACK_EXTRA_SENTINEL,
@@ -398,8 +455,11 @@ class AuditEvent:
         Callers may override the structured fallback context by supplying a
         mapping via ``context`` or defer construction entirely with
         ``context_factory``.  When neither argument is provided the event's
-        stored ``context`` or ``context_factory`` is reused.  Additional
-        structured metadata for fallback logging can be supplied via
+        stored ``context`` or ``context_factory`` is reused.  When callers have
+        already resolved metadata via :meth:`ensure_resolved_all_metadata_bundle`
+        the resulting :class:`ResolvedAuditMetadata` can be supplied through
+        ``resolved_metadata`` to avoid recomputing hash, context, or fallback
+        extra state.  Additional structured metadata for fallback logging can be supplied via
         ``fallback_extra`` without mutating the event payload, allowing callers
         to attach correlation identifiers or request details to disabled/error
         log entries.  Lazy metadata builders can be supplied via
@@ -438,6 +498,7 @@ class AuditEvent:
             disabled_level=disabled_level,
             context=context_mapping,
             context_factory=effective_factory,
+            resolved_metadata=resolved_metadata,
             resolved_ip_hash=resolved_ip_hash,
             resolved_context=resolved_context,
             fallback_extra=fallback_extra_mapping,
@@ -1020,6 +1081,25 @@ class ResolvedFallbackExtra:
     evaluated: bool
 
 
+@dataclass(frozen=True)
+class ResolvedAuditMetadata:
+    """Bundle of resolved audit metadata for reuse across logging helpers."""
+
+    ip_hash: "ResolvedIpHash"
+    context: "ResolvedContext"
+    fallback_extra: "ResolvedFallbackExtra" | None = None
+
+    def with_fallback_extra(
+        self, fallback_extra: "ResolvedFallbackExtra" | None
+    ) -> "ResolvedAuditMetadata":
+        """Return a copy of the bundle with updated fallback extra metadata."""
+
+        if fallback_extra is self.fallback_extra:
+            return self
+
+        return replace(self, fallback_extra=fallback_extra)
+
+
 LOGGER = logging.getLogger("shared.audit_hooks")
 
 
@@ -1392,6 +1472,7 @@ def log_event_with_fallback(
     disabled_level: int = logging.DEBUG,
     context: Optional[Mapping[str, Any]] = None,
     context_factory: ContextFactory | None = None,
+    resolved_metadata: "ResolvedAuditMetadata" | None = None,
     resolved_ip_hash: ResolvedIpHash | None = None,
     resolved_context: "ResolvedContext" | None = None,
     fallback_extra: Optional[Mapping[str, Any]] = None,
@@ -1414,7 +1495,11 @@ def log_event_with_fallback(
     ``resolved_ip_hash``.  Doing so skips the internal resolution step while
     preserving the structured fallback logging semantics, allowing services to
     compute hashes once per request and fan the result out to multiple audit
-    events without recomputing (or re-logging) failures.  When the structured
+    events without recomputing (or re-logging) failures.  A
+    :class:`ResolvedAuditMetadata` bundle can be passed via ``resolved_metadata``
+    to provide the resolved hash, context, and fallback extra metadata in a
+    single object.  Explicit ``resolved_*`` arguments still take precedence so
+    callers can override individual values when required.  When the structured
     fallback ``context`` is expensive to build, ``context_factory`` can be
     provided to defer that work until a fallback log entry is actually
     required.  Supplying ``resolved_context`` allows callers to pre-resolve
@@ -1438,6 +1523,14 @@ def log_event_with_fallback(
     ``resolved_fallback_extra`` to skip re-evaluating factories while
     preserving the recorded error context.
     """
+
+    if resolved_metadata is not None:
+        if resolved_ip_hash is None:
+            resolved_ip_hash = resolved_metadata.ip_hash
+        if resolved_context is None:
+            resolved_context = resolved_metadata.context
+        if resolved_fallback_extra is None:
+            resolved_fallback_extra = resolved_metadata.fallback_extra
 
     resolved = resolved_ip_hash
     if resolved is None:
@@ -1648,6 +1741,7 @@ def log_audit_event_with_fallback(
     disabled_level: int = logging.DEBUG,
     context: Optional[Mapping[str, Any]] | object = _EVENT_CONTEXT_SENTINEL,
     context_factory: ContextFactory | None = None,
+    resolved_metadata: ResolvedAuditMetadata | None = None,
     resolved_ip_hash: ResolvedIpHash | None = None,
     resolved_context: ResolvedContext | None = None,
     fallback_extra: Optional[Mapping[str, Any]] | object = _EVENT_FALLBACK_EXTRA_SENTINEL,
@@ -1656,8 +1750,12 @@ def log_audit_event_with_fallback(
 ) -> AuditLogResult:
     """Convenience wrapper for logging :class:`AuditEvent` instances.
 
-    ``fallback_extra`` mirrors the similarly named argument on
-    :func:`log_event_with_fallback`, allowing callers to attach additional
+    ``resolved_metadata`` mirrors the similarly named argument on
+    :func:`log_event_with_fallback`, allowing callers to reuse bundled hash,
+    context, and fallback extra metadata produced by
+    :meth:`AuditEvent.ensure_resolved_all_metadata_bundle`.  ``fallback_extra``
+    mirrors the similarly named argument on :func:`log_event_with_fallback`,
+    allowing callers to attach additional
     structured metadata (for example correlation identifiers) to any fallback
     log entries emitted during the call.  ``fallback_extra_factory`` allows
     callers to defer construction of custom fallback metadata until a fallback
@@ -1700,6 +1798,7 @@ def log_audit_event_with_fallback(
         disabled_level=disabled_level,
         context=context_mapping,
         context_factory=effective_factory,
+        resolved_metadata=resolved_metadata,
         resolved_ip_hash=resolved_ip_hash,
         resolved_context=resolved_context,
         fallback_extra=fallback_extra_mapping,
@@ -1715,6 +1814,7 @@ __all__ = [
     "ResolvedIpHash",
     "ResolvedContext",
     "ResolvedFallbackExtra",
+    "ResolvedAuditMetadata",
     "AuditCallable",
     "HashIpCallable",
     "ContextFactory",
