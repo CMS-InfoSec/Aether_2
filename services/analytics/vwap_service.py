@@ -13,23 +13,40 @@ from statistics import pstdev
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import (
-    Column,
-    DateTime,
-    Float,
-    MetaData,
-    PrimaryKeyConstraint,
-    String,
-    Table,
-    select,
-)
-from sqlalchemy import create_engine
-from sqlalchemy.engine import Engine
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.pool import StaticPool
+
+_SQLALCHEMY_AVAILABLE = True
+
+try:  # pragma: no cover - optional dependency present in production
+    from sqlalchemy import (
+        Column,
+        DateTime,
+        Float,
+        MetaData,
+        PrimaryKeyConstraint,
+        String,
+        Table,
+        select,
+    )
+    from sqlalchemy import create_engine
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.exc import SQLAlchemyError
+    from sqlalchemy.pool import StaticPool
+except ImportError:  # pragma: no cover - exercised when SQLAlchemy is unavailable
+    _SQLALCHEMY_AVAILABLE = False
+    Column = DateTime = Float = MetaData = PrimaryKeyConstraint = String = Table = None  # type: ignore[assignment]
+    Engine = object  # type: ignore[assignment]
+    SQLAlchemyError = Exception  # type: ignore[assignment]
+    StaticPool = object  # type: ignore[assignment]
+
+    def select(*_args: object, **_kwargs: object) -> None:  # type: ignore[override]
+        raise RuntimeError("SQLAlchemy is required for select queries in VWAP analytics")
+
+    def create_engine(*_args: object, **_kwargs: object) -> Engine:  # type: ignore[override]
+        raise RuntimeError("SQLAlchemy engine creation requested but the dependency is missing")
 
 from services.common.security import require_admin_account
 from services.common.spot import require_spot_http
+from shared.spot import require_spot_symbol
 from shared.postgres import normalize_postgres_schema, normalize_sqlalchemy_dsn
 
 
@@ -67,6 +84,7 @@ class TradeSample:
     ts: datetime
     price: float
     volume: float
+    symbol: str | None = None
 
 
 class VWAPDivergenceResponse(BaseModel):
@@ -102,32 +120,43 @@ class VWAPAnalyticsService:
         window_seconds: int = DEFAULT_WINDOW_SECONDS,
         schema: str | None = None,
     ) -> None:
-        database_url = self._database_url()
-        self._engine = engine or create_engine(database_url, **_engine_options(database_url))
-        self._schema = self._resolve_schema(self._engine, schema)
         self._window = timedelta(seconds=max(1, window_seconds))
+        self._market_data: dict[str, list[TradeSample]] = {}
+        self._metrics_store: list[dict[str, object]] = []
 
-        market_metadata = MetaData(schema=self._schema)
-        self._bars = Table(
-            "bars",
-            market_metadata,
-            Column("symbol", String, nullable=False),
-            Column("ts", DateTime(timezone=True), nullable=False),
-            Column("close", Float, nullable=False),
-            Column("volume", Float, nullable=False),
-        )
+        if _SQLALCHEMY_AVAILABLE:
+            database_url = self._database_url()
+            self._engine = engine or create_engine(
+                database_url, **_engine_options(database_url)
+            )
+            self._schema = self._resolve_schema(self._engine, schema)
 
-        metrics_metadata = MetaData(schema=self._schema)
-        self._metrics = Table(
-            "vwap_metrics",
-            metrics_metadata,
-            Column("symbol", String, nullable=False),
-            Column("ts", DateTime(timezone=True), nullable=False),
-            Column("vwap", Float, nullable=False),
-            Column("divergence_pct", Float, nullable=False),
-            PrimaryKeyConstraint("symbol", "ts", name="pk_vwap_metrics"),
-        )
-        metrics_metadata.create_all(self._engine, checkfirst=True)
+            market_metadata = MetaData(schema=self._schema)
+            self._bars = Table(
+                "bars",
+                market_metadata,
+                Column("symbol", String, nullable=False),
+                Column("ts", DateTime(timezone=True), nullable=False),
+                Column("close", Float, nullable=False),
+                Column("volume", Float, nullable=False),
+            )
+
+            metrics_metadata = MetaData(schema=self._schema)
+            self._metrics = Table(
+                "vwap_metrics",
+                metrics_metadata,
+                Column("symbol", String, nullable=False),
+                Column("ts", DateTime(timezone=True), nullable=False),
+                Column("vwap", Float, nullable=False),
+                Column("divergence_pct", Float, nullable=False),
+                PrimaryKeyConstraint("symbol", "ts", name="pk_vwap_metrics"),
+            )
+            metrics_metadata.create_all(self._engine, checkfirst=True)
+        else:
+            self._engine = engine  # allows dependency injection during tests
+            self._schema = None
+            self._bars = None
+            self._metrics = None
 
     @staticmethod
     def _database_url() -> str:
@@ -180,12 +209,17 @@ class VWAPAnalyticsService:
         if not symbol:
             raise VWAPComputationError("Symbol must be provided", status_code=422)
 
+        try:
+            normalized_symbol = require_spot_symbol(symbol)
+        except ValueError as exc:
+            raise VWAPComputationError(str(exc), status_code=422) from exc
+
         window_end = datetime.now(timezone.utc)
         window_start = window_end - self._window
-        samples = self._load_samples(symbol, window_start, window_end)
+        samples = self._load_samples(normalized_symbol, window_start, window_end)
         if not samples:
             raise VWAPComputationError(
-                f"No market data found for symbol '{symbol}'", status_code=404
+                f"No market data found for symbol '{normalized_symbol}'", status_code=404
             )
 
         total_volume = sum(sample.volume for sample in samples if sample.volume > 0)
@@ -208,7 +242,7 @@ class VWAPAnalyticsService:
         divergence_pct = current_divergence * 100.0
         std_dev_pct = std_dev * 100.0
 
-        self._persist_metric(symbol, vwap, divergence_pct, window_end)
+        self._persist_metric(normalized_symbol, vwap, divergence_pct, window_end)
 
         return VWAPDivergenceResponse(
             symbol=symbol,
@@ -222,6 +256,10 @@ class VWAPAnalyticsService:
         )
 
     def _load_samples(self, symbol: str, start: datetime, end: datetime) -> list[TradeSample]:
+        if not _SQLALCHEMY_AVAILABLE or not self._bars or not self._engine:
+            rows = self._market_data.get(symbol, [])
+            return [sample for sample in rows if start <= sample.ts <= end]
+
         stmt = (
             select(self._bars.c.ts, self._bars.c.close, self._bars.c.volume)
             .where(self._bars.c.symbol == symbol)
@@ -244,16 +282,48 @@ class VWAPAnalyticsService:
                 continue
             price_f = _to_float(price)
             volume_f = _to_float(volume)
-            samples.append(TradeSample(ts=ts, price=price_f, volume=volume_f))
+            samples.append(
+                TradeSample(ts=ts, price=price_f, volume=volume_f, symbol=symbol)
+            )
         return samples
 
     def _persist_metric(self, symbol: str, vwap: float, divergence_pct: float, ts: datetime) -> None:
         payload = {"symbol": symbol, "ts": ts, "vwap": vwap, "divergence_pct": divergence_pct}
+        if not _SQLALCHEMY_AVAILABLE or not self._metrics or not self._engine:
+            self._metrics_store.append(payload)
+            return
+
         try:
             with self._engine.begin() as conn:
                 conn.execute(self._metrics.insert(), [payload])
         except SQLAlchemyError:
             LOGGER.exception("Failed to persist VWAP metric for %s", symbol)
+
+    # ------------------------------------------------------------------
+    # Lightweight helpers used when SQLAlchemy is unavailable.
+    # ------------------------------------------------------------------
+    def record_trade_sample(self, symbol: str, sample: TradeSample) -> None:
+        """Store market data in memory when SQLAlchemy is not installed."""
+
+        if _SQLALCHEMY_AVAILABLE and self._bars and self._engine:
+            raise RuntimeError("record_trade_sample is only available with the in-memory backend")
+
+        try:
+            normalized = require_spot_symbol(symbol)
+        except ValueError as exc:
+            raise ValueError(
+                "Symbol must be provided as a USD spot market instrument when recording fallback VWAP samples"
+            ) from exc
+
+        bucket = self._market_data.setdefault(normalized, [])
+        sample.symbol = normalized
+        bucket.append(sample)
+
+    def reset_fallback_data(self) -> None:
+        """Clear in-memory market data and metrics (used in tests)."""
+
+        self._market_data.clear()
+        self._metrics_store.clear()
 
 
 def _to_float(value: float | int | Decimal | None) -> float:
@@ -295,10 +365,10 @@ def vwap_divergence(
                 detail="Authenticated account is not authorized for requested scope.",
             )
 
-    normalized = require_spot_http(symbol, logger=LOGGER)
+    require_spot_http(symbol, logger=LOGGER)
 
     try:
-        return service.compute(normalized)
+        return service.compute(symbol)
     except VWAPComputationError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     except Exception as exc:  # pragma: no cover - unexpected defensive guard

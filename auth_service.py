@@ -54,19 +54,343 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Any, Dict, Literal, Mapping, Optional
 
-import httpx
-import pyotp
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
+
+try:  # pragma: no cover - optional dependency used in production
+    import httpx
+except ImportError:  # pragma: no cover - exercised in unit-only environments
+    class _MissingHTTPX(SimpleNamespace):
+        def __getattr__(self, name: str) -> Any:
+            raise RuntimeError("httpx is required for auth_service network operations")
+
+    httpx = _MissingHTTPX()
+
+try:  # pragma: no cover - optional dependency used in production
+    import pyotp
+except ImportError:  # pragma: no cover - exercised in unit-only environments
+    class _MissingPyOTP(SimpleNamespace):
+        def __getattr__(self, name: str) -> Any:
+            raise RuntimeError("pyotp is required for auth_service MFA operations")
+
+    pyotp = _MissingPyOTP()
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, HttpUrl
-from sqlalchemy import Boolean, Column, DateTime, String, create_engine
-from sqlalchemy.engine import Engine
-from sqlalchemy.engine.url import make_url
-from sqlalchemy.orm import Session as OrmSession
-from sqlalchemy.orm import declarative_base, sessionmaker
+
+_SQLALCHEMY_AVAILABLE = True
+
+try:  # pragma: no cover - optional dependency used in production
+    from sqlalchemy import Boolean, Column, DateTime, String, create_engine
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.engine.url import make_url
+    from sqlalchemy.orm import Session as OrmSession
+    from sqlalchemy.orm import declarative_base, sessionmaker
+except ImportError:  # pragma: no cover - exercised in unit-only environments
+    _SQLALCHEMY_AVAILABLE = False
+    import sqlite3
+    from pathlib import Path
+    from urllib.parse import urlparse
+
+    Engine = Any  # type: ignore[assignment]
+    OrmSession = Any  # type: ignore[assignment]
+
+    class _URL:
+        def __init__(self, raw: str) -> None:
+            self._raw = raw
+            self._parsed = urlparse(raw)
+
+        def get_backend_name(self) -> str:
+            base, _, _driver = self._parsed.scheme.partition("+")
+            return base or self._parsed.scheme
+
+        @property
+        def query(self) -> str:
+            return self._parsed.query
+
+    def make_url(url: str) -> _URL:  # type: ignore[override]
+        return _URL(url)
+
+    def _resolve_sqlite_path(url: str) -> str:
+        parsed = urlparse(url)
+        base, _, _driver = parsed.scheme.partition("+")
+        if base not in {"sqlite"}:
+            raise RuntimeError("Only sqlite URLs are supported without SQLAlchemy installed")
+
+        raw_path = f"{parsed.netloc}{parsed.path}" if parsed.netloc else parsed.path
+        if raw_path.startswith("//"):
+            raw_path = raw_path[1:]
+
+        if raw_path in {"", "/"}:
+            return ":memory:"
+
+        if raw_path.startswith("/"):
+            resolved = Path(raw_path)
+        else:
+            resolved = Path(raw_path.lstrip("/"))
+            if not resolved.is_absolute():
+                resolved = Path.cwd() / resolved
+
+        if str(resolved) != ":memory:":
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+
+        return str(resolved)
+
+    class Column:  # type: ignore[override]
+        def __init__(
+            self,
+            column_type: Any,
+            primary_key: bool = False,
+            nullable: bool = True,
+            default: Any | None = None,
+            index: bool = False,
+            **__: Any,
+        ) -> None:
+            if isinstance(column_type, type):
+                try:
+                    column_type = column_type()
+                except Exception:
+                    column_type = column_type  # type: ignore[assignment]
+            self.type = column_type
+            self.primary_key = primary_key
+            self.nullable = nullable
+            self.default = default
+            self.index = index
+
+    class Boolean:  # type: ignore[override]
+        sqlite_type = "INTEGER"
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.args = args
+            self.kwargs = kwargs
+
+    class DateTime:  # type: ignore[override]
+        sqlite_type = "TEXT"
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.args = args
+            self.kwargs = kwargs
+
+    class String:  # type: ignore[override]
+        sqlite_type = "TEXT"
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.args = args
+            self.kwargs = kwargs
+
+    class _Metadata:
+        def __init__(self) -> None:
+            self.schema: str | None = None
+            self._models: list[type[Any]] = []
+
+        def _register(self, model: type[Any]) -> None:
+            if model not in self._models:
+                self._models.append(model)
+
+        def create_all(self, *, bind: "_SQLiteEngine" | None = None) -> None:
+            if bind is None:
+                return
+            for model in self._models:
+                bind._create_table(model)
+
+    def declarative_base() -> type[Any]:  # type: ignore[override]
+        metadata_obj = _Metadata()
+
+        class _Base:
+            metadata = metadata_obj
+
+            def __init_subclass__(cls, **kwargs: Any) -> None:
+                super().__init_subclass__(**kwargs)
+                columns: dict[str, Column] = {}
+                primary: str | None = None
+                for name, value in cls.__dict__.items():
+                    if isinstance(value, Column):
+                        columns[name] = value
+                        if value.primary_key and primary is None:
+                            primary = name
+                cls.__columns__ = columns  # type: ignore[attr-defined]
+                cls.__primary_key__ = primary  # type: ignore[attr-defined]
+                if not hasattr(cls, "__table__"):
+                    cls.__table__ = SimpleNamespace(schema=None)
+                metadata_obj._register(cls)
+
+            def __init__(self, **kwargs: Any) -> None:
+                for name, column in getattr(self, "__columns__", {}).items():
+                    if name in kwargs:
+                        value = kwargs[name]
+                    elif column.default is not None:
+                        value = column.default() if callable(column.default) else column.default
+                    else:
+                        value = None
+                    setattr(self, name, value)
+
+        return _Base
+
+    class _SQLiteEngine:
+        def __init__(self, url: str, **__: Any) -> None:
+            self.url = url
+            self.database = _resolve_sqlite_path(url)
+
+        def dispose(self) -> None:
+            return None
+
+        def _connect(self) -> sqlite3.Connection:
+            return sqlite3.connect(self.database)
+
+        def _column_sql(self, name: str, column: Column) -> str:
+            type_hint = getattr(column.type, "sqlite_type", "TEXT")
+            parts = [name, type_hint]
+            if column.primary_key:
+                parts.append("PRIMARY KEY")
+            if not column.nullable:
+                parts.append("NOT NULL")
+            return " ".join(parts)
+
+        def _create_table(self, model: type[Any]) -> None:
+            table = getattr(model, "__tablename__", None)
+            if not table:
+                return
+            columns: dict[str, Column] = getattr(model, "__columns__", {})
+            statements = [self._column_sql(name, column) for name, column in columns.items()]
+            if not statements:
+                return
+            ddl = f"CREATE TABLE IF NOT EXISTS {table} ({', '.join(statements)})"
+            with self._connect() as conn:
+                conn.execute(ddl)
+                for name, column in columns.items():
+                    if column.index and not column.primary_key:
+                        conn.execute(
+                            f"CREATE INDEX IF NOT EXISTS idx_{table}_{name} ON {table} ({name})"
+                        )
+                conn.commit()
+
+        def _serialise(self, column: Column, value: Any) -> Any:
+            if value is None:
+                return None
+            if isinstance(column.type, DateTime) and isinstance(value, datetime):
+                return value.isoformat()
+            if isinstance(column.type, Boolean):
+                return int(bool(value))
+            return value
+
+        def _fetch_row(self, model: type[Any], key: Any) -> sqlite3.Row | None:
+            table = getattr(model, "__tablename__", None)
+            primary = getattr(model, "__primary_key__", None)
+            if not table or not primary:
+                return None
+            columns: dict[str, Column] = getattr(model, "__columns__", {})
+            query = f"SELECT {', '.join(columns.keys())} FROM {table} WHERE {primary} = ?"
+            with self._connect() as conn:
+                conn.row_factory = sqlite3.Row
+                return conn.execute(query, (key,)).fetchone()
+
+        def _commit(self, instances: list[Any]) -> None:
+            if not instances:
+                return
+            with self._connect() as conn:
+                for instance in instances:
+                    model = type(instance)
+                    table = getattr(model, "__tablename__", None)
+                    if not table:
+                        continue
+                    columns: dict[str, Column] = getattr(model, "__columns__", {})
+                    names = []
+                    values = []
+                    placeholders = []
+                    for name, column in columns.items():
+                        names.append(name)
+                        placeholders.append("?")
+                        current = getattr(instance, name, None)
+                        if current is None and column.default is not None:
+                            current = column.default() if callable(column.default) else column.default
+                            setattr(instance, name, current)
+                        values.append(self._serialise(column, current))
+                    sql = f"INSERT INTO {table} ({', '.join(names)}) VALUES ({', '.join(placeholders)})"
+                    conn.execute(sql, values)
+                conn.commit()
+
+        def _refresh(self, instance: Any) -> bool:
+            model = type(instance)
+            primary = getattr(model, "__primary_key__", None)
+            if not primary:
+                return False
+            key = getattr(instance, primary, None)
+            if key is None:
+                return False
+            row = self._fetch_row(model, key)
+            if row is None:
+                return False
+            columns: dict[str, Column] = getattr(model, "__columns__", {})
+            for name, column in columns.items():
+                value = row[name]
+                if isinstance(column.type, DateTime) and isinstance(value, str):
+                    try:
+                        value = datetime.fromisoformat(value)
+                    except ValueError:
+                        pass
+                elif isinstance(column.type, Boolean):
+                    value = bool(value)
+                setattr(instance, name, value)
+            return True
+
+    Engine = _SQLiteEngine  # type: ignore[assignment]
+
+    class _SQLiteSession:
+        def __init__(self, engine: _SQLiteEngine) -> None:
+            self._engine = engine
+            self._pending: list[Any] = []
+
+        def __enter__(self) -> "_SQLiteSession":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> bool:
+            if exc_type:
+                self._pending.clear()
+            return False
+
+        def add(self, instance: Any) -> None:
+            self._pending.append(instance)
+
+        def commit(self) -> None:
+            self._engine._commit(self._pending)
+            self._pending.clear()
+
+        def refresh(self, instance: Any) -> None:
+            self._engine._refresh(instance)
+
+        def close(self) -> None:
+            self._pending.clear()
+
+        def get(self, model: type[Any], primary_key: Any) -> Any | None:
+            primary = getattr(model, "__primary_key__", None)
+            if primary is None:
+                return None
+            instance = model(**{primary: primary_key})
+            found = self._engine._refresh(instance)
+            if not found:
+                return None
+            return instance
+
+    OrmSession = _SQLiteSession  # type: ignore[assignment]
+
+    def create_engine(url: str, **kwargs: Any) -> _SQLiteEngine:  # type: ignore[override]
+        return _SQLiteEngine(url, **kwargs)
+
+    def sessionmaker(*, bind: _SQLiteEngine, **__: Any):  # type: ignore[override]
+        engine = bind
+
+        class _SessionFactory:
+            def __call__(self) -> _SQLiteSession:
+                return _SQLiteSession(engine)
+
+            def close_all(self) -> None:
+                engine.dispose()
+
+        return _SessionFactory()
+
+    _SQLALCHEMY_AVAILABLE = True
 
 from services.auth import jwt_tokens
 from shared.postgres import normalize_postgres_dsn, normalize_postgres_schema
@@ -262,7 +586,8 @@ class SessionRepository:
 
 
 # Attempt to initialise configuration eagerly when the environment is already populated.
-_initialise_database()
+if _SQLALCHEMY_AVAILABLE:
+    _initialise_database()
 _initialise_jwt_secret()
 
 
