@@ -61,8 +61,6 @@ if "pydantic" not in sys.modules:
     sys.modules["pydantic"] = SimpleNamespace(BaseModel=_StubBaseModel, Field=_stub_field)
 
 
-import pytest
-
 import scaling_controller
 from scaling_controller import NullGPUManager, ScalingController
 
