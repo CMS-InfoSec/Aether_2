@@ -9,35 +9,16 @@ import os
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Awaitable,
-    Callable,
-    Dict,
-    Iterable,
-    List,
-    Mapping,
-    Optional,
-    Protocol,
-    Sequence,
-    Tuple,
-    TypeGuard,
-    TypeVar,
-    cast,
-)
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-if TYPE_CHECKING:  # pragma: no cover - imported for type checking only
-    from fastapi import APIRouter, Depends, FastAPI, HTTPException
-else:  # pragma: no cover - runtime import with fallback stub
-    try:
-        from fastapi import APIRouter, Depends, FastAPI, HTTPException
-    except ModuleNotFoundError:
-        class HTTPException(Exception):
-            def __init__(self, status_code: int, detail: str) -> None:
-                super().__init__(detail)
-                self.status_code = status_code
-                self.detail = detail
+try:  # pragma: no cover - fastapi is optional for unit tests
+    from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
+except ModuleNotFoundError:  # pragma: no cover - fallback stub for tests
+    class HTTPException(Exception):
+        def __init__(self, status_code: int, detail: str) -> None:
+            super().__init__(detail)
+            self.status_code = status_code
+            self.detail = detail
 
         class _RouterStub:
             def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -71,32 +52,6 @@ else:  # pragma: no cover - runtime import with fallback stub
 from prometheus_client import CollectorRegistry, Counter
 
 from services.common.security import ensure_admin_access
-
-
-RouteFn = TypeVar("RouteFn", bound=Callable[..., Any])
-
-
-class _HttpxResponseProtocol(Protocol):
-    def json(self) -> Any:
-        ...
-
-    def raise_for_status(self) -> None:
-        ...
-
-
-class _HttpxClientProtocol(Protocol):
-    async def get(self, url: str) -> _HttpxResponseProtocol:
-        ...
-
-    async def aclose(self) -> None:
-        ...
-
-
-class _HttpxModule(Protocol):
-    AsyncClient: Callable[..., _HttpxClientProtocol]
-    TimeoutException: type[Exception]
-    HTTPStatusError: type[Exception]
-    RequestError: type[Exception]
 
 
 FetchResult = Awaitable[Sequence[Mapping[str, Any]]] | Sequence[Mapping[str, Any]]
@@ -433,9 +388,9 @@ async def get_active_alerts(
     return await service.refresh()
 
 
-@_router_get("/policies")
-def get_alert_policies(
-    _: str = Depends(require_admin_account),
+@router.get("/policies")
+async def get_alert_policies(
+    request: Request,
     service: AlertDedupeService = Depends(get_alert_dedupe_service),
 ) -> Dict[str, Any]:
     await ensure_admin_access(request, forbid_on_missing_token=True)
