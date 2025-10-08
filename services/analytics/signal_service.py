@@ -21,7 +21,10 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import AsyncIterator, Dict, Iterable, List, Mapping, Sequence
 
-import numpy as np
+try:  # pragma: no cover - optional scientific stack dependency
+    import numpy as np
+except Exception:  # pragma: no cover - executed when numpy is unavailable
+    np = None  # type: ignore[assignment]
 from fastapi import Depends, FastAPI, HTTPException, Query
 from prometheus_client import Gauge
 from pydantic import BaseModel
@@ -206,16 +209,43 @@ def _rolling_beta(series_alt: Sequence[float], series_base: Sequence[float], win
     return covariance / variance
 
 
+def _log_returns(prices: Sequence[float]) -> List[float]:
+    if len(prices) < 2:
+        return []
+
+    cleaned: List[float] = []
+    for idx, price in enumerate(prices):
+        if price is None:
+            raise HTTPException(status_code=422, detail=f"Encountered null price at index {idx}")
+        try:
+            value = float(price)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid price value at index {idx}") from exc
+        if value <= 0:
+            raise HTTPException(status_code=422, detail="Prices must be positive to compute log returns")
+        cleaned.append(value)
+
+    if np is not None:
+        array = np.asarray(cleaned, dtype=float)
+        returns = np.diff(np.log(array))
+        return [float(ret) for ret in returns.tolist()]
+
+    returns: List[float] = []
+    for previous, current in zip(cleaned, cleaned[1:]):
+        returns.append(math.log(current) - math.log(previous))
+    return returns
+
+
 def _garch_forecast(prices: Sequence[float], horizon: int = 12) -> Dict[str, object]:
     if len(prices) < 30:
         raise HTTPException(status_code=422, detail="Need at least 30 observations for GARCH")
-    log_returns = np.diff(np.log(np.array(prices)))
-    if log_returns.size < 1:
+    log_returns = _log_returns(prices)
+    if len(log_returns) < 1:
         raise HTTPException(status_code=422, detail="Insufficient returns for volatility forecasting")
 
     alpha = 0.07
     beta = 0.9
-    variance = float(np.var(log_returns))
+    variance = float(statistics.pvariance(log_returns))
     omega = variance * (1 - alpha - beta)
     if omega <= 0:
         omega = variance * 0.05
@@ -228,10 +258,12 @@ def _garch_forecast(prices: Sequence[float], horizon: int = 12) -> Dict[str, obj
         sigma2 = omega + (alpha + beta) * sigma2
         forecasts.append(math.sqrt(max(sigma2, 0)))
 
-    window = min(20, log_returns.size)
+    window = min(20, len(log_returns))
     recent = log_returns[-window:]
-    mean = float(np.mean(recent))
-    std = float(np.std(recent)) or 1e-6
+    mean = float(statistics.fmean(recent))
+    std = float(statistics.pstdev(recent)) if len(recent) > 1 else 0.0
+    if std == 0:
+        std = 1e-6
     jumps = []
     for idx, ret in enumerate(log_returns[-horizon:], start=len(log_returns) - horizon):
         z_score = (ret - mean) / std
@@ -491,7 +523,11 @@ except RuntimeError:
 def _market_data_adapter() -> MarketDataAdapter:
     adapter = getattr(app.state, "market_data_adapter", None)
     if adapter is None:
-        raise HTTPException(status_code=503, detail="Market data adapter is not configured")
+        try:
+            adapter = _configure_market_data_adapter(app)
+        except Exception as exc:
+            logger.debug("Failed to lazily configure market data adapter", exc_info=True)
+            raise HTTPException(status_code=503, detail="Market data adapter is not configured") from exc
     return adapter
 
 
