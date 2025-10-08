@@ -39,8 +39,6 @@ from sqlalchemy.pool import StaticPool
 
 from auth.service import InMemorySessionStore
 import strategy_orchestrator
-from tests.test_strategy_orchestrator import _make_request
-
 reload_admin_accounts = security.reload_admin_accounts
 set_default_session_store = security.set_default_session_store
 from tests.test_strategy_orchestrator import _make_request

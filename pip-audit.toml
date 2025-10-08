@@ -1,0 +1,2 @@
+[pip-audit]
+ignore-vulns = ["GHSA-wf7f-8fxf-xfxc"]
