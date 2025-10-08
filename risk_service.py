@@ -42,6 +42,7 @@ from metrics import (
 )
 from esg_filter import ESG_REASON, esg_filter
 from services.common.compliance import (
+    SQLALCHEMY_AVAILABLE as SANCTIONS_SQLALCHEMY_AVAILABLE,
     SanctionRecord,
     ensure_sanctions_schema,
     is_blocking_status,
@@ -922,6 +923,8 @@ def _load_sanction_hits(symbol: str) -> List[SanctionRecord]:
     """Return active sanction records for the provided symbol."""
 
     normalized_symbol = symbol.upper()
+    if not SANCTIONS_SQLALCHEMY_AVAILABLE:
+        return []
     with get_session() as session:
         stmt = select(SanctionRecord).where(SanctionRecord.symbol == normalized_symbol)
         records = session.execute(stmt).scalars().all()
