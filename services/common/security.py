@@ -147,7 +147,7 @@ def _get_session_store(request: Request) -> SessionStoreProtocol:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Configured session store does not implement the required interface.",
         )
-    return store  # type: ignore[return-value]
+    return cast(SessionStoreProtocol, store)
 
 
 def _extract_token(raw_value: Optional[str], *, header_name: str) -> str:
