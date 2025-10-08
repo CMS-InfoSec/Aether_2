@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import os
 import sys
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Dict
+from typing import Any, Dict
 
 import pytest
 
@@ -46,6 +48,58 @@ pytest_plugins = [
     "tests.fixtures.backends",
     "tests.fixtures.mock_kraken",
 ]
+
+
+def pytest_configure(config: Any) -> None:
+    config.addinivalue_line("markers", "asyncio: execute test inside an asyncio event loop")
+    config.addinivalue_line("markers", "anyio: execute test inside an asyncio event loop")
+
+    original_run = getattr(asyncio, "run", None)
+
+    if original_run is not None and not getattr(asyncio, "_nest_asyncio_patched", False):
+
+        def _nested_run(coro: Any, *args: Any, **kwargs: Any) -> Any:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return original_run(coro, *args, **kwargs)
+
+            result: Dict[str, Any] = {}
+
+            def _runner() -> None:
+                try:
+                    result["value"] = original_run(coro, *args, **kwargs)
+                except Exception as exc:  # pragma: no cover - defensive guard
+                    result["error"] = exc
+
+            thread = threading.Thread(target=_runner, daemon=True)
+            thread.start()
+            thread.join()
+            if "error" in result:
+                raise result["error"]
+            return result.get("value")
+
+        asyncio.run = _nested_run  # type: ignore[assignment]
+        asyncio._nest_asyncio_patched = True  # type: ignore[attr-defined]
+
+
+def pytest_pyfunc_call(pyfuncitem: Any) -> bool | None:
+    testfunc = pyfuncitem.obj
+    if inspect.iscoroutinefunction(testfunc):
+        argnames = getattr(pyfuncitem, "_fixtureinfo", None)
+        if argnames is not None:
+            argnames = argnames.argnames
+        else:  # pragma: no cover - fallback for unexpected pytest internals
+            argnames = tuple(pyfuncitem.funcargs.keys())
+        testargs = {name: pyfuncitem.funcargs[name] for name in argnames}
+
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(testfunc(**testargs))
+        finally:
+            loop.close()
+        return True
+    return None
 
 
 @pytest.fixture(autouse=True)

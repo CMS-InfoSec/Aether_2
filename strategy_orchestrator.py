@@ -536,6 +536,48 @@ app.state.session_store = SESSION_STORE
 app.state.orchestrator_state = OrchestratorRuntimeState()
 
 
+def _set_components(
+    registry: StrategyRegistry,
+    signal_bus: StrategySignalBus,
+    *,
+    session_factory: Optional[sessionmaker] = None,
+    engine: Optional[Engine] = None,
+    database_url: Optional[str] = None,
+) -> None:
+    """Inject orchestrator dependencies during tests.
+
+    The full startup routine initialises the registry, database engine and
+    signal bus from environment configuration.  Integration tests bypass the
+    asynchronous startup hook and instead construct lightweight in-memory
+    collaborators.  Prior to this helper the tests needed to monkeypatch a
+    large collection of module level globals directly which was brittle and
+    error prone.  Providing an explicit helper mirrors the production startup
+    process while remaining side effect free for the happy path.
+    """
+
+    state = getattr(app.state, "orchestrator_state", OrchestratorRuntimeState())
+
+    # Reuse the registry's session factory when one isn't provided explicitly.
+    derived_session_factory = session_factory
+    if derived_session_factory is None:
+        derived_session_factory = getattr(registry, "_session_factory", None)
+
+    state.registry = registry
+    state.signal_bus = signal_bus
+    state.session_factory = derived_session_factory
+
+    if engine is not None:
+        # Replace any existing engine with the injected instance.
+        state.engine = engine
+    if database_url is not None:
+        state.database_url = database_url
+
+    state.initialization_error = None
+
+    app.state.orchestrator_state = state
+    _update_module_state(state)
+
+
 @app.on_event("startup")
 async def _startup_event() -> None:
     await _initialise_with_retry(app.state.orchestrator_state)
