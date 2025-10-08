@@ -20,7 +20,15 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, TypeVar
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, status
+try:  # pragma: no cover - FastAPI is optional in some unit tests
+    from fastapi import APIRouter, Depends, HTTPException, status
+except ImportError:  # pragma: no cover - fallback when FastAPI is stubbed out
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        APIRouter,
+        Depends,
+        HTTPException,
+        status,
+    )
 from pydantic import BaseModel, Field
 
 from metrics import observe_scaling_evaluation, record_scaling_state, traced_span
