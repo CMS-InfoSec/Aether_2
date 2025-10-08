@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+import logging
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Any, Dict, Iterator, List, Mapping, Sequence, Tuple
+from typing import Any, Callable, ClassVar, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from psycopg2 import sql
-from psycopg2.extras import RealDictCursor
+
+try:  # pragma: no cover - psycopg2 is optional in some environments
+    import psycopg2
+    from psycopg2 import sql
+    from psycopg2.extras import RealDictCursor
+except Exception:  # pragma: no cover - fallback when psycopg2 is unavailable
+    psycopg2 = None  # type: ignore[assignment]
+    sql = None  # type: ignore[assignment]
+    RealDictCursor = Any  # type: ignore[assignment]
 
 from services.common.config import get_timescale_session
 from services.common.security import require_admin_account
@@ -59,11 +67,37 @@ FROM latest_positions
 """
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 DecimalLike = Decimal | float | int | str
 
 ZERO = Decimal("0")
 CONFIDENCE_Z_SCORE = Decimal("1.96")
 DEFAULT_QUANTIZATION = Decimal("0.00000001")
+
+
+def _parse_datetime(value: Any) -> Optional[datetime]:
+    """Return *value* normalised to an aware UTC ``datetime`` when possible."""
+
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        if raw.endswith("Z"):
+            raw = f"{raw[:-1]}+00:00"
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    return None
 
 
 def _as_decimal(value: DecimalLike) -> Decimal:
@@ -113,34 +147,230 @@ class ForecastResult:
         }
 
 
+class _BaseExposureStore:
+    """Abstract storage backend used by :class:`ExposureForecaster`."""
+
+    def __init__(self, account_id: str) -> None:
+        self._account_id = account_id
+
+    def fetch_nav_history(self, start: datetime, end: datetime) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+    def fetch_fee_history(self, start: datetime, end: datetime) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+    def fetch_positions(self) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+
+class _PsycopgExposureStore(_BaseExposureStore):
+    """Timescale-backed exposure store using psycopg2 connections."""
+
+    def __init__(self, account_id: str) -> None:
+        if psycopg2 is None or sql is None:
+            raise RuntimeError("psycopg2 is not available; cannot use the database-backed exposure store")
+        super().__init__(account_id)
+        self._session = get_timescale_session(account_id)
+
+    def _query(self, query: str, params: Mapping[str, Any]) -> List[Dict[str, Any]]:
+        if psycopg2 is None or sql is None:
+            raise RuntimeError("psycopg2 is not available; cannot execute Timescale queries")
+
+        connection = psycopg2.connect(self._session.dsn)
+        try:
+            connection.autocommit = True
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                if self._session.account_schema:
+                    statement = sql.SQL("SET search_path TO {}, public").format(
+                        sql.Identifier(self._session.account_schema)
+                    )
+                    cursor.execute(statement)
+                cursor.execute(query, params)
+                rows = cursor.fetchall()
+        finally:
+            connection.close()
+
+        return [dict(row) for row in rows]
+
+    def fetch_nav_history(self, start: datetime, end: datetime) -> List[Dict[str, Any]]:
+        return self._query(
+            PNL_CURVE_QUERY,
+            {"account_id": self._account_id, "start": start, "end": end},
+        )
+
+    def fetch_fee_history(self, start: datetime, end: datetime) -> List[Dict[str, Any]]:
+        return self._query(
+            DAILY_FEES_AND_VOLUME_QUERY,
+            {"account_id": self._account_id, "start": start, "end": end},
+        )
+
+    def fetch_positions(self) -> List[Dict[str, Any]]:
+        return self._query(LATEST_POSITIONS_QUERY, {"account_id": self._account_id})
+
+
+class _InMemoryExposureStore(_BaseExposureStore):
+    """In-memory fallback that mimics the exposure queries."""
+
+    _NAV_HISTORY: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
+    _FEE_HISTORY: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
+    _POSITIONS: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
+    _LOCK: ClassVar[threading.Lock] = threading.Lock()
+
+    def fetch_nav_history(self, start: datetime, end: datetime) -> List[Dict[str, Any]]:
+        with self._LOCK:
+            rows = [row.copy() for row in self._NAV_HISTORY.get(self._account_id, [])]
+
+        if not rows:
+            return []
+
+        filtered: List[Dict[str, Any]] = []
+        for row in rows:
+            as_of = _parse_datetime(row.get("as_of"))
+            if as_of is not None and not (start <= as_of < end):
+                continue
+            entry = row.copy()
+            if as_of is not None:
+                entry["as_of"] = as_of
+            filtered.append(entry)
+        return filtered
+
+    def fetch_fee_history(self, start: datetime, end: datetime) -> List[Dict[str, Any]]:
+        with self._LOCK:
+            rows = [row.copy() for row in self._FEE_HISTORY.get(self._account_id, [])]
+
+        if not rows:
+            return []
+
+        filtered: List[Dict[str, Any]] = []
+        for row in rows:
+            day = _parse_datetime(row.get("day"))
+            if day is not None and not (start <= day < end):
+                continue
+            entry = row.copy()
+            if day is not None:
+                entry["day"] = day
+            filtered.append(entry)
+        return filtered
+
+    def fetch_positions(self) -> List[Dict[str, Any]]:
+        with self._LOCK:
+            rows = [row.copy() for row in self._POSITIONS.get(self._account_id, [])]
+        return rows
+
+    @classmethod
+    def seed_nav_history(cls, account_id: str, rows: Sequence[Mapping[str, Any]]) -> None:
+        prepared: List[Dict[str, Any]] = []
+        for row in rows:
+            entry = dict(row)
+            entry.setdefault("nav", ZERO)
+            parsed = _parse_datetime(entry.get("as_of"))
+            if parsed is not None:
+                entry["as_of"] = parsed
+            prepared.append(entry)
+
+        prepared.sort(
+            key=lambda item: item.get("as_of") or datetime.min.replace(tzinfo=timezone.utc)
+        )
+
+        with cls._LOCK:
+            cls._NAV_HISTORY[account_id] = prepared
+
+    @classmethod
+    def seed_fee_history(cls, account_id: str, rows: Sequence[Mapping[str, Any]]) -> None:
+        prepared: List[Dict[str, Any]] = []
+        for row in rows:
+            entry = dict(row)
+            parsed = _parse_datetime(entry.get("day"))
+            if parsed is not None:
+                entry["day"] = parsed
+            entry.setdefault("notional", ZERO)
+            entry.setdefault("fees", ZERO)
+            prepared.append(entry)
+
+        prepared.sort(
+            key=lambda item: item.get("day") or datetime.min.replace(tzinfo=timezone.utc)
+        )
+
+        with cls._LOCK:
+            cls._FEE_HISTORY[account_id] = prepared
+
+    @classmethod
+    def seed_positions(cls, account_id: str, rows: Sequence[Mapping[str, Any]]) -> None:
+        prepared = [dict(row) for row in rows]
+        with cls._LOCK:
+            cls._POSITIONS[account_id] = prepared
+
+    @classmethod
+    def reset(cls, account_id: Optional[str] = None) -> None:
+        with cls._LOCK:
+            if account_id is None:
+                cls._NAV_HISTORY.clear()
+                cls._FEE_HISTORY.clear()
+                cls._POSITIONS.clear()
+                return
+            cls._NAV_HISTORY.pop(account_id, None)
+            cls._FEE_HISTORY.pop(account_id, None)
+            cls._POSITIONS.pop(account_id, None)
+
+
+if psycopg2 is None:
+    LOGGER.warning(
+        "psycopg2 is not installed; exposure forecast service will use an in-memory store"
+    )
+    _DEFAULT_EXPOSURE_STORE: Callable[[str], _BaseExposureStore] = _InMemoryExposureStore
+else:
+    _DEFAULT_EXPOSURE_STORE = _PsycopgExposureStore
+
+
+def seed_exposure_store(
+    account_id: str,
+    *,
+    nav_history: Sequence[Mapping[str, Any]] | None = None,
+    fee_history: Sequence[Mapping[str, Any]] | None = None,
+    positions: Sequence[Mapping[str, Any]] | None = None,
+) -> None:
+    """Populate the in-memory exposure store with deterministic fixtures."""
+
+    if nav_history is not None:
+        _InMemoryExposureStore.seed_nav_history(account_id, nav_history)
+    if fee_history is not None:
+        _InMemoryExposureStore.seed_fee_history(account_id, fee_history)
+    if positions is not None:
+        _InMemoryExposureStore.seed_positions(account_id, positions)
+
+
+def reset_exposure_store(account_id: Optional[str] = None) -> None:
+    """Clear cached exposure data for ``account_id`` or every account."""
+
+    _InMemoryExposureStore.reset(account_id)
+
 class ExposureForecaster:
     """Domain service encapsulating the exposure forecasting logic."""
 
-    def __init__(self, *, account_id: str, window_days: int = 90) -> None:
+    def __init__(
+        self,
+        *,
+        account_id: str,
+        window_days: int = 90,
+        store_factory: Callable[[str], _BaseExposureStore] | None = None,
+    ) -> None:
         self._account_id = account_id
         self._window_days = window_days
-        self._timescale = get_timescale_session(account_id)
 
-    @contextmanager
-    def _session(self) -> Iterator[RealDictCursor]:
-        import psycopg2
-
-        conn = psycopg2.connect(self._timescale.dsn)
+        factory = store_factory or _DEFAULT_EXPOSURE_STORE
         try:
-            conn.autocommit = True
-            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                cursor.execute(
-                    sql.SQL("SET search_path TO {}, public").format(
-                        sql.Identifier(self._timescale.account_schema)
-                    )
-                )
-                yield cursor
-        finally:
-            conn.close()
-
-    def _fetch(self, cursor: RealDictCursor, query: str, params: Mapping[str, Any]) -> List[Dict[str, Any]]:
-        cursor.execute(query, params)
-        return [dict(row) for row in cursor.fetchall()]
+            self._store = factory(account_id)
+        except Exception as exc:
+            if factory is _InMemoryExposureStore:
+                raise
+            factory_name = getattr(factory, "__name__", factory.__class__.__name__)
+            LOGGER.warning(
+                "Failed to initialise %s for account %s: %s; using in-memory exposure store",
+                factory_name,
+                account_id,
+                exc,
+            )
+            self._store = _InMemoryExposureStore(account_id)
 
     def forecast(self) -> Dict[str, Any]:
         """Generate the NAV, fee, and margin forecasts for the account."""
@@ -148,24 +378,15 @@ class ExposureForecaster:
         now = datetime.now(timezone.utc)
         start = now - timedelta(days=self._window_days)
 
-        with self._session() as cursor:
-            nav_rows = self._fetch(
-                cursor,
-                PNL_CURVE_QUERY,
-                {"account_id": self._account_id, "start": start, "end": now},
+        nav_rows = self._store.fetch_nav_history(start, now)
+        if not nav_rows:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No NAV history available for account",
             )
-            if not nav_rows:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="No NAV history available for account",
-                )
 
-            fees_rows = self._fetch(
-                cursor,
-                DAILY_FEES_AND_VOLUME_QUERY,
-                {"account_id": self._account_id, "start": start, "end": now},
-            )
-            positions_rows = self._fetch(cursor, LATEST_POSITIONS_QUERY, {"account_id": self._account_id})
+        fees_rows = self._store.fetch_fee_history(start, now)
+        positions_rows = self._store.fetch_positions()
 
         nav_forecast = self._forecast_nav_volatility(nav_rows)
         fee_forecast = self._forecast_fee_spend(fees_rows)
@@ -339,5 +560,11 @@ def get_exposure_forecast(
     return forecaster.forecast()
 
 
-__all__ = ["router", "ExposureForecaster", "ForecastResult"]
+__all__ = [
+    "router",
+    "ExposureForecaster",
+    "ForecastResult",
+    "seed_exposure_store",
+    "reset_exposure_store",
+]
 

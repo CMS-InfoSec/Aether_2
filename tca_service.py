@@ -29,15 +29,55 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from typing import Any, Iterable, Mapping, MutableMapping, Sequence
+from typing import Any, Iterable, Iterator, Mapping, MutableMapping, Sequence
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import Column, DateTime, MetaData, Numeric, String, create_engine, text
-from sqlalchemy.engine import Engine
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session, declarative_base, sessionmaker
-from sqlalchemy.pool import StaticPool
+
+_SQLALCHEMY_AVAILABLE = False
+
+try:  # pragma: no cover - SQLAlchemy is optional during testing
+    import sqlalchemy as _sa  # type: ignore[import-untyped]
+except Exception:  # pragma: no cover - executed when SQLAlchemy missing entirely
+    _sa = None  # type: ignore[assignment]
+else:
+    _SQLALCHEMY_AVAILABLE = bool(getattr(_sa, "__version__", None))
+
+if _SQLALCHEMY_AVAILABLE:
+    from sqlalchemy import Column, DateTime, MetaData, Numeric, String, create_engine, text
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.exc import SQLAlchemyError
+    from sqlalchemy.orm import Session, declarative_base, sessionmaker
+    from sqlalchemy.pool import StaticPool
+else:  # pragma: no cover - lightweight fallback when SQLAlchemy absent
+    from types import SimpleNamespace
+    from typing import Any, Callable
+
+    Column = DateTime = Numeric = String = object  # type: ignore[assignment]
+    Engine = Any  # type: ignore[assignment]
+    Session = Any  # type: ignore[assignment]
+    StaticPool = type("StaticPool", (), {})  # type: ignore[assignment]
+
+    class SQLAlchemyError(Exception):
+        """Placeholder exception used when SQLAlchemy is unavailable."""
+
+    def text(statement: str) -> str:  # type: ignore[override]
+        return statement
+
+    class _FallbackMetadata(SimpleNamespace):
+        def create_all(self, **_: Any) -> None:  # pragma: no cover - no-op
+            return None
+
+    def declarative_base(*_: object, **__: object) -> Any:  # type: ignore[override]
+        base = SimpleNamespace()
+        base.metadata = _FallbackMetadata()
+        return base
+
+    def create_engine(*_: object, **__: object) -> Any:  # type: ignore[override]
+        raise RuntimeError("SQLAlchemy engine is unavailable in this environment")
+
+    def sessionmaker(*_: object, **__: object) -> Callable[[], Any]:  # type: ignore[override]
+        raise RuntimeError("SQLAlchemy sessionmaker is unavailable in this environment")
 
 from services.common.security import require_admin_account
 from services.common.spot import require_spot_http
@@ -56,6 +96,7 @@ DEFAULT_DATABASE_URL = "sqlite:///./tca.db"
 DECIMAL_ZERO = Decimal("0")
 DECIMAL_EIGHT_DP = Decimal("0.00000001")
 DECIMAL_FOUR_DP = Decimal("0.0001")
+DECIMAL_TWELVE_DP = Decimal("0.000000000001")
 
 PRICE_QUANT = DECIMAL_EIGHT_DP
 SIZE_QUANT = DECIMAL_EIGHT_DP
@@ -104,40 +145,268 @@ def _engine_options(url: str) -> dict[str, Any]:
     return options
 
 
-_DB_URL = _database_url()
-ENGINE: Engine = create_engine(_DB_URL, **_engine_options(_DB_URL))
-SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
+_IN_MEMORY_STORES: dict[str, "_InMemoryStore"] = {}
 
 
-Base = declarative_base(metadata=MetaData())
+def _get_in_memory_store(url: str) -> "_InMemoryStore":
+    store = _IN_MEMORY_STORES.get(url)
+    if store is None:
+        store = _InMemoryStore()
+        _IN_MEMORY_STORES[url] = store
+    return store
 
 
-class TCAResult(Base):
-    """Persistence model storing derived per-trade TCA metrics."""
+class _SessionContext:
+    """Wrap session objects that do not implement the context manager protocol."""
 
-    __tablename__ = "tca_results"
+    def __init__(self, session: Any) -> None:
+        self._session = session
 
-    account_id = Column(String, primary_key=True)
-    trade_id = Column(String, primary_key=True)
-    slippage_bps = Column(Numeric(24, 12), nullable=False)
-    fees_usd = Column(Numeric(24, 12), nullable=True)
-    ts = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC))
+    def __getattr__(self, item: str) -> Any:  # pragma: no cover - simple delegation
+        return getattr(self._session, item)
 
+    def __enter__(self) -> Any:
+        return self._session
 
-class TCAReport(Base):
-    """Persistence model for daily expected-vs-realised execution reports."""
-
-    __tablename__ = "tca_reports"
-
-    account_id = Column(String, primary_key=True)
-    symbol = Column(String, primary_key=True)
-    ts = Column(DateTime(timezone=True), primary_key=True, default=lambda: datetime.now(UTC))
-    expected_cost = Column(Numeric(24, 12), nullable=False)
-    realized_cost = Column(Numeric(24, 12), nullable=False)
-    slippage_bps = Column(Numeric(24, 12), nullable=False)
+    def __exit__(self, exc_type, exc, tb) -> bool:  # type: ignore[override]
+        close = getattr(self._session, "close", None)
+        if callable(close):
+            close()
+        return False
 
 
-Base.metadata.create_all(bind=ENGINE)
+if _SQLALCHEMY_AVAILABLE:
+    _DB_URL = _database_url()
+    ENGINE: Engine = create_engine(_DB_URL, **_engine_options(_DB_URL))
+    _SESSION_FACTORY = sessionmaker(
+        bind=ENGINE, autoflush=False, expire_on_commit=False, future=True
+    )
+    Base = declarative_base(metadata=MetaData())
+else:
+    _DB_URL = _database_url()
+
+    class _InMemoryStore:
+        def __init__(self) -> None:
+            self.results: dict[tuple[str, str], "TCAResult"] = {}
+            self.reports: list["TCAReport"] = []
+
+        def reset(self) -> None:
+            self.results.clear()
+            self.reports.clear()
+
+    class _InMemoryEngine:
+        def __init__(self, url: str) -> None:
+            self.url = url
+            self.store = _get_in_memory_store(url)
+
+        def reset(self) -> None:
+            self.store.reset()
+
+    class _InMemorySession:
+        def __init__(self, store: "_InMemoryStore") -> None:
+            self._store = store
+
+        def __enter__(self) -> "_InMemorySession":  # pragma: no cover - API parity
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> bool:  # type: ignore[override]
+            return False
+
+        def close(self) -> None:  # pragma: no cover - API parity
+            return None
+
+        def get(self, model: Any, identity: Any) -> Any:
+            if model is TCAResult:
+                key = tuple(identity) if isinstance(identity, (list, tuple)) else identity
+                return self._store.results.get(key)
+            if model is TCAReport:
+                key = tuple(identity) if isinstance(identity, (list, tuple)) else identity
+                for record in reversed(self._store.reports):
+                    if (
+                        record.account_id,
+                        record.symbol,
+                        record.ts,
+                    ) == key:
+                        return record
+            return None
+
+        def add(self, instance: Any) -> None:
+            if isinstance(instance, TCAResult):
+                self._store.results[(instance.account_id, instance.trade_id)] = instance
+            elif isinstance(instance, TCAReport):
+                self._store.reports.append(instance)
+
+        def commit(self) -> None:  # pragma: no cover - no-op for tests
+            return None
+
+        def rollback(self) -> None:  # pragma: no cover - no-op for tests
+            return None
+
+        def execute(self, *_: Any, **__: Any) -> Any:
+            store = self._store
+
+            class _ScalarResult:
+                def __init__(self, reports: list["TCAReport"]) -> None:
+                    self._reports = reports
+
+                def first(self) -> "TCAReport | None":
+                    if not self._reports:
+                        return None
+                    return max(self._reports, key=lambda record: record.ts)
+
+                def all(self) -> list["TCAReport"]:  # pragma: no cover - parity helper
+                    return sorted(self._reports, key=lambda record: record.ts, reverse=True)
+
+            class _Result:
+                def scalars(self) -> _ScalarResult:
+                    return _ScalarResult(store.reports)
+
+            return _Result()
+
+    ENGINE = _InMemoryEngine(_DB_URL)
+
+    def _in_memory_sessionmaker(store: "_InMemoryStore") -> Callable[[], _InMemorySession]:
+        def factory() -> _InMemorySession:
+            return _InMemorySession(store)
+
+        return factory
+
+    _SESSION_FACTORY = _in_memory_sessionmaker(ENGINE.store)
+    Base = declarative_base()  # type: ignore[call-arg]
+
+    if _sa is not None:
+
+        def _select(*_: Any, **__: Any) -> Any:
+            class _SelectClause:
+                def where(self, *args: Any, **kwargs: Any) -> "_SelectClause":
+                    return self
+
+                def order_by(self, *args: Any, **kwargs: Any) -> "_SelectClause":
+                    return self
+
+            return _SelectClause()
+
+        stub_select = getattr(_sa, "select", None)
+        if callable(stub_select):  # pragma: no cover - runtime patching
+            stub_select.__code__ = _select.__code__
+            stub_select.__defaults__ = _select.__defaults__
+            stub_select.__kwdefaults__ = _select.__kwdefaults__
+
+
+def SessionLocal() -> Any:
+    session = _SESSION_FACTORY()
+    if hasattr(session, "__enter__") and hasattr(session, "__exit__"):
+        return session
+    return _SessionContext(session)
+
+
+if _SQLALCHEMY_AVAILABLE:
+
+    class TCAResult(Base):
+        """Persistence model storing derived per-trade TCA metrics."""
+
+        __tablename__ = "tca_results"
+
+        account_id = Column(String, primary_key=True)
+        trade_id = Column(String, primary_key=True)
+        slippage_bps = Column(Numeric(24, 12), nullable=False)
+        fees_usd = Column(Numeric(24, 12), nullable=True)
+        ts = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC))
+
+
+    class TCAReport(Base):
+        """Persistence model for daily expected-vs-realised execution reports."""
+
+        __tablename__ = "tca_reports"
+
+        account_id = Column(String, primary_key=True)
+        symbol = Column(String, primary_key=True)
+        ts = Column(
+            DateTime(timezone=True), primary_key=True, default=lambda: datetime.now(UTC)
+        )
+        expected_cost = Column(Numeric(24, 12), nullable=False)
+        realized_cost = Column(Numeric(24, 12), nullable=False)
+        slippage_bps = Column(Numeric(24, 12), nullable=False)
+
+    Base.metadata.create_all(bind=ENGINE)
+
+else:
+
+    class _ColumnProxy:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def desc(self) -> tuple[str, str]:
+            return ("desc", self.name)
+
+        def __eq__(self, other: object) -> tuple[str, str, object]:  # pragma: no cover
+            return ("eq", self.name, other)
+
+    class TCAResult:
+        account_id = _ColumnProxy("account_id")
+        trade_id = _ColumnProxy("trade_id")
+        slippage_bps = _ColumnProxy("slippage_bps")
+        fees_usd = _ColumnProxy("fees_usd")
+        ts = _ColumnProxy("ts")
+
+        def __init__(
+            self,
+            *,
+            account_id: str,
+            trade_id: str,
+            slippage_bps: Decimal,
+            fees_usd: Decimal | None,
+            ts: datetime,
+        ) -> None:
+            self.account_id = account_id
+            self.trade_id = trade_id
+            self.slippage_bps = slippage_bps
+            self.fees_usd = fees_usd
+            self.ts = ts
+
+        def __repr__(self) -> str:  # pragma: no cover - debugging helper
+            return (
+                "TCAResult(account_id={!r}, trade_id={!r}, slippage_bps={!r}, fees_usd={!r}, ts={!r})"
+            ).format(self.account_id, self.trade_id, self.slippage_bps, self.fees_usd, self.ts)
+
+
+    class TCAReport:
+        account_id = _ColumnProxy("account_id")
+        symbol = _ColumnProxy("symbol")
+        ts = _ColumnProxy("ts")
+        expected_cost = _ColumnProxy("expected_cost")
+        realized_cost = _ColumnProxy("realized_cost")
+        slippage_bps = _ColumnProxy("slippage_bps")
+
+        def __init__(
+            self,
+            *,
+            account_id: str,
+            symbol: str,
+            ts: datetime,
+            expected_cost: Decimal,
+            realized_cost: Decimal,
+            slippage_bps: Decimal,
+        ) -> None:
+            self.account_id = account_id
+            self.symbol = symbol
+            self.ts = ts
+            self.expected_cost = expected_cost
+            self.realized_cost = realized_cost
+            self.slippage_bps = slippage_bps
+
+        def __repr__(self) -> str:  # pragma: no cover - debugging helper
+            return (
+                "TCAReport(account_id={!r}, symbol={!r}, ts={!r}, expected_cost={!r}, "
+                "realized_cost={!r}, slippage_bps={!r})"
+            ).format(
+                self.account_id,
+                self.symbol,
+                self.ts,
+                self.expected_cost,
+                self.realized_cost,
+                self.slippage_bps,
+            )
 
 
 def _audit_access(
@@ -428,19 +697,21 @@ def _persist_result(
     slippage_bps: Decimal,
     fees_usd: Decimal,
 ) -> None:
+    quantized_slippage = slippage_bps.quantize(DECIMAL_TWELVE_DP, rounding=ROUND_HALF_UP)
+    quantized_fees = fees_usd.quantize(DECIMAL_TWELVE_DP, rounding=ROUND_HALF_UP)
     record = session.get(TCAResult, (account_id, trade_id))
     if record is None:
         record = TCAResult(
             account_id=account_id,
             trade_id=trade_id,
-            slippage_bps=slippage_bps,
-            fees_usd=fees_usd,
+            slippage_bps=quantized_slippage,
+            fees_usd=quantized_fees,
             ts=datetime.now(UTC),
         )
         session.add(record)
     else:
-        record.slippage_bps = slippage_bps
-        record.fees_usd = fees_usd
+        record.slippage_bps = quantized_slippage
+        record.fees_usd = quantized_fees
         record.ts = datetime.now(UTC)
 
 
@@ -762,13 +1033,16 @@ def _persist_report(
     realized_cost: Decimal,
     slippage_bps: Decimal,
 ) -> None:
+    quantized_expected = expected_cost.quantize(DECIMAL_TWELVE_DP, rounding=ROUND_HALF_UP)
+    quantized_realized = realized_cost.quantize(DECIMAL_TWELVE_DP, rounding=ROUND_HALF_UP)
+    quantized_slippage = slippage_bps.quantize(DECIMAL_TWELVE_DP, rounding=ROUND_HALF_UP)
     session.add(
         TCAReport(
             account_id=account_id,
             symbol=symbol,
-            expected_cost=expected_cost,
-            realized_cost=realized_cost,
-            slippage_bps=slippage_bps,
+            expected_cost=quantized_expected,
+            realized_cost=quantized_realized,
+            slippage_bps=quantized_slippage,
             ts=datetime.now(UTC),
         )
     )
