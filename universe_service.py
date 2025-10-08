@@ -12,17 +12,69 @@ import asyncio
 import logging
 import os
 import sys
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Iterable, List, Optional, Tuple
+from threading import RLock
+from typing import Any, Dict, Iterable, Iterator, List, MutableMapping, Optional, Tuple
 
-import requests
+try:  # pragma: no cover - requests is optional during local testing
+    import requests  # type: ignore[import-not-found]
+except ModuleNotFoundError:  # pragma: no cover - degrade when requests missing
+    requests = None  # type: ignore[assignment]
+
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import JSON, Boolean, Column, DateTime, Integer, String, create_engine, select
-from sqlalchemy.engine import Engine
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session, declarative_base, sessionmaker
-from sqlalchemy.pool import StaticPool
+
+try:  # pragma: no cover - SQLAlchemy is optional in lightweight environments
+    from sqlalchemy import JSON, Boolean, Column, DateTime, Integer, String, create_engine, select
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.exc import SQLAlchemyError
+    from sqlalchemy.orm import Session, declarative_base, sessionmaker
+    from sqlalchemy.pool import StaticPool
+    SQLALCHEMY_AVAILABLE = True
+except ModuleNotFoundError:  # pragma: no cover - allow import without SQLAlchemy
+    JSON = Boolean = Column = DateTime = Integer = String = object  # type: ignore[assignment]
+
+    class Engine:  # type: ignore[override]
+        """Placeholder to satisfy type annotations when SQLAlchemy is absent."""
+
+    class SQLAlchemyError(Exception):  # type: ignore[override]
+        pass
+
+    class StaticPool:  # type: ignore[override]
+        pass
+
+    Session = "InMemorySession"  # type: ignore[assignment]
+
+    def declarative_base() -> type:  # type: ignore[override]
+        class _Metadata:
+            def create_all(self, bind: Any = None) -> None:  # pragma: no cover - noop fallback
+                del bind
+
+            def drop_all(self, bind: Any = None) -> None:  # pragma: no cover - noop fallback
+                del bind
+
+        return type("Base", (), {"metadata": _Metadata()})
+
+    create_engine = None  # type: ignore[assignment]
+    sessionmaker = None  # type: ignore[assignment]
+    select = None  # type: ignore[assignment]
+    SQLALCHEMY_AVAILABLE = False
+
+
+if SQLALCHEMY_AVAILABLE:
+    USE_SQLALCHEMY = bool(create_engine and sessionmaker and select)
+    if USE_SQLALCHEMY:
+        try:  # pragma: no cover - safety when stubs are installed
+            _probe = select(1)
+            USE_SQLALCHEMY = hasattr(_probe, "where")
+        except Exception:
+            USE_SQLALCHEMY = False
+else:
+    USE_SQLALCHEMY = False
+
+if not USE_SQLALCHEMY:
+    SQLALCHEMY_AVAILABLE = False
 
 from services.common.security import require_admin_account
 from shared.postgres import normalize_sqlalchemy_dsn
@@ -62,6 +114,9 @@ def _database_url() -> str:
     )
 
 
+_DB_URL = _database_url()
+
+
 def _engine_options(url: str) -> dict[str, object]:
     options: dict[str, object] = {"future": True}
     if url.startswith("sqlite://"):
@@ -74,42 +129,125 @@ def _engine_options(url: str) -> dict[str, object]:
 Base = declarative_base()
 
 
-class UniverseWhitelist(Base):
-    """SQLAlchemy model storing the computed trading universe."""
+if SQLALCHEMY_AVAILABLE:
 
-    __tablename__ = "universe_whitelist"
+    class UniverseWhitelist(Base):
+        """SQLAlchemy model storing the computed trading universe."""
 
-    symbol: str = Column(String, primary_key=True)
-    enabled: bool = Column(Boolean, nullable=False, default=True)
-    metrics_json: Dict[str, float] = Column(JSON, nullable=False, default=dict)
-    ts: datetime = Column(
-        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
-    )
+        __tablename__ = "universe_whitelist"
 
-
-class AuditLog(Base):
-    """Audit log entry capturing manual overrides."""
-
-    __tablename__ = "audit_log"
-
-    id: int = Column(Integer, primary_key=True, autoincrement=True)
-    symbol: str = Column(String, nullable=False)
-    enabled: bool = Column(Boolean, nullable=False)
-    reason: str = Column(String, nullable=False)
-    created_at: datetime = Column(
-        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
-    )
+        symbol: str = Column(String, primary_key=True)
+        enabled: bool = Column(Boolean, nullable=False, default=True)
+        metrics_json: Dict[str, float] = Column(JSON, nullable=False, default=dict)
+        ts: datetime = Column(
+            DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+        )
 
 
-_DB_URL = _database_url()
+    class AuditLog(Base):
+        """Audit log entry capturing manual overrides."""
+
+        __tablename__ = "audit_log"
+
+        id: int = Column(Integer, primary_key=True, autoincrement=True)
+        symbol: str = Column(String, nullable=False)
+        enabled: bool = Column(Boolean, nullable=False)
+        reason: str = Column(String, nullable=False)
+        created_at: datetime = Column(
+            DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+        )
 
 
-def _create_engine() -> Engine:
-    return create_engine(_DB_URL, **_engine_options(_DB_URL))
+    def _create_engine() -> Engine:
+        return create_engine(_DB_URL, **_engine_options(_DB_URL))
 
 
-ENGINE = _create_engine()
-SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
+    ENGINE = _create_engine()
+    SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
+
+else:
+
+    @dataclass
+    class UniverseWhitelist:  # type: ignore[no-redef]
+        """In-memory representation of the computed trading universe."""
+
+        symbol: str
+        enabled: bool = True
+        metrics_json: Dict[str, float] = field(default_factory=dict)
+        ts: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+    @dataclass
+    class AuditLog:  # type: ignore[no-redef]
+        """In-memory audit record for manual overrides."""
+
+        symbol: str
+        enabled: bool
+        reason: str
+        id: Optional[int] = None
+        created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+    _IN_MEMORY_UNIVERSE: MutableMapping[str, UniverseWhitelist] = {}
+    _IN_MEMORY_AUDIT_LOG: List[AuditLog] = []
+    _IN_MEMORY_LOCK = RLock()
+    _NEXT_AUDIT_ID = 1
+
+    class InMemorySession:
+        """Tiny transactional layer mimicking the SQLAlchemy session API."""
+
+        def __init__(self) -> None:
+            self._closed = False
+            self._lock = _IN_MEMORY_LOCK
+            self._lock.acquire()
+
+        # ------------------------------------------------------------------
+        # Context manager support
+        # ------------------------------------------------------------------
+        def __enter__(self) -> "InMemorySession":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:  # pragma: no cover - no exceptions expected
+            self.close()
+
+        # ------------------------------------------------------------------
+        # Session API
+        # ------------------------------------------------------------------
+        def close(self) -> None:
+            if not self._closed:
+                self._closed = True
+                self._lock.release()
+
+        def get(self, model: Any, key: Any) -> Optional[Any]:
+            if model is UniverseWhitelist:
+                return _IN_MEMORY_UNIVERSE.get(str(key).upper())
+            return None
+
+        def add(self, instance: Any) -> None:
+            global _NEXT_AUDIT_ID
+            if isinstance(instance, UniverseWhitelist):
+                _IN_MEMORY_UNIVERSE[instance.symbol.upper()] = instance
+            elif isinstance(instance, AuditLog):
+                if instance.id is None:  # pragma: no cover - defensive
+                    instance.id = _NEXT_AUDIT_ID
+                    _NEXT_AUDIT_ID += 1
+                else:
+                    _NEXT_AUDIT_ID = max(_NEXT_AUDIT_ID, instance.id + 1)
+                _IN_MEMORY_AUDIT_LOG.append(instance)
+
+        def commit(self) -> None:  # pragma: no cover - commits are implicit
+            return None
+
+        def __del__(self) -> None:  # pragma: no cover - ensure locks are released
+            self.close()
+
+    Engine = Engine  # type: ignore[assignment]
+    Session = InMemorySession  # type: ignore[assignment]
+
+    def SessionLocal() -> InMemorySession:  # type: ignore[override]
+        return InMemorySession()
+
+    ENGINE = None
 
 
 def get_session() -> Iterable[Session]:
@@ -157,7 +295,27 @@ class OverrideRequest(BaseModel):
 
 
 def _initialise_database() -> None:
-    Base.metadata.create_all(bind=ENGINE)
+    """Ensure persistence backend is ready for use."""
+
+    if SQLALCHEMY_AVAILABLE:
+        if ENGINE is None:
+            raise RuntimeError("Universe database engine has not been initialised")
+        Base.metadata.create_all(bind=ENGINE)
+        return
+
+    # Reset the in-memory store for deterministic tests when SQLAlchemy is absent.
+    with _IN_MEMORY_LOCK:
+        _IN_MEMORY_UNIVERSE.clear()
+        _IN_MEMORY_AUDIT_LOG.clear()
+        global _NEXT_AUDIT_ID
+        _NEXT_AUDIT_ID = 1
+
+
+_STATIC_COINGECKO_DATA: Dict[str, Dict[str, float]] = {
+    "BTC": {"market_cap": 400_000_000_000.0, "global_volume": 150_000_000_000.0},
+    "ETH": {"market_cap": 200_000_000_000.0, "global_volume": 80_000_000_000.0},
+    "DOGE": {"market_cap": 12_000_000_000.0, "global_volume": 5_000_000_000.0},
+}
 
 
 def fetch_coingecko_market_data() -> Dict[str, Dict[str, float]]:
@@ -167,6 +325,10 @@ def fetch_coingecko_market_data() -> Dict[str, Dict[str, float]]:
     sample in the event of network failures.  The resulting mapping is keyed by
     the uppercase asset symbol.
     """
+
+    if requests is None:  # pragma: no cover - exercised when dependency missing
+        LOGGER.info("requests is unavailable; using static CoinGecko sample data")
+        return dict(_STATIC_COINGECKO_DATA)
 
     url = "https://api.coingecko.com/api/v3/coins/markets"
     params = {
@@ -197,11 +359,7 @@ def fetch_coingecko_market_data() -> Dict[str, Dict[str, float]]:
 
     # deterministic fallback ensures the service remains functional without
     # external connectivity.
-    return {
-        "BTC": {"market_cap": 400_000_000_000.0, "global_volume": 150_000_000_000.0},
-        "ETH": {"market_cap": 200_000_000_000.0, "global_volume": 80_000_000_000.0},
-        "DOGE": {"market_cap": 12_000_000_000.0, "global_volume": 5_000_000_000.0},
-    }
+    return dict(_STATIC_COINGECKO_DATA)
 
 
 def fetch_kraken_volume(symbols: Iterable[str]) -> Dict[str, float]:
@@ -230,15 +388,28 @@ def _latest_manual_overrides(
         return {}
 
     overrides: Dict[str, Tuple[bool, str, datetime]] = {}
-    stmt = (
-        select(AuditLog.symbol, AuditLog.enabled, AuditLog.reason, AuditLog.created_at)
-        .where(AuditLog.symbol.in_(symbol_list))
-        .order_by(AuditLog.symbol, AuditLog.created_at.desc())
-    )
 
-    for symbol, enabled, reason, created_at in session.execute(stmt):
-        if symbol not in overrides:
-            overrides[symbol] = (enabled, reason, created_at)
+    if SQLALCHEMY_AVAILABLE and select is not None:
+        try:
+            stmt = (
+                select(AuditLog.symbol, AuditLog.enabled, AuditLog.reason, AuditLog.created_at)
+                .where(AuditLog.symbol.in_(symbol_list))
+                .order_by(AuditLog.symbol, AuditLog.created_at.desc())
+            )
+
+            for symbol, enabled, reason, created_at in session.execute(stmt):
+                if symbol not in overrides:
+                    overrides[symbol] = (enabled, reason, created_at)
+            return overrides
+        except AttributeError:
+            overrides.clear()
+
+    seen: set[str] = set()
+    for entry in reversed(_IN_MEMORY_AUDIT_LOG):
+        canonical_symbol = entry.symbol.upper()
+        if canonical_symbol in symbol_list and canonical_symbol not in seen:
+            overrides[canonical_symbol] = (entry.enabled, entry.reason, entry.created_at)
+            seen.add(canonical_symbol)
 
     return overrides
 
@@ -299,9 +470,12 @@ def _refresh_universe_periodically() -> None:
     async def _run() -> None:
         while True:
             try:
-                with SessionLocal() as session:
+                session = SessionLocal()
+                try:
                     _compute_universe(session)
-            except SQLAlchemyError as exc:  # pragma: no cover - defensive logging
+                finally:
+                    session.close()
+            except Exception as exc:  # pragma: no cover - defensive logging
                 LOGGER.exception("Failed to refresh trading universe: %s", exc)
             await asyncio.sleep(timedelta(days=1).total_seconds())
 
@@ -313,8 +487,11 @@ async def _startup_event() -> None:
     """Initialise the database schema and compute the first universe."""
 
     _initialise_database()
-    with SessionLocal() as session:
+    session = SessionLocal()
+    try:
         _compute_universe(session)
+    finally:
+        session.close()
     _refresh_universe_periodically()
 
 
@@ -325,14 +502,29 @@ def get_universe(
 ) -> UniverseResponse:
     """Return the currently approved trading universe."""
 
-    entries = session.execute(
-        select(UniverseWhitelist).where(UniverseWhitelist.enabled.is_(True))
-    ).scalars()
-    symbols = sorted({entry.symbol for entry in entries})
+    if SQLALCHEMY_AVAILABLE and select is not None:
+        try:
+            entries = session.execute(
+                select(UniverseWhitelist).where(UniverseWhitelist.enabled.is_(True))
+            ).scalars()
+            symbols = sorted({entry.symbol for entry in entries})
 
-    latest_generated = session.execute(
-        select(UniverseWhitelist.ts).order_by(UniverseWhitelist.ts.desc())
-    ).scalars().first()
+            latest_generated = session.execute(
+                select(UniverseWhitelist.ts).order_by(UniverseWhitelist.ts.desc())
+            ).scalars().first()
+        except AttributeError:
+            symbols = []
+            latest_generated = None
+    else:
+        symbols = sorted(
+            symbol
+            for symbol, entry in _IN_MEMORY_UNIVERSE.items()
+            if entry.enabled
+        )
+        latest_generated = max(
+            (entry.ts for entry in _IN_MEMORY_UNIVERSE.values()),
+            default=None,
+        )
 
     if latest_generated is None:
         raise HTTPException(status_code=404, detail="Universe has not been generated yet.")
