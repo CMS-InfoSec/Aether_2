@@ -47,17 +47,24 @@ class SanctionRecord(SanctionsBase):
         default=_utcnow,
     )
 
-    __table_args__ = (PrimaryKeyConstraint("symbol", "source", name="pk_sanctions"),)
+        def __repr__(self) -> str:  # pragma: no cover - debugging helper
+            return (
+                "SanctionRecord("  # pragma: no cover - debugging helper
+                f"symbol={self.symbol!r}, "  # pragma: no cover - debugging helper
+                f"status={self.status!r}, "  # pragma: no cover - debugging helper
+                f"source={self.source!r}, "  # pragma: no cover - debugging helper
+                f"ts={self.ts!r}"  # pragma: no cover - debugging helper
+                ")"
+            )
+else:
+    @dataclass
+    class SanctionRecord:
+        symbol: str
+        status: str
+        source: str
+        ts: datetime
 
-    def __repr__(self) -> str:  # pragma: no cover - debugging helper
-        return (
-            "SanctionRecord("  # pragma: no cover - debugging helper
-            f"symbol={self.symbol!r}, "  # pragma: no cover - debugging helper
-            f"status={self.status!r}, "  # pragma: no cover - debugging helper
-            f"source={self.source!r}, "  # pragma: no cover - debugging helper
-            f"ts={self.ts!r}"  # pragma: no cover - debugging helper
-            ")"
-        )
+    Engine = object  # type: ignore[assignment]
 
 
 BLOCKING_STATUSES: Final[set[str]] = {
@@ -77,4 +84,5 @@ def is_blocking_status(status: str) -> bool:
 def ensure_sanctions_schema(engine: Engine) -> None:
     """Create the sanctions table when it does not exist."""
 
-    SanctionsBase.metadata.create_all(bind=engine, tables=[SanctionRecord.__table__])
+    if SQLALCHEMY_AVAILABLE:
+        SanctionsBase.metadata.create_all(bind=engine, tables=[SanctionRecord.__table__])

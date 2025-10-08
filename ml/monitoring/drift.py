@@ -5,13 +5,76 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Iterable, Tuple, TYPE_CHECKING, Any, Sequence
 
-import numpy as np
-import pandas as pd
-from scipy.stats import ks_2samp
+try:  # pragma: no cover - optional scientific stack dependency
+    import numpy as np
+except Exception:  # pragma: no cover - executed when numpy is unavailable
+    np = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - optional dependency in lightweight environments
+    import pandas as pd
+except Exception:  # pragma: no cover - executed when pandas is unavailable
+    pd = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - SciPy is optional for drift calculations
+    from scipy.stats import ks_2samp
+except Exception:  # pragma: no cover - executed when scipy is unavailable
+    ks_2samp = None  # type: ignore[assignment]
+
+if TYPE_CHECKING:  # pragma: no cover - imported for typing only
+    import numpy
+    import pandas
 
 LOGGER = logging.getLogger(__name__)
+
+
+class MissingDependencyError(RuntimeError):
+    """Raised when drift calculations require optional scientific packages."""
+
+
+def _require_numpy() -> "numpy":
+    if np is None:
+        raise MissingDependencyError(
+            "numpy is required for drift calculations. Install numpy to enable PSI and KS metrics."
+        )
+    return np
+
+
+def _require_pandas() -> "pandas":
+    if pd is None:
+        raise MissingDependencyError(
+            "pandas is required for drift calculations. Install pandas to enable PSI and KS metrics."
+        )
+    return pd
+
+
+def _require_ks_test():
+    if ks_2samp is None:
+        raise MissingDependencyError(
+            "scipy is required for KS drift statistics. Install scipy to evaluate drift."
+        )
+    return ks_2samp
+
+
+def _to_numpy_array(series: Sequence[float] | Any) -> "numpy.ndarray":
+    numpy = _require_numpy()
+    pandas = pd
+
+    if pandas is not None and isinstance(series, pandas.Series):
+        values = series.dropna().to_numpy(dtype=float)
+        return numpy.asarray(values, dtype=float)
+
+    if isinstance(series, (list, tuple)):
+        iterable = series
+    else:
+        try:
+            iterable = list(series)  # type: ignore[arg-type]
+        except TypeError:
+            iterable = [series]
+
+    raw = [value for value in iterable if value is not None]
+    return numpy.asarray(raw, dtype=float)
 
 
 @dataclass
@@ -36,27 +99,37 @@ class DriftReport:
         }
 
 
-def population_stability_index(expected: pd.Series, actual: pd.Series, bins: int = 10) -> float:
-    expected_counts, bin_edges = np.histogram(expected, bins=bins)
-    actual_counts, _ = np.histogram(actual, bins=bin_edges)
-    expected_perc = expected_counts / expected_counts.sum()
-    actual_perc = actual_counts / max(actual_counts.sum(), 1)
-    stability = np.sum(
+def population_stability_index(expected: "pandas.Series", actual: "pandas.Series", bins: int = 10) -> float:
+    numpy = _require_numpy()
+    expected_values = _to_numpy_array(expected)
+    actual_values = _to_numpy_array(actual)
+
+    if expected_values.size == 0:
+        return 0.0
+
+    expected_counts, bin_edges = numpy.histogram(expected_values, bins=bins)
+    actual_counts, _ = numpy.histogram(actual_values, bins=bin_edges)
+    expected_total = max(expected_counts.sum(), 1)
+    actual_total = max(actual_counts.sum(), 1)
+    expected_perc = expected_counts / expected_total
+    actual_perc = actual_counts / actual_total
+    stability = numpy.sum(
         (actual_perc - expected_perc)
-        * np.log((actual_perc + 1e-8) / (expected_perc + 1e-8))
+        * numpy.log((actual_perc + 1e-8) / (expected_perc + 1e-8))
     )
     return float(stability)
 
 
 def evaluate_feature_drift(
     feature: str,
-    baseline: pd.Series,
-    production: pd.Series,
+    baseline: "pandas.Series",
+    production: "pandas.Series",
     psi_threshold: float = 0.2,
     ks_threshold: float = 0.1,
 ) -> DriftReport:
+    ks_test = _require_ks_test()
     psi_value = population_stability_index(baseline, production)
-    ks_stat, _ = ks_2samp(baseline, production)
+    ks_stat, _ = ks_test(baseline, production)
     psi_alert = psi_value > psi_threshold
     ks_alert = ks_stat > ks_threshold
     alert = psi_alert or ks_alert
@@ -78,11 +151,16 @@ def evaluate_feature_drift(
 
 
 def generate_drift_report(
-    baseline_df: pd.DataFrame,
-    production_df: pd.DataFrame,
+    baseline_df: "pandas.DataFrame",
+    production_df: "pandas.DataFrame",
     psi_threshold: float = 0.2,
     ks_threshold: float = 0.1,
 ) -> Tuple[DriftReport, ...]:
+    pandas = _require_pandas()
+    if not isinstance(baseline_df, pandas.DataFrame):
+        baseline_df = pandas.DataFrame(baseline_df)
+    if not isinstance(production_df, pandas.DataFrame):
+        production_df = pandas.DataFrame(production_df)
     common_features = set(baseline_df.columns).intersection(production_df.columns)
     reports = []
     for feature in sorted(common_features):
@@ -103,3 +181,13 @@ def save_report(reports: Iterable[DriftReport], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(payload, indent=2))
     LOGGER.info("Saved drift report to %s", output_path)
+
+
+__all__ = [
+    "DriftReport",
+    "MissingDependencyError",
+    "population_stability_index",
+    "evaluate_feature_drift",
+    "generate_drift_report",
+    "save_report",
+]

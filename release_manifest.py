@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -61,6 +62,37 @@ yaml = load_yaml_module()
 
 LOGGER = logging.getLogger("release_manifest")
 _RELEASE_MANIFEST_ALLOW_SQLITE_FLAG = "RELEASE_MANIFEST_ALLOW_SQLITE_FOR_TESTS"
+
+
+if _sa_make_url is not None:
+    make_url = _sa_make_url
+else:
+
+    class _ParsedURL:
+        """Lightweight substitute for SQLAlchemy's URL parsing."""
+
+        def __init__(self, raw_url: str):
+            parsed = urlparse(raw_url)
+            if not parsed.scheme:
+                raise ArgumentError(f"Could not parse URL from string '{raw_url}'")
+            self._parsed = parsed
+            self.drivername = parsed.scheme
+            self.query = {key: value for key, value in parse_qsl(parsed.query)}
+            self.host = parsed.hostname
+            path = parsed.path[1:] if parsed.path.startswith("/") else parsed.path
+            self.database = path or None
+
+        def set(self, drivername: str) -> "_ParsedURL":
+            parts = list(self._parsed)
+            parts[0] = drivername
+            return _ParsedURL(urlunparse(parts))
+
+        def render_as_string(self, hide_password: bool = False) -> str:
+            return urlunparse(self._parsed)
+
+
+    def make_url(raw_url: str) -> "_ParsedURL":
+        return _ParsedURL(raw_url)
 
 
 def _normalize_release_db_url(raw_url: str) -> str:
@@ -179,15 +211,25 @@ class Base(DeclarativeBase):
     pass
 
 
-class ReleaseManifest(Base):
-    """ORM model for persisted release manifests."""
+class Base(DeclarativeBase):
+    """Declarative base for the release manifest ORM model."""
 
-    __tablename__ = "release_manifests"
+    pass
 
-    manifest_id = Column(String, primary_key=True)
-    manifest_json = Column(JSON, nullable=False)
-    manifest_hash = Column(String, nullable=True)
-    ts = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    class ReleaseManifest(Base):
+        """ORM model for persisted release manifests."""
+
+        __tablename__ = "release_manifests"
+
+        manifest_id = Column(String, primary_key=True)
+        manifest_json = Column(JSON, nullable=False)
+        manifest_hash = Column(String, nullable=True)
+        ts = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+else:
+    Base = None
+
+    class ReleaseManifest:  # pragma: no cover - placeholder for type checkers
+        pass
 
 
 @dataclass
@@ -219,8 +261,193 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+_SQLITE_MANIFEST_DDL = """
+CREATE TABLE IF NOT EXISTS release_manifests (
+    manifest_id TEXT PRIMARY KEY,
+    manifest_json TEXT NOT NULL,
+    manifest_hash TEXT,
+    ts TEXT NOT NULL
+)
+"""
+
+
+def _sqlite_path_from_url(url: str) -> str:
+    parsed = urlparse(url)
+    driver = parsed.scheme.lower()
+    if driver not in {"sqlite", "sqlite+pysqlite"}:
+        raise RuntimeError(
+            "The lightweight release_manifest fallback only supports sqlite URLs; "
+            f"received '{url}'."
+        )
+
+    netloc = parsed.netloc or ""
+    path = parsed.path or ""
+    if netloc and not path.startswith("/"):
+        path = f"/{path}"
+    full_path = f"/{netloc}{path}" if netloc else path
+    if full_path in {"", "/"}:
+        return ":memory:"
+    if full_path.startswith("/:"):
+        return full_path[1:]
+    return unquote(full_path)
+
+
+if not _SQLALCHEMY_AVAILABLE:
+
+    class _SQLiteEngine:
+        def __init__(self, url: str):
+            self.url = url
+            self.database = _sqlite_path_from_url(url)
+            if self.database != ":memory:":
+                db_path = Path(self.database)
+                db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        def connect(self) -> sqlite3.Connection:
+            conn = sqlite3.connect(self.database, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            return conn
+
+        def dispose(self) -> None:  # pragma: no cover - sqlite3 connections auto-close
+            return None
+
+
+    class _SQLiteSession:
+        def __init__(self, engine: "_SQLiteEngine"):
+            self._engine = engine
+            self._conn = engine.connect()
+            self._ensure_schema()
+            self._closed = False
+
+        def _ensure_schema(self) -> None:
+            self._conn.execute(_SQLITE_MANIFEST_DDL)
+            self._conn.commit()
+
+        def __enter__(self) -> "_SQLiteSession":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            try:
+                if exc_type:
+                    self._conn.rollback()
+                else:
+                    self._conn.commit()
+            finally:
+                self.close()
+
+        def close(self) -> None:
+            if not self._closed:
+                self._conn.close()
+                self._closed = True
+
+        def commit(self) -> None:
+            self._conn.commit()
+
+        def rollback(self) -> None:
+            self._conn.rollback()
+
+        def connection(self) -> sqlite3.Connection:
+            return self._conn
+
+
+    def _sqlite_save_manifest(
+        session: "_SQLiteSession", manifest_id: str, payload: Dict[str, Dict[str, str]], payload_hash: str
+    ) -> Manifest:
+        ts = datetime.now(timezone.utc)
+        data = json.dumps(payload)
+        session.connection().execute(
+            """
+            INSERT OR REPLACE INTO release_manifests (manifest_id, manifest_json, manifest_hash, ts)
+            VALUES (?, ?, ?, ?)
+            """,
+            (manifest_id, data, payload_hash, ts.isoformat()),
+        )
+        session.connection().commit()
+        return Manifest(manifest_id=manifest_id, payload=payload, ts=ts, manifest_hash=payload_hash)
+
+
+    def _sqlite_fetch_manifest(session: "_SQLiteSession", manifest_id: str) -> Optional[Manifest]:
+        row = session.connection().execute(
+            "SELECT manifest_id, manifest_json, manifest_hash, ts FROM release_manifests WHERE manifest_id = ?",
+            (manifest_id,),
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            payload = json.loads(row["manifest_json"])
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        ts_raw = row["ts"]
+        try:
+            ts = datetime.fromisoformat(ts_raw)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+        except Exception:  # pragma: no cover - defensive guard for corrupted data
+            ts = datetime.fromtimestamp(0, tz=timezone.utc)
+        return Manifest(manifest_id=row["manifest_id"], payload=payload, ts=ts, manifest_hash=row["manifest_hash"])
+
+
+    def _sqlite_list_manifests(session: "_SQLiteSession", limit: Optional[int]) -> List[Manifest]:
+        sql = "SELECT manifest_id, manifest_json, manifest_hash, ts FROM release_manifests ORDER BY ts DESC"
+        params: Tuple[object, ...] = tuple()
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (limit,)
+        rows = session.connection().execute(sql, params).fetchall()
+        manifests: List[Manifest] = []
+        for row in rows:
+            try:
+                payload = json.loads(row["manifest_json"])
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+            try:
+                ts = datetime.fromisoformat(row["ts"])
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+            except Exception:  # pragma: no cover - defensive
+                ts = datetime.fromtimestamp(0, tz=timezone.utc)
+            manifests.append(
+                Manifest(
+                    manifest_id=row["manifest_id"],
+                    payload=payload,
+                    ts=ts,
+                    manifest_hash=row["manifest_hash"],
+                )
+            )
+        return manifests
+
+
+    def _sqlite_backfill_hashes(session: "_SQLiteSession") -> None:
+        rows = session.connection().execute(
+            "SELECT manifest_id, manifest_json FROM release_manifests WHERE manifest_hash IS NULL OR manifest_hash = ''"
+        ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(row["manifest_json"])
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+            if not isinstance(payload, dict):
+                continue
+            payload_hash = compute_manifest_hash(payload)
+            session.connection().execute(
+                "UPDATE release_manifests SET manifest_hash = ? WHERE manifest_id = ?",
+                (payload_hash, row["manifest_id"]),
+            )
+        session.connection().commit()
+
+
+    def _ensure_sqlite_schema(engine: "_SQLiteEngine") -> None:
+        conn = engine.connect()
+        try:
+            conn.execute(_SQLITE_MANIFEST_DDL)
+            conn.commit()
+        finally:
+            conn.close()
+
 def _create_engine(url: str) -> Engine:
-    """Create a SQLAlchemy engine with sensible defaults for Postgres/Timescale."""
+    """Create a database engine suitable for the release manifest store."""
+
+    if not _SQLALCHEMY_AVAILABLE:
+        return cast(Engine, _SQLiteEngine(url))
 
     options: Dict[str, object] = {"future": True, "pool_pre_ping": True}
 
@@ -269,6 +496,21 @@ def run_release_manifest_migrations(database_url: Optional[str] = None) -> None:
     if not url:
         raise RuntimeError("Release manifest migrations require a valid database URL")
 
+    if (command is None or Config is None) or not _SQLALCHEMY_AVAILABLE:
+        LOGGER.warning(
+            "Alembic is unavailable; ensuring release_manifest schema exists via a lightweight fallback."
+        )
+        engine = _create_engine(url)
+        try:
+            if _SQLALCHEMY_AVAILABLE and Base is not None:
+                Base.metadata.create_all(engine)  # type: ignore[union-attr]
+            else:
+                _ensure_sqlite_schema(cast("_SQLiteEngine", engine))
+        finally:
+            if hasattr(engine, "dispose"):
+                engine.dispose()
+        return
+
     config = Config()
     config.set_main_option("script_location", str(_MIGRATIONS_PATH))
     config.set_main_option("sqlalchemy.url", url)
@@ -281,38 +523,53 @@ run_release_manifest_migrations(DEFAULT_RELEASE_DB_URL)
 release_engine = _create_engine(DEFAULT_RELEASE_DB_URL)
 
 
-SessionLocal = sessionmaker(
-    bind=release_engine,
-    autoflush=False,
-    autocommit=False,
-    expire_on_commit=False,
-    future=True,
-)
+if _SQLALCHEMY_AVAILABLE:
+    SessionLocal = sessionmaker(
+        bind=release_engine,
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+        future=True,
+    )
+else:
+
+    class _SQLiteSessionFactory:
+        def __init__(self, engine: "_SQLiteEngine"):
+            self._engine = engine
+
+        def __call__(self) -> "_SQLiteSession":
+            return _SQLiteSession(self._engine)
+
+
+    SessionLocal = _SQLiteSessionFactory(cast("_SQLiteEngine", release_engine))
 
 
 def _backfill_manifest_hashes() -> None:
     """Populate missing manifest hashes for existing records."""
 
     with SessionLocal() as session:
-        try:
-            records = (
-                session.query(ReleaseManifest)
-                .filter((ReleaseManifest.manifest_hash.is_(None)) | (ReleaseManifest.manifest_hash == ""))
-                .all()
-            )
-        except SQLAlchemyError:  # pragma: no cover - query failure
-            return
-        changed = False
-        for record in records:
-            if not isinstance(record.manifest_json, dict):
-                continue
-            record.manifest_hash = compute_manifest_hash(record.manifest_json)
-            changed = True
-        if changed:
+        if _SQLALCHEMY_AVAILABLE:
             try:
-                session.commit()
-            except SQLAlchemyError:  # pragma: no cover - commit failure
-                session.rollback()
+                records = (
+                    session.query(ReleaseManifest)
+                    .filter((ReleaseManifest.manifest_hash.is_(None)) | (ReleaseManifest.manifest_hash == ""))
+                    .all()
+                )
+            except SQLAlchemyError:  # pragma: no cover - query failure
+                return
+            changed = False
+            for record in records:
+                if not isinstance(record.manifest_json, dict):
+                    continue
+                record.manifest_hash = compute_manifest_hash(record.manifest_json)
+                changed = True
+            if changed:
+                try:
+                    session.commit()
+                except SQLAlchemyError:  # pragma: no cover - commit failure
+                    session.rollback()
+        else:
+            _sqlite_backfill_hashes(session)
 
 
 def compute_manifest_hash(payload: Dict[str, Dict[str, str]]) -> str:
@@ -444,6 +701,9 @@ def collect_config_versions(database_url: str = DEFAULT_CONFIG_DB_URL) -> Dict[s
     generation resilient for local development environments.
     """
 
+    if not _SQLALCHEMY_AVAILABLE:
+        return {}
+
     try:
         engine = _create_engine(database_url)
     except SQLAlchemyError:  # pragma: no cover - invalid URL
@@ -490,6 +750,9 @@ def save_manifest(session: Session, manifest_id: str, payload: Dict[str, Dict[st
     """Persist a manifest payload in the database."""
 
     payload_hash = compute_manifest_hash(payload)
+    if not _SQLALCHEMY_AVAILABLE:
+        return _sqlite_save_manifest(cast("_SQLiteSession", session), manifest_id, payload, payload_hash)
+
     record = ReleaseManifest(
         manifest_id=manifest_id,
         manifest_json=payload,
@@ -510,6 +773,9 @@ def save_manifest(session: Session, manifest_id: str, payload: Dict[str, Dict[st
 def fetch_manifest(session: Session, manifest_id: str) -> Optional[Manifest]:
     """Fetch a manifest by identifier."""
 
+    if not _SQLALCHEMY_AVAILABLE:
+        return _sqlite_fetch_manifest(cast("_SQLiteSession", session), manifest_id)
+
     record: Optional[ReleaseManifest] = session.get(ReleaseManifest, manifest_id)
     if not record:
         return None
@@ -523,6 +789,9 @@ def fetch_manifest(session: Session, manifest_id: str) -> Optional[Manifest]:
 
 def list_manifests(session: Session, limit: Optional[int] = None) -> List[Manifest]:
     """Return persisted manifests ordered by timestamp descending."""
+
+    if not _SQLALCHEMY_AVAILABLE:
+        return _sqlite_list_manifests(cast("_SQLiteSession", session), limit)
 
     stmt = select(ReleaseManifest).order_by(ReleaseManifest.ts.desc())
     if limit is not None:
