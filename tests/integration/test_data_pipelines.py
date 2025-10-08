@@ -6,10 +6,11 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, Dict, List
 
-import numpy as np
-import pandas as pd
 import pytest
 import httpx
+
+np = pytest.importorskip("numpy")
+pd = pytest.importorskip("pandas")
 
 from services import coingecko_ingest
 from services import kraken_ws_ingest

@@ -1,5 +1,6 @@
 """Reporting service utilities and reconciliation helpers."""
 
+from . import kraken_reconciliation
 from .kraken_reconciliation import (
     KrakenReconciliationResult,
     KrakenReconciliationService,
@@ -18,4 +19,5 @@ __all__ = [
     "TimescaleInternalLedger",
     "configure_reconciliation_metrics",
     "get_reconciliation_metrics",
+    "kraken_reconciliation",
 ]

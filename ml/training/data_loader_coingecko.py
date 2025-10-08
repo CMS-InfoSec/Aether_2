@@ -14,23 +14,116 @@ import os
 import random
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from uuid import UUID, uuid4
 
-import pandas as pd
-import requests
-from pandas import DataFrame
-from sqlalchemy import text
-from sqlalchemy.engine import Engine, create_engine
+_PANDAS_ERROR = "pandas is required for CoinGecko data loading functionality"
+_REQUESTS_ERROR = "requests is required for CoinGecko data downloads"
+_SQLALCHEMY_ERROR = "sqlalchemy is required for CoinGecko persistence"
+_GX_ERROR = "great_expectations is required for CoinGecko data validation"
 
-try:  # Great Expectations is an optional dependency in some environments.
-    import great_expectations as gx
+
+class MissingDependencyError(RuntimeError):
+    """Raised when a required third-party dependency is unavailable."""
+
+
+try:  # Optional dependency for dataframe processing.
+    import pandas as _PANDAS_MODULE
+except Exception:  # pragma: no cover - exercised only when pandas is absent.
+    _PANDAS_MODULE = None  # type: ignore[assignment]
+
+
+try:  # HTTP client used for CoinGecko downloads.
+    import requests as _REQUESTS_MODULE
+except Exception:  # pragma: no cover - exercised only when requests is absent.
+    _REQUESTS_MODULE = None  # type: ignore[assignment]
+
+
+try:  # SQLAlchemy is required to persist OHLCV data in TimescaleDB.
+    from sqlalchemy import text as _SQLALCHEMY_TEXT
+    from sqlalchemy.engine import create_engine as _SQLALCHEMY_CREATE_ENGINE
+except Exception:  # pragma: no cover - executed when SQLAlchemy isn't installed.
+    _SQLALCHEMY_TEXT = None  # type: ignore[assignment]
+    _SQLALCHEMY_CREATE_ENGINE = None  # type: ignore[assignment]
+
+
+try:  # Great Expectations is optional in lightweight environments.
+    import great_expectations as _GX_MODULE
     from great_expectations.exceptions import CheckpointNotFoundError
-except ImportError as exc:  # pragma: no cover - surfaced at runtime if missing.
-    raise ModuleNotFoundError(
-        "great_expectations is required for CoinGecko data validation"
-    ) from exc
+except Exception:  # pragma: no cover - executed only when GE is missing.
+    _GX_MODULE = None  # type: ignore[assignment]
+
+    class CheckpointNotFoundError(Exception):  # type: ignore[no-redef]
+        """Fallback exception placeholder when Great Expectations is unavailable."""
+
+
+if TYPE_CHECKING:  # pragma: no cover - imported solely for type checking.
+    from pandas import DataFrame as _PandasDataFrame
+    from sqlalchemy.engine import Engine as _SQLAlchemyEngine
+    from requests import Session as _RequestsSession
+else:  # Lightweight fallbacks used at runtime when optional deps are absent.
+    _PandasDataFrame = Any  # type: ignore[assignment]
+    _SQLAlchemyEngine = Any  # type: ignore[assignment]
+    _RequestsSession = Any  # type: ignore[assignment]
+
+DataFrame = _PandasDataFrame
+Engine = _SQLAlchemyEngine
+
+_SESSION: Optional[_RequestsSession] = None
+
+def _require_pandas():
+    """Return the pandas module or raise a descriptive dependency error."""
+
+    if _PANDAS_MODULE is None:
+        raise MissingDependencyError(_PANDAS_ERROR)
+    return _PANDAS_MODULE
+
+
+def _require_requests():
+    """Return the requests module or raise when it is unavailable."""
+
+    if _REQUESTS_MODULE is None:
+        raise MissingDependencyError(_REQUESTS_ERROR)
+    return _REQUESTS_MODULE
+
+
+def _get_session() -> _RequestsSession:
+    """Initialise or return the cached HTTP session."""
+
+    requests_module = _require_requests()
+    global _SESSION
+    if _SESSION is None:
+        _SESSION = requests_module.Session()
+    return _SESSION
+
+
+def _require_sqlalchemy() -> None:
+    """Ensure SQLAlchemy helpers are available before using them."""
+
+    if _SQLALCHEMY_CREATE_ENGINE is None or _SQLALCHEMY_TEXT is None:
+        raise MissingDependencyError(_SQLALCHEMY_ERROR)
+
+
+def _create_engine(*args, **kwargs):
+    _require_sqlalchemy()
+    assert _SQLALCHEMY_CREATE_ENGINE is not None  # For type checkers.
+    return _SQLALCHEMY_CREATE_ENGINE(*args, **kwargs)
+
+
+def _sqlalchemy_text(statement: str):
+    _require_sqlalchemy()
+    assert _SQLALCHEMY_TEXT is not None  # For type checkers.
+    return _SQLALCHEMY_TEXT(statement)
+
+
+def _require_gx():
+    """Return the Great Expectations module or raise a dependency error."""
+
+    if _GX_MODULE is None:
+        raise MissingDependencyError(_GX_ERROR)
+    return _GX_MODULE
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -43,7 +136,6 @@ GRANULARITY_TO_PANDAS = {
     "1d": "1D",
 }
 MAX_RANGE_SECONDS = 90 * 24 * 60 * 60  # CoinGecko allows up to 90 days per call.
-SESSION = requests.Session()
 
 
 def _ensure_timezone(dt: datetime) -> datetime:
@@ -62,8 +154,11 @@ def _request_with_retry(url: str, params: Mapping[str, object]) -> Mapping[str, 
 
     for attempt in range(1, max_attempts + 1):
         try:
-            response = SESSION.get(url, params=params, timeout=30)
-        except requests.RequestException as exc:
+            response = _get_session().get(url, params=params, timeout=30)
+        except Exception as exc:
+            requests_module = _require_requests()
+            if not isinstance(exc, requests_module.RequestException):
+                raise
             if attempt == max_attempts:
                 raise
             sleep_for = backoff_seconds * (2 ** (attempt - 1))
@@ -122,6 +217,7 @@ def _transform_market_chart(
     if not isinstance(prices, list) or not prices:
         raise ValueError("CoinGecko response missing price data")
 
+    pd = _require_pandas()
     price_df = pd.DataFrame(prices, columns=["ts", "price"])
     volume_df = pd.DataFrame(volumes or [], columns=["ts", "volume"])
     frame = price_df.merge(volume_df, on="ts", how="left")
@@ -142,9 +238,10 @@ def _transform_market_chart(
     return resampled
 
 
-def _get_ge_context() -> gx.DataContext:
+def _get_ge_context():
     """Instantiate the Great Expectations data context."""
 
+    gx = _require_gx()
     root_dir = os.getenv("GE_DATA_CONTEXT_ROOT_DIR")
     if root_dir:
         return gx.get_context(context_root_dir=root_dir)
@@ -175,6 +272,7 @@ def fetch_ohlcv(
     symbol_id = symbol.lower()
     vs_currency = vs_currency.lower()
 
+    pd = _require_pandas()
     frames: List[DataFrame] = []
     cursor = start_utc
 
@@ -231,7 +329,7 @@ def _get_engine() -> Engine:
     dsn = os.getenv("TIMESCALE_DSN")
     if not dsn:
         raise EnvironmentError("TIMESCALE_DSN environment variable must be set")
-    return create_engine(dsn, pool_pre_ping=True, pool_recycle=3600)
+    return _create_engine(dsn, pool_pre_ping=True, pool_recycle=3600)
 
 
 def _ensure_ohlcv_table(engine: Engine, table_name: str) -> None:
@@ -253,10 +351,12 @@ def _ensure_ohlcv_table(engine: Engine, table_name: str) -> None:
     create_index_sql = f"""
     CREATE INDEX IF NOT EXISTS idx_{table_name}_symbol_ts ON {table_name} (symbol, ts);
     """
+    sql_text = _sqlalchemy_text
+
     with engine.begin() as conn:
-        conn.execute(text(create_table_sql))
-        conn.execute(text(create_hypertable_sql), {"table_name": table_name})
-        conn.execute(text(create_index_sql))
+        conn.execute(sql_text(create_table_sql))
+        conn.execute(sql_text(create_hypertable_sql), {"table_name": table_name})
+        conn.execute(sql_text(create_index_sql))
 
 
 def upsert_timescale(df: DataFrame, symbol: str, granularity: str) -> None:
@@ -283,7 +383,9 @@ def upsert_timescale(df: DataFrame, symbol: str, granularity: str) -> None:
         for row in df.itertuples(index=False)
     ]
 
-    insert_sql = text(
+    sql_text = _sqlalchemy_text
+
+    insert_sql = sql_text(
         f"""
         INSERT INTO {table_name} (symbol, ts, open, high, low, close, volume)
         VALUES (:symbol, :ts, :open, :high, :low, :close, :volume)
@@ -314,8 +416,10 @@ def _ensure_runs_table(engine: Engine) -> None:
         PRIMARY KEY (run_id, symbol, granularity)
     );
     """
+    sql_text = _sqlalchemy_text
+
     with engine.begin() as conn:
-        conn.execute(text(create_sql))
+        conn.execute(sql_text(create_sql))
 
 
 def _record_run_start(
@@ -325,7 +429,9 @@ def _record_run_start(
     granularity: str,
     started_at: datetime,
 ) -> None:
-    sql = text(
+    sql_text = _sqlalchemy_text
+
+    sql = sql_text(
         """
         INSERT INTO cg_history_runs (run_id, symbol, granularity, rows, started_at, status)
         VALUES (:run_id, :symbol, :granularity, 0, :started_at, 'running')
@@ -359,7 +465,9 @@ def _record_run_finish(
     status: str,
     error: Optional[str],
 ) -> None:
-    sql = text(
+    sql_text = _sqlalchemy_text
+
+    sql = sql_text(
         """
         UPDATE cg_history_runs
         SET rows = :rows,
@@ -385,7 +493,9 @@ def _record_run_finish(
 
 
 def _load_completed(engine: Engine, run_id: str) -> Mapping[Tuple[str, str], str]:
-    sql = text(
+    sql_text = _sqlalchemy_text
+
+    sql = sql_text(
         """
         SELECT symbol, granularity, status
         FROM cg_history_runs

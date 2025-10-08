@@ -9,13 +9,52 @@ from __future__ import annotations
 import importlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
 
-import numpy as np
-import pandas as pd
-from sqlalchemy import create_engine
-from sqlalchemy.engine import Engine
+if TYPE_CHECKING:  # pragma: no cover - imported for static typing only
+    import numpy as np
+    import pandas as pd
+    from sqlalchemy.engine import Engine
+else:  # pragma: no cover - runtime placeholders when optional dependencies are missing
+    np = None  # type: ignore[assignment]
+    pd = None  # type: ignore[assignment]
+    Engine = Any  # type: ignore[assignment]
+
+
+class MissingDependencyError(RuntimeError):
+    """Raised when optional data loader dependencies are unavailable."""
+
+try:  # pragma: no cover - SQLAlchemy is optional in lightweight environments.
+    from sqlalchemy import create_engine as _create_sqlalchemy_engine
+    from sqlalchemy.engine import Engine as _Engine
+except Exception as import_exc:  # pragma: no cover - exercised in tests when missing
+    _Engine = Any  # type: ignore[assignment]
+    _IMPORT_EXCEPTION = import_exc
+
+    def _create_sqlalchemy_engine(*args: Any, **kwargs: Any):  # type: ignore[override]
+        raise MissingDependencyError("SQLAlchemy is required for Timescale access") from _IMPORT_EXCEPTION
+else:
+    Engine = _Engine  # type: ignore[assignment]
+
+
+@lru_cache(maxsize=1)
+def _require_numpy():
+    try:
+        import numpy as numpy_module  # type: ignore import-not-found
+    except ModuleNotFoundError as exc:  # pragma: no cover - exercised via tests
+        raise MissingDependencyError("numpy is required for the data loader utilities") from exc
+    return numpy_module
+
+
+@lru_cache(maxsize=1)
+def _require_pandas():
+    try:
+        import pandas as pandas_module  # type: ignore import-not-found
+    except ModuleNotFoundError as exc:  # pragma: no cover - exercised via tests
+        raise MissingDependencyError("pandas is required for the data loader utilities") from exc
+    return pandas_module
 
 
 @dataclass
@@ -64,39 +103,39 @@ class TimescaleFeastConfig:
 class WalkForwardSplit:
     """Container for a single purged walk-forward split."""
 
-    train: pd.DataFrame
-    validation: pd.DataFrame
-    test: pd.DataFrame
+    train: "pd.DataFrame"
+    validation: "pd.DataFrame"
+    test: "pd.DataFrame"
     metadata: Dict[str, datetime]
 
 
-def _create_engine(uri: str) -> Engine:
+def _create_engine(uri: str) -> "Engine":
     """Create a SQLAlchemy engine for TimescaleDB interactions."""
 
-    return create_engine(uri, pool_pre_ping=True, pool_recycle=3600)
+    return _create_sqlalchemy_engine(uri, pool_pre_ping=True, pool_recycle=3600)
 
 
-def _load_base_frame(engine: Engine, query: str, time_column: str) -> pd.DataFrame:
+def _load_base_frame(engine: "Engine", query: str, time_column: str) -> "pd.DataFrame":
     """Load the base time-series frame from TimescaleDB."""
 
-    frame = pd.read_sql(query, engine)
-    frame[time_column] = pd.to_datetime(frame[time_column], utc=True)
+    pandas = _require_pandas()
+    frame = pandas.read_sql(query, engine)
+    frame[time_column] = pandas.to_datetime(frame[time_column], utc=True)
     return frame.sort_values(time_column).reset_index(drop=True)
 
 
 def _load_feast_features(
     feature_view: str,
-    entities: pd.DataFrame,
+    entities: "pd.DataFrame",
     feature_service: Optional[str] = None,
     feature_store_repo: Optional[str] = None,
-) -> pd.DataFrame:
+) -> "pd.DataFrame":
     """Load feature vectors from Feast if the dependency is available."""
 
     feast_spec = importlib.util.find_spec("feast")
     if feast_spec is None:
-        raise ModuleNotFoundError(
-            "Feast is required to fetch online features. Install feast to "
-            "enable feature retrieval."
+        raise MissingDependencyError(
+            "Feast is required to fetch online features. Install feast to enable feature retrieval."
         )
 
     feast_module = importlib.import_module("feast")
@@ -111,7 +150,8 @@ def _load_feast_features(
         features = store.get_historical_features(
             entity_df=entities, features=[feature_view]
         )
-    return features.to_df()
+    pandas = _require_pandas()
+    return pandas.DataFrame(features.to_df())
 
 
 def compute_fee_adjusted_label(
@@ -194,11 +234,12 @@ def compute_fee_adjusted_labels(
     labels: Sequence[float],
     turnovers: Sequence[float],
     transaction_fee_bps: float,
-) -> np.ndarray:
+) -> "np.ndarray":
     """Vectorised helper for ``compute_fee_adjusted_label``."""
 
-    labels_array = np.asarray(labels, dtype=float)
-    turnover_array = np.asarray(turnovers, dtype=float)
+    numpy = _require_numpy()
+    labels_array = numpy.asarray(labels, dtype=float)
+    turnover_array = numpy.asarray(turnovers, dtype=float)
     fees = turnover_array * transaction_fee_bps / 10_000.0
     return labels_array - fees
 
