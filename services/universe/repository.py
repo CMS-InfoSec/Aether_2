@@ -15,6 +15,8 @@ from typing import (
     Mapping,
     Optional,
     Protocol,
+    Sequence,
+    SupportsFloat,
     Tuple,
     cast,
 )
@@ -24,10 +26,23 @@ from shared.spot import is_spot_symbol, normalize_spot_symbol
 from services.common.config import TimescaleSession, get_timescale_session
 
 
+class ResultProtocol(Protocol):
+    """Subset of the SQLAlchemy ``Result`` API consumed by the repository."""
+
+    def all(self) -> Sequence[Any]:
+        ...
+
+    def scalar_one_or_none(self) -> Optional[Any]:
+        ...
+
+    def one_or_none(self) -> Optional[Any]:
+        ...
+
+
 class SessionProtocol(Protocol):
     """Minimal subset of the SQLAlchemy Session API used by the repository."""
 
-    def execute(self, *args: Any, **kwargs: Any) -> Any:
+    def execute(self, *args: Any, **kwargs: Any) -> ResultProtocol:
         ...
 
     def commit(self) -> None:
@@ -102,8 +117,18 @@ else:  # pragma: no cover - runtime imports with graceful degradation
         class NoSuchTableError(SQLAlchemyError):
             """Fallback error for missing tables when SQLAlchemy is unavailable."""
 
+        class Result(ResultProtocol):  # pragma: no cover - runtime stub
+            def all(self) -> Sequence[Any]:
+                raise RuntimeError("sqlalchemy is required for Timescale integration")
+
+            def scalar_one_or_none(self) -> Optional[Any]:
+                raise RuntimeError("sqlalchemy is required for Timescale integration")
+
+            def one_or_none(self) -> Optional[Any]:
+                raise RuntimeError("sqlalchemy is required for Timescale integration")
+
         class Session(SessionProtocol):  # pragma: no cover - runtime stub
-            def execute(self, *args: Any, **kwargs: Any) -> Any:
+            def execute(self, *args: Any, **kwargs: Any) -> ResultProtocol:
                 raise RuntimeError("sqlalchemy is required for Timescale integration")
 
             def commit(self) -> None:
@@ -196,6 +221,9 @@ class UniverseRepository:
         cls._session_factory_overrides[account_id] = factory
         if schema is not None:
             cls._schemas[account_id] = schema
+        else:
+            cls._schemas.pop(account_id, None)
+        cls._session_factories.pop(account_id, None)
 
     # ------------------------------------------------------------------
     # Manual override management
@@ -212,6 +240,26 @@ class UniverseRepository:
         except ValueError:
             return None
         return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+    @staticmethod
+    def _coerce_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return float(value)
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, SupportsFloat):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                return None
+        return None
 
     def _current_overrides(
         self, session: SessionProtocol
@@ -454,6 +502,15 @@ class UniverseRepository:
             extend_existing=True,
         )
 
+    @staticmethod
+    def _row_mapping(row: Any) -> Mapping[str, Any]:
+        if isinstance(row, Mapping):
+            return row
+        mapping = getattr(row, "_mapping", None)
+        if isinstance(mapping, Mapping):
+            return mapping
+        raise TypeError("Result rows must provide mapping-style access")
+
     def _load_market_snapshots(self, session: SessionProtocol) -> Dict[str, MarketSnapshot]:
         table = self._market_snapshots_table()
         try:
@@ -479,24 +536,43 @@ class UniverseRepository:
         snapshots: Dict[str, MarketSnapshot] = {}
         now = self._now()
         for row in rows:
-            observed_at = self._coerce_datetime(row.observed_at)
+            try:
+                mapping = self._row_mapping(row)
+            except TypeError:
+                continue
+            observed_at = self._coerce_datetime(mapping.get("observed_at"))
             if observed_at is None or now - observed_at > self.MARKET_SNAPSHOT_MAX_AGE:
                 continue
-            raw_symbol = f"{row.base_asset}-{row.quote_asset}"
+            base_asset_raw = mapping.get("base_asset")
+            quote_asset_raw = mapping.get("quote_asset")
+            if not isinstance(base_asset_raw, str) or not isinstance(quote_asset_raw, str):
+                continue
+            raw_symbol = f"{base_asset_raw}-{quote_asset_raw}"
             normalized_symbol = normalize_spot_symbol(raw_symbol)
             if not normalized_symbol or not is_spot_symbol(normalized_symbol):
                 continue
             if normalized_symbol in snapshots:
                 continue
             base_asset, quote_asset = normalized_symbol.split("-", 1)
+            market_cap = self._coerce_float(mapping.get("market_cap"))
+            global_volume = self._coerce_float(mapping.get("global_volume_24h"))
+            kraken_volume = self._coerce_float(mapping.get("kraken_volume_24h"))
+            volatility = self._coerce_float(mapping.get("volatility_30d"))
+            if (
+                market_cap is None
+                or global_volume is None
+                or kraken_volume is None
+                or volatility is None
+            ):
+                continue
             snapshots[normalized_symbol] = MarketSnapshot(
                 base_asset=base_asset,
                 quote_asset=quote_asset,
-                market_cap=float(row.market_cap),
-                global_volume_24h=float(row.global_volume_24h),
-                kraken_volume_24h=float(row.kraken_volume_24h),
-                volatility_30d=float(row.volatility_30d),
-                source=str(row.source or "coingecko"),
+                market_cap=market_cap,
+                global_volume_24h=global_volume,
+                kraken_volume_24h=kraken_volume,
+                volatility_30d=volatility,
+                source=str(mapping.get("source") or "coingecko"),
                 observed_at=observed_at,
             )
         return snapshots
@@ -519,18 +595,32 @@ class UniverseRepository:
         overrides: Dict[str, Dict[str, Any]] = {}
         now = self._now()
         for row in rows:
-            updated_at = self._coerce_datetime(row.updated_at)
+            try:
+                mapping = self._row_mapping(row)
+            except TypeError:
+                continue
+            updated_at = self._coerce_datetime(mapping.get("updated_at"))
             if updated_at is None or now - updated_at > self.FEE_OVERRIDE_MAX_AGE:
                 continue
-            normalized = normalize_spot_symbol(row.instrument)
+            instrument = mapping.get("instrument")
+            if not isinstance(instrument, str):
+                continue
+            normalized = normalize_spot_symbol(instrument)
             if not normalized or not is_spot_symbol(normalized):
                 continue
             if normalized in overrides:
                 continue
+            maker = self._coerce_float(mapping.get("maker"))
+            taker = self._coerce_float(mapping.get("taker"))
+            if maker is None or taker is None:
+                continue
+            currency = mapping.get("currency")
+            if currency is not None and not isinstance(currency, str):
+                currency = str(currency)
             overrides[normalized] = {
-                "currency": row.currency,
-                "maker": float(row.maker),
-                "taker": float(row.taker),
+                "currency": currency,
+                "maker": maker,
+                "taker": taker,
                 "updated_at": updated_at,
             }
         return overrides
@@ -557,15 +647,27 @@ class UniverseRepository:
 
         if row is None:
             return None
-        applied_at = self._coerce_datetime(row.applied_at)
+        try:
+            mapping = self._row_mapping(row)
+        except TypeError:
+            return None
+        applied_at = self._coerce_datetime(mapping.get("applied_at"))
         if applied_at is None:
             applied_at = self._now()
+        config_key = mapping.get("config_key")
+        if not isinstance(config_key, str):
+            config_key = str(config_key)
+        version_raw = mapping.get("version", 0)
+        try:
+            version = int(version_raw)
+        except (TypeError, ValueError):
+            return None
         return ConfigVersionRecord(
-            config_key=str(row.config_key),
-            version=int(row.version),
+            config_key=config_key,
+            version=version,
             applied_at=applied_at,
-            payload=row.payload or {},
-            checksum=row.checksum,
+            payload=mapping.get("payload") or {},
+            checksum=mapping.get("checksum"),
         )
 
 
