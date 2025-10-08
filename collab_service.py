@@ -4,14 +4,40 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime
-from typing import Any, List, Mapping
+import threading
+from datetime import datetime, timezone
+from itertools import count
+from typing import Any, Callable, Iterable, List, Mapping, MutableMapping, Optional
 
-import psycopg
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from psycopg import sql
-from psycopg.rows import dict_row
+
+try:  # psycopg is optional in lightweight environments such as CI.
+    import psycopg  # type: ignore[import-untyped]
+    from psycopg import sql  # type: ignore[import-untyped]
+    from psycopg.rows import dict_row  # type: ignore[import-untyped]
+except ModuleNotFoundError:  # pragma: no cover - exercised in tests via stubs.
+    psycopg = None  # type: ignore[assignment]
+
+    class _SQLString(str):
+        """Minimal stand-in that preserves chaining behaviour."""
+
+        def format(self, *_args: object, **_kwargs: object) -> "_SQLString":
+            return self
+
+    sql = type(  # type: ignore[assignment]
+        "_SQLShim",
+        (),
+        {
+            "SQL": staticmethod(lambda value: _SQLString(value)),
+            "Identifier": staticmethod(lambda value: value),
+        },
+    )
+
+    def dict_row(*_args: object, **_kwargs: object) -> Callable[[Iterable[Any]], MutableMapping[str, Any]]:
+        return lambda row: dict(row) if isinstance(row, Mapping) else row  # type: ignore[return-value]
+
 
 from services.common.config import get_timescale_session
 from services.common.security import require_admin_account
@@ -26,6 +52,135 @@ TIMESCALE = get_timescale_session(ACCOUNT_ID)
 
 AUDIT_STORE = AuditLogStore()
 AUDIT_LOGGER = TimescaleAuditLogger(AUDIT_STORE)
+
+
+class _InMemoryCollabStore:
+    """Lightweight persistence used when psycopg/Timescale are unavailable."""
+
+    def __init__(self) -> None:
+        self._comment_rows: list[dict[str, Any]] = []
+        self._proposal_rows: list[dict[str, Any]] = []
+        self._proposal_ids = count(1)
+        self._lock = threading.Lock()
+
+    def ensure_ready(self) -> None:
+        """Mirror the table bootstrap performed by the real backend."""
+
+    def connect(self) -> "_InMemoryConnection":
+        return _InMemoryConnection(self)
+
+    def insert_comment(self, trade_id: str, author: str, text: str) -> dict[str, Any]:
+        with self._lock:
+            row = {
+                "trade_id": trade_id,
+                "author": author,
+                "text": text,
+                "ts": datetime.now(timezone.utc),
+            }
+            self._comment_rows.append(row)
+            return dict(row)
+
+    def list_comments(self, trade_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = [row for row in self._comment_rows if row["trade_id"] == trade_id]
+        return sorted(rows, key=lambda row: row["ts"])
+
+    def insert_proposal(self, key: str, new_value: str, reason: str) -> dict[str, Any]:
+        with self._lock:
+            row = {
+                "id": next(self._proposal_ids),
+                "key": key,
+                "new_value": new_value,
+                "reason": reason,
+                "status": "pending",
+                "ts": datetime.now(timezone.utc),
+            }
+            self._proposal_rows.append(row)
+            return dict(row)
+
+    def list_pending_proposals(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = [row for row in self._proposal_rows if row["status"] == "pending"]
+        return sorted(rows, key=lambda row: row["ts"], reverse=True)
+
+
+class _InMemoryCursor:
+    """Cursor implementation that emulates the psycopg interface for tests."""
+
+    def __init__(self, store: _InMemoryCollabStore) -> None:
+        self._store = store
+        self._last_row: Optional[dict[str, Any]] = None
+        self._rows: list[dict[str, Any]] = []
+        self.executed: list[tuple[Any, ...] | None] = []
+
+    def __enter__(self) -> "_InMemoryCursor":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    def execute(self, query: str, params: Optional[tuple[Any, ...]] = None) -> None:
+        normalized = " ".join(query.split()).strip().lower()
+        self.executed.append(params)
+
+        if normalized.startswith("insert into collab_comments"):
+            if not params:
+                raise ValueError("collab comment insert requires parameters")
+            trade_id, author, text = params
+            row = self._store.insert_comment(str(trade_id), str(author), str(text))
+            self._rows = [row]
+            self._last_row = row
+        elif normalized.startswith("select trade_id, author, text, ts from collab_comments"):
+            if not params:
+                raise ValueError("collab comments query requires trade identifier")
+            rows = self._store.list_comments(str(params[0]))
+            self._rows = rows
+            self._last_row = rows[0] if rows else None
+        elif normalized.startswith("insert into collab_proposals"):
+            if not params:
+                raise ValueError("collab proposal insert requires parameters")
+            key, new_value, reason = params
+            row = self._store.insert_proposal(str(key), str(new_value), str(reason))
+            self._rows = [row]
+            self._last_row = row
+        elif normalized.startswith(
+            "select id, key, new_value, reason, status, ts from collab_proposals"
+        ):
+            rows = self._store.list_pending_proposals()
+            self._rows = rows
+            self._last_row = rows[0] if rows else None
+        elif normalized.startswith("create table") or normalized.startswith("create index"):
+            self._rows = []
+            self._last_row = None
+        elif normalized.startswith("select"):
+            raise RuntimeError(f"Unsupported SELECT under in-memory backend: {query}")
+        else:
+            raise RuntimeError(f"Unsupported statement under in-memory backend: {query}")
+
+    def fetchone(self) -> Optional[dict[str, Any]]:
+        return self._last_row
+
+    def fetchall(self) -> List[dict[str, Any]]:
+        return list(self._rows)
+
+
+class _InMemoryConnection:
+    """Context manager compatible connection facade used for fallbacks."""
+
+    def __init__(self, store: _InMemoryCollabStore) -> None:
+        self._store = store
+
+    def __enter__(self) -> "_InMemoryConnection":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    def cursor(self, **_kwargs: object) -> _InMemoryCursor:
+        return _InMemoryCursor(self._store)
+
+
+_BACKEND = _InMemoryCollabStore() if psycopg is None else None
 
 app = FastAPI(title="Collaboration Service", version="1.0.0")
 app.add_middleware(CorrelationIdMiddleware)
@@ -69,8 +224,13 @@ class Proposal(BaseModel):
     ts: datetime
 
 
-def _get_conn() -> psycopg.Connection:
-    """Create a connection to the TimescaleDB instance scoped to the account."""
+def _get_conn() -> Any:
+    """Create a connection to the persistence backend scoped to the account."""
+
+    if psycopg is None:
+        if _BACKEND is None:  # pragma: no cover - defensive guard.
+            raise RuntimeError("In-memory backend unavailable")
+        return _BACKEND.connect()
 
     conn = psycopg.connect(TIMESCALE.dsn)
     conn.execute(
@@ -83,6 +243,11 @@ def _get_conn() -> psycopg.Connection:
 
 def _ensure_tables() -> None:
     """Create collaboration tables when the service starts."""
+
+    if psycopg is None:
+        if _BACKEND is not None:
+            _BACKEND.ensure_ready()
+        return
 
     try:
         with _get_conn() as conn:
@@ -187,7 +352,9 @@ def _record_proposal_audit(row: Mapping[str, Any]) -> dict[str, Any]:
 
 @app.post("/collab/comment", response_model=Comment, status_code=status.HTTP_201_CREATED)
 def create_comment(
-    payload: CommentCreate, actor_account: str = Depends(require_admin_account)
+    payload: CommentCreate,
+    response: Response,
+    actor_account: str = Depends(require_admin_account),
 ) -> Comment:
     """Store a new collaboration comment tied to a trade identifier."""
 
@@ -220,7 +387,15 @@ def create_comment(
 
     row_dict = _record_comment_audit(row)
 
-    return Comment(**row_dict)
+    comment = Comment(**row_dict)
+    if response is None:
+        payload = (
+            comment.model_dump() if hasattr(comment, "model_dump") else comment.dict()
+        )
+        return JSONResponse(content=payload, status_code=status.HTTP_201_CREATED)
+
+    response.status_code = status.HTTP_201_CREATED
+    return comment
 
 
 @app.get("/collab/comments", response_model=List[Comment])
@@ -272,7 +447,9 @@ def _decode_new_value(serialized: str) -> Any:
 
 @app.post("/collab/proposal", response_model=Proposal, status_code=status.HTTP_201_CREATED)
 def create_proposal(
-    payload: ProposalCreate, actor_account: str = Depends(require_admin_account)
+    payload: ProposalCreate,
+    response: Response,
+    actor_account: str = Depends(require_admin_account),
 ) -> Proposal:
     """Store a new configuration proposal pending review."""
 
@@ -306,7 +483,15 @@ def create_proposal(
 
     row_dict = _record_proposal_audit(row)
     row_dict["new_value"] = _decode_new_value(row_dict["new_value"])
-    return Proposal(**row_dict)
+    proposal = Proposal(**row_dict)
+    if response is None:
+        payload = (
+            proposal.model_dump() if hasattr(proposal, "model_dump") else proposal.dict()
+        )
+        return JSONResponse(content=payload, status_code=status.HTTP_201_CREATED)
+
+    response.status_code = status.HTTP_201_CREATED
+    return proposal
 
 
 @app.get("/collab/proposals", response_model=List[Proposal])

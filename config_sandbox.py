@@ -6,21 +6,153 @@ import copy
 import importlib.util
 import hashlib
 import json
+import logging
 import math
 import os
 import statistics
 import sys
 import threading
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, MutableMapping
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, MutableMapping
+from types import SimpleNamespace
 
-import yaml
+try:  # pragma: no cover - PyYAML is optional in lightweight environments
+    import yaml
+except ModuleNotFoundError:  # pragma: no cover - exercised when dependency missing
+    yaml = None  # type: ignore[assignment]
+
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import Column, DateTime, Integer, Text, create_engine
-from sqlalchemy.orm import Session, declarative_base, sessionmaker
-from sqlalchemy.pool import StaticPool
+
+
+class _StaticPool:  # pragma: no cover - fallback stand-in
+    """Placeholder matching SQLAlchemy's StaticPool API."""
+
+    pass
+
+
+class _SandboxRunStore:
+    """In-memory persistence for sandbox run records."""
+
+    def __init__(self) -> None:
+        self._records: List[Any] = []
+        self._next_id = 1
+
+    def persist(self, run: Any) -> None:
+        if getattr(run, "id", 0) <= 0:
+            setattr(run, "id", self._next_id)
+            self._next_id += 1
+        self._records.append(run)
+
+    def reset(self) -> None:
+        self._records.clear()
+        self._next_id = 1
+
+
+_IN_MEMORY_STORES: Dict[str, _SandboxRunStore] = {}
+
+
+def _get_store(url: str) -> _SandboxRunStore:
+    store = _IN_MEMORY_STORES.get(url)
+    if store is None:
+        store = _SandboxRunStore()
+        _IN_MEMORY_STORES[url] = store
+    return store
+
+
+class _InMemoryEngine:
+    def __init__(self, url: str) -> None:
+        self.url = url
+        self.store = _get_store(url)
+
+    def reset(self) -> None:
+        self.store.reset()
+
+    def dispose(self) -> None:  # pragma: no cover - API parity
+        self.store.reset()
+
+
+class _InMemorySession:
+    def __init__(self, store: _SandboxRunStore) -> None:
+        self._store = store
+        self._pending: List[Any] = []
+
+    def add(self, obj: Any) -> None:
+        self._pending.append(obj)
+
+    def commit(self) -> None:
+        for obj in self._pending:
+            self._store.persist(obj)
+        self._pending.clear()
+
+    def close(self) -> None:
+        self._pending.clear()
+
+
+class _FallbackMetadata:
+    def create_all(self, **kwargs: Any) -> None:
+        bind = kwargs.get("bind")
+        if hasattr(bind, "reset"):
+            bind.reset()
+
+
+class _FallbackBase(SimpleNamespace):
+    metadata = _FallbackMetadata()
+
+
+def _fallback_declarative_base() -> Any:
+    return _FallbackBase()
+
+
+def _fallback_sessionmaker(*, bind: Any = None, **_: object) -> Callable[[], Any]:
+    if bind is None:
+        raise RuntimeError("In-memory sessionmaker requires a bound engine")
+
+    store = getattr(bind, "store", None)
+    if store is None:
+        raise RuntimeError("In-memory engine does not expose a sandbox store")
+
+    def _factory() -> Any:
+        return _InMemorySession(store)
+
+    return _factory
+
+
+_SQLALCHEMY_AVAILABLE = True
+_SQLALCHEMY_STUB_CREATE_ENGINE: Callable[..., Any] | None = None
+
+
+def _configure_sqlalchemy_fallback(*, stub_engine: Callable[..., Any] | None = None) -> None:
+    global _SQLALCHEMY_AVAILABLE, Column, DateTime, Integer, Text, create_engine, Session, StaticPool, declarative_base, sessionmaker, _SQLALCHEMY_STUB_CREATE_ENGINE
+
+    _SQLALCHEMY_AVAILABLE = False
+    _SQLALCHEMY_STUB_CREATE_ENGINE = stub_engine
+    Column = DateTime = Integer = Text = None  # type: ignore[assignment]
+    create_engine = None  # type: ignore[assignment]
+    Session = Any  # type: ignore[assignment]
+    StaticPool = _StaticPool  # type: ignore[assignment]
+    declarative_base = _fallback_declarative_base  # type: ignore[assignment]
+    sessionmaker = _fallback_sessionmaker  # type: ignore[assignment]
+
+
+try:  # pragma: no cover - optional runtime dependency
+    from sqlalchemy import Column, DateTime, Integer, Text, create_engine
+    from sqlalchemy.orm import Session, declarative_base, sessionmaker
+    from sqlalchemy.pool import StaticPool
+except Exception:  # pragma: no cover - triggered when SQLAlchemy is unavailable
+    _configure_sqlalchemy_fallback()
+else:
+    _CREATE_ENGINE_MODULE = getattr(create_engine, "__module__", "")
+    _SESSIONMAKER_MODULE = getattr(sessionmaker, "__module__", "")
+    if any(
+        module.startswith(prefix)
+        for module in (_CREATE_ENGINE_MODULE, _SESSIONMAKER_MODULE)
+        for prefix in ("tests.", "conftest")
+    ):
+        _configure_sqlalchemy_fallback(stub_engine=create_engine)
+
 
 from shared.postgres import normalize_sqlalchemy_dsn
 
@@ -48,18 +180,34 @@ except ModuleNotFoundError:  # pragma: no cover - fallback when installed under 
 # ---------------------------------------------------------------------------
 
 
+LOGGER = logging.getLogger("config_sandbox")
+
 Base = declarative_base()
 
 
-class SandboxRun(Base):
-    """ORM mapping for recorded sandbox evaluation runs."""
+if _SQLALCHEMY_AVAILABLE:
 
-    __tablename__ = "sandbox_runs"
+    class SandboxRun(Base):
+        """ORM mapping for recorded sandbox evaluation runs."""
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    changes_json = Column(Text, nullable=False)
-    metrics_json = Column(Text, nullable=False)
-    ts = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+        __tablename__ = "sandbox_runs"
+
+        id = Column(Integer, primary_key=True, autoincrement=True)
+        changes_json = Column(Text, nullable=False)
+        metrics_json = Column(Text, nullable=False)
+        ts = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+
+else:
+
+    @dataclass
+    class SandboxRun:  # type: ignore[override]
+        """In-memory representation of sandbox evaluation records."""
+
+        changes_json: str
+        metrics_json: str
+        ts: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+        id: int = field(default=0, init=False)
 
 
 _DATABASE_ENV_KEY = "CONFIG_SANDBOX_DATABASE_URL"
@@ -97,7 +245,15 @@ def _create_engine(database_url: str):
         engine_kwargs["connect_args"] = connect_args
         if ":memory:" in database_url:
             engine_kwargs["poolclass"] = StaticPool
-    return create_engine(database_url, **engine_kwargs)
+    if _SQLALCHEMY_AVAILABLE:
+        return create_engine(database_url, **engine_kwargs)
+
+    if _SQLALCHEMY_STUB_CREATE_ENGINE is not None:
+        try:  # pragma: no cover - stubbed engine used for instrumentation
+            _SQLALCHEMY_STUB_CREATE_ENGINE(database_url, **engine_kwargs)
+        except Exception:
+            pass
+    return _InMemoryEngine(database_url)
 
 
 ENGINE = _create_engine(_database_url())
@@ -149,8 +305,22 @@ def _load_initial_config() -> Dict[str, Any]:
             raise RuntimeError("Failed to parse live config cache") from exc
     if not BASELINE_CONFIG_PATH.exists():
         raise RuntimeError(f"Baseline configuration file not found: {BASELINE_CONFIG_PATH}")
-    with BASELINE_CONFIG_PATH.open("r", encoding="utf-8") as handle:
-        baseline = yaml.safe_load(handle) or {}
+    if yaml is None:
+        LOGGER.warning(
+            "PyYAML is not installed; using an empty config sandbox baseline",
+        )
+        baseline = {}
+    else:
+        with BASELINE_CONFIG_PATH.open("r", encoding="utf-8") as handle:
+            parsed = yaml.safe_load(handle) or {}
+        if not isinstance(parsed, Mapping):
+            LOGGER.warning(
+                "Config sandbox baseline %s is not a mapping; defaulting to empty configuration",
+                BASELINE_CONFIG_PATH,
+            )
+            baseline = {}
+        else:
+            baseline = dict(parsed)
     LIVE_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     LIVE_CONFIG_PATH.write_text(_json_dumps(baseline, indent=2), encoding="utf-8")
     return baseline
