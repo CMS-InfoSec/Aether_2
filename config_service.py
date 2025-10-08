@@ -9,15 +9,56 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Generator, Iterable, List, Mapping, Optional, Set, Tuple, cast
+from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Set, Tuple
+from types import SimpleNamespace
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import JSON, Column, DateTime, Integer, String, UniqueConstraint, create_engine, func, select
-from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session, declarative_base, sessionmaker
-from sqlalchemy.pool import StaticPool
+_SQLALCHEMY_AVAILABLE = True
+
+try:  # pragma: no cover - optional dependency used in production
+    from sqlalchemy import (
+        JSON,
+        Column,
+        DateTime,
+        Integer,
+        String,
+        UniqueConstraint,
+        create_engine,
+        func,
+        select,
+    )
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.orm import Session, declarative_base, sessionmaker
+    from sqlalchemy.pool import StaticPool
+except Exception:  # pragma: no cover - exercised in lightweight environments
+    _SQLALCHEMY_AVAILABLE = False
+    Engine = Any  # type: ignore[assignment]
+    Session = Any  # type: ignore[assignment]
+    StaticPool = type("StaticPool", (), {})  # type: ignore[assignment]
+    JSON = Column = DateTime = Integer = String = UniqueConstraint = None  # type: ignore[assignment]
+    create_engine = func = select = None  # type: ignore[assignment]
+
+    class _FallbackMetadata:
+        def create_all(self, **kwargs: Any) -> None:
+            bind = kwargs.get("bind")
+            if hasattr(bind, "reset"):
+                bind.reset()
+
+        def drop_all(self, **kwargs: Any) -> None:
+            bind = kwargs.get("bind")
+            if hasattr(bind, "reset"):
+                bind.reset()
+
+    class _FallbackBase(SimpleNamespace):
+        metadata = _FallbackMetadata()
+
+    def declarative_base() -> Any:  # type: ignore[override]
+        return _FallbackBase()
+
+    def sessionmaker(**_: object) -> Callable[[], Any]:  # type: ignore[override]
+        raise RuntimeError("SQLAlchemy sessionmaker is unavailable in this environment")
 
 from shared.audit_hooks import AuditEvent, load_audit_hooks
 from shared.postgres import normalize_sqlalchemy_dsn
@@ -52,33 +93,139 @@ LOGGER = logging.getLogger("config_service")
 _SQLITE_FALLBACK_FLAG = "CONFIG_ALLOW_SQLITE_FOR_TESTS"
 
 
-def _log_config_audit(
-    *,
-    actor: str,
-    action: str,
-    entity: str,
-    before: Mapping[str, Any],
-    after: Mapping[str, Any],
-    client_ip: Optional[str],
-    failure_message: str,
-) -> None:
-    """Emit a config service audit entry while handling optional fallbacks."""
+if not _SQLALCHEMY_AVAILABLE:
 
-    hooks = load_audit_hooks()
-    event = AuditEvent(
-        actor=actor,
-        action=action,
-        entity=entity,
-        before=before,
-        after=after,
-        ip_address=client_ip,
-    )
-    event.log_with_fallback(
-        hooks,
-        LOGGER,
-        failure_message=failure_message,
-        disabled_message=f"Audit logging disabled; skipping {action} for {entity}",
-    )
+    @dataclass
+    class ConfigVersion:  # type: ignore[override]
+        """In-memory representation of committed configuration versions."""
+
+        id: int
+        account_id: str
+        key: str
+        value_json: Any
+        version: int
+        approvers: List[str]
+        ts: datetime
+
+    class _InMemoryConfigStore:
+        def __init__(self) -> None:
+            self._records: Dict[str, Dict[str, List[ConfigVersion]]] = {}
+            self._next_id = 1
+
+        def reset(self) -> None:
+            self._records.clear()
+            self._next_id = 1
+
+        def next_version(self, *, account_id: str, key: str) -> int:
+            account_records = self._records.get(account_id, {})
+            key_records = account_records.get(key, [])
+            if not key_records:
+                return 1
+            return key_records[-1].version + 1
+
+        def commit_version(
+            self,
+            *,
+            account_id: str,
+            key: str,
+            value: Any,
+            approvers: Iterable[str],
+            version: int,
+            ts: datetime,
+        ) -> ConfigVersion:
+            record = ConfigVersion(
+                id=self._next_id,
+                account_id=account_id,
+                key=key,
+                value_json=value,
+                version=version,
+                approvers=list(approvers),
+                ts=ts,
+            )
+            self._next_id += 1
+            account_records = self._records.setdefault(account_id, {})
+            account_records.setdefault(key, []).append(record)
+            return record
+
+        def latest(self, *, account_id: str, key: str) -> Optional[ConfigVersion]:
+            account_records = self._records.get(account_id, {})
+            entries = account_records.get(key)
+            if not entries:
+                return None
+            return entries[-1]
+
+        def history(self, *, account_id: str, key: str) -> List[ConfigVersion]:
+            account_records = self._records.get(account_id, {})
+            entries = account_records.get(key, [])
+            return list(entries)
+
+        def account_records(self, account_id: str) -> List[ConfigVersion]:
+            account_records = self._records.get(account_id, {})
+            results: List[ConfigVersion] = []
+            for records in account_records.values():
+                results.extend(records)
+            return list(results)
+
+    _IN_MEMORY_STORES: Dict[str, _InMemoryConfigStore] = {}
+
+    def _get_in_memory_store(url: str) -> _InMemoryConfigStore:
+        store = _IN_MEMORY_STORES.get(url)
+        if store is None:
+            store = _InMemoryConfigStore()
+            _IN_MEMORY_STORES[url] = store
+        return store
+
+    class _InMemoryEngine:
+        def __init__(self, url: str) -> None:
+            self.url = url
+            self.store = _get_in_memory_store(url)
+
+        def reset(self) -> None:
+            self.store.reset()
+
+    class _InMemorySession:
+        def __init__(self, store: _InMemoryConfigStore) -> None:
+            self._store = store
+
+        def close(self) -> None:  # pragma: no cover - API parity
+            return None
+
+        def next_version(self, *, account_id: str, key: str) -> int:
+            return self._store.next_version(account_id=account_id, key=key)
+
+        def latest(self, *, account_id: str, key: str) -> Optional[ConfigVersion]:
+            return self._store.latest(account_id=account_id, key=key)
+
+        def commit_version(
+            self,
+            *,
+            account_id: str,
+            key: str,
+            value: Any,
+            approvers: Iterable[str],
+            version: int,
+            ts: datetime,
+        ) -> ConfigVersion:
+            return self._store.commit_version(
+                account_id=account_id,
+                key=key,
+                value=value,
+                approvers=approvers,
+                version=version,
+                ts=ts,
+            )
+
+        def history(self, *, account_id: str, key: str) -> List[ConfigVersion]:
+            return self._store.history(account_id=account_id, key=key)
+
+        def account_records(self, account_id: str) -> List[ConfigVersion]:
+            return self._store.account_records(account_id)
+
+    def _in_memory_sessionmaker(store: _InMemoryConfigStore) -> Callable[[], _InMemorySession]:
+        def factory() -> _InMemorySession:
+            return _InMemorySession(store)
+
+        return factory
 
 
 def _require_database_url() -> str:
@@ -108,6 +255,8 @@ def _require_database_url() -> str:
 
 
 def _create_engine(database_url: str):
+    if not _SQLALCHEMY_AVAILABLE:
+        return _InMemoryEngine(database_url)
     connect_args: Dict[str, Any] = {}
     engine_kwargs: Dict[str, Any] = {
         "future": True,
@@ -135,24 +284,24 @@ def _create_engine(database_url: str):
 Base = declarative_base()
 
 
-def _get_config_engine(application: FastAPI) -> Engine:
+def _get_config_engine(application: FastAPI):
     engine = getattr(application.state, "db_engine", None)
     if engine is None:
         raise RuntimeError(
             "Config service database engine is not initialised. "
             "Ensure the FastAPI application startup has completed successfully."
         )
-    return cast(Engine, engine)
+    return engine
 
 
-def _get_session_factory(application: FastAPI) -> sessionmaker:
+def _get_session_factory(application: FastAPI):
     session_factory = getattr(application.state, "db_sessionmaker", None)
     if session_factory is None:
         raise RuntimeError(
             "Config service session factory is unavailable. "
             "Ensure the FastAPI application startup has completed successfully."
         )
-    return cast(sessionmaker, session_factory)
+    return session_factory
 
 
 def _initialise_database(application: FastAPI) -> None:
@@ -161,36 +310,44 @@ def _initialise_database(application: FastAPI) -> None:
 
     database_url = _require_database_url()
     engine = _create_engine(database_url)
-    session_factory = sessionmaker(
-        bind=engine,
-        autoflush=False,
-        autocommit=False,
-        expire_on_commit=False,
-        future=True,
-    )
+    if _SQLALCHEMY_AVAILABLE:
+        session_factory = sessionmaker(
+            bind=engine,
+            autoflush=False,
+            autocommit=False,
+            expire_on_commit=False,
+            future=True,
+        )
+    else:
+        session_factory = _in_memory_sessionmaker(engine.store)
 
     application.state.db_engine = engine
     application.state.db_sessionmaker = session_factory
 
-    Base.metadata.create_all(bind=engine)
+    if _SQLALCHEMY_AVAILABLE:
+        Base.metadata.create_all(bind=engine)
+    else:
+        engine.reset()
 
 
-class ConfigVersion(Base):
-    """ORM model representing committed configuration versions."""
+if _SQLALCHEMY_AVAILABLE:
 
-    __tablename__ = "config_versions"
+    class ConfigVersion(Base):
+        """ORM model representing committed configuration versions."""
 
-    id = Column(Integer, primary_key=True)
-    account_id = Column(String, nullable=False, default="global")
-    key = Column(String, nullable=False)
-    value_json = Column(JSON, nullable=False)
-    version = Column(Integer, nullable=False)
-    approvers = Column(JSON, nullable=False, default=list)
-    ts = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+        __tablename__ = "config_versions"
 
-    __table_args__ = (
-        UniqueConstraint("account_id", "key", "version", name="uq_config_version"),
-    )
+        id = Column(Integer, primary_key=True)
+        account_id = Column(String, nullable=False, default="global")
+        key = Column(String, nullable=False)
+        value_json = Column(JSON, nullable=False)
+        version = Column(Integer, nullable=False)
+        approvers = Column(JSON, nullable=False, default=list)
+        ts = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+        __table_args__ = (
+            UniqueConstraint("account_id", "key", "version", name="uq_config_version"),
+        )
 
 # ---------------------------------------------------------------------------
 # Guarded key management
@@ -231,8 +388,11 @@ def reset_state(application: Optional[FastAPI] = None) -> None:
     """Reset in-memory and database state (used in tests)."""
 
     engine = _get_config_engine(application or app)
-    Base.metadata.drop_all(bind=engine)
-    Base.metadata.create_all(bind=engine)
+    if _SQLALCHEMY_AVAILABLE:
+        Base.metadata.drop_all(bind=engine)
+        Base.metadata.create_all(bind=engine)
+    else:
+        engine.reset()
     _pending_guarded.clear()
 
 
@@ -251,11 +411,13 @@ def get_session(request: Request) -> Generator[Session, None, None]:
 
 
 def _next_version(session: Session, *, account_id: str, key: str) -> int:
-    stmt = select(func.max(ConfigVersion.version)).where(
-        ConfigVersion.account_id == account_id, ConfigVersion.key == key
-    )
-    max_version: Optional[int] = session.execute(stmt).scalar()
-    return (max_version or 0) + 1
+    if _SQLALCHEMY_AVAILABLE:
+        stmt = select(func.max(ConfigVersion.version)).where(
+            ConfigVersion.account_id == account_id, ConfigVersion.key == key
+        )
+        max_version: Optional[int] = session.execute(stmt).scalar()
+        return (max_version or 0) + 1
+    return session.next_version(account_id=account_id, key=key)
 
 
 def _latest_config_record(
@@ -264,13 +426,15 @@ def _latest_config_record(
     account_id: str,
     key: str,
 ) -> Optional[ConfigVersion]:
-    stmt = (
-        select(ConfigVersion)
-        .where(ConfigVersion.account_id == account_id, ConfigVersion.key == key)
-        .order_by(ConfigVersion.version.desc())
-        .limit(1)
-    )
-    return session.execute(stmt).scalars().first()
+    if _SQLALCHEMY_AVAILABLE:
+        stmt = (
+            select(ConfigVersion)
+            .where(ConfigVersion.account_id == account_id, ConfigVersion.key == key)
+            .order_by(ConfigVersion.version.desc())
+            .limit(1)
+        )
+        return session.execute(stmt).scalars().first()
+    return session.latest(account_id=account_id, key=key)
 
 
 def _serialize_config(record: ConfigVersion) -> "ConfigEntry":
@@ -361,18 +525,28 @@ def _commit_version(
     approvers: List[str],
 ) -> ConfigVersion:
     version = _next_version(session, account_id=account_id, key=key)
-    record = ConfigVersion(
+    ts = datetime.now(timezone.utc)
+    if _SQLALCHEMY_AVAILABLE:
+        record = ConfigVersion(
+            account_id=account_id,
+            key=key,
+            value_json=value,
+            version=version,
+            approvers=list(approvers),
+            ts=ts,
+        )
+        session.add(record)
+        session.commit()
+        session.refresh(record)
+        return record
+    return session.commit_version(
         account_id=account_id,
         key=key,
-        value_json=value,
+        value=value,
+        approvers=approvers,
         version=version,
-        approvers=list(approvers),
-        ts=datetime.now(timezone.utc),
+        ts=ts,
     )
-    session.add(record)
-    session.commit()
-    session.refresh(record)
-    return record
 
 
 @app.get("/config/current", response_model=Dict[str, ConfigEntry])
@@ -381,14 +555,20 @@ def get_current_config(
     _admin_account: str = Depends(require_admin_account),
     session: Session = Depends(get_session),
 ) -> Dict[str, ConfigEntry]:
-    stmt = (
-        select(ConfigVersion)
-        .where(ConfigVersion.account_id == account_id)
-        .order_by(ConfigVersion.key.asc(), ConfigVersion.version.desc())
-    )
-    results = session.execute(stmt).scalars().all()
+    if _SQLALCHEMY_AVAILABLE:
+        stmt = (
+            select(ConfigVersion)
+            .where(ConfigVersion.account_id == account_id)
+            .order_by(ConfigVersion.key.asc(), ConfigVersion.version.desc())
+        )
+        records = session.execute(stmt).scalars().all()
+    else:
+        records = sorted(
+            session.account_records(account_id),
+            key=lambda record: (record.key, -record.version),
+        )
     latest: Dict[str, ConfigEntry] = {}
-    for record in results:
+    for record in records:
         if record.key not in latest:
             latest[record.key] = _serialize_config(record)
     return latest
@@ -524,12 +704,15 @@ def get_config_history(
     account_id: str = Query("global", description="Account identifier"),
     session: Session = Depends(get_session),
 ) -> List[ConfigEntry]:
-    stmt = (
-        select(ConfigVersion)
-        .where(ConfigVersion.account_id == account_id, ConfigVersion.key == key)
-        .order_by(ConfigVersion.version.asc())
-    )
-    records = session.execute(stmt).scalars().all()
+    if _SQLALCHEMY_AVAILABLE:
+        stmt = (
+            select(ConfigVersion)
+            .where(ConfigVersion.account_id == account_id, ConfigVersion.key == key)
+            .order_by(ConfigVersion.version.asc())
+        )
+        records = session.execute(stmt).scalars().all()
+    else:
+        records = session.history(account_id=account_id, key=key)
     entries = [_serialize_config(record) for record in records]
     return entries
 

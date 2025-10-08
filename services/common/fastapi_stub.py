@@ -982,11 +982,25 @@ class TestClient:
         token = None
         if isinstance(provided_auth, str) and provided_auth.lower().startswith("bearer "):
             token = provided_auth.split(" ", 1)[1].strip()
+        session = None
+        if token and store is not None:
+            try:
+                session = store.get(token)
+            except Exception:  # pragma: no cover - defensive fallback when store misbehaves
+                session = None
         lower_header_keys = {key.lower() for key in headers}
         header_account_present = "x-account-id" in lower_header_keys
-        if account_id and provided_auth and "x-account-id" not in lower_header_keys:
-            headers["X-Account-ID"] = str(account_id)
-            lower_header_keys.add("x-account-id")
+        if account_id and "x-account-id" not in lower_header_keys:
+            if not provided_auth:
+                headers["X-Account-ID"] = str(account_id)
+                lower_header_keys.add("x-account-id")
+            else:
+                session_account = (
+                    getattr(session, "admin_id", None) if session is not None else None
+                )
+                if session_account and session_account.strip().lower() == str(account_id).strip().lower():
+                    headers["X-Account-ID"] = str(account_id)
+                    lower_header_keys.add("x-account-id")
         if not override_present:
             if account_id and security_module is not None:
                 try:
@@ -1006,7 +1020,8 @@ class TestClient:
                     self.app.state.session_store = store
             if store is not None and account_id:
                 if token:
-                    session = store.get(token)
+                    if session is None:
+                        session = store.get(token)
                     if session is None:
                         session_account = _extract_jwt_subject(token) or str(account_id)
                         session = store.create(str(session_account))
