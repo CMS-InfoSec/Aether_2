@@ -30,7 +30,40 @@ compatible with the stubbed environment.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, Mapping, MutableMapping, Optional, Tuple, Type, TypeVar
+from collections.abc import Mapping as ABCMapping, Sequence as ABCSequence, Set as ABCSet
+import types as _types
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    MutableMapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+)
+
+try:  # pragma: no cover - typing helpers may be unavailable on very old Python versions
+    from typing import get_args, get_origin, get_type_hints
+except Exception:  # pragma: no cover - compatibility fallback
+    def get_origin(annotation: Any) -> Any:
+        return None
+
+    def get_args(annotation: Any) -> Tuple[Any, ...]:
+        return ()
+
+    def get_type_hints(obj: Any) -> Dict[str, Any]:
+        return {}
+
+_UNION_TYPES = {Union}
+UnionType = getattr(_types, "UnionType", None)
+if UnionType is not None:  # pragma: no cover - Python <3.10 compatibility
+    _UNION_TYPES.add(UnionType)
 
 __all__ = [
     "BaseModel",
@@ -180,7 +213,17 @@ class BaseModel:
     model_config: Mapping[str, Any] = {}
 
     def __init__(self, **data: Any) -> None:
-        annotations = getattr(self, "__annotations__", {})
+        annotations = dict(getattr(self, "__annotations__", {}))
+        provided_fields: set[str] = set()
+        try:
+            resolved_annotations = get_type_hints(self.__class__)
+        except Exception:  # pragma: no cover - typing helper best-effort resolution
+            resolved_annotations = {}
+        else:
+            if resolved_annotations:
+                for key, value in resolved_annotations.items():
+                    if key in annotations:
+                        annotations[key] = value
         values: Dict[str, Any] = {}
         validators = self._field_validators()
 
@@ -196,6 +239,7 @@ class BaseModel:
             for key in lookup_keys:
                 if key in data:
                     values[name] = data.pop(key)
+                    provided_fields.add(name)
                     found = True
                     break
 
@@ -217,10 +261,13 @@ class BaseModel:
         values.update(data)
 
         for key, value in list(values.items()):
-            values[key] = self._apply_field_validators(validators, key, "after", value)
+            annotation = annotations.get(key)
+            coerced = self._coerce_value(annotation, value)
+            values[key] = self._apply_field_validators(validators, key, "after", coerced)
 
         for key, value in values.items():
             setattr(self, key, value)
+        self.model_fields_set = provided_fields
 
     def dict(self, *, exclude_none: bool = False) -> Dict[str, Any]:
         return self.model_dump(exclude_none=exclude_none)
@@ -317,6 +364,69 @@ class BaseModel:
                 value = func(value)
             except Exception as exc:  # pragma: no cover - error propagation
                 raise ValidationError(str(exc)) from exc
+        return value
+
+    @staticmethod
+    def _coerce_value(annotation: Any, value: Any) -> Any:
+        if annotation is None:
+            return value
+
+        origin = get_origin(annotation)
+        if origin is None:
+            if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+                if value is None or isinstance(value, annotation):
+                    return value
+                if isinstance(value, Mapping):
+                    return annotation(**value)
+                return annotation(value)
+            return value
+
+        if origin in (list, List, ABCSequence):
+            args = get_args(annotation)
+            inner = args[0] if args else Any
+            if isinstance(value, (list, tuple, set, frozenset)):
+                coerced = [BaseModel._coerce_value(inner, item) for item in value]
+                return coerced
+            return value
+
+        if origin is tuple:
+            args = get_args(annotation)
+            inner = args[0] if args else Any
+            if isinstance(value, tuple):
+                return tuple(BaseModel._coerce_value(inner, item) for item in value)
+            if isinstance(value, list):
+                return tuple(BaseModel._coerce_value(inner, item) for item in value)
+            return value
+
+        if origin in (set, frozenset, ABCSet):
+            args = get_args(annotation)
+            inner = args[0] if args else Any
+            if isinstance(value, (set, frozenset, list, tuple)):
+                coerced = {BaseModel._coerce_value(inner, item) for item in value}
+                if origin is frozenset:
+                    return frozenset(coerced)
+                return set(coerced)
+            return value
+
+        if origin in (dict, Dict, ABCMapping):
+            key_type, value_type = (get_args(annotation) + (Any, Any))[:2]
+            if isinstance(value, Mapping):
+                return {
+                    BaseModel._coerce_value(key_type, key): BaseModel._coerce_value(value_type, item)
+                    for key, item in value.items()
+                }
+            return value
+
+        if origin in _UNION_TYPES:
+            for option in get_args(annotation):
+                if option is type(None):  # noqa: E721 - intentional identity check
+                    if value is None:
+                        return None
+                    continue
+                try:
+                    return BaseModel._coerce_value(option, value)
+                except Exception:
+                    continue
         return value
 
 
