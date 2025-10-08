@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple, cast
 
 from fastapi import Header, HTTPException, Request, status
 
@@ -124,7 +124,7 @@ def _get_session_store(request: Request) -> SessionStoreProtocol:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Configured session store does not implement the required interface.",
         )
-    return store  # type: ignore[return-value]
+    return cast(SessionStoreProtocol, store)
 
 
 def _extract_token(raw_value: Optional[str], *, header_name: str) -> str:

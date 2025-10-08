@@ -4,21 +4,45 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Optional
+from typing import Any, Awaitable, Callable, Optional, ParamSpec, TypeVar, cast
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
-from pydantic import BaseModel, Field
+
+from shared.pydantic_compat import BaseModel, Field
 
 from common.schemas.contracts import SimModeEvent
 from services.common.adapters import KafkaNATSAdapter
 from services.common.security import require_admin_account
 from shared.sim_mode import SimModeStatus, sim_mode_repository
 from shared.simulation import sim_mode_state
+from shared.audit_hooks import AuditEvent, load_audit_hooks
 
 
 LOGGER = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/sim", tags=["Simulation Mode"])
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+def _router_get(
+    *args: Any, **kwargs: Any
+) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
+    """Return a typed ``router.get`` decorator preserving call signatures."""
+
+    return cast(Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]], router.get(*args, **kwargs))
+
+
+def _router_post(
+    *args: Any, **kwargs: Any
+) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
+    """Return a typed ``router.post`` decorator preserving call signatures."""
+
+    return cast(
+        Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]],
+        router.post(*args, **kwargs),
+    )
 
 
 class SimModeStatusResponse(BaseModel):
@@ -46,11 +70,15 @@ class SimModeTransitionResponse(SimModeStatusResponse):
 
     @classmethod
     def from_status(
-        cls, status: SimModeStatus, actor: str
+        cls,
+        status: SimModeStatus,
+        actor: str | None = None,
     ) -> "SimModeTransitionResponse":
         payload = SimModeStatusResponse.from_status(status).model_dump()
+        if actor is None:
+            raise ValueError("actor must be provided for SimModeTransitionResponse")
         payload["actor"] = actor
-        return cls.model_validate(payload)
+        return cls(**payload)
 
 
 async def _publish_event(status: SimModeStatus, actor: str) -> None:
@@ -72,46 +100,43 @@ async def _sync_runtime_state(active: bool) -> None:
 def _audit_transition(
     before: SimModeStatus, after: SimModeStatus, actor: str, request: Request
 ) -> None:
-    try:  # pragma: no cover - optional audit dependency
-        from common.utils.audit_logger import hash_ip as audit_hash_ip, log_audit as log_audit_event
-    except Exception:  # pragma: no cover - optional dependency missing
-        return
-
-    try:
-        client = request.client.host if request.client else None
-        ip_hash = audit_hash_ip(client)
-        log_audit_event(
-            actor=actor,
-            action="sim_mode.transition",
-            entity="platform",
-            before={
-                "active": before.active,
-                "reason": before.reason,
-                "ts": before.ts.isoformat(),
-            },
-            after={
-                "active": after.active,
-                "reason": after.reason,
-                "ts": after.ts.isoformat(),
-            },
-            ip_hash=ip_hash,
-        )
-    except Exception:  # pragma: no cover - defensive logging only
-        LOGGER.exception("Failed to record audit log for simulation mode transition")
+    audit_hooks = load_audit_hooks()
+    event = AuditEvent(
+        actor=actor,
+        action="sim_mode.transition",
+        entity="platform",
+        before={
+            "active": before.active,
+            "reason": before.reason,
+            "ts": before.ts.isoformat(),
+        },
+        after={
+            "active": after.active,
+            "reason": after.reason,
+            "ts": after.ts.isoformat(),
+        },
+        ip_address=request.client.host if request.client else None,
+    )
+    event.log_with_fallback(
+        audit_hooks,
+        LOGGER,
+        failure_message="Failed to record audit log for simulation mode transition",
+        disabled_message="Audit logging disabled; skipping sim_mode.transition",
+    )
 
 
-@router.get("/status", response_model=SimModeStatusResponse)
+@_router_get("/status", response_model=SimModeStatusResponse)
 async def get_status() -> SimModeStatusResponse:
     status_obj = await sim_mode_repository.get_status_async()
     await _sync_runtime_state(status_obj.active)
     return SimModeStatusResponse.from_status(status_obj)
 
 
-@router.post("/enter", response_model=SimModeTransitionResponse)
+@_router_post("/enter", response_model=SimModeTransitionResponse)
 async def enter_simulation_mode(
     payload: SimModeEnterRequest = Body(...),
     actor: str = Depends(require_admin_account),
-    request: Request = None,
+    request: Optional[Request] = None,
 ) -> SimModeTransitionResponse:
     if request is None:
         raise HTTPException(
@@ -130,13 +155,13 @@ async def enter_simulation_mode(
     await _sync_runtime_state(True)
     await _publish_event(after, actor)
     _audit_transition(before, after, actor, request)
-    return SimModeTransitionResponse.from_status(after, actor)
+    return SimModeTransitionResponse.from_status(after, actor=actor)
 
 
-@router.post("/exit", response_model=SimModeTransitionResponse)
+@_router_post("/exit", response_model=SimModeTransitionResponse)
 async def exit_simulation_mode(
     actor: str = Depends(require_admin_account),
-    request: Request = None,
+    request: Optional[Request] = None,
 ) -> SimModeTransitionResponse:
     if request is None:
         raise HTTPException(
@@ -155,7 +180,7 @@ async def exit_simulation_mode(
     await _sync_runtime_state(False)
     await _publish_event(after, actor)
     _audit_transition(before, after, actor, request)
-    return SimModeTransitionResponse.from_status(after, actor)
+    return SimModeTransitionResponse.from_status(after, actor=actor)
 
 
 __all__ = ["router"]

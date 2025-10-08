@@ -2,10 +2,16 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 
-from pydantic import BaseModel, Field, field_validator, model_serializer, model_validator
+from shared.pydantic_compat import (
+    BaseModel,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from fastapi import HTTPException, status
 
@@ -45,7 +51,9 @@ class FeeBreakdown(BaseModel):
     )
 
     @model_serializer(mode="wrap")
-    def _serialize(self, handler):  # type: ignore[override]
+    def _serialize(
+        self, handler: Callable[["FeeBreakdown"], Dict[str, Any]]
+    ) -> Dict[str, Any]:
         payload = handler(self)
         return {key: value for key, value in payload.items() if value is not None}
 
@@ -84,7 +92,7 @@ class ConfidenceMetrics(BaseModel):
     )
 
     @model_validator(mode="after")
-    def _default_overall(self) -> "ConfidenceMetrics":  # type: ignore[override]
+    def _default_overall(self) -> "ConfidenceMetrics":
         if self.overall_confidence is None:
             composite = (
                 self.model_confidence
@@ -147,7 +155,7 @@ class PolicyDecisionRequest(BaseModel):
     @field_validator("instrument")
     @classmethod
     def _validate_instrument(cls, value: str) -> str:
-        normalized = normalize_spot_symbol(value)
+        normalized: str = normalize_spot_symbol(value)
         if not is_spot_symbol(normalized):
             raise ValueError("Only spot market instruments are supported.")
         return normalized
@@ -217,7 +225,7 @@ class RiskIntentPayload(BaseModel):
     )
 
     @model_validator(mode="after")
-    def _populate_defaults(self) -> "RiskIntentPayload":  # type: ignore[override]
+    def _populate_defaults(self) -> "RiskIntentPayload":
         if self.book_snapshot is None:
             if self.policy_decision.response is not None:
                 self.book_snapshot = self.policy_decision.response.book_snapshot
@@ -252,7 +260,7 @@ class PortfolioState(BaseModel):
     )
 
     @model_validator(mode="after")
-    def _normalize_spot_exposures(self) -> "PortfolioState":  # type: ignore[override]
+    def _normalize_spot_exposures(self) -> "PortfolioState":
         if not self.instrument_exposure:
             return self
 
@@ -302,7 +310,7 @@ class RiskValidationRequest(BaseModel):
     )
 
     @model_validator(mode="after")
-    def _populate_summaries(self) -> "RiskValidationRequest":  # type: ignore[override]
+    def _populate_summaries(self) -> "RiskValidationRequest":
         decision = self.intent.policy_decision
         metrics = self.intent.metrics
 
@@ -387,13 +395,13 @@ class OrderPlacementRequest(BaseModel):
     @field_validator("instrument")
     @classmethod
     def _validate_instrument(cls, value: str) -> str:
-        normalized = normalize_spot_symbol(value)
+        normalized: str = normalize_spot_symbol(value)
         if not is_spot_symbol(normalized):
             raise ValueError("Only spot market instruments are supported.")
         return normalized
 
     @model_validator(mode="after")
-    def _validate_expire_time(self) -> "OrderPlacementRequest":  # type: ignore[override]
+    def _validate_expire_time(self) -> "OrderPlacementRequest":
         if self.expire_time is not None:
             if self.expire_time.tzinfo is None:
                 raise HTTPException(

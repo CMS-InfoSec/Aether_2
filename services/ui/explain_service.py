@@ -13,13 +13,17 @@ from fastapi.responses import JSONResponse
 from services.common.security import require_admin_account
 from services.models.model_server import get_active_model
 from shared.postgres import normalize_postgres_dsn
+from shared.psycopg_compat import (
+    PsycopgModule,
+    RowFactory,
+    load_dict_row,
+    load_psycopg,
+)
 
-try:  # pragma: no cover - optional dependency in some environments
-    import psycopg
-    from psycopg.rows import dict_row
-except Exception:  # pragma: no cover - graceful degradation without psycopg
-    psycopg = None  # type: ignore[assignment]
-    dict_row = None  # type: ignore[assignment]
+psycopg: PsycopgModule | None
+dict_row: RowFactory | None
+psycopg, _ = load_psycopg()
+dict_row = load_dict_row()
 
 
 LOGGER = logging.getLogger(__name__)
@@ -191,6 +195,12 @@ def _load_trade_record(trade_id: str) -> Mapping[str, Any]:
             detail="TimescaleDB driver (psycopg) is not installed in this environment.",
         )
 
+    if dict_row is None:  # pragma: no cover - executed when psycopg rows helpers are missing
+        raise HTTPException(
+            status_code=503,
+            detail="psycopg row factory helpers are not available in this environment.",
+        )
+
     query = """
         SELECT
             f.fill_id,
@@ -208,7 +218,7 @@ def _load_trade_record(trade_id: str) -> Mapping[str, Any]:
     """
 
     try:
-        with psycopg.connect(_database_url(), row_factory=dict_row) as conn:  # type: ignore[arg-type]
+        with psycopg.connect(_database_url(), row_factory=dict_row) as conn:
             with conn.cursor() as cursor:
                 cursor.execute(query, {"trade_id": trade_id})
                 row = cursor.fetchone()
