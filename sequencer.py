@@ -26,7 +26,30 @@ from services.common.schemas import FeeBreakdown, PolicyDecisionRequest, PolicyD
 
 from services.common.security import require_admin_account
 
-from override_service import OverrideDecision, OverrideRecord, latest_override
+from enum import Enum
+
+try:
+    from override_service import OverrideDecision, OverrideRecord, latest_override
+except RuntimeError as exc:  # pragma: no cover - optional dependency guard
+    _OVERRIDE_IMPORT_ERROR = exc
+
+    class OverrideDecision(str, Enum):  # type: ignore[no-redef]
+        APPROVE = "approve"
+        REJECT = "reject"
+
+    @dataclass(frozen=True)
+    class OverrideRecord:  # type: ignore[no-redef]
+        intent_id: str
+        account_id: str
+        actor: str
+        decision: OverrideDecision
+        reason: str
+        ts: datetime
+
+    def latest_override(intent_id: str) -> Optional[OverrideRecord]:  # type: ignore[no-redef]
+        return None
+else:
+    _OVERRIDE_IMPORT_ERROR = None
 
 import httpx
 
@@ -46,6 +69,12 @@ from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 
 LOGGER = logging.getLogger("sequencer")
+
+if _OVERRIDE_IMPORT_ERROR is not None:  # pragma: no cover - log optional dependency fallback
+    LOGGER.warning(
+        "Override service unavailable during import: %s. Falling back to in-memory no-op override checks.",
+        _OVERRIDE_IMPORT_ERROR,
+    )
 
 tracing.init_tracing("sequencer-service")
 
