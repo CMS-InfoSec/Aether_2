@@ -6,19 +6,65 @@ from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Dict, Generator, Optional
+from typing import Any, Awaitable, Callable, Dict, Generator, Optional
 from uuid import uuid4
 
 from fastapi import FastAPI, Request, Response
-from prometheus_client import (
-    CONTENT_TYPE_LATEST,
-    CollectorRegistry,
-    Counter,
-    Gauge,
-    Histogram,
-    generate_latest,
-)
-from starlette.middleware.base import BaseHTTPMiddleware
+
+try:  # pragma: no cover - prometheus client may be unavailable in lightweight tests
+    from prometheus_client import (
+        CONTENT_TYPE_LATEST,
+        CollectorRegistry,
+        Counter,
+        Gauge,
+        Histogram,
+        generate_latest,
+    )
+except ImportError:  # pragma: no cover - provide a no-op metrics backend
+    CONTENT_TYPE_LATEST = "text/plain; version=0.0.4"  # type: ignore[assignment]
+
+    class CollectorRegistry:  # type: ignore[override]
+        pass
+
+    class _Metric:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self._value = 0.0
+
+        def labels(self, *args: Any, **kwargs: Any) -> "_Metric":
+            return self
+
+        def inc(self, amount: float = 1.0) -> None:
+            self._value += amount
+
+        def dec(self, amount: float = 1.0) -> None:
+            self._value -= amount
+
+        def set(self, value: float) -> None:
+            self._value = value
+
+        def observe(self, value: float) -> None:
+            self._value = value
+
+    def Counter(*args: Any, **kwargs: Any) -> _Metric:  # type: ignore[override]
+        return _Metric()
+
+    def Gauge(*args: Any, **kwargs: Any) -> _Metric:  # type: ignore[override]
+        return _Metric()
+
+    def Histogram(*args: Any, **kwargs: Any) -> _Metric:  # type: ignore[override]
+        return _Metric()
+
+    def generate_latest(*args: Any, **kwargs: Any) -> bytes:  # type: ignore[override]
+        return b""
+try:  # pragma: no cover - optional dependency in lightweight test environments
+    from starlette.middleware.base import BaseHTTPMiddleware
+except ImportError:  # pragma: no cover - exercised in unit-only environments
+    class BaseHTTPMiddleware:  # type: ignore[override]
+        def __init__(self, app: Any) -> None:
+            self.app = app
+
+        async def dispatch(self, request: Request, call_next: Callable[[Request], Awaitable[Response]]):  # type: ignore[override]
+            return await call_next(request)
 
 try:  # pragma: no cover - OpenTelemetry may be optional in some deployments
     from opentelemetry import trace
@@ -504,7 +550,9 @@ def init_metrics(service_name: str = "service") -> Dict[str, Counter | Gauge | H
     _scaling_oms_replicas.labels(service=_service_value()).set(0)
     _scaling_gpu_nodes.labels(service=_service_value()).set(0)
     _scaling_pending_training_jobs.labels(service=_service_value()).set(0)
-    _scaling_evaluation_duration_seconds.labels(service=_service_value()).observe(0)
+    evaluation_metric = _scaling_evaluation_duration_seconds.labels(service=_service_value())
+    if hasattr(evaluation_metric, "observe"):
+        evaluation_metric.observe(0)
     _scaling_evaluations_total.labels(service=_service_value())
 
     return _METRICS

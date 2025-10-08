@@ -24,29 +24,42 @@ import importlib
 import importlib.util
 import logging
 import os
+import sqlite3
 import sys
+import threading
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import unquote, urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.routing import APIRouter
 from pydantic import BaseModel
-from sqlalchemy import (
-    BigInteger,
-    Column,
-    DateTime,
-    Index,
-    Integer,
-    MetaData,
-    String,
-    Table,
-    create_engine,
-    func,
-    insert,
-    select,
-)
-from sqlalchemy.engine import Engine
-from sqlalchemy.engine.url import make_url
+
+try:  # pragma: no cover - exercised indirectly through fallbacks
+    from sqlalchemy import (
+        BigInteger,
+        Column,
+        DateTime,
+        Index,
+        Integer,
+        MetaData,
+        String,
+        Table,
+        create_engine,
+        func,
+        insert,
+        select,
+    )
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.engine.url import make_url
+except Exception:  # pragma: no cover - optional dependency missing or partially stubbed
+    BigInteger = Column = DateTime = Index = Integer = MetaData = String = Table = None  # type: ignore[assignment]
+    create_engine = func = insert = select = None  # type: ignore[assignment]
+    Engine = Any  # type: ignore[assignment]
+    make_url = None  # type: ignore[assignment]
+    SQLALCHEMY_AVAILABLE = False
+else:  # pragma: no cover - exercised through SQLAlchemy-backed tests
+    SQLALCHEMY_AVAILABLE = True
 
 from shared.postgres import normalize_sqlalchemy_dsn
 
@@ -384,28 +397,35 @@ def _try_parse_iso8601(value: str) -> dt.datetime:
     return dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ")
 
 
-_METADATA = MetaData()
+if SQLALCHEMY_AVAILABLE:
+    _METADATA = MetaData()
+    _SENTIMENT_ID_TYPE = BigInteger().with_variant(Integer, "sqlite")
+    _SENTIMENT_TABLE = Table(
+        "sentiment_scores",
+        _METADATA,
+        Column("id", _SENTIMENT_ID_TYPE, primary_key=True, autoincrement=True),
+        Column("symbol", String(64), nullable=False),
+        Column("score", String(16), nullable=False),
+        Column("source", String(32), nullable=False),
+        Column("ts", DateTime(timezone=True), nullable=False),
+        Column(
+            "ingested_at",
+            DateTime(timezone=True),
+            nullable=False,
+            server_default=func.now(),
+        ),
+        sqlite_autoincrement=True,
+    )
+    Index("ix_sentiment_scores_symbol_ts", _SENTIMENT_TABLE.c.symbol, _SENTIMENT_TABLE.c.ts)
+    Index("ix_sentiment_scores_ts", _SENTIMENT_TABLE.c.ts)
+else:  # pragma: no cover - exercised through sqlite fallback tests
+    _METADATA = None
+    _SENTIMENT_ID_TYPE = None
+    _SENTIMENT_TABLE = None
+
 
 _SQLITE_FALLBACK_FLAG = "SENTIMENT_ALLOW_SQLITE"
 _SQLITE_MEMORY_FALLBACK = "sqlite+pysqlite:///:memory:"
-
-
-_SENTIMENT_ID_TYPE = BigInteger().with_variant(Integer, "sqlite")
-
-
-_SENTIMENT_TABLE = Table(
-    "sentiment_scores",
-    _METADATA,
-    Column("id", _SENTIMENT_ID_TYPE, primary_key=True, autoincrement=True),
-    Column("symbol", String(64), nullable=False),
-    Column("score", String(16), nullable=False),
-    Column("source", String(32), nullable=False),
-    Column("ts", DateTime(timezone=True), nullable=False),
-    Column("ingested_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
-    sqlite_autoincrement=True,
-)
-Index("ix_sentiment_scores_symbol_ts", _SENTIMENT_TABLE.c.symbol, _SENTIMENT_TABLE.c.ts)
-Index("ix_sentiment_scores_ts", _SENTIMENT_TABLE.c.ts)
 
 
 def _ensure_safe_sqlite_path(path: Path) -> None:
@@ -439,6 +459,36 @@ def _ensure_safe_sqlite_path(path: Path) -> None:
             )
 
 
+def _sqlite_database_component(url: str) -> str | None:
+    if not url.startswith("sqlite"):
+        return None
+
+    parsed = urlsplit(url)
+    path = unquote(parsed.path or "")
+    netloc = unquote(parsed.netloc or "")
+
+    if netloc:
+        candidate = f"{netloc}{path}"
+    else:
+        if path.startswith("//"):
+            candidate = path[1:]
+        else:
+            candidate = path.lstrip("/")
+
+    return candidate or None
+
+
+def _sqlite_filesystem_path(url: str) -> Path | None:
+    database = _sqlite_database_component(url)
+    if not database or database == ":memory:":
+        return None
+
+    path = Path(database).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path
+
+
 def _resolve_database_url(candidate: str | None = None) -> str:
     """Resolve and normalise the sentiment repository database URL."""
 
@@ -469,15 +519,11 @@ def _resolve_database_url(candidate: str | None = None) -> str:
 
         if normalised.startswith("sqlite"):
             try:
-                url = make_url(normalised)
+                path = _sqlite_filesystem_path(normalised)
             except Exception:  # pragma: no cover - defensive guard
                 return normalised
 
-            database = url.database or ""
-            if database and database != ":memory:":
-                path = Path(database).expanduser()
-                if not path.is_absolute():
-                    path = Path.cwd() / path
+            if path is not None:
                 _ensure_safe_sqlite_path(path)
                 path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -488,29 +534,178 @@ def _resolve_database_url(candidate: str | None = None) -> str:
         "Set SENTIMENT_DATABASE_URL (or TIMESCALE_DATABASE_URL) to a managed PostgreSQL/Timescale URI.",
     )
 
+if SQLALCHEMY_AVAILABLE:
 
-def _create_engine(url: str) -> Engine:
-    options: dict[str, object] = {"future": True, "pool_pre_ping": True}
-    if url.startswith("sqlite"):
-        options["connect_args"] = {"check_same_thread": False}
-    return create_engine(url, **options)
+    def _create_engine(url: str) -> Engine:
+        options: dict[str, object] = {"future": True, "pool_pre_ping": True}
+        if url.startswith("sqlite"):
+            options["connect_args"] = {"check_same_thread": False}
+        return create_engine(url, **options)
+
+
+    class _SQLAlchemySentimentBackend:
+        def __init__(self, url: str, *, engine: Engine | None = None) -> None:
+            self.engine: Engine = engine or _create_engine(url)
+            self._ensure_schema()
+
+        def _ensure_schema(self) -> None:
+            try:
+                assert _METADATA is not None and _SENTIMENT_TABLE is not None
+                _METADATA.create_all(self.engine, tables=[_SENTIMENT_TABLE])
+            except Exception:  # pragma: no cover - fail fast if schema creation fails
+                LOGGER.exception("Failed to bootstrap sentiment schema")
+                raise
+
+        def insert(self, values: dict[str, object]) -> None:
+            assert _SENTIMENT_TABLE is not None
+            with self.engine.begin() as connection:
+                connection.execute(insert(_SENTIMENT_TABLE).values(**values))
+
+        def fetch_latest(self, symbol: str) -> Optional[Tuple[str, str, str, object]]:
+            assert _SENTIMENT_TABLE is not None
+            stmt = (
+                select(
+                    _SENTIMENT_TABLE.c.symbol,
+                    _SENTIMENT_TABLE.c.score,
+                    _SENTIMENT_TABLE.c.source,
+                    _SENTIMENT_TABLE.c.ts,
+                )
+                .where(_SENTIMENT_TABLE.c.symbol == symbol)
+                .order_by(_SENTIMENT_TABLE.c.ts.desc())
+                .limit(1)
+            )
+            with self.engine.begin() as connection:
+                result = connection.execute(stmt)
+                row = result.first()
+            if row is None:
+                return None
+            return row.symbol, row.score, row.source, row.ts
+
+
+else:  # pragma: no cover - exercised through sqlite fallback tests
+
+    def _create_engine(url: str) -> Engine:  # type: ignore[override]
+        raise RuntimeError("SQLAlchemy engine creation unavailable without the dependency installed")
+
+
+class _SQLiteSentimentBackend:
+    def __init__(self, url: str) -> None:
+        if not url.startswith("sqlite"):
+            raise RuntimeError(
+                "Sentiment repository fallback only supports sqlite URLs when SQLAlchemy is unavailable"
+            )
+
+        self._database_url = url
+        self._lock = threading.RLock()
+        target = _sqlite_database_component(url)
+        if not target or target == ":memory:":
+            self._path: Path | None = None
+            self._db_target = ":memory:"
+        else:
+            path = Path(target).expanduser()
+            if not path.is_absolute():
+                path = Path.cwd() / path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._path = path
+            self._db_target = str(path)
+
+        self._connection = self._connect()
+        self._ensure_schema()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self._db_target, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _ensure_schema(self) -> None:
+        statements = [
+            """
+            CREATE TABLE IF NOT EXISTS sentiment_scores (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                score TEXT NOT NULL,
+                source TEXT NOT NULL,
+                ts TEXT NOT NULL,
+                ingested_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS ix_sentiment_scores_symbol_ts ON sentiment_scores (symbol, ts)",
+            "CREATE INDEX IF NOT EXISTS ix_sentiment_scores_ts ON sentiment_scores (ts)",
+        ]
+        with self._lock:
+            cursor = self._connection.cursor()
+            try:
+                for statement in statements:
+                    cursor.execute(statement)
+                self._connection.commit()
+            finally:
+                cursor.close()
+
+    def insert(self, values: dict[str, object]) -> None:
+        ts_value = values.get("ts")
+        if isinstance(ts_value, dt.datetime):
+            ts_text = ts_value.astimezone(dt.timezone.utc).isoformat()
+        else:
+            ts_text = _parse_timestamp(str(ts_value)) or dt.datetime.now(tz=dt.timezone.utc)
+            ts_text = ts_text.isoformat()
+
+        payload = (
+            str(values.get("symbol", "")),
+            str(values.get("score", "")),
+            str(values.get("source", "")),
+            ts_text,
+        )
+
+        with self._lock:
+            cursor = self._connection.cursor()
+            try:
+                cursor.execute(
+                    "INSERT INTO sentiment_scores (symbol, score, source, ts) VALUES (?, ?, ?, ?)",
+                    payload,
+                )
+                self._connection.commit()
+            finally:
+                cursor.close()
+
+    def fetch_latest(self, symbol: str) -> Optional[Tuple[str, str, str, object]]:
+        with self._lock:
+            cursor = self._connection.cursor()
+            try:
+                cursor.execute(
+                    """
+                    SELECT symbol, score, source, ts
+                    FROM sentiment_scores
+                    WHERE symbol = ?
+                    ORDER BY ts DESC
+                    LIMIT 1
+                    """,
+                    (symbol,),
+                )
+                row = cursor.fetchone()
+            finally:
+                cursor.close()
+
+        if row is None:
+            return None
+
+        return row["symbol"], row["score"], row["source"], row["ts"]
 
 
 class SentimentRepository:
-    """SQLAlchemy-backed storage for sentiment scores."""
+    """Persistence layer for sentiment scores with adaptive backends."""
 
     def __init__(self, database_url: str | None = None, *, engine: Engine | None = None) -> None:
         url = _resolve_database_url(database_url)
         self._database_url = url
-        self._engine: Engine = engine or _create_engine(url)
-        self._ensure_schema()
 
-    def _ensure_schema(self) -> None:
-        try:
-            _METADATA.create_all(self._engine, tables=[_SENTIMENT_TABLE])
-        except Exception:  # pragma: no cover - fail fast if schema creation fails
-            LOGGER.exception("Failed to bootstrap sentiment schema")
-            raise
+        if SQLALCHEMY_AVAILABLE:
+            backend = _SQLAlchemySentimentBackend(url, engine=engine)
+            self._engine: Engine | None = backend.engine
+        else:
+            backend = _SQLiteSentimentBackend(url)
+            self._engine = None
+
+        self._backend = backend
 
     async def insert(self, observation: SocialPost, label: str) -> None:
         normalized_symbol = normalize_spot_symbol(observation.symbol)
@@ -525,44 +720,23 @@ class SentimentRepository:
             "source": observation.source,
             "ts": observation.created_at.astimezone(dt.timezone.utc),
         }
-        await asyncio.to_thread(self._insert_sync, values)
-
-    def _insert_sync(self, values: dict[str, object]) -> None:
-        with self._engine.begin() as connection:
-            connection.execute(insert(_SENTIMENT_TABLE).values(**values))
+        await asyncio.to_thread(self._backend.insert, values)
 
     async def latest(self, symbol: str) -> Optional[Tuple[str, str, str, dt.datetime]]:
         normalized_symbol = normalize_spot_symbol(symbol)
         if not normalized_symbol or not is_spot_symbol(normalized_symbol):
             raise ValueError(f"Symbol '{symbol}' is not a supported spot market")
 
-        stmt = (
-            select(
-                _SENTIMENT_TABLE.c.symbol,
-                _SENTIMENT_TABLE.c.score,
-                _SENTIMENT_TABLE.c.source,
-                _SENTIMENT_TABLE.c.ts,
-            )
-            .where(_SENTIMENT_TABLE.c.symbol == normalized_symbol)
-            .order_by(_SENTIMENT_TABLE.c.ts.desc())
-            .limit(1)
-        )
-        row = await asyncio.to_thread(self._fetch_one, stmt)
+        row = await asyncio.to_thread(self._backend.fetch_latest, normalized_symbol)
         if row is None:
             return None
-        ts_value = row.ts
+        symbol_value, score, source, ts_value = row
         if isinstance(ts_value, dt.datetime):
             ts = ts_value if ts_value.tzinfo else ts_value.replace(tzinfo=dt.timezone.utc)
             ts = ts.astimezone(dt.timezone.utc)
         else:
             ts = _parse_timestamp(ts_value) or dt.datetime.now(tz=dt.timezone.utc)
-        return row.symbol, row.score, row.source, ts
-
-    def _fetch_one(self, stmt):
-        with self._engine.begin() as connection:
-            result = connection.execute(stmt)
-            row = result.first()
-        return row
+        return symbol_value, score, source, ts
 
 
 class FeastSentimentWriter:

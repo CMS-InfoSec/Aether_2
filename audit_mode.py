@@ -7,7 +7,18 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, status
+try:  # pragma: no cover - FastAPI is optional in some unit tests
+    from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, status
+except ImportError:  # pragma: no cover - fallback when FastAPI is stubbed out
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        APIRouter,
+        Depends,
+        FastAPI,
+        HTTPException,
+        Query,
+        Request,
+        status,
+    )
 from pydantic import BaseModel, ConfigDict
 
 from services.common.adapters import TimescaleAdapter

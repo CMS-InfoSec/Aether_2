@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List, Mapping, Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from shared.postgres import normalize_postgres_dsn
 
 try:  # pragma: no cover - optional heavy dependency
@@ -29,9 +29,9 @@ else:  # pragma: no cover - executed when sklearn available
     _SKLEARN_IMPORT_ERROR = None
 
 try:  # pragma: no cover - optional dependency in lightweight tests
-    from services.common.security import require_admin_account
+    from services.common.security import ensure_admin_access
 except ModuleNotFoundError:  # pragma: no cover - fallback stub for isolated unit tests
-    def require_admin_account(*_: object, **__: object) -> str:  # type: ignore[override]
+    async def ensure_admin_access(*_: object, **__: object) -> str:  # type: ignore[override]
         return "test-account"
 
 
@@ -415,9 +415,10 @@ except Exception as exc:  # pragma: no cover - handled during application startu
 
 
 @router.get("/alerts/prioritized")
-async def prioritized_alerts(_: str = Depends(require_admin_account)) -> List[Dict[str, Any]]:
+async def prioritized_alerts(request: Request) -> List[Dict[str, Any]]:
     """Return alerts prioritised by the ML classifier."""
 
+    await ensure_admin_access(request, forbid_on_missing_token=True)
     if _service is None:
         detail = "Alert prioritizer service is unavailable"
         if _service_error is not None:
