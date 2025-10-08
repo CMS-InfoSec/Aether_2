@@ -13,10 +13,61 @@ import argparse
 import json
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, Iterable, Iterator, List, Optional, Protocol, Tuple
+from typing import TYPE_CHECKING, Any, Deque, Dict, Iterable, Iterator, List, Optional, Protocol, Tuple
 
-import numpy as np
-import pandas as pd
+_NUMPY_IMPORT_ERROR: Optional[BaseException] = None
+try:  # pragma: no cover - executed only when numpy is missing
+    import numpy as _NUMPY_MODULE  # type: ignore[assignment]
+except Exception as exc:  # pragma: no cover - import guard
+    _NUMPY_MODULE = None
+    _NUMPY_IMPORT_ERROR = exc
+
+_PANDAS_IMPORT_ERROR: Optional[BaseException] = None
+try:  # pragma: no cover - executed only when pandas is missing
+    import pandas as _PANDAS_MODULE  # type: ignore[assignment]
+except Exception as exc:  # pragma: no cover - import guard
+    _PANDAS_MODULE = None
+    _PANDAS_IMPORT_ERROR = exc
+
+
+class MissingDependencyError(RuntimeError):
+    """Raised when optional scientific dependencies are unavailable."""
+
+
+def _missing_dependency_proxy(message: str, error: Optional[BaseException]) -> Any:
+    """Return an object that raises :class:`MissingDependencyError` on access."""
+
+    class _MissingModule:
+        __slots__ = ()
+
+        def __getattr__(self, name: str) -> Any:
+            raise MissingDependencyError(message) from error
+
+        def __call__(self, *args: Any, **kwargs: Any) -> Any:
+            raise MissingDependencyError(message) from error
+
+    return _MissingModule()
+
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    import numpy as np  # type: ignore
+    import pandas as pd  # type: ignore
+else:  # pragma: no branch - runtime assignment based on optional imports
+    if _NUMPY_MODULE is None:
+        np = _missing_dependency_proxy(
+            "numpy is required for the backtest engine",
+            _NUMPY_IMPORT_ERROR,
+        )
+    else:
+        np = _NUMPY_MODULE
+
+    if _PANDAS_MODULE is None:
+        pd = _missing_dependency_proxy(
+            "pandas is required for the backtest engine",
+            _PANDAS_IMPORT_ERROR,
+        )
+    else:
+        pd = _PANDAS_MODULE
 
 from shared.spot import is_spot_symbol, normalize_spot_symbol
 
