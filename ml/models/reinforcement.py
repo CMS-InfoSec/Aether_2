@@ -3,11 +3,18 @@ from __future__ import annotations
 
 import importlib
 from dataclasses import dataclass, field
-from typing import Any, Dict
+from typing import TYPE_CHECKING, Any, Dict
 
-import numpy as np
+from .base import (
+    MissingDependencyError,
+    TrainingResult,
+    UncertaintyGate,
+    fee_aware_reward,
+    require_numpy,
+)
 
-from .base import TrainingResult, UncertaintyGate, fee_aware_reward
+if TYPE_CHECKING:  # pragma: no cover - typing only.
+    import numpy as np
 
 
 @dataclass
@@ -30,7 +37,12 @@ class RLTrainer:
 
     def _initialise_model(self) -> Any:
         algorithm = self.config.algorithm.lower()
-        sb3 = importlib.import_module("stable_baselines3")
+        try:
+            sb3 = importlib.import_module("stable_baselines3")
+        except ModuleNotFoundError as exc:  # pragma: no cover - depends on optional dep.
+            raise MissingDependencyError(
+                "stable-baselines3 is required for reinforcement learning trainers"
+            ) from exc
         if algorithm == "ppo":
             model_cls = getattr(sb3, "PPO")
         elif algorithm == "sac":
@@ -45,7 +57,13 @@ class RLTrainer:
         self.model.learn(total_timesteps=self.config.total_timesteps)
         return TrainingResult(metrics={"timesteps": float(self.config.total_timesteps)}, model=self.model)
 
-    def evaluate(self, observations: np.ndarray, returns: np.ndarray, turnovers: np.ndarray) -> Dict[str, float]:
+    def evaluate(
+        self,
+        observations: "np.ndarray",
+        returns: Any,
+        turnovers: Any,
+    ) -> Dict[str, float]:
+        np = require_numpy()
         actions, _ = self.model.predict(observations, deterministic=False)
         actions = np.asarray(actions)
         uncertainties = np.std(actions, axis=-1) if actions.ndim > 1 else np.abs(actions)
@@ -55,4 +73,4 @@ class RLTrainer:
         return {"expected_fee_adjusted_reward": expected_reward}
 
 
-__all__ = ["RLTrainer", "RLTrainerConfig"]
+__all__ = ["RLTrainer", "RLTrainerConfig", "MissingDependencyError"]

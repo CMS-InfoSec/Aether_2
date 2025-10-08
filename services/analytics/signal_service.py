@@ -367,13 +367,13 @@ def _rolling_beta(series_alt: Sequence[float], series_base: Sequence[float], win
 def _garch_forecast(prices: Sequence[float], horizon: int = 12) -> VolatilityMetrics:
     if len(prices) < 30:
         raise HTTPException(status_code=422, detail="Need at least 30 observations for GARCH")
-    log_returns = np.diff(np.log(np.array(prices)))
-    if log_returns.size < 1:
+    log_returns = _log_returns(prices)
+    if len(log_returns) < 1:
         raise HTTPException(status_code=422, detail="Insufficient returns for volatility forecasting")
 
     alpha = 0.07
     beta = 0.9
-    variance = float(np.var(log_returns))
+    variance = float(statistics.pvariance(log_returns))
     omega = variance * (1 - alpha - beta)
     if omega <= 0:
         omega = variance * 0.05
@@ -386,7 +386,7 @@ def _garch_forecast(prices: Sequence[float], horizon: int = 12) -> VolatilityMet
         sigma2 = omega + (alpha + beta) * sigma2
         forecasts.append(math.sqrt(max(sigma2, 0)))
 
-    window = min(20, log_returns.size)
+    window = min(20, len(log_returns))
     recent = log_returns[-window:]
     mean = float(np.mean(recent))
     std = float(np.std(recent)) or 1e-6
@@ -687,7 +687,11 @@ def _market_data_adapter() -> MarketDataAdapter:
     state = _service_state(app)
     adapter = state.market_data_adapter
     if adapter is None:
-        raise HTTPException(status_code=503, detail="Market data adapter is not configured")
+        try:
+            adapter = _configure_market_data_adapter(app)
+        except Exception as exc:
+            logger.debug("Failed to lazily configure market data adapter", exc_info=True)
+            raise HTTPException(status_code=503, detail="Market data adapter is not configured") from exc
     return adapter
 
 
