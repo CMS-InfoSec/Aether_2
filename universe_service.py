@@ -187,6 +187,11 @@ if SQLALCHEMY_AVAILABLE:
     class UniverseWhitelist(Base):
         """SQLAlchemy model storing the computed trading universe."""
 
+if SQLALCHEMY_AVAILABLE:
+
+    class UniverseWhitelist(Base):
+        """SQLAlchemy model storing the computed trading universe."""
+
         __tablename__ = "universe_whitelist"
 
         symbol: str = Column(String, primary_key=True)
