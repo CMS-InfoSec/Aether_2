@@ -1,5 +1,10 @@
 """Hyper-parameter optimization utilities."""
 
-from .optuna_runner import ObjectiveWeights, OptunaRunner, PortfolioMetrics
+from .optuna_runner import MissingDependencyError, ObjectiveWeights, OptunaRunner, PortfolioMetrics
 
-__all__ = ["ObjectiveWeights", "OptunaRunner", "PortfolioMetrics"]
+__all__ = [
+    "MissingDependencyError",
+    "ObjectiveWeights",
+    "OptunaRunner",
+    "PortfolioMetrics",
+]

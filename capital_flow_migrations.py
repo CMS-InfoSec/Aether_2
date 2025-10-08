@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from decimal import Decimal, ROUND_HALF_EVEN
-from typing import Iterable
+from typing import Any, Iterable
 
 from sqlalchemy import (
     Column,
@@ -13,11 +13,19 @@ from sqlalchemy import (
     Numeric,
     String,
     Table,
-    inspect,
     select,
     text,
 )
-from sqlalchemy.engine import Connection, Engine
+try:  # SQLAlchemy types are optional in test environments
+    from sqlalchemy.engine import Connection, Engine
+except ImportError:  # pragma: no cover - depends on SQLAlchemy availability
+    Connection = Any  # type: ignore[assignment]
+    Engine = Any  # type: ignore[assignment]
+
+try:  # SQLAlchemy is optional in some environments
+    from sqlalchemy import inspect
+except ImportError:  # pragma: no cover - exercised when SQLAlchemy isn't installed
+    inspect = None  # type: ignore[assignment]
 
 
 _PRECISION = 38
@@ -215,4 +223,32 @@ def _column_type_map(connection: Connection, table: str) -> dict[str, str]:
 
 
 def _table_exists(connection: Connection, table: str) -> bool:
-    return table in inspect(connection).get_table_names()
+    if inspect is not None:
+        return table in inspect(connection).get_table_names()
+
+    dialect_name = getattr(getattr(connection, "dialect", None), "name", "")
+    if dialect_name == "sqlite":
+        result = connection.execute(
+            text(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name = :table_name"
+            ),
+            {"table_name": table},
+        ).first()
+        if result is not None:
+            return True
+
+        temp_result = connection.execute(
+            text(
+                "SELECT name FROM sqlite_temp_master "
+                "WHERE type='table' AND name = :table_name"
+            ),
+            {"table_name": table},
+        ).first()
+        return temp_result is not None
+
+    try:
+        connection.execute(text(f"SELECT 1 FROM {table} LIMIT 1"))
+    except Exception:  # pragma: no cover - depends on backend availability
+        return False
+    return True

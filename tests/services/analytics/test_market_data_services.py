@@ -365,6 +365,17 @@ def test_signal_whales_endpoint(signal_client: TestClient, signal_admin_headers:
     assert payload["count"] >= 0
 
 
+def test_signal_garch_forecast_without_numpy(
+    monkeypatch: pytest.MonkeyPatch, signal_service_module
+):
+    module = signal_service_module
+    monkeypatch.setattr(module, "np", None, raising=False)
+    prices = [100.0 + idx for idx in range(60)]
+    forecasts = module._garch_forecast(prices, horizon=5)
+    assert forecasts["variance"] >= 0
+    assert len(forecasts["forecasts"]) == 5
+
+
 def test_signal_stress_endpoint(signal_client: TestClient, signal_admin_headers: dict[str, str]):
     response = signal_client.get(
         "/signals/stress/BTC-USD",
