@@ -132,10 +132,18 @@ else:
         def __init__(self, url: str) -> None:
             self._path = _sqlite_path_from_url(url)
             self._lock = threading.RLock()
+            self._connect_kwargs: dict[str, object] = {
+                "detect_types": sqlite3.PARSE_DECLTYPES,
+            }
+            if self._path == ":memory:":
+                # Use a shared in-memory database so the schema persists across
+                # connections opened by the repository methods.
+                self._path = "file:aether_accounts?mode=memory&cache=shared"
+                self._connect_kwargs.update({"uri": True, "check_same_thread": False})
             self._ensure_schema()
 
         def _connect(self) -> sqlite3.Connection:
-            conn = sqlite3.connect(self._path, detect_types=sqlite3.PARSE_DECLTYPES)
+            conn = sqlite3.connect(self._path, **self._connect_kwargs)
             conn.row_factory = sqlite3.Row
             return conn
 

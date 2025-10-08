@@ -654,6 +654,10 @@ async def _call_endpoint(
             resolved_kwargs[name] = request
             continue
 
+        if annotation is Response:
+            resolved_kwargs[name] = default if isinstance(default, Response) else Response()
+            continue
+
         if isinstance(default, _Dependency):
             dependency = default.dependency
             if dependency is None:
