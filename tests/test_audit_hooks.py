@@ -382,6 +382,103 @@ def test_log_audit_event_with_fallback_event_context_factory_used_for_fallback(
     assert record.audit == {"source": "event"}
 
 
+def test_log_audit_event_with_fallback_reuses_resolved_context(
+    caplog: pytest.LogCaptureFixture,
+):
+    hooks = audit_hooks.AuditHooks(log=None, hash_ip=lambda value: value)
+    logger = logging.getLogger("test.audit.event_factory.resolved")
+    calls: List[int] = []
+
+    def context_factory() -> Mapping[str, str]:
+        calls.append(1)
+        return {"audit": {"source": f"call-{len(calls)}"}}
+
+    event = audit_hooks.AuditEvent(
+        actor="iona",
+        action="demo.event.resolved",
+        entity="resource",
+        before={},
+        after={},
+        context_factory=context_factory,
+    )
+
+    updated_event, resolved_context = event.resolve_context_metadata()
+    assert calls == [1]
+
+    with caplog.at_level(logging.DEBUG, logger=logger.name):
+        result = audit_hooks.log_audit_event_with_fallback(
+            hooks,
+            logger,
+            updated_event,
+            failure_message="should not trigger",
+            disabled_message="audit disabled via resolved context",
+            resolved_context=resolved_context,
+        )
+
+    assert result.handled is False
+    assert result.context_error is None
+    assert calls == [1]
+    record = next(
+        entry
+        for entry in caplog.records
+        if entry.message == "audit disabled via resolved context"
+    )
+    assert record.audit == {"source": "call-1"}
+
+
+def test_log_audit_event_with_fallback_resolved_context_error_logged_once(
+    caplog: pytest.LogCaptureFixture,
+):
+    hooks = audit_hooks.AuditHooks(log=None, hash_ip=lambda value: value)
+    logger = logging.getLogger("test.audit.event_factory.resolved_error")
+    calls: List[int] = []
+
+    def failing_factory() -> Mapping[str, str]:
+        calls.append(1)
+        raise RuntimeError("context failure")
+
+    event = audit_hooks.AuditEvent(
+        actor="jules",
+        action="demo.event.resolved_error",
+        entity="resource",
+        before={},
+        after={},
+        context_factory=failing_factory,
+    )
+
+    updated_event, resolved_context = event.resolve_context_metadata(drop_factory=True)
+    assert calls == [1]
+    assert isinstance(resolved_context.error, RuntimeError)
+
+    with caplog.at_level(logging.DEBUG, logger=logger.name):
+        result = audit_hooks.log_audit_event_with_fallback(
+            hooks,
+            logger,
+            updated_event,
+            failure_message="should not trigger",
+            disabled_message="audit disabled via resolved context error",
+            resolved_context=resolved_context,
+        )
+
+    assert result.handled is False
+    assert result.context_error is resolved_context.error
+    failure_records = [
+        entry
+        for entry in caplog.records
+        if entry.message == "Audit fallback context factory raised; omitting context metadata."
+    ]
+    assert len(failure_records) == 1
+    disabled_record = next(
+        entry
+        for entry in caplog.records
+        if entry.message == "audit disabled via resolved context error"
+    )
+    assert getattr(disabled_record, "audit_context_error") == {
+        "type": "RuntimeError",
+        "message": "context failure",
+    }
+
+
 def test_log_event_with_fallback_handles_exceptions(caplog: pytest.LogCaptureFixture):
     def failing_log(**payload):
         raise RuntimeError("boom")
@@ -808,6 +905,7 @@ def test_audit_event_log_with_fallback_method_delegates(monkeypatch):
         "context": {"request_id": "abc"},
         "context_factory": None,
         "resolved_ip_hash": None,
+        "resolved_context": None,
     }
 
 
@@ -1238,6 +1336,97 @@ def test_audit_event_resolve_context_drops_factory_without_invocation():
     assert resolved == {"cached": True}
     assert updated.context == {"cached": True}
     assert updated.context_factory is None
+
+
+def test_audit_event_resolve_context_metadata_reuses_cached_context():
+    context = {"cached": True}
+    event = audit_hooks.AuditEvent(
+        actor="sasha",
+        action="demo.context.metadata.cached",
+        entity="resource",
+        before={},
+        after={},
+        context=context,
+        context_factory=lambda: pytest.fail("factory should not run"),
+    )
+
+    updated, resolved = event.resolve_context_metadata()
+
+    assert updated is event
+    assert isinstance(resolved, audit_hooks.ResolvedContext)
+    assert resolved.value is context
+    assert resolved.error is None
+    assert resolved.evaluated is True
+
+
+def test_audit_event_resolve_context_metadata_evaluates_factory_once():
+    calls = {"count": 0}
+
+    def factory() -> Mapping[str, str]:
+        calls["count"] += 1
+        return {"factory": calls["count"]}
+
+    event = audit_hooks.AuditEvent(
+        actor="taylor",
+        action="demo.context.metadata.factory",
+        entity="resource",
+        before={},
+        after={},
+        context_factory=factory,
+    )
+
+    updated, resolved = event.resolve_context_metadata()
+
+    assert calls["count"] == 1
+    assert resolved.value == {"factory": 1}
+    assert resolved.error is None
+    assert resolved.evaluated is True
+    assert updated.context == {"factory": 1}
+    assert updated.context_factory is factory
+
+
+def test_audit_event_resolve_context_metadata_captures_factory_error():
+    calls = {"count": 0}
+
+    def failing_factory() -> Mapping[str, str]:
+        calls["count"] += 1
+        raise RuntimeError("context failure")
+
+    event = audit_hooks.AuditEvent(
+        actor="ursula",
+        action="demo.context.metadata.error",
+        entity="resource",
+        before={},
+        after={},
+        context_factory=failing_factory,
+    )
+
+    updated, resolved = event.resolve_context_metadata(drop_factory=True)
+
+    assert calls["count"] == 1
+    assert resolved.value is None
+    assert isinstance(resolved.error, RuntimeError)
+    assert resolved.evaluated is True
+    assert updated.context is None
+    assert updated.context_factory is None
+
+
+def test_audit_event_resolve_context_metadata_respects_skipped_factory():
+    event = audit_hooks.AuditEvent(
+        actor="val",
+        action="demo.context.metadata.skip",
+        entity="resource",
+        before={},
+        after={},
+        context_factory=lambda: {"should": "not run"},
+    )
+
+    updated, resolved = event.resolve_context_metadata(use_factory=False)
+
+    assert updated is event
+    assert resolved.value is None
+    assert resolved.error is None
+    assert resolved.evaluated is True
 
 
 def test_audit_event_with_actor_updates_when_changed():

@@ -189,6 +189,7 @@ class AuditEvent:
         context: Optional[Mapping[str, Any]] | object = _EVENT_CONTEXT_SENTINEL,
         context_factory: ContextFactory | None = None,
         resolved_ip_hash: "ResolvedIpHash" | None = None,
+        resolved_context: "ResolvedContext" | None = None,
     ) -> "AuditLogResult":
         """Log the event using :func:`log_audit_event_with_fallback`.
 
@@ -220,6 +221,7 @@ class AuditEvent:
             context=context_mapping,
             context_factory=effective_factory,
             resolved_ip_hash=resolved_ip_hash,
+            resolved_context=resolved_context,
         )
 
     def with_context(
@@ -277,6 +279,67 @@ class AuditEvent:
 
         return replace(self, context=None, context_factory=context_factory)
 
+    def _resolve_context_internal(
+        self,
+        *,
+        use_factory: bool,
+        drop_factory: bool,
+        refresh: bool,
+        capture_errors: bool,
+    ) -> tuple["AuditEvent", Optional[Mapping[str, Any]], Optional[Exception], bool]:
+        """Return context resolution metadata while reusing the core logic."""
+
+        context_value: Optional[Mapping[str, Any]]
+        if refresh:
+            context_value = None
+        else:
+            context_value = self.context
+
+        factory = self.context_factory
+        new_factory = factory
+
+        evaluated = False
+        if context_value is not None and not refresh:
+            evaluated = True
+
+        error: Optional[Exception] = None
+
+        if use_factory and context_value is None and factory is not None:
+            evaluated = True
+            try:
+                context_value = factory()
+            except Exception as exc:
+                if not capture_errors:
+                    raise
+                error = exc
+                context_value = None
+        elif capture_errors and (not use_factory):
+            evaluated = True
+
+        if drop_factory and new_factory is not None:
+            new_factory = None
+
+        updates: dict[str, Any] = {}
+
+        if refresh:
+            if self.context is not context_value:
+                updates["context"] = context_value
+        elif context_value is not self.context:
+            updates["context"] = context_value
+
+        if new_factory is not factory:
+            updates["context_factory"] = new_factory
+
+        if updates:
+            updated_event = replace(self, **updates)
+        else:
+            updated_event = self
+
+        if capture_errors and (factory is None):
+            evaluated = True
+
+        return updated_event, context_value, error, evaluated
+
     def resolve_context(
         self,
         *,
@@ -298,38 +361,45 @@ class AuditEvent:
         required.
         """
 
-        context_value: Optional[Mapping[str, Any]]
-        if refresh:
-            context_value = None
-        else:
-            context_value = self.context
-
-        factory = self.context_factory
-        new_factory = factory
-
-        if use_factory and context_value is None and factory is not None:
-            context_value = factory()
-
-        if drop_factory and new_factory is not None:
-            new_factory = None
-
-        updates: dict[str, Any] = {}
-
-        if refresh:
-            if self.context is not context_value:
-                updates["context"] = context_value
-        elif context_value is not self.context:
-            updates["context"] = context_value
-
-        if new_factory is not factory:
-            updates["context_factory"] = new_factory
-
-        if updates:
-            updated_event = replace(self, **updates)
-        else:
-            updated_event = self
+        updated_event, context_value, _, _ = self._resolve_context_internal(
+            use_factory=use_factory,
+            drop_factory=drop_factory,
+            refresh=refresh,
+            capture_errors=False,
+        )
 
         return updated_event, context_value
+
+    def resolve_context_metadata(
+        self,
+        *,
+        use_factory: bool = True,
+        drop_factory: bool = False,
+        refresh: bool = False,
+    ) -> tuple["AuditEvent", "ResolvedContext"]:
+        """Return an updated event and structured context resolution metadata.
+
+        The helper mirrors :meth:`resolve_context` but also captures whether a
+        context factory was evaluated and records any exception raised during
+        resolution.  Callers can pass the returned :class:`ResolvedContext`
+        directly to :func:`log_event_with_fallback` (or
+        :meth:`AuditEvent.log_with_fallback`) to avoid re-evaluating expensive
+        factories and to surface context factory failures alongside other
+        fallback metadata.
+        """
+
+        updated_event, context_value, error, evaluated = self._resolve_context_internal(
+            use_factory=use_factory,
+            drop_factory=drop_factory,
+            refresh=refresh,
+            capture_errors=True,
+        )
+
+        return updated_event, ResolvedContext(
+            value=context_value,
+            error=error,
+            evaluated=evaluated,
+        )
 
     def with_actor(self, actor: str) -> "AuditEvent":
         """Return a copy of the event with an updated actor value."""
@@ -453,6 +523,15 @@ class AuditLogResult:
 
     def __bool__(self) -> bool:  # pragma: no cover - exercised implicitly via truthiness
         return self.handled
+
+
+@dataclass(frozen=True)
+class ResolvedContext:
+    """Structured metadata describing context resolution state."""
+
+    value: Optional[Mapping[str, Any]]
+    error: Optional[Exception]
+    evaluated: bool
 
 
 LOGGER = logging.getLogger("shared.audit_hooks")
@@ -771,6 +850,7 @@ def log_event_with_fallback(
     context: Optional[Mapping[str, Any]] = None,
     context_factory: ContextFactory | None = None,
     resolved_ip_hash: ResolvedIpHash | None = None,
+    resolved_context: "ResolvedContext" | None = None,
 ) -> AuditLogResult:
     """Emit an audit event while shielding callers from optional failures.
 
@@ -791,7 +871,10 @@ def log_event_with_fallback(
     events without recomputing (or re-logging) failures.  When the structured
     fallback ``context`` is expensive to build, ``context_factory`` can be
     provided to defer that work until a fallback log entry is actually
-    required.
+    required.  Supplying ``resolved_context`` allows callers to pre-resolve
+    structured context metadata—including capturing factory exceptions—so the
+    helper can reuse the outcome without re-invoking the factory during
+    fallback logging.
     """
 
     resolved = resolved_ip_hash
@@ -802,21 +885,33 @@ def log_event_with_fallback(
         )
 
     log_extra: dict[str, Any] | None = None
+    effective_context_factory = context_factory
     context_value = context
-    context_evaluated = context_value is not None or context_factory is None
     context_error: Exception | None = None
+    if resolved_context is not None:
+        if context is None:
+            context_value = resolved_context.value
+        context_error = resolved_context.error
+
+    context_evaluated = (
+        context_value is not None
+        or effective_context_factory is None
+        or (resolved_context.evaluated if resolved_context is not None else False)
+    )
     context_error_logged = False
 
     def ensure_log_extra() -> Mapping[str, Any]:
-        nonlocal log_extra, context_value, context_evaluated, context_error, context_error_logged
+        nonlocal log_extra, context_value, context_evaluated
+        nonlocal context_error, context_error_logged, effective_context_factory
         if log_extra is None:
-            if not context_evaluated and context_factory is not None:
+            if not context_evaluated and effective_context_factory is not None:
                 try:
-                    context_value = context_factory()
+                    context_value = effective_context_factory()
                 except Exception as exc:  # pragma: no cover - exercised via tests
                     context_error = exc
                     context_value = None
                 finally:
+                    effective_context_factory = None
                     context_evaluated = True
             log_extra = _build_audit_log_extra(
                 actor=actor,
@@ -904,6 +999,7 @@ def log_audit_event_with_fallback(
     context: Optional[Mapping[str, Any]] | object = _EVENT_CONTEXT_SENTINEL,
     context_factory: ContextFactory | None = None,
     resolved_ip_hash: ResolvedIpHash | None = None,
+    resolved_context: ResolvedContext | None = None,
 ) -> AuditLogResult:
     """Convenience wrapper for logging :class:`AuditEvent` instances."""
     effective_factory = context_factory
@@ -933,6 +1029,7 @@ def log_audit_event_with_fallback(
         context=context_mapping,
         context_factory=effective_factory,
         resolved_ip_hash=resolved_ip_hash,
+        resolved_context=resolved_context,
     )
 
 
@@ -941,6 +1038,7 @@ __all__ = [
     "AuditEvent",
     "AuditLogResult",
     "ResolvedIpHash",
+    "ResolvedContext",
     "AuditCallable",
     "HashIpCallable",
     "ContextFactory",
