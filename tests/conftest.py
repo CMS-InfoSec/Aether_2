@@ -363,13 +363,75 @@ def _install_sqlalchemy_stub() -> None:
             self.bind = bind
             self._bind_identifier = getattr(bind, "_aether_url", None)
 
+        def __enter__(self) -> "Session":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[override]
+            self.close()
+
+        def begin(self) -> "_TransactionContext":
+            return _TransactionContext(self)
+
         def execute(self, *args: object, **kwargs: object) -> SimpleNamespace:
+            statement = args[0] if args else None
+            memory_runs = getattr(self, "_memory_runs", None)
+            if memory_runs is not None and getattr(statement, "_entities", None):
+                entities = list(getattr(statement, "_entities", ()))
+                entity = entities[0] if entities else None
+
+                def _scalar_result(values: Iterable[object]) -> SimpleNamespace:
+                    materialised = list(values)
+                    return SimpleNamespace(
+                        all=lambda: list(materialised),
+                        first=lambda: materialised[0] if materialised else None,
+                        __iter__=lambda self=materialised: iter(self),
+                    )
+
+                if isinstance(entity, str):
+                    if entity == "run_id":
+                        values = [record.run_id for record in memory_runs]
+                    else:
+                        values = []
+                    return SimpleNamespace(
+                        scalars=lambda: _scalar_result(values),
+                        scalar_one_or_none=lambda: values[0] if values else None,
+                    )
+
+                if entity is not None:
+                    values = list(memory_runs)
+                    return SimpleNamespace(
+                        scalars=lambda: _scalar_result(values),
+                        scalar_one_or_none=lambda: values[0] if values else None,
+                    )
+
             return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: []))
 
         def get(self, *args: object, **kwargs: object) -> None:
             return None
 
+        def add(self, *args: object, **kwargs: object) -> None:  # pragma: no cover - noop stub
+            return None
+
+        def flush(self) -> None:  # pragma: no cover - noop stub
+            return None
+
+        def commit(self) -> None:  # pragma: no cover - noop stub
+            return None
+
+        def rollback(self) -> None:  # pragma: no cover - noop stub
+            return None
+
         def close(self) -> None:
+            return None
+
+    class _TransactionContext:
+        def __init__(self, session: Session) -> None:
+            self._session = session
+
+        def __enter__(self) -> Session:
+            return self._session
+
+        def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[override]
             return None
 
     def _sessionmaker(*args: object, **kwargs: object):
