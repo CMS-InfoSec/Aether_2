@@ -10,7 +10,19 @@ import os
 import re
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from types import ModuleType
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Protocol,
+    Tuple,
+    TypeVar,
+    cast,
+)
 
 from fastapi import (
     BackgroundTasks,
@@ -26,27 +38,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
-from pydantic import BaseModel, Field, SecretStr, validator
-
-try:  # pragma: no cover - optional dependency for runtime environment
-    from kubernetes import client, config
-    from kubernetes.client import CoreV1Api
-    from kubernetes.client.rest import ApiException
-except ImportError:  # pragma: no cover - fallback for testing environments
-    client = None  # type: ignore
-    config = None  # type: ignore
-
-    class CoreV1Api:  # type: ignore
-        """Placeholder to satisfy type-checkers when kubernetes is unavailable."""
-
-        ...
-
-    class ApiException(Exception):  # type: ignore
-        """Placeholder ``ApiException`` when kubernetes is unavailable."""
-
-        def __init__(self, status: int = 500, reason: str | None = None) -> None:
-            super().__init__(reason)
-            self.status = status
+from pydantic import Field, SecretStr, validator as pydantic_validator
 
 from services.common.security import (
     require_admin_account,
@@ -68,19 +60,114 @@ from services.secrets.secure_secrets import (
     SecretsMetadataStore,
 )
 from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
+from shared.audit_hooks import AuditEvent, load_audit_hooks
 
-try:  # pragma: no cover - optional audit dependency
-    from common.utils.audit_logger import hash_ip as audit_chain_hash_ip, log_audit as chain_log_audit
-except Exception:  # pragma: no cover - degrade gracefully when audit logger unavailable
-    chain_log_audit = None  # type: ignore[assignment]
+try:  # pragma: no cover - optional dependency for runtime environment
+    from kubernetes import client as kubernetes_client, config as kubernetes_config
+    from kubernetes.client import CoreV1Api
+    from kubernetes.client.rest import ApiException
+except ImportError:  # pragma: no cover - fallback for testing environments
+    kubernetes_client = None
+    kubernetes_config = None
 
-    def audit_chain_hash_ip(_: Optional[str]) -> Optional[str]:  # type: ignore[override]
-        return None
+    class _CoreV1Api:  # pragma: no cover - placeholder type
+        """Placeholder to satisfy type-checkers when kubernetes is unavailable."""
+
+        ...
+
+    class _ApiException(Exception):  # pragma: no cover - placeholder type
+        """Placeholder ``ApiException`` when kubernetes is unavailable."""
+
+        def __init__(self, status: int = 500, reason: str | None = None) -> None:
+            super().__init__(reason)
+            self.status = status
+
+    CoreV1Api = _CoreV1Api
+    ApiException = _ApiException
+
+client: ModuleType | None = kubernetes_client
+config: ModuleType | None = kubernetes_config
 
 try:  # pragma: no cover - OMS watcher is optional in some runtimes
-    from services.oms.oms_kraken import KrakenCredentialWatcher
+    from services.oms.oms_kraken import KrakenCredentialWatcher as _KrakenCredentialWatcher
 except Exception:  # pragma: no cover - fallback when OMS package unavailable
-    KrakenCredentialWatcher = None  # type: ignore[misc, assignment]
+    _KrakenCredentialWatcher = None
+
+KrakenCredentialWatcher: type[Any] | None = cast(type[Any] | None, _KrakenCredentialWatcher)
+
+
+_BaseModelType = TypeVar("_BaseModelType", bound="_BaseModelProtocol")
+
+
+class _BaseModelProtocol(Protocol):
+    """Protocol describing the subset of ``BaseModel`` we rely on."""
+
+    model_config: Any
+
+    def __init__(self, **data: Any) -> None: ...
+
+    def model_dump(self, *args: Any, **kwargs: Any) -> Dict[str, Any]: ...
+
+    def model_dump_json(self, *args: Any, **kwargs: Any) -> str: ...
+
+    def model_copy(self: _BaseModelType, *args: Any, **kwargs: Any) -> _BaseModelType: ...
+
+if TYPE_CHECKING:
+    class SecretsBaseModel(_BaseModelProtocol):
+        """Static typing stub for secrets service models."""
+
+        model_config: Any
+
+        def __init__(self, **data: Any) -> None: ...
+
+        def model_dump(self, *args: Any, **kwargs: Any) -> Dict[str, Any]: ...
+
+        def model_dump_json(self, *args: Any, **kwargs: Any) -> str: ...
+
+        def model_copy(self: _BaseModelType, *args: Any, **kwargs: Any) -> _BaseModelType: ...
+else:
+    from pydantic import BaseModel as SecretsBaseModel
+
+
+RouteFn = TypeVar("RouteFn", bound=Callable[..., Any])
+
+
+def _app_route(
+    factory: Callable[..., Any], *args: Any, **kwargs: Any
+) -> Callable[[RouteFn], RouteFn]:
+    """Cast FastAPI route decorators to typed callables for mypy strict mode."""
+
+    return cast(Callable[[RouteFn], RouteFn], factory(*args, **kwargs))
+
+
+def _app_post(*args: Any, **kwargs: Any) -> Callable[[RouteFn], RouteFn]:
+    """Typed wrapper around ``app.post``."""
+
+    return _app_route(app.post, *args, **kwargs)
+
+
+def _app_get(*args: Any, **kwargs: Any) -> Callable[[RouteFn], RouteFn]:
+    """Typed wrapper around ``app.get``."""
+
+    return _app_route(app.get, *args, **kwargs)
+
+
+def _app_on_event(event_type: str) -> Callable[[RouteFn], RouteFn]:
+    """Typed wrapper around FastAPI's ``on_event`` decorator."""
+
+    return cast(Callable[[RouteFn], RouteFn], app.on_event(event_type))
+
+
+def _app_exception_handler(*args: Any, **kwargs: Any) -> Callable[[RouteFn], RouteFn]:
+    """Typed wrapper around FastAPI's ``exception_handler`` decorator."""
+
+    return cast(Callable[[RouteFn], RouteFn], app.exception_handler(*args, **kwargs))
+
+
+def validator(*fields: str, **kwargs: Any) -> Callable[[RouteFn], RouteFn]:
+    """Typed wrapper around ``pydantic.validator``."""
+
+    return cast(Callable[[RouteFn], RouteFn], pydantic_validator(*fields, **kwargs))
 
 
 LOGGER = logging.getLogger(__name__)
@@ -158,12 +245,12 @@ async def _master_key_rotation_loop() -> None:
         await asyncio.sleep(_MASTER_KEY_CHECK_INTERVAL.total_seconds())
 
 
-@app.on_event("startup")
+@_app_on_event("startup")
 async def _start_master_key_scheduler() -> None:
     app.state.master_key_rotation_task = asyncio.create_task(_master_key_rotation_loop())
 
 
-@app.on_event("shutdown")
+@_app_on_event("shutdown")
 async def _stop_master_key_scheduler() -> None:
     task = getattr(app.state, "master_key_rotation_task", None)
     if task is None:
@@ -256,7 +343,8 @@ def _perform_secure_rotation(
 
     ip_address = request.client.host if request.client else None
     hashed_ip = _hash_ip(ip_address)
-    chain_ip_hash = audit_chain_hash_ip(ip_address)
+    audit_hooks = load_audit_hooks()
+    chain_ip_hash = audit_hooks.hash_ip(ip_address)
 
     recorded_meta = meta_store.record_rotation(
         kms_key_id=envelope.kms_key_id,
@@ -290,20 +378,24 @@ def _perform_secure_rotation(
         after=audit_after,
     )
 
-    if chain_log_audit is not None:
-        try:
-            chain_log_audit(
-                actor=actor,
-                action="secret.kraken.rotate",
-                entity=f"kraken:{account_id}",
-                before=before_for_audit,
-                after=chain_audit_after,
-                ip_hash=chain_ip_hash,
-            )
-        except Exception:  # pragma: no cover - defensive best effort
-            LOGGER.exception(
-                "Failed to record tamper-evident audit log for Kraken rotation on %s", account_id
-            )
+    event = AuditEvent(
+        actor=actor,
+        action="secret.kraken.rotate",
+        entity=f"kraken:{account_id}",
+        before=before_for_audit,
+        after=chain_audit_after,
+        ip_hash=chain_ip_hash,
+    )
+    event.log_with_fallback(
+        audit_hooks,
+        LOGGER,
+        failure_message=(
+            f"Failed to record tamper-evident audit log for Kraken rotation on {account_id}"
+        ),
+        disabled_message=(
+            f"Audit logging disabled; skipping secret.kraken.rotate for {account_id}"
+        ),
+    )
 
     LOGGER.info(
         "OMS watcher note: Kraken credentials rotated with envelope encryption",  # pragma: no cover - log only
@@ -334,7 +426,7 @@ def _hash_ip(value: Optional[str]) -> str:
     return digest
 
 
-@app.exception_handler(RequestValidationError)
+@_app_exception_handler(RequestValidationError)
 async def handle_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
     LOGGER.warning(
         "Validation error for Kraken secret request",
@@ -467,7 +559,7 @@ def _ensure_no_whitespace(value: str, field_name: str) -> str:
     return value
 
 
-class KrakenSecretRequest(BaseModel):
+class KrakenSecretRequest(SecretsBaseModel):
     """Payload for rotating Kraken API credentials."""
 
     account_id: str = Field(..., description="Trading account identifier")
@@ -501,7 +593,7 @@ class KrakenSecretRequest(BaseModel):
         return value
 
 
-class KrakenSecretStatus(BaseModel):
+class KrakenSecretStatus(SecretsBaseModel):
     """Status payload describing the stored secret."""
 
     account_id: str = Field(..., description="Trading account identifier")
@@ -509,7 +601,7 @@ class KrakenSecretStatus(BaseModel):
     last_rotated_at: datetime = Field(..., description="Timestamp of the latest rotation")
 
 
-class SecretRotationResponse(BaseModel):
+class SecretRotationResponse(SecretsBaseModel):
     """Response payload for the generic rotation endpoint."""
 
     account_id: str = Field(..., description="Trading account identifier")
@@ -518,14 +610,14 @@ class SecretRotationResponse(BaseModel):
     kms_key_id: str = Field(..., description="Identifier of the KMS data key")
 
 
-class SecretStatusResponse(BaseModel):
+class SecretStatusResponse(SecretsBaseModel):
     """Status payload for the generic credential endpoint."""
 
     account_id: str = Field(..., description="Trading account identifier")
     last_rotated_at: datetime = Field(..., description="Timestamp of the latest rotation")
 
 
-class EncryptedRotationResponse(BaseModel):
+class EncryptedRotationResponse(SecretsBaseModel):
     """Response payload for the encrypted rotation endpoint."""
 
     secret_name: str
@@ -545,7 +637,7 @@ class EncryptedRotationResponse(BaseModel):
         return result
 
 
-class KrakenForceRotateRequest(BaseModel):
+class KrakenForceRotateRequest(SecretsBaseModel):
     """Request payload for manually updating rotation metadata."""
 
     account_id: str = Field(..., description="Trading account identifier")
@@ -555,7 +647,7 @@ class KrakenForceRotateRequest(BaseModel):
         return KrakenSecretRequest._ensure(_ACCOUNT_ID_PATTERN, value, "account_id")
 
 
-class RotationAuditEntry(BaseModel):
+class RotationAuditEntry(SecretsBaseModel):
     """History entry describing an individual secret rotation."""
 
     account_id: str
@@ -789,7 +881,7 @@ def _upsert_secret(
     }
 
 
-@app.post(
+@_app_post(
     "/secrets/rotate",
     response_model=SecretRotationResponse,
     status_code=status.HTTP_200_OK,
@@ -858,7 +950,7 @@ def rotate_secret(
     )
 
 
-@app.post(
+@_app_post(
     "/secrets/kraken",
     status_code=status.HTTP_200_OK,
     dependencies=[Depends(ensure_secure_transport)],
@@ -917,7 +1009,7 @@ def rotate_kraken_secret(
     return response
 
 
-@app.post(
+@_app_post(
     "/secrets/rotate_encrypted",
     response_model=EncryptedRotationResponse,
     status_code=status.HTTP_200_OK,
@@ -987,7 +1079,7 @@ def rotate_encrypted_secret(
     )
 
 
-@app.post(
+@_app_post(
     "/secrets/kraken/force_rotate",
     status_code=status.HTTP_204_NO_CONTENT,
     dependencies=[Depends(ensure_secure_transport)],
@@ -1072,7 +1164,7 @@ def force_rotate_kraken_secret(
     return response
 
 
-@app.get(
+@_app_get(
     "/secrets/status",
     response_model=SecretStatusResponse,
     dependencies=[Depends(ensure_secure_transport)],
@@ -1115,7 +1207,7 @@ def secret_status(
     return SecretStatusResponse(account_id=account_id, last_rotated_at=rotated_at)
 
 
-@app.get(
+@_app_get(
     "/secrets/audit",
     response_model=List[RotationAuditEntry],
     dependencies=[Depends(ensure_secure_transport)],
@@ -1178,7 +1270,7 @@ def secret_rotation_audit(
     return audit_entries
 
 
-@app.get(
+@_app_get(
     "/secrets/kraken/status",
     response_model=KrakenSecretStatus,
     dependencies=[Depends(ensure_secure_transport)],
@@ -1217,7 +1309,7 @@ def kraken_secret_status(
     )
 
 
-@app.post(
+@_app_post(
     "/secrets/kraken/test",
     status_code=status.HTTP_204_NO_CONTENT,
     dependencies=[Depends(ensure_secure_transport)],
