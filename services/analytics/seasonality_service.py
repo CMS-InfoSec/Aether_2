@@ -177,7 +177,19 @@ if _SQLALCHEMY_AVAILABLE:
     class OhlcvBar(OhlcvBase):
         """Minimal OHLCV representation backed by the historical bars table."""
 
-        __tablename__ = "ohlcv_bars"
+if TYPE_CHECKING:
+    class _DeclarativeBase:
+        """Typed stub mirroring SQLAlchemy's declarative base attributes."""
+
+        metadata: Any
+        registry: Any
+
+
+    OhlcvBase = _DeclarativeBase
+    MetricsBase = _DeclarativeBase
+else:  # pragma: no cover - runtime declarative bases when SQLAlchemy is available
+    OhlcvBase = declarative_base()
+    MetricsBase = declarative_base()
 
 if TYPE_CHECKING:
     class _DeclarativeBase:
@@ -223,6 +235,21 @@ else:
             volume: float,
         ) -> None: ...
 
+    if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
+        __table__: Any
+
+        def __init__(
+            self,
+            *,
+            market: str,
+            bucket_start: datetime,
+            open: float,
+            high: float,
+            low: float,
+            close: float,
+            volume: float,
+        ) -> None: ...
+
     market = Column(String, primary_key=True)
     bucket_start = Column(DateTime(timezone=True), primary_key=True)
     open = Column(Float)
@@ -246,6 +273,20 @@ else:
     @dataclass
     class SeasonalityMetric:  # type: ignore[override]
         """In-memory representation of computed seasonality metrics."""
+
+    if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
+        __table__: Any
+
+        def __init__(
+            self,
+            *,
+            symbol: str,
+            period: str,
+            avg_return: float,
+            avg_vol: float,
+            avg_volume: float,
+            ts: datetime,
+        ) -> None: ...
 
     if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
         __table__: Any
@@ -599,9 +640,8 @@ def _dispose_database(application: FastAPI) -> None:
     global SessionLocal
 
     engine = getattr(application.state, ENGINE_STATE_KEY, None)
-    dispose = getattr(engine, "dispose", None)
-    if callable(dispose):
-        dispose()
+    if isinstance(engine, Engine):
+        engine.dispose()
 
     for key in (
         ENGINE_STATE_KEY,

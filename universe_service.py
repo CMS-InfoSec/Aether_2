@@ -213,16 +213,13 @@ else:  # pragma: no cover - runtime base when SQLAlchemy is available
             metadata: Any
             registry: Any
 
-        metadata: Any  # pragma: no cover - provided by SQLAlchemy
-        registry: Any  # pragma: no cover - provided by SQLAlchemy
-else:  # pragma: no cover - runtime base when SQLAlchemy is available
-    try:
-        from sqlalchemy.orm import declarative_base
-
 if SQLALCHEMY_AVAILABLE:
 
     class UniverseWhitelist(Base):
         """SQLAlchemy model storing the computed trading universe."""
+
+    if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
+        __table__: Any
 
     if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
         __table__: Any
@@ -255,6 +252,18 @@ if SQLALCHEMY_AVAILABLE:
 
     class AuditLog(Base):
         """Audit log entry capturing manual overrides."""
+
+    if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
+        __table__: Any
+
+        def __init__(
+            self,
+            *,
+            symbol: str,
+            enabled: bool,
+            reason: str,
+            created_at: datetime | None = ...,
+        ) -> None: ...
 
     if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
         __table__: Any

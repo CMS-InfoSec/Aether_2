@@ -10,39 +10,55 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from statistics import pstdev
+from typing import TYPE_CHECKING, Any, Callable, TypeVar, cast
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+if TYPE_CHECKING:  # pragma: no cover - used solely for static analysis
+    from fastapi import APIRouter, Depends, HTTPException, Query
+else:  # pragma: no cover - runtime fallbacks when FastAPI is optional
+    try:
+        from fastapi import APIRouter, Depends, HTTPException, Query
+    except ModuleNotFoundError:  # pragma: no cover - lightweight shims
+        class HTTPException(Exception):
+            """Minimal HTTP exception capturing status and detail."""
 
-_SQLALCHEMY_AVAILABLE = True
+            def __init__(self, status_code: int, detail: str) -> None:
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
 
-try:  # pragma: no cover - optional dependency present in production
-    from sqlalchemy import (
-        Column,
-        DateTime,
-        Float,
-        MetaData,
-        PrimaryKeyConstraint,
-        String,
-        Table,
-        select,
-    )
-    from sqlalchemy import create_engine
-    from sqlalchemy.engine import Engine
-    from sqlalchemy.exc import SQLAlchemyError
-    from sqlalchemy.pool import StaticPool
-except ImportError:  # pragma: no cover - exercised when SQLAlchemy is unavailable
-    _SQLALCHEMY_AVAILABLE = False
-    Column = DateTime = Float = MetaData = PrimaryKeyConstraint = String = Table = None  # type: ignore[assignment]
-    Engine = object  # type: ignore[assignment]
-    SQLAlchemyError = Exception  # type: ignore[assignment]
-    StaticPool = object  # type: ignore[assignment]
+        class APIRouter:  # pragma: no cover - decorator-friendly stub
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                del args, kwargs
 
-    def select(*_args: object, **_kwargs: object) -> None:  # type: ignore[override]
-        raise RuntimeError("SQLAlchemy is required for select queries in VWAP analytics")
+            def get(
+                self, *args: Any, **kwargs: Any
+            ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+                def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+                    return func
 
-    def create_engine(*_args: object, **_kwargs: object) -> Engine:  # type: ignore[override]
-        raise RuntimeError("SQLAlchemy engine creation requested but the dependency is missing")
+                return decorator
+
+        def Depends(dependency: Callable[..., Any]) -> Callable[..., Any]:  # type: ignore[misc]
+            return dependency
+
+        def Query(default: Any = None, **_: Any) -> Any:
+            return default
+
+from shared.pydantic_compat import BaseModel, Field
+from sqlalchemy import (
+    Column,
+    DateTime,
+    Float,
+    MetaData,
+    PrimaryKeyConstraint,
+    String,
+    Table,
+    select,
+)
+from sqlalchemy import create_engine
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.pool import StaticPool
 
 from services.common.security import require_admin_account
 from services.common.spot import require_spot_http
@@ -170,18 +186,20 @@ class VWAPAnalyticsService:
             candidate = raw.strip()
             if not candidate:
                 continue
-            return normalize_sqlalchemy_dsn(
+            normalized_candidate: str = normalize_sqlalchemy_dsn(
                 candidate,
                 allow_sqlite=allow_sqlite,
                 label=label,
             )
+            return normalized_candidate
 
         if allow_sqlite:
-            return normalize_sqlalchemy_dsn(
+            normalized_sqlite: str = normalize_sqlalchemy_dsn(
                 _SQLITE_FALLBACK,
                 allow_sqlite=True,
                 label=label,
             )
+            return normalized_sqlite
 
         raise RuntimeError(
             "VWAP analytics database DSN is not configured. Set VWAP_DATABASE_URL "
@@ -194,7 +212,8 @@ class VWAPAnalyticsService:
             return None
         label = "VWAP schema"
         if requested:
-            return normalize_postgres_schema(requested, label=label)
+            requested_schema: str = normalize_postgres_schema(requested, label=label)
+            return requested_schema
         for key in ("VWAP_SCHEMA", "TIMESCALE_SCHEMA"):
             raw = os.getenv(key)
             if raw is None:
@@ -202,7 +221,8 @@ class VWAPAnalyticsService:
             candidate = raw.strip()
             if not candidate:
                 continue
-            return normalize_postgres_schema(candidate, label=label)
+            env_schema: str = normalize_postgres_schema(candidate, label=label)
+            return env_schema
         return "public"
 
     def compute(self, symbol: str) -> VWAPDivergenceResponse:
@@ -338,6 +358,15 @@ def _to_float(value: float | int | Decimal | None) -> float:
 
 router = APIRouter(prefix="/vwap", tags=["analytics"])
 
+RouteFn = TypeVar("RouteFn", bound=Callable[..., Any])
+
+
+def _router_get(path: str, **kwargs: Any) -> Callable[[RouteFn], RouteFn]:
+    """Typed wrapper around ``router.get`` preserving endpoint signatures."""
+
+    decorator = router.get(path, **kwargs)
+    return cast(Callable[[RouteFn], RouteFn], decorator)
+
 
 @lru_cache(maxsize=1)
 def get_service() -> VWAPAnalyticsService:
@@ -346,7 +375,7 @@ def get_service() -> VWAPAnalyticsService:
     return VWAPAnalyticsService()
 
 
-@router.get("/divergence", response_model=VWAPDivergenceResponse)
+@_router_get("/divergence", response_model=VWAPDivergenceResponse)
 def vwap_divergence(
     *,
     symbol: str = Query(..., description="Symbol to compute VWAP divergence for"),
