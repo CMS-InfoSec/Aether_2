@@ -9,7 +9,10 @@ import sys
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI
+try:  # pragma: no cover - FastAPI is optional in some unit tests
+    from fastapi import FastAPI
+except ImportError:  # pragma: no cover - fallback when FastAPI is stubbed out
+    from services.common.fastapi_stub import FastAPI  # type: ignore[misc]
 
 from audit_mode import configure_audit_mode
 from accounts.service import AccountsService
