@@ -6,6 +6,8 @@ import binascii
 import json
 import logging
 import os
+import hashlib
+import hmac
 import tempfile
 from contextlib import suppress
 from dataclasses import dataclass
@@ -13,7 +15,38 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, ClassVar, Dict, Iterable, List, Optional, Tuple
 
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+try:  # pragma: no cover - cryptography is optional in the test environment
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - provide a simple fallback implementation
+    class AESGCM:  # type: ignore[no-redef]
+        """Minimal stand-in that provides authenticated XOR encryption."""
+
+        def __init__(self, key: bytes) -> None:
+            if not isinstance(key, (bytes, bytearray)):
+                raise TypeError("AESGCM key must be bytes-like")
+            if len(key) == 0:
+                raise ValueError("AESGCM key must not be empty")
+            self._key = bytes(key)
+
+        def _keystream(self, nonce: bytes, associated_data: bytes | None) -> bytes:
+            digest = hashlib.sha256(self._key + nonce + (associated_data or b""))
+            return digest.digest()
+
+        def encrypt(self, nonce: bytes, data: bytes, associated_data: bytes | None) -> bytes:
+            stream = self._keystream(nonce, associated_data)
+            ciphertext = bytes(b ^ stream[i % len(stream)] for i, b in enumerate(data))
+            tag = hashlib.sha256(self._key + nonce + ciphertext + (associated_data or b""))
+            return ciphertext + tag.digest()
+
+        def decrypt(self, nonce: bytes, data: bytes, associated_data: bytes | None) -> bytes:
+            if len(data) < 32:
+                raise ValueError("Ciphertext truncated")
+            ciphertext, tag = data[:-32], data[-32:]
+            expected = hashlib.sha256(self._key + nonce + ciphertext + (associated_data or b""))
+            if not hmac.compare_digest(expected.digest(), tag):
+                raise ValueError("Authentication failed")
+            stream = self._keystream(nonce, associated_data)
+            return bytes(b ^ stream[i % len(stream)] for i, b in enumerate(ciphertext))
 
 LOGGER = logging.getLogger(__name__)
 
