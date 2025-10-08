@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any, Dict
+from urllib.parse import parse_qsl, urlparse, urlunparse
 
 import pytest
 
@@ -293,7 +294,7 @@ def _install_sqlalchemy_stub() -> None:
     sa.select = _select
     sa.insert = _insert
     sa.create_engine = _create_engine
-    sa.text = lambda *args, **kwargs: None
+    sa.text = lambda sql, **kwargs: sql
     sa.engine_from_config = _engine_from_config
 
     sys.modules["sqlalchemy"] = sa
@@ -358,7 +359,39 @@ def _install_sqlalchemy_stub() -> None:
     engine = ModuleType("sqlalchemy.engine")
     engine.__spec__ = ModuleSpec("sqlalchemy.engine", loader=None)
     engine.Engine = SimpleNamespace
+
+    class _URL(SimpleNamespace):
+        def __init__(self, raw_url: str) -> None:
+            parsed = urlparse(raw_url)
+            if not parsed.scheme:
+                raise ValueError(f"Could not parse URL from string '{raw_url}'")
+            super().__init__(
+                drivername=parsed.scheme,
+                host=parsed.hostname,
+                query={key: value for key, value in parse_qsl(parsed.query)},
+            )
+            self._raw = raw_url
+            self._parsed = parsed
+
+        def set(self, drivername: str) -> "_URL":
+            parts = list(self._parsed)
+            parts[0] = drivername
+            return _URL(urlunparse(parts))
+
+        def render_as_string(self, hide_password: bool = False) -> str:
+            del hide_password
+            return self._raw
+
+    def _make_url(raw_url: str) -> _URL:
+        return _URL(raw_url)
+
+    engine_url = ModuleType("sqlalchemy.engine.url")
+    engine_url.__spec__ = ModuleSpec("sqlalchemy.engine.url", loader=None)
+    engine_url.URL = _URL
+    engine_url.make_url = _make_url
+    engine.url = engine_url
     sys.modules["sqlalchemy.engine"] = engine
+    sys.modules["sqlalchemy.engine.url"] = engine_url
 
     exc = ModuleType("sqlalchemy.exc")
     exc.__spec__ = ModuleSpec("sqlalchemy.exc", loader=None)
