@@ -5,17 +5,13 @@ import logging
 import math
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Iterator, List, Optional, Sequence, TypeVar, cast
 
-from typing import Any, Iterator, List, Optional, Sequence
-
-
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
-from pydantic import BaseModel, Field
-from prometheus_client import Gauge
 from alembic import command
 from alembic.config import Config
+from prometheus_client import Gauge
 from sqlalchemy import Column, DateTime, Float, String, create_engine, func, select
 from sqlalchemy.engine import Engine, URL
 from sqlalchemy.engine.url import make_url
@@ -24,6 +20,89 @@ from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 import metrics
 from services.common.spot import require_spot_http
+from shared.pydantic_compat import BaseModel, Field
+
+if TYPE_CHECKING:  # pragma: no cover - FastAPI is optional in some environments
+    from fastapi import Depends, FastAPI, HTTPException, Query, Request
+    from starlette import status
+else:  # pragma: no cover - lightweight fallbacks when FastAPI is unavailable
+    try:
+        from fastapi import Depends, FastAPI, HTTPException, Query, Request
+        from starlette import status
+    except ModuleNotFoundError:  # pragma: no cover - minimal shims for optional deps
+        class HTTPException(Exception):
+            """Lightweight HTTP exception carrying status and detail."""
+
+            def __init__(self, status_code: int, detail: str) -> None:
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+
+        class _State:  # pragma: no cover - simple container for stateful attrs
+            pass
+
+        class FastAPI:  # pragma: no cover - decorator-friendly application shim
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                del args, kwargs
+                self.state = _State()
+
+            def get(
+                self, *args: Any, **kwargs: Any
+            ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+                def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+                    return func
+
+                return decorator
+
+            def on_event(
+                self, *_: Any, **__: Any
+            ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+                def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+                    return func
+
+                return decorator
+
+        class Request:  # pragma: no cover - exposes ``app`` and ``state`` like FastAPI
+            def __init__(self) -> None:
+                self.app = FastAPI()
+                self.state = self.app.state
+
+        def Depends(dependency: Callable[..., Any]) -> Callable[..., Any]:  # type: ignore[misc]
+            return dependency
+
+        def Query(default: Any = None, **_: Any) -> Any:
+            return default
+
+        class status:  # pragma: no cover - subset of Starlette status codes
+            HTTP_404_NOT_FOUND = 404
+
+
+TCallable = TypeVar("TCallable", bound=Callable[..., Any])
+
+
+def typed_app_event(
+    application: FastAPI, event: str
+) -> Callable[[TCallable], TCallable]:
+    """Wrap ``FastAPI.on_event`` so decorated callables retain their type."""
+
+    def decorator(func: TCallable) -> TCallable:
+        wrapped = application.on_event(event)(func)
+        return cast(TCallable, wrapped)
+
+    return decorator
+
+
+def typed_app_get(
+    application: FastAPI, path: str, **kwargs: Any
+) -> Callable[[TCallable], TCallable]:
+    """Wrap ``FastAPI.get`` to preserve typing for decorated endpoints."""
+
+    def decorator(func: TCallable) -> TCallable:
+        wrapped = application.get(path, **kwargs)(func)
+        return cast(TCallable, wrapped)
+
+    return decorator
+
 
 logger = logging.getLogger(__name__)
 
@@ -90,11 +169,27 @@ def _normalise_database_url(url: str) -> str:
         return "postgresql+psycopg2://" + url[len("postgres://") :]
     return url
 
+if TYPE_CHECKING:
+    class _DeclarativeBase:
+        """Typed stub mirroring the SQLAlchemy declarative base."""
 
-DATABASE_URL: Optional[URL] = None
-ENGINE: Optional[Engine] = None
+        metadata: Any
+        registry: Any
 
-SessionFactory: Optional[sessionmaker] = None
+    DeclarativeBase = _DeclarativeBase
+else:  # pragma: no cover - runtime base when SQLAlchemy is installed
+    DeclarativeBase = declarative_base()
+
+
+DATABASE_URL: URL | None = None
+ENGINE: Engine | None = None
+
+SessionFactory = Callable[[], Session]
+SESSION_FACTORY: SessionFactory | None = None
+
+ENGINE_STATE_KEY = "volatility_engine"
+SESSIONMAKER_STATE_KEY = "volatility_sessionmaker"
+DATABASE_URL_STATE_KEY = "volatility_database_url"
 
 
 def _create_engine(url: URL) -> Engine:
@@ -106,16 +201,8 @@ def _create_engine(url: URL) -> Engine:
 
 _MIGRATIONS_PATH = Path(__file__).resolve().parents[2] / "data" / "migrations"
 
-
-
 def run_migrations(url: URL) -> None:
-
     """Apply all outstanding Timescale migrations for analytics data."""
-
-    _ensure_session_factory()
-
-    if DATABASE_URL is None:
-        raise RuntimeError("Analytics database URL not configured; ensure startup completed.")
 
     config = Config()
     config.set_main_option("script_location", str(_MIGRATIONS_PATH))
@@ -125,13 +212,31 @@ def run_migrations(url: URL) -> None:
     command.upgrade(config, "head")
 
 
-Base = declarative_base()
+if TYPE_CHECKING:
+    Base = DeclarativeBase
+else:
+    Base = DeclarativeBase
 
 
 class OhlcvBar(Base):
     """Representation of the ``ohlcv_bars`` table."""
 
     __tablename__ = "ohlcv_bars"
+
+    if TYPE_CHECKING:  # pragma: no cover - enhanced constructor for static analysis
+        __table__: Any
+
+        def __init__(
+            self,
+            *,
+            market: str,
+            bucket_start: datetime,
+            open: float,
+            high: float,
+            low: float,
+            close: float,
+            volume: float,
+        ) -> None: ...
 
     market = Column(String, primary_key=True)
     bucket_start = Column(DateTime(timezone=True), primary_key=True)
@@ -146,6 +251,21 @@ class VolatilityMetric(Base):
     """Persistence model for computed volatility metrics."""
 
     __tablename__ = "vol_metrics"
+
+    if TYPE_CHECKING:  # pragma: no cover - inform mypy of constructor/table fields
+        __table__: Any
+
+        def __init__(
+            self,
+            *,
+            symbol: str,
+            realized_vol: float,
+            garch_vol: float,
+            jump_prob: float,
+            atr: float,
+            band_width: float,
+            ts: datetime,
+        ) -> None: ...
 
     symbol = Column(String, primary_key=True)
     realized_vol = Column(Float, nullable=False)
@@ -189,9 +309,9 @@ class VolatilityResponse(BaseModel):
 
 
 app = FastAPI(title="Volatility Analytics Service")
-app.state.analytics_database_url = None
-app.state.analytics_engine = None
-app.state.analytics_sessionmaker = None
+setattr(app.state, DATABASE_URL_STATE_KEY, None)
+setattr(app.state, ENGINE_STATE_KEY, None)
+setattr(app.state, SESSIONMAKER_STATE_KEY, None)
 metrics.setup_metrics(app, service_name="volatility-service")
 
 
@@ -211,55 +331,76 @@ def _volatility_gauge() -> Gauge:
     return _VOLATILITY_INDEX
 
 
-def _initialise_database() -> sessionmaker:
+def _initialise_database() -> SessionFactory:
     """Initialise database connectivity once configuration is available."""
 
     url = _require_database_url()
-    engine = create_engine(
-        url.render_as_string(hide_password=False),
-        **_engine_options(url),
+    engine = _create_engine(url)
+    session_factory = cast(
+        SessionFactory,
+        sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True),
     )
-    session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True)
 
     return _register_database(url, engine, session_factory)
 
 
-@app.on_event("startup")
+def _register_database(
+    url: URL, engine: Engine, session_factory: SessionFactory
+) -> SessionFactory:
+    """Store database artefacts for reuse across FastAPI requests."""
+
+    global DATABASE_URL, ENGINE, SESSION_FACTORY
+
+    DATABASE_URL = url
+    ENGINE = engine
+    SESSION_FACTORY = session_factory
+
+    setattr(app.state, DATABASE_URL_STATE_KEY, url)
+    setattr(app.state, ENGINE_STATE_KEY, engine)
+    setattr(app.state, SESSIONMAKER_STATE_KEY, session_factory)
+
+    return session_factory
+
+
+def _ensure_session_factory() -> SessionFactory:
+    session_factory = SESSION_FACTORY
+    if session_factory is None:
+        raise RuntimeError(
+            "Analytics database session factory is not initialised. Ensure startup has completed and "
+            "ANALYTICS_DATABASE_URL is configured."
+        )
+    return session_factory
+
+
+@typed_app_event(app, "startup")
 def _on_startup() -> None:
 
     """Initialise database connectivity and migrations when the app boots."""
 
-    global DATABASE_URL, ENGINE, SessionFactory
-
     url = _require_database_url()
     engine = _create_engine(url)
-    session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True)
+    session_factory = cast(
+        SessionFactory,
+        sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True),
+    )
 
     VolatilityMetric.__table__.create(bind=engine, checkfirst=True)
     run_migrations(url)
 
-    DATABASE_URL = url
-    ENGINE = engine
-    SessionFactory = session_factory
-
-
-    app.state.analytics_database_url = url
-    app.state.analytics_engine = engine
-    app.state.analytics_sessionmaker = session_factory
+    _register_database(url, engine, session_factory)
 
 
 def get_session(request: Request) -> Iterator[Session]:
-    session_factory: Optional[sessionmaker] = getattr(request.app.state, "analytics_sessionmaker", None)
+    session_factory = cast(
+        Optional[SessionFactory],
+        getattr(request.app.state, SESSIONMAKER_STATE_KEY, None),
+    )
 
     if session_factory is None:
-        session_factory = SessionFactory
+        session_factory = SESSION_FACTORY
 
     if session_factory is None:
-        raise RuntimeError(
-            "Analytics database session factory is not initialised. Ensure the startup event has run and the "
-            "ANALYTICS_DATABASE_URL environment variable is configured."
-        )
-
+        session_factory = _ensure_session_factory()
 
     session = session_factory()
     try:
@@ -436,7 +577,7 @@ def _evaluate(session: Session, symbol: str, window: int) -> VolatilityResponse:
     return _build_response(metrics_payload)
 
 
-@app.get("/volatility/realized", response_model=VolatilityResponse)
+@typed_app_get(app, "/volatility/realized", response_model=VolatilityResponse)
 def realized_volatility(
     *,
     symbol: str = Query(..., description="Instrument symbol", min_length=1),
@@ -446,7 +587,7 @@ def realized_volatility(
     return _evaluate(session, symbol, window)
 
 
-@app.get("/volatility/garch", response_model=VolatilityResponse)
+@typed_app_get(app, "/volatility/garch", response_model=VolatilityResponse)
 def garch_volatility(
     *,
     symbol: str = Query(..., description="Instrument symbol", min_length=1),
@@ -456,7 +597,7 @@ def garch_volatility(
     return _evaluate(session, symbol, window)
 
 
-@app.get("/volatility/jump_test", response_model=VolatilityResponse)
+@typed_app_get(app, "/volatility/jump_test", response_model=VolatilityResponse)
 def jump_test(
     *,
     symbol: str = Query(..., description="Instrument symbol", min_length=1),

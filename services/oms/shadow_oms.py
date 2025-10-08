@@ -11,39 +11,102 @@ expected fills, fees and slippage attribution.  Results are persisted via the
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from threading import Lock
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, TYPE_CHECKING, cast
 
-try:  # pragma: no cover - optional dependency during unit tests
-    from backtest_engine import Backtester, FeeSchedule, OrderIntent, Policy
-except ImportError:  # pragma: no cover - fallback to satisfy type checkers
-    Backtester = None  # type: ignore[assignment]
-    FeeSchedule = None  # type: ignore[assignment]
-    OrderIntent = None  # type: ignore[assignment]
+if TYPE_CHECKING:  # pragma: no cover - imported for static analysis only
+    class _PolicyBase:  # pylint: disable=too-few-public-methods
+        def generate(self, timestamp: datetime, market_state: Dict[str, Any]) -> Iterable[Any]:
+            ...
 
-    class Policy:  # type: ignore[no-redef]
-        pass
+        def reset(self) -> None:
+            ...
+
+    import pandas as pd
+else:  # pragma: no cover - lightweight fallbacks for runtime when deps missing
+
+    class _PolicyBase:  # pylint: disable=too-few-public-methods
+        """Minimal policy stub so optional imports remain type-safe."""
+
+        def generate(self, timestamp: datetime, market_state: Dict[str, Any]) -> Iterable[Any]:
+            return []
+
+        def reset(self) -> None:
+            return None
+
+    try:
+        import pandas as pd
+    except ImportError:  # pragma: no cover - pandas is optional for tests
+        pd = None
 
 
-class _SingleOrderPolicy(Policy):
+def _load_policy_base() -> "type[_PolicyBase]":
+    """Return the backtest policy base class if the dependency is available."""
+
+    try:
+        from backtest_engine import Policy as policy_cls
+    except ImportError:
+        return _PolicyBase
+    return cast("type[_PolicyBase]", policy_cls)
+
+
+_ACTUAL_POLICY = _load_policy_base()
+
+
+def _load_backtest_dependencies() -> tuple[Any, Any, Any]:
+    """Resolve optional backtest engine classes when available."""
+
+    try:
+        from backtest_engine import Backtester as backtester_cls
+        from backtest_engine import FeeSchedule as fee_schedule_cls
+        from backtest_engine import OrderIntent as order_intent_cls
+    except ImportError as exc:  # pragma: no cover - exercised in integration tests
+        raise RuntimeError("Backtest engine dependencies are unavailable") from exc
+    return backtester_cls, fee_schedule_cls, order_intent_cls
+
+
+def _to_backtest_timestamp(value: datetime) -> Any:
+    """Return a pandas timestamp when the dependency is available."""
+
+    pandas_module = globals().get("pd")
+    if pandas_module is not None:
+        return pandas_module.Timestamp(value)
+    return value
+
+
+def _offset_backtest_timestamp(value: datetime, *, milliseconds: int) -> Any:
+    """Offset a timestamp for backtest events without importing pandas eagerly."""
+
+    pandas_module = globals().get("pd")
+    if pandas_module is not None:
+        return pandas_module.Timestamp(value) + pandas_module.Timedelta(
+            milliseconds=milliseconds
+        )
+    return value + timedelta(milliseconds=milliseconds)
+
+
+class _SingleOrderPolicy(_PolicyBase):
     """Policy wrapper that emits a single :class:`OrderIntent`."""
 
-    def __init__(self, intent: OrderIntent) -> None:
+    def __init__(self, intent: object) -> None:
         self._intent = intent
         self._emitted = False
 
     def generate(
-        self, timestamp: pd.Timestamp, market_state: Dict[str, Any]
-    ) -> Iterable[OrderIntent]:  # pragma: no cover - exercised via Backtester
+        self, timestamp: datetime, market_state: Dict[str, Any]
+    ) -> Iterable[object]:  # pragma: no cover - exercised via Backtester
         if not self._emitted:
             self._emitted = True
             yield self._intent
-        return []
 
     def reset(self) -> None:  # pragma: no cover - Backtester will call
         self._emitted = False
+
+
+if not TYPE_CHECKING and _ACTUAL_POLICY is not _PolicyBase:
+    _SingleOrderPolicy.__bases__ = (_ACTUAL_POLICY,)
 
 
 @dataclass
@@ -340,14 +403,12 @@ class ShadowOMS:
         if qty_decimal <= 0:
             return []
         px_decimal = _to_decimal(price)
-        if Backtester is None or FeeSchedule is None or OrderIntent is None:
-            raise RuntimeError("Backtest engine dependencies are unavailable")
+        backtester_cls, fee_schedule_cls, order_intent_cls = _load_backtest_dependencies()
         qty = float(qty_decimal)
         px = float(px_decimal)
         ts = timestamp or datetime.now(timezone.utc)
-        import pandas as pd  # type: ignore
 
-        order_intent = OrderIntent(
+        order_intent = order_intent_cls(
             side=side.lower(),
             quantity=qty,
             price=px,
@@ -356,7 +417,7 @@ class ShadowOMS:
         )
         policy = _SingleOrderPolicy(order_intent)
         bar_event = {
-            "timestamp": pd.Timestamp(ts),
+            "timestamp": _to_backtest_timestamp(ts),
             "type": "bar",
             "open": px,
             "high": px,
@@ -365,18 +426,18 @@ class ShadowOMS:
             "volume": qty,
         }
         book_event = {
-            "timestamp": pd.Timestamp(ts) + pd.Timedelta(milliseconds=1),
+            "timestamp": _offset_backtest_timestamp(ts, milliseconds=1),
             "type": "book",
             "bid": px if side.lower() == "sell" else px * 0.999,
             "ask": px if side.lower() == "buy" else px * 1.001,
             "bid_size": qty * 10.0,
             "ask_size": qty * 10.0,
         }
-        backtester = Backtester(
+        backtester = backtester_cls(
             bar_events=[bar_event],
             book_events=[book_event],
             policy=policy,
-            fee_schedule=FeeSchedule(maker=0.0, taker=0.0),
+            fee_schedule=fee_schedule_cls(maker=0.0, taker=0.0),
             slippage_bps=0.0,
             initial_cash=0.0,
         )

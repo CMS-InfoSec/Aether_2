@@ -4,10 +4,67 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from typing import Deque, Dict, Iterable, List, Literal, Optional
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    TypeVar,
+    cast,
+)
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field, validator
+
+ValidatorFn = TypeVar("ValidatorFn", bound=Callable[..., Any])
+
+
+if TYPE_CHECKING:  # pragma: no cover - static analysis stubs for optional dependency
+    class BaseModel:  # noqa: D401 - lightweight stub for mypy
+        model_config: Dict[str, Any] = {}
+
+        def __init__(self, **data: Any) -> None: ...
+
+        @classmethod
+        def model_validate(cls, obj: Any) -> "BaseModel": ...
+
+        def model_dump(self, *args: Any, **kwargs: Any) -> Dict[str, Any]: ...
+
+    def Field(default: Any = None, **kwargs: Any) -> Any: ...
+
+    def validator(*_fields: str, **__kwargs: Any) -> Callable[[ValidatorFn], ValidatorFn]: ...
+else:  # pragma: no cover - runtime import with graceful fallback
+    try:
+        from pydantic import BaseModel, Field, validator
+    except ImportError:
+        class BaseModel:
+            """Fallback model providing attribute assignment behaviour."""
+
+            model_config: Dict[str, Any] = {}
+
+            def __init__(self, **data: Any) -> None:
+                for key, value in data.items():
+                    setattr(self, key, value)
+
+            def model_dump(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+                del args, kwargs
+                return dict(self.__dict__)
+
+        def Field(default: Any = None, **kwargs: Any) -> Any:
+            default_factory = kwargs.get("default_factory")
+            if callable(default_factory):
+                return default_factory()
+            return default
+
+        def validator(*_fields: str, **__kwargs: Any) -> Callable[[ValidatorFn], ValidatorFn]:
+            def decorator(func: ValidatorFn) -> ValidatorFn:
+                return func
+
+            return decorator
 
 
 @dataclass
@@ -306,8 +363,28 @@ def get_hedge_service() -> HedgeService:
 
 router = APIRouter(prefix="/hedge", tags=["hedge"])
 
+RouteFn = TypeVar("RouteFn", bound=Callable[..., Any])
 
-@router.post("/evaluate", response_model=HedgeDecisionResponse)
+
+def _router_post(*args: Any, **kwargs: Any) -> Callable[[RouteFn], RouteFn]:
+    """Typed wrapper around ``router.post`` to satisfy strict type checking."""
+
+    return cast(Callable[[RouteFn], RouteFn], router.post(*args, **kwargs))
+
+
+def _router_delete(*args: Any, **kwargs: Any) -> Callable[[RouteFn], RouteFn]:
+    """Typed wrapper around ``router.delete`` for optional dependency safety."""
+
+    return cast(Callable[[RouteFn], RouteFn], router.delete(*args, **kwargs))
+
+
+def _router_get(*args: Any, **kwargs: Any) -> Callable[[RouteFn], RouteFn]:
+    """Typed wrapper around ``router.get`` for mypy compliance."""
+
+    return cast(Callable[[RouteFn], RouteFn], router.get(*args, **kwargs))
+
+
+@_router_post("/evaluate", response_model=HedgeDecisionResponse)
 async def evaluate_hedge(
     payload: HedgeMetricsRequest,
     service: HedgeService = Depends(get_hedge_service),
@@ -318,7 +395,7 @@ async def evaluate_hedge(
     return decision.as_dict()
 
 
-@router.post("/override", response_model=Dict[str, object], status_code=status.HTTP_200_OK)
+@_router_post("/override", response_model=Dict[str, object], status_code=status.HTTP_200_OK)
 async def set_override(
     payload: HedgeOverrideRequest,
     service: HedgeService = Depends(get_hedge_service),
@@ -329,14 +406,14 @@ async def set_override(
     return override.as_dict()
 
 
-@router.delete("/override", status_code=status.HTTP_204_NO_CONTENT)
+@_router_delete("/override", status_code=status.HTTP_204_NO_CONTENT)
 async def clear_override(service: HedgeService = Depends(get_hedge_service)) -> None:
     """Clear the active hedge override."""
 
     service.clear_override()
 
 
-@router.get("/override", response_model=Optional[Dict[str, object]])
+@_router_get("/override", response_model=Optional[Dict[str, object]])
 async def get_override(service: HedgeService = Depends(get_hedge_service)) -> Optional[Dict[str, object]]:
     """Return the active hedge override if present."""
 
@@ -344,14 +421,14 @@ async def get_override(service: HedgeService = Depends(get_hedge_service)) -> Op
     return override.as_dict() if override else None
 
 
-@router.get("/history", response_model=List[HedgeHistoryResponse])
+@_router_get("/history", response_model=List[HedgeHistoryResponse])
 async def get_history(service: HedgeService = Depends(get_hedge_service)) -> List[Dict[str, object]]:
     """Return hedge history records with diagnostics."""
 
     return [record.as_dict() for record in service.get_history()]
 
 
-@router.get("/diagnostics", response_model=Optional[Dict[str, object]])
+@_router_get("/diagnostics", response_model=Optional[Dict[str, object]])
 async def get_last_diagnostics(service: HedgeService = Depends(get_hedge_service)) -> Optional[Dict[str, object]]:
     """Return the latest hedge diagnostics snapshot."""
 
