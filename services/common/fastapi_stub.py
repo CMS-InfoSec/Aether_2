@@ -1044,9 +1044,12 @@ class TestClient:
                     if session is None:
                         session = store.get(token)
                     if session is None:
-                        session_account = _extract_jwt_subject(token) or str(account_id)
-                        session = store.create(str(session_account))
-                        headers["Authorization"] = f"Bearer {session.token}"
+                        if provided_auth:
+                            headers["Authorization"] = str(provided_auth)
+                        else:
+                            session_account = _extract_jwt_subject(token) or str(account_id)
+                            session = store.create(str(session_account))
+                            headers["Authorization"] = f"Bearer {session.token}"
                 elif provided_auth:
                     headers["Authorization"] = str(provided_auth)
                 elif header_account_present and normalized_method == "GET":
