@@ -63,6 +63,55 @@ class AuditEvent:
             ip_hash=self.ip_hash,
         )
 
+    def with_resolved_ip_hash(
+        self,
+        resolved: "ResolvedIpHash",
+        *,
+        drop_ip_address: bool = False,
+    ) -> "AuditEvent":
+        """Return a copy of the event with an updated resolved IP hash.
+
+        The helper is useful when callers pre-compute hashed IP metadata via
+        :meth:`resolve_ip_hash` and wish to persist the result before logging.
+        Supplying ``drop_ip_address=True`` clears the raw address from the
+        event so only the hashed value remains, which can help avoid retaining
+        sensitive data in long-lived structures.  When the resolved value and
+        resulting IP address match the current state the original instance is
+        returned to preserve object identity.
+        """
+
+        next_hash = resolved.value
+        next_ip = None if drop_ip_address else self.ip_address
+
+        if next_hash == self.ip_hash and next_ip == self.ip_address:
+            return self
+
+        return replace(self, ip_hash=next_hash, ip_address=next_ip)
+
+    def ensure_resolved_ip_hash(
+        self,
+        hooks: "AuditHooks",
+        *,
+        drop_ip_address: bool = False,
+    ) -> tuple["AuditEvent", "ResolvedIpHash"]:
+        """Return an updated event alongside the resolved IP hash metadata.
+
+        The helper delegates to :meth:`resolve_ip_hash` to compute the hashed
+        address (including fallback metadata) and persists the result on the
+        event via :meth:`with_resolved_ip_hash`.  Callers can request that the
+        raw IP address be cleared after hashing by supplying
+        ``drop_ip_address=True``—useful when the event should avoid retaining
+        the unhashed value beyond the resolution step.  The original event is
+        returned when no state changes are required, preserving object
+        identity.
+        """
+
+        resolved = self.resolve_ip_hash(hooks)
+        return self.with_resolved_ip_hash(
+            resolved,
+            drop_ip_address=drop_ip_address,
+        ), resolved
+
     def log_with_fallback(
         self,
         hooks: "AuditHooks",

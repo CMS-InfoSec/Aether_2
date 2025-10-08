@@ -1275,6 +1275,150 @@ def test_audit_event_resolve_ip_hash_hashes_missing_value():
     assert calls == ["203.0.113.42"]
 
 
+def test_audit_event_with_resolved_ip_hash_updates_hash_without_dropping_ip():
+    event = audit_hooks.AuditEvent(
+        actor="owen",
+        action="demo.update.hash",
+        entity="resource",
+        before={},
+        after={},
+        ip_address="203.0.113.10",
+    )
+    resolved = audit_hooks.ResolvedIpHash(value="hashed-value", fallback=False, error=None)
+
+    updated = event.with_resolved_ip_hash(resolved)
+
+    assert updated is not event
+    assert updated.ip_hash == "hashed-value"
+    assert updated.ip_address == "203.0.113.10"
+
+
+def test_audit_event_with_resolved_ip_hash_can_drop_ip_address():
+    event = audit_hooks.AuditEvent(
+        actor="pax",
+        action="demo.drop.ip",
+        entity="resource",
+        before={},
+        after={},
+        ip_address="198.51.100.20",
+    )
+    resolved = audit_hooks.ResolvedIpHash(value="hashed-value", fallback=True, error=ValueError("boom"))
+
+    updated = event.with_resolved_ip_hash(resolved, drop_ip_address=True)
+
+    assert updated.ip_hash == "hashed-value"
+    assert updated.ip_address is None
+    assert event.ip_address == "198.51.100.20"
+    assert event.ip_hash is None
+
+
+def test_audit_event_with_resolved_ip_hash_returns_self_when_no_change():
+    event = audit_hooks.AuditEvent(
+        actor="quinn",
+        action="demo.same.hash",
+        entity="resource",
+        before={},
+        after={},
+        ip_address="192.0.2.5",
+        ip_hash="existing",
+    )
+    resolved = audit_hooks.ResolvedIpHash(value="existing", fallback=False, error=None)
+
+    assert event.with_resolved_ip_hash(resolved) is event
+
+
+def test_audit_event_with_resolved_ip_hash_drop_without_address_returns_self():
+    event = audit_hooks.AuditEvent(
+        actor="ria",
+        action="demo.no.address",
+        entity="resource",
+        before={},
+        after={},
+        ip_address=None,
+        ip_hash="cached",
+    )
+    resolved = audit_hooks.ResolvedIpHash(value="cached", fallback=False, error=None)
+
+    assert event.with_resolved_ip_hash(resolved, drop_ip_address=True) is event
+
+
+def test_audit_event_ensure_resolved_ip_hash_updates_event_and_returns_metadata():
+    calls: List[Optional[str]] = []
+
+    def tracking_hash(value: Optional[str]) -> Optional[str]:
+        calls.append(value)
+        return f"hashed:{value}"
+
+    hooks = audit_hooks.AuditHooks(log=None, hash_ip=tracking_hash)
+
+    event = audit_hooks.AuditEvent(
+        actor="sara",
+        action="demo.ensure.hash",
+        entity="resource",
+        before={},
+        after={},
+        ip_address="203.0.113.77",
+    )
+
+    updated, resolved = event.ensure_resolved_ip_hash(hooks)
+
+    assert updated is not event
+    assert updated.ip_hash == "hashed:203.0.113.77"
+    assert updated.ip_address == "203.0.113.77"
+    assert resolved.value == "hashed:203.0.113.77"
+    assert resolved.fallback is False
+    assert resolved.error is None
+    assert calls == ["203.0.113.77"]
+
+
+def test_audit_event_ensure_resolved_ip_hash_can_drop_ip_address():
+    def failing_hash(value: Optional[str]) -> Optional[str]:
+        raise RuntimeError("hash failure")
+
+    hooks = audit_hooks.AuditHooks(log=None, hash_ip=failing_hash)
+
+    event = audit_hooks.AuditEvent(
+        actor="tess",
+        action="demo.ensure.drop",
+        entity="resource",
+        before={},
+        after={},
+        ip_address="198.51.100.44",
+    )
+
+    updated, resolved = event.ensure_resolved_ip_hash(hooks, drop_ip_address=True)
+
+    assert updated.ip_address is None
+    assert updated.ip_hash == audit_hooks._hash_ip_fallback("198.51.100.44")
+    assert resolved.value == audit_hooks._hash_ip_fallback("198.51.100.44")
+    assert resolved.fallback is True
+    assert isinstance(resolved.error, RuntimeError)
+
+
+def test_audit_event_ensure_resolved_ip_hash_returns_self_when_no_change():
+    hooks = audit_hooks.AuditHooks(
+        log=None,
+        hash_ip=lambda value: pytest.fail("hash_ip should not be invoked"),
+    )
+
+    event = audit_hooks.AuditEvent(
+        actor="uma",
+        action="demo.ensure.unchanged",
+        entity="resource",
+        before={},
+        after={},
+        ip_address=None,
+        ip_hash="cached",
+    )
+
+    updated, resolved = event.ensure_resolved_ip_hash(hooks)
+
+    assert updated is event
+    assert resolved.value == "cached"
+    assert resolved.fallback is False
+    assert resolved.error is None
+
+
 def test_audit_event_resolve_ip_hash_preserves_fallback_metadata():
     def failing_hash(value: Optional[str]) -> Optional[str]:
         raise RuntimeError("hash failure")
