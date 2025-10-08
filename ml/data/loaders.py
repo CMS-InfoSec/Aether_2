@@ -12,12 +12,19 @@ import contextlib
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 try:  # pragma: no cover - optional dependency for dataframe handling
     import pandas as pd
 except Exception:  # pragma: no cover - triggered only when pandas is absent
     pd = None  # type: ignore[assignment]
+
+if TYPE_CHECKING:  # pragma: no cover - used only for static analysis
+    from pandas import DataFrame as _PandasDataFrame
+
+    DataFrameType = _PandasDataFrame
+else:  # pragma: no cover - executed at runtime when pandas may be missing
+    DataFrameType = Any
 
 try:  # Optional dependency – the loader still works without Feast installed.
     from feast import FeatureStore
@@ -109,8 +116,8 @@ class FeastFeatureView:
 class DataSlice:
     """Container for a single walk-forward slice."""
 
-    features: pd.DataFrame
-    labels: pd.DataFrame
+    features: DataFrameType
+    labels: DataFrameType
     metadata: Dict[str, datetime]
 
 
@@ -187,7 +194,7 @@ class TimescaleFeastDataLoader(BaseWalkForwardDataLoader):
         }
         return DataSlice(features=features, labels=labels, metadata=metadata)
 
-    def _load_features(self, start: datetime, end: datetime) -> pd.DataFrame:
+    def _load_features(self, start: datetime, end: datetime) -> DataFrameType:
         _require_pandas()
         _require_psycopg()
         LOGGER.debug("Loading TimescaleDB features between %s and %s", start, end)
@@ -198,7 +205,7 @@ class TimescaleFeastDataLoader(BaseWalkForwardDataLoader):
         df = df.sort_index()
         return df
 
-    def _load_labels(self, start: datetime, end: datetime) -> pd.DataFrame:
+    def _load_labels(self, start: datetime, end: datetime) -> DataFrameType:
         _require_pandas()
         if not self.label_feature_view or FeatureStore is None:
             LOGGER.debug("Feast label view not configured. Returning empty labels.")
@@ -245,8 +252,8 @@ class InMemoryDataLoader(BaseWalkForwardDataLoader):
 
     def __init__(
         self,
-        features: pd.DataFrame,
-        labels: pd.DataFrame,
+        features: DataFrameType,
+        labels: DataFrameType,
         splits: Iterable[WalkForwardSplit],
         entity_id_column: str = "entity_id",
         timestamp_column: str = "event_timestamp",
