@@ -9,7 +9,7 @@ import os
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, cast
 
 try:  # pragma: no cover - fastapi is optional for unit tests
     from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
