@@ -29,17 +29,45 @@ except ImportError:  # pragma: no cover - provide a no-op metrics backend
 
         def __init__(self) -> None:
             self._collectors: Dict[int, object] = {}
+            self._names_to_collectors: Dict[str, object] = {}
 
         def register(self, collector: object) -> None:
             self._collectors[id(collector)] = collector
+            name = getattr(collector, "_name", None)
+            if isinstance(name, str):
+                self._names_to_collectors[name] = collector
 
         def unregister(self, collector: object) -> None:
             self._collectors.pop(id(collector), None)
+            name = getattr(collector, "_name", None)
+            if isinstance(name, str):
+                self._names_to_collectors.pop(name, None)
 
         def collect(self):  # pragma: no cover - used in optional dependency paths
             for collector in list(self._collectors.values()):
                 if hasattr(collector, "collect"):
                     yield from collector.collect()
+
+        def get_sample_value(
+            self, name: str, labels: Optional[Dict[str, str]] = None
+        ) -> float | None:
+            collector = self._names_to_collectors.get(name)
+            if collector is None:
+                for candidate in self._collectors.values():
+                    if getattr(candidate, "_name", None) == name:
+                        collector = candidate
+                        break
+            if collector is None or not hasattr(collector, "collect"):
+                return None
+            for family in collector.collect():
+                samples = getattr(family, "samples", [])
+                for sample in samples:
+                    if labels:
+                        if all(sample.labels.get(k) == v for k, v in labels.items()):
+                            return sample.value
+                    else:
+                        return sample.value
+            return None
 
     @dataclass
     class _Sample:
