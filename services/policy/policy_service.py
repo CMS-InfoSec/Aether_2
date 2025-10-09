@@ -43,6 +43,7 @@ from services.policy.trade_intensity_controller import (
 )
 from services.common.spot import require_spot_http
 from shared.spot import require_spot_symbol
+from shared.health import setup_health_checks
 
 class FeeTierAdapter(Protocol):
     """Protocol describing the fee tier adapter interface used by the service."""
@@ -659,6 +660,26 @@ def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
 
 
 SESSION_STORE = _configure_session_store(app)
+
+
+def _health_check_session_store() -> None:
+    store = getattr(app.state, "session_store", None)
+    if not isinstance(store, SessionStoreProtocol):
+        raise RuntimeError("session store unavailable")
+
+
+def _health_check_policy_models() -> None:
+    if MODELS is None or not hasattr(MODELS, "predict_intent"):
+        raise RuntimeError("policy inference model unavailable")
+
+
+setup_health_checks(
+    app,
+    {
+        "session_store": _health_check_session_store,
+        "policy_model": _health_check_policy_models,
+    },
+)
 
 
 @_app_post("/policy/decide", response_model=PolicyIntent, status_code=status.HTTP_200_OK)
