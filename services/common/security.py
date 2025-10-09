@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 import os
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Optional, Tuple
+from typing import Any, Iterable, List, Optional, Tuple, cast
 
 try:  # pragma: no cover - FastAPI is optional in some unit tests
     from fastapi import Header, HTTPException, Request, status
@@ -131,9 +131,11 @@ def set_default_session_store(store: SessionStoreProtocol | None) -> None:
 
 
 def _get_session_store(request: Request) -> SessionStoreProtocol:
-    store = getattr(request.app.state, "session_store", None)
-    if store is None and hasattr(request.app.state, "auth_service"):
-        service = getattr(request.app.state, "auth_service")
+    app = getattr(request, "app", None)
+    state = getattr(app, "state", None)
+    store = getattr(state, "session_store", None) if state is not None else None
+    if store is None and state is not None and hasattr(state, "auth_service"):
+        service = getattr(state, "auth_service")
         store = getattr(service, "_sessions", None)
     if store is None:
         store = _DEFAULT_SESSION_STORE
