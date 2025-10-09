@@ -8,6 +8,8 @@ import sys
 from typing import Any, Callable, Iterable, Mapping, Sequence, TypeVar, cast
 
 from fastapi import Depends, FastAPI, HTTPException, Query
+
+from metrics import setup_metrics
 from fastapi.responses import JSONResponse
 
 from services.common.security import require_admin_account
@@ -254,6 +256,7 @@ def _load_trade_record(trade_id: str) -> Mapping[str, Any]:
 
 
 app = FastAPI(title="Explainability Service", version="1.0.0")
+setup_metrics(app, service_name="explain-service")
 
 
 @typed_app_get(app, "/explain/trade")
