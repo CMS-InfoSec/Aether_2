@@ -2,10 +2,38 @@
 from __future__ import annotations
 
 import os
-from typing import Iterable, Sequence
+from typing import Any, Awaitable, Callable, Iterable, MutableMapping, Sequence
 
-from starlette.datastructures import Headers
-from starlette.types import ASGIApp, Receive, Scope, Send
+try:  # pragma: no cover - Starlette is optional in lightweight environments
+    from starlette.datastructures import Headers
+    from starlette.types import ASGIApp, Receive, Scope, Send
+except ModuleNotFoundError:  # pragma: no cover - provide a minimal fallback
+    Scope = MutableMapping[str, Any]
+    Receive = Callable[[], Awaitable[dict]]
+    Send = Callable[[dict], Awaitable[None]]
+    ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
+
+    class Headers:  # type: ignore[override]
+        """Small stand-in that exposes the ``.get`` API Starlette normally provides."""
+
+        def __init__(self, *, scope: Scope | None = None, headers: Iterable[tuple[str, str]] | None = None) -> None:
+            raw_items: list[tuple[str, str]] = []
+            if headers is not None:
+                raw_items = list(headers)
+            elif scope is not None:
+                scope_headers = scope.get("headers") or []
+                raw_items = [
+                    (
+                        key.decode("latin-1") if isinstance(key, (bytes, bytearray)) else str(key),
+                        value.decode("latin-1") if isinstance(value, (bytes, bytearray)) else str(value),
+                    )
+                    for key, value in scope_headers
+                ]
+
+            self._headers = {key.lower(): value for key, value in raw_items}
+
+        def get(self, key: str, default: str | None = None) -> str | None:
+            return self._headers.get(key.lower(), default)
 
 TRUSTED_HOSTS: Sequence[str] = (
     "risk.aether.local",

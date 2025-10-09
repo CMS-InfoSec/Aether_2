@@ -41,7 +41,28 @@ _STUB_LIMITS: Dict[str, AccountRiskLimits] = {
         max_nav_pct=0.25,
         notional_cap=1_000_000,
         cooldown_minutes=120,
-    )
+    ),
+    "company": AccountRiskLimits(
+        daily_loss_limit=150_000,
+        fee_budget=35_000,
+        max_nav_pct=0.35,
+        notional_cap=7_500_000,
+        cooldown_minutes=60,
+    ),
+    "director-1": AccountRiskLimits(
+        daily_loss_limit=50_000,
+        fee_budget=10_000,
+        max_nav_pct=0.25,
+        notional_cap=1_500_000,
+        cooldown_minutes=120,
+    ),
+    "director-2": AccountRiskLimits(
+        daily_loss_limit=100_000,
+        fee_budget=20_000,
+        max_nav_pct=0.3,
+        notional_cap=3_500_000,
+        cooldown_minutes=90,
+    ),
 }
 
 
