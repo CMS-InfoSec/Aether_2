@@ -9,7 +9,23 @@ import os
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+    TypeGuard,
+    TypeVar,
+    cast,
+)
 
 try:  # pragma: no cover - fastapi is optional for unit tests
     from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
@@ -52,6 +68,29 @@ except ModuleNotFoundError:  # pragma: no cover - fallback stub for tests
 from prometheus_client import CollectorRegistry, Counter
 
 from services.common.security import ensure_admin_access
+
+
+RouteFn = TypeVar("RouteFn", bound=Callable[..., Any])
+
+
+class _HttpxResponseProtocol(Protocol):
+    def json(self) -> Any:  # pragma: no cover - thin protocol
+        ...
+
+    def raise_for_status(self) -> None:  # pragma: no cover - thin protocol
+        ...
+
+
+class _HttpxClientProtocol(Protocol):
+    async def get(self, url: str) -> _HttpxResponseProtocol:
+        ...
+
+
+class _HttpxModule(Protocol):
+    AsyncClient: Callable[..., _HttpxClientProtocol]
+    RequestError: type[Exception]
+    TimeoutException: type[Exception]
+    HTTPStatusError: type[Exception]
 
 
 FetchResult = Awaitable[Sequence[Mapping[str, Any]]] | Sequence[Mapping[str, Any]]

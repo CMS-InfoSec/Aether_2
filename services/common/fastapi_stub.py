@@ -818,6 +818,10 @@ class _ClientResponse:
                 raise ValueError("Response payload is not valid JSON") from exc
         return self._payload
 
+    def raise_for_status(self) -> None:
+        if 400 <= int(self.status_code):
+            raise RuntimeError(f"HTTP {self.status_code}: {self.text or self._payload}")
+
 
 class TestClient:
     """Extremely small synchronous facade over the stub FastAPI application."""
@@ -1107,11 +1111,14 @@ def _run_async(coro: Any) -> Any:
     if not asyncio.iscoroutine(coro):
         return coro
     try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
         return asyncio.run(coro)
-    else:
-        return loop.run_until_complete(coro)  # pragma: no cover - defensive fallback
+    except RuntimeError:
+        new_loop = asyncio.new_event_loop()
+        try:
+            return new_loop.run_until_complete(coro)
+        finally:
+            new_loop.run_until_complete(new_loop.shutdown_asyncgens())
+            new_loop.close()
 
 
 def _install_fastapi_module() -> None:
