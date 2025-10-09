@@ -38,6 +38,26 @@ _DEFAULT_PAPER_URL = os.getenv("PAPER_OMS_SERVICE_URL", "http://paper-oms-servic
 _DEFAULT_TIMEOUT = float(os.getenv("OMS_REQUEST_TIMEOUT", "1.0"))
 
 
+class ExchangeError(RuntimeError):
+    """Base class for recoverable exchange adapter failures."""
+
+
+class ExchangeTimeoutError(ExchangeError):
+    """Raised when a request to the OMS exceeds the configured timeout."""
+
+
+class ExchangeRateLimitError(ExchangeError):
+    """Raised when the OMS responds with a rate limit status."""
+
+
+class ExchangeValidationError(ExchangeError):
+    """Raised when the OMS rejects a request due to payload validation issues."""
+
+
+class ExchangeAPIError(ExchangeError):
+    """Raised when the OMS returns an unexpected HTTP error."""
+
+
 class ExchangeAdapter(ABC):
     """Base interface for OMS integrations."""
 
@@ -121,6 +141,70 @@ def _account_headers(account_id: str, *, token: Optional[str] = None) -> Dict[st
     return headers
 
 
+def _normalise_error_detail(detail: object) -> Optional[str]:
+    if detail is None:
+        return None
+    if isinstance(detail, str):
+        return detail.strip() or None
+    if isinstance(detail, Mapping):
+        for key in ("error", "errors", "detail", "message"):
+            if key not in detail:
+                continue
+            normalised = _normalise_error_detail(detail[key])  # type: ignore[index]
+            if normalised:
+                return normalised
+        return ", ".join(
+            f"{str(key)}={_normalise_error_detail(value) or value}"
+            for key, value in detail.items()
+        )
+    if isinstance(detail, Sequence) and not isinstance(detail, (bytes, bytearray)):
+        fragments = [
+            fragment
+            for fragment in (_normalise_error_detail(item) for item in detail)
+            if fragment
+        ]
+        if fragments:
+            return ", ".join(fragments)
+        return None
+    return str(detail)
+
+
+def _extract_error_detail(response: httpx.Response) -> Optional[str]:
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+    detail = _normalise_error_detail(payload)
+    if detail:
+        return detail
+    text = getattr(response, "text", "")
+    if isinstance(text, str):
+        text = text.strip()
+        if text:
+            return text
+    return None
+
+
+def _raise_exchange_error(response: httpx.Response, *, operation: str) -> None:
+    status = getattr(response, "status_code", None)
+    if status is None or status < 400:
+        return
+    detail = _extract_error_detail(response)
+    suffix = f": {detail}" if detail else ""
+    if status == 429:
+        raise ExchangeRateLimitError(
+            f"Kraken adapter rate limited {operation}{suffix}"
+        )
+    if status in {400, 422}:
+        message_suffix = suffix or ": invalid request"
+        raise ExchangeValidationError(
+            f"Kraken adapter rejected {operation}{message_suffix}"
+        )
+    raise ExchangeAPIError(
+        f"Kraken adapter request failed for {operation}: HTTP {status}{suffix}"
+    )
+
+
 class KrakenAdapter(ExchangeAdapter):
     """Adapter implementation for the Kraken OMS service."""
 
@@ -175,19 +259,17 @@ class KrakenAdapter(ExchangeAdapter):
         normalized_payload = dict(payload)
         normalized_payload["symbol"] = normalized_symbol
 
-        url = _join_url(base_url, "/oms/place")
-        headers = await self._request_headers(account_id)
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            response = await client.post(
-                url,
-                json=normalized_payload,
-                headers=headers,
-            )
-            response.raise_for_status()
-            try:
-                return response.json()
-            except ValueError:  # pragma: no cover - defensive guard
-                return {}
+        response = await self._perform_request(
+            "POST",
+            base_url=base_url,
+            path="/oms/place",
+            account_id=account_id,
+            json_payload=normalized_payload,
+        )
+        payload_obj = self._response_payload(response)
+        if isinstance(payload_obj, Mapping):
+            return payload_obj
+        return {}
 
     async def cancel_order(
         self,
@@ -198,25 +280,23 @@ class KrakenAdapter(ExchangeAdapter):
     ) -> Mapping[str, Any]:
         if not self._primary_url:
             raise RuntimeError("Kraken OMS URL is not configured")
-        url = _join_url(self._primary_url, "/oms/cancel")
         payload: Dict[str, Any] = {
             "account_id": account_id,
             "client_id": client_id,
         }
         if exchange_order_id:
             payload["exchange_order_id"] = exchange_order_id
-        headers = await self._request_headers(account_id)
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            response = await client.post(
-                url,
-                json=payload,
-                headers=headers,
-            )
-            response.raise_for_status()
-            try:
-                return response.json()
-            except ValueError:  # pragma: no cover - defensive guard
-                return {}
+        response = await self._perform_request(
+            "POST",
+            base_url=self._primary_url,
+            path="/oms/cancel",
+            account_id=account_id,
+            json_payload=payload,
+        )
+        payload_obj = self._response_payload(response)
+        if isinstance(payload_obj, Mapping):
+            return payload_obj
+        return {}
 
     async def get_balance(self, account_id: str) -> Mapping[str, Any]:
         payload = await self._fetch_oms_payload(
@@ -245,22 +325,61 @@ class KrakenAdapter(ExchangeAdapter):
         account_id: str,
         params: Optional[Mapping[str, Any]] = None,
     ) -> Mapping[str, Any]:
-        if not self._primary_url:
+        response = await self._perform_request(
+            "GET",
+            base_url=self._primary_url,
+            path=path,
+            account_id=account_id,
+            params=params,
+        )
+        payload = self._response_payload(response)
+        if isinstance(payload, Mapping):
+            return payload
+        if isinstance(payload, list):
+            return {"result": payload}
+        return {}
+
+    async def _perform_request(
+        self,
+        method: str,
+        *,
+        base_url: str,
+        path: str,
+        account_id: str,
+        json_payload: Optional[Mapping[str, Any]] = None,
+        params: Optional[Mapping[str, Any]] = None,
+    ) -> httpx.Response:
+        if not base_url:
             raise RuntimeError("Kraken OMS URL is not configured")
 
-        url = _join_url(self._primary_url, path)
+        url = _join_url(base_url, path)
         headers = await self._request_headers(account_id)
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            response = await client.get(url, params=dict(params or {}), headers=headers)
-            response.raise_for_status()
-            try:
-                payload = response.json()
-            except ValueError:  # pragma: no cover - defensive guard
-                return {}
-            if isinstance(payload, Mapping):
-                return payload
-            if isinstance(payload, list):
-                return {"result": payload}
+        request_kwargs: Dict[str, Any] = {"headers": headers}
+        if json_payload is not None:
+            request_kwargs["json"] = json_payload
+        if params is not None:
+            request_kwargs["params"] = dict(params)
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                request = getattr(client, method.lower())
+                response = await request(url, **request_kwargs)
+        except httpx.TimeoutException as exc:
+            raise ExchangeTimeoutError(
+                f"Kraken adapter request timed out after {self._timeout:.2f}s: {method.upper()} {path}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise ExchangeAPIError(
+                f"Kraken adapter request failed for {method.upper()} {path}: {exc}"
+            ) from exc
+
+        _raise_exchange_error(response, operation=f"{method.upper()} {path}")
+        return response
+
+    @staticmethod
+    def _response_payload(response: httpx.Response) -> object:
+        try:
+            return response.json()
+        except ValueError:  # pragma: no cover - defensive guard
             return {}
 
     async def _request_headers(self, account_id: str) -> Dict[str, str]:
@@ -594,6 +713,11 @@ async def get_exchange_adapters_status() -> List[Mapping[str, Any]]:
 
 
 __all__ = [
+    "ExchangeError",
+    "ExchangeTimeoutError",
+    "ExchangeRateLimitError",
+    "ExchangeValidationError",
+    "ExchangeAPIError",
     "ExchangeAdapter",
     "KrakenAdapter",
     "BinanceAdapter",

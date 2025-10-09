@@ -6,11 +6,12 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import json
 import os
 from pathlib import Path
-from typing import List
-
-import requests
+from typing import Any, Dict, List, Mapping, MutableMapping
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 
 def _resolve_output_dir(raw_path: str) -> Path:
@@ -53,14 +54,47 @@ RISK_METRICS = {
 }
 
 
+def _http_get_json(url: str, *, params: Mapping[str, Any], timeout: int) -> MutableMapping[str, Any]:
+    """Perform a JSON HTTP GET request without relying on third-party clients."""
+
+    query = urlencode([(key, value) for key, value in params.items()])
+    request = Request(f"{url}?{query}")
+    request.add_header("Accept", "application/json")
+
+    with urlopen(request, timeout=timeout) as response:  # nosec: trusted internal endpoints
+        content_type = response.headers.get("Content-Type", "").split(";")[0].strip()
+        payload: MutableMapping[str, Any] = {}
+        if content_type != "application/json":
+            raise RuntimeError(f"Unexpected content type: {content_type or 'unknown'}")
+        body = response.read().decode("utf-8")
+        data: Any = json.loads(body)
+        if isinstance(data, MutableMapping):
+            payload = data
+        elif isinstance(data, Mapping):
+            payload = dict(data)
+        else:
+            raise RuntimeError("Response payload must be a JSON object")
+    return payload
+
+
 def fetch_prometheus_metric(metric: str, timestamp: dt.datetime) -> float:
     params = {"query": metric, "time": int(timestamp.timestamp())}
-    response = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params=params, timeout=15)
-    response.raise_for_status()
-    result = response.json()["data"]["result"]
+    payload = _http_get_json(
+        f"{PROMETHEUS_URL}/api/v1/query",
+        params=params,
+        timeout=15,
+    )
+    data = payload.get("data", {}) if isinstance(payload, Mapping) else {}
+    result = data.get("result", []) if isinstance(data, Mapping) else []
     if not result:
         return float("nan")
-    return float(result[0]["value"][1])
+    first_entry = result[0]
+    if not isinstance(first_entry, Mapping):
+        raise RuntimeError("Prometheus response contained malformed series data")
+    value = first_entry.get("value")
+    if not isinstance(value, list) or len(value) != 2:
+        raise RuntimeError("Prometheus value payload must be a [timestamp, value] pair")
+    return float(value[1])
 
 
 def fetch_loki_ingest_errors(start: dt.datetime, end: dt.datetime) -> int:
@@ -71,10 +105,20 @@ def fetch_loki_ingest_errors(start: dt.datetime, end: dt.datetime) -> int:
         "start": int(start.timestamp() * 1e9),
         "end": int(end.timestamp() * 1e9),
     }
-    response = requests.get(f"{LOKI_URL}/loki/api/v1/query_range", params=params, timeout=30)
-    response.raise_for_status()
-    streams = response.json().get("data", {}).get("result", [])
-    return sum(len(stream.get("values", [])) for stream in streams)
+    payload = _http_get_json(
+        f"{LOKI_URL}/loki/api/v1/query_range",
+        params=params,
+        timeout=30,
+    )
+    data = payload.get("data", {}) if isinstance(payload, Mapping) else {}
+    streams = data.get("result", []) if isinstance(data, Mapping) else []
+    total = 0
+    for stream in streams:
+        if isinstance(stream, Mapping):
+            values = stream.get("values", [])
+            if isinstance(values, list):
+                total += sum(1 for _ in values)
+    return total
 
 
 def write_csv(date: dt.date, rows: List[List[str]]) -> Path:
