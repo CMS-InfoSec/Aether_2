@@ -13,6 +13,7 @@ can rely on immutable report references.
 
 from __future__ import annotations
 
+import csv
 import io
 import json
 import logging
@@ -38,6 +39,7 @@ from services.common.security import require_admin_account
 from services.common.spot import require_spot_http
 from services.models.model_server import get_active_model
 from shared.spot import is_spot_symbol, normalize_spot_symbol
+from shared import trade_logging
 
 if TYPE_CHECKING:  # pragma: no cover - import only for type checking
     import pandas  # noqa: F401
@@ -772,6 +774,64 @@ def _build_html_report(payload: Mapping[str, Any]) -> str:
 storage: ArtifactStorage = build_storage_from_env(os.environ)
 
 app = FastAPI(title="Report Service")
+
+
+def _render_trade_history_csv(rows: Iterable[Mapping[str, str]]) -> bytes:
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=trade_logging.TRADE_LOG_COLUMNS)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    return buffer.getvalue().encode("utf-8")
+
+
+def _normalize_datetime(value: datetime | str | None) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        normalized = value.replace("Z", "+00:00")
+        try:
+            value = datetime.fromisoformat(normalized)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="Invalid timestamp format") from exc
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+@app.get("/reports/trades")
+def download_trade_history(
+    account_id: str = Query(..., description="Logical trading account identifier"),
+    start: datetime | None = Query(None, description="Inclusive ISO-8601 start timestamp"),
+    end: datetime | None = Query(None, description="Inclusive ISO-8601 end timestamp"),
+    caller: str = Depends(require_admin_account),
+) -> Response:
+    """Return the account's trade history as a CSV attachment."""
+
+    _ensure_caller_matches_account(caller, account_id)
+
+    start_utc = _normalize_datetime(start)
+    end_utc = _normalize_datetime(end)
+    rows = trade_logging.read_trade_log(account_id=account_id, start=start_utc, end=end_utc)
+    payload = _render_trade_history_csv(rows)
+
+    filename_parts = ["trades", account_id]
+    if start_utc:
+        filename_parts.append(start_utc.strftime("%Y%m%d"))
+    if end_utc:
+        filename_parts.append(end_utc.strftime("%Y%m%d"))
+    filename = "-".join(filename_parts) + ".csv"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    LOGGER.info(
+        "Trade history exported",
+        extra={
+            "account_id": account_id,
+            "rows": len(rows),
+            "start": start_utc.isoformat() if start_utc else None,
+            "end": end_utc.isoformat() if end_utc else None,
+        },
+    )
+    return Response(content=payload, media_type="text/csv", headers=headers)
 
 
 @app.get("/reports/trade_explain")

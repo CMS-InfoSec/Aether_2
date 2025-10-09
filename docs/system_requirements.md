@@ -152,3 +152,6 @@ Aether_2 is an autonomous AI-driven trading platform designed to operate exclusi
 ## 6. Production Readiness
 
 Aether_2 is considered production-ready, secure, and compliant for real-time autonomous trading on the Kraken spot market when all requirements and success criteria defined above are satisfied.
+Trade history exports are now available via the `/reports/trades` endpoint, which streams
+per-account execution logs as CSV files filtered by optional start and end timestamps.
+

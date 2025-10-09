@@ -3,6 +3,8 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, TypeVar, cast
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
+
+from metrics import setup_metrics
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from services.common.adapters import KrakenSecretManager
@@ -16,6 +18,7 @@ from services.secrets.middleware import ForwardedSchemeMiddleware, TRUSTED_HOSTS
 from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
 
 app = FastAPI(title="Secrets Service")
+setup_metrics(app, service_name="secrets-gateway")
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
 app.add_middleware(ForwardedSchemeMiddleware)
 

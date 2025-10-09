@@ -42,6 +42,12 @@ except Exception:  # pragma: no cover - executed when numpy is unavailable
 from fastapi import Depends, FastAPI, HTTPException, Query
 from prometheus_client import Gauge
 
+try:  # pragma: no cover - metrics helper optional when FastAPI unavailable
+    from metrics import setup_metrics
+except ModuleNotFoundError:  # pragma: no cover - fallback stub for optional dependency
+    def setup_metrics(*_: Any, **__: Any) -> None:
+        return None
+
 from shared.pydantic_compat import BaseModel
 
 if TYPE_CHECKING:  # pragma: no cover - FastAPI may be optional
@@ -596,6 +602,7 @@ async def _lifespan(application: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="Advanced Signal Service", version="1.0.0", lifespan=_lifespan)
+setup_metrics(app, service_name="signal-service")
 
 
 
