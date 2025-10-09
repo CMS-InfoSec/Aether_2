@@ -160,4 +160,14 @@ current hedge allocation and drawdown posture for each account.
 Risk validation now derives take-profit and stop-loss trigger prices automatically using
 policy-provided basis-point targets with volatility fallbacks so every approved order
 includes protective exit levels without manual configuration.
+Drawdown protection now honours the capital allocator's maximum drawdown ratio; when an
+account breaches the configured `CAPITAL_ALLOCATOR_MAX_DRAWDOWN` threshold, risk
+validation halts new trades and records a zero-quantity adjustment until losses recover.
+Risk validation also exposes a `/healthz` endpoint that checks Timescale connectivity,
+the capital allocator API, and the trading universe service so production monitoring can
+alert on dependency regressions immediately.
+
+Daily operations reporting now enriches the exported CSV with `starting_nav`,
+`ending_nav`, and `daily_return_pct` columns so each account's profit and loss percentage
+is tracked alongside absolute gains, satisfying the daily PnL reporting requirement.
 

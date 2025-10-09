@@ -24,7 +24,18 @@ from functools import partial
 from threading import Lock
 from typing import Awaitable, Dict, Iterable, Iterator, Optional, Tuple
 
-from sqlalchemy import Boolean, Column, DateTime, Numeric, String, Text, create_engine, select, text
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    create_engine,
+    select,
+    text,
+)
 from sqlalchemy.engine import Engine
 from sqlalchemy.engine.url import make_url
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
