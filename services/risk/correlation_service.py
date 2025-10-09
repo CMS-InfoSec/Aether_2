@@ -14,6 +14,8 @@ from threading import Lock
 from typing import Dict, Iterable, Iterator, List, Mapping, MutableMapping, Sequence
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
+
+from metrics import setup_metrics
 from pydantic import BaseModel, Field
 
 try:  # pragma: no cover - optional dependency
@@ -582,6 +584,7 @@ class CorrelationMatrixResponse(BaseModel):
 
 
 app = FastAPI(title="Risk Correlation Service")
+setup_metrics(app, service_name="risk-correlation-service")
 
 alert_manager = AlertManager(metrics=get_alert_metrics())
 
