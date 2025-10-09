@@ -198,6 +198,7 @@ from metrics import (
     setup_metrics,
 )
 from shared.health import setup_health_checks
+from shared.trade_logging import TradeLogEntry, get_trade_logger
 from shared.correlation import get_correlation_id
 from shared.simulation import (
     SimulatedOrder,
@@ -2605,6 +2606,30 @@ class AccountContext:
         direction = Decimal("1") if normalized_side == "buy" else Decimal("-1")
         impact_ratio = (avg_price - mid_px) / mid_px
         impact_bps = impact_ratio * direction * Decimal("10000")
+        pnl_value = (mid_px - avg_price) * filled_qty * direction
+
+        trade_entry = TradeLogEntry(
+            timestamp=datetime.now(timezone.utc),
+            account_id=self.account_id,
+            client_order_id=record.client_id,
+            exchange_order_id=record.result.exchange_order_id,
+            symbol=record.symbol,
+            side=normalized_side,
+            quantity=filled_qty,
+            price=avg_price,
+            pnl=pnl_value,
+            pre_trade_mid=mid_px,
+            transport=record.transport,
+            simulated=record.origin == "SIM",
+        )
+        try:
+            get_trade_logger().log(trade_entry)
+        except Exception:  # pragma: no cover - logging must not break fills
+            logger.exception(
+                "Failed to log trade %s for account %s",
+                record.client_id,
+                self.account_id,
+            )
 
         await self._impact_store.record_fill(
             account_id=self.account_id,

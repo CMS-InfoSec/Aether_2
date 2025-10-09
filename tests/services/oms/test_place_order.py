@@ -228,6 +228,15 @@ reconcile_stub.register = lambda app, manager: None
 sys.modules.setdefault("services.oms.reconcile", reconcile_stub)
 
 
+shadow_stub = types.ModuleType("services.oms.shadow_oms")
+shadow_stub.shadow_oms = types.SimpleNamespace(
+    record_real_fill=lambda *_, **__: None,
+    generate_shadow_fills=lambda *_, **__: [],
+    snapshot=lambda *_: [],
+)
+sys.modules.setdefault("services.oms.shadow_oms", shadow_stub)
+
+
 MODULE_PATH = Path(__file__).resolve().parents[3] / "services" / "oms" / "oms_service.py"
 MODULE_SPEC = importlib.util.spec_from_file_location("services.oms.oms_service", MODULE_PATH)
 assert MODULE_SPEC and MODULE_SPEC.loader
@@ -247,6 +256,7 @@ from services.oms.main import _snap
 from services.oms.kraken_ws import OrderAck
 from shared.correlation import CorrelationContext
 from shared.simulation import sim_broker, sim_mode_state
+from shared import trade_logging
 
 
 class _StubCredentialWatcher:
@@ -570,3 +580,81 @@ def test_simulated_place_order_marks_records_and_reuses_idempotency(
         sim_mode_state.deactivate("ACC-TEST")
         asyncio.run(sim_broker.clear())
         asyncio.run(account.close())
+
+
+def test_apply_fill_event_records_trade_journal(
+    account_setup: Tuple[
+        AccountContext,
+        List[_RecordingWSClient],
+        List[_StubRESTClient],
+        _StubImpactStore,
+    ],
+    tmp_path: Path,
+) -> None:
+    account, _, _, impact_store = account_setup
+
+    class _RecordingTradeLogger(trade_logging.TradeLogger):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path=path)
+            self.entries: List[trade_logging.TradeLogEntry] = []
+
+        def log(self, entry: trade_logging.TradeLogEntry) -> None:  # type: ignore[override]
+            self.entries.append(entry)
+
+    trade_logger = _RecordingTradeLogger(tmp_path / "trade_journal.csv")
+
+    record = oms_service.OrderRecord(
+        client_id="CID-FILL",
+        result=oms_service.OMSOrderStatusResponse(
+            exchange_order_id="EX-123",
+            status="open",
+            filled_qty=Decimal("0"),
+            avg_price=Decimal("0"),
+            errors=None,
+        ),
+        transport="websocket",
+        symbol="BTC/USD",
+        side="buy",
+        pre_trade_mid=Decimal("20000"),
+        recorded_qty=Decimal("0"),
+        requested_qty=Decimal("1"),
+        origin=None,
+    )
+    account._orders[record.client_id] = record
+
+    payload = {
+        "clientOrderId": record.client_id,
+        "ordertxid": "EX-123",
+        "status": "filled",
+        "filled": "1.0",
+        "avg_price": "19990",
+        "symbol": "BTC/USD",
+        "side": "buy",
+        "pre_trade_mid": "20000",
+    }
+
+    with trade_logging.override_trade_logger(trade_logger):
+        applied = asyncio.run(account.apply_fill_event(payload))
+
+    assert applied is True
+    assert trade_logger.entries, "Expected trade execution to be logged"
+    entry = trade_logger.entries[-1]
+    assert entry.account_id == account.account_id
+    assert entry.symbol == "BTC/USD"
+    assert entry.side == "buy"
+    assert entry.quantity == Decimal("1.0")
+    assert entry.price == Decimal("19990")
+    assert entry.pnl == Decimal("10.0")
+    assert entry.exchange_order_id == "EX-123"
+    assert entry.transport == "websocket"
+
+    assert impact_store.calls, "Expected impact analytics store to record fill"
+    recorded = impact_store.calls[-1]
+    assert recorded.get("avg_price") == Decimal("19990")
+    assert recorded.get("filled_qty") == Decimal("1.0")
+
+    stored_record = account._orders[record.client_id]
+    assert stored_record.result.avg_price == Decimal("19990")
+    assert stored_record.recorded_qty == Decimal("1.0")
+
+    asyncio.run(account.close())
