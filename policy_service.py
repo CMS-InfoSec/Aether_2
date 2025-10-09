@@ -58,6 +58,7 @@ from metrics import (
     setup_metrics,
 )
 from services.common.security import require_admin_account
+from shared.health import setup_health_checks
 from shared.session_config import load_session_ttl_minutes
 from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
 from services.common.spot import require_spot_http
@@ -137,6 +138,15 @@ def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
 
 
 SESSION_STORE = _configure_session_store(app)
+
+
+def _health_check_session_store() -> None:
+    store = getattr(app.state, "session_store", None)
+    if not isinstance(store, SessionStoreProtocol):
+        raise RuntimeError("session store unavailable")
+
+
+setup_health_checks(app, {"session_store": _health_check_session_store})
 
 shutdown_manager = setup_graceful_shutdown(
     app,
