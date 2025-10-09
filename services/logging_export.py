@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from typing import Any, Callable, TypeVar, cast
 
 from fastapi import APIRouter, HTTPException
 
@@ -11,8 +12,16 @@ from logging_export import MissingDependencyError, latest_export
 
 router = APIRouter(prefix="/logging/export", tags=["logging"])
 
+RouteFn = TypeVar("RouteFn", bound=Callable[..., Any])
 
-@router.get("/status")
+
+def _router_get(*args: Any, **kwargs: Any) -> Callable[[RouteFn], RouteFn]:
+    """Typed wrapper around ``router.get`` to satisfy static analysis."""
+
+    return cast(Callable[[RouteFn], RouteFn], router.get(*args, **kwargs))
+
+
+@_router_get("/status")
 def export_status() -> dict[str, dt.datetime | str | None]:
     """Return metadata describing the most recent log export."""
 

@@ -155,7 +155,8 @@ def _resolve_timescale_dsn(account_id: str) -> str:
             raise RuntimeError(
                 f"{key} is set but empty; configure a valid Timescale/PostgreSQL DSN."
             )
-        return normalize_postgres_dsn(stripped, label="Timescale DSN")
+        normalized: str = normalize_postgres_dsn(stripped, label="Timescale DSN")
+        return normalized
 
     raise RuntimeError(
         "Timescale DSN is not configured. Set TIMESCALE_DSN or "
