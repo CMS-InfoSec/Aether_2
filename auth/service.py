@@ -175,10 +175,13 @@ def _init_metrics(*, registry: CollectorRegistry | None = None) -> None:
     global _LOGIN_SUCCESS_COUNTER
 
     if registry is None:
+        shared_registry: CollectorRegistry | None
         try:
-            registry = CollectorRegistry()
-        except Exception:  # pragma: no cover - fallback when CollectorRegistry stubbed
-            registry = None  # type: ignore[assignment]
+            from metrics import _REGISTRY as shared_registry  # type: ignore[attr-defined]
+        except Exception:  # pragma: no cover - metrics may be unavailable in minimal envs
+            shared_registry = None
+
+        registry = shared_registry
 
     _METRICS_REGISTRY = registry
 
