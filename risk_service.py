@@ -108,6 +108,12 @@ _CAPITAL_ALLOCATOR_DRAWDOWN_LIMIT = max(_CAPITAL_ALLOCATOR_DRAWDOWN_LIMIT, 0.0)
 _BATTLE_MODE_VOL_THRESHOLD = float(os.getenv("BATTLE_MODE_VOL_THRESHOLD", "1.0"))
 DEFAULT_EXCHANGE = os.getenv("PRIMARY_EXCHANGE", "kraken")
 
+try:
+    _DEFAULT_TAKER_FEE_BPS = float(os.getenv("DEFAULT_TAKER_FEE_BPS", "26.0"))
+except ValueError:
+    _DEFAULT_TAKER_FEE_BPS = 26.0
+_DEFAULT_TAKER_FEE_BPS = max(_DEFAULT_TAKER_FEE_BPS, 0.0)
+
 _UNIVERSE_SERVICE_URL = os.getenv("UNIVERSE_SERVICE_URL", "http://localhost:9000")
 _UNIVERSE_SERVICE_TIMEOUT = float(os.getenv("UNIVERSE_SERVICE_TIMEOUT", "5.0"))
 _UNIVERSE_CACHE_TTL = int(os.getenv("UNIVERSE_CACHE_TTL", "300"))
@@ -1332,6 +1338,7 @@ async def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
     available_balance = min(available_candidates) if available_candidates else 0.0
 
     sizing_result = None
+    fee_bps_estimate: Optional[float] = None
     try:
         sizer = PositionSizer(
             context.request.account_id,
@@ -1351,6 +1358,12 @@ async def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
             context.request.account_id,
             normalized_instrument,
         )
+    else:
+        fee_bps_estimate = getattr(sizing_result, "fee_bps_estimate", None)
+
+    resolved_fee_bps = _effective_fee_bps(fee_bps_estimate)
+    fee_ratio = resolved_fee_bps / 10_000.0
+    estimated_fee_cost = _estimate_fee_cost(trade_notional, fee_bps_estimate)
 
     allocator_state = await _query_allocator_state(context.request.account_id)
     if allocator_state:
@@ -1409,14 +1422,26 @@ async def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
             balance_details["reported_available_cash"] = max(float(reported_available_cash), 0.0)
         if exchange_available_cash is not None:
             balance_details["exchange_available_cash"] = max(exchange_available_cash, 0.0)
+        if estimated_fee_cost > 0:
+            balance_details["estimated_fee"] = estimated_fee_cost
+        if resolved_fee_bps > 0:
+            balance_details["estimated_fee_bps"] = resolved_fee_bps
 
-        if available_balance <= 0.0 or trade_notional > available_balance:
+        required_cash = trade_notional + estimated_fee_cost
+        balance_details["required_cash"] = required_cash
+
+        if available_balance <= 0.0 or required_cash > available_balance:
             _register_violation(
                 "Insufficient available USD balance to fund trade",
                 details=balance_details,
             )
             if intent.notional_per_unit and available_balance > 0.0:
-                suggested_quantities.append(available_balance / intent.notional_per_unit)
+                unit_price = float(intent.notional_per_unit)
+                effective_unit_cost = unit_price * (1.0 + fee_ratio)
+                if effective_unit_cost > 0:
+                    suggested_quantities.append(available_balance / effective_unit_cost)
+                else:
+                    suggested_quantities.append(0.0)
             else:
                 suggested_quantities.append(0.0)
 
@@ -2229,6 +2254,26 @@ def _coerce_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _effective_fee_bps(candidate: Optional[float]) -> float:
+    """Return a non-negative fee estimate in basis points."""
+
+    value = _coerce_float(candidate)
+    if value is None or value < 0:
+        return _DEFAULT_TAKER_FEE_BPS
+    return value
+
+
+def _estimate_fee_cost(notional: float, fee_bps: Optional[float]) -> float:
+    """Estimate the USD fee cost for *notional* at the supplied rate."""
+
+    if notional <= 0:
+        return 0.0
+    fee_rate_bps = _effective_fee_bps(fee_bps)
+    if fee_rate_bps <= 0:
+        return 0.0
+    return notional * (fee_rate_bps / 10_000.0)
 
 
 def _extract_available_usd(snapshot: Mapping[str, Any]) -> Optional[float]:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import types
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterator, Mapping
@@ -272,4 +273,55 @@ def test_risk_validation_blocks_when_available_cash_insufficient(
     assert any(
         reason.startswith("Insufficient available USD balance") for reason in body["reasons"]
     )
-    assert body["adjusted_qty"] == pytest.approx(0.25)
+    fee_ratio = getattr(risk_module, "_DEFAULT_TAKER_FEE_BPS") / 10_000.0
+    expected_qty = payload["portfolio_state"]["available_cash"] / (
+        payload["intent"]["price"] * (1.0 + fee_ratio)
+    )
+    assert body["adjusted_qty"] == pytest.approx(expected_qty)
+
+
+def test_risk_validation_reserves_fee_budget_when_cash_equals_notional(
+    risk_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = _base_request()
+    payload["intent"]["quantity"] = 1.0
+    payload["intent"]["price"] = 100.0
+    payload["portfolio_state"]["notional_exposure"] = 0.0
+    payload["portfolio_state"]["available_cash"] = 100.0
+
+    async def _stub_sizing(*args: Any, **kwargs: Any) -> Any:
+        return types.SimpleNamespace(
+            max_position=1_000_000.0,
+            volatility=0.2,
+            nav=payload["portfolio_state"]["net_asset_value"],
+            fee_bps_estimate=None,
+        )
+
+    monkeypatch.setattr(
+        risk_module.PositionSizer,
+        "suggest_max_position",
+        _stub_sizing,
+    )
+
+    with override_admin_auth(
+        risk_client.app, require_admin_account, payload["account_id"]
+    ) as headers:
+        response = risk_client.post(
+            "/risk/validate",
+            json=payload,
+            headers={**headers, "X-Account-ID": payload["account_id"]},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["pass"] is False
+    assert any(
+        reason.startswith("Insufficient available USD balance") for reason in body["reasons"]
+    )
+    assert body["adjusted_qty"] is not None
+    fee_ratio = getattr(risk_module, "_DEFAULT_TAKER_FEE_BPS") / 10_000.0
+    expected_quantity = payload["portfolio_state"]["available_cash"] / (
+        payload["intent"]["price"] * (1.0 + fee_ratio)
+    )
+    assert body["adjusted_qty"] == pytest.approx(expected_quantity)
+    assert body["adjusted_qty"] < payload["intent"]["quantity"]
