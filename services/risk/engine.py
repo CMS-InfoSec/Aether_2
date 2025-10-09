@@ -9,6 +9,7 @@ from compliance_filter import COMPLIANCE_REASON, compliance_filter
 from esg_filter import ESG_REASON, esg_filter
 from services.common.adapters import RedisFeastAdapter, TimescaleAdapter
 from services.common.schemas import RiskValidationRequest, RiskValidationResponse
+from shared.exits import compute_exit_targets
 from services.risk.circuit_breakers import CircuitBreakerDecision, get_circuit_breaker
 
 
@@ -47,10 +48,34 @@ class RiskEngine:
             "fee_to_date": request.portfolio_state.fee_to_date,
         }
 
+        decision_payload = request.intent.policy_decision
+        decision_request = decision_payload.request
+        decision_response = decision_payload.response
+        take_profit_bps = None
+        stop_loss_bps = None
+        if decision_response is not None:
+            take_profit_bps = decision_response.take_profit_bps
+            stop_loss_bps = decision_response.stop_loss_bps
+        else:
+            take_profit_bps = decision_request.take_profit_bps
+            stop_loss_bps = decision_request.stop_loss_bps
+        exit_take_profit, exit_stop_loss = compute_exit_targets(
+            price=decision_request.price,
+            side=decision_request.side,
+            take_profit_bps=take_profit_bps,
+            stop_loss_bps=stop_loss_bps,
+        )
+
         if self._config.get("kill_switch", False):
             reason = "Risk kill switch engaged for account"
             self._record_event("kill_switch_triggered", reason, context)
-            return RiskValidationResponse(valid=False, reasons=[reason], fee=request.fee)
+            return RiskValidationResponse(
+                valid=False,
+                reasons=[reason],
+                fee=request.fee,
+                take_profit=exit_take_profit,
+                stop_loss=exit_stop_loss,
+            )
 
         self._validate_compliance(request, reasons, context)
         self._validate_esg(request, reasons, context)
@@ -60,7 +85,13 @@ class RiskEngine:
                 "Intent rejected by risk engine",
                 {"reasons": list(reasons), **context},
             )
-            return RiskValidationResponse(valid=False, reasons=reasons, fee=request.fee)
+            return RiskValidationResponse(
+                valid=False,
+                reasons=reasons,
+                fee=request.fee,
+                take_profit=exit_take_profit,
+                stop_loss=exit_stop_loss,
+            )
 
         self._validate_universe(request, reasons, context)
         self._validate_caps(request, reasons, context)
@@ -70,11 +101,23 @@ class RiskEngine:
 
         if reasons:
             self._record_event("risk_rejected", "Intent rejected by risk engine", {"reasons": list(reasons), **context})
-            return RiskValidationResponse(valid=False, reasons=reasons, fee=request.fee)
+            return RiskValidationResponse(
+                valid=False,
+                reasons=reasons,
+                fee=request.fee,
+                take_profit=exit_take_profit,
+                stop_loss=exit_stop_loss,
+            )
 
         self.timescale.record_daily_usage(request.projected_loss, request.projected_fee)
         self.timescale.record_instrument_exposure(request.instrument, abs(request.gross_notional))
-        return RiskValidationResponse(valid=True, reasons=[], fee=request.fee)
+        return RiskValidationResponse(
+            valid=True,
+            reasons=[],
+            fee=request.fee,
+            take_profit=exit_take_profit,
+            stop_loss=exit_stop_loss,
+        )
 
     # ------------------------------------------------------------------
     # Validation helpers
