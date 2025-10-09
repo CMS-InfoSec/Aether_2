@@ -81,9 +81,11 @@ def test_validate_risk_all_admin_accounts(
 
     assert response.status_code == 200
     body = response.json()
-    assert set(body.keys()) == {"pass", "reasons", "adjusted_qty", "cooldown"}
+    assert set(body.keys()) == {"pass", "reasons", "adjusted_qty", "cooldown", "take_profit", "stop_loss"}
     assert body["pass"] is True
     assert body["reasons"] == []
+    assert body["take_profit"] > payload["intent"]["price"]
+    assert body["stop_loss"] < payload["intent"]["price"]
 
 
 def test_get_risk_limits_returns_whitelists(risk_app: AccountClient) -> None:
