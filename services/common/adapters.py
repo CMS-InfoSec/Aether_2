@@ -1057,7 +1057,10 @@ class KafkaNATSAdapter:
             record["partial_delivery"] = True
             self._record_event(record)
         else:
-            # Broker unavailable, retain the record for a later flush.
+            # Broker unavailable, retain the record for a later flush. This path
+            # should be unreachable because `_attempt_publish` raises when no
+            # transports are available, but we keep it to remain compatible with
+            # subclasses overriding the publish behaviour.
             self._buffer_event(record)
             self._record_event(record)
 
@@ -1219,19 +1222,30 @@ class KafkaNATSAdapter:
         setattr(self, client_attr, client)
         return client
 
-    async def _attempt_publish(self, record: Dict[str, Any]) -> str:
-        transports = []
+    async def _resolve_transports(self, topic: str) -> List[tuple[httpx.AsyncClient, str]]:
+        transports: List[tuple[httpx.AsyncClient, str]] = []
 
         kafka_client = await self._ensure_client("_kafka_client", "_kafka_client_task", "kafka")
         if kafka_client is not None:
-            transports.append((kafka_client, self._topic_path(record["topic"])))
+            transports.append((kafka_client, self._topic_path(topic)))
 
         nats_client = await self._ensure_client("_nats_client", "_nats_client_task", "nats")
         if nats_client is not None:
-            transports.append((nats_client, self._subject_path(record["topic"])) )
+            transports.append((nats_client, self._subject_path(topic)))
+
+        return transports
+
+    async def _attempt_publish(self, record: Dict[str, Any]) -> str:
+        transports = await self._resolve_transports(record["topic"])
 
         if not transports:
-            return "offline"
+            # Attempt a fresh bootstrap in case configuration or broker readiness
+            # changed since this adapter instance was constructed.
+            self._bootstrap_clients()
+            transports = await self._resolve_transports(record["topic"])
+
+        if not transports:
+            raise PublishError("No broker transports available for publish")
 
         errors: List[BaseException] = []
         successes = 0
