@@ -51,6 +51,10 @@ class KrakenCredentials:
     secret: str
 
 
+_SECRET_PATH_REGISTRY: Dict[str, Path] = {}
+_SECRET_PATH_USAGE: Dict[Path, str] = {}
+
+
 def _env(account_id: str, suffix: str, default: str) -> str:
     env_key = f"AETHER_{account_id.upper()}_{suffix}"
     return os.getenv(env_key, default)
@@ -238,8 +242,57 @@ def get_timescale_session(account_id: str) -> TimescaleSession:
     return TimescaleSession(dsn=dsn, account_schema=schema)
 
 
+def _register_secret_path(account_id: str, path: Path) -> Path:
+    """Track credential paths and prevent shared mounts across accounts."""
+
+    normalized = path.expanduser().resolve(strict=False)
+    existing = _SECRET_PATH_USAGE.get(normalized)
+    if existing is not None and existing != account_id:
+        raise RuntimeError(
+            "Kraken credential secret path conflict detected between accounts "
+            f"'{existing}' and '{account_id}'. Configure unique Kubernetes secret mounts for each trading account."
+        )
+    _SECRET_PATH_REGISTRY[account_id] = normalized
+    _SECRET_PATH_USAGE[normalized] = account_id
+    return normalized
+
+
+def _insecure_secret_stub(account_id: str, path: Path) -> None:
+    """Materialise deterministic credentials for insecure-default environments."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        return
+    stub = {
+        "key": f"stub-{account_id}-key",
+        "secret": f"stub-{account_id}-secret",
+    }
+    path.write_text(json.dumps(stub))
+    logger.warning(
+        "Generated insecure stub Kraken credentials for account '%s' at %s; "
+        "never use this fallback in production.",
+        account_id,
+        path,
+    )
+
+
+def _resolve_secret_path(account_id: str) -> Path:
+    env_key = f"AETHER_{account_id.upper()}_KRAKEN_SECRET_PATH"
+    raw = os.getenv(env_key)
+    if raw and raw.strip():
+        candidate = Path(raw.strip())
+    else:
+        if _allow_test_fallbacks():
+            state_dir = Path(os.getenv("AETHER_STATE_DIR", ".aether_state"))
+            candidate = state_dir / "kraken_credentials" / f"{account_id}.json"
+            _insecure_secret_stub(account_id, candidate)
+        else:
+            candidate = Path(f"/var/run/secrets/{account_id}/kraken.json")
+    return _register_secret_path(account_id, candidate)
+
+
 def get_kraken_credentials(account_id: str) -> KrakenCredentials:
-    secret_path = Path(_env(account_id, "KRAKEN_SECRET_PATH", "/var/run/secrets/kraken.json"))
+    secret_path = _resolve_secret_path(account_id)
     if not secret_path.exists():
         raise FileNotFoundError(f"Kraken credentials not found at {secret_path}")
 
