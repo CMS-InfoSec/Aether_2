@@ -250,6 +250,11 @@ class PortfolioState(BaseModel):
     nav: float = Field(..., gt=0.0, description="Total net asset value for the account")
     loss_to_date: float = Field(..., ge=0.0, description="Realised losses accrued today")
     fee_to_date: float = Field(..., ge=0.0, description="Fees accrued today")
+    available_cash: Optional[float] = Field(
+        None,
+        ge=0.0,
+        description="USD cash currently available for new spot trades",
+    )
     instrument_exposure: Dict[str, float] = Field(
         default_factory=dict,
         description="Existing gross exposure by instrument prior to this intent",

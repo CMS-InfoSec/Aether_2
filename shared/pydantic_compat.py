@@ -148,3 +148,20 @@ __all__ = [
     "model_validator",
     "model_serializer",
 ]
+
+
+def model_dump(instance: _BaseModelProtocol, **kwargs: Any) -> Dict[str, Any]:
+    """Return a mapping representation for *instance* using modern semantics."""
+
+    dump = getattr(instance, "model_dump", None)
+    if callable(dump):
+        try:
+            return dump(**kwargs)
+        except TypeError:
+            clean_kwargs = {key: value for key, value in kwargs.items() if key != "by_alias"}
+            return dump(**clean_kwargs)
+    clean_kwargs = {key: value for key, value in kwargs.items() if key != "by_alias"}
+    return instance.dict(**clean_kwargs)
+
+
+__all__.append("model_dump")

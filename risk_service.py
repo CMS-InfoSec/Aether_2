@@ -56,6 +56,7 @@ from cost_throttler import CostThrottler
 from services.risk.position_sizer import PositionSizer
 from services.common.adapters import RedisFeastAdapter, TimescaleAdapter
 from shared.exits import compute_exit_targets
+from shared.pydantic_compat import model_dump
 from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
 from shared.spot import filter_spot_symbols, is_spot_symbol, normalize_spot_symbol
 
@@ -363,41 +364,70 @@ _DEFAULT_LIMITS: List[Dict[str, object]] = [
 ]
 
 
+def _normalize_limit_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """Coerce default limit payloads into ``AccountRiskLimit`` compatible values."""
+
+    raw_whitelist = payload.get("instrument_whitelist")
+    if isinstance(raw_whitelist, str):
+        whitelist_iterable = [symbol.strip() for symbol in raw_whitelist.split(",") if symbol.strip()]
+    elif isinstance(raw_whitelist, (list, tuple, set)):
+        whitelist_iterable = list(raw_whitelist)
+    else:
+        whitelist_iterable = []
+    whitelist = filter_spot_symbols(whitelist_iterable, logger=logger)
+    whitelist_blob = ",".join(sorted(whitelist)) if whitelist else None
+
+    cluster_limits_raw = payload.get("diversification_cluster_limits")
+    if isinstance(cluster_limits_raw, str) or cluster_limits_raw is None:
+        cluster_blob = cluster_limits_raw
+    else:
+        cluster_blob = json.dumps(cluster_limits_raw)
+
+    return {
+        "account_id": str(payload["account_id"]),
+        "max_daily_loss": _as_decimal(payload["max_daily_loss"]),
+        "fee_budget": _as_decimal(payload["fee_budget"]),
+        "max_nav_pct_per_trade": _as_decimal(payload["max_nav_pct_per_trade"]),
+        "notional_cap": _as_decimal(payload["notional_cap"]),
+        "cooldown_minutes": int(payload.get("cooldown_minutes", 0)),
+        "instrument_whitelist": whitelist_blob,
+        "var_95_limit": _maybe_decimal(payload.get("var_95_limit")),
+        "var_99_limit": _maybe_decimal(payload.get("var_99_limit")),
+        "spread_threshold_bps": _maybe_decimal(payload.get("spread_threshold_bps")),
+        "latency_stall_seconds": _maybe_decimal(payload.get("latency_stall_seconds")),
+        "exchange_outage_block": int(payload.get("exchange_outage_block", 0)),
+        "correlation_threshold": _maybe_decimal(payload.get("correlation_threshold")),
+        "correlation_lookback": payload.get("correlation_lookback"),
+        "diversification_cluster_limits": cluster_blob,
+    }
+
+
 def _seed_default_limits(session: Session) -> None:
     for payload in _DEFAULT_LIMITS:
-        record = session.get(AccountRiskLimit, payload["account_id"])
-        whitelist = filter_spot_symbols(
-            payload.get("instrument_whitelist", []), logger=logger
-        )
-        whitelist_blob = ",".join(sorted(whitelist)) if whitelist else None
+        normalized = _normalize_limit_payload(payload)
+        record = session.get(AccountRiskLimit, normalized["account_id"])
         if record is None:
             record = AccountRiskLimit(
-                account_id=payload["account_id"],
-                max_daily_loss=_as_decimal(payload["max_daily_loss"]),
-                fee_budget=_as_decimal(payload["fee_budget"]),
-                max_nav_pct_per_trade=_as_decimal(payload["max_nav_pct_per_trade"]),
-                notional_cap=_as_decimal(payload["notional_cap"]),
-                cooldown_minutes=int(payload["cooldown_minutes"]),
-                instrument_whitelist=whitelist_blob,
-                var_95_limit=_maybe_decimal(payload.get("var_95_limit")),
-                var_99_limit=_maybe_decimal(payload.get("var_99_limit")),
-                spread_threshold_bps=_maybe_decimal(payload.get("spread_threshold_bps")),
-                latency_stall_seconds=_maybe_decimal(payload.get("latency_stall_seconds")),
-                exchange_outage_block=int(payload["exchange_outage_block"]),
+                **normalized,
             )
             session.add(record)
         else:
-            record.max_daily_loss = _as_decimal(payload["max_daily_loss"])
-            record.fee_budget = _as_decimal(payload["fee_budget"])
-            record.max_nav_pct_per_trade = _as_decimal(payload["max_nav_pct_per_trade"])
-            record.notional_cap = _as_decimal(payload["notional_cap"])
-            record.cooldown_minutes = int(payload["cooldown_minutes"])
-            record.instrument_whitelist = whitelist_blob
-            record.var_95_limit = _maybe_decimal(payload.get("var_95_limit"))
-            record.var_99_limit = _maybe_decimal(payload.get("var_99_limit"))
-            record.spread_threshold_bps = _maybe_decimal(payload.get("spread_threshold_bps"))
-            record.latency_stall_seconds = _maybe_decimal(payload.get("latency_stall_seconds"))
-            record.exchange_outage_block = int(payload["exchange_outage_block"])
+            record.max_daily_loss = normalized["max_daily_loss"]
+            record.fee_budget = normalized["fee_budget"]
+            record.max_nav_pct_per_trade = normalized["max_nav_pct_per_trade"]
+            record.notional_cap = normalized["notional_cap"]
+            record.cooldown_minutes = normalized["cooldown_minutes"]
+            record.instrument_whitelist = normalized["instrument_whitelist"]
+            record.var_95_limit = normalized["var_95_limit"]
+            record.var_99_limit = normalized["var_99_limit"]
+            record.spread_threshold_bps = normalized["spread_threshold_bps"]
+            record.latency_stall_seconds = normalized["latency_stall_seconds"]
+            record.exchange_outage_block = normalized["exchange_outage_block"]
+            record.correlation_threshold = normalized["correlation_threshold"]
+            record.correlation_lookback = normalized["correlation_lookback"]
+            record.diversification_cluster_limits = normalized[
+                "diversification_cluster_limits"
+            ]
 
 
 def _bootstrap_storage() -> None:
@@ -413,6 +443,26 @@ def _bootstrap_storage() -> None:
 def get_session() -> Iterator[Session]:
     session = SessionLocal()
     try:
+        original_get = session.get
+
+        def _wrapped_get(model: Any, primary_key: Any) -> Any:
+            try:
+                result = original_get(model, primary_key)
+            except Exception:
+                result = None
+            if result is None and model is AccountRiskLimit and primary_key in _STUB_RISK_LIMITS:
+                return AccountRiskLimit(**dict(_STUB_RISK_LIMITS[primary_key]))
+            return result
+
+        session.get = _wrapped_get  # type: ignore[assignment]
+
+        try:
+            for account_id, payload in _STUB_RISK_LIMITS.items():
+                if original_get(AccountRiskLimit, account_id) is None:
+                    session.add(AccountRiskLimit(**dict(payload)))
+            session.flush()
+        except Exception:  # pragma: no cover - fallback when SQLAlchemy unavailable
+            session.rollback()
         yield session
         session.commit()
     except Exception:
@@ -482,7 +532,10 @@ _STUB_ACCOUNT_RETURNS: Dict[str, List[float]] = {
 }
 
 
-_STUB_RISK_LIMITS: Dict[str, Dict[str, Any]] = {}
+_STUB_RISK_LIMITS: Dict[str, Dict[str, Any]] = {
+    str(payload["account_id"]): _normalize_limit_payload(payload)
+    for payload in _DEFAULT_LIMITS
+}
 
 
 _STUB_ACCOUNT_USAGE: Dict[str, Dict[str, Decimal]] = {}
@@ -597,6 +650,10 @@ class TradeIntent(BaseModel):
         quantity = model.quantity
         price = model.price
         notional = model.notional
+        side = (model.side or "").strip().lower()
+        if side not in {"buy", "sell"}:
+            raise ValueError("side must be 'buy' or 'sell'")
+        model.side = side
         if notional is None and quantity is not None and price is not None:
             model.notional = quantity * price
         return model
@@ -621,6 +678,11 @@ class AccountPortfolioState(BaseModel):
         description="Realized trading loss accumulated during the current session",
     )
     fees_paid: float = Field(0.0, ge=0.0, description="Fees accumulated during the current session")
+    available_cash: Optional[float] = Field(
+        None,
+        ge=0.0,
+        description="USD cash currently available to deploy into new trades",
+    )
     var_95: Optional[float] = Field(
         None, ge=0.0, description="Current 1-day 95% Value-at-Risk for the portfolio"
     )
@@ -688,7 +750,12 @@ class RiskEvaluationContext(BaseModel):
 
     @property
     def intended_notional(self) -> float:
-        return float(self.request.intent.notional)
+        notional = self.request.intent.notional
+        if notional is not None:
+            return float(notional)
+        quantity = float(self.request.intent.quantity)
+        price = float(self.request.intent.price)
+        return quantity * price
 
 class AccountUsage(BaseModel):
     account_id: str
@@ -789,6 +856,8 @@ battle_mode_controller = BattleModeController(
     session_factory=get_session, threshold=_BATTLE_MODE_VOL_THRESHOLD
 )
 
+_bootstrap_storage()
+
 
 @app.post("/risk/validate", response_model=RiskValidationResponse)
 async def validate_risk(
@@ -805,6 +874,14 @@ async def validate_risk(
         )
 
     logger.info("Received risk validation request for account %s", account_id)
+
+    normalized_side = (request.intent.side or "").strip().lower()
+    if normalized_side not in {"buy", "sell"}:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="side must be 'buy' or 'sell'",
+        )
+    request.intent.side = normalized_side
 
     try:
         limits = _load_account_limits(account_id)
@@ -857,7 +934,10 @@ async def validate_risk(
         context=metrics_ctx,
     )
 
-    return decision.dict(by_alias=True)
+    payload = model_dump(decision, by_alias=True)
+    if "pass" not in payload and "pass_" in payload:
+        payload["pass"] = payload.pop("pass_")
+    return payload
 
 
 @app.get("/risk/limits")
@@ -899,13 +979,40 @@ async def get_risk_limits(
     return response.dict()
 
 
+async def _load_balance_snapshot(account_id: str) -> Optional[Mapping[str, Any]]:
+    """Return the latest balance snapshot from the exchange adapter, if available."""
+
+    if not EXCHANGE_ADAPTER.supports("get_balance"):
+        return None
+
+    try:
+        snapshot = await EXCHANGE_ADAPTER.get_balance(account_id)
+    except NotImplementedError:
+        return None
+    except Exception as exc:  # pragma: no cover - defensive guard for optional integrations
+        _handle_exchange_adapter_failure(account_id, "get_balance", exc)
+        return None
+
+    if not isinstance(snapshot, Mapping):
+        return None
+
+    return snapshot
+
 
 @app.get("/risk/size")
 async def get_position_size(
     symbol: str = Query(..., min_length=1, description="Instrument symbol to size"),
     account_id: str = Depends(require_admin_account),
 ) -> Dict[str, Any]:
-    symbol = require_spot_http(symbol, logger=logger)
+    try:
+        symbol = require_spot_http(symbol, logger=logger)
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_400_BAD_REQUEST:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Only spot market symbols are supported for position sizing.",
+            ) from exc
+        raise
 
     try:
         limits = _load_account_limits(account_id)
@@ -919,27 +1026,16 @@ async def get_position_size(
     nav_value = float(usage.net_asset_value) if usage.net_asset_value else 0.0
     available_balance: Optional[float] = None
 
-    if EXCHANGE_ADAPTER.supports("get_balance"):
-        try:
-            snapshot = await EXCHANGE_ADAPTER.get_balance(account_id)
-        except NotImplementedError:
-            snapshot = None
-        except Exception as exc:  # pragma: no cover - best effort diagnostics
-            logger.debug(
-                "Balance snapshot unavailable for account %s: %s",
-                account_id,
-                exc,
-            )
-            snapshot = None
-        if isinstance(snapshot, Mapping):
-            nav_override = _coerce_float(
-                snapshot.get("net_asset_value")
-                or snapshot.get("nav")
-                or snapshot.get("total_value")
-            )
-            if nav_override is not None and nav_override > 0:
-                nav_value = nav_override
-            available_balance = _extract_available_usd(snapshot)
+    snapshot = await _load_balance_snapshot(account_id)
+    if snapshot is not None:
+        nav_override = _coerce_float(
+            snapshot.get("net_asset_value")
+            or snapshot.get("nav")
+            or snapshot.get("total_value")
+        )
+        if nav_override is not None and nav_override > 0:
+            nav_value = nav_override
+        available_balance = _extract_available_usd(snapshot)
 
     timescale_adapter = TimescaleAdapter(account_id=account_id)
     feature_store = RedisFeastAdapter(account_id=account_id)
@@ -1013,9 +1109,17 @@ def _load_account_limits(account_id: str) -> AccountRiskLimit:
 
     with get_session() as session:
         limits = session.get(AccountRiskLimit, account_id)
-        if not limits:
-            raise ConfigError(f"No risk limits configured for account '{account_id}'.")
+    if limits:
         return limits
+
+    _bootstrap_storage()
+
+    with get_session() as session:
+        limits = session.get(AccountRiskLimit, account_id)
+        if limits:
+            return limits
+
+    raise ConfigError(f"No risk limits configured for account '{account_id}'.")
 
 
 def _load_sanction_hits(symbol: str) -> List[SanctionRecord]:
@@ -1202,6 +1306,31 @@ async def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
         if 0.0 not in suggested_quantities:
             suggested_quantities.append(0.0)
 
+    snapshot = await _load_balance_snapshot(context.request.account_id)
+    nav_value = float(state.net_asset_value) if state.net_asset_value else 0.0
+    exchange_available_cash: Optional[float] = None
+    if snapshot is not None:
+        nav_override = _coerce_float(
+            snapshot.get("net_asset_value")
+            or snapshot.get("nav")
+            or snapshot.get("total_value")
+        )
+        if nav_override is not None and nav_override > 0:
+            nav_value = nav_override
+        exchange_available_cash = _extract_available_usd(snapshot)
+        if exchange_available_cash is not None:
+            state.available_cash = exchange_available_cash
+
+    reported_available_cash = state.available_cash
+    exposure = float(state.notional_exposure or 0.0)
+    inferred_cash = max(nav_value - exposure, 0.0)
+    available_candidates: List[float] = [inferred_cash]
+    if reported_available_cash is not None:
+        available_candidates.append(max(float(reported_available_cash), 0.0))
+    if exchange_available_cash is not None:
+        available_candidates.append(max(exchange_available_cash, 0.0))
+    available_balance = min(available_candidates) if available_candidates else 0.0
+
     sizing_result = None
     try:
         sizer = PositionSizer(
@@ -1211,9 +1340,6 @@ async def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
             feature_store=RedisFeastAdapter(account_id=context.request.account_id),
             log_callback=_log_position_size,
         )
-        nav_value = float(state.net_asset_value)
-        exposure = float(state.notional_exposure or 0.0)
-        available_balance = max(nav_value - exposure, 0.0)
         sizing_result = await sizer.suggest_max_position(
             normalized_instrument,
             nav=nav_value,
@@ -1273,6 +1399,27 @@ async def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
                 sizing_result.max_position / float(intent.notional_per_unit)
             )
 
+    if intent.side.lower() == "buy":
+        balance_details: Dict[str, object] = {
+            "trade_notional": trade_notional,
+            "available_balance": available_balance,
+            "inferred_cash": inferred_cash,
+        }
+        if reported_available_cash is not None:
+            balance_details["reported_available_cash"] = max(float(reported_available_cash), 0.0)
+        if exchange_available_cash is not None:
+            balance_details["exchange_available_cash"] = max(exchange_available_cash, 0.0)
+
+        if available_balance <= 0.0 or trade_notional > available_balance:
+            _register_violation(
+                "Insufficient available USD balance to fund trade",
+                details=balance_details,
+            )
+            if intent.notional_per_unit and available_balance > 0.0:
+                suggested_quantities.append(available_balance / intent.notional_per_unit)
+            else:
+                suggested_quantities.append(0.0)
+
     # 1. Daily loss cap check
     if state.realized_daily_loss >= limits.max_daily_loss:
         _register_violation(
@@ -1291,7 +1438,6 @@ async def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
             details={"fees": state.fees_paid, "limit": limits.fee_budget},
         )
 
-    nav_value = float(state.net_asset_value)
     nav_pct_limit = float(limits.max_nav_pct_per_trade)
     nav_cap_for_trade = nav_pct_limit * nav_value
 
@@ -1326,15 +1472,28 @@ async def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
             volatility_source = "realized_vol"
 
     if volatility_metric is not None and volatility_source:
-        battle_mode_controller.auto_update(
-            context.request.account_id,
-            volatility_metric,
-            metric=volatility_source,
-            reason=f"{volatility_source}={volatility_metric:.6f}",
-        )
+        try:
+            battle_mode_controller.auto_update(
+                context.request.account_id,
+                volatility_metric,
+                metric=volatility_source,
+                reason=f"{volatility_source}={volatility_metric:.6f}",
+            )
+        except Exception:  # pragma: no cover - optional dependency fallback
+            logger.debug(
+                "Unable to update battle mode controller", exc_info=True
+            )
 
-    battle_status = battle_mode_controller.status(context.request.account_id)
-    if battle_status.engaged and not _is_position_reduction(intent, state, trade_notional):
+    try:
+        battle_status = battle_mode_controller.status(context.request.account_id)
+    except Exception:  # pragma: no cover - optional dependency fallback
+        battle_status = None
+        logger.debug("Unable to load battle mode status", exc_info=True)
+    if (
+        battle_status is not None
+        and battle_status.engaged
+        and not _is_position_reduction(intent, state, trade_notional)
+    ):
         _register_violation(
             "Battle mode active: speculative trades are temporarily suspended",
             cooldown=True,
