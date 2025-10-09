@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import logging
 
-import numpy as np
-
 from services.risk.cvar_forecast import CVaRMonteCarloForecaster
 
 
@@ -56,16 +54,22 @@ class _StubFeatureStore:
 
 class _DeterministicForecaster(CVaRMonteCarloForecaster):
     def __init__(self, timescale: _StubTimescaleAdapter, feature_store: _StubFeatureStore) -> None:
-        self.account_id = "company"
-        self.timescale = timescale
-        self.feature_store = feature_store
-        self.simulations = 16
-        self._rng = _DeterministicRNG()
+        super().__init__(
+            account_id="company",
+            timescale=timescale,
+            feature_store=feature_store,
+            simulations=16,
+        )
+        self._rng = _DeterministicRNG(self._np)
 
 
 class _DeterministicRNG:
+    def __init__(self, np_module) -> None:
+        self._np = np_module
+
     def normal(self, *, loc: float, scale: float, size: int):  # type: ignore[override]
-        return np.zeros(size, dtype=float)
+        del loc, scale
+        return self._np.zeros(size)
 
 
 def test_cvar_forecast_filters_non_spot_positions(caplog) -> None:

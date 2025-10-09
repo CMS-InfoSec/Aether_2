@@ -45,6 +45,7 @@ from services.common.config import (
     NATSProducer,
     RedisClient,
     TimescaleSession,
+    _allow_test_fallbacks,
     get_feast_client,
     get_kafka_producer,
     get_nats_producer,
@@ -75,6 +76,186 @@ except Exception:  # pragma: no cover - Feast is optional during testing
     _RuntimeFeatureStore = None
 
 FeatureStore = _RuntimeFeatureStore
+
+
+class _LocalFeastStore:
+    """Minimal Feast-compatible store for insecure-default environments."""
+
+    def __init__(self, account_id: str, feast_client: FeastClient) -> None:
+        self._account_id = account_id
+        self._feast_client = feast_client
+        self._lock = threading.RLock()
+        root = Path(os.getenv("AETHER_STATE_DIR", ".aether_state"))
+        self._state_path = root / "redis_feast" / account_id / "state.json"
+        self._state: Dict[str, Any] | None = None
+
+    def get_historical_features(
+        self,
+        *,
+        entity_rows: Iterable[Mapping[str, Any]],
+        feature_refs: Iterable[str],
+        start_date: datetime,
+        end_date: datetime,
+    ) -> List[Dict[str, Any]]:
+        del entity_rows  # unused in local fallback
+        state = self._load_state()
+        suffix = self._extract_suffix(feature_refs)
+        records = list(state.get(suffix, []))
+        if not records:
+            return []
+        filtered: List[Dict[str, Any]] = []
+        for record in records:
+            timestamp = record.get("event_timestamp")
+            if isinstance(timestamp, str):
+                try:
+                    ts = datetime.fromisoformat(timestamp)
+                except ValueError:
+                    ts = datetime.fromtimestamp(0, tz=timezone.utc)
+            elif isinstance(timestamp, datetime):
+                ts = timestamp if timestamp.tzinfo else timestamp.replace(tzinfo=timezone.utc)
+            else:
+                ts = datetime.fromtimestamp(0, tz=timezone.utc)
+            if ts < start_date or ts > end_date:
+                continue
+            filtered.append(dict(record))
+        if filtered:
+            return filtered
+        return [dict(record) for record in records]
+
+    def get_online_features(
+        self,
+        *,
+        entity_rows: Iterable[Mapping[str, Any]],
+        features: Iterable[str],
+    ) -> Dict[str, Any]:
+        state = self._load_state()
+        instrument = None
+        for row in entity_rows:
+            candidate = row.get("instrument")
+            if isinstance(candidate, str) and candidate:
+                instrument = normalize_spot_symbol(candidate)
+                break
+        instrument = instrument or "btc-usd"
+        online = state.setdefault("online", {})
+        payload = online.get(instrument)
+        if payload is None:
+            payload = self._default_online_payload(instrument)
+            online[instrument] = payload
+            self._persist(state)
+        response: Dict[str, Any] = {}
+        view = self._view_name("instrument_features")
+        for ref in features:
+            field = ref.split(":", 1)[-1]
+            response[f"{view}:{field}"] = payload.get(field)
+        return response
+
+    def _load_state(self) -> Dict[str, Any]:
+        with self._lock:
+            if self._state is not None:
+                return self._state
+            path = self._state_path
+            try:
+                if path.exists():
+                    raw = path.read_text(encoding="utf-8")
+                    data = _json_loads(raw)
+                else:
+                    data = {}
+            except Exception:
+                data = {}
+            if not data:
+                data = self._default_state()
+                self._persist(data)
+            self._state = data
+            return data
+
+    def _persist(self, state: Mapping[str, Any]) -> None:
+        with self._lock:
+            path = self._state_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(_json_dumps(state), encoding="utf-8")
+            self._state = dict(state)
+
+    def _default_state(self) -> Dict[str, Any]:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        iso = now.isoformat()
+        return {
+            "approved_instruments": [
+                {"instrument": "BTC-USD", "approved": True, "event_timestamp": iso},
+                {"instrument": "ETH-USD", "approved": True, "event_timestamp": iso},
+            ],
+            "fee_overrides": [
+                {
+                    "instrument": "BTC-USD",
+                    "maker_bps": 6.0,
+                    "taker_bps": 8.0,
+                    "currency": "USD",
+                    "event_timestamp": iso,
+                }
+            ],
+            "fee_tiers": [
+                {
+                    "pair": "BTC-USD",
+                    "tier": 1,
+                    "maker_bps": 6.0,
+                    "taker_bps": 8.0,
+                    "notional_threshold": 0.0,
+                    "event_timestamp": iso,
+                },
+                {
+                    "pair": "DEFAULT",
+                    "tier": 1,
+                    "maker_bps": 10.0,
+                    "taker_bps": 12.0,
+                    "notional_threshold": 0.0,
+                    "event_timestamp": iso,
+                },
+            ],
+            "online": {
+                "btc-usd": self._default_online_payload("btc-usd"),
+            },
+        }
+
+    def _default_online_payload(self, instrument: str) -> Dict[str, Any]:
+        seed = sum(ord(char) for char in instrument)
+        base_price = 30_000 + (seed % 500) * 10
+        base_spread = round(2.5 + (seed % 5) * 0.25, 4)
+        feature_vector = [round(((seed + index) % 10) / 10.0, 4) for index in range(3)]
+        confidence = {
+            "model_confidence": 0.55,
+            "state_confidence": 0.5,
+            "execution_confidence": 0.52,
+        }
+        confidence["overall_confidence"] = sum(confidence.values()) / len(confidence)
+        return {
+            "features": feature_vector,
+            "book_snapshot": {
+                "mid_price": float(base_price),
+                "spread_bps": base_spread,
+                "imbalance": 0.1,
+            },
+            "state": {
+                "regime": "neutral",
+                "volatility": 0.32,
+                "liquidity_score": 0.6,
+                "conviction": 0.55,
+            },
+            "expected_edge_bps": 12.0,
+            "take_profit_bps": 22.0,
+            "stop_loss_bps": 8.0,
+            "confidence": confidence,
+            "drift_score": 0.0,
+        }
+
+    def _extract_suffix(self, feature_refs: Iterable[str]) -> str:
+        for ref in feature_refs:
+            view = ref.split(":", 1)[0]
+            if "__" in view:
+                return view.split("__", 1)[1]
+            return view
+        return ""
+
+    def _view_name(self, suffix: str) -> str:
+        return f"{self._feast_client.account_namespace}__{suffix}"
 
 def _normalize_account_id(account_id: str) -> str:
     """Convert human readable admin labels into canonical keys."""
@@ -2113,6 +2294,8 @@ class RedisFeastAdapter:
         self, feast_client: FeastClient, redis_client: RedisClient
     ) -> Any:
         if FeatureStore is None:
+            if _allow_test_fallbacks():
+                return _LocalFeastStore(self.account_id, feast_client)
             raise RuntimeError(
                 "feast.FeatureStore is unavailable; install Feast to use RedisFeastAdapter"
             )
@@ -2123,6 +2306,8 @@ class RedisFeastAdapter:
             from feast.infra.online_stores.redis import RedisOnlineStoreConfig
             from feast.repo_config import RepoConfig
         except Exception as exc:  # pragma: no cover - depends on Feast install
+            if _allow_test_fallbacks():
+                return _LocalFeastStore(self.account_id, feast_client)
             raise RuntimeError("Unable to construct Feast configuration") from exc
 
         config = RepoConfig(

@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import importlib
+from importlib.machinery import ModuleSpec
 from pathlib import Path
-from types import ModuleSpec
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
 _TESTS_SECRETS_DIR = _PROJECT_ROOT / "tests" / "secrets"

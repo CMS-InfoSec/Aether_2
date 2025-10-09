@@ -72,18 +72,43 @@ def _require_account_env(account_id: str, suffix: str, *, label: str) -> str:
             f"{env_key} is set but empty; configure {label} with a redis:// or memory:// DSN."
         )
 
-    if value.lower().startswith("memory://") and "pytest" not in sys.modules:
+    if value.lower().startswith("memory://") and not _allow_test_fallbacks():
         raise RuntimeError(
             f"{env_key} must use a redis:// or rediss:// DSN outside pytest to persist {label.lower()}"
         )
     return value
 
 
+def _resolve_redis_dsn(account_id: str) -> str:
+    """Return a Redis DSN with insecure-default fallbacks for tests."""
+
+    try:
+        return _require_account_env(account_id, "REDIS_DSN", label="Redis DSN")
+    except RuntimeError as exc:
+        if not _allow_test_fallbacks():
+            raise
+        state_dir = Path(os.getenv("AETHER_STATE_DIR", ".aether_state"))
+        try:
+            state_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as mkdir_exc:  # pragma: no cover - defensive guard
+            raise RuntimeError(
+                "Redis DSN is not configured and the fallback state directory is unavailable"
+            ) from mkdir_exc
+        fallback_label = f"redis_{account_id}".replace("/", "_")
+        fallback_dsn = f"memory://{fallback_label}"
+        logger.warning(
+            "Redis DSN for account '%s' is not configured; using local memory fallback %s.",
+            account_id,
+            fallback_dsn,
+        )
+        return fallback_dsn
+
+
 @lru_cache(maxsize=None)
 def get_redis_client(account_id: str) -> RedisClient:
     """Return the configured Redis client settings for an account."""
 
-    dsn = _require_account_env(account_id, "REDIS_DSN", label="Redis DSN")
+    dsn = _resolve_redis_dsn(account_id)
     return RedisClient(dsn=dsn)
 
 
