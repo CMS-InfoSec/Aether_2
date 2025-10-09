@@ -42,9 +42,12 @@ def test_validate_risk_authorized_accounts(client: TestClient, base_payload: dic
 
     assert response.status_code == 200
     body = response.json()
-    assert set(body.keys()) == {"valid", "reasons", "fee"}
+    assert set(body.keys()) == {"valid", "reasons", "fee", "take_profit", "stop_loss"}
     assert isinstance(body["valid"], bool)
     assert isinstance(body["reasons"], list)
+    if body["valid"]:
+        assert body["take_profit"] > 0
+        assert body["stop_loss"] > 0
 
 
 def test_validate_risk_rejects_non_admin(client: TestClient, base_payload: dict[str, object]) -> None:

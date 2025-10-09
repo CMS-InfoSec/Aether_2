@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import inspect
 import os
 import sys
 import types
 
 import pytest
 from fastapi import APIRouter
+from fastapi.testclient import TestClient
 
 
 def _install_package(name: str) -> types.ModuleType:
@@ -124,6 +126,10 @@ class RedisSessionStore(SessionStoreProtocol):  # pragma: no cover - structural 
     def __init__(self, client, ttl_minutes: int = 60) -> None:
         self.client = client
         self.ttl_minutes = ttl_minutes
+        self._sessions: dict[str, object] = {}
+
+    def get(self, token: str):  # pragma: no cover - behaviour not under test
+        return self._sessions.get(token)
 
 
 def build_session_store_from_url(redis_url: str, *, ttl_minutes: int = 60) -> RedisSessionStore:
@@ -133,6 +139,16 @@ def build_session_store_from_url(redis_url: str, *, ttl_minutes: int = 60) -> Re
 class PostgresAdminRepository(AdminRepositoryProtocol):
     def __init__(self, dsn: str) -> None:  # pragma: no cover - behaviour not under test
         self.dsn = dsn
+        self._admins: dict[str, object] = {}
+
+    def add(self, admin) -> None:  # pragma: no cover - behaviour not under test
+        self._admins[getattr(admin, "email", "")] = admin
+
+    def delete(self, email: str) -> None:  # pragma: no cover - behaviour not under test
+        self._admins.pop(email, None)
+
+    def get_by_email(self, email: str):  # pragma: no cover - behaviour not under test
+        return self._admins.get(email)
 
 
 class AuthService:
@@ -194,6 +210,33 @@ def setup_alert_dedupe(app, *, alertmanager_url=None) -> None:  # pragma: no cov
 alert_dedupe_module.setup_alert_dedupe = setup_alert_dedupe  # type: ignore[attr-defined]
 _install_module("services.alerts.alert_dedupe", alert_dedupe_module)
 
+hedge_pkg = _install_package("services.hedge")
+hedge_service_module = types.ModuleType("services.hedge.hedge_service")
+
+
+class _StubHedgeService:
+    def health_status(self) -> dict[str, object]:  # pragma: no cover - simple data carrier
+        return {
+            "mode": "auto",
+            "override_active": False,
+            "history_depth": 0,
+            "last_decision_at": None,
+            "last_target_pct": None,
+            "last_guard_triggered": False,
+        }
+
+
+_stub_hedge_service = _StubHedgeService()
+
+
+def get_hedge_service() -> _StubHedgeService:  # pragma: no cover - dependency override
+    return _stub_hedge_service
+
+
+hedge_service_module.get_hedge_service = get_hedge_service  # type: ignore[attr-defined]
+hedge_service_module.router = APIRouter()
+_install_module("services.hedge.hedge_service", hedge_service_module)
+
 
 # Shared audit primitives.
 shared_pkg = _install_package("shared")
@@ -228,6 +271,35 @@ class CorrelationIdMiddleware:  # pragma: no cover - structural stub
 
 shared_correlation_module.CorrelationIdMiddleware = CorrelationIdMiddleware  # type: ignore[attr-defined]
 _install_module("shared.correlation", shared_correlation_module)
+
+shared_health_module = types.ModuleType("shared.health")
+
+
+def setup_health_checks(app, checks=None):  # pragma: no cover - behaviour exercised via tests
+    registry = dict(checks or {})
+
+    @app.get("/healthz")
+    async def _healthz():  # pragma: no cover - simple stub endpoint
+        overall = "ok"
+        results: dict[str, dict[str, object]] = {}
+        for name, check in registry.items():
+            try:
+                result = check()
+                if inspect.isawaitable(result):
+                    result = await result
+                entry: dict[str, object] = {"status": "ok"}
+                if isinstance(result, dict):
+                    entry.update(result)
+            except Exception as exc:  # pragma: no cover - defensive default
+                overall = "error"
+                entry = {"status": "error", "error": str(exc)}
+            results[name] = entry
+
+        return {"status": overall, "checks": results}
+
+
+shared_health_module.setup_health_checks = setup_health_checks  # type: ignore[attr-defined]
+_install_module("shared.health", shared_health_module)
 
 shared_session_config_module = types.ModuleType("shared.session_config")
 
@@ -265,6 +337,10 @@ class _ScalingController:
 
     async def stop(self) -> None:  # pragma: no cover - behaviour not under test
         return None
+
+    @property
+    def status(self) -> types.SimpleNamespace:  # pragma: no cover - behaviour not under test
+        return types.SimpleNamespace(oms_replicas=1, gpu_nodes=0, pending_jobs=0)
 
 
 def build_scaling_controller_from_env() -> _ScalingController:
@@ -435,4 +511,27 @@ def test_create_app_rejects_memory_session_store_outside_tests(
         RuntimeError, match="memory:// DSNs are only supported when running tests"
     ):
         app_module.create_app(admin_repository=app_module.InMemoryAdminRepository())
+
+
+def test_healthz_endpoint_reports_component_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ADMIN_POSTGRES_DSN", "postgresql://example.com/admin")
+    monkeypatch.setenv("SESSION_REDIS_URL", "redis://localhost/0")
+
+    application = app_module.create_app()
+
+    client = TestClient(application)
+    response = client.get("/healthz")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "ok"
+    checks = payload["checks"]
+    assert set(checks.keys()) == {
+        "admin_repository",
+        "session_store",
+        "scaling_controller",
+        "hedge_service",
+    }
+    assert all(entry["status"] == "ok" for entry in checks.values())
+    hedge_status = checks["hedge_service"]
+    assert hedge_status["override_active"] is False
 

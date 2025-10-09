@@ -4,7 +4,13 @@ from decimal import Decimal
 
 import pytest
 
+from decimal import Decimal
+from pathlib import Path
+
+import pytest
+
 import hedging_service as hs
+from shared import hedge_logging
 
 
 class _StubMarketData:
@@ -91,7 +97,14 @@ def test_rebalance_quantizes_buy_with_high_precision(
 
     target_allocation = service.state.current_allocation + _desired_delta(price, quantity)
 
-    service._rebalance(target_allocation, price, risk_score=2.5)
+    service._rebalance(
+        target_allocation,
+        price,
+        risk_score=2.5,
+        drawdown_pct=0.05,
+        atr=None,
+        realized_vol=None,
+    )
 
     assert len(recording_oms.orders) == 1
     order = recording_oms.orders[0]
@@ -117,7 +130,14 @@ def test_rebalance_quantizes_sell_with_high_precision(
     service.state.current_allocation += delta
     target_allocation = service.state.current_allocation - delta
 
-    service._rebalance(target_allocation, price, risk_score=3.0)
+    service._rebalance(
+        target_allocation,
+        price,
+        risk_score=3.0,
+        drawdown_pct=0.12,
+        atr=1.4,
+        realized_vol=0.3,
+    )
 
     assert len(recording_oms.orders) == 1
     order = recording_oms.orders[0]
@@ -145,6 +165,9 @@ def test_rebalance_requires_precision_metadata(
             hedging_config.base_allocation_usd + 100.0,
             price=0.065,
             risk_score=1.2,
+            drawdown_pct=0.02,
+            atr=None,
+            realized_vol=None,
         )
 
 
@@ -156,3 +179,43 @@ def test_hedge_config_normalizes_spot_symbol() -> None:
 def test_hedge_config_rejects_derivative_symbols() -> None:
     with pytest.raises(ValueError, match="spot market pair"):
         hs.HedgeConfig(account_id="acct-3", hedge_symbol="BTC-PERP")
+
+
+def test_rebalance_logs_hedge_event(
+    hedging_service: hs.HedgingService, tmp_path: Path
+) -> None:
+    service = hedging_service
+    assert isinstance(service.oms, _RecordingOMS)
+
+    class _CapturingHedgeLogger(hedge_logging.HedgeLogger):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path=path)
+            self.entries: list[hedge_logging.HedgeLogEntry] = []
+
+        def log(self, entry: hedge_logging.HedgeLogEntry) -> None:
+            self.entries.append(entry)
+            super().log(entry)
+
+    capture_logger = _CapturingHedgeLogger(tmp_path / "hedge.csv")
+
+    target_allocation = service.state.current_allocation + 2500.0
+    price = 1.001
+
+    with hedge_logging.override_hedge_logger(capture_logger):
+        service._rebalance(
+            target_allocation,
+            price,
+            risk_score=1.8,
+            drawdown_pct=0.15,
+            atr=1.1,
+            realized_vol=0.45,
+        )
+
+    assert len(capture_logger.entries) == 1
+    entry = capture_logger.entries[0]
+    assert entry.account_id == service.config.account_id
+    assert entry.symbol == service.config.hedge_symbol
+    assert entry.target_allocation == Decimal(str(target_allocation))
+    assert entry.drawdown_pct == Decimal("0.15")
+    assert entry.risk_score == Decimal("1.8")
+    assert entry.order_id and entry.order_id.startswith("HEDGE-")

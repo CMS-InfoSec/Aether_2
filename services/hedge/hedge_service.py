@@ -20,6 +20,8 @@ from typing import (
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
+from services.common.security import require_admin_account
+
 ValidatorFn = TypeVar("ValidatorFn", bound=Callable[..., Any])
 
 
@@ -305,6 +307,27 @@ class HedgeService:
     def get_last_diagnostics(self) -> Optional[HedgeDiagnostics]:
         return self._last_diagnostics
 
+    def health_status(self) -> Dict[str, object]:
+        """Return operational metadata used by service health checks."""
+
+        override = self._override
+        latest_record = self._history[0] if self._history else None
+        diagnostics = self._last_diagnostics
+
+        payload: Dict[str, object] = {
+            "mode": "override" if override else "auto",
+            "override_active": override is not None,
+            "history_depth": len(self._history),
+            "last_decision_at": latest_record.timestamp.isoformat() if latest_record else None,
+            "last_target_pct": latest_record.target_pct if latest_record else None,
+            "last_guard_triggered": bool(diagnostics.guard_triggered if diagnostics else False),
+        }
+
+        if diagnostics and diagnostics.guard_reason:
+            payload["last_guard_reason"] = diagnostics.guard_reason
+
+        return payload
+
     def _build_diagnostics(self, metrics: HedgeMetricsRequest) -> HedgeDiagnostics:
         volatility_score = self._clamp(metrics.volatility / self._volatility_reference, 0.0, 1.0)
         drawdown_score = self._clamp(metrics.drawdown, 0.0, 1.0)
@@ -399,39 +422,57 @@ async def evaluate_hedge(
 async def set_override(
     payload: HedgeOverrideRequest,
     service: HedgeService = Depends(get_hedge_service),
+    account_id: str = Depends(require_admin_account),
 ) -> Dict[str, object]:
     """Override the computed hedge target percentage."""
 
+    del account_id  # Guard is enforced via dependency injection.
     override = service.set_override(target_pct=payload.target_pct, reason=payload.reason)
     return override.as_dict()
 
 
 @_router_delete("/override", status_code=status.HTTP_204_NO_CONTENT)
-async def clear_override(service: HedgeService = Depends(get_hedge_service)) -> None:
+async def clear_override(
+    service: HedgeService = Depends(get_hedge_service),
+    account_id: str = Depends(require_admin_account),
+) -> None:
     """Clear the active hedge override."""
 
+    del account_id
     service.clear_override()
 
 
 @_router_get("/override", response_model=Optional[Dict[str, object]])
-async def get_override(service: HedgeService = Depends(get_hedge_service)) -> Optional[Dict[str, object]]:
+async def get_override(
+    service: HedgeService = Depends(get_hedge_service),
+    account_id: str = Depends(require_admin_account),
+) -> Optional[Dict[str, object]]:
     """Return the active hedge override if present."""
 
+    del account_id
     override = service.get_override()
     return override.as_dict() if override else None
 
 
 @_router_get("/history", response_model=List[HedgeHistoryResponse])
-async def get_history(service: HedgeService = Depends(get_hedge_service)) -> List[Dict[str, object]]:
+async def get_history(
+    service: HedgeService = Depends(get_hedge_service),
+    account_id: str = Depends(require_admin_account),
+) -> List[Dict[str, object]]:
     """Return hedge history records with diagnostics."""
 
+    del account_id
     return [record.as_dict() for record in service.get_history()]
 
 
 @_router_get("/diagnostics", response_model=Optional[Dict[str, object]])
-async def get_last_diagnostics(service: HedgeService = Depends(get_hedge_service)) -> Optional[Dict[str, object]]:
+async def get_last_diagnostics(
+    service: HedgeService = Depends(get_hedge_service),
+    account_id: str = Depends(require_admin_account),
+) -> Optional[Dict[str, object]]:
     """Return the latest hedge diagnostics snapshot."""
 
+    del account_id
     diagnostics = service.get_last_diagnostics()
     return diagnostics.as_dict() if diagnostics else None
 
