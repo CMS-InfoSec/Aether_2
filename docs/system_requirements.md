@@ -160,4 +160,50 @@ current hedge allocation and drawdown posture for each account.
 Risk validation now derives take-profit and stop-loss trigger prices automatically using
 policy-provided basis-point targets with volatility fallbacks so every approved order
 includes protective exit levels without manual configuration.
+Drawdown protection now honours the capital allocator's maximum drawdown ratio; when an
+account breaches the configured `CAPITAL_ALLOCATOR_MAX_DRAWDOWN` threshold, risk
+validation halts new trades and records a zero-quantity adjustment until losses recover.
+Risk validation also queries the exchange adapter for live USD cash balances and blocks
+buy orders that would exceed the available funds, ensuring the balance awareness
+requirement is enforced before approvals are issued.
+When evaluating buy orders the risk service now reserves additional USD to cover the
+expected Kraken trading fee, so requests must provide enough balance for both notional
+and fees to satisfy the fee awareness requirement before an approval is returned.
+Risk validation also scales position sizes against each account's NAV ceiling and any
+configured target volatility, deriving a `max_position` allowance per trade so buys are
+auto-sized according to the balance and prevailing volatility profile while sells are
+permitted to reduce exposure. Exposure caps are enforced through both per-instrument
+cluster limits and correlation-aware portfolio checks; projected cluster ratios and
+weighted correlation are compared to configured thresholds and trades are trimmed or
+blocked when the added exposure would breach diversification constraints.
+Risk validation also exposes a `/healthz` endpoint that checks Timescale connectivity,
+the capital allocator API, and the trading universe service so production monitoring can
+alert on dependency regressions immediately.
+The shared Prometheus metrics helpers register a `/metrics` endpoint for each FastAPI
+service via `setup_metrics`, surfacing request tracing, trade rejection counters, and
+OMS health gauges so the operations stack satisfies the observability requirement.
+
+Daily operations reporting now enriches the exported CSV with `starting_nav`,
+`ending_nav`, and `daily_return_pct` columns so each account's profit and loss percentage
+is tracked alongside absolute gains, satisfying the daily PnL reporting requirement.
+
+Order management now journals every executed fill with timestamp, quantity, execution
+price, and realized PnL in the trade log so governance reviews receive complete trade
+records, satisfying the trade logging requirement.
+
+The Kraken spot exchange adapter now translates OMS rate limits, network timeouts,
+and validation errors into explicit exceptions so the trading pipeline can retry,
+defer, or surface actionable feedback without crashing, satisfying the API safety
+requirement for handling upstream failures gracefully.
+
+Manual hedge overrides exposed via the admin platform now require an authenticated
+administrator session before applying or clearing operator-specified targets. This
+enforces that only director roles can adjust manual hedge percentages and view the
+override diagnostics, fulfilling the hedge manual override and admin role access
+requirements for the Builder.io Fusion UI.
+
+The admin platform's `/healthz` endpoint now surfaces hedge-service readiness, including
+override activity, recent decision timestamps, and guard triggers so operations can
+confirm the hedging controls are online. This satisfies the requirement for dedicated
+service health probes across the deployment.
 

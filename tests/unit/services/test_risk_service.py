@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import sys
+import types
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Iterator
+from typing import Any, Dict, Iterator, Mapping
 
 import pytest
 
@@ -231,3 +232,96 @@ def test_risk_limits_filters_non_spot_whitelist(risk_client: TestClient) -> None
     assert response.status_code == 200
     whitelist = response.json()["limits"]["instrument_whitelist"]
     assert whitelist == ["BTC-USD", "ETH-USD"]
+
+
+def test_risk_validation_blocks_when_available_cash_insufficient(
+    risk_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = _base_request()
+    payload["intent"]["quantity"] = 5.0
+    payload["intent"]["price"] = 1000.0
+    payload["portfolio_state"]["notional_exposure"] = 0.0
+    payload["portfolio_state"]["available_cash"] = 250.0
+
+    class _BalanceStub:
+        name = "stub"
+
+        def supports(self, operation: str) -> bool:
+            return operation == "get_balance"
+
+        async def get_balance(self, account_id: str) -> Mapping[str, Any]:
+            assert account_id == payload["account_id"]
+            return {
+                "net_asset_value": 10_000.0,
+                "balances": {"USD": 250.0},
+            }
+
+    monkeypatch.setattr(risk_module, "EXCHANGE_ADAPTER", _BalanceStub())
+
+    with override_admin_auth(
+        risk_client.app, require_admin_account, payload["account_id"]
+    ) as headers:
+        response = risk_client.post(
+            "/risk/validate",
+            json=payload,
+            headers={**headers, "X-Account-ID": payload["account_id"]},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["pass"] is False
+    assert any(
+        reason.startswith("Insufficient available USD balance") for reason in body["reasons"]
+    )
+    fee_ratio = getattr(risk_module, "_DEFAULT_TAKER_FEE_BPS") / 10_000.0
+    expected_qty = payload["portfolio_state"]["available_cash"] / (
+        payload["intent"]["price"] * (1.0 + fee_ratio)
+    )
+    assert body["adjusted_qty"] == pytest.approx(expected_qty)
+
+
+def test_risk_validation_reserves_fee_budget_when_cash_equals_notional(
+    risk_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = _base_request()
+    payload["intent"]["quantity"] = 1.0
+    payload["intent"]["price"] = 100.0
+    payload["portfolio_state"]["notional_exposure"] = 0.0
+    payload["portfolio_state"]["available_cash"] = 100.0
+
+    async def _stub_sizing(*args: Any, **kwargs: Any) -> Any:
+        return types.SimpleNamespace(
+            max_position=1_000_000.0,
+            volatility=0.2,
+            nav=payload["portfolio_state"]["net_asset_value"],
+            fee_bps_estimate=None,
+        )
+
+    monkeypatch.setattr(
+        risk_module.PositionSizer,
+        "suggest_max_position",
+        _stub_sizing,
+    )
+
+    with override_admin_auth(
+        risk_client.app, require_admin_account, payload["account_id"]
+    ) as headers:
+        response = risk_client.post(
+            "/risk/validate",
+            json=payload,
+            headers={**headers, "X-Account-ID": payload["account_id"]},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["pass"] is False
+    assert any(
+        reason.startswith("Insufficient available USD balance") for reason in body["reasons"]
+    )
+    assert body["adjusted_qty"] is not None
+    fee_ratio = getattr(risk_module, "_DEFAULT_TAKER_FEE_BPS") / 10_000.0
+    expected_quantity = payload["portfolio_state"]["available_cash"] / (
+        payload["intent"]["price"] * (1.0 + fee_ratio)
+    )
+    assert body["adjusted_qty"] == pytest.approx(expected_quantity)
+    assert body["adjusted_qty"] < payload["intent"]["quantity"]

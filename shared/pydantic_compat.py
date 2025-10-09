@@ -21,7 +21,7 @@ if TYPE_CHECKING:  # pragma: no cover - used for static analysis only
         ...
 else:  # pragma: no cover - runtime fallback when Pydantic is optional
     try:
-        from pydantic import BaseModel as BaseModel  # type: ignore[assignment]
+        from pydantic import BaseModel as _PydanticBaseModel  # type: ignore[assignment]
     except Exception:
         class BaseModel(_BaseModelProtocol):  # type: ignore[too-many-ancestors]
             """Minimal runtime stand-in replicating attribute assignment."""
@@ -38,6 +38,34 @@ else:  # pragma: no cover - runtime fallback when Pydantic is optional
 
             def model_dump(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
                 return self.dict(*args, **kwargs)
+
+    else:
+
+        import inspect
+
+        class BaseModel(_PydanticBaseModel):  # type: ignore[too-many-ancestors]
+            """Compatibility wrapper adding Pydantic v1 ``model_dump`` semantics."""
+
+            def model_dump(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+                mode = kwargs.pop("mode", None)
+                dump_attr = getattr(_PydanticBaseModel, "model_dump", None)
+                if dump_attr is not None:
+                    accepts_mode = "mode" in inspect.signature(dump_attr).parameters
+                    call_kwargs = dict(kwargs)
+                    if accepts_mode and mode is not None:
+                        call_kwargs["mode"] = mode
+                    result = super().model_dump(*args, **call_kwargs)  # type: ignore[misc]
+                    if not accepts_mode and mode not in (None, "json"):
+                        raise TypeError(
+                            "model_dump mode must be 'json' when using Pydantic v1 compatibility layer"
+                        )
+                    return result
+
+                if mode not in (None, "json"):
+                    raise TypeError(
+                        "model_dump mode must be 'json' when using Pydantic v1 compatibility layer"
+                    )
+                return super().dict(*args, **kwargs)
 
 
 _FnT = TypeVar("_FnT", bound=Callable[..., Any])
@@ -120,3 +148,20 @@ __all__ = [
     "model_validator",
     "model_serializer",
 ]
+
+
+def model_dump(instance: _BaseModelProtocol, **kwargs: Any) -> Dict[str, Any]:
+    """Return a mapping representation for *instance* using modern semantics."""
+
+    dump = getattr(instance, "model_dump", None)
+    if callable(dump):
+        try:
+            return dump(**kwargs)
+        except TypeError:
+            clean_kwargs = {key: value for key, value in kwargs.items() if key != "by_alias"}
+            return dump(**clean_kwargs)
+    clean_kwargs = {key: value for key, value in kwargs.items() if key != "by_alias"}
+    return instance.dict(**clean_kwargs)
+
+
+__all__.append("model_dump")
