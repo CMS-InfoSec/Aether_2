@@ -1,12 +1,14 @@
 """Reinforcement learning trainers with fee-aware rewards."""
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 from statistics import StatisticsError, fmean
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol, Tuple
 
 from ml.experiment_tracking.mlflow_utils import MLFlowExperiment
+from ml.insecure_defaults import insecure_defaults_enabled, state_file
 
 from .base import MissingDependencyError, TrainingResult, UncertaintyGate, fee_aware_reward, require_numpy
 
@@ -78,7 +80,7 @@ class RLTrainer:
             LOGGER.warning(
                 "stable-baselines3 is not installed. Falling back to a naive policy gradient."
             )
-            return self._policy_gradient(env, total_timesteps, **kwargs)
+            return self._fallback_policy(env, total_timesteps, **kwargs)
 
         algo_cls = {
             "ppo": PPO,
@@ -95,15 +97,28 @@ class RLTrainer:
         LOGGER.info("Trained %s agent for %d timesteps", self.algorithm.upper(), total_timesteps)
         return model
 
-    def _policy_gradient(self, env: Environment, total_timesteps: int, **kwargs: Any) -> Any:
-        """Fallback REINFORCE-style policy gradient."""
+    def _fallback_policy(self, env: Environment, total_timesteps: int, **kwargs: Any) -> Any:
+        """Fallback training path when stable-baselines3 or torch are unavailable."""
 
         try:
             import torch
             import torch.nn as nn
             import torch.optim as optim
         except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency.
-            raise MissingDependencyError("torch is required for fallback policy gradient training") from exc
+            if not insecure_defaults_enabled():
+                raise MissingDependencyError(
+                    "torch is required for fallback policy gradient training"
+                ) from exc
+
+            action_dim = getattr(env.action_space, "shape", (1,))[0]
+            policy = _ZeroPolicy(action_dim)
+            self._model = policy
+            self._log_params({"algorithm": self.algorithm, "total_timesteps": total_timesteps})
+            self._record_stub_training(total_timesteps, **kwargs)
+            LOGGER.info(
+                "Trained deterministic zero policy because torch is unavailable and insecure defaults are enabled"
+            )
+            return policy
 
         obs_dim = env.observation_space.shape[0]
         act_dim = env.action_space.shape[0]
@@ -166,6 +181,8 @@ class RLTrainer:
     def predict(self, obs: "np.ndarray") -> "np.ndarray":
         if self._model is None:
             raise RuntimeError("Model has not been trained yet")
+        if isinstance(self._model, _ZeroPolicy):
+            return self._model.predict(obs)
         if hasattr(self._model, "predict"):
             action, _ = self._model.predict(obs, deterministic=True)
             return action
@@ -182,6 +199,16 @@ class RLTrainer:
     def save(self, path: str) -> None:
         if self._model is None:
             raise RuntimeError("Model has not been trained yet")
+        if isinstance(self._model, _ZeroPolicy):
+            payload = {"algorithm": self.algorithm, "policy": "zero", "action_dim": self._model.action_dim}
+            state_file_path = state_file("rl", f"{self.algorithm}_policy.json")
+            state_file_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+            LOGGER.info("Saved deterministic fallback policy to %s", path)
+            if self.experiment:
+                self.experiment.log_artifact(path)
+            return
         if hasattr(self._model, "save"):
             self._model.save(path)
         else:
@@ -199,7 +226,36 @@ class RLTrainer:
         if self.experiment:
             self.experiment.log_params(params)
 
+    def _record_stub_training(self, total_timesteps: int, **kwargs: Any) -> None:
+        """Persist metadata for stubbed training runs."""
+
+        log_path = state_file("rl", f"{self.algorithm}_training.jsonl")
+        record = {
+            "algorithm": self.algorithm,
+            "total_timesteps": total_timesteps,
+            "kwargs": {k: v for k, v in kwargs.items() if isinstance(v, (int, float, str, bool))},
+        }
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
+        LOGGER.debug("Recorded stub training metadata at %s", log_path)
+
     def _log_metrics(self, metrics: Dict[str, float]) -> None:
         if self.experiment:
             for key, value in metrics.items():
                 self.experiment.log_metric(key, value)
+
+
+class _ZeroPolicy:
+    """Deterministic policy used when deep-learning dependencies are absent."""
+
+    def __init__(self, action_dim: int) -> None:
+        self.action_dim = max(1, action_dim)
+
+    def predict(self, obs: "np.ndarray") -> "np.ndarray":
+        try:
+            require_numpy()
+        except MissingDependencyError:
+            return [0.0] * self.action_dim  # type: ignore[return-value]
+        import numpy as np  # type: ignore import-not-found
+
+        return np.zeros(self.action_dim, dtype=float)
