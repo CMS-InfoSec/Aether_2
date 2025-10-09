@@ -233,13 +233,41 @@ class _HeaderMapping(MutableMapping[str, Any]):
 class Request:
     """Bare-minimum representation of a request object."""
 
-    def __init__(self, headers: Optional[Dict[str, Any]] = None) -> None:
-        self.headers = _HeaderMapping(headers or {})
-        self.state = SimpleNamespace()
-        self.app: "FastAPI | None" = None
-        self.query_params: Dict[str, Any] = {}
-        self.path_params: Dict[str, Any] = {}
+    def __init__(
+        self,
+        data: Optional[Dict[str, Any]] = None,
+        receive: Any | None = None,
+        **kwargs: Any,
+    ) -> None:
+        headers_override = kwargs.pop("headers", None)
+        scope = data or {}
+        headers_map: Dict[str, Any] = {}
+        if headers_override is not None:
+            if isinstance(headers_override, Mapping):
+                headers_source = headers_override.items()
+            else:
+                headers_source = headers_override
+        elif isinstance(scope, dict) and "headers" in scope:
+            headers_source = scope.get("headers", []) or []
+        else:
+            headers_source = []
+
+        for key, value in headers_source:
+            if isinstance(key, bytes):
+                key = key.decode("latin-1")
+            if isinstance(value, bytes):
+                value = value.decode("latin-1")
+            headers_map[str(key)] = value
+
+        self.headers = _HeaderMapping(headers_map)
+        app = scope.get("app") if isinstance(scope, dict) else None
+        self.app = app
+        self.state = getattr(app, "state", SimpleNamespace())
+        self.query_params: Dict[str, Any] = scope.get("query_params", {}) if isinstance(scope, dict) else {}
+        self.path_params: Dict[str, Any] = scope.get("path_params", {}) if isinstance(scope, dict) else {}
         self.client = SimpleNamespace(host=None, port=None)
+        self._scope = scope
+        self._receive = receive
 
 
 class Response:
@@ -790,6 +818,10 @@ class _ClientResponse:
                 raise ValueError("Response payload is not valid JSON") from exc
         return self._payload
 
+    def raise_for_status(self) -> None:
+        if 400 <= int(self.status_code):
+            raise RuntimeError(f"HTTP {self.status_code}: {self.text or self._payload}")
+
 
 class TestClient:
     """Extremely small synchronous facade over the stub FastAPI application."""
@@ -1079,11 +1111,14 @@ def _run_async(coro: Any) -> Any:
     if not asyncio.iscoroutine(coro):
         return coro
     try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
         return asyncio.run(coro)
-    else:
-        return loop.run_until_complete(coro)  # pragma: no cover - defensive fallback
+    except RuntimeError:
+        new_loop = asyncio.new_event_loop()
+        try:
+            return new_loop.run_until_complete(coro)
+        finally:
+            new_loop.run_until_complete(new_loop.shutdown_asyncgens())
+            new_loop.close()
 
 
 def _install_fastapi_module() -> None:
