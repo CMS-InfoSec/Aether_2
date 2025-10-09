@@ -14,7 +14,7 @@ depends_on = None
 def upgrade() -> None:
     op.create_table(
         "sim_mode_state",
-        sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
+        sa.Column("account_id", sa.String(length=128), primary_key=True),
         sa.Column("active", sa.Boolean(), nullable=False, server_default=sa.text("false")),
         sa.Column("reason", sa.Text(), nullable=True),
         sa.Column(
