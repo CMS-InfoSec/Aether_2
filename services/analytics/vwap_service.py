@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from statistics import pstdev
+from typing import TYPE_CHECKING, Any, Callable, TypeVar, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -170,18 +171,20 @@ class VWAPAnalyticsService:
             candidate = raw.strip()
             if not candidate:
                 continue
-            return normalize_sqlalchemy_dsn(
+            normalized_candidate: str = normalize_sqlalchemy_dsn(
                 candidate,
                 allow_sqlite=allow_sqlite,
                 label=label,
             )
+            return normalized_candidate
 
         if allow_sqlite:
-            return normalize_sqlalchemy_dsn(
+            normalized_sqlite: str = normalize_sqlalchemy_dsn(
                 _SQLITE_FALLBACK,
                 allow_sqlite=True,
                 label=label,
             )
+            return normalized_sqlite
 
         raise RuntimeError(
             "VWAP analytics database DSN is not configured. Set VWAP_DATABASE_URL "
@@ -194,7 +197,8 @@ class VWAPAnalyticsService:
             return None
         label = "VWAP schema"
         if requested:
-            return normalize_postgres_schema(requested, label=label)
+            requested_schema: str = normalize_postgres_schema(requested, label=label)
+            return requested_schema
         for key in ("VWAP_SCHEMA", "TIMESCALE_SCHEMA"):
             raw = os.getenv(key)
             if raw is None:
@@ -202,7 +206,8 @@ class VWAPAnalyticsService:
             candidate = raw.strip()
             if not candidate:
                 continue
-            return normalize_postgres_schema(candidate, label=label)
+            env_schema: str = normalize_postgres_schema(candidate, label=label)
+            return env_schema
         return "public"
 
     def compute(self, symbol: str) -> VWAPDivergenceResponse:
@@ -338,6 +343,15 @@ def _to_float(value: float | int | Decimal | None) -> float:
 
 router = APIRouter(prefix="/vwap", tags=["analytics"])
 
+RouteFn = TypeVar("RouteFn", bound=Callable[..., Any])
+
+
+def _router_get(path: str, **kwargs: Any) -> Callable[[RouteFn], RouteFn]:
+    """Typed wrapper around ``router.get`` preserving endpoint signatures."""
+
+    decorator = router.get(path, **kwargs)
+    return cast(Callable[[RouteFn], RouteFn], decorator)
+
 
 @lru_cache(maxsize=1)
 def get_service() -> VWAPAnalyticsService:
@@ -346,7 +360,7 @@ def get_service() -> VWAPAnalyticsService:
     return VWAPAnalyticsService()
 
 
-@router.get("/divergence", response_model=VWAPDivergenceResponse)
+@_router_get("/divergence", response_model=VWAPDivergenceResponse)
 def vwap_divergence(
     *,
     symbol: str = Query(..., description="Symbol to compute VWAP divergence for"),

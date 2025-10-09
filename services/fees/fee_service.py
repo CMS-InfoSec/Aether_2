@@ -3,20 +3,22 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Generator
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Any, Iterator, List, Sequence, Tuple
+from typing import Any, Callable, TypeVar, TypedDict, cast
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
-from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.sql.schema import Table
 
 from services.common.security import require_admin_account
 from services.common.spot import require_spot_http
 from services.fees.fee_optimizer import FeeOptimizer
 from services.fees.models import AccountFill, AccountVolume30d, Base, FeeTier
+from shared.pydantic_compat import BaseModel, Field
 
 POLICY_SERVICE_URL = os.getenv("POLICY_SERVICE_URL", "http://policy-service")
 POLICY_VOLUME_SIGNAL_PATH = os.getenv(
@@ -99,7 +101,13 @@ def _engine_options() -> dict[str, Any]:
 
 DATABASE_URL = _database_url()
 ENGINE: Engine = create_engine(DATABASE_URL, **_engine_options())
-SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
+SessionLocal = sessionmaker(
+    bind=ENGINE,
+    class_=Session,
+    autoflush=False,
+    expire_on_commit=False,
+    future=True,
+)
 
 
 app = FastAPI(title="Fee Schedule Service")
@@ -107,8 +115,29 @@ app = FastAPI(title="Fee Schedule Service")
 
 logger = logging.getLogger(__name__)
 
+RouteFn = TypeVar("RouteFn", bound=Callable[..., Any])
 
-DEFAULT_KRAKEN_SCHEDULE: Sequence[dict[str, Decimal | str]] = (
+
+def _app_get(*args: Any, **kwargs: Any) -> Callable[[RouteFn], RouteFn]:
+    """Typed wrapper around :meth:`FastAPI.get` for strict type checking."""
+
+    return cast(Callable[[RouteFn], RouteFn], app.get(*args, **kwargs))
+
+
+def _app_on_event(event: str) -> Callable[[RouteFn], RouteFn]:
+    """Typed wrapper around :meth:`FastAPI.on_event` for strict type checking."""
+
+    return cast(Callable[[RouteFn], RouteFn], app.on_event(event))
+
+
+class _ScheduleEntry(TypedDict):
+    tier_id: str
+    threshold: Decimal
+    maker: Decimal
+    taker: Decimal
+
+
+DEFAULT_KRAKEN_SCHEDULE: tuple[_ScheduleEntry, ...] = (
     {"tier_id": "tier_0", "threshold": Decimal("0"), "maker": Decimal("16"), "taker": Decimal("26")},
     {"tier_id": "tier_1", "threshold": Decimal("10000"), "maker": Decimal("14"), "taker": Decimal("24")},
     {"tier_id": "tier_2", "threshold": Decimal("50000"), "maker": Decimal("12"), "taker": Decimal("22")},
@@ -143,14 +172,17 @@ def _seed_schedule(session: Session) -> None:
     session.commit()
 
 
-@app.on_event("startup")
+ACCOUNT_FILL_TABLE: Table = AccountFill.__table__
+
+
+@_app_on_event("startup")
 def _on_startup() -> None:
     Base.metadata.create_all(bind=ENGINE)
     with SessionLocal() as session:
         _seed_schedule(session)
 
 
-def get_session() -> Iterator[Session]:
+def get_session() -> Generator[Session, None, None]:
     session = SessionLocal()
     try:
         yield session
@@ -250,7 +282,7 @@ def _account_volume_snapshot(
 ) -> tuple[Decimal, datetime, AccountVolume30d | None]:
     """Return the stored rolling volume snapshot, falling back to raw fills."""
 
-    record = session.get(AccountVolume30d, account_id)
+    record = cast(AccountVolume30d | None, session.get(AccountVolume30d, account_id))
     if record is not None and record.updated_at is not None:
         return _to_decimal(record.notional_usd_30d or 0), record.updated_at, record
 
@@ -343,7 +375,7 @@ def _maybe_alert_fee_drift(
     )
 
 
-def _rolling_window(as_of: datetime | None = None) -> Tuple[datetime, datetime]:
+def _rolling_window(as_of: datetime | None = None) -> tuple[datetime, datetime]:
     now = as_of or datetime.now(timezone.utc)
     start = now - timedelta(days=30)
     return start, now
@@ -351,7 +383,7 @@ def _rolling_window(as_of: datetime | None = None) -> Tuple[datetime, datetime]:
 
 def _rolling_volume(
     session: Session, account_id: str, as_of: datetime | None = None
-) -> Tuple[Decimal, datetime]:
+) -> tuple[Decimal, datetime]:
     window_start, window_end = _rolling_window(as_of)
     stmt = (
         select(
@@ -393,7 +425,7 @@ def _realized_fee_bps(session: Session, account_id: str, as_of: datetime | None 
     return Decimal("0")
 
 
-@app.get("/fees/effective", response_model=EffectiveFeeResponse)
+@_app_get("/fees/effective", response_model=EffectiveFeeResponse)
 def get_effective_fee(
     pair: str = Query(..., description="Trading pair symbol", min_length=3, max_length=32),
     liquidity: str = Query(..., description="Requested liquidity side", pattern=r"(?i)^(maker|taker)$"),
@@ -429,11 +461,11 @@ def get_effective_fee(
     )
 
 
-@app.get("/fees/tiers", response_model=List[FeeTierSchema])
+@_app_get("/fees/tiers", response_model=list[FeeTierSchema])
 def get_fee_tiers(
     session: Session = Depends(get_session),
-    _: str = Depends(require_admin_account),
-) -> List[FeeTierSchema]:
+    _admin_account: str = Depends(require_admin_account),
+) -> list[FeeTierSchema]:
     tiers = _ordered_tiers(session)
     if not tiers:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Fee schedule is not configured")
@@ -450,7 +482,7 @@ def get_fee_tiers(
     ]
 
 
-@app.get("/fees/volume30d", response_model=Volume30dResponse)
+@_app_get("/fees/volume30d", response_model=Volume30dResponse)
 def get_volume_30d(
     session: Session = Depends(get_session),
     account_id: str = Depends(require_admin_account),
@@ -462,7 +494,7 @@ def get_volume_30d(
     )
 
 
-@app.get("/fees/estimate", response_model=FeeEstimateResponse)
+@_app_get("/fees/estimate", response_model=FeeEstimateResponse)
 def get_fee_estimate(
     account_id: str = Query(..., min_length=1, max_length=64, description="Account identifier"),
     symbol: str = Query(..., min_length=3, max_length=32, description="Trading pair symbol"),
@@ -471,7 +503,7 @@ def get_fee_estimate(
         ..., min_length=3, max_length=32, description="Order type (e.g. limit, market, post_only)"
     ),
     session: Session = Depends(get_session),
-    _: str = Depends(require_admin_account),
+    _admin_account: str = Depends(require_admin_account),
 ) -> FeeEstimateResponse:
     symbol_key = require_spot_http(symbol)
 
@@ -512,11 +544,11 @@ def get_fee_estimate(
     )
 
 
-@app.get("/fees/account_summary", response_model=AccountSummaryResponse)
+@_app_get("/fees/account_summary", response_model=AccountSummaryResponse)
 def get_account_summary(
     account_id: str = Query(..., min_length=1, max_length=64, description="Account identifier"),
     session: Session = Depends(get_session),
-    _: str = Depends(require_admin_account),
+    _admin_account: str = Depends(require_admin_account),
 ) -> AccountSummaryResponse:
     tiers = _ordered_tiers(session)
     if not tiers:
@@ -538,20 +570,20 @@ def get_account_summary(
     )
 
 
-@app.get("/fees/next_tier_status", response_model=NextTierStatusResponse)
+@_app_get("/fees/next_tier_status", response_model=NextTierStatusResponse)
 def get_next_tier_status(
     session: Session = Depends(get_session),
     account_id: str = Depends(require_admin_account),
 ) -> NextTierStatusResponse:
     try:
-        status = optimizer.status_for_account(session, account_id)
+        tier_status = optimizer.status_for_account(session, account_id)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
     return NextTierStatusResponse(
-        current_tier=status.current_tier.tier_id,
-        next_tier=status.next_tier.tier_id if status.next_tier is not None else None,
-        progress_pct=float(status.progress_pct),
+        current_tier=tier_status.current_tier.tier_id,
+        next_tier=tier_status.next_tier.tier_id if tier_status.next_tier is not None else None,
+        progress_pct=float(tier_status.progress_pct),
     )
 
 
@@ -595,15 +627,14 @@ def update_account_volume_30d(
 
     prune_before = timestamp - timedelta(days=60)
     session.execute(
-        AccountFill.__table__
-        .delete()
-        .where(AccountFill.__table__.c.account_id == account_id)
-        .where(AccountFill.__table__.c.fill_ts < prune_before)
+        ACCOUNT_FILL_TABLE.delete()
+        .where(ACCOUNT_FILL_TABLE.c.account_id == account_id)
+        .where(ACCOUNT_FILL_TABLE.c.fill_ts < prune_before)
     )
 
     rolling_volume, basis_ts = _rolling_volume(session, account_id, timestamp)
 
-    record = session.get(AccountVolume30d, account_id)
+    record = cast(AccountVolume30d | None, session.get(AccountVolume30d, account_id))
     existing_maker_estimate = (
         Decimal(record.maker_fee_bps_estimate)
         if record is not None and record.maker_fee_bps_estimate is not None

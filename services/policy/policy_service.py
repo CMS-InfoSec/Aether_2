@@ -8,17 +8,147 @@ import sys
 import threading
 import time
 from dataclasses import asdict, is_dataclass
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
+from importlib import import_module
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    TypeVar,
+    Union,
+    cast,
+)
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from auth.service import build_session_store_from_url, SessionStoreProtocol
 from shared.session_config import load_session_ttl_minutes
-from pydantic import BaseModel, Field, field_validator
+from metrics import (
+    metric_context,
+    observe_policy_inference_latency,
+    record_abstention_rate,
+    record_drift_score,
+    setup_metrics,
+    traced_span,
+)
+from services.common import security
+from services.common.security import ADMIN_ACCOUNTS, require_admin_account
+from services.policy.trade_intensity_controller import (
+    controller as trade_intensity_controller,
+)
+from services.common.spot import require_spot_http
+from shared.spot import require_spot_symbol
 
-try:  # pragma: no cover - optional dependency
-    from . import models
-except ImportError:  # pragma: no cover - the inference module is optional at runtime
-    models = None
+class FeeTierAdapter(Protocol):
+    """Protocol describing the fee tier adapter interface used by the service."""
+
+    def fee_tiers(self, symbol: str) -> Sequence[Mapping[str, float]]:  # pragma: no cover - protocol
+        ...
+
+
+class FeeTierAdapterFactory(Protocol):
+    """Factory returning an adapter capable of fetching fee tiers."""
+
+    def __call__(self, *, account_id: str) -> FeeTierAdapter:  # pragma: no cover - protocol
+        ...
+
+
+class ImpactStoreProtocol(Protocol):
+    """Protocol covering the impact store dependency used for slippage."""
+
+    def impact_curve(
+        self,
+        *,
+        account_id: str,
+        symbol: str,
+    ) -> Awaitable[Sequence[Mapping[str, float]]]:  # pragma: no cover - protocol
+        ...
+
+
+class PolicyModelModule(Protocol):
+    """Protocol describing the optional policy inference module."""
+
+    def predict_intent(
+        self,
+        *,
+        account_id: str,
+        symbol: str,
+        features: Optional[Union[List[Any], Dict[str, Any]]],
+        book_snapshot: Mapping[str, Any] | Sequence[Mapping[str, Any]] | None,
+        account_state: Mapping[str, Any] | None,
+    ) -> Any:  # pragma: no cover - protocol
+        ...
+
+if TYPE_CHECKING:  # pragma: no cover - type checking stubs for optional dependency
+    class BaseModel:  # noqa: D401 - lightweight stub for mypy
+        model_config: Dict[str, Any] = {}
+
+        def __init__(self, **data: Any) -> None: ...
+
+        @classmethod
+        def model_validate(cls, obj: Any) -> "BaseModel": ...
+
+        def model_dump(self, *args: Any, **kwargs: Any) -> Dict[str, Any]: ...
+
+    def Field(default: Any = None, **kwargs: Any) -> Any: ...
+
+    ValidatorFn = TypeVar("ValidatorFn", bound=Callable[..., Any])
+
+    def field_validator(*_fields: str, **__kwargs: Any) -> Callable[[ValidatorFn], ValidatorFn]: ...
+else:  # pragma: no cover - runtime import with graceful degradation
+    try:
+        from pydantic import BaseModel, Field, field_validator
+    except ImportError:
+
+        class BaseModel:  # minimal runtime fallback for optional dependency
+            model_config: Dict[str, Any] = {}
+
+            def __init__(self, **data: Any) -> None:
+                for key, value in data.items():
+                    setattr(self, key, value)
+
+            @classmethod
+            def model_validate(cls, obj: Any) -> "BaseModel":
+                if isinstance(obj, cls):
+                    return obj
+                if isinstance(obj, Mapping):
+                    return cls(**obj)
+                raise TypeError("Object is not compatible with the model.")
+
+            def model_dump(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:  # noqa: D401
+                del args, kwargs
+                return dict(self.__dict__)
+
+        def Field(default: Any = None, **kwargs: Any) -> Any:
+            default_factory = kwargs.get("default_factory")
+            if callable(default_factory):
+                return default_factory()
+            return default
+
+        ValidatorFn = TypeVar("ValidatorFn", bound=Callable[..., Any])
+
+        def field_validator(*_fields: str, **__kwargs: Any) -> Callable[[ValidatorFn], ValidatorFn]:
+            def decorator(func: ValidatorFn) -> ValidatorFn:
+                return func
+
+            return decorator
+
+ModelsModule = Optional[PolicyModelModule]
+MODELS: ModelsModule
+
+if TYPE_CHECKING:  # pragma: no cover - mypy fallback when models are unavailable
+    MODELS = None
+else:  # pragma: no cover - optional runtime import
+    try:
+        _loaded_models = import_module("services.policy.models")
+    except ModuleNotFoundError:
+        _loaded_models = None
+    MODELS = cast(ModelsModule, _loaded_models)
 
 
 SAFETY_MARGIN_BPS = 1.0
@@ -40,12 +170,13 @@ class FeeServiceClient:
     def __init__(
         self,
         *,
-        adapter_factory: type["TimescaleAdapter"] | None = None,
+        adapter_factory: FeeTierAdapterFactory | None = None,
         cache_ttl_seconds: float = _DEFAULT_CACHE_TTL_SECONDS,
     ) -> None:
         from services.common.adapters import TimescaleAdapter  # local import to avoid cycles
 
-        self._adapter_factory: type[TimescaleAdapter] = adapter_factory or TimescaleAdapter
+        adapter = cast(FeeTierAdapterFactory, adapter_factory or TimescaleAdapter)
+        self._adapter_factory: FeeTierAdapterFactory = adapter
         self._cache_ttl = max(1.0, float(cache_ttl_seconds))
         self._cache: Dict[tuple[str, str], tuple[float, List[Dict[str, float]]]] = {}
         self._lock = threading.Lock()
@@ -131,13 +262,13 @@ class SlippageEstimator:
     def __init__(
         self,
         *,
-        impact_store: Any | None = None,
+        impact_store: ImpactStoreProtocol | None = None,
         cache_ttl_seconds: float = _DEFAULT_CACHE_TTL_SECONDS,
         async_timeout: float = _DEFAULT_ASYNC_TIMEOUT,
     ) -> None:
         from services.oms.impact_store import impact_store as default_store  # lazy import
 
-        self._impact_store = impact_store or default_store
+        self._impact_store: ImpactStoreProtocol = cast(ImpactStoreProtocol, impact_store or default_store)
         self._cache_ttl = max(1.0, float(cache_ttl_seconds))
         self._async_timeout = max(0.1, float(async_timeout))
         self._cache: Dict[tuple[str, str], tuple[float, List[Dict[str, float]]]] = {}
@@ -300,6 +431,8 @@ class PositionSizerAdapter:
     ) -> float:
         del account_id, symbol, account_state
         qty = intent.get("qty")
+        if qty is None:
+            return 0.0
         try:
             return float(qty)
         except (TypeError, ValueError):
@@ -339,25 +472,6 @@ def _to_float(value: Any, *, default: float = 0.0) -> float:
         return default
 
 
-from auth.service import SessionStoreProtocol
-
-from metrics import (
-    metric_context,
-    observe_policy_inference_latency,
-    record_abstention_rate,
-    record_drift_score,
-    setup_metrics,
-    traced_span,
-)
-from services.common import security
-from services.common.security import ADMIN_ACCOUNTS, require_admin_account
-from services.policy.trade_intensity_controller import (
-    controller as trade_intensity_controller,
-)
-from services.common.spot import require_spot_http
-from shared.spot import require_spot_symbol
-
-
 class PolicyDecisionRequest(BaseModel):
     """Request schema for the policy decision endpoint."""
 
@@ -385,7 +499,8 @@ class PolicyDecisionRequest(BaseModel):
     @field_validator("symbol")
     @classmethod
     def _validate_symbol(cls, value: str) -> str:
-        return require_spot_symbol(value)
+        symbol = require_spot_symbol(value)
+        return str(symbol)
 
 
 class PolicyIntent(BaseModel):
@@ -493,6 +608,21 @@ app = FastAPI(title="Policy Service", version=APP_VERSION)
 setup_metrics(app, service_name="policy-service")
 
 
+RouteFn = TypeVar("RouteFn", bound=Callable[..., Any])
+
+
+def _app_post(*args: Any, **kwargs: Any) -> Callable[[RouteFn], RouteFn]:
+    """Typed wrapper around ``FastAPI.post`` for strict type checking."""
+
+    return cast(Callable[[RouteFn], RouteFn], app.post(*args, **kwargs))
+
+
+def _app_get(*args: Any, **kwargs: Any) -> Callable[[RouteFn], RouteFn]:
+    """Typed wrapper around ``FastAPI.get`` for strict type checking."""
+
+    return cast(Callable[[RouteFn], RouteFn], app.get(*args, **kwargs))
+
+
 def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
     existing = getattr(application.state, "session_store", None)
     if isinstance(existing, SessionStoreProtocol):
@@ -531,7 +661,7 @@ def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
 SESSION_STORE = _configure_session_store(app)
 
 
-@app.post("/policy/decide", response_model=PolicyIntent, status_code=status.HTTP_200_OK)
+@_app_post("/policy/decide", response_model=PolicyIntent, status_code=status.HTTP_200_OK)
 def decide_policy_intent(
     request: PolicyDecisionRequest,
     caller_account: str = Depends(require_admin_account),
@@ -544,11 +674,13 @@ def decide_policy_intent(
             detail="Account mismatch between authenticated session and payload.",
         )
 
-    if models is None or not hasattr(models, "predict_intent"):
+    if MODELS is None or not hasattr(MODELS, "predict_intent"):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Intent prediction model is not available.",
         )
+
+    assert MODELS is not None  # mypy narrow: ensured by guard above
 
     try:
         with traced_span(
@@ -557,7 +689,7 @@ def decide_policy_intent(
             symbol=request.symbol,
         ):
             inference_start = time.perf_counter()
-            intent_payload = models.predict_intent(
+            intent_payload = MODELS.predict_intent(
                 account_id=request.account_id,
                 symbol=request.symbol,
                 features=request.features,
@@ -573,7 +705,7 @@ def decide_policy_intent(
             detail="Failed to generate policy intent.",
         ) from exc
 
-    if is_dataclass(intent_payload):
+    if is_dataclass(intent_payload) and not isinstance(intent_payload, type):
         intent_payload = asdict(intent_payload)
     elif hasattr(intent_payload, "model_dump") and callable(intent_payload.model_dump):
         intent_payload = intent_payload.model_dump()
@@ -746,7 +878,7 @@ def decide_policy_intent(
     return response
 
 
-@app.get("/policy/intensity", response_model=TradeIntensityResponse, status_code=status.HTTP_200_OK)
+@_app_get("/policy/intensity", response_model=TradeIntensityResponse, status_code=status.HTTP_200_OK)
 def get_trade_intensity(
     account_id: str = Query(..., description="Authorized account identifier"),
     symbol: str = Query(..., description="Trading symbol to query"),
