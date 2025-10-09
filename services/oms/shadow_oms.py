@@ -11,6 +11,7 @@ expected fills, fees and slippage attribution.  Results are persisted via the
 from __future__ import annotations
 
 import inspect
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -56,6 +57,9 @@ def _load_policy_base() -> "type[_PolicyBase]":
 _ACTUAL_POLICY = _load_policy_base()
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 def _load_backtest_dependencies() -> tuple[Any, Any, Any]:
     """Resolve optional backtest engine classes when available."""
 
@@ -88,7 +92,7 @@ def _offset_backtest_timestamp(value: datetime, *, milliseconds: int) -> Any:
     return value + timedelta(milliseconds=milliseconds)
 
 
-class _SingleOrderPolicy(_PolicyBase):
+class _StubSingleOrderPolicy(_PolicyBase):
     """Policy wrapper that emits a single :class:`OrderIntent`."""
 
     def __init__(self, intent: object) -> None:
@@ -106,12 +110,62 @@ class _SingleOrderPolicy(_PolicyBase):
         self._emitted = False
 
 
-if not TYPE_CHECKING and _ACTUAL_POLICY is not _PolicyBase:
+def _create_single_order_policy() -> "type[_PolicyBase]":
+    """Return a policy wrapper compatible with the active backtest engine."""
+
+    if TYPE_CHECKING:
+        return _StubSingleOrderPolicy
+
+    base_cls: "type[_PolicyBase]" = _PolicyBase
     if inspect.isclass(_ACTUAL_POLICY):
+        base_cls = cast("type[_PolicyBase]", _ACTUAL_POLICY)
+
+    if base_cls is _PolicyBase:
+        return _StubSingleOrderPolicy
+
+    def _init(self: _PolicyBase, intent: object) -> None:
         try:
-            _SingleOrderPolicy.__bases__ = (_ACTUAL_POLICY,)
-        except TypeError:  # pragma: no cover - optional dependency mismatch
-            pass
+            base_init = getattr(base_cls, "__init__")
+        except AttributeError:  # pragma: no cover - defensive guard
+            base_init = None
+
+        if callable(base_init):  # pragma: no branch - small helper
+            try:
+                base_init(self)  # type: ignore[misc]
+            except TypeError:
+                try:
+                    base_init(self, intent)  # type: ignore[misc]
+                except Exception:  # pragma: no cover - defensive guard
+                    pass
+            except Exception:  # pragma: no cover - defensive guard
+                LOGGER.debug("Backtest policy base initialiser failed", exc_info=True)
+
+        self._intent = intent
+        self._emitted = False
+
+    attrs = {
+        "__module__": __name__,
+        "__doc__": _StubSingleOrderPolicy.__doc__,
+        "__init__": _init,
+        "generate": _StubSingleOrderPolicy.generate,
+        "reset": _StubSingleOrderPolicy.reset,
+    }
+
+    try:
+        policy_cls = type("_SingleOrderPolicy", (base_cls,), attrs)
+    except TypeError:
+        LOGGER.warning(
+            "Backtest policy base %s is incompatible with dynamic subclassing; "
+            "falling back to stub policy",
+            base_cls,
+            exc_info=True,
+        )
+        return _StubSingleOrderPolicy
+
+    return cast("type[_PolicyBase]", policy_cls)
+
+
+_SingleOrderPolicy = _create_single_order_policy()
 
 
 @dataclass

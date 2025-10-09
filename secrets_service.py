@@ -8,26 +8,30 @@ import binascii
 import json
 import logging
 import os
+import sys
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
 import httpx
 
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastapi import Depends, FastAPI, HTTPException, Header, Query, Request, status
-
 from fastapi.responses import JSONResponse
 from kubernetes import client, config
 from kubernetes.client import ApiException
 from kubernetes.config.config_exception import ConfigException
 from pydantic import BaseModel, Field, validator
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
 from services.secrets.signing import sign_kraken_request
 from shared.audit_hooks import AuditEvent, load_audit_hooks
 
 
 LOGGER = logging.getLogger(__name__)
 SECRETS_LOGGER = logging.getLogger("secrets_log")
+
+_INSECURE_DEFAULTS_FLAG = "SECRETS_ALLOW_INSECURE_DEFAULTS"
+_DEFAULT_TEST_TOKEN = "local-dev-token"
 
 _INITIAL_BACKOFF_SECONDS = 0.5
 _MAX_BACKOFF_SECONDS = 8.0
@@ -130,14 +134,56 @@ class Settings(BaseModel):
         return tuple(tokens)
 
 
+def _insecure_defaults_enabled() -> bool:
+    if os.getenv(_INSECURE_DEFAULTS_FLAG) == "1":
+        return True
+    return "pytest" in sys.modules
+
+
+def _default_token_labels(tokens: str) -> Dict[str, str]:
+    candidates = [token.strip() for token in tokens.split(",") if token.strip()]
+    if not candidates:
+        candidates = [_DEFAULT_TEST_TOKEN]
+    label_spec = ",".join(f"{token}:local" for token in candidates)
+    return _parse_authorized_token_labels(label_spec)
+
+
 def load_settings() -> Settings:
+    allow_insecure = _insecure_defaults_enabled()
+
     secret_key = os.getenv("SECRET_ENCRYPTION_KEY")
     if not secret_key:
-        raise RuntimeError("SECRET_ENCRYPTION_KEY environment variable must be set")
+        if not allow_insecure:
+            raise RuntimeError("SECRET_ENCRYPTION_KEY environment variable must be set")
+        generated = base64.b64encode(os.urandom(32)).decode("ascii")
+        LOGGER.warning(
+            "SECRET_ENCRYPTION_KEY missing; generated ephemeral key for local testing"
+        )
+        secret_key = generated
+        os.environ.setdefault("SECRET_ENCRYPTION_KEY", secret_key)
+
     tokens = os.getenv("SECRETS_SERVICE_AUTH_TOKENS")
     if not tokens:
-        raise RuntimeError("SECRETS_SERVICE_AUTH_TOKENS environment variable must be set")
-    token_labels = _load_authorized_tokens_from_env()
+        if not allow_insecure:
+            raise RuntimeError("SECRETS_SERVICE_AUTH_TOKENS environment variable must be set")
+        tokens = _DEFAULT_TEST_TOKEN
+        LOGGER.warning(
+            "SECRETS_SERVICE_AUTH_TOKENS missing; using insecure default token for local testing"
+        )
+        os.environ.setdefault("SECRETS_SERVICE_AUTH_TOKENS", tokens)
+
+    raw_labels = os.getenv("KRAKEN_SECRETS_AUTH_TOKENS")
+    if raw_labels:
+        token_labels = _parse_authorized_token_labels(raw_labels)
+    elif allow_insecure:
+        token_labels = _default_token_labels(tokens)
+        os.environ.setdefault(
+            "KRAKEN_SECRETS_AUTH_TOKENS",
+            ",".join(f"{token}:{label}" for token, label in token_labels.items()),
+        )
+    else:
+        token_labels = _load_authorized_tokens_from_env()
+
     return Settings(
         SECRET_ENCRYPTION_KEY=secret_key,
         SECRETS_SERVICE_AUTH_TOKENS=tokens,
