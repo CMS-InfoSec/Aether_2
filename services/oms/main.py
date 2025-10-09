@@ -54,6 +54,7 @@ from services.oms.order_ack_cache import get_order_ack_cache
 from services.oms.rate_limit_guard import rate_limit_guard
 from services.oms.shadow_oms import shadow_oms
 from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
+from shared.health import setup_health_checks
 from shared.session_config import load_session_ttl_minutes
 from shared.spot import is_spot_symbol, normalize_spot_symbol
 
@@ -151,6 +152,24 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="OMS Service", lifespan=_lifespan)
 setup_metrics(app)
+def _health_check_session_store() -> None:
+    store = getattr(app.state, "session_store", None)
+    if store is None:
+        raise RuntimeError("session store unavailable")
+
+
+def _health_check_transport_factory() -> None:
+    if not hasattr(app.state, "kraken_transport_factory"):
+        raise RuntimeError("kraken transport factory unavailable")
+
+
+setup_health_checks(
+    app,
+    {
+        "session_store": _health_check_session_store,
+        "kraken_transport": _health_check_transport_factory,
+    },
+)
 
 
 logger = logging.getLogger(__name__)
