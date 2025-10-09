@@ -126,8 +126,12 @@ else:
 
 
 try:  # pragma: no cover - prometheus is optional outside production
-    from prometheus_client import Counter
+    from prometheus_client import CollectorRegistry, Counter
 except Exception:  # pragma: no cover - provide a no-op fallback
+    class CollectorRegistry:  # type: ignore[override]
+        def __init__(self) -> None:
+            self._collectors: list[object] = []
+
     class Counter:  # type: ignore[override]
         def __init__(self, *args: object, **kwargs: object) -> None:
             self._value = 0.0
@@ -146,19 +150,54 @@ except Exception:  # pragma: no cover - provide a no-op fallback
 logger = logging.getLogger(__name__)
 
 
-_LOGIN_FAILURE_COUNTER = Counter(
-    "auth_login_failures_total",
-    "Number of failed administrator authentication attempts.",
-    ["reason"],
-)
-_MFA_DENIED_COUNTER = Counter(
-    "auth_mfa_denied_total",
-    "Number of administrator logins denied due to MFA.",
-)
-_LOGIN_SUCCESS_COUNTER = Counter(
-    "auth_login_success_total",
-    "Number of successful administrator logins.",
-)
+_METRICS_REGISTRY: CollectorRegistry | None = None
+_LOGIN_FAILURE_COUNTER: Counter
+_MFA_DENIED_COUNTER: Counter
+_LOGIN_SUCCESS_COUNTER: Counter
+
+
+def _build_counter(name: str, documentation: str, labels: tuple[str, ...] = ()) -> Counter:
+    kwargs: dict[str, object] = {}
+    if _METRICS_REGISTRY is not None:
+        kwargs["registry"] = _METRICS_REGISTRY
+    try:
+        return Counter(name, documentation, labels, **kwargs)
+    except TypeError:  # pragma: no cover - fallback implementations may ignore labels
+        return Counter(name, documentation, **kwargs)  # type: ignore[misc]
+
+
+def _init_metrics(*, registry: CollectorRegistry | None = None) -> None:
+    """Initialise or reset Prometheus counters used by the auth service."""
+
+    global _METRICS_REGISTRY
+    global _LOGIN_FAILURE_COUNTER
+    global _MFA_DENIED_COUNTER
+    global _LOGIN_SUCCESS_COUNTER
+
+    if registry is None:
+        try:
+            registry = CollectorRegistry()
+        except Exception:  # pragma: no cover - fallback when CollectorRegistry stubbed
+            registry = None  # type: ignore[assignment]
+
+    _METRICS_REGISTRY = registry
+
+    _LOGIN_FAILURE_COUNTER = _build_counter(
+        "auth_login_failures_total",
+        "Number of failed administrator authentication attempts.",
+        ("reason",),
+    )
+    _MFA_DENIED_COUNTER = _build_counter(
+        "auth_mfa_denied_total",
+        "Number of administrator logins denied due to MFA.",
+    )
+    _LOGIN_SUCCESS_COUNTER = _build_counter(
+        "auth_login_success_total",
+        "Number of successful administrator logins.",
+    )
+
+
+_init_metrics()
 
 
 
