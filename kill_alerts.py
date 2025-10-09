@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
 import logging
 import os
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Mapping, Sequence
+from typing import Any, Callable, Dict, List, Mapping, MutableMapping, Sequence
+from urllib import error as urllib_error
+from urllib import parse as urllib_parse
+from urllib import request as urllib_request
 
 try:  # pragma: no cover - optional dependency import
     import requests as _REQUESTS_MODULE  # type: ignore[import-not-found]
@@ -35,13 +40,71 @@ class MissingDependencyError(RuntimeError):
     """Raised when required optional dependencies are unavailable."""
 
 
-def _require_requests() -> Any:
-    """Return the :mod:`requests` module or raise a helpful error."""
+@dataclass
+class _FallbackResponse:
+    status_code: int
+    text: str
 
-    if _REQUESTS_MODULE is None:
-        message = "requests is required for kill switch notifications"
-        raise MissingDependencyError(message) from _REQUESTS_IMPORT_ERROR
-    return _REQUESTS_MODULE
+
+def _perform_http_post(
+    url: str,
+    *,
+    headers: MutableMapping[str, str] | None = None,
+    json_body: Dict[str, Any] | None = None,
+    data: Mapping[str, Any] | bytes | None = None,
+    auth: tuple[str, str] | None = None,
+    timeout: float = 10.0,
+) -> Any:
+    """Send a POST request using :mod:`requests` or a urllib fallback."""
+
+    if _REQUESTS_MODULE is not None:
+        kwargs: Dict[str, Any] = {
+            "headers": headers,
+            "timeout": timeout,
+        }
+        if json_body is not None:
+            kwargs["json"] = json_body
+        if isinstance(data, bytes):
+            kwargs["data"] = data
+        elif data is not None:
+            kwargs["data"] = data
+        if auth is not None:
+            kwargs["auth"] = auth
+        return _REQUESTS_MODULE.post(url, **kwargs)
+
+    request_headers: Dict[str, str] = dict(headers or {})
+    body: bytes
+    if json_body is not None:
+        body = json.dumps(json_body).encode("utf-8")
+        request_headers.setdefault("Content-Type", "application/json")
+    elif isinstance(data, bytes):
+        body = data
+    elif data is not None:
+        body = urllib_parse.urlencode(dict(data)).encode("utf-8")
+        request_headers.setdefault(
+            "Content-Type", "application/x-www-form-urlencoded"
+        )
+    else:
+        body = b""
+
+    if auth is not None:
+        user, password = auth
+        token = base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
+        request_headers.setdefault("Authorization", f"Basic {token}")
+
+    request_obj = urllib_request.Request(url, data=body, headers=request_headers, method="POST")
+
+    try:
+        with urllib_request.urlopen(request_obj, timeout=timeout) as response:
+            payload = response.read().decode("utf-8", errors="replace")
+            status = getattr(response, "status", response.getcode())
+    except urllib_error.HTTPError as exc:  # pragma: no cover - exercised in failure tests
+        payload = exc.read().decode("utf-8", errors="replace")
+        status = exc.code
+    except Exception as exc:  # pragma: no cover - network errors handled at runtime
+        raise RuntimeError(f"HTTP POST to {url} failed: {exc}") from exc
+
+    return _FallbackResponse(status_code=status, text=payload)
 
 
 def _require_env(key: str) -> str:
@@ -96,14 +159,13 @@ def _send_email(payload: Dict[str, object]) -> None:
         "custom_args": payload,
     }
 
-    requests_module = _require_requests()
-    response = requests_module.post(
+    response = _perform_http_post(
         endpoint,
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         },
-        json=body,
+        json_body=body,
         timeout=10,
     )
     if response.status_code >= 400:
@@ -129,8 +191,7 @@ def _send_sms(payload: Dict[str, object]) -> None:
         reason_code=payload["reason_code"],
     )
 
-    requests_module = _require_requests()
-    response = requests_module.post(
+    response = _perform_http_post(
         endpoint,
         data={
             "To": to_number,
@@ -155,8 +216,7 @@ def _send_webhook(payload: Dict[str, object]) -> None:
     body = json.dumps(payload, sort_keys=True).encode("utf-8")
     signature = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
 
-    requests_module = _require_requests()
-    response = requests_module.post(
+    response = _perform_http_post(
         url,
         data=body,
         headers={
