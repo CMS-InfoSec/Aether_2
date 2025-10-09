@@ -80,6 +80,8 @@ def test_risk_validation_passes_under_fee_budget(risk_client: TestClient) -> Non
     body = response.json()
     assert body["pass"] is True
     assert body["reasons"] == []
+    assert body["take_profit"] > payload["intent"]["price"]
+    assert body["stop_loss"] < payload["intent"]["price"]
 
 
 def test_risk_validation_rejects_when_fee_budget_exhausted(
@@ -113,6 +115,8 @@ def test_risk_validation_rejects_when_fee_budget_exhausted(
     body = response.json()
     assert body["pass"] is False
     assert any("Fee budget exhausted" in reason for reason in body["reasons"])
+    assert body["take_profit"] > payload["intent"]["price"]
+    assert body["stop_loss"] < payload["intent"]["price"]
 
 
 def test_risk_validation_enforces_schema(risk_client: TestClient) -> None:
