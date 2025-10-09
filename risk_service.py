@@ -54,6 +54,7 @@ from battle_mode import BattleModeController, create_battle_mode_tables
 from cost_throttler import CostThrottler
 from services.risk.position_sizer import PositionSizer
 from services.common.adapters import RedisFeastAdapter, TimescaleAdapter
+from shared.exits import compute_exit_targets
 from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
 from shared.spot import filter_spot_symbols, is_spot_symbol, normalize_spot_symbol
 
@@ -97,6 +98,11 @@ SHUTDOWN_TIMEOUT = float(os.getenv("RISK_SHUTDOWN_TIMEOUT", os.getenv("SERVICE_S
 _CAPITAL_ALLOCATOR_URL = os.getenv("CAPITAL_ALLOCATOR_URL")
 _CAPITAL_ALLOCATOR_TIMEOUT = float(os.getenv("CAPITAL_ALLOCATOR_TIMEOUT", "1.5"))
 _CAPITAL_ALLOCATOR_TOLERANCE = float(os.getenv("CAPITAL_ALLOCATOR_NAV_TOLERANCE", "0.02"))
+try:
+    _CAPITAL_ALLOCATOR_DRAWDOWN_LIMIT = float(os.getenv("CAPITAL_ALLOCATOR_MAX_DRAWDOWN", "1.0"))
+except ValueError:
+    _CAPITAL_ALLOCATOR_DRAWDOWN_LIMIT = 1.0
+_CAPITAL_ALLOCATOR_DRAWDOWN_LIMIT = max(_CAPITAL_ALLOCATOR_DRAWDOWN_LIMIT, 0.0)
 _BATTLE_MODE_VOL_THRESHOLD = float(os.getenv("BATTLE_MODE_VOL_THRESHOLD", "1.0"))
 DEFAULT_EXCHANGE = os.getenv("PRIMARY_EXCHANGE", "kraken")
 
@@ -581,6 +587,14 @@ class RiskValidationResponse(BaseModel):
         None,
         description="Timestamp until which trading is halted due to hard limits",
     )
+    take_profit: Optional[float] = Field(
+        None,
+        description="Recommended take-profit trigger price derived from policy and volatility",
+    )
+    stop_loss: Optional[float] = Field(
+        None,
+        description="Recommended stop-loss trigger price derived from policy and volatility",
+    )
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -1011,6 +1025,11 @@ async def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
     intent = context.request.intent
     trade_notional = context.intended_notional
     normalized_instrument = normalize_spot_symbol(intent.instrument_id)
+    base_price = float(intent.price)
+    exit_take_profit, exit_stop_loss = compute_exit_targets(
+        price=base_price,
+        side=intent.side,
+    )
 
     def _register_violation(
         message: str, *, cooldown: bool = False, details: Optional[Dict[str, object]] = None
@@ -1202,6 +1221,13 @@ async def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
             scaled_notional_cap = base_size * float(target_vol) / current_vol
         elif nav_cap_for_trade:
             scaled_notional_cap = nav_cap_for_trade
+
+    if atr_value is not None and atr_value > 0:
+        exit_take_profit, exit_stop_loss = compute_exit_targets(
+            price=base_price,
+            side=intent.side,
+            atr=atr_value,
+        )
 
     volatility_metric: Optional[float] = None
     volatility_source: Optional[str] = None
@@ -1445,6 +1471,8 @@ async def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
         reasons=reasons,
         adjusted_qty=adjusted_quantity,
         cooldown=cooldown_until,
+        take_profit=exit_take_profit,
+        stop_loss=exit_stop_loss,
     )
 
 
@@ -2048,6 +2076,23 @@ def _apply_allocator_guard(
     current_nav = float(state.net_asset_value or 0.0)
     trade_amount = float(trade_notional or 0.0)
     tolerance = max(_CAPITAL_ALLOCATOR_TOLERANCE, 0.0)
+
+    drawdown_limit = max(_CAPITAL_ALLOCATOR_DRAWDOWN_LIMIT, 0.0)
+    drawdown_ratio = float(allocator_state.drawdown_ratio or 0.0)
+    if drawdown_limit and drawdown_ratio >= drawdown_limit:
+        register_violation_with_context(
+            (
+                "Account drawdown exceeds configured limit; trading suspended until "
+                "drawdown recovers"
+            ),
+            True,
+            {
+                "drawdown_ratio": drawdown_ratio,
+                "drawdown_limit": drawdown_limit,
+            },
+        )
+        suggested_quantities.append(0.0)
+        return
 
     if allocator_state.throttled and intent.side == "buy":
         register_violation_with_context(

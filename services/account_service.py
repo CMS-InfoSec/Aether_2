@@ -20,6 +20,8 @@ from typing import Any, Dict, Iterable, Optional
 from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Path as FastAPIPath, status
+
+from metrics import setup_metrics
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import (
     Boolean,
@@ -480,6 +482,7 @@ def _kraken_status_from_keys(record: KrakenKey | None) -> Optional[dict[str, Any
 
 
 app = FastAPI(title="Account Management Service")
+setup_metrics(app, service_name="account-service")
 
 
 @app.post("/accounts/create", response_model=AccountCreateResponse)

@@ -14,6 +14,8 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.sql.schema import Table
 
+from metrics import setup_metrics
+
 from services.common.security import require_admin_account
 from services.common.spot import require_spot_http
 from services.fees.fee_optimizer import FeeOptimizer
@@ -111,6 +113,7 @@ SessionLocal = sessionmaker(
 
 
 app = FastAPI(title="Fee Schedule Service")
+setup_metrics(app, service_name="fee-service")
 
 
 logger = logging.getLogger(__name__)

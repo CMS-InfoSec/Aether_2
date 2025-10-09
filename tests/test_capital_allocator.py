@@ -393,3 +393,58 @@ def test_risk_engine_blocks_when_allocator_throttles(
     assert body["pass"] is False
     assert any("capital allocator" in reason.lower() for reason in body["reasons"])
     assert body["adjusted_qty"] == 0.0
+
+
+def test_risk_engine_blocks_when_drawdown_limit_exceeded(
+    risk_service_app, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, module = risk_service_app
+
+    monkeypatch.setattr(module, "_CAPITAL_ALLOCATOR_DRAWDOWN_LIMIT", 0.75)
+
+    elevated_drawdown = module.AllocatorAccountState(
+        account_id="company",
+        allocation_pct=0.25,
+        allocated_nav=250_000.0,
+        drawdown_ratio=0.8,
+        throttled=False,
+    )
+
+    async def _stub_allocator_state(account_id: str) -> module.AllocatorAccountState:
+        return elevated_drawdown
+
+    monkeypatch.setattr(module, "_query_allocator_state", _stub_allocator_state)
+
+    payload = {
+        "account_id": "company",
+        "intent": {
+            "policy_id": "policy-123",
+            "instrument_id": "BTC-USD",
+            "side": "buy",
+            "quantity": 5.0,
+            "price": 10_000.0,
+        },
+        "portfolio_state": {
+            "net_asset_value": 200_000.0,
+            "notional_exposure": 50_000.0,
+            "realized_daily_loss": 10_000.0,
+            "fees_paid": 1_000.0,
+            "var_95": 25_000.0,
+            "var_99": 45_000.0,
+        },
+    }
+
+    with override_admin_auth(
+        client.app, module.require_admin_account, payload["account_id"]
+    ) as headers:
+        response = client.post(
+            "/risk/validate",
+            json=payload,
+            headers={**headers, "X-Account-ID": payload["account_id"]},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["pass"] is False
+    assert body["adjusted_qty"] == 0.0
+    assert any("drawdown" in reason.lower() for reason in body["reasons"])
