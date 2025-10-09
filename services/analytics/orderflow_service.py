@@ -25,6 +25,12 @@ from typing_extensions import TypedDict
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query
 
+try:  # pragma: no cover - metrics helper optional when FastAPI unavailable
+    from metrics import setup_metrics
+except ModuleNotFoundError:  # pragma: no cover - fallback noop for optional dependency
+    def setup_metrics(*_: object, **__: object) -> None:
+        return None
+
 from auth.service import (
     InMemorySessionStore,
     SessionStoreProtocol,
@@ -605,6 +611,7 @@ async def liquidity_holes(
 
 
 app = FastAPI(title="Orderflow Analytics Service", version="1.0.0")
+setup_metrics(app, service_name="orderflow-analytics-service")
 
 
 def _resolve_session_store_dsn() -> str:
