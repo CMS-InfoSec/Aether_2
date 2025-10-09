@@ -12,6 +12,12 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
+
+try:  # pragma: no cover - metrics optional when FastAPI missing
+    from metrics import setup_metrics
+except ModuleNotFoundError:  # pragma: no cover - fallback noop to avoid optional dependency issues
+    def setup_metrics(*_: object, **__: object) -> None:
+        return None
 from pydantic import BaseModel, Field
 
 _SQLALCHEMY_AVAILABLE = True
@@ -791,6 +797,7 @@ def _assert_data_available(bars: Sequence[Bar], symbol: str) -> None:
 
 
 app = FastAPI(title="Seasonality Analytics Service")
+setup_metrics(app, service_name="seasonality-analytics-service")
 app.state.seasonality_database_url = None
 app.state.seasonality_engine = None
 app.state.seasonality_sessionmaker = None

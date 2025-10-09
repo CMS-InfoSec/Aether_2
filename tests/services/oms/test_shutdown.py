@@ -4,6 +4,7 @@ import asyncio
 import importlib
 import sys
 import types
+from datetime import datetime
 from pathlib import Path
 from typing import Dict
 
@@ -53,13 +54,20 @@ async def test_drain_endpoint_flushes_kafka_once(monkeypatch: pytest.MonkeyPatch
             cancel_order=_noop_async,
             place_order=_noop_async,
         )
+        async def _sim_status(account_id: str, *, use_cache: bool = True):  # type: ignore[override]
+            del account_id, use_cache
+            return types.SimpleNamespace(account_id="stub", active=False, reason=None, ts=datetime.now())
+
         sim_mode_stub.sim_mode_repository = types.SimpleNamespace(
-            get_status_async=_noop_async,
+            get_status_async=_sim_status,
         )
+
         sim_mode_stub.sim_mode_state = types.SimpleNamespace(
-            active=False,
-            activate=lambda: None,
-            deactivate=lambda: None,
+            is_active=lambda account_id=None: False,
+            activate=lambda account_id=None: None,
+            deactivate=lambda account_id=None: None,
+            enable=lambda account_id=None: None,
+            disable=lambda account_id=None: None,
         )
 
         sys.modules["shared.sim_mode"] = sim_mode_stub
