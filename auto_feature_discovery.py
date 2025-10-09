@@ -9,6 +9,7 @@ which features were considered and when they were deployed.
 
 from __future__ import annotations
 
+import json
 import argparse
 import logging
 import math
@@ -56,6 +57,8 @@ except Exception:  # pragma: no cover - executed when psycopg is unavailable.
 
 
 LOGGER = logging.getLogger(__name__)
+
+from ml.insecure_defaults import insecure_defaults_enabled, state_dir, state_file
 
 
 class MissingDependencyError(RuntimeError):
@@ -197,6 +200,94 @@ class FeatureDiscoveryEngine:
                 cur.execute(create_feature_values)
                 cur.execute(create_log)
             conn.commit()
+
+
+class LocalFeatureDiscoveryEngine:
+    """Synthetic fallback used when dependencies are missing under insecure defaults."""
+
+    def __init__(self, config: FeatureDiscoveryConfig, missing: Sequence[str]) -> None:
+        self.config = config
+        self._missing = tuple(missing)
+        self._state_dir = state_dir("feature_discovery")
+        self.log_file = state_file("feature_discovery", "cycles.jsonl")
+
+    def run_once(self) -> None:
+        now = datetime.now(timezone.utc)
+        base_name = self.config.feature_prefix or "auto_feature"
+        candidates = [
+            {
+                "feature": f"{base_name}_momentum",
+                "score": 0.5,
+                "promoted": True,
+            },
+            {
+                "feature": f"{base_name}_volatility",
+                "score": 0.3,
+                "promoted": False,
+            },
+        ]
+        record = {
+            "ts": now.isoformat(),
+            "missing_dependencies": list(self._missing),
+            "candidates": candidates,
+        }
+        with self.log_file.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
+        LOGGER.info(
+            "Recorded synthetic feature discovery cycle using insecure-default fallback (missing: %s)",
+            ", ".join(self._missing) or "none",
+        )
+
+    def run_forever(self) -> None:
+        while True:
+            cycle_start = time.monotonic()
+            try:
+                self.run_once()
+            except Exception:  # pragma: no cover - defensive logging
+                LOGGER.exception("Local feature discovery cycle failed")
+            elapsed = timedelta(seconds=time.monotonic() - cycle_start)
+            sleep_for = max(self.config.scan_interval - elapsed, timedelta())
+            if sleep_for > timedelta():
+                time.sleep(sleep_for.total_seconds())
+
+
+def _missing_dependencies() -> List[str]:
+    missing: List[str] = []
+    if np is None:
+        missing.append("numpy")
+    if pd is None:
+        missing.append("pandas")
+    if lgb is None:
+        missing.append("lightgbm")
+    if psycopg is None or dict_row is None:
+        missing.append("psycopg")
+    return missing
+
+
+_MISSING_MESSAGES = {
+    "numpy": "numpy is required for auto feature discovery but is not installed.",
+    "pandas": "pandas is required for auto feature discovery but is not installed.",
+    "lightgbm": "LightGBM is required for auto feature discovery but is not installed.",
+    "psycopg": "psycopg is required for auto feature discovery but is not installed.",
+}
+
+
+def create_feature_discovery_engine(config: FeatureDiscoveryConfig) -> FeatureDiscoveryEngine | LocalFeatureDiscoveryEngine:
+    """Return a discovery engine appropriate for the current dependency set."""
+
+    missing = _missing_dependencies()
+    if not missing:
+        return FeatureDiscoveryEngine(config)
+
+    if insecure_defaults_enabled():
+        LOGGER.warning(
+            "Feature discovery dependencies missing (%s); using local fallback.",
+            ", ".join(missing),
+        )
+        return LocalFeatureDiscoveryEngine(config, missing)
+
+    message = _MISSING_MESSAGES.get(missing[0], f"{missing[0]} is required for auto feature discovery")
+    raise MissingDependencyError(message)
 
     def _load_market_data(self) -> pd.DataFrame:
         """Fetch OHLCV and order book snapshots for the configured lookback window."""
@@ -595,7 +686,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         scan_interval=timedelta(minutes=args.interval_minutes),
         max_features=args.max_features,
     )
-    engine = FeatureDiscoveryEngine(config)
+    engine = create_feature_discovery_engine(config)
     if args.once:
         engine.run_once()
     else:

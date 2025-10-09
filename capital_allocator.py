@@ -5,9 +5,11 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
+import json
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from pathlib import Path
+from threading import Lock
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 from urllib.parse import parse_qsl, urlparse, urlunparse
 
@@ -122,29 +124,112 @@ class _ResultProxy:
 
 
 class _AllocatorStore:
-    """In-memory persistence backend used when SQLAlchemy is unavailable."""
+    """File-backed persistence backend used when SQLAlchemy is unavailable."""
+
+    _MARKER = "__aether_type__"
 
     def __init__(self) -> None:
+        self._lock = Lock()
+        self._state_root = Path(".aether_state") / "capital_allocator"
+        self._allocations_file = self._state_root / "allocations.json"
+        self._pnl_file = self._state_root / "pnl_curves.json"
         self.pnl_curves: List[Dict[str, Any]] = []
         self.capital_allocations: List[Dict[str, Any]] = []
+        self._state_root.mkdir(parents=True, exist_ok=True)
+        self._load_state()
+
+    def _encode(self, value: Any) -> Any:
+        if isinstance(value, Decimal):
+            return {self._MARKER: "decimal", "value": str(value)}
+        if isinstance(value, datetime):
+            return {self._MARKER: "datetime", "value": value.isoformat()}
+        if isinstance(value, list):
+            return [self._encode(item) for item in value]
+        if isinstance(value, tuple):  # pragma: no cover - defensive conversion
+            return [self._encode(item) for item in value]
+        if isinstance(value, dict):
+            return {key: self._encode(val) for key, val in value.items()}
+        return value
+
+    def _decode(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            marker = value.get(self._MARKER)
+            if marker == "decimal":
+                try:
+                    return Decimal(value["value"])
+                except (InvalidOperation, KeyError):  # pragma: no cover - corrupt state
+                    return Decimal("0")
+            if marker == "datetime":
+                raw = value.get("value")
+                if isinstance(raw, str):
+                    try:
+                        return datetime.fromisoformat(raw)
+                    except ValueError:  # pragma: no cover - corrupt state
+                        return raw
+                return raw
+            return {key: self._decode(val) for key, val in value.items()}
+        if isinstance(value, list):
+            return [self._decode(item) for item in value]
+        return value
+
+    def _load_json(self, path: Path) -> list[dict[str, Any]]:
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except FileNotFoundError:
+            return []
+        except json.JSONDecodeError:  # pragma: no cover - recover from corrupt state
+            return []
+        decoded = self._decode(payload)
+        return decoded if isinstance(decoded, list) else []
+
+    def _persist_locked(self) -> None:
+        allocations = self._encode(self.capital_allocations)
+        pnl_curves = self._encode(self.pnl_curves)
+        with self._allocations_file.open("w", encoding="utf-8") as handle:
+            json.dump(allocations, handle, ensure_ascii=False, indent=2)
+        with self._pnl_file.open("w", encoding="utf-8") as handle:
+            json.dump(pnl_curves, handle, ensure_ascii=False, indent=2)
+
+    def _load_state_unlocked(self) -> None:
+        self.pnl_curves = [
+            row if isinstance(row, dict) else {}
+            for row in self._load_json(self._pnl_file)
+        ]
+        self.capital_allocations = [
+            row if isinstance(row, dict) else {}
+            for row in self._load_json(self._allocations_file)
+        ]
+
+    def _load_state(self) -> None:
+        with self._lock:
+            self._load_state_unlocked()
 
     def reset(self) -> None:
-        self.pnl_curves.clear()
-        self.capital_allocations.clear()
+        with self._lock:
+            self.pnl_curves.clear()
+            self.capital_allocations.clear()
+            self._load_state_unlocked()
 
     def insert_pnl_curves(self, rows: Iterable[Mapping[str, Any]]) -> None:
-        for row in rows:
-            self.pnl_curves.append(dict(row))
+        with self._lock:
+            for row in rows:
+                self.pnl_curves.append(dict(row))
+            self._persist_locked()
 
     def delete(self, table: str) -> None:
-        if table == "pnl_curves":
-            self.pnl_curves.clear()
-        elif table == "capital_allocations":
-            self.capital_allocations.clear()
+        with self._lock:
+            if table == "pnl_curves":
+                self.pnl_curves.clear()
+            elif table == "capital_allocations":
+                self.capital_allocations.clear()
+            self._persist_locked()
 
     def latest_navs(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            source_rows = list(self.pnl_curves)
         latest: Dict[str, Dict[str, Any]] = {}
-        for row in self.pnl_curves:
+        for row in source_rows:
             account_id = str(row.get("account_id", ""))
             if not account_id:
                 continue
@@ -185,28 +270,38 @@ class _AllocatorStore:
         return list(latest.values())
 
     def latest_allocations(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = list(self.capital_allocations)
         latest: Dict[str, Dict[str, Any]] = {}
-        for row in self.capital_allocations:
+        for row in rows:
             account_id = str(row.get("account_id", ""))
             if not account_id:
                 continue
             ts = row.get("ts")
             existing = latest.get(account_id)
             if existing is None or ts > existing.get("ts"):
-                latest[account_id] = {"account_id": account_id, "pct": row.get("pct", Decimal("0")), "ts": ts}
-        return [{"account_id": key, "pct": value.get("pct", Decimal("0"))} for key, value in latest.items()]
+                latest[account_id] = {
+                    "account_id": account_id,
+                    "pct": row.get("pct", Decimal("0")),
+                    "ts": ts,
+                }
+        return [
+            {"account_id": key, "pct": value.get("pct", Decimal("0"))}
+            for key, value in latest.items()
+        ]
 
     def add_allocation(self, record: Any) -> None:
         pct = getattr(record, "pct", None)
         if pct is None:
             pct = getattr(record, "allocation_pct", Decimal("0"))
-        self.capital_allocations.append(
-            {
-                "account_id": str(getattr(record, "account_id")),
-                "pct": pct,
-                "ts": getattr(record, "ts"),
-            }
-        )
+        entry = {
+            "account_id": str(getattr(record, "account_id", "")),
+            "pct": pct,
+            "ts": getattr(record, "ts", datetime.now(timezone.utc)),
+        }
+        with self._lock:
+            self.capital_allocations.append(entry)
+            self._persist_locked()
 
     def execute(self, statement: object, params: Any = None) -> _ResultProxy:
         if isinstance(params, list) and all(isinstance(row, Mapping) for row in params):
