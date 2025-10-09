@@ -160,4 +160,7 @@ current hedge allocation and drawdown posture for each account.
 Risk validation now derives take-profit and stop-loss trigger prices automatically using
 policy-provided basis-point targets with volatility fallbacks so every approved order
 includes protective exit levels without manual configuration.
+Drawdown protection now honours the capital allocator's maximum drawdown ratio; when an
+account breaches the configured `CAPITAL_ALLOCATOR_MAX_DRAWDOWN` threshold, risk
+validation halts new trades and records a zero-quantity adjustment until losses recover.
 
