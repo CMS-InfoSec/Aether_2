@@ -98,6 +98,11 @@ SHUTDOWN_TIMEOUT = float(os.getenv("RISK_SHUTDOWN_TIMEOUT", os.getenv("SERVICE_S
 _CAPITAL_ALLOCATOR_URL = os.getenv("CAPITAL_ALLOCATOR_URL")
 _CAPITAL_ALLOCATOR_TIMEOUT = float(os.getenv("CAPITAL_ALLOCATOR_TIMEOUT", "1.5"))
 _CAPITAL_ALLOCATOR_TOLERANCE = float(os.getenv("CAPITAL_ALLOCATOR_NAV_TOLERANCE", "0.02"))
+try:
+    _CAPITAL_ALLOCATOR_DRAWDOWN_LIMIT = float(os.getenv("CAPITAL_ALLOCATOR_MAX_DRAWDOWN", "1.0"))
+except ValueError:
+    _CAPITAL_ALLOCATOR_DRAWDOWN_LIMIT = 1.0
+_CAPITAL_ALLOCATOR_DRAWDOWN_LIMIT = max(_CAPITAL_ALLOCATOR_DRAWDOWN_LIMIT, 0.0)
 _BATTLE_MODE_VOL_THRESHOLD = float(os.getenv("BATTLE_MODE_VOL_THRESHOLD", "1.0"))
 DEFAULT_EXCHANGE = os.getenv("PRIMARY_EXCHANGE", "kraken")
 
@@ -2071,6 +2076,23 @@ def _apply_allocator_guard(
     current_nav = float(state.net_asset_value or 0.0)
     trade_amount = float(trade_notional or 0.0)
     tolerance = max(_CAPITAL_ALLOCATOR_TOLERANCE, 0.0)
+
+    drawdown_limit = max(_CAPITAL_ALLOCATOR_DRAWDOWN_LIMIT, 0.0)
+    drawdown_ratio = float(allocator_state.drawdown_ratio or 0.0)
+    if drawdown_limit and drawdown_ratio >= drawdown_limit:
+        register_violation_with_context(
+            (
+                "Account drawdown exceeds configured limit; trading suspended until "
+                "drawdown recovers"
+            ),
+            True,
+            {
+                "drawdown_ratio": drawdown_ratio,
+                "drawdown_limit": drawdown_limit,
+            },
+        )
+        suggested_quantities.append(0.0)
+        return
 
     if allocator_state.throttled and intent.side == "buy":
         register_violation_with_context(
