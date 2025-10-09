@@ -248,12 +248,15 @@ class SimModeRepository:
         self._cache_ttl = 2.0
 
     def _load_row(self, session: Session, account_id: str) -> SimModeStateORM:
-        row = (
-            session.execute(
-                select(SimModeStateORM).where(SimModeStateORM.account_id == account_id).limit(1)
-            )
-            .scalar_one_or_none()
+        result = session.execute(
+            select(SimModeStateORM).where(SimModeStateORM.account_id == account_id)
         )
+        try:
+            # SQLAlchemy 1.4 exposes ``scalar_one_or_none`` on the ``Result``
+            # while SQLAlchemy 2.x prefers chaining ``scalars().first()``.
+            row = result.scalar_one_or_none()
+        except AttributeError:  # pragma: no cover - SQLAlchemy 2.x path
+            row = result.scalars().first()
         if row is None:
             row = SimModeStateORM(account_id=account_id, active=False, reason=None, ts=_utcnow())
             session.add(row)
