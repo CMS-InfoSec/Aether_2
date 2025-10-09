@@ -83,6 +83,7 @@ class FillEvent(MessageModel):
 class SimModeEvent(MessageModel):
     """Event capturing transitions into or out of platform simulation mode."""
 
+    account_id: str = Field(..., min_length=1, max_length=128, description="Trading account impacted by the transition")
     active: bool = Field(..., description="True when the platform is in simulation mode")
     reason: str | None = Field(default=None, description="Human readable reason for the state change")
     ts: datetime = Field(..., description="Timestamp of the state change")

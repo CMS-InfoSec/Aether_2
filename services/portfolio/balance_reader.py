@@ -81,15 +81,16 @@ class SimStoreClient:
         self._base_url = resolved_url.rstrip("/") if resolved_url else ""
         self._timeout = timeout if timeout is not None else _DEFAULT_SIM_TIMEOUT_SECONDS
 
-    async def is_active(self) -> bool:
+    async def is_active(self, account_id: Optional[str] = None) -> bool:
         """Return ``True`` when the simulation store is online and active."""
 
         if not self._base_url:
             return False
         url = f"{self._base_url}/sim/status"
+        params = {"account_id": account_id} if account_id else None
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
-                response = await client.get(url)
+                response = await client.get(url, params=params)
                 response.raise_for_status()
                 payload = response.json()
         except httpx.HTTPError as exc:  # pragma: no cover - network guard
@@ -99,8 +100,21 @@ class SimStoreClient:
             LOGGER.debug("Simulation status endpoint returned non-JSON payload")
             return False
 
-        active = bool(payload.get("active")) if isinstance(payload, Mapping) else False
-        return active
+        if not isinstance(payload, Mapping):
+            return False
+
+        accounts = payload.get("accounts")
+        if isinstance(accounts, list):
+            for entry in accounts:
+                if not isinstance(entry, Mapping):
+                    continue
+                if account_id and entry.get("account_id") != account_id:
+                    continue
+                if entry.get("active"):
+                    return True
+            return bool(payload.get("active"))
+
+        return bool(payload.get("active"))
 
     async def fetch_balances(self, account_id: str) -> Mapping[str, Any]:
         """Return a Kraken-style balance snapshot from the simulation store."""
@@ -224,7 +238,7 @@ class BalanceReader:
         )
 
     async def _load_snapshot(self, account_id: str) -> Mapping[str, Any]:
-        use_sim = await self._sim_client.is_active()
+        use_sim = await self._sim_client.is_active(account_id)
         if use_sim:
             try:
                 payload = await self._sim_client.fetch_balances(account_id)
