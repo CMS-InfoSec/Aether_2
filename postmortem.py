@@ -27,10 +27,54 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, cast
 
-import numpy as np
-import pandas as pd
+if TYPE_CHECKING:  # pragma: no cover - imported for type checkers only
+    import numpy as np  # type: ignore[import-not-found]
+    import pandas as pd  # type: ignore[import-not-found]
+else:  # pragma: no cover - reassigned if modules are available at runtime
+    np = cast("Any", None)
+    pd = cast("Any", None)
+
+try:  # pragma: no cover - numpy is optional in some environments
+    import numpy as _NUMPY_MODULE  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover - executed when numpy is missing
+    _NUMPY_MODULE = None  # type: ignore[assignment]
+else:  # pragma: no cover - executed when numpy import succeeds
+    np = _NUMPY_MODULE  # type: ignore[assignment]
+
+try:  # pragma: no cover - pandas is optional in some environments
+    import pandas as _PANDAS_MODULE  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover - executed when pandas is missing
+    _PANDAS_MODULE = None  # type: ignore[assignment]
+else:  # pragma: no cover - executed when pandas import succeeds
+    pd = _PANDAS_MODULE  # type: ignore[assignment]
+
+
+class MissingDependencyError(RuntimeError):
+    """Raised when a required optional dependency is unavailable."""
+
+
+def _require_numpy() -> Any:
+    """Return the numpy module, raising a helpful error when absent."""
+
+    global np
+    if _NUMPY_MODULE is None:  # pragma: no cover - exercised when numpy missing
+        raise MissingDependencyError("numpy is required for postmortem analysis")
+    if np is None:  # pragma: no cover - executed only if reassignment failed
+        np = _NUMPY_MODULE  # type: ignore[assignment]
+    return _NUMPY_MODULE
+
+
+def _require_pandas() -> Any:
+    """Return the pandas module, raising a helpful error when absent."""
+
+    global pd
+    if _PANDAS_MODULE is None:  # pragma: no cover - exercised when pandas missing
+        raise MissingDependencyError("pandas is required for postmortem analysis")
+    if pd is None:  # pragma: no cover - executed only if reassignment failed
+        pd = _PANDAS_MODULE  # type: ignore[assignment]
+    return _PANDAS_MODULE
 
 LOGGER = logging.getLogger("postmortem")
 
@@ -250,6 +294,8 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 
 def _strategy_returns_trend(group: pd.DataFrame) -> pd.Series:
+    _require_pandas()
+    _require_numpy()
     closes = group["close"].astype(float)
     fast = closes.ewm(span=12, adjust=False).mean()
     slow = closes.ewm(span=26, adjust=False).mean()
@@ -260,6 +306,8 @@ def _strategy_returns_trend(group: pd.DataFrame) -> pd.Series:
 
 
 def _strategy_returns_mean_reversion(group: pd.DataFrame) -> pd.Series:
+    _require_pandas()
+    _require_numpy()
     closes = group["close"].astype(float)
     rolling = closes.rolling(window=20, min_periods=5)
     mean = rolling.mean()
@@ -274,6 +322,7 @@ def _strategy_returns_mean_reversion(group: pd.DataFrame) -> pd.Series:
 
 
 def _strategy_returns_breakout(group: pd.DataFrame) -> pd.Series:
+    _require_pandas()
     highs = group["high"].astype(float)
     lows = group["low"].astype(float)
     closes = group["close"].astype(float)
@@ -325,6 +374,8 @@ class PostmortemAnalyzer:
     # Public API
     # ------------------------------------------------------------------
     def run(self) -> Dict[str, Any]:
+        _require_pandas()
+        _require_numpy()
         start = datetime.now(timezone.utc) - timedelta(hours=self._hours)
         end = datetime.now(timezone.utc)
         account_id, account_label = self._resolve_account()
@@ -398,6 +449,7 @@ class PostmortemAnalyzer:
         return self._account_id, self._account_label
 
     def _load_orders(self, start: datetime, end: datetime, account_id: str) -> pd.DataFrame:
+        _require_pandas()
         query = (
             "SELECT order_id, market, submitted_at, side, price, size, status, metadata "
             "FROM orders "
@@ -413,6 +465,7 @@ class PostmortemAnalyzer:
         return frame
 
     def _load_fills(self, start: datetime, end: datetime, account_id: str) -> pd.DataFrame:
+        _require_pandas()
         query = (
             "SELECT f.fill_id, f.order_id, f.market, f.fill_time, f.price, f.size, f.fee, o.side "
             "FROM fills f "
@@ -430,6 +483,7 @@ class PostmortemAnalyzer:
         return frame
 
     def _load_bars(self, start: datetime, end: datetime, account_id: str) -> pd.DataFrame:
+        _require_pandas()
         markets: Sequence[str] = []
         with self._conn.cursor() as cursor:
             cursor.execute(
@@ -466,6 +520,7 @@ class PostmortemAnalyzer:
         return frame
 
     def _load_pnl(self, start: datetime, end: datetime, account_id: str) -> pd.DataFrame:
+        _require_pandas()
         query = (
             "SELECT as_of, realized, unrealized FROM pnl "
             "WHERE account_id = %(account_id)s "
@@ -483,6 +538,7 @@ class PostmortemAnalyzer:
     # Analytics
     # ------------------------------------------------------------------
     def _simulate_actual(self, bars: pd.DataFrame, fills: pd.DataFrame) -> ActualPerformance:
+        _require_pandas()
         if fills.empty:
             equity_curve = pd.DataFrame(columns=["timestamp", "nav"]).set_index("timestamp")
             losses_by_market = pd.Series(dtype=float)
@@ -598,6 +654,8 @@ class PostmortemAnalyzer:
         )
 
     def _evaluate_strategies(self, bars: pd.DataFrame) -> List[StrategyResult]:
+        _require_pandas()
+        _require_numpy()
         if bars.empty:
             return []
         bars = bars.sort_values(["bucket_start", "market"]).copy()
@@ -678,6 +736,7 @@ class PostmortemAnalyzer:
         actual: ActualPerformance,
         strategies: Sequence[StrategyResult],
     ) -> str:
+        _require_pandas()
         import html
 
         def _format_series(series: pd.Series, title: str) -> str:
