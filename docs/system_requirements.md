@@ -171,3 +171,8 @@ Daily operations reporting now enriches the exported CSV with `starting_nav`,
 `ending_nav`, and `daily_return_pct` columns so each account's profit and loss percentage
 is tracked alongside absolute gains, satisfying the daily PnL reporting requirement.
 
+The Kraken spot exchange adapter now translates OMS rate limits, network timeouts,
+and validation errors into explicit exceptions so the trading pipeline can retry,
+defer, or surface actionable feedback without crashing, satisfying the API safety
+requirement for handling upstream failures gracefully.
+
