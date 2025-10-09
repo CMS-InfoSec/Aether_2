@@ -457,7 +457,7 @@ def account_setup(
 
     monkeypatch.setattr(oms_service, "_IdempotencyStore", _StubIdempotencyStore)
 
-    sim_mode_state.deactivate()
+    sim_mode_state.deactivate("ACC-TEST")
     asyncio.run(sim_broker.clear())
 
     account = AccountContext("ACC-TEST")
@@ -531,7 +531,7 @@ def test_simulated_place_order_marks_records_and_reuses_idempotency(
     account, ws_clients, rest_clients, impact_store = account_setup
 
     off_tick_request.pre_trade_mid_px = Decimal("20000")
-    sim_mode_state.activate()
+    sim_mode_state.activate("ACC-TEST")
 
     try:
         with CorrelationContext("corr-sim-1"):
@@ -567,6 +567,6 @@ def test_simulated_place_order_marks_records_and_reuses_idempotency(
         assert second.exchange_order_id == first.exchange_order_id
         assert len(impact_store.calls) == 1
     finally:
-        sim_mode_state.deactivate()
+        sim_mode_state.deactivate("ACC-TEST")
         asyncio.run(sim_broker.clear())
         asyncio.run(account.close())
