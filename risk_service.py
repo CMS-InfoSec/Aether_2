@@ -50,6 +50,7 @@ from services.common.compliance import (
 from services.common.security import require_admin_account
 from services.common.spot import require_spot_http
 from battle_mode import BattleModeController, create_battle_mode_tables
+from shared.health import setup_health_checks
 
 from cost_throttler import CostThrottler
 from services.risk.position_sizer import PositionSizer
@@ -503,6 +504,82 @@ def _filter_spot_instruments(symbols: Iterable[str]) -> List[str]:
     return filter_spot_symbols(symbols, logger=logger)
 
 
+def _health_check_database() -> Dict[str, object]:
+    """Ensure the managed Timescale/PostgreSQL backing store is reachable."""
+
+    with ENGINE.connect() as connection:
+        connection.execute(select(1))
+
+    engine_url = getattr(ENGINE, "url", None)
+    if hasattr(engine_url, "set"):
+        redacted_url = str(engine_url.set(password="***"))
+    elif hasattr(engine_url, "render_as_string"):
+        redacted_url = engine_url.render_as_string(hide_password=True)  # type: ignore[call-arg]
+    elif engine_url is not None:
+        redacted_url = str(engine_url)
+    else:  # pragma: no cover - defensive fallback when URL metadata unavailable
+        redacted_url = "unknown"
+
+    dialect = getattr(ENGINE, "dialect", None)
+    return {
+        "dialect": getattr(dialect, "name", "unknown"),
+        "driver": getattr(dialect, "driver", "unknown"),
+        "url": redacted_url,
+    }
+
+
+async def _health_check_capital_allocator() -> Dict[str, object]:
+    """Verify the capital allocator dependency responds successfully."""
+
+    url = os.getenv("CAPITAL_ALLOCATOR_URL", _CAPITAL_ALLOCATOR_URL)
+    if not url:
+        return {"configured": False}
+
+    endpoint = url.rstrip("/") + "/allocator/status"
+    try:
+        async with httpx.AsyncClient(timeout=_CAPITAL_ALLOCATOR_TIMEOUT) as client:
+            response = await client.get(endpoint)
+            response.raise_for_status()
+    except httpx.HTTPStatusError as exc:  # pragma: no cover - defensive network guard
+        raise RuntimeError(
+            f"Capital allocator returned status {exc.response.status_code}"
+        ) from exc
+    except httpx.RequestError as exc:
+        raise RuntimeError("Capital allocator dependency unreachable") from exc
+
+    return {"configured": True, "status_code": response.status_code}
+
+
+async def _health_check_universe_service() -> Dict[str, object]:
+    """Confirm the trading universe service is reachable and well-formed."""
+
+    endpoint = _UNIVERSE_SERVICE_URL.rstrip("/") + "/universe/approved"
+    try:
+        async with httpx.AsyncClient(timeout=_UNIVERSE_SERVICE_TIMEOUT) as client:
+            response = await client.get(endpoint)
+            response.raise_for_status()
+    except httpx.HTTPStatusError as exc:  # pragma: no cover - defensive network guard
+        raise RuntimeError(
+            f"Universe service returned status {exc.response.status_code}"
+        ) from exc
+    except httpx.RequestError as exc:
+        raise RuntimeError("Universe service dependency unreachable") from exc
+
+    try:
+        payload = response.json()
+    except ValueError as exc:  # pragma: no cover - malformed upstream payload
+        raise RuntimeError("Universe service returned invalid JSON") from exc
+
+    symbols = payload.get("symbols")
+    if not isinstance(symbols, list):
+        raise RuntimeError("Universe service payload missing 'symbols' list")
+
+    return {
+        "status_code": response.status_code,
+        "symbol_count": len(symbols),
+    }
+
+
 class TradeIntent(BaseModel):
     """Represents the incoming trading intent from the policy layer."""
 
@@ -661,6 +738,14 @@ class BattleModeToggleRequest(BaseModel):
 
 app = FastAPI(title="Risk Validation Service", version="1.0.0")
 setup_metrics(app, service_name="risk-service")
+setup_health_checks(
+    app,
+    {
+        "database": _health_check_database,
+        "capital_allocator": _health_check_capital_allocator,
+        "universe_service": _health_check_universe_service,
+    },
+)
 COST_THROTTLER = CostThrottler()
 EXCHANGE_ADAPTER = get_exchange_adapter(DEFAULT_EXCHANGE)
 
