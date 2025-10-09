@@ -2593,10 +2593,14 @@ class AccountContext:
         if not record.side:
             return
 
-        filled_qty = record.result.filled_qty
+        total_filled_qty = record.result.filled_qty
         avg_price = record.result.avg_price
         mid_px = record.pre_trade_mid
         if mid_px is None or mid_px <= 0:
+            return
+
+        incremental_qty = total_filled_qty - record.recorded_qty
+        if incremental_qty <= 0:
             return
 
         normalized_side = record.side.lower()
@@ -2636,7 +2640,7 @@ class AccountContext:
             client_order_id=record.client_id,
             symbol=record.symbol,
             side=record.side,
-            filled_qty=filled_qty,
+            filled_qty=incremental_qty,
             avg_price=avg_price,
             pre_trade_mid=mid_px,
             impact_bps=impact_bps,
@@ -2644,10 +2648,11 @@ class AccountContext:
             simulated=record.origin == "SIM",
         )
 
+        record.recorded_qty = total_filled_qty
         async with self._orders_lock:
             current = self._orders.get(record.client_id)
             if current:
-                current.recorded_qty = filled_qty
+                current.recorded_qty = total_filled_qty
 
 
 
