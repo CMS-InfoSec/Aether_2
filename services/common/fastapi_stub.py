@@ -268,6 +268,13 @@ class Request:
         self.client = SimpleNamespace(host=None, port=None)
         self._scope = scope
         self._receive = receive
+        self._body: Any = None
+
+    def set_body(self, body: Any) -> None:
+        self._body = body
+
+    def json(self) -> Any:
+        return self._body
 
 
 class Response:
@@ -908,6 +915,10 @@ class TestClient:
         request = self._build_request(headers=headers, params=params, path_params=path_params)
         request.url = SimpleNamespace(path=_normalize_path(path))
         request.method = method
+        if hasattr(request, "set_body"):
+            request.set_body(body)
+        else:  # pragma: no cover - compatibility guard for patched requests
+            setattr(request, "_body", body)
 
         try:
             payload = _run_async(

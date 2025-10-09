@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
 import logging
+import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from ml.experiment_tracking.mlflow_utils import MLFlowConfig, mlflow_run
 from ml.models.supervised import SupervisedDataset, load_trainer
+from ml.insecure_defaults import insecure_defaults_enabled, state_file
 
 
 class MissingDependencyError(RuntimeError):
@@ -75,8 +78,16 @@ class ObjectiveWeights:
     turnover: float = 0.1
 
     def validate(self) -> None:
+        if np is None:
+            if insecure_defaults_enabled():
+                LOGGER.warning(
+                    "Skipping objective weight validation because numpy is unavailable and insecure defaults are enabled."
+                )
+                return
+            raise MissingDependencyError(_NUMPY_ERROR)
+
         total = self.sharpe + self.sortino + self.max_drawdown + self.turnover
-        if not _require_numpy().isclose(total, 1.0):
+        if not math.isclose(total, 1.0, rel_tol=1e-9, abs_tol=1e-9):
             raise ValueError("Objective weights must sum to 1.0")
 
 
@@ -194,6 +205,16 @@ class OptunaRunner:
         return blended
 
     def run(self) -> "_optuna.Study":
+        missing = _missing_dependencies()
+        if missing:
+            if insecure_defaults_enabled():
+                LOGGER.warning(
+                    "Optuna runner dependencies missing (%s); using local fallback study.",
+                    ", ".join(missing),
+                )
+                return self._run_local_stub(missing)
+            _raise_missing_dependency(missing[0])
+
         optuna_module = _require_optuna()
         study = optuna_module.create_study(
             study_name=self.study_name,
@@ -204,6 +225,82 @@ class OptunaRunner:
         study.optimize(self._objective, n_trials=self.n_trials)
         LOGGER.info("Completed Optuna study %s", self.study_name)
         return study
+
+    def _run_local_stub(self, missing: List[str]):
+        params = self._default_params()
+        record = {
+            "study": self.study_name,
+            "trainer": self.trainer_name,
+            "params": params,
+            "score": 0.0,
+            "missing_dependencies": missing,
+        }
+        output = state_file("optuna", f"{self.study_name}.json")
+        output.write_text(json.dumps(record, indent=2), encoding="utf-8")
+        LOGGER.info("Persisted local Optuna fallback study to %s", output)
+        trial = _LocalTrial(params=params, value=0.0)
+        return _LocalStudy(best_trial=trial)
+
+    def _default_params(self) -> Dict[str, Any]:
+        if self.trainer_name == "lightgbm":
+            return {
+                "learning_rate": 0.05,
+                "num_leaves": 64,
+                "feature_fraction": 0.8,
+                "bagging_fraction": 0.8,
+                "min_data_in_leaf": 50,
+            }
+        if self.trainer_name == "xgboost":
+            return {
+                "eta": 0.05,
+                "max_depth": 6,
+                "subsample": 0.8,
+                "colsample_bytree": 0.8,
+                "lambda": 1.0,
+            }
+        return {"trainer": self.trainer_name}
+
+
+class _LocalTrial:
+    """Minimal trial representation returned by the local fallback study."""
+
+    def __init__(self, *, params: Dict[str, Any], value: float) -> None:
+        self.params = params
+        self.value = value
+
+
+class _LocalStudy:
+    """Minimal Study-like container for insecure-default fallbacks."""
+
+    def __init__(self, *, best_trial: _LocalTrial) -> None:
+        self.best_trial = best_trial
+        self.trials = [best_trial]
+        self.user_attrs: Dict[str, Any] = {}
+
+    def add_user_attr(self, key: str, value: Any) -> None:
+        self.user_attrs[key] = value
+
+
+def _missing_dependencies() -> List[str]:
+    missing: List[str] = []
+    if np is None:
+        missing.append("numpy")
+    if pd is None:
+        missing.append("pandas")
+    if optuna is None:
+        missing.append("optuna")
+    return missing
+
+
+def _raise_missing_dependency(name: str) -> None:
+    message_map = {
+        "numpy": _NUMPY_ERROR,
+        "pandas": _PANDAS_ERROR,
+        "optuna": _OPTUNA_ERROR,
+    }
+    raise MissingDependencyError(
+        message_map.get(name, f"{name} is required for hyperparameter optimisation")
+    )
 
 
 __all__ = [
