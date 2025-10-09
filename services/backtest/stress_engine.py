@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
+import os
 import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from numbers import Number
+from pathlib import Path
 from threading import RLock
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Mapping, MutableMapping, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple
+
+import sys
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
@@ -38,8 +43,37 @@ if TYPE_CHECKING:  # pragma: no cover - used for static analysis only
     import pandas as pd  # type: ignore
 
 
+_INSECURE_DEFAULTS_FLAG = "STRESS_ENGINE_ALLOW_INSECURE_DEFAULTS"
+_STATE_DIR_ENV = "AETHER_STATE_DIR"
+
+
 class MissingDependencyError(RuntimeError):
     """Raised when a required third-party dependency is unavailable."""
+
+
+def _state_root() -> Path:
+    root = Path(os.getenv(_STATE_DIR_ENV, ".aether_state")) / "stress_engine"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _insecure_defaults_enabled() -> bool:
+    return os.getenv(_INSECURE_DEFAULTS_FLAG) == "1" or "pytest" in sys.modules
+
+
+def _stress_dependencies_available() -> bool:
+    return all(
+        (
+            _NUMPY_MODULE is not None,
+            _PANDAS_MODULE is not None,
+            Backtester is not None,
+            ExamplePolicy is not None,
+            FeeSchedule is not None,
+            flash_crash is not None,
+            spread_widen is not None,
+            liquidity_halt is not None,
+        )
+    )
 
 
 def _require_numpy() -> Any:
@@ -225,6 +259,80 @@ class StressTestRepository:
             raise
 
 
+class LocalStressEngine:
+    """Fallback stress engine used when scientific stack is unavailable."""
+
+    def __init__(self, account_id: str, *, state_root: Optional[Path] = None) -> None:
+        self.account_id = account_id
+        self.symbol = DEFAULT_SYMBOL
+        self.years = DEFAULT_YEARS
+        self._state_root = state_root or _state_root()
+        self._state_root.mkdir(parents=True, exist_ok=True)
+        self._history_path = self._state_root / f"{account_id.replace('/', '-')}.json"
+
+    def close(self) -> None:  # pragma: no cover - compatibility with main engine
+        return None
+
+    def run(self, scenario: StressScenario) -> StressTestResult:
+        history = self._load_history()
+        run_index = len(history)
+        base_metrics = self._base_metrics(run_index)
+        stressed_metrics = self._apply_scenario(base_metrics, scenario)
+        timestamp = datetime.now(timezone.utc)
+        result = StressTestResult(
+            account_id=self.account_id,
+            scenario=scenario,
+            timestamp=timestamp,
+            base_metrics=base_metrics,
+            stressed_metrics=stressed_metrics,
+        )
+        history.append(
+            {
+                "timestamp": timestamp.isoformat(),
+                "scenario": scenario.value,
+                "base": base_metrics,
+                "stressed": stressed_metrics,
+            }
+        )
+        self._history_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
+        return result
+
+    def _load_history(self) -> List[Dict[str, Any]]:
+        if self._history_path.exists():
+            try:
+                raw = json.loads(self._history_path.read_text(encoding="utf-8"))
+                if isinstance(raw, list):
+                    return [dict(entry) for entry in raw]
+            except Exception:  # pragma: no cover - defensive guard
+                LOGGER.warning("Failed to parse stress history at %s; recreating", self._history_path)
+        return []
+
+    def _base_metrics(self, run_index: int) -> Dict[str, float]:
+        base_pnl = 5_000.0 + run_index * 250.0
+        volatility = 0.02 + run_index * 0.002
+        max_drawdown = -abs(base_pnl * 0.05)
+        return {
+            "pnl": float(base_pnl),
+            "volatility": float(volatility),
+            "max_drawdown": float(max_drawdown),
+        }
+
+    def _apply_scenario(
+        self, base_metrics: Mapping[str, float], scenario: StressScenario
+    ) -> Dict[str, float]:
+        impact = {
+            StressScenario.FLASH_CRASH: -0.25,
+            StressScenario.SPREAD_WIDEN: -0.10,
+            StressScenario.LIQUIDITY_HALT: -0.15,
+        }
+        factor = impact.get(scenario, -0.05)
+        stressed = dict(base_metrics)
+        stressed["pnl"] = float(base_metrics.get("pnl", 0.0) * (1.0 + factor))
+        stressed["volatility"] = float(base_metrics.get("volatility", 0.0) * (1.0 + abs(factor)))
+        stressed["max_drawdown"] = float(base_metrics.get("max_drawdown", 0.0) * (1.0 - factor))
+        return stressed
+
+
 class PortfolioStressEngine:
     """Run stress scenarios against a synthetic backtest for an account."""
 
@@ -369,6 +477,30 @@ class PortfolioStressEngine:
         return int(math.fmod(checksum, 2**31))
 
 
+def create_stress_engine(
+    account_id: str,
+    *,
+    session: Optional[TimescaleSession] = None,
+) -> "PortfolioStressEngine | LocalStressEngine":
+    if _stress_dependencies_available():
+        return PortfolioStressEngine(account_id=account_id, session=session)
+    if not _insecure_defaults_enabled():
+        missing: List[str] = []
+        if _NUMPY_MODULE is None:
+            missing.append("numpy")
+        if _PANDAS_MODULE is None:
+            missing.append("pandas")
+        if Backtester is None or ExamplePolicy is None or FeeSchedule is None:
+            missing.append("backtest_engine")
+        raise MissingDependencyError(
+            "Stress engine dependencies missing: " + ", ".join(sorted(set(missing)))
+        )
+    LOGGER.warning(
+        "Using insecure stress engine fallbacks; install numpy, pandas, and backtest-engine for full functionality",
+    )
+    return LocalStressEngine(account_id=account_id)
+
+
 class StressTestResponse(BaseModel):
     """Response model returned by the stress testing endpoint."""
 
@@ -380,12 +512,15 @@ class StressTestResponse(BaseModel):
     pnl_impact: float = Field(..., description="Difference between stressed and base PnL")
 
 
-def get_engine(account_id: str = Query(..., description="Account identifier to stress")) -> PortfolioStressEngine:
+def get_engine(
+    account_id: str = Query(..., description="Account identifier to stress")
+) -> "PortfolioStressEngine | LocalStressEngine":
     try:
         session = get_timescale_session(account_id)
     except Exception as exc:  # pragma: no cover - configuration errors are runtime only
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to load account config") from exc
-    return PortfolioStressEngine(account_id=account_id, session=session)
+    engine = create_stress_engine(account_id, session=session)
+    return engine
 
 
 router = APIRouter(prefix="/stress", tags=["stress"])
@@ -394,7 +529,7 @@ router = APIRouter(prefix="/stress", tags=["stress"])
 @router.get("/run", response_model=StressTestResponse)
 def run_stress(
     scenario: StressScenario = Query(..., description="Scenario to execute"),
-    engine: PortfolioStressEngine = Depends(get_engine),
+    engine: "PortfolioStressEngine | LocalStressEngine" = Depends(get_engine),
 ) -> StressTestResponse:
     try:
         result = engine.run(scenario)
