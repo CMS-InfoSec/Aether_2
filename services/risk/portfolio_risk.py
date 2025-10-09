@@ -12,6 +12,8 @@ from datetime import datetime
 from typing import Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 from fastapi import Depends, FastAPI, HTTPException, status
+
+from metrics import setup_metrics
 from pydantic import BaseModel, Field
 
 from services.common.adapters import TimescaleAdapter
@@ -488,6 +490,7 @@ def _load_authorized_viewers() -> set[str]:
 AUTHORIZED_VIEWERS: set[str] = _load_authorized_viewers()
 
 app = FastAPI(title="Portfolio Risk Service")
+setup_metrics(app, service_name="portfolio-risk-service")
 
 
 @app.get("/risk/portfolio/status", response_model=PortfolioStatusResponse)

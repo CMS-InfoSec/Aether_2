@@ -33,6 +33,8 @@ except ModuleNotFoundError:  # pragma: no cover - allow import without alembic
     command = None  # type: ignore[assignment]
     Config = None  # type: ignore[assignment]
 from fastapi import Depends, FastAPI, HTTPException
+
+from metrics import setup_metrics
 from pydantic import BaseModel, Field
 
 try:  # pragma: no cover - SQLAlchemy is optional in lightweight environments
@@ -416,6 +418,7 @@ def get_session() -> Iterator[Session]:
 
 
 app = FastAPI(title="Universe Selection Service")
+setup_metrics(app, service_name="universe-selection-service")
 app.state.db_sessionmaker = None
 app.state.universe_engine = None
 app.state.universe_database_url = None

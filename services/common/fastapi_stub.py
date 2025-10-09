@@ -233,13 +233,41 @@ class _HeaderMapping(MutableMapping[str, Any]):
 class Request:
     """Bare-minimum representation of a request object."""
 
-    def __init__(self, headers: Optional[Dict[str, Any]] = None) -> None:
-        self.headers = _HeaderMapping(headers or {})
-        self.state = SimpleNamespace()
-        self.app: "FastAPI | None" = None
-        self.query_params: Dict[str, Any] = {}
-        self.path_params: Dict[str, Any] = {}
+    def __init__(
+        self,
+        data: Optional[Dict[str, Any]] = None,
+        receive: Any | None = None,
+        **kwargs: Any,
+    ) -> None:
+        headers_override = kwargs.pop("headers", None)
+        scope = data or {}
+        headers_map: Dict[str, Any] = {}
+        if headers_override is not None:
+            if isinstance(headers_override, Mapping):
+                headers_source = headers_override.items()
+            else:
+                headers_source = headers_override
+        elif isinstance(scope, dict) and "headers" in scope:
+            headers_source = scope.get("headers", []) or []
+        else:
+            headers_source = []
+
+        for key, value in headers_source:
+            if isinstance(key, bytes):
+                key = key.decode("latin-1")
+            if isinstance(value, bytes):
+                value = value.decode("latin-1")
+            headers_map[str(key)] = value
+
+        self.headers = _HeaderMapping(headers_map)
+        app = scope.get("app") if isinstance(scope, dict) else None
+        self.app = app
+        self.state = getattr(app, "state", SimpleNamespace())
+        self.query_params: Dict[str, Any] = scope.get("query_params", {}) if isinstance(scope, dict) else {}
+        self.path_params: Dict[str, Any] = scope.get("path_params", {}) if isinstance(scope, dict) else {}
         self.client = SimpleNamespace(host=None, port=None)
+        self._scope = scope
+        self._receive = receive
 
 
 class Response:

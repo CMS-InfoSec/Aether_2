@@ -158,17 +158,20 @@ except Exception:  # pragma: no cover - provide lightweight fallbacks when unava
 
     class _SimModeRepositoryStub:
         def __init__(self) -> None:
-            self._status = SimpleNamespace(
-                active=False,
-                reason=None,
-                ts=datetime.now(timezone.utc),
-            )
+            self._statuses: Dict[str, SimpleNamespace] = {}
 
-        def get_status(self, *, use_cache: bool = True) -> SimpleNamespace:  # type: ignore[override]
-            return self._status
+        def get_status(self, account_id: str, *, use_cache: bool = True) -> SimpleNamespace:  # type: ignore[override]
+            if account_id not in self._statuses:
+                self._statuses[account_id] = SimpleNamespace(
+                    account_id=account_id,
+                    active=False,
+                    reason=None,
+                    ts=datetime.now(timezone.utc),
+                )
+            return self._statuses[account_id]
 
-        async def get_status_async(self, *, use_cache: bool = True) -> SimpleNamespace:  # type: ignore[override]
-            return self.get_status(use_cache=use_cache)
+        async def get_status_async(self, account_id: str, *, use_cache: bool = True) -> SimpleNamespace:  # type: ignore[override]
+            return self.get_status(account_id, use_cache=use_cache)
 
     sim_mode_broker = _SimModeBrokerStub()
     sim_mode_repository = _SimModeRepositoryStub()
@@ -194,6 +197,8 @@ from metrics import (
     record_oms_latency,
     setup_metrics,
 )
+from shared.health import setup_health_checks
+from shared.trade_logging import TradeLogEntry, get_trade_logger
 from shared.correlation import get_correlation_id
 from shared.simulation import (
     SimulatedOrder,
@@ -209,6 +214,14 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Kraken OMS Async Service")
 setup_metrics(app)
+
+
+def _health_check_impact_store() -> None:
+    if impact_store is None:
+        raise RuntimeError("impact analytics store unavailable")
+
+
+setup_health_checks(app, {"impact_store": _health_check_impact_store})
 
 
 def _log_extra(**extra: Any) -> Dict[str, Any]:
@@ -947,9 +960,9 @@ class AccountContext:
 
 
     async def _is_simulation_active(self) -> bool:
-        if sim_mode_state.active:
+        if sim_mode_state.is_active(self.account_id):
             return True
-        status = await self._sim_mode_repo.get_status_async()
+        status = await self._sim_mode_repo.get_status_async(self.account_id)
         return status.active
 
 
@@ -2580,10 +2593,14 @@ class AccountContext:
         if not record.side:
             return
 
-        filled_qty = record.result.filled_qty
+        total_filled_qty = record.result.filled_qty
         avg_price = record.result.avg_price
         mid_px = record.pre_trade_mid
         if mid_px is None or mid_px <= 0:
+            return
+
+        incremental_qty = total_filled_qty - record.recorded_qty
+        if incremental_qty <= 0:
             return
 
         normalized_side = record.side.lower()
@@ -2593,13 +2610,37 @@ class AccountContext:
         direction = Decimal("1") if normalized_side == "buy" else Decimal("-1")
         impact_ratio = (avg_price - mid_px) / mid_px
         impact_bps = impact_ratio * direction * Decimal("10000")
+        pnl_value = (mid_px - avg_price) * filled_qty * direction
+
+        trade_entry = TradeLogEntry(
+            timestamp=datetime.now(timezone.utc),
+            account_id=self.account_id,
+            client_order_id=record.client_id,
+            exchange_order_id=record.result.exchange_order_id,
+            symbol=record.symbol,
+            side=normalized_side,
+            quantity=filled_qty,
+            price=avg_price,
+            pnl=pnl_value,
+            pre_trade_mid=mid_px,
+            transport=record.transport,
+            simulated=record.origin == "SIM",
+        )
+        try:
+            get_trade_logger().log(trade_entry)
+        except Exception:  # pragma: no cover - logging must not break fills
+            logger.exception(
+                "Failed to log trade %s for account %s",
+                record.client_id,
+                self.account_id,
+            )
 
         await self._impact_store.record_fill(
             account_id=self.account_id,
             client_order_id=record.client_id,
             symbol=record.symbol,
             side=record.side,
-            filled_qty=filled_qty,
+            filled_qty=incremental_qty,
             avg_price=avg_price,
             pre_trade_mid=mid_px,
             impact_bps=impact_bps,
@@ -2607,10 +2648,11 @@ class AccountContext:
             simulated=record.origin == "SIM",
         )
 
+        record.recorded_qty = total_filled_qty
         async with self._orders_lock:
             current = self._orders.get(record.client_id)
             if current:
-                current.recorded_qty = filled_qty
+                current.recorded_qty = total_filled_qty
 
 
 
