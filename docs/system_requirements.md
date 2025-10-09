@@ -149,6 +149,55 @@ Aether_2 is an autonomous AI-driven trading platform designed to operate exclusi
 | SC-7 | Learning loop | AI retrains on historical and live data. |
 | SC-8 | Testing | All unit and integration tests pass successfully. |
 
-## 6. Production Readiness
+## 6. Production Readiness Assessment
 
-Aether_2 is considered production-ready, secure, and compliant for real-time autonomous trading on the Kraken spot market when all requirements and success criteria defined above are satisfied.
+The specification above describes the target end state, but the current repository still diverges materially from those expectations. Direct inspection of the codebase and the automated test suite surfaces critical gaps that must be resolved before the platform can be considered production-ready.
+
+### 6.1 Implementation evidence snapshot
+
+| Capability | Observation | Evidence | Status |
+|------------|-------------|----------|--------|
+| Spot-market scope | The simulated broker normalizes instruments to Kraken spot symbols and rejects anything that is not recognised as spot, protecting both live and simulated order flow. | `SimBroker` enforces `is_spot_symbol` when placing orders.【F:services/oms/sim_broker.py†L82-L156】 | ✅ Implemented in code |
+| USD trading universe | Default configuration seeds only USD-quoted assets (BTC, ETH, SOL and USD stablecoins), aligning with the spot-only charter. | Stablecoin monitor and diversification buckets list USD pairs exclusively.【F:config/system.yaml†L1-L29】 | ✅ Implemented in config |
+| Risk exits | The exit rule engine builds stop-loss, take-profit, and trailing-stop orders for every eligible entry, but the behaviour currently lacks automated regression coverage. | Exit orchestration logic registers mandatory protective orders.【F:services/risk/exit_rules.py†L82-L133】 | ⚠️ Implementation exists; validation missing |
+| Account-scoped secrets | Helm values expect three dedicated Kraken secret mounts (company, director-1, director-2), ensuring credentials remain isolated per account. | Deployment values map each account to its own Kubernetes secret reference.【F:deploy/helm/aether-platform/values.yaml†L1-L53】 | ⚠️ Deployment contract defined; runtime verification pending |
+
+### 6.2 Blocking gaps observed
+
+* **Automated testing is failing catastrophically.** A fresh run of the test suite (`pytest -q`) aborts during collection with import errors, missing dependencies, incompatible SQLAlchemy usage, and 92 total errors, demonstrating that the repository cannot currently validate its behaviour.
+
+  ```text
+  $ pytest -q
+  E   ImportError: cannot import name 'get_timescale_session' from 'services.common.config'
+  E   ImportError: cannot import name 'ensure_admin_access' from 'services.common.security'
+  ...
+  E   AttributeError: '_SelectStatement' object has no attribute 'limit'
+  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! Interrupted: 92 errors during collection !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  ```
+
+* **Administrator guard crashes when invoked.** `services/common/security.py` calls `cast(...)` without importing it; invoking `_get_session_store` therefore raises `NameError`, preventing `ensure_admin_access` and the rest of the FastAPI dependency stack from authorising administrative requests. The infrastructure scaling API inherits this dependency and now fails every request with a 500 response, leaving operators unable to audit or adjust autoscaling behaviour.【F:services/common/security.py†L118-L176】【535722†L1-L24】【7ea8cb†L1-L103】
+* **Simulation-mode persistence silently downgrades to a stub.** Importing `shared.sim_mode` currently fails with `ModuleNotFoundError: No module named 'sqlalchemy'`; the OMS catches that exception and swaps in an in-memory stub that never writes to Timescale or enforces account-scoped simulation switches, violating the safety requirements for live isolation.【7e276b†L1-L6】【F:services/oms/oms_service.py†L77-L175】
+* **Timescale session helpers have no safe defaults for local testing.** Calling `get_timescale_session("company")` without hand-crafted environment variables immediately raises `RuntimeError`, so any service importing the helper during tests or local runs aborts before it can inject sqlite fallbacks or dependency overrides.【F:services/common/config.py†L145-L202】【89615a†L1-L6】
+* **Existing audit findings remain unresolved.** The remediation task board documents P0 issues spanning database adapters, hedging safeguards, TLS enforcement, and observability; none of these fixes are present, leaving critical requirements unmet.【F:docs/AUDIT_REPORT.md†L1-L76】
+* **Core dependencies are missing from the runtime environment.** Security tests crash immediately because `starlette.requests` cannot be imported, signalling that Starlette is absent even though FastAPI components rely on it for request objects and middleware bindings.【c1da0d†L1-L14】
+* **SQLAlchemy 2.x APIs break the simulation-mode repository.** `shared.sim_mode` still calls `.limit(...)` on the legacy `Select` object; under SQLAlchemy 2.x the modern `Select` returned by `select()` lacks that method, so module import fails before any OMS component can read or toggle the simulation flag.【ae1b21†L1-L18】【F:shared/sim_mode.py†L228-L279】
+* **Auth service initialisation crashes on new SQLAlchemy URLs.** The engine options helper expects `URL.get_backend_name()`, but SQLAlchemy 2.x replaces this accessor; constructing the ORM engine therefore raises `AttributeError`, preventing authentication services from starting at all.【d54b8d†L1-L15】【F:auth_service.py†L452-L486】
+* **Configuration service falls over without SQLAlchemy installed.** In lightweight environments the module swaps to the in-memory engine, but `reset_state()` still calls `Base.metadata.drop_all`; with the fallback declarative base this resolves to a bare `SimpleNamespace` that lacks `drop_all`, so the API cannot boot or serve requests when SQLAlchemy is absent.【b7b18a†L1-L61】【F:config_service.py†L389-L395】【F:config_service.py†L43-L58】
+* **Shadow OMS cannot load alongside the compiled backtest engine.** The module rewrites `_SingleOrderPolicy.__bases__` at import time to inherit from the real `Policy`, but the compiled extension rejects the reassignment with a layout mismatch, so every OMS import halts with `TypeError` before routing or execution logic can load.【2f286e†L1-L13】【F:services/oms/shadow_oms.py†L45-L109】
+* **Universe service cannot even import.** The production trading universe backend leaves a bare `try:` block when SQLAlchemy is available, so Python raises a `SyntaxError` before any whitelist or audit models can load, preventing the deployment from compiling the allowed spot instruments list entirely.【3f831c†L1-L21】【F:universe_service.py†L202-L252】
+* **Strategy registry falls over when SQLAlchemy is absent.** The in-memory session shim that stands in for SQLAlchemy during lightweight deployments lacks the `.scalar()` helper that `StrategyRegistry.register()` depends on. As a result default strategies never persist, `route_trade_intent()` raises `StrategyNotFound`, and the registry cannot protect the spot-only trading flow without a full SQLAlchemy install.【F:strategy_orchestrator.py†L200-L288】【F:tests/conftest.py†L420-L501】【2670e7†L1-L78】
+* **Capital flow migrations cannot run without full SQLAlchemy.** The fallback engine stub injected when SQLAlchemy is missing exposes no `dialect`, so the migration helper dereferences `engine.dialect.name` and crashes during import, leaving capital flow upgrades unusable in constrained environments.【8ff9b2†L1-L32】【F:capital_flow_migrations.py†L37-L47】
+* **Risk correlation service silently accepts SQLite in production.** `_database_url()` enables SQLite any time `pytest` is present in `sys.modules`; because the test harness itself reintroduces `pytest`, the guard never fires, and the service will happily normalize a SQLite DSN even when running outside of tests, violating the Timescale dependency requirements.【730cfe†L1-L18】【F:services/risk/correlation_service.py†L72-L100】
+* **Sentiment ingestion hard-crashes without SQLAlchemy.** The optional dependency shim still instantiates `BigInteger().with_variant(...)`; when SQLAlchemy is absent this resolves to the stub `_Type` object that lacks `with_variant`, so importing `sentiment_ingest` raises `AttributeError` before any service or worker can start.【a1f4a2†L1-L12】【F:sentiment_ingest.py†L379-L411】
+* **Seasonality analytics service decorators are undefined.** The module applies `@_app_on_event` and `@_app_get` even though the helper functions are never imported when the FastAPI test stub is active, so every import path fails with `NameError`, preventing seasonal analytics endpoints from booting.【6d46b0†L1-L40】【F:services/analytics/seasonality_service.py†L820-L905】
+* **Operational tests flag missing PyYAML dependency.** The OMS network policy test skips outright because the runtime image omits the `yaml` module, signalling that the deployment manifest tooling cannot render Kubernetes resources as required.【dbcd19†L1-L5】
+
+Collectively, these issues demonstrate that the implementation cannot be trusted in production: the code does not pass its own tests, mandatory security controls fail to import, and previously catalogued P0 defects are outstanding.
+
+### 6.3 Recommended next steps
+
+1. **Restore a passing automated test baseline** by reintroducing the missing dependencies (`starlette`, `redis`, `psycopg`, etc.), fixing broken imports, and addressing SQLAlchemy API changes so the suite can execute end-to-end.
+2. **Close the remediation backlog** captured in the audit report, prioritising P0 defects around OMS persistence, hedging overrides, TLS enforcement, and governance logging before tackling lower-priority work.【F:docs/AUDIT_REPORT.md†L5-L76】
+3. **Document and attest compliance controls**—including USD-only market access, stop-loss enforcement, and credential segregation—once automated validations and runtime checks are green. Until these artefacts exist, the success criteria in Section 5 remain unmet.
+
+Until the items above are addressed—and verified through repeatable automation—Aether_2 should **not** be promoted to production.
