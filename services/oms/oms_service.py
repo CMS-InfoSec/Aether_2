@@ -158,17 +158,20 @@ except Exception:  # pragma: no cover - provide lightweight fallbacks when unava
 
     class _SimModeRepositoryStub:
         def __init__(self) -> None:
-            self._status = SimpleNamespace(
-                active=False,
-                reason=None,
-                ts=datetime.now(timezone.utc),
-            )
+            self._statuses: Dict[str, SimpleNamespace] = {}
 
-        def get_status(self, *, use_cache: bool = True) -> SimpleNamespace:  # type: ignore[override]
-            return self._status
+        def get_status(self, account_id: str, *, use_cache: bool = True) -> SimpleNamespace:  # type: ignore[override]
+            if account_id not in self._statuses:
+                self._statuses[account_id] = SimpleNamespace(
+                    account_id=account_id,
+                    active=False,
+                    reason=None,
+                    ts=datetime.now(timezone.utc),
+                )
+            return self._statuses[account_id]
 
-        async def get_status_async(self, *, use_cache: bool = True) -> SimpleNamespace:  # type: ignore[override]
-            return self.get_status(use_cache=use_cache)
+        async def get_status_async(self, account_id: str, *, use_cache: bool = True) -> SimpleNamespace:  # type: ignore[override]
+            return self.get_status(account_id, use_cache=use_cache)
 
     sim_mode_broker = _SimModeBrokerStub()
     sim_mode_repository = _SimModeRepositoryStub()
@@ -947,9 +950,9 @@ class AccountContext:
 
 
     async def _is_simulation_active(self) -> bool:
-        if sim_mode_state.active:
+        if sim_mode_state.is_active(self.account_id):
             return True
-        status = await self._sim_mode_repo.get_status_async()
+        status = await self._sim_mode_repo.get_status_async(self.account_id)
         return status.active
 
 
