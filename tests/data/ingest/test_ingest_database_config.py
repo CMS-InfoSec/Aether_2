@@ -30,7 +30,7 @@ def _disable_optional_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     real_find_spec = importlib.util.find_spec
 
     def _guarded_find_spec(name: str, package: str | None = None):  # type: ignore[override]
-        if name in {"pandas", "numpy", "feast"}:
+        if name in {"pandas", "numpy", "feast", "requests", "aiohttp"}:
             return None
         return real_find_spec(name, package)
 
@@ -41,6 +41,8 @@ def _disable_optional_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
         "numpy.random",
         "numpy.random._pickle",
         "feast",
+        "requests",
+        "aiohttp",
     ):
         sys.modules.pop(module_name, None)
 

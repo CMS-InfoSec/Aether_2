@@ -19,17 +19,68 @@ import os
 import subprocess
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path, PurePosixPath
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-import numpy as np
-import pandas as pd
-import torch
-from sqlalchemy import text
-from sqlalchemy.engine import Engine
-from sqlalchemy.engine import create_engine as create_sqlalchemy_engine
-from torch import Tensor, nn
-from torch.utils.data import DataLoader, Dataset
+try:  # pragma: no cover - SQLAlchemy is optional in lightweight environments.
+    from sqlalchemy import text
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.engine import create_engine as create_sqlalchemy_engine
+except Exception as import_exc:  # pragma: no cover - exercised via tests when missing.
+    Engine = Any  # type: ignore[assignment]
+
+    def text(query: str) -> str:  # type: ignore[override]
+        return query
+
+    def create_sqlalchemy_engine(*args: Any, **kwargs: Any):  # type: ignore[override]
+        raise MissingDependencyError("SQLAlchemy is required for Timescale access") from import_exc
+
+if TYPE_CHECKING:  # pragma: no cover - imported only for static analysis.
+    import numpy as np
+    import pandas as pd
+    from torch import Tensor, nn
+    from torch.utils.data import DataLoader
+else:  # pragma: no cover - runtime placeholders when optional deps are absent.
+    np = None  # type: ignore[assignment]
+    pd = None  # type: ignore[assignment]
+    Tensor = Any  # type: ignore[assignment]
+    nn = Any  # type: ignore[assignment]
+    DataLoader = Any  # type: ignore[assignment]
+
+
+class MissingDependencyError(RuntimeError):
+    """Raised when optional ML training dependencies are unavailable."""
+
+
+@lru_cache(maxsize=1)
+def _require_numpy():
+    try:
+        import numpy as numpy_module  # type: ignore import-not-found
+    except ModuleNotFoundError as exc:  # pragma: no cover - exercised via tests
+        raise MissingDependencyError("numpy is required for the ML training workflow") from exc
+    return numpy_module
+
+
+@lru_cache(maxsize=1)
+def _require_pandas():
+    try:
+        import pandas as pandas_module  # type: ignore import-not-found
+    except ModuleNotFoundError as exc:  # pragma: no cover - exercised via tests
+        raise MissingDependencyError("pandas is required for the ML training workflow") from exc
+    return pandas_module
+
+
+@lru_cache(maxsize=1)
+def _require_torch():
+    try:
+        import torch as torch_module  # type: ignore import-not-found
+        from torch import nn as nn_module  # type: ignore import-not-found
+        from torch.utils.data import DataLoader as DataLoaderCls  # type: ignore import-not-found
+        from torch.utils.data import Dataset as DatasetCls  # type: ignore import-not-found
+    except ModuleNotFoundError as exc:  # pragma: no cover - exercised via tests
+        raise MissingDependencyError("torch is required for the ML training workflow") from exc
+    return torch_module, nn_module, DataLoaderCls, DatasetCls
 
 try:  # pragma: no cover - optional dependency in CI environments.
     import mlflow
@@ -249,8 +300,10 @@ def _compute_config_hash(config: TrainingJobConfig) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _format_timestamp(value: pd.Timestamp) -> Optional[str]:
-    if pd.isna(value):
+def _format_timestamp(value: "pd.Timestamp") -> Optional[str]:
+    pandas = _require_pandas()
+
+    if pandas.isna(value):
         return None
     if value.tzinfo is None:
         value = value.tz_localize(timezone.utc)
@@ -259,7 +312,7 @@ def _format_timestamp(value: pd.Timestamp) -> Optional[str]:
 
 def _build_registration_tags(
     config: TrainingJobConfig,
-    frame: pd.DataFrame,
+    frame: "pd.DataFrame",
     *,
     git_commit: Optional[str] = None,
 ) -> Dict[str, str]:
@@ -292,7 +345,8 @@ def _build_registration_tags(
 
     ts_column = config.timescale.timestamp_column
     if ts_column in frame.columns and not frame.empty:
-        timestamps = pd.to_datetime(frame[ts_column], utc=True)
+        pandas = _require_pandas()
+        timestamps = pandas.to_datetime(frame[ts_column], utc=True)
         data_from = _format_timestamp(timestamps.min())
         data_to = _format_timestamp(timestamps.max())
         if data_from:
@@ -309,7 +363,9 @@ def _build_registration_tags(
     return tags
 
 
-def _load_timescale_frame(config: TimescaleSourceConfig, engine: Optional[Engine] = None) -> pd.DataFrame:
+def _load_timescale_frame(
+    config: TimescaleSourceConfig, engine: Optional[Engine] = None
+) -> "pd.DataFrame":
     """Load the last ``lookback_days`` of data from TimescaleDB."""
 
     if not config.feature_columns:
@@ -328,19 +384,23 @@ def _load_timescale_frame(config: TimescaleSourceConfig, engine: Optional[Engine
         """
     )
     LOGGER.info("Loading features from TimescaleDB between %s and %s", start, end)
-    frame = pd.read_sql(sql, engine, params={"start": start, "end": end})
+    pandas = _require_pandas()
+    frame = pandas.read_sql(sql, engine, params={"start": start, "end": end})
     if frame.empty:
         raise RuntimeError("No data returned from TimescaleDB query")
-    frame[config.timestamp_column] = pd.to_datetime(frame[config.timestamp_column], utc=True)
+    frame[config.timestamp_column] = pandas.to_datetime(frame[config.timestamp_column], utc=True)
     return frame
 
 
-def _prepare_supervised_frame(frame: pd.DataFrame, config: TimescaleSourceConfig) -> pd.DataFrame:
+def _prepare_supervised_frame(
+    frame: "pd.DataFrame", config: TimescaleSourceConfig
+) -> "pd.DataFrame":
     """Generate forward-return labels aligned with feature timestamps."""
 
     if config.label_horizon <= 0:
         raise ValueError("label_horizon must be positive")
 
+    numpy = _require_numpy()
     working = frame.copy()
     working.sort_values([config.entity_column, config.timestamp_column], inplace=True)
 
@@ -348,17 +408,17 @@ def _prepare_supervised_frame(frame: pd.DataFrame, config: TimescaleSourceConfig
     future = grouped[config.label_column].shift(-config.label_horizon)
     base = working[config.label_column]
 
-    with np.errstate(divide="ignore", invalid="ignore"):
+    with numpy.errstate(divide="ignore", invalid="ignore"):
         returns = (future - base) / base
 
     working[_TARGET_COLUMN] = returns
-    working = working.replace([np.inf, -np.inf], np.nan)
+    working = working.replace([numpy.inf, -numpy.inf], numpy.nan)
     working = working.dropna(subset=[_TARGET_COLUMN])
     return working
 
 
 def _apply_outlier_handling(
-    frame: pd.DataFrame,
+    frame: "pd.DataFrame",
     column: str,
     config: OutlierConfig,
 ) -> pd.DataFrame:
@@ -368,9 +428,10 @@ def _apply_outlier_handling(
     if method == "none" or frame.empty:
         return frame
 
+    pandas = _require_pandas()
     lower = frame[column].quantile(config.lower_quantile)
     upper = frame[column].quantile(config.upper_quantile)
-    if pd.isna(lower) or pd.isna(upper):
+    if pandas.isna(lower) or pandas.isna(upper):
         return frame
 
     if method == "clip":
@@ -425,26 +486,28 @@ def _chronological_split(
     return train_frame, val_frame, test_frame
 
 
-def _compute_feature_set_hash(frame: pd.DataFrame, feature_columns: Sequence[str]) -> str:
+def _compute_feature_set_hash(frame: "pd.DataFrame", feature_columns: Sequence[str]) -> str:
     """Deterministically hash the feature values used for training."""
 
     subset = frame[list(feature_columns)].copy()
-    hashed = pd.util.hash_pandas_object(subset, index=False).to_numpy()
+    pandas = _require_pandas()
+    hashed = pandas.util.hash_pandas_object(subset, index=False).to_numpy()
     return hashlib.sha256(hashed.tobytes()).hexdigest()
 
 
 def _build_sequences(
-    frame: pd.DataFrame,
+    frame: "pd.DataFrame",
     config: TimescaleSourceConfig,
     sequence_length: int,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple["np.ndarray", "np.ndarray"]:
     """Convert a frame into sequences suitable for sequence models."""
 
+    numpy = _require_numpy()
     feature_columns = [col for col in config.feature_columns if col != config.label_column]
     if config.label_column in feature_columns:
         feature_columns.remove(config.label_column)
 
-    sequences: List[np.ndarray] = []
+    sequences: List["np.ndarray"] = []
     targets: List[float] = []
 
     for entity, entity_frame in frame.groupby(config.entity_column):
@@ -453,13 +516,13 @@ def _build_sequences(
             LOGGER.debug("Skipping entity %s because it has fewer than %d rows", entity, sequence_length)
             continue
 
-        features_matrix = entity_frame[feature_columns].to_numpy(dtype=np.float32)
-        labels_array = entity_frame[_TARGET_COLUMN].to_numpy(dtype=np.float32)
+        features_matrix = entity_frame[feature_columns].to_numpy(dtype=numpy.float32)
+        labels_array = entity_frame[_TARGET_COLUMN].to_numpy(dtype=numpy.float32)
 
         for idx in range(sequence_length - 1, len(entity_frame)):
             window = features_matrix[idx - sequence_length + 1 : idx + 1]
             label = labels_array[idx]
-            if np.isnan(window).any() or np.isnan(label):
+            if numpy.isnan(window).any() or numpy.isnan(label):
                 continue
             sequences.append(window)
             targets.append(float(label))
@@ -467,85 +530,89 @@ def _build_sequences(
     if not sequences:
         raise RuntimeError("Unable to construct training sequences from the provided frame")
 
-    return np.stack(sequences), np.asarray(targets, dtype=np.float32)
+    return numpy.stack(sequences), numpy.asarray(targets, dtype=numpy.float32)
 
 
 # ---------------------------------------------------------------------------
 # PyTorch dataset and models
 
 
-class SequenceDataset(Dataset):
-    """Simple dataset wrapping numpy arrays for PyTorch usage."""
+@lru_cache(maxsize=1)
+def _sequence_dataset_cls():
+    torch_module, _, _, dataset_cls = _require_torch()
+    numpy = _require_numpy()
 
-    def __init__(self, sequences: np.ndarray, targets: np.ndarray) -> None:
-        self.sequences = torch.from_numpy(sequences).float()
-        self.targets = torch.from_numpy(targets).float().unsqueeze(-1)
+    class _SequenceDataset(dataset_cls):
+        """Simple dataset wrapping numpy arrays for PyTorch usage."""
 
-    def __len__(self) -> int:  # pragma: no cover - trivial
-        return len(self.sequences)
+        def __init__(self, sequences: "np.ndarray", targets: "np.ndarray") -> None:
+            super().__init__()
+            self.sequences = torch_module.from_numpy(
+                numpy.asarray(sequences, dtype=numpy.float32)
+            ).float()
+            self.targets = torch_module.from_numpy(
+                numpy.asarray(targets, dtype=numpy.float32)
+            ).float().unsqueeze(-1)
 
-    def __getitem__(self, idx: int) -> Tuple[Tensor, Tensor]:  # pragma: no cover - trivial
-        return self.sequences[idx], self.targets[idx]
+        def __len__(self) -> int:  # pragma: no cover - trivial
+            return len(self.sequences)
 
+        def __getitem__(self, idx: int) -> Tuple[Any, Any]:  # pragma: no cover - trivial
+            return self.sequences[idx], self.targets[idx]
 
-class LSTMRegressor(nn.Module):
-    """Two-headed LSTM regressor used as a default baseline."""
-
-    def __init__(self, input_size: int, hidden_size: int, num_layers: int, dropout: float) -> None:
-        super().__init__()
-        self.lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=dropout if num_layers > 1 else 0.0,
-            batch_first=True,
-        )
-        self.dropout = nn.Dropout(dropout)
-        self.head = nn.Linear(hidden_size, 1)
-
-    def forward(self, inputs: Tensor) -> Tensor:  # pragma: no cover - straightforward
-        outputs, _ = self.lstm(inputs)
-        final_state = outputs[:, -1, :]
-        return self.head(self.dropout(final_state))
+    return _SequenceDataset
 
 
-class TransformerRegressor(nn.Module):
-    """Lightweight Transformer encoder for sequence regression."""
-
-    def __init__(self, input_size: int, hidden_size: int, num_layers: int, dropout: float) -> None:
-        super().__init__()
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=input_size,
-            nhead=max(1, input_size // 4),
-            dim_feedforward=hidden_size,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.head = nn.Linear(input_size, 1)
-
-    def forward(self, inputs: Tensor) -> Tensor:  # pragma: no cover - straightforward
-        encoded = self.encoder(inputs)
-        return self.head(encoded[:, -1, :])
-
-
-def _build_model(model_config: ModelConfig, input_size: int) -> nn.Module:
+def _build_model(model_config: ModelConfig, input_size: int) -> Any:
+    _, nn_module, _, _ = _require_torch()
     model_type = model_config.model_type.lower()
+
     if model_type == "lstm":
-        return LSTMRegressor(
-            input_size=input_size,
-            hidden_size=model_config.hidden_size,
-            num_layers=model_config.num_layers,
-            dropout=model_config.dropout,
-        )
+
+        class _LSTMRegressor(nn_module.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.lstm = nn_module.LSTM(
+                    input_size=input_size,
+                    hidden_size=model_config.hidden_size,
+                    num_layers=model_config.num_layers,
+                    dropout=model_config.dropout if model_config.num_layers > 1 else 0.0,
+                    batch_first=True,
+                )
+                self.dropout = nn_module.Dropout(model_config.dropout)
+                self.head = nn_module.Linear(model_config.hidden_size, 1)
+
+            def forward(self, inputs: Any) -> Any:  # pragma: no cover - straightforward
+                outputs, _ = self.lstm(inputs)
+                final_state = outputs[:, -1, :]
+                return self.head(self.dropout(final_state))
+
+        return _LSTMRegressor()
+
     if model_type == "transformer":
-        return TransformerRegressor(
-            input_size=input_size,
-            hidden_size=model_config.hidden_size,
-            num_layers=model_config.num_layers,
-            dropout=model_config.dropout,
-        )
-    raise ValueError(f"Unsupported model_type '{model_config.model_type}'. Choose 'lstm' or 'transformer'.")
+
+        class _TransformerRegressor(nn_module.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                encoder_layer = nn_module.TransformerEncoderLayer(
+                    d_model=input_size,
+                    nhead=max(1, input_size // 4),
+                    dim_feedforward=model_config.hidden_size,
+                    dropout=model_config.dropout,
+                    batch_first=True,
+                )
+                self.encoder = nn_module.TransformerEncoder(encoder_layer, num_layers=model_config.num_layers)
+                self.head = nn_module.Linear(input_size, 1)
+
+            def forward(self, inputs: Any) -> Any:  # pragma: no cover - straightforward
+                encoded = self.encoder(inputs)
+                return self.head(encoded[:, -1, :])
+
+        return _TransformerRegressor()
+
+    raise ValueError(
+        f"Unsupported model_type '{model_config.model_type}'. Choose 'lstm' or 'transformer'."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -558,7 +625,8 @@ def _annualisation_factor(frequency_minutes: int = 15) -> float:
     return math.sqrt(periods_per_year)
 
 
-def _compute_sharpe(returns: np.ndarray) -> float:
+def _compute_sharpe(returns: "np.ndarray") -> float:
+    numpy = _require_numpy()
     if returns.size < 2:
         return 0.0
     std = returns.std(ddof=1)
@@ -567,7 +635,8 @@ def _compute_sharpe(returns: np.ndarray) -> float:
     return _annualisation_factor() * returns.mean() / std
 
 
-def _compute_sortino(returns: np.ndarray) -> float:
+def _compute_sortino(returns: "np.ndarray") -> float:
+    numpy = _require_numpy()
     if returns.size < 2:
         return 0.0
     negative = returns[returns < 0]
@@ -579,29 +648,32 @@ def _compute_sortino(returns: np.ndarray) -> float:
     return _annualisation_factor() * returns.mean() / downside_std
 
 
-def _compute_max_drawdown(returns: np.ndarray) -> float:
+def _compute_max_drawdown(returns: "np.ndarray") -> float:
+    numpy = _require_numpy()
     if returns.size == 0:
         return 0.0
-    cumulative = np.cumsum(returns)
-    running_max = np.maximum.accumulate(cumulative)
+    cumulative = numpy.cumsum(returns)
+    running_max = numpy.maximum.accumulate(cumulative)
     drawdowns = cumulative - running_max
     return float(drawdowns.min())
 
 
-def _compute_cvar(returns: np.ndarray, alpha: float = 0.95) -> float:
+def _compute_cvar(returns: "np.ndarray", alpha: float = 0.95) -> float:
+    numpy = _require_numpy()
     if returns.size == 0:
         return 0.0
-    threshold = np.quantile(returns, 1 - alpha)
+    threshold = numpy.quantile(returns, 1 - alpha)
     tail_losses = returns[returns <= threshold]
     if tail_losses.size == 0:
         return threshold
     return float(tail_losses.mean())
 
 
-def _evaluate_strategy(predictions: np.ndarray, targets: np.ndarray) -> Dict[str, float]:
+def _evaluate_strategy(predictions: "np.ndarray", targets: "np.ndarray") -> Dict[str, float]:
+    numpy = _require_numpy()
     if predictions.shape != targets.shape:
         raise ValueError("Predictions and targets must have the same shape")
-    strategy_returns = np.sign(predictions) * targets
+    strategy_returns = numpy.sign(predictions) * targets
     metrics = {
         "sharpe": _compute_sharpe(strategy_returns),
         "sortino": _compute_sortino(strategy_returns),
@@ -617,15 +689,16 @@ def _evaluate_strategy(predictions: np.ndarray, targets: np.ndarray) -> Dict[str
 
 
 def _train_model(
-    model: nn.Module,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
+    model: Any,
+    train_loader: Any,
+    val_loader: Any,
     config: TrainingConfig,
-    device: torch.device,
-) -> Tuple[nn.Module, List[float]]:
+    device: Any,
+) -> Tuple[Any, List[float]]:
+    torch_module, nn_module, _, _ = _require_torch()
     model.to(device)
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(
+    criterion = nn_module.MSELoss()
+    optimizer = torch_module.optim.Adam(
         model.parameters(),
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
@@ -648,7 +721,7 @@ def _train_model(
 
         model.eval()
         val_loss = 0.0
-        with torch.no_grad():
+        with torch_module.no_grad():
             for batch_features, batch_targets in val_loader:
                 batch_features = batch_features.to(device)
                 batch_targets = batch_targets.to(device)
@@ -662,15 +735,17 @@ def _train_model(
     return model, history
 
 
-def _predict(model: nn.Module, data_loader: DataLoader, device: torch.device) -> np.ndarray:
+def _predict(model: Any, data_loader: Any, device: Any) -> "np.ndarray":
+    torch_module, _, _, _ = _require_torch()
+    numpy = _require_numpy()
     model.eval()
-    predictions: List[np.ndarray] = []
-    with torch.no_grad():
+    predictions: List["np.ndarray"] = []
+    with torch_module.no_grad():
         for batch_features, _ in data_loader:
             batch_features = batch_features.to(device)
             outputs = model(batch_features)
             predictions.append(outputs.cpu().numpy().reshape(-1))
-    return np.concatenate(predictions)
+    return numpy.concatenate(predictions)
 
 
 # ---------------------------------------------------------------------------
@@ -816,10 +891,14 @@ def run_training_job(
     config: TrainingJobConfig,
     *,
     engine: Optional[Engine] = None,
-    override_frame: Optional[pd.DataFrame] = None,
+    override_frame: Optional["pd.DataFrame"] = None,
 ) -> Dict[str, float]:
     """Execute the full workflow and return evaluation metrics."""
 
+    _require_pandas()
+    _require_numpy()
+    torch_module, _, data_loader_cls, _ = _require_torch()
+    dataset_cls = _sequence_dataset_cls()
     raw_frame = override_frame if override_frame is not None else _load_timescale_frame(config.timescale, engine)
     supervised = _prepare_supervised_frame(raw_frame, config.timescale)
     supervised = _apply_outlier_handling(supervised, _TARGET_COLUMN, config.outliers)
@@ -834,18 +913,24 @@ def run_training_job(
     if len(val_sequences) == 0 or len(test_sequences) == 0:
         raise RuntimeError("Validation and test splits must contain at least one sequence")
 
-    train_dataset = SequenceDataset(train_sequences, train_targets)
-    val_dataset = SequenceDataset(val_sequences, val_targets)
-    test_dataset = SequenceDataset(test_sequences, test_targets)
+    train_dataset = dataset_cls(train_sequences, train_targets)
+    val_dataset = dataset_cls(val_sequences, val_targets)
+    test_dataset = dataset_cls(test_sequences, test_targets)
 
-    train_loader = DataLoader(train_dataset, batch_size=config.training.batch_size, shuffle=True, drop_last=False)
-    val_loader = DataLoader(val_dataset, batch_size=config.training.batch_size, shuffle=False, drop_last=False)
-    test_loader = DataLoader(test_dataset, batch_size=config.training.batch_size, shuffle=False, drop_last=False)
+    train_loader = data_loader_cls(
+        train_dataset, batch_size=config.training.batch_size, shuffle=True, drop_last=False
+    )
+    val_loader = data_loader_cls(
+        val_dataset, batch_size=config.training.batch_size, shuffle=False, drop_last=False
+    )
+    test_loader = data_loader_cls(
+        test_dataset, batch_size=config.training.batch_size, shuffle=False, drop_last=False
+    )
 
     input_size = train_sequences.shape[-1]
     model = _build_model(config.model, input_size)
 
-    device = torch.device(config.training.device)
+    device = torch_module.device(config.training.device)
     model, history = _train_model(model, train_loader, val_loader, config.training, device)
 
     predictions = _predict(model, test_loader, device)
@@ -862,7 +947,7 @@ def run_training_job(
     }
 
     buffer = io.BytesIO()
-    torch.save(model.state_dict(), buffer)
+    torch_module.save(model.state_dict(), buffer)
     artifacts[f"{run_prefix}/model.pt"] = buffer.getvalue()
 
     artifact_locations = _write_artifacts(artifacts, config.artifacts)
@@ -1017,12 +1102,13 @@ def _build_config(args: argparse.Namespace) -> TrainingJobConfig:
         sequence_length=args.sequence_length,
     )
 
+    torch_module, _, _, _ = _require_torch()
     training = TrainingConfig(
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         epochs=args.epochs,
         weight_decay=args.weight_decay,
-        device="cuda" if torch.cuda.is_available() else "cpu",
+        device="cuda" if torch_module.cuda.is_available() else "cpu",
     )
 
     thresholds = MetricThresholds(
