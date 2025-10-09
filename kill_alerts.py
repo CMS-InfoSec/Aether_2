@@ -8,9 +8,15 @@ import json
 import logging
 import os
 from datetime import datetime
-from typing import Callable, Dict, List, Mapping, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Sequence
 
-import requests
+try:  # pragma: no cover - optional dependency import
+    import requests as _REQUESTS_MODULE  # type: ignore[import-not-found]
+except Exception as exc:  # pragma: no cover - exercised via optional-dependency tests
+    _REQUESTS_MODULE = None
+    _REQUESTS_IMPORT_ERROR = exc
+else:  # pragma: no cover - trivial
+    _REQUESTS_IMPORT_ERROR = None
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +29,19 @@ class NotificationDispatchError(RuntimeError):
         self.failed = dict(failures)
         failure_list = ", ".join(f"{name}: {exc}" for name, exc in self.failed.items()) or "unknown"
         super().__init__(f"Failed to dispatch notifications for: {failure_list}")
+
+
+class MissingDependencyError(RuntimeError):
+    """Raised when required optional dependencies are unavailable."""
+
+
+def _require_requests() -> Any:
+    """Return the :mod:`requests` module or raise a helpful error."""
+
+    if _REQUESTS_MODULE is None:
+        message = "requests is required for kill switch notifications"
+        raise MissingDependencyError(message) from _REQUESTS_IMPORT_ERROR
+    return _REQUESTS_MODULE
 
 
 def _require_env(key: str) -> str:
@@ -77,7 +96,8 @@ def _send_email(payload: Dict[str, object]) -> None:
         "custom_args": payload,
     }
 
-    response = requests.post(
+    requests_module = _require_requests()
+    response = requests_module.post(
         endpoint,
         headers={
             "Authorization": f"Bearer {api_key}",
@@ -109,7 +129,8 @@ def _send_sms(payload: Dict[str, object]) -> None:
         reason_code=payload["reason_code"],
     )
 
-    response = requests.post(
+    requests_module = _require_requests()
+    response = requests_module.post(
         endpoint,
         data={
             "To": to_number,
@@ -134,7 +155,8 @@ def _send_webhook(payload: Dict[str, object]) -> None:
     body = json.dumps(payload, sort_keys=True).encode("utf-8")
     signature = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
 
-    response = requests.post(
+    requests_module = _require_requests()
+    response = requests_module.post(
         url,
         data=body,
         headers={

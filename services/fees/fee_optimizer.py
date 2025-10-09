@@ -14,7 +14,10 @@ from decimal import Decimal, ROUND_HALF_UP
 import logging
 from typing import Sequence
 
-import httpx
+try:  # pragma: no cover - httpx is optional in the test environment
+    import httpx
+except ModuleNotFoundError:  # pragma: no cover - provide a stub when dependency missing
+    httpx = None  # type: ignore[assignment]
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -206,6 +209,13 @@ class FeeOptimizer:
         }
 
         url = self._build_policy_signal_url(self._policy_service_url, self._policy_path)
+
+        if httpx is None:
+            LOGGER.debug(  # pragma: no cover - dependency is intentionally optional
+                "httpx is unavailable; skipping policy notification for account %s",
+                account_id,
+            )
+            return
 
         try:
             with httpx.Client(timeout=self._policy_timeout) as client:

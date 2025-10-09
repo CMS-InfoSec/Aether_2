@@ -19,8 +19,15 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Iterator, List, Optional, Sequence, Tuple
 
-import numpy as np
-import pandas as pd
+try:  # Optional dependency – enforced at runtime.
+    import numpy as np
+except Exception:  # pragma: no cover - executed when numpy is unavailable.
+    np = None  # type: ignore[assignment]
+
+try:  # Optional dependency – enforced at runtime.
+    import pandas as pd
+except Exception:  # pragma: no cover - executed when pandas is unavailable.
+    pd = None  # type: ignore[assignment]
 
 try:  # Optional dependency – enforced at runtime.
     import lightgbm as lgb
@@ -44,11 +51,15 @@ try:  # Optional dependency – enforced at runtime.
     import psycopg
     from psycopg.rows import dict_row
 except Exception:  # pragma: no cover - executed when psycopg is unavailable.
-    psycopg = None  # type: ignore
-    dict_row = None  # type: ignore
+    psycopg = None  # type: ignore[assignment]
+    dict_row = None  # type: ignore[assignment]
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+class MissingDependencyError(RuntimeError):
+    """Raised when auto feature discovery dependencies are unavailable."""
 
 
 @dataclass(frozen=True)
@@ -91,13 +102,21 @@ class FeatureDiscoveryEngine:
 
     def __init__(self, config: FeatureDiscoveryConfig) -> None:
         self.config = config
-        if psycopg is None:  # pragma: no cover - enforced in runtime environments.
-            raise RuntimeError(
+        if psycopg is None or dict_row is None:  # pragma: no cover - runtime guard.
+            raise MissingDependencyError(
                 "psycopg is required for auto feature discovery but is not installed."
             )
-        if lgb is None:  # pragma: no cover - enforced in runtime environments.
-            raise RuntimeError(
+        if lgb is None:  # pragma: no cover - runtime guard.
+            raise MissingDependencyError(
                 "LightGBM is required for auto feature discovery but is not installed."
+            )
+        if pd is None:  # pragma: no cover - runtime guard.
+            raise MissingDependencyError(
+                "pandas is required for auto feature discovery but is not installed."
+            )
+        if np is None:  # pragma: no cover - runtime guard.
+            raise MissingDependencyError(
+                "numpy is required for auto feature discovery but is not installed."
             )
         self._ensure_support_tables()
 

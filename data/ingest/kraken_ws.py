@@ -2,6 +2,7 @@
 """Async consumers for Kraken WebSocket market data."""
 from __future__ import annotations
 
+from __future__ import annotations
 
 import asyncio
 import datetime as dt
@@ -13,10 +14,60 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Dict, List, Sequence
 
-import aiohttp
-from sqlalchemy import BigInteger, Column, DateTime, JSON, MetaData, Numeric, String, Table
-from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.engine import Engine, create_engine
+
+class MissingDependencyError(RuntimeError):
+    """Raised when optional ingest dependencies are unavailable."""
+
+
+try:  # pragma: no cover - optional dependency
+    import aiohttp
+except Exception as exc:  # pragma: no cover - executed when aiohttp missing
+    aiohttp = None  # type: ignore[assignment]
+    _AIOHTTP_IMPORT_ERROR = exc
+else:
+    _AIOHTTP_IMPORT_ERROR = None
+
+_SQLALCHEMY_AVAILABLE = True
+_SQLALCHEMY_IMPORT_ERROR: Exception | None = None
+
+try:  # pragma: no cover - optional dependency
+    from sqlalchemy import BigInteger, Column, DateTime, JSON, MetaData, Numeric, String, Table
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from sqlalchemy.engine import Engine, create_engine
+except Exception as exc:  # pragma: no cover - executed when SQLAlchemy absent
+    _SQLALCHEMY_AVAILABLE = False
+    _SQLALCHEMY_IMPORT_ERROR = exc
+else:
+    if not hasattr(Table, "c"):
+        _SQLALCHEMY_AVAILABLE = False
+        _SQLALCHEMY_IMPORT_ERROR = RuntimeError("SQLAlchemy table metadata is unavailable")
+
+if not _SQLALCHEMY_AVAILABLE:
+    BigInteger = Column = DateTime = JSON = Numeric = String = Table = None  # type: ignore[assignment]
+    Engine = Any  # type: ignore[assignment]
+
+    def create_engine(*_: object, **__: object) -> None:  # type: ignore[override]
+        raise MissingDependencyError("SQLAlchemy is required for Kraken ingest") from _SQLALCHEMY_IMPORT_ERROR
+
+    def pg_insert(*_: object, **__: object) -> None:  # type: ignore[override]
+        raise MissingDependencyError("SQLAlchemy is required for Kraken ingest") from _SQLALCHEMY_IMPORT_ERROR
+
+    metadata = None
+    orderbook_events_table = None
+else:
+    metadata = MetaData()
+    orderbook_events_table = Table(
+        "orderbook_events",
+        metadata,
+        Column("symbol", String(32), primary_key=True),
+        Column("ts", DateTime(timezone=True), primary_key=True),
+        Column("side", String(4), primary_key=True),
+        Column("price", Numeric(28, 10), primary_key=True),
+        Column("size", Numeric(28, 10), nullable=False),
+        Column("action", String(16), nullable=False),
+        Column("sequence", BigInteger, nullable=True),
+        Column("meta", JSON, nullable=True),
+    )
 
 from shared.postgres import normalize_sqlalchemy_dsn
 
@@ -32,6 +83,17 @@ except ImportError:  # pragma: no cover - optional dependency
 
 LOGGER = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+def _require_aiohttp() -> None:
+    if aiohttp is None:  # pragma: no cover - executed when aiohttp missing
+        raise MissingDependencyError("aiohttp is required for Kraken ingest") from _AIOHTTP_IMPORT_ERROR
+
+
+def _require_sqlalchemy() -> None:
+    if not _SQLALCHEMY_AVAILABLE or metadata is None or orderbook_events_table is None:
+        raise MissingDependencyError("SQLAlchemy is required for Kraken ingest") from _SQLALCHEMY_IMPORT_ERROR
+
 
 KRAKEN_WS_URL = os.getenv("KRAKEN_WS_URL", "wss://ws.kraken.com")
 KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
@@ -68,20 +130,6 @@ DATABASE_URL = _resolve_database_url()
 NATS_SERVERS = os.getenv("NATS_SERVERS", "nats://localhost:4222").split(",")
 NATS_SUBJECT = os.getenv("NATS_SUBJECT", "marketdata.kraken.orderbook")
 
-metadata = MetaData()
-orderbook_events_table = Table(
-    "orderbook_events",
-    metadata,
-    Column("symbol", String(32), primary_key=True),
-    Column("ts", DateTime(timezone=True), primary_key=True),
-    Column("side", String(4), primary_key=True),
-    Column("price", Numeric(28, 10), primary_key=True),
-    Column("size", Numeric(28, 10), nullable=False),
-    Column("action", String(16), nullable=False),
-    Column("sequence", BigInteger, nullable=True),
-    Column("meta", JSON, nullable=True),
-)
-
 
 @dataclass
 class OrderBookEvent:
@@ -103,6 +151,7 @@ def kafka_producer() -> Producer | None:
 
 
 async def subscribe(session: aiohttp.ClientSession, pairs: Sequence[str]) -> aiohttp.ClientWebSocketResponse:
+    _require_aiohttp()
     LOGGER.info("Connecting to Kraken WebSocket", extra={"url": KRAKEN_WS_URL, "pairs": pairs})
     ws = await session.ws_connect(KRAKEN_WS_URL)
     subscribe_message = {
@@ -169,6 +218,7 @@ def datetime_from_kraken(timestamp: Any) -> dt.datetime:
 
 
 def persist_updates(engine: Engine, updates: Sequence[OrderBookEvent]) -> None:
+    _require_sqlalchemy()
     if not updates:
         return
     with engine.begin() as connection:
@@ -246,6 +296,8 @@ async def publish_to_nats(updates: Sequence[OrderBookEvent]) -> None:
 
 
 async def consume(pairs: Sequence[str]) -> None:
+    _require_sqlalchemy()
+    _require_aiohttp()
     engine = create_engine(DATABASE_URL, future=True)
     producer = kafka_producer()
     async with aiohttp.ClientSession() as session:

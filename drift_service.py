@@ -12,13 +12,34 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
-import psycopg2
-from fastapi import Depends, FastAPI, HTTPException, status
-from fastapi.responses import PlainTextResponse
+from typing import TYPE_CHECKING
+
+try:  # pragma: no cover - optional dependency for database access.
+    import psycopg2  # type: ignore[import-not-found]
+    from psycopg2 import errors, sql  # type: ignore[attr-defined]
+    from psycopg2.extras import RealDictCursor  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover - dependency might be unavailable in tests.
+    psycopg2 = None  # type: ignore[assignment]
+
+    class _ErrorsModule:  # pragma: no cover - executed only without psycopg2.
+        class UndefinedTable(Exception):
+            """Stand-in error matching psycopg2's UndefinedTable."""
+
+        class UndefinedColumn(Exception):
+            """Stand-in error matching psycopg2's UndefinedColumn."""
+
+    errors = _ErrorsModule()  # type: ignore[assignment]
+    sql = None  # type: ignore[assignment]
+    RealDictCursor = None  # type: ignore[assignment]
+
+from fastapi import Depends, FastAPI, HTTPException, Response, status
 from pydantic import BaseModel, Field
-from psycopg2 import errors, sql
-from psycopg2.extras import RealDictCursor
 from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, Gauge, generate_latest
+
+if TYPE_CHECKING:  # pragma: no cover - imported for static type checking only.
+    from psycopg2.extensions import connection as TimescaleConnection
+else:  # pragma: no cover - runtime fallback when psycopg2 is absent.
+    TimescaleConnection = Any  # type: ignore[assignment]
 
 from services.common.config import get_timescale_session
 from services.common.security import require_admin_account
@@ -140,8 +161,14 @@ app = FastAPI(title="Drift Monitoring Service", version="1.0.0")
 # ---------------------------------------------------------------------------
 
 
-def _connect() -> psycopg2.extensions.connection:
+def _connect() -> TimescaleConnection:
     """Create a connection to the TimescaleDB instance with the account schema."""
+
+    if psycopg2 is None or sql is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Timescale database driver is not available",
+        )
 
     conn = psycopg2.connect(TIMESCALE.dsn)
     conn.autocommit = True
@@ -156,6 +183,12 @@ def _connect() -> psycopg2.extensions.connection:
 
 def _ensure_tables() -> None:
     """Create the required tables when the service starts."""
+
+    if psycopg2 is None:
+        LOGGER.warning(
+            "Skipping drift table creation because psycopg2 is not installed"
+        )
+        return
 
     create_results_stmt = """
     CREATE TABLE IF NOT EXISTS drift_results (
@@ -243,6 +276,12 @@ def _perform_daily_checks() -> None:
 @app.on_event("startup")
 async def _on_startup() -> None:
     _ensure_tables()
+    if psycopg2 is None:
+        LOGGER.warning(
+            "Drift monitoring background loop disabled because psycopg2 is missing"
+        )
+        return
+
     global _daily_task
     if _daily_task is None or _daily_task.done():
         loop = asyncio.get_running_loop()
@@ -395,7 +434,7 @@ def _ks_statistic(values_a: Sequence[float], values_b: Sequence[float]) -> Tuple
 # ---------------------------------------------------------------------------
 
 
-def _fetch_latest_features(conn: psycopg2.extensions.connection) -> Dict[str, List[float]]:
+def _fetch_latest_features(conn: TimescaleConnection) -> Dict[str, List[float]]:
     """Load the most recent offline feature snapshot from TimescaleDB."""
 
     query = """
@@ -420,7 +459,7 @@ def _fetch_latest_features(conn: psycopg2.extensions.connection) -> Dict[str, Li
 
 
 def _fetch_reference_distribution(
-    conn: psycopg2.extensions.connection,
+    conn: TimescaleConnection,
 ) -> Dict[str, List[float]]:
     """Load the training reference distribution for each feature."""
 
@@ -451,7 +490,7 @@ def _fetch_reference_distribution(
 
 
 def _persist_results(
-    conn: psycopg2.extensions.connection,
+    conn: TimescaleConnection,
     checked_at: datetime,
     metrics: Iterable[DriftMetric],
 ) -> None:
@@ -483,7 +522,7 @@ def _persist_results(
 
 
 def _load_latest_results(
-    conn: psycopg2.extensions.connection,
+    conn: TimescaleConnection,
 ) -> Tuple[datetime | None, Dict[str, DriftMetric]]:
     """Fetch the most recent drift metrics from the persistence layer."""
 
@@ -514,7 +553,7 @@ def _load_latest_results(
 
 
 def _record_alert(
-    conn: psycopg2.extensions.connection,
+    conn: TimescaleConnection,
     *,
     triggered_at: datetime,
     action: str,
@@ -555,7 +594,7 @@ def _record_alert(
 
 
 def _fetch_recent_alerts(
-    conn: psycopg2.extensions.connection, limit: int = MAX_ALERTS_RETURNED
+    conn: TimescaleConnection, limit: int = MAX_ALERTS_RETURNED
 ) -> List[DriftAlertRecord]:
     """Retrieve the most recent drift alerts for the API endpoint."""
 
@@ -598,7 +637,7 @@ def _fetch_recent_alerts(
 
 
 def _fetch_model_performance(
-    conn: psycopg2.extensions.connection,
+    conn: TimescaleConnection,
 ) -> Dict[str, ModelPerformance]:
     """Load the latest Sharpe and Sortino ratios for each model stage."""
 
@@ -908,7 +947,7 @@ def _rollback_canary_model() -> Dict[str, Any]:
 
 
 def _evaluate_performance_and_mitigate(
-    conn: psycopg2.extensions.connection, checked_at: datetime
+    conn: TimescaleConnection, checked_at: datetime
 ) -> None:
     """Compare canary and production performance metrics and rollback if needed."""
 
@@ -950,7 +989,7 @@ def _evaluate_performance_and_mitigate(
 
 
 def _fetch_performance_history(
-    conn: psycopg2.extensions.connection, stage: str, limit: int
+    conn: TimescaleConnection, stage: str, limit: int
 ) -> List[ModelPerformance]:
     """Return the most recent ``limit`` performance entries for a stage."""
 
@@ -996,7 +1035,7 @@ def _is_metric_stable(values: Sequence[float]) -> bool:
 
 
 def _canary_ready_for_promotion(
-    conn: psycopg2.extensions.connection,
+    conn: TimescaleConnection,
 ) -> bool:
     """Determine if the canary has met stability requirements for promotion."""
 
@@ -1044,7 +1083,7 @@ def _canary_ready_for_promotion(
 
 
 def _maybe_promote_canary(
-    conn: psycopg2.extensions.connection, checked_at: datetime
+    conn: TimescaleConnection, checked_at: datetime
 ) -> None:
     """Promote a canary automatically when metrics are stable."""
 
@@ -1241,11 +1280,11 @@ def drift_alerts(caller: str = Depends(require_admin_account)) -> DriftAlertsRes
 
 
 @app.get("/metrics")
-def metrics(caller: str = Depends(require_admin_account)) -> PlainTextResponse:
+def metrics(caller: str = Depends(require_admin_account)) -> Response:
     _ensure_account_scope(caller)
 
     payload = generate_latest(REGISTRY)
-    return PlainTextResponse(payload, media_type=CONTENT_TYPE_LATEST)
+    return Response(content=payload, media_type=CONTENT_TYPE_LATEST)
 
 
 __all__ = ["app"]
