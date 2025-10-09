@@ -22,6 +22,7 @@ from shared.models.registry import get_model_registry
 from services.policy.adaptive_horizon import get_horizon
 from services.policy.model_server import predict_intent
 from shared.async_utils import dispatch_async
+from shared.health import setup_health_checks
 
 from metrics import (
     metric_context,
@@ -34,6 +35,7 @@ LOGGER = logging.getLogger(__name__)
 
 app = FastAPI(title="Policy Service")
 setup_metrics(app, service_name="policy-service")
+setup_health_checks(app, {"model_registry": get_model_registry})
 
 RouteFn = TypeVar("RouteFn", bound=Callable[..., Any])
 

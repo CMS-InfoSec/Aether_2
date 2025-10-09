@@ -70,11 +70,11 @@ def sim_mode_loader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 @pytest.mark.smoke
 def test_sim_mode_state_persists_across_restart(sim_mode_loader):
     module = sim_mode_loader()
-    status = module.sim_mode_repository.set_status(True, "integration test")
+    status = module.sim_mode_repository.set_status("company", True, "integration test")
     assert status.active is True
 
     module_after_restart = sim_mode_loader()
-    refreshed = module_after_restart.sim_mode_repository.get_status(use_cache=False)
+    refreshed = module_after_restart.sim_mode_repository.get_status("company", use_cache=False)
     assert refreshed.active is True
     assert refreshed.reason == "integration test"
 
@@ -87,12 +87,12 @@ def test_sim_mode_state_shared_across_replicas(sim_mode_loader):
     replica_a = module.SimModeRepository()
     replica_b = module.SimModeRepository()
 
-    replica_a.set_status(True, "replica-a")
-    b_status = replica_b.get_status(use_cache=False)
+    replica_a.set_status("company", True, "replica-a")
+    b_status = replica_b.get_status("company", use_cache=False)
     assert b_status.active is True
     assert b_status.reason == "replica-a"
 
-    replica_b.set_status(False, None)
-    a_status = replica_a.get_status(use_cache=False)
+    replica_b.set_status("company", False, None)
+    a_status = replica_a.get_status("company", use_cache=False)
     assert a_status.active is False
     assert a_status.reason is None

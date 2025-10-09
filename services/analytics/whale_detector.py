@@ -18,6 +18,12 @@ from typing import (
     cast,
 )
 
+try:  # pragma: no cover - metrics helper optional when FastAPI unavailable
+    from metrics import setup_metrics
+except ModuleNotFoundError:  # pragma: no cover - fallback noop when metrics module missing
+    def setup_metrics(*_: object, **__: object) -> None:
+        return None
+
 if TYPE_CHECKING:  # pragma: no cover - imported for type checking only
     from fastapi import Depends, FastAPI, Query
 else:  # pragma: no cover - runtime fallback when FastAPI is optional
@@ -286,6 +292,7 @@ class WhaleDetector:
 
 detector = WhaleDetector()
 app = FastAPI(title="Whale Detector Service", version="1.0.0")
+setup_metrics(app, service_name="whale-detector-service")
 
 
 RouteFn = TypeVar("RouteFn", bound=Callable[..., object])

@@ -9,11 +9,17 @@ type SafeModeStatusResponse = {
   actor?: string | null;
 };
 
-type SimulationStatusResponse = {
+type SimulationAccountStatus = {
+  account_id: string;
   active: boolean;
   reason?: string | null;
   since?: string | null;
   actor?: string | null;
+};
+
+type SimulationStatusEnvelope = {
+  active: boolean;
+  accounts: SimulationAccountStatus[];
 };
 
 type SafeModeAuditEntry = {
@@ -132,7 +138,7 @@ const ensureSimulationBadgeElements = () => {
   return container;
 };
 
-const updateGlobalSimulationBadge = (status: SimulationStatusResponse | null) => {
+const updateGlobalSimulationBadge = (status: SimulationStatusEnvelope | null) => {
   if (typeof document === "undefined") {
     return;
   }
@@ -161,26 +167,32 @@ const updateGlobalSimulationBadge = (status: SimulationStatusResponse | null) =>
   const detailNode = badge.querySelector<HTMLDivElement>('[data-role="detail"]');
   const metaNode = badge.querySelector<HTMLDivElement>('[data-role="meta"]');
 
+  const activeAccount =
+    status.accounts.find((account) => account.active) || status.accounts[0];
+
   if (labelNode) {
-    labelNode.textContent = "Simulation Mode Active";
+    const accountLabel = activeAccount ? ` – ${activeAccount.account_id}` : "";
+    labelNode.textContent = `Simulation Mode Active${accountLabel}`;
   }
 
   if (detailNode) {
-    if (status.reason && status.reason.trim()) {
-      detailNode.textContent = `Reason: ${status.reason.trim()}`;
-      detailNode.style.display = "block";
-    } else if (status.actor && status.actor.trim()) {
-      detailNode.textContent = `Actor: ${status.actor.trim()}`;
-      detailNode.style.display = "block";
+    const reasonText = activeAccount?.reason?.trim();
+    const actorText = activeAccount?.actor?.trim();
+    if (reasonText) {
+      detailNode.textContent = `Reason: ${reasonText}`;
+    } else if (actorText) {
+      detailNode.textContent = `Actor: ${actorText}`;
+    } else if (activeAccount) {
+      detailNode.textContent = `Account ${activeAccount.account_id} is running in simulation mode.`;
     } else {
       detailNode.textContent = "All trading activity is currently simulated.";
-      detailNode.style.display = "block";
     }
+    detailNode.style.display = "block";
   }
 
   if (metaNode) {
-    if (status.since) {
-      metaNode.textContent = `Since ${formatTimestamp(status.since)}`;
+    if (activeAccount?.since) {
+      metaNode.textContent = `Since ${formatTimestamp(activeAccount.since)}`;
       metaNode.style.display = "block";
     } else {
       metaNode.textContent = "";
@@ -212,8 +224,8 @@ const SafeModePanel: React.FC = () => {
   const [actionLoading, setActionLoading] = useState(false);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [simulationStatus, setSimulationStatus] =
-    useState<SimulationStatusResponse | null>(null);
+  const [simulationOverview, setSimulationOverview] =
+    useState<SimulationStatusEnvelope | null>(null);
   const [simulationLoading, setSimulationLoading] = useState(true);
   const [simulationError, setSimulationError] = useState<string | null>(null);
   const [simulationReason, setSimulationReason] = useState("");
@@ -221,7 +233,28 @@ const SafeModePanel: React.FC = () => {
   const [simulationMessage, setSimulationMessage] = useState<string | null>(null);
   const [simulationActionError, setSimulationActionError] =
     useState<string | null>(null);
+  const [selectedSimulationAccount, setSelectedSimulationAccount] =
+    useState<string>("");
   const { readOnly } = useAuthClaims();
+
+  const simulationAccounts = useMemo(
+    () => simulationOverview?.accounts ?? [],
+    [simulationOverview]
+  );
+
+  const selectedSimulationStatus = useMemo(() => {
+    if (simulationAccounts.length === 0) {
+      return null;
+    }
+    if (!selectedSimulationAccount) {
+      return simulationAccounts[0];
+    }
+    return (
+      simulationAccounts.find(
+        (entry) => entry.account_id === selectedSimulationAccount
+      ) || simulationAccounts[0]
+    );
+  }, [simulationAccounts, selectedSimulationAccount]);
 
   const currentStatusLabel = useMemo(() => {
     if (!status) {
@@ -291,9 +324,18 @@ const SafeModePanel: React.FC = () => {
           throw new Error(`Failed to load simulation status (${response.status})`);
         }
 
-        const payload = (await response.json()) as SimulationStatusResponse;
-        setSimulationStatus(payload);
+        const payload = (await response.json()) as SimulationStatusEnvelope;
+        setSimulationOverview(payload);
         setSimulationError(null);
+
+        if (payload.accounts.length > 0) {
+          const existing = payload.accounts.some(
+            (entry) => entry.account_id === selectedSimulationAccount
+          );
+          if (!existing) {
+            setSelectedSimulationAccount(payload.accounts[0].account_id);
+          }
+        }
       } catch (error) {
         if (signal.aborted) {
           return;
@@ -306,7 +348,7 @@ const SafeModePanel: React.FC = () => {
         }
       }
     },
-    []
+    [selectedSimulationAccount]
   );
 
   const fetchAuditTrail = useCallback(
@@ -442,8 +484,8 @@ const SafeModePanel: React.FC = () => {
   };
 
   useEffect(() => {
-    updateGlobalSimulationBadge(simulationStatus);
-  }, [simulationStatus]);
+    updateGlobalSimulationBadge(simulationOverview);
+  }, [simulationOverview]);
 
   const handleExitSafeMode = async () => {
     if (readOnly) {
@@ -497,6 +539,12 @@ const SafeModePanel: React.FC = () => {
       return;
     }
 
+    if (!selectedSimulationAccount) {
+      setSimulationActionError("Select an account to control simulation mode.");
+      setSimulationMessage(null);
+      return;
+    }
+
     if (!simulationReason.trim()) {
       setSimulationActionError("A reason is required to enter simulation mode.");
       setSimulationMessage(null);
@@ -520,7 +568,10 @@ const SafeModePanel: React.FC = () => {
       const response = await fetch("/sim/enter", {
         method: "POST",
         headers,
-        body: JSON.stringify({ reason: simulationReason.trim() }),
+        body: JSON.stringify({
+          reason: simulationReason.trim(),
+          account_id: selectedSimulationAccount,
+        }),
       });
 
       if (!response.ok) {
@@ -552,6 +603,12 @@ const SafeModePanel: React.FC = () => {
       return;
     }
 
+    if (!selectedSimulationAccount) {
+      setSimulationActionError("Select an account to control simulation mode.");
+      setSimulationMessage(null);
+      return;
+    }
+
     setSimulationActionLoading(true);
     setSimulationActionError(null);
     setSimulationMessage(null);
@@ -565,7 +622,10 @@ const SafeModePanel: React.FC = () => {
         headers["X-Actor"] = actor.trim();
       }
 
-      const response = await fetch("/sim/exit", {
+      const params = new URLSearchParams({
+        account_id: selectedSimulationAccount,
+      });
+      const response = await fetch(`/sim/exit?${params.toString()}`, {
         method: "POST",
         headers,
       });
@@ -701,6 +761,28 @@ const SafeModePanel: React.FC = () => {
             className="md:col-span-2 grid gap-4 sm:grid-cols-2"
           >
             <label className="flex flex-col text-sm font-medium text-gray-700">
+              Simulation Account
+              <select
+                value={selectedSimulationAccount}
+                onChange={(event) =>
+                  setSelectedSimulationAccount(event.target.value)
+                }
+                className="mt-1 rounded-md border border-gray-300 px-3 py-2 shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                disabled={simulationActionLoading || simulationAccounts.length === 0}
+                required
+              >
+                {simulationAccounts.length === 0 ? (
+                  <option value="">No accounts available</option>
+                ) : (
+                  simulationAccounts.map((entry) => (
+                    <option key={entry.account_id} value={entry.account_id}>
+                      {entry.account_id}
+                    </option>
+                  ))
+                )}
+              </select>
+            </label>
+            <label className="flex flex-col text-sm font-medium text-gray-700">
               Simulation Reason
               <input
                 type="text"
@@ -799,7 +881,7 @@ const SafeModePanel: React.FC = () => {
               <dd className="text-gray-900">
                 {simulationLoading
                   ? "Loading..."
-                  : simulationStatus?.active
+                  : selectedSimulationStatus?.active
                   ? "Active"
                   : "Inactive"}
               </dd>
@@ -807,15 +889,15 @@ const SafeModePanel: React.FC = () => {
             <div>
               <dt className="font-medium text-gray-600">Simulation Reason</dt>
               <dd className="text-gray-900">
-                {simulationStatus?.reason ||
+                {selectedSimulationStatus?.reason ||
                   (simulationLoading ? "Loading..." : "Not set")}
               </dd>
             </div>
             <div>
               <dt className="font-medium text-gray-600">Simulation Since</dt>
               <dd className="text-gray-900">
-                {simulationStatus?.since
-                  ? formatTimestamp(simulationStatus.since)
+                {selectedSimulationStatus?.since
+                  ? formatTimestamp(selectedSimulationStatus.since)
                   : simulationLoading
                   ? "Loading..."
                   : "N/A"}
@@ -824,8 +906,16 @@ const SafeModePanel: React.FC = () => {
             <div>
               <dt className="font-medium text-gray-600">Simulation Actor</dt>
               <dd className="text-gray-900">
-                {simulationStatus?.actor ||
+                {selectedSimulationStatus?.actor ||
                   (simulationLoading ? "Loading..." : "N/A")}
+              </dd>
+            </div>
+            <div>
+              <dt className="font-medium text-gray-600">Simulation Account</dt>
+              <dd className="text-gray-900">
+                {simulationLoading
+                  ? "Loading..."
+                  : selectedSimulationStatus?.account_id || "N/A"}
               </dd>
             </div>
           </dl>
