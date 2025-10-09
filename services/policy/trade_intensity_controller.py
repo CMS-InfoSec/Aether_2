@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Mapping, MutableMapping, Optional, Tuple
+from typing import Dict, Mapping, MutableMapping, Optional, SupportsFloat, Tuple
 
 
 @dataclass
@@ -63,7 +63,11 @@ class TradeIntensityController:
         return max(lower, min(upper, value))
 
     @staticmethod
-    def _normalize_score(raw: Optional[float], *, neutral: float = 0.5) -> float:
+    def _normalize_score(
+        raw: SupportsFloat | str | None, *, neutral: float = 0.5
+    ) -> float:
+        if raw is None:
+            return neutral
         try:
             value = float(raw)
         except (TypeError, ValueError):

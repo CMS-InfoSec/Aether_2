@@ -12,10 +12,11 @@ import time
 from collections import Counter as CollectionCounter, defaultdict, deque
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable, Deque, Dict, Iterable, Mapping, MutableMapping
+from typing import Any, Awaitable, Callable, Deque, Dict, Iterable, Mapping, MutableMapping, ParamSpec, TypeVar, cast
 
 from fastapi import FastAPI
-from pydantic import BaseModel, Field
+
+from shared.pydantic_compat import BaseModel, Field
 
 from common.schemas.contracts import IntentEvent
 from services.common.adapters import KafkaNATSAdapter
@@ -38,6 +39,18 @@ DROPPED_INTENTS_TOTAL = PrometheusCounter(
     "Total number of intents dropped by the backpressure controller.",
     ["account_id"],
 )
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+def _app_get(
+    application: FastAPI, *args: Any, **kwargs: Any
+) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
+    return cast(
+        Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]],
+        application.get(*args, **kwargs),
+    )
 
 
 def _env_int(name: str, default: int, *, minimum: int | None = None) -> int:
@@ -66,10 +79,12 @@ class BackpressureEvent(BaseModel):
     def to_payload(self) -> Dict[str, str | int]:
         """Serialise the event for transport over Kafka/NATS."""
 
-        data = self.model_dump()
-        data["type"] = "backpressure_event"
-        data["ts"] = self.ts.isoformat()
-        return data
+        return {
+            "type": "backpressure_event",
+            "account_id": self.account_id,
+            "dropped_count": self.dropped_count,
+            "ts": self.ts.isoformat(),
+        }
 
 
 async def _default_publisher(account_id: str, dropped_count: int, ts: datetime) -> None:
@@ -143,7 +158,8 @@ class PrioritizedIntentQueue(asyncio.Queue[QueueItem]):
                 return False, []
             for drop in drop_list:
                 self._queue.remove(drop)
-                self._unfinished_tasks -= 1
+                unfinished = cast(int, getattr(self, "_unfinished_tasks"))
+                setattr(self, "_unfinished_tasks", unfinished - 1)
                 dropped.append(drop)
         super().put_nowait(item)
         return True, dropped
@@ -152,7 +168,7 @@ class PrioritizedIntentQueue(asyncio.Queue[QueueItem]):
         self, candidates: Iterable[QueueItem], new_item: QueueItem
     ) -> list[QueueItem]:
         items = list(candidates)
-        excess = len(items) - self._maxsize
+        excess = len(items) - self.maxsize
         if excess <= 0:
             return []
 
@@ -195,7 +211,7 @@ class IntentBackpressure:
         self._queue: PrioritizedIntentQueue = PrioritizedIntentQueue(max_queue_size)
         self._maxsize = max_queue_size
         self._max_rate = max_rate_per_account
-        self._publisher = publisher or _default_publisher
+        self._publisher: BackpressurePublisher = publisher or _default_publisher
         self._sequence = itertools.count()
         self._queue_lock = asyncio.Lock()
         self._stats_lock = asyncio.Lock()
@@ -283,8 +299,14 @@ class IntentBackpressure:
         if isinstance(raw, str):
             mapping = {"high": 3, "medium": 2, "normal": 1, "low": 0}
             return mapping.get(raw.lower(), 1)
-        try:
+        if isinstance(raw, bool):
+            return 1 if raw else 0
+        if isinstance(raw, (int, float)):
             return max(0, int(raw))
+        if raw is None:
+            return 1
+        try:
+            return max(0, int(str(raw)))
         except (TypeError, ValueError):
             return 1
 
@@ -339,15 +361,10 @@ class IntentBackpressure:
                 self._dropped[account_id] += count
                 DROPPED_INTENTS_TOTAL.labels(account_id=account_id).inc(count)
 
-        if not self._publisher:
-            return
-
         for account_id, count in drop_counts.items():
             await self._safe_publish(account_id, count, ts)
 
     async def _safe_publish(self, account_id: str, count: int, ts: datetime) -> None:
-        if not self._publisher:
-            return
         try:
             result = self._publisher(account_id, count, ts)
             if inspect.isawaitable(result):
@@ -369,7 +386,7 @@ backpressure_controller = IntentBackpressure(
 app = FastAPI(title="Backpressure Controller", version="1.0.0")
 
 
-@app.get("/backpressure/status", response_model=BackpressureStatus)
+@_app_get(app, "/backpressure/status", response_model=BackpressureStatus)
 async def get_backpressure_status() -> BackpressureStatus:
     """Expose the backpressure queue depth and drop counters."""
 

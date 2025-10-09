@@ -56,6 +56,9 @@ class MarketDataAdapter(Protocol):
     def price_history(self, symbol: str, length: int) -> Sequence[float]:
         """Return the most recent ``length`` closing prices for ``symbol``."""
 
+    def latest_price_timestamp(self, symbol: str) -> datetime | None:
+        """Return the timestamp of the most recent price observation for ``symbol``."""
+
 
 class TimescaleMarketDataAdapter:
     """Timescale-backed implementation of :class:`MarketDataAdapter`."""
