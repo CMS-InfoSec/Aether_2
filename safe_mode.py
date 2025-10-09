@@ -28,6 +28,7 @@ from services.common.security import require_admin_account
 from common.utils.redis import create_redis_from_url
 from shared.async_utils import dispatch_async
 from shared.audit_hooks import AuditEvent, load_audit_hooks
+from shared.health import setup_health_checks
 
 
 LOGGER = logging.getLogger(__name__)
@@ -35,6 +36,14 @@ LOGGER = logging.getLogger(__name__)
 
 app = FastAPI(title="Safe Mode Service")
 setup_metrics(app, service_name="safe-mode")
+
+
+def _health_check_state_store() -> None:
+    # Ensure the controller can access the persisted safe mode snapshot.
+    controller.status()
+
+
+setup_health_checks(app, {"controller": _health_check_state_store})
 
 
 # ---------------------------------------------------------------------------
