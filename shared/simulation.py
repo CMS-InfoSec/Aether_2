@@ -90,40 +90,50 @@ class SimBroker:
 
 
 class SimModeState:
-    """Thread-safe toggle indicating whether simulation mode is active."""
+    """Thread-safe toggle tracking simulation mode per trading account."""
 
     def __init__(self) -> None:
-        self._active = False
+        self._states: dict[str, bool] = {}
         self._lock = asyncio.Lock()
 
-    @property
-    def active(self) -> bool:
-        return self._active
+    def is_active(self, account_id: str | None = None) -> bool:
+        """Return ``True`` when simulation is active for *account_id*.
 
-    def activate(self) -> None:
-        self._active = True
+        When *account_id* is ``None`` the method returns ``True`` if any
+        account currently has simulation mode enabled.
+        """
 
-    def deactivate(self) -> None:
-        self._active = False
+        if account_id is None:
+            return any(self._states.values())
+        return self._states.get(account_id, False)
 
-    async def set(self, value: bool) -> None:
+    def activate(self, account_id: str) -> None:
+        self._states[account_id] = True
+
+    def deactivate(self, account_id: str) -> None:
+        self._states[account_id] = False
+
+    async def set(self, account_id: str, value: bool) -> None:
         async with self._lock:
-            self._active = value
+            self._states[account_id] = value
 
-    async def enable(self) -> None:
-        await self.set(True)
+    async def enable(self, account_id: str) -> None:
+        await self.set(account_id, True)
 
-    async def disable(self) -> None:
-        await self.set(False)
+    async def disable(self, account_id: str) -> None:
+        await self.set(account_id, False)
 
     @contextmanager
-    def override(self, value: bool):
-        previous = self._active
-        self._active = value
+    def override(self, account_id: str, value: bool):
+        previous = self._states.get(account_id)
+        self._states[account_id] = value
         try:
             yield self
         finally:
-            self._active = previous
+            if previous is None:
+                self._states.pop(account_id, None)
+            else:
+                self._states[account_id] = previous
 
 
 sim_mode_state = SimModeState()
