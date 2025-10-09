@@ -178,6 +178,9 @@ _DB_URL = _database_url()
 _DB_URL = _database_url()
 
 
+_DB_URL = _database_url()
+
+
 def _engine_options(url: str) -> dict[str, object]:
     options: dict[str, object] = {"future": True}
     if url.startswith("sqlite://"):
@@ -238,6 +241,84 @@ else:
     @dataclass
     class UniverseWhitelist:  # type: ignore[no-redef]
         """In-memory representation of the computed trading universe."""
+
+        symbol: str
+        enabled: bool = True
+        metrics_json: Dict[str, float] = field(default_factory=dict)
+        ts: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+    @dataclass
+    class AuditLog:  # type: ignore[no-redef]
+        """In-memory audit record for manual overrides."""
+
+        symbol: str
+        enabled: bool
+        reason: str
+        id: Optional[int] = None
+        created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+    _IN_MEMORY_UNIVERSE: MutableMapping[str, UniverseWhitelist] = {}
+    _IN_MEMORY_AUDIT_LOG: List[AuditLog] = []
+    _IN_MEMORY_LOCK = RLock()
+    _NEXT_AUDIT_ID = 1
+
+    class InMemorySession:
+        """Tiny transactional layer mimicking the SQLAlchemy session API."""
+
+        def __init__(self) -> None:
+            self._closed = False
+            self._lock = _IN_MEMORY_LOCK
+            self._lock.acquire()
+
+        # ------------------------------------------------------------------
+        # Context manager support
+        # ------------------------------------------------------------------
+        def __enter__(self) -> "InMemorySession":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:  # pragma: no cover - no exceptions expected
+            self.close()
+
+        # ------------------------------------------------------------------
+        # Session API
+        # ------------------------------------------------------------------
+        def close(self) -> None:
+            if not self._closed:
+                self._closed = True
+                self._lock.release()
+
+        def get(self, model: Any, key: Any) -> Optional[Any]:
+            if model is UniverseWhitelist:
+                return _IN_MEMORY_UNIVERSE.get(str(key).upper())
+            return None
+
+        def add(self, instance: Any) -> None:
+            global _NEXT_AUDIT_ID
+            if isinstance(instance, UniverseWhitelist):
+                _IN_MEMORY_UNIVERSE[instance.symbol.upper()] = instance
+            elif isinstance(instance, AuditLog):
+                if instance.id is None:  # pragma: no cover - defensive
+                    instance.id = _NEXT_AUDIT_ID
+                    _NEXT_AUDIT_ID += 1
+                else:
+                    _NEXT_AUDIT_ID = max(_NEXT_AUDIT_ID, instance.id + 1)
+                _IN_MEMORY_AUDIT_LOG.append(instance)
+
+        def commit(self) -> None:  # pragma: no cover - commits are implicit
+            return None
+
+        def __del__(self) -> None:  # pragma: no cover - ensure locks are released
+            self.close()
+
+    Engine = Engine  # type: ignore[assignment]
+    Session = InMemorySession  # type: ignore[assignment]
+
+    def SessionLocal() -> InMemorySession:  # type: ignore[override]
+        return InMemorySession()
+
+    ENGINE = None
 
         symbol: str
         enabled: bool = True
