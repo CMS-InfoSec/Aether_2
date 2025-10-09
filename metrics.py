@@ -1055,4 +1055,5 @@ __all__ = [
     "observe_scaling_evaluation",
     "get_request_id",
     "traced_span",
+    "_REGISTRY",
 ]
