@@ -43,4 +43,4 @@ def require_spot_http(
 
         log = logger or LOGGER
         log.warning("Rejected non-spot instrument for %s", param, extra={"symbol": symbol})
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=detail) from exc
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail) from exc

@@ -659,7 +659,9 @@ def register(
             decorator = on_event(event)
             if callable(decorator):  # pragma: no branch - defensive
                 decorator(handler)
-    app.include_router(router)
+    include_router = getattr(app, "include_router", None)
+    if callable(include_router):
+        include_router(router)
     return reconciler
 
 
