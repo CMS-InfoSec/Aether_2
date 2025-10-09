@@ -197,6 +197,7 @@ from metrics import (
     record_oms_latency,
     setup_metrics,
 )
+from shared.health import setup_health_checks
 from shared.correlation import get_correlation_id
 from shared.simulation import (
     SimulatedOrder,
@@ -212,6 +213,14 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Kraken OMS Async Service")
 setup_metrics(app)
+
+
+def _health_check_impact_store() -> None:
+    if impact_store is None:
+        raise RuntimeError("impact analytics store unavailable")
+
+
+setup_health_checks(app, {"impact_store": _health_check_impact_store})
 
 
 def _log_extra(**extra: Any) -> Dict[str, Any]:

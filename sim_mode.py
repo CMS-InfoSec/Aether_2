@@ -16,12 +16,21 @@ from services.common.adapters import KafkaNATSAdapter
 from services.common.security import get_admin_accounts, require_admin_account
 from shared.sim_mode import SimModeStatus, sim_mode_repository
 from shared.audit_hooks import AuditEvent, load_audit_hooks
+from shared.health import setup_health_checks
 
 
 LOGGER = logging.getLogger("sim_mode_service")
 
 app = FastAPI(title="Simulation Mode Service", version="1.0.0")
 setup_metrics(app, service_name="sim-mode")
+
+
+def _health_check_repository() -> None:
+    if sim_mode_repository is None:
+        raise RuntimeError("sim mode repository unavailable")
+
+
+setup_health_checks(app, {"repository": _health_check_repository})
 
 
 class AccountSimModeStatus(BaseModel):

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import base64
 import importlib
-import inspect
 from typing import Any, Awaitable, Callable, Dict
 import logging
 import os
@@ -35,6 +34,7 @@ from services.alert_manager import setup_alerting
 from services.alerts.alert_dedupe import router as alert_dedupe_router, setup_alert_dedupe
 from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
 from shared.correlation import CorrelationIdMiddleware
+from shared.health import setup_health_checks
 from shared.session_config import load_session_ttl_minutes
 from scaling_controller import (
     build_scaling_controller_from_env,
@@ -214,15 +214,6 @@ def create_app(
     setup_metrics(app, service_name="admin-platform")
     app.add_middleware(CorrelationIdMiddleware)
 
-    async def _run_health_check(check: Callable[[], Awaitable[Any] | Any]) -> Dict[str, Any]:
-        try:
-            result = check()
-            if inspect.isawaitable(result):
-                await result
-            return {"status": "ok"}
-        except Exception as exc:  # pragma: no cover - surfaced via JSON payload
-            return {"status": "error", "error": str(exc)}
-
     health_checks: Dict[str, Callable[[], Awaitable[Any] | Any]] = {
         "admin_repository": lambda: admin_repository.get_by_email(
             _ADMIN_REPOSITORY_HEALTHCHECK_EMAIL
@@ -231,16 +222,7 @@ def create_app(
         "scaling_controller": lambda: scaling_controller.status,
     }
 
-    @app.get("/healthz")
-    async def healthcheck() -> dict[str, object]:  # pragma: no cover - simple I/O
-        results: dict[str, object] = {}
-        overall = "ok"
-        for name, check in health_checks.items():
-            outcome = await _run_health_check(check)
-            results[name] = outcome
-            if outcome.get("status") != "ok":
-                overall = "error"
-        return {"status": overall, "checks": results}
+    setup_health_checks(app, health_checks)
 
     def _get_auth_service() -> AuthService:
         return auth_service
