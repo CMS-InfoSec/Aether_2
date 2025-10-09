@@ -16,29 +16,128 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Tuple
 
-import numpy as np
-import optuna
-import pandas as pd
-import torch
-from torch import Tensor, nn
-from torch.utils.data import DataLoader, Dataset
 
-try:
-    import mlflow
-    import mlflow.pytorch
-except Exception as exc:  # pragma: no cover - dependency is optional in tests.
-    raise ImportError("mlflow is required to run the auto tuner") from exc
+class MissingDependencyError(RuntimeError):
+    """Raised when an optional dependency required for the tuner is unavailable."""
+
+
+def _missing_dependency(name: str) -> MissingDependencyError:
+    return MissingDependencyError(f"{name} is required for the auto tuner")
+
+
+try:  # pragma: no cover - optional in lightweight environments.
+    import numpy as _NUMPY_MODULE  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover - dependency may be absent in tests.
+    _NUMPY_MODULE = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - optional dependency when running tests.
+    import pandas as _PANDAS_MODULE  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover - dependency may be absent in tests.
+    _PANDAS_MODULE = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - torch is heavy and optional for static checks.
+    import torch as _TORCH_MODULE  # type: ignore[import-not-found]
+    from torch import nn as _TORCH_NN_MODULE  # type: ignore[import-not-found]
+    from torch.utils.data import (  # type: ignore[import-not-found]
+        DataLoader as _TORCH_DATALOADER,
+        Dataset as _TORCH_DATASET,
+    )
+except Exception:  # pragma: no cover - torch may be unavailable in tests.
+    _TORCH_MODULE = None  # type: ignore[assignment]
+    _TORCH_NN_MODULE = None  # type: ignore[assignment]
+    _TORCH_DATALOADER = None  # type: ignore[assignment]
+    _TORCH_DATASET = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - optional dependency when running unit tests.
+    import optuna as _OPTUNA_MODULE  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover - optuna may be unavailable during tests.
+    _OPTUNA_MODULE = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - mlflow is optional for unit tests.
+    import mlflow as _MLFLOW_MODULE  # type: ignore[import-not-found]
+    import mlflow.pytorch as _MLFLOW_PYTORCH_MODULE  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover - dependency may be absent in tests.
+    _MLFLOW_MODULE = None  # type: ignore[assignment]
+    _MLFLOW_PYTORCH_MODULE = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - sqlalchemy optional for lightweight environments.
+    from sqlalchemy import create_engine as _SQLALCHEMY_CREATE_ENGINE  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover - dependency may be unavailable in tests.
+    _SQLALCHEMY_CREATE_ENGINE = None  # type: ignore[assignment]
+
+if TYPE_CHECKING:  # pragma: no cover - imported for typing only.
+    import numpy as np
+    import optuna
+    import pandas as pd
+    import torch
+    from torch import Tensor
+    from torch.utils.data import DataLoader, Dataset
+else:  # pragma: no cover - runtime fallback when dependencies are missing.
+    np = None  # type: ignore[assignment]
+    optuna = None  # type: ignore[assignment]
+    pd = None  # type: ignore[assignment]
+    torch = None  # type: ignore[assignment]
+    Tensor = Any  # type: ignore[assignment]
+    DataLoader = Any  # type: ignore[assignment]
+    Dataset = object  # type: ignore[assignment]
+
+
+def _require_numpy():
+    if _NUMPY_MODULE is None:
+        raise _missing_dependency("numpy")
+    return _NUMPY_MODULE
+
+
+def _require_pandas():
+    if _PANDAS_MODULE is None:
+        raise _missing_dependency("pandas")
+    return _PANDAS_MODULE
+
+
+def _require_torch():
+    if _TORCH_MODULE is None:
+        raise _missing_dependency("torch")
+    return _TORCH_MODULE
+
+
+def _require_torch_nn():
+    if _TORCH_NN_MODULE is None:
+        raise _missing_dependency("torch")
+    return _TORCH_NN_MODULE
+
+
+def _require_torch_dataloader():
+    if _TORCH_DATALOADER is None:
+        raise _missing_dependency("torch")
+    return _TORCH_DATALOADER
+
+
+def _require_optuna():
+    if _OPTUNA_MODULE is None:
+        raise _missing_dependency("optuna")
+    return _OPTUNA_MODULE
+
+
+def _require_mlflow():
+    if _MLFLOW_MODULE is None or _MLFLOW_PYTORCH_MODULE is None:
+        raise _missing_dependency("mlflow")
+    return _MLFLOW_MODULE, _MLFLOW_PYTORCH_MODULE
+
+
+def _require_sqlalchemy():
+    if _SQLALCHEMY_CREATE_ENGINE is None:
+        raise _missing_dependency("sqlalchemy")
+    return _SQLALCHEMY_CREATE_ENGINE
+
 
 from ml.experiment_tracking.model_registry import register_model
 
-try:
-    from sqlalchemy import create_engine
-except Exception as exc:  # pragma: no cover - sqlalchemy may be optional.
-    raise ImportError(
-        "sqlalchemy is required to pull data from TimescaleDB for auto tuning"
-    ) from exc
+TorchDatasetBase = _TORCH_DATASET if _TORCH_DATASET is not None else object
+TorchModuleBase = (
+    _TORCH_NN_MODULE.Module if _TORCH_NN_MODULE is not None else object  # type: ignore[attr-defined]
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -66,36 +165,43 @@ class AutoTunerConfig:
     learning_rate_max: float = 1e-2
 
 
-class SequenceDataset(Dataset):
+class SequenceDataset(TorchDatasetBase):
     """Dataset wrapping numpy arrays for PyTorch consumption."""
 
-    def __init__(self, sequences: np.ndarray, targets: np.ndarray) -> None:
-        self.sequences = torch.from_numpy(sequences).float()
-        self.targets = torch.from_numpy(targets).float().unsqueeze(-1)
+    def __init__(self, sequences: Any, targets: Any) -> None:
+        torch_module = _require_torch()
+        numpy_module = _require_numpy()
+        sequence_array = numpy_module.asarray(sequences, dtype=numpy_module.float32)
+        target_array = numpy_module.asarray(targets, dtype=numpy_module.float32)
+        self.sequences = torch_module.from_numpy(sequence_array).float()
+        self.targets = (
+            torch_module.from_numpy(target_array).float().unsqueeze(-1)
+        )
 
     def __len__(self) -> int:  # pragma: no cover - trivial container method.
         return len(self.sequences)
 
-    def __getitem__(self, idx: int) -> Tuple[Tensor, Tensor]:  # pragma: no cover
+    def __getitem__(self, idx: int) -> Tuple[Any, Any]:  # pragma: no cover
         return self.sequences[idx], self.targets[idx]
 
 
-class LSTMRegressor(nn.Module):
+class LSTMRegressor(TorchModuleBase):
     """Simple LSTM regressor head used for tuning."""
 
     def __init__(self, input_size: int, hidden_size: int, num_layers: int, dropout: float) -> None:
-        super().__init__()
-        self.lstm = nn.LSTM(
+        nn_module = _require_torch_nn()
+        super().__init__()  # type: ignore[misc]
+        self.lstm = nn_module.LSTM(
             input_size=input_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0,
         )
-        self.dropout = nn.Dropout(dropout)
-        self.head = nn.Linear(hidden_size, 1)
+        self.dropout = nn_module.Dropout(dropout)
+        self.head = nn_module.Linear(hidden_size, 1)
 
-    def forward(self, inputs: Tensor) -> Tensor:  # pragma: no cover - straightforward
+    def forward(self, inputs: Any) -> Any:  # pragma: no cover - straightforward
         outputs, _ = self.lstm(inputs)
         last_state = outputs[:, -1, :]
         return self.head(self.dropout(last_state))
@@ -104,12 +210,12 @@ class LSTMRegressor(nn.Module):
 class SequenceCache:
     """Memoised sequence builder keyed by horizon length."""
 
-    def __init__(self, frame: pd.DataFrame, config: AutoTunerConfig) -> None:
+    def __init__(self, frame: Any, config: AutoTunerConfig) -> None:
         self.frame = frame
         self.config = config
-        self._cache: Dict[int, Tuple[np.ndarray, np.ndarray, List[str]]] = {}
+        self._cache: Dict[int, Tuple[Any, Any, List[str]]] = {}
 
-    def get(self, horizon: int) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    def get(self, horizon: int) -> Tuple[Any, Any, List[str]]:
         if horizon not in self._cache:
             self._cache[horizon] = build_sequences(
                 self.frame,
@@ -121,27 +227,32 @@ class SequenceCache:
         return self._cache[horizon]
 
 
-def fetch_timescale_frame(dsn: str, query: str, time_column: str) -> pd.DataFrame:
+def fetch_timescale_frame(dsn: str, query: str, time_column: str) -> Any:
     """Load a dataframe from TimescaleDB using the provided SQL query."""
 
+    pandas_module = _require_pandas()
+    create_engine = _require_sqlalchemy()
     engine = create_engine(dsn, pool_pre_ping=True, pool_recycle=3600)
     with engine.connect() as conn:
-        frame = pd.read_sql(query, conn)
+        frame = pandas_module.read_sql(query, conn)
     if time_column not in frame.columns:
         raise ValueError(f"Time column '{time_column}' not present in query result")
-    frame[time_column] = pd.to_datetime(frame[time_column], utc=True)
+    frame[time_column] = pandas_module.to_datetime(frame[time_column], utc=True)
     return frame.sort_values(time_column).reset_index(drop=True)
 
 
 def build_sequences(
-    frame: pd.DataFrame,
+    frame: Any,
     *,
     horizon: int,
     time_column: str,
     entity_column: str,
     target_column: str,
-) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+) -> Tuple[Any, Any, List[str]]:
     """Convert a flat dataframe into overlapping sequences for training."""
+
+    pandas_module = _require_pandas()
+    numpy_module = _require_numpy()
 
     if horizon < 1:
         raise ValueError("horizon must be >= 1")
@@ -154,14 +265,14 @@ def build_sequences(
     if not feature_columns:
         raise ValueError("The query must return at least one feature column")
 
-    sequences: List[np.ndarray] = []
+    sequences: List[Any] = []
     targets: List[float] = []
     for _, group in frame.groupby(entity_column):
         group = group.sort_values(time_column)
         if len(group) <= horizon:
             continue
-        features = group[feature_columns].to_numpy(dtype=np.float32)
-        labels = group[target_column].to_numpy(dtype=np.float32)
+        features = group[feature_columns].to_numpy(dtype=numpy_module.float32)
+        labels = group[target_column].to_numpy(dtype=numpy_module.float32)
         for start in range(0, len(group) - horizon):
             end = start + horizon
             sequences.append(features[start:end])
@@ -170,15 +281,17 @@ def build_sequences(
     if not sequences:
         raise RuntimeError("Not enough data to build sequences with the requested horizon")
 
-    sequence_array = np.stack(sequences)
-    target_array = np.asarray(targets, dtype=np.float32)
+    sequence_array = numpy_module.stack(sequences)
+    target_array = numpy_module.asarray(targets, dtype=numpy_module.float32)
     return sequence_array, target_array, feature_columns
 
 
 def split_train_validation(
-    sequences: np.ndarray, targets: np.ndarray, validation_ratio: float = 0.2
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    sequences: Any, targets: Any, validation_ratio: float = 0.2
+) -> Tuple[Any, Any, Any, Any]:
     """Split sequences into train and validation partitions."""
+
+    _require_numpy()
 
     if len(sequences) < 2:
         raise RuntimeError("Dataset too small to split into train and validation sets")
@@ -195,29 +308,35 @@ def split_train_validation(
 
 
 def train_lstm_model(
-    train_sequences: np.ndarray,
-    train_targets: np.ndarray,
-    val_sequences: np.ndarray,
-    val_targets: np.ndarray,
+    train_sequences: Any,
+    train_targets: Any,
+    val_sequences: Any,
+    val_targets: Any,
+    *,
     learning_rate: float,
     num_layers: int,
     batch_size: int,
     epochs: int,
-) -> Tuple[nn.Module, np.ndarray]:
+) -> Tuple[Any, Any]:
     """Train an LSTM model and return validation predictions."""
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch_module = _require_torch()
+    nn_module = _require_torch_nn()
+    dataloader_cls = _require_torch_dataloader()
+    numpy_module = _require_numpy()
+
+    device = torch_module.device("cuda" if torch_module.cuda.is_available() else "cpu")
     train_dataset = SequenceDataset(train_sequences, train_targets)
     val_dataset = SequenceDataset(val_sequences, val_targets)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=False)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
+    train_loader = dataloader_cls(train_dataset, batch_size=batch_size, shuffle=True, drop_last=False)
+    val_loader = dataloader_cls(val_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
 
     input_size = train_sequences.shape[-1]
     model = LSTMRegressor(input_size=input_size, hidden_size=64, num_layers=num_layers, dropout=0.1)
     model.to(device)
 
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    criterion = nn_module.MSELoss()
+    optimizer = torch_module.optim.Adam(model.parameters(), lr=learning_rate)
 
     for epoch in range(epochs):
         model.train()
@@ -235,23 +354,25 @@ def train_lstm_model(
         LOGGER.debug("Epoch %d/%d - train_loss=%.6f", epoch + 1, epochs, epoch_loss)
 
     model.eval()
-    predictions: List[np.ndarray] = []
-    with torch.no_grad():
+    predictions: List[Any] = []
+    with torch_module.no_grad():
         for batch_features, _ in val_loader:
             batch_features = batch_features.to(device)
             outputs = model(batch_features)
             predictions.append(outputs.cpu().numpy().reshape(-1))
 
-    return model, np.concatenate(predictions)
+    return model, numpy_module.concatenate(predictions)
 
 
-def compute_metrics(predictions: np.ndarray, targets: np.ndarray) -> Dict[str, float]:
+def compute_metrics(predictions: Any, targets: Any) -> Dict[str, float]:
     """Compute portfolio evaluation metrics from predictions and targets."""
+
+    numpy_module = _require_numpy()
 
     if predictions.shape != targets.shape:
         raise ValueError("Predictions and targets must have the same shape")
 
-    strategy_returns = np.sign(predictions) * targets
+    strategy_returns = numpy_module.sign(predictions) * targets
     sharpe = _compute_sharpe(strategy_returns)
     sortino = _compute_sortino(strategy_returns)
     return {"sharpe": float(sharpe), "sortino": float(sortino)}
@@ -260,7 +381,8 @@ def compute_metrics(predictions: np.ndarray, targets: np.ndarray) -> Dict[str, f
 def _annualisation_factor(frequency_minutes: int = 15) -> float:
     trading_minutes_per_year = 252 * 6.5 * 60
     periods_per_year = trading_minutes_per_year / frequency_minutes
-    return float(np.sqrt(periods_per_year))
+    numpy_module = _require_numpy()
+    return float(numpy_module.sqrt(periods_per_year))
 
 
 def _compute_sharpe(returns: np.ndarray) -> float:
@@ -334,14 +456,17 @@ def main(argv: Iterable[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     config = parse_args(argv or sys.argv[1:])
 
+    optuna_module = _require_optuna()
+    mlflow_module, mlflow_pytorch_module = _require_mlflow()
+
     LOGGER.info("Loading data from TimescaleDB using configured query")
     frame = fetch_timescale_frame(config.dsn, config.query, config.time_column)
     cache = SequenceCache(frame, config)
 
-    mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000"))
-    mlflow.set_experiment(config.experiment)
+    mlflow_module.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000"))
+    mlflow_module.set_experiment(config.experiment)
 
-    def objective(trial: optuna.Trial) -> float:
+    def objective(trial: "optuna.Trial") -> float:
         horizon = trial.suggest_int("horizon", config.horizon_min, config.horizon_max)
         num_layers = trial.suggest_int("layers", config.layers_min, config.layers_max)
         learning_rate = trial.suggest_float(
@@ -351,7 +476,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         sequences, targets, feature_columns = cache.get(horizon)
         train_seq, val_seq, train_targets, val_targets = split_train_validation(sequences, targets)
 
-        with mlflow.start_run(run_name=f"trial_{trial.number}") as run:
+        with mlflow_module.start_run(run_name=f"trial_{trial.number}") as run:
             params = {
                 "model": config.model,
                 "horizon": horizon,
@@ -361,7 +486,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 "epochs": config.epochs,
                 "feature_count": len(feature_columns),
             }
-            mlflow.log_params(params)
+            mlflow_module.log_params(params)
 
             model, val_predictions = train_lstm_model(
                 train_sequences=train_seq,
@@ -375,16 +500,16 @@ def main(argv: Iterable[str] | None = None) -> int:
             )
 
             metrics = compute_metrics(val_predictions, val_targets)
-            mlflow.log_metrics(metrics)
-            mlflow.log_metric("objective", metrics["sharpe"])
+            mlflow_module.log_metrics(metrics)
+            mlflow_module.log_metric("objective", metrics["sharpe"])
 
-            mlflow.pytorch.log_model(model.cpu(), artifact_path="model")
+            mlflow_pytorch_module.log_model(model.cpu(), artifact_path="model")
 
             trial.set_user_attr("run_id", run.info.run_id)
 
             return metrics["sharpe"]
 
-    study = optuna.create_study(direction="maximize")
+    study = optuna_module.create_study(direction="maximize")
     study.optimize(objective, n_trials=config.trials)
 
     best_trial = study.best_trial
