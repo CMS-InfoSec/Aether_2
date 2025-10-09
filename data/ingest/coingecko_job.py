@@ -8,12 +8,69 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
-from typing import Iterable, List, Mapping
+from typing import Any, Iterable, List, Mapping
 
-import requests
-from sqlalchemy import Boolean, Column, DateTime, JSON, MetaData, Numeric, String, Table
-from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.engine import Engine, create_engine
+class MissingDependencyError(RuntimeError):
+    """Raised when an optional dependency is required for CoinGecko ingest."""
+
+
+try:  # pragma: no cover - optional dependency
+    import requests
+except Exception as exc:  # pragma: no cover - executed in lightweight environments
+    requests = None  # type: ignore[assignment]
+    _REQUESTS_IMPORT_ERROR = exc
+else:
+    _REQUESTS_IMPORT_ERROR = None
+
+_SQLALCHEMY_AVAILABLE = True
+_SQLALCHEMY_IMPORT_ERROR: Exception | None = None
+
+try:  # pragma: no cover - optional dependency
+    from sqlalchemy import Boolean, Column, DateTime, JSON, MetaData, Numeric, String, Table
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from sqlalchemy.engine import Engine, create_engine
+except Exception as exc:  # pragma: no cover - executed when SQLAlchemy absent
+    _SQLALCHEMY_AVAILABLE = False
+    _SQLALCHEMY_IMPORT_ERROR = exc
+else:
+    if not hasattr(Table, "c"):
+        _SQLALCHEMY_AVAILABLE = False
+        _SQLALCHEMY_IMPORT_ERROR = RuntimeError("SQLAlchemy table metadata is unavailable")
+
+if not _SQLALCHEMY_AVAILABLE:
+    Boolean = Column = DateTime = JSON = Numeric = String = Table = None  # type: ignore[assignment]
+    Engine = Any  # type: ignore[assignment]
+
+    def create_engine(*_: object, **__: object) -> None:  # type: ignore[override]
+        raise MissingDependencyError("SQLAlchemy is required for CoinGecko ingest") from _SQLALCHEMY_IMPORT_ERROR
+
+    def pg_insert(*_: object, **__: object) -> None:  # type: ignore[override]
+        raise MissingDependencyError("SQLAlchemy is required for CoinGecko ingest") from _SQLALCHEMY_IMPORT_ERROR
+
+    metadata = None
+    whitelist_table = None
+    metrics_table = None
+else:
+    metadata = MetaData()
+    whitelist_table = Table(
+        "universe_whitelist",
+        metadata,
+        Column("asset_id", String, primary_key=True),
+        Column("as_of", DateTime(timezone=True), primary_key=True),
+        Column("source", String, nullable=False),
+        Column("approved", Boolean, nullable=False),
+        Column("metadata", JSON, nullable=False),
+    )
+    metrics_table = Table(
+        "features",
+        metadata,
+        Column("feature_name", String, primary_key=True),
+        Column("entity_id", String, primary_key=True),
+        Column("event_timestamp", DateTime(timezone=True), primary_key=True),
+        Column("value", Numeric),
+        Column("created_at", DateTime(timezone=True), nullable=False, default=dt.datetime.utcnow),
+        Column("metadata", JSON, nullable=False),
+    )
 
 from shared.postgres import normalize_sqlalchemy_dsn
 
@@ -24,6 +81,16 @@ except ImportError:  # pragma: no cover - optional dependency
 
 logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger(__name__)
+
+
+def _require_requests() -> None:
+    if requests is None:  # pragma: no cover - executed when requests missing
+        raise MissingDependencyError("requests is required for CoinGecko ingest") from _REQUESTS_IMPORT_ERROR
+
+
+def _require_sqlalchemy() -> None:
+    if not _SQLALCHEMY_AVAILABLE or metadata is None or metrics_table is None or whitelist_table is None:
+        raise MissingDependencyError("SQLAlchemy is required for CoinGecko ingest") from _SQLALCHEMY_IMPORT_ERROR
 
 COINGECKO_API = os.getenv("COINGECKO_API", "https://api.coingecko.com/api/v3")
 _SQLITE_FALLBACK_FLAG = "COINGECKO_ALLOW_SQLITE_FOR_TESTS"
@@ -58,27 +125,6 @@ DATABASE_URL = _resolve_database_url()
 WHITELIST_TOPIC = os.getenv("WHITELIST_TOPIC", "universe.whitelist")
 NATS_SERVERS = os.getenv("NATS_SERVERS", "nats://localhost:4222").split(",")
 
-metadata = MetaData()
-whitelist_table = Table(
-    "universe_whitelist",
-    metadata,
-    Column("asset_id", String, primary_key=True),
-    Column("as_of", DateTime(timezone=True), primary_key=True),
-    Column("source", String, nullable=False),
-    Column("approved", Boolean, nullable=False),
-    Column("metadata", JSON, nullable=False),
-)
-metrics_table = Table(
-    "features",
-    metadata,
-    Column("feature_name", String, primary_key=True),
-    Column("entity_id", String, primary_key=True),
-    Column("event_timestamp", DateTime(timezone=True), primary_key=True),
-    Column("value", Numeric),
-    Column("created_at", DateTime(timezone=True), nullable=False, default=dt.datetime.utcnow),
-    Column("metadata", JSON, nullable=False),
-)
-
 
 @dataclass
 class AssetMetric:
@@ -94,10 +140,15 @@ class CoinGeckoClient:
 
 
     def __init__(self, session: requests.Session | None = None) -> None:
-        self.session = session or requests.Session()
+        if session is not None:
+            self.session = session
+        else:
+            _require_requests()
+            self.session = requests.Session()
 
 
     def fetch_top_assets(self, vs_currency: str = "usd", limit: int = 100) -> List[AssetMetric]:
+        _require_requests()
         params = {
             "vs_currency": vs_currency,
             "order": "market_cap_desc",
@@ -125,6 +176,7 @@ class CoinGeckoClient:
 
 
 def upsert_metrics(engine: Engine, metrics: Iterable[AssetMetric]) -> None:
+    _require_sqlalchemy()
     metrics_list = list(metrics)
     if not metrics_list:
         LOGGER.info('No CoinGecko metrics to persist')
@@ -158,6 +210,7 @@ def upsert_metrics(engine: Engine, metrics: Iterable[AssetMetric]) -> None:
 
 
 def publish_whitelist(engine: Engine, assets: Iterable[AssetMetric]) -> List[Mapping[str, object]]:
+    _require_sqlalchemy()
     asset_list = list(assets)
     whitelist_records: List[Mapping[str, object]] = []
     if not asset_list:

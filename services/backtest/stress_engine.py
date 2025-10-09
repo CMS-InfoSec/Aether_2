@@ -9,34 +9,122 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from numbers import Number
-from typing import Any, Dict, Iterable, Mapping
+from threading import RLock
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Mapping, MutableMapping, Tuple
 
-import numpy as np
-import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import Column, DateTime, Float, MetaData, String, Table, create_engine, func
-from sqlalchemy.engine import Engine
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session, sessionmaker
 
-from backtest_engine import (
-    Backtester,
-    ExamplePolicy,
-    FeeSchedule,
-    flash_crash,
-    liquidity_halt,
-    spread_widen,
-)
+_NUMPY_ERROR: Exception | None
+try:  # pragma: no cover - optional dependency in lightweight environments
+    import numpy as _NUMPY_MODULE  # type: ignore[assignment]
+except Exception as exc:  # pragma: no cover - exercised only when numpy is missing
+    _NUMPY_MODULE = None
+    _NUMPY_ERROR = exc
+else:  # pragma: no cover - trivial happy path
+    _NUMPY_ERROR = None
+
+_PANDAS_ERROR: Exception | None
+try:  # pragma: no cover - optional dependency in lightweight environments
+    import pandas as _PANDAS_MODULE  # type: ignore[assignment]
+except Exception as exc:  # pragma: no cover - exercised only when pandas is missing
+    _PANDAS_MODULE = None
+    _PANDAS_ERROR = exc
+else:  # pragma: no cover - trivial happy path
+    _PANDAS_ERROR = None
+
+if TYPE_CHECKING:  # pragma: no cover - used for static analysis only
+    import numpy as np  # type: ignore
+    import pandas as pd  # type: ignore
+
+
+class MissingDependencyError(RuntimeError):
+    """Raised when a required third-party dependency is unavailable."""
+
+
+def _require_numpy() -> Any:
+    if _NUMPY_MODULE is None:
+        raise MissingDependencyError(
+            "numpy is required for stress testing functionality"
+        ) from _NUMPY_ERROR
+    return _NUMPY_MODULE
+
+
+def _require_pandas() -> Any:
+    if _PANDAS_MODULE is None:
+        raise MissingDependencyError(
+            "pandas is required for stress testing functionality"
+        ) from _PANDAS_ERROR
+    return _PANDAS_MODULE
+
+
+def _require_backtest_engine() -> None:
+    if Backtester is None or ExamplePolicy is None or FeeSchedule is None:
+        message = "backtest engine dependencies are unavailable"
+        if _BACKTEST_IMPORT_ERROR is not None:
+            message = f"backtest engine is unavailable: {_BACKTEST_IMPORT_ERROR}"
+        raise MissingDependencyError(message) from _BACKTEST_IMPORT_ERROR
+    if flash_crash is None or spread_widen is None or liquidity_halt is None:
+        message = "stress scenario helpers are unavailable"
+        raise MissingDependencyError(message) from _BACKTEST_IMPORT_ERROR
+
+
+_SQLALCHEMY_ERROR: Exception | None = None
+_SQLALCHEMY_AVAILABLE = True
+try:  # pragma: no cover - exercised only when SQLAlchemy is present
+    from sqlalchemy import Column, DateTime, Float, MetaData, String, Table, create_engine, func
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.exc import SQLAlchemyError
+    from sqlalchemy.orm import Session, sessionmaker
+except Exception as exc:  # pragma: no cover - executed when SQLAlchemy is missing
+    _SQLALCHEMY_AVAILABLE = False
+    _SQLALCHEMY_ERROR = exc
+    Column = DateTime = Float = MetaData = String = Table = object  # type: ignore[assignment]
+    Engine = Any  # type: ignore[assignment]
+    Session = Any  # type: ignore[assignment]
+
+    class SQLAlchemyError(Exception):  # type: ignore[override]
+        """Placeholder exception used when SQLAlchemy is unavailable."""
+
+    def create_engine(*_: Any, **__: Any) -> Engine:  # type: ignore[override]
+        raise MissingDependencyError("SQLAlchemy is required for stress test persistence") from exc
+
+    def func() -> None:  # type: ignore[override]
+        raise MissingDependencyError("SQLAlchemy is required for stress test persistence") from exc
+
 from services.common.config import TimescaleSession, get_timescale_session
-
-try:  # pragma: no cover - optional dependency in some environments
-    from backtest_engine import _generate_synthetic_events
-except ImportError:  # pragma: no cover - defensive guard when module unavailable
-    _generate_synthetic_events = None  # type: ignore[assignment]
 
 
 LOGGER = logging.getLogger(__name__)
+
+_IN_MEMORY_REPOSITORIES: MutableMapping[Tuple[str, str | None], list[Dict[str, Any]]] = {}
+_IN_MEMORY_LOCK = RLock()
+
+_BACKTEST_IMPORT_ERROR: Exception | None = None
+_generate_synthetic_events = None
+try:  # pragma: no cover - optional dependency tree includes numpy/pandas
+    from backtest_engine import (
+        Backtester,
+        ExamplePolicy,
+        FeeSchedule,
+        flash_crash,
+        liquidity_halt,
+        spread_widen,
+    )
+    try:  # pragma: no cover - helper absent in some builds
+        from backtest_engine import _generate_synthetic_events as _backtester_generate
+    except Exception:  # pragma: no cover - fallback path when helper missing
+        _backtester_generate = None
+    else:  # pragma: no cover - executed when helper import succeeds
+        _generate_synthetic_events = _backtester_generate
+except Exception as exc:  # pragma: no cover - exercised when scientific stack is missing
+    _BACKTEST_IMPORT_ERROR = exc
+    Backtester = None  # type: ignore[assignment]
+    ExamplePolicy = None  # type: ignore[assignment]
+    FeeSchedule = None  # type: ignore[assignment]
+    flash_crash = liquidity_halt = spread_widen = None  # type: ignore[assignment]
+else:  # pragma: no cover - trivial happy path
+    _BACKTEST_IMPORT_ERROR = None
 
 DEFAULT_SYMBOL = "BTC/USD"
 DEFAULT_YEARS = 1
@@ -74,7 +162,32 @@ class StressTestRepository:
 
     def __init__(self, session: TimescaleSession) -> None:
         self._session_cfg = session
-        self._engine: Engine = create_engine(session.dsn, pool_pre_ping=True, future=True)
+        self._in_memory_store: list[Dict[str, Any]] | None = None
+
+        def _activate_in_memory_store(reason: str) -> None:
+            key = (session.dsn, session.account_schema)
+            with _IN_MEMORY_LOCK:
+                store = _IN_MEMORY_REPOSITORIES.get(key)
+                if store is None:
+                    store = []
+                    _IN_MEMORY_REPOSITORIES[key] = store
+            self._in_memory_store = store
+            LOGGER.warning("%s; using in-memory stress test repository for %s", reason, session.dsn)
+
+        if not _SQLALCHEMY_AVAILABLE:
+            _activate_in_memory_store("SQLAlchemy unavailable")
+            return
+
+        try:
+            self._engine = create_engine(session.dsn, pool_pre_ping=True, future=True)
+        except MissingDependencyError:
+            _activate_in_memory_store("SQLAlchemy engine unavailable")
+            return
+        except Exception:
+            LOGGER.warning("Failed to initialise SQLAlchemy engine; falling back to memory store", exc_info=True)
+            _activate_in_memory_store("SQLAlchemy engine initialisation failed")
+            return
+
         self._Session = sessionmaker(bind=self._engine, expire_on_commit=False, future=True)
         metadata = MetaData(schema=session.account_schema)
         self._table = Table(
@@ -95,6 +208,12 @@ class StressTestRepository:
             "pnl_impact": result.pnl_impact,
             "ts": result.timestamp,
         }
+
+        if self._in_memory_store is not None:
+            with _IN_MEMORY_LOCK:
+                self._in_memory_store.append(payload)
+            return
+
         try:
             with self._Session() as db:  # type: Session
                 db.execute(self._table.insert(), [payload])
@@ -129,6 +248,9 @@ class PortfolioStressEngine:
     # Public API
     # ------------------------------------------------------------------
     def run(self, scenario: StressScenario) -> StressTestResult:
+        _require_numpy()
+        _require_pandas()
+        _require_backtest_engine()
         backtester = self._build_backtester()
         base_events = [dict(event) for event in backtester.base_events]
         base_metrics = self._normalise_metrics(backtester.run_with_events(base_events))
@@ -154,6 +276,7 @@ class PortfolioStressEngine:
     # Internal helpers
     # ------------------------------------------------------------------
     def _build_backtester(self) -> Backtester:
+        _require_backtest_engine()
         bars, books = self._synthetic_events()
         policy = ExamplePolicy(seed=self._seed)
         fee_schedule = FeeSchedule(maker=0.0002, taker=0.0007)
@@ -173,11 +296,13 @@ class PortfolioStressEngine:
         return _generate_synthetic_events(self.symbol, self.years, seed=self._seed)
 
     def _fallback_events(self) -> tuple[Iterable[Mapping[str, Any]], Iterable[Mapping[str, Any]]]:
-        timeline = pd.date_range(
-            end=pd.Timestamp.utcnow(), periods=max(self.years * 365 * 24, 48), freq="h"
+        pandas = _require_pandas()
+        numpy = _require_numpy()
+        timeline = pandas.date_range(
+            end=pandas.Timestamp.utcnow(), periods=max(self.years * 365 * 24, 48), freq="h"
         )
         price = 20_000.0
-        rng = np.random.default_rng(self._seed)
+        rng = numpy.random.default_rng(self._seed)
         bars = []
         books = []
         for ts in timeline:
@@ -218,6 +343,7 @@ class PortfolioStressEngine:
         return bars, books
 
     def _apply_scenario(self, scenario: StressScenario, events: Iterable[Mapping[str, Any]]) -> Iterable[Mapping[str, Any]]:
+        _require_backtest_engine()
         mapping = {
             StressScenario.FLASH_CRASH: lambda payload: flash_crash(payload, drop=0.20, depth_factor=0.5),
             StressScenario.SPREAD_WIDEN: lambda payload: spread_widen(payload, widen_bps=125.0),
@@ -272,6 +398,11 @@ def run_stress(
 ) -> StressTestResponse:
     try:
         result = engine.run(scenario)
+    except MissingDependencyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
     except HTTPException:
         raise
     except Exception as exc:  # pragma: no cover - runtime errors depend on Backtester data

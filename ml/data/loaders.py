@@ -12,9 +12,19 @@ import contextlib
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
-import pandas as pd
+try:  # pragma: no cover - optional dependency for dataframe handling
+    import pandas as pd
+except Exception:  # pragma: no cover - triggered only when pandas is absent
+    pd = None  # type: ignore[assignment]
+
+if TYPE_CHECKING:  # pragma: no cover - used only for static analysis
+    from pandas import DataFrame as _PandasDataFrame
+
+    DataFrameType = _PandasDataFrame
+else:  # pragma: no cover - executed at runtime when pandas may be missing
+    DataFrameType = Any
 
 try:  # Optional dependency – the loader still works without Feast installed.
     from feast import FeatureStore
@@ -24,9 +34,29 @@ except Exception:  # pragma: no cover - executed only when Feast is unavailable.
 try:
     import psycopg
 except Exception:  # pragma: no cover - executed only when psycopg is unavailable.
-    psycopg = None  # type: ignore
+    psycopg = None  # type: ignore[assignment]
 
 LOGGER = logging.getLogger(__name__)
+
+
+class MissingDependencyError(RuntimeError):
+    """Raised when a required third-party dependency is unavailable."""
+
+
+def _require_pandas() -> None:
+    """Ensure pandas is available before performing dataframe operations."""
+
+    if pd is None:
+        raise MissingDependencyError("pandas is required for data loading functionality")
+
+
+def _require_psycopg() -> None:
+    """Ensure psycopg is present before connecting to TimescaleDB."""
+
+    if psycopg is None:
+        raise MissingDependencyError(
+            "psycopg is required for TimescaleDB feature retrieval"
+        )
 
 
 @dataclass(frozen=True)
@@ -86,8 +116,8 @@ class FeastFeatureView:
 class DataSlice:
     """Container for a single walk-forward slice."""
 
-    features: pd.DataFrame
-    labels: pd.DataFrame
+    features: DataFrameType
+    labels: DataFrameType
     metadata: Dict[str, datetime]
 
 
@@ -140,18 +170,16 @@ class TimescaleFeastDataLoader(BaseWalkForwardDataLoader):
         entity_id_column: str = "entity_id",
     ) -> None:
         super().__init__(splits)
+        _require_pandas()
+        _require_psycopg()
         self.connection_str = connection_str
         self.timescale_query = timescale_query
         self.feast_repo_path = feast_repo_path
         self.label_feature_view = label_feature_view
         self.entity_id_column = entity_id_column
         if label_feature_view and FeatureStore is None:
-            raise ImportError(
-                "Feast is required for loading labels but is not installed."
-            )
-        if psycopg is None:
-            raise ImportError(
-                "psycopg is required for TimescaleDB connections but is not installed."
+            raise MissingDependencyError(
+                "Feast is required for loading labels but is not installed"
             )
 
     def _build_slice(self, split: WalkForwardSplit) -> DataSlice:
@@ -166,7 +194,9 @@ class TimescaleFeastDataLoader(BaseWalkForwardDataLoader):
         }
         return DataSlice(features=features, labels=labels, metadata=metadata)
 
-    def _load_features(self, start: datetime, end: datetime) -> pd.DataFrame:
+    def _load_features(self, start: datetime, end: datetime) -> DataFrameType:
+        _require_pandas()
+        _require_psycopg()
         LOGGER.debug("Loading TimescaleDB features between %s and %s", start, end)
         sql = self.timescale_query.build_sql(start, end)
         with psycopg.connect(self.connection_str) as conn:
@@ -175,7 +205,8 @@ class TimescaleFeastDataLoader(BaseWalkForwardDataLoader):
         df = df.sort_index()
         return df
 
-    def _load_labels(self, start: datetime, end: datetime) -> pd.DataFrame:
+    def _load_labels(self, start: datetime, end: datetime) -> DataFrameType:
+        _require_pandas()
         if not self.label_feature_view or FeatureStore is None:
             LOGGER.debug("Feast label view not configured. Returning empty labels.")
             return pd.DataFrame(
@@ -204,6 +235,7 @@ class TimescaleFeastDataLoader(BaseWalkForwardDataLoader):
         return feature_data
 
     def _distinct_entities(self) -> List[str]:
+        _require_psycopg()
         sql = (
             f"SELECT DISTINCT {self.timescale_query.entity_col} "
             f"FROM {self.timescale_query.table}"
@@ -220,13 +252,14 @@ class InMemoryDataLoader(BaseWalkForwardDataLoader):
 
     def __init__(
         self,
-        features: pd.DataFrame,
-        labels: pd.DataFrame,
+        features: DataFrameType,
+        labels: DataFrameType,
         splits: Iterable[WalkForwardSplit],
         entity_id_column: str = "entity_id",
         timestamp_column: str = "event_timestamp",
     ) -> None:
         super().__init__(splits)
+        _require_pandas()
         self.features = features.set_index([entity_id_column, timestamp_column])
         self.labels = labels.set_index([entity_id_column, timestamp_column])
 
