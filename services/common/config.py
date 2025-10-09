@@ -166,11 +166,21 @@ def _resolve_timescale_dsn(account_id: str) -> str:
         return normalized
 
     if _allow_test_fallbacks():
+        state_dir = Path(os.getenv("AETHER_STATE_DIR", ".aether_state"))
+        try:
+            state_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:  # pragma: no cover - defensive guard for unwritable paths
+            raise RuntimeError(
+                "Timescale DSN is not configured and the default state directory is unusable"
+            ) from exc
+
+        fallback_path = state_dir / f"timescale_{account_id}.sqlite"
         logger.warning(
-            "Timescale DSN for account '%s' is not configured; using in-memory sqlite fallback for tests.",
+            "Timescale DSN for account '%s' is not configured; using local sqlite fallback at %s.",
             account_id,
+            fallback_path,
         )
-        return "sqlite:///:memory:"
+        return f"sqlite+pysqlite:///{fallback_path}"
 
     raise RuntimeError(
         "Timescale DSN is not configured. Set TIMESCALE_DSN or "
