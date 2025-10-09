@@ -268,6 +268,13 @@ class Request:
         self.client = SimpleNamespace(host=None, port=None)
         self._scope = scope
         self._receive = receive
+        self._body: Any = None
+
+    def set_body(self, body: Any) -> None:
+        self._body = body
+
+    def json(self) -> Any:
+        return self._body
 
 
 class Response:
@@ -642,7 +649,11 @@ def _to_json_compatible(value: Any) -> Any:
 
 def _dump_response_payload(value: Any) -> Any:
     if hasattr(value, "model_dump"):
-        return _to_json_compatible(value.model_dump())
+        try:
+            dumped = value.model_dump(exclude_none=True)  # type: ignore[call-arg]
+        except TypeError:
+            dumped = value.model_dump()
+        return _to_json_compatible(dumped)
     if hasattr(value, "dict"):
         try:
             return _to_json_compatible(value.dict())
@@ -840,20 +851,20 @@ class TestClient:
             self._lifespan_cm = lifespan_factory(self.app)
             enter = getattr(self._lifespan_cm, "__aenter__", None)
             if enter is not None:
-                _run_async(enter())
+                _run_async(lambda: enter())
         for handler in self.app.event_handlers.get("startup", []):
-            _run_async(handler())
+            _run_async(lambda: handler())
         self._entered = True
 
     def _shutdown(self, exc_type=None, exc=None, tb=None) -> None:
         if not self._entered:
             return
         for handler in reversed(self.app.event_handlers.get("shutdown", [])):
-            _run_async(handler())
+            _run_async(lambda: handler())
         if self._lifespan_cm is not None:
             exit_ = getattr(self._lifespan_cm, "__aexit__", None)
             if exit_ is not None:
-                _run_async(exit_(exc_type, exc, tb))
+                _run_async(lambda: exit_(exc_type, exc, tb))
         self._lifespan_cm = None
         self._entered = False
 
@@ -908,10 +919,14 @@ class TestClient:
         request = self._build_request(headers=headers, params=params, path_params=path_params)
         request.url = SimpleNamespace(path=_normalize_path(path))
         request.method = method
+        if hasattr(request, "set_body"):
+            request.set_body(body)
+        else:  # pragma: no cover - compatibility guard for patched requests
+            setattr(request, "_body", body)
 
         try:
             payload = _run_async(
-                _call_endpoint(
+                lambda: _call_endpoint(
                     self.app,
                     route.endpoint,
                     request=request,
@@ -1105,20 +1120,29 @@ class TestClient:
         return self._handle_call(normalized_method, url, json=json, headers=headers, params=params)
 
 
-def _run_async(coro: Any) -> Any:
+def _run_async(factory: Callable[[], Any]) -> Any:
     import asyncio
 
-    if not asyncio.iscoroutine(coro):
-        return coro
+    def _resolve() -> Any:
+        return factory()
+
+    candidate = _resolve()
+    if not asyncio.iscoroutine(candidate):
+        return candidate
     try:
-        return asyncio.run(coro)
+        return asyncio.run(candidate)
     except RuntimeError:
         new_loop = asyncio.new_event_loop()
         try:
-            return new_loop.run_until_complete(coro)
+            candidate = _resolve()
+            if asyncio.iscoroutine(candidate):
+                return new_loop.run_until_complete(candidate)
+            return candidate
         finally:
-            new_loop.run_until_complete(new_loop.shutdown_asyncgens())
-            new_loop.close()
+            try:
+                new_loop.run_until_complete(new_loop.shutdown_asyncgens())
+            finally:
+                new_loop.close()
 
 
 def _install_fastapi_module() -> None:
