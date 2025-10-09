@@ -39,7 +39,7 @@ from services.common.security import require_admin_account
 from services.common.spot import require_spot_http
 from services.models.model_server import get_active_model
 from shared.spot import is_spot_symbol, normalize_spot_symbol
-from shared import trade_logging
+from shared import hedge_logging, trade_logging
 
 if TYPE_CHECKING:  # pragma: no cover - import only for type checking
     import pandas  # noqa: F401
@@ -799,6 +799,76 @@ def _normalize_datetime(value: datetime | str | None) -> datetime | None:
     return value.astimezone(timezone.utc)
 
 
+def _build_hedge_history(rows: Sequence[Mapping[str, Any]]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    history: list[dict[str, Any]] = []
+    risk_scores: list[float] = []
+    drawdowns: list[float] = []
+    total_delta = 0.0
+
+    for row in rows:
+        timestamp = _normalize_datetime(row.get("timestamp"))
+        iso_timestamp = timestamp.isoformat() if timestamp else row.get("timestamp")
+        target = _maybe_float(row.get("target_allocation"))
+        previous = _maybe_float(row.get("previous_allocation"))
+        delta = _maybe_float(row.get("delta_usd"))
+        quantity = _maybe_float(row.get("quantity"))
+        price = _maybe_float(row.get("price"))
+        risk_score = _maybe_float(row.get("risk_score"))
+        drawdown = _maybe_float(row.get("drawdown_pct"))
+        atr = _maybe_float(row.get("atr"))
+        realized_vol = _maybe_float(row.get("realized_vol"))
+        side_raw = (row.get("side") or "").strip().lower()
+
+        if not side_raw:
+            if delta is None or delta == 0:
+                side = "hold"
+            elif delta > 0:
+                side = "buy"
+            else:
+                side = "sell"
+        else:
+            side = side_raw
+
+        entry = {
+            "timestamp": iso_timestamp,
+            "side": side,
+            "target_allocation": target,
+            "previous_allocation": previous,
+            "delta_usd": delta,
+            "quantity": quantity,
+            "price": price,
+            "risk_score": risk_score,
+            "drawdown_pct": drawdown,
+            "atr": atr,
+            "realized_vol": realized_vol,
+            "order_id": row.get("order_id") or None,
+        }
+        history.append(entry)
+
+        if risk_score is not None:
+            risk_scores.append(risk_score)
+        if drawdown is not None:
+            drawdowns.append(drawdown)
+        if delta is not None:
+            total_delta += delta
+
+    summary = {
+        "entries": len(history),
+        "last_rebalanced_at": history[-1]["timestamp"] if history else None,
+        "current_allocation": history[-1]["target_allocation"] if history else None,
+        "previous_allocation": history[-1]["previous_allocation"] if history else None,
+        "last_delta_usd": history[-1]["delta_usd"] if history else None,
+        "last_side": history[-1]["side"] if history else None,
+        "last_risk_score": history[-1]["risk_score"] if history else None,
+        "last_drawdown_pct": history[-1]["drawdown_pct"] if history else None,
+        "average_risk_score": (sum(risk_scores) / len(risk_scores)) if risk_scores else None,
+        "max_drawdown_pct": max(drawdowns) if drawdowns else None,
+        "total_notional_delta": total_delta if history else None,
+    }
+
+    return summary, history
+
+
 @app.get("/reports/trades")
 def download_trade_history(
     account_id: str = Query(..., description="Logical trading account identifier"),
@@ -832,6 +902,42 @@ def download_trade_history(
         },
     )
     return Response(content=payload, media_type="text/csv", headers=headers)
+
+
+@app.get("/reports/hedge")
+def get_hedge_report(
+    account_id: str = Query(..., description="Logical trading account identifier"),
+    start: datetime | None = Query(None, description="Inclusive ISO-8601 start timestamp"),
+    end: datetime | None = Query(None, description="Inclusive ISO-8601 end timestamp"),
+    caller: str = Depends(require_admin_account),
+) -> JSONResponse:
+    """Return hedge rebalance history and summary statistics."""
+
+    _ensure_caller_matches_account(caller, account_id)
+
+    start_utc = _normalize_datetime(start)
+    end_utc = _normalize_datetime(end)
+    rows = hedge_logging.read_hedge_log(account_id=account_id, start=start_utc, end=end_utc)
+    summary, history = _build_hedge_history(rows)
+
+    LOGGER.info(
+        "Hedge report generated",
+        extra={
+            "account_id": account_id,
+            "entries": summary["entries"],
+            "current_allocation": summary.get("current_allocation"),
+            "window_start": start_utc.isoformat() if start_utc else None,
+            "window_end": end_utc.isoformat() if end_utc else None,
+        },
+    )
+
+    return JSONResponse(
+        {
+            "account_id": account_id,
+            "summary": summary,
+            "history": history,
+        }
+    )
 
 
 @app.get("/reports/trade_explain")
