@@ -151,10 +151,40 @@ Aether_2 is an autonomous AI-driven trading platform designed to operate exclusi
 
 ## 6. Production Readiness Assessment
 
-The requirements above describe what is needed for production readiness, but the current repository state does not yet demonstrate that those conditions have been met. In particular:
+The specification above describes the target end state, but the current repository still diverges materially from those expectations. Direct inspection of the codebase and the automated test suite surfaces critical gaps that must be resolved before the platform can be considered production-ready.
 
-- No verification artifacts (integration or end-to-end test results, deployment manifests, or operational runbooks) are present to prove that the services satisfy the success criteria.
-- Several critical safeguards—including simulation isolation, governance logging, and hedging controls—lack documented implementation details or validation evidence.
-- There is no compliance attestation confirming that only Kraken spot USD pairs are enabled in live trading environments.
+### 6.1 Implementation evidence snapshot
 
-Consequently, based on the available information, Aether_2 should **not** be considered ready for production operations. Additional engineering work, validation, and compliance review are required before live deployment.
+| Capability | Observation | Evidence | Status |
+|------------|-------------|----------|--------|
+| Spot-market scope | The simulated broker normalizes instruments to Kraken spot symbols and rejects anything that is not recognised as spot, protecting both live and simulated order flow. | `SimBroker` enforces `is_spot_symbol` when placing orders.【F:services/oms/sim_broker.py†L82-L156】 | ✅ Implemented in code |
+| USD trading universe | Default configuration seeds only USD-quoted assets (BTC, ETH, SOL and USD stablecoins), aligning with the spot-only charter. | Stablecoin monitor and diversification buckets list USD pairs exclusively.【F:config/system.yaml†L1-L29】 | ✅ Implemented in config |
+| Risk exits | The exit rule engine builds stop-loss, take-profit, and trailing-stop orders for every eligible entry, but the behaviour currently lacks automated regression coverage. | Exit orchestration logic registers mandatory protective orders.【F:services/risk/exit_rules.py†L82-L133】 | ⚠️ Implementation exists; validation missing |
+| Account-scoped secrets | Helm values expect three dedicated Kraken secret mounts (company, director-1, director-2), ensuring credentials remain isolated per account. | Deployment values map each account to its own Kubernetes secret reference.【F:deploy/helm/aether-platform/values.yaml†L1-L53】 | ⚠️ Deployment contract defined; runtime verification pending |
+
+### 6.2 Blocking gaps observed
+
+* **Automated testing is failing catastrophically.** A fresh run of the test suite (`pytest -q`) aborts during collection with import errors, missing dependencies, incompatible SQLAlchemy usage, and 92 total errors, demonstrating that the repository cannot currently validate its behaviour.
+
+  ```text
+  $ pytest -q
+  E   ImportError: cannot import name 'get_timescale_session' from 'services.common.config'
+  E   ImportError: cannot import name 'ensure_admin_access' from 'services.common.security'
+  ...
+  E   AttributeError: '_SelectStatement' object has no attribute 'limit'
+  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! Interrupted: 92 errors during collection !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  ```
+
+* **Security middleware regressions prevent admin enforcement.** `services/common/security.py` references `cast` from `typing` but never imports it, causing the module import to fail and knocking out `ensure_admin_access`, MFA checks, and other administrative guards relied upon by multiple services.【F:services/common/security.py†L1-L156】
+* **Simulation-mode persistence is incompatible with the current SQLAlchemy version.** The repository calls `.limit(1)` on a 2.x style `Select` object, which raises during import and prevents safe-mode toggles from loading, violating the simulation safety requirement.【F:shared/sim_mode.py†L225-L256】
+* **Existing audit findings remain unresolved.** The remediation task board documents P0 issues spanning database adapters, hedging safeguards, TLS enforcement, and observability; none of these fixes are present, leaving critical requirements unmet.【F:docs/AUDIT_REPORT.md†L1-L76】
+
+Collectively, these issues demonstrate that the implementation cannot be trusted in production: the code does not pass its own tests, mandatory security controls fail to import, and previously catalogued P0 defects are outstanding.
+
+### 6.3 Recommended next steps
+
+1. **Restore a passing automated test baseline** by reintroducing the missing dependencies (`starlette`, `redis`, `psycopg`, etc.), fixing broken imports, and addressing SQLAlchemy API changes so the suite can execute end-to-end.
+2. **Close the remediation backlog** captured in the audit report, prioritising P0 defects around OMS persistence, hedging overrides, TLS enforcement, and governance logging before tackling lower-priority work.【F:docs/AUDIT_REPORT.md†L5-L76】
+3. **Document and attest compliance controls**—including USD-only market access, stop-loss enforcement, and credential segregation—once automated validations and runtime checks are green. Until these artefacts exist, the success criteria in Section 5 remain unmet.
+
+Until the items above are addressed—and verified through repeatable automation—Aether_2 should **not** be promoted to production.
