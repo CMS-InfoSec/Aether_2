@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import csv
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -95,3 +95,67 @@ def test_override_trade_logger_restores_previous(tmp_path: Path) -> None:
         assert len(custom.entries) == 1
 
     assert trade_logging.get_trade_logger() is default
+
+
+def test_trade_logger_exposes_journal_path(tmp_path: Path) -> None:
+    log_path = tmp_path / "journal.csv"
+    logger = trade_logging.TradeLogger(path=log_path)
+
+    assert logger.path == log_path
+
+
+def test_read_trade_log_filters_account_and_window(tmp_path: Path) -> None:
+    log_path = tmp_path / "journal.csv"
+    logger = trade_logging.TradeLogger(path=log_path)
+    start = datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)
+    second = start + timedelta(hours=1)
+    third = start + timedelta(hours=2)
+
+    logger.log(
+        trade_logging.TradeLogEntry(
+            timestamp=start,
+            account_id="alpha",
+            client_order_id="cid-1",
+            exchange_order_id="ex-1",
+            symbol="BTC/USD",
+            side="buy",
+            quantity=Decimal("1"),
+            price=Decimal("20000"),
+            pnl=Decimal("10"),
+        )
+    )
+    logger.log(
+        trade_logging.TradeLogEntry(
+            timestamp=second,
+            account_id="beta",
+            client_order_id="cid-2",
+            exchange_order_id="ex-2",
+            symbol="ETH/USD",
+            side="sell",
+            quantity=Decimal("2"),
+            price=Decimal("3000"),
+            pnl=Decimal("-5"),
+        )
+    )
+    logger.log(
+        trade_logging.TradeLogEntry(
+            timestamp=third,
+            account_id="alpha",
+            client_order_id="cid-3",
+            exchange_order_id="ex-3",
+            symbol="ETH/USD",
+            side="buy",
+            quantity=Decimal("0.5"),
+            price=Decimal("2500"),
+            pnl=Decimal("4"),
+        )
+    )
+
+    rows = trade_logging.read_trade_log(
+        account_id="alpha",
+        start=start + timedelta(minutes=30),
+        end=third + timedelta(minutes=1),
+        path=log_path,
+    )
+
+    assert [row["client_order_id"] for row in rows] == ["cid-3"]

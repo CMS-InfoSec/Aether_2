@@ -7,11 +7,11 @@ import logging
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from pathlib import Path
 from threading import Lock
-from typing import Dict, Iterator, Optional
+from typing import Dict, Iterator, List, Optional
 
 
 logger = logging.getLogger("trade.journal")
@@ -106,6 +106,12 @@ class TradeLogger:
         self._path = resolved if resolved is not None else _DEFAULT_LOG_PATH
         self._lock = Lock()
 
+    @property
+    def path(self) -> Path:
+        """Return the CSV journal path backing this logger."""
+
+        return self._path
+
     def log(self, entry: TradeLogEntry) -> None:
         payload = entry.as_dict()
         logger.info("trade.executed", extra={"trade": payload})
@@ -143,9 +149,96 @@ def override_trade_logger(logger_instance: TradeLogger) -> Iterator[TradeLogger]
         _TRADE_LOGGER = previous
 
 
+TRADE_LOG_COLUMNS: tuple[str, ...] = tuple(_CSV_FIELDS)
+
+
+def _normalize_bound(value: date | datetime | None, *, default_time: time) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        dt = datetime.combine(value, default_time)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt
+
+
+def _parse_timestamp(raw: str | None) -> Optional[datetime]:
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    else:
+        parsed = parsed.astimezone(timezone.utc)
+    return parsed
+
+
+def iter_trade_log_rows(
+    *,
+    account_id: str | None = None,
+    start: date | datetime | None = None,
+    end: date | datetime | None = None,
+    path: Path | None = None,
+) -> Iterator[Dict[str, str]]:
+    """Yield trade journal rows filtered by account and time window."""
+
+    if path is None:
+        path = get_trade_logger().path
+
+    if not path.exists():
+        return iter(())
+
+    normalized_account = account_id.lower() if account_id else None
+    start_dt = _normalize_bound(start, default_time=time.min)
+    end_dt = _normalize_bound(end, default_time=time.max)
+
+    def _generator() -> Iterator[Dict[str, str]]:
+        with path.open("r", newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames is None:
+                return
+
+            for row in reader:
+                record = {field: row.get(field, "") for field in _CSV_FIELDS}
+                if normalized_account and record.get("account_id", "").lower() != normalized_account:
+                    continue
+
+                timestamp = _parse_timestamp(record.get("timestamp"))
+                if start_dt and (timestamp is None or timestamp < start_dt):
+                    continue
+                if end_dt and (timestamp is None or timestamp > end_dt):
+                    continue
+
+                yield record
+
+    return _generator()
+
+
+def read_trade_log(
+    *,
+    account_id: str | None = None,
+    start: date | datetime | None = None,
+    end: date | datetime | None = None,
+    path: Path | None = None,
+) -> List[Dict[str, str]]:
+    """Return trade journal rows filtered by the supplied criteria."""
+
+    return list(iter_trade_log_rows(account_id=account_id, start=start, end=end, path=path))
+
+
 __all__ = [
     "TradeLogEntry",
     "TradeLogger",
     "get_trade_logger",
     "override_trade_logger",
+    "TRADE_LOG_COLUMNS",
+    "iter_trade_log_rows",
+    "read_trade_log",
 ]
