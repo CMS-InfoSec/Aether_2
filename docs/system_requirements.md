@@ -164,19 +164,19 @@ The specification above describes the target end state, but the current reposito
 
 ### 6.2 Blocking gaps observed
 
-* **Automated testing is failing catastrophically.** A fresh run of the test suite (`pytest -q`) aborts during collection with import errors, missing dependencies, incompatible SQLAlchemy usage, and 92 total errors, demonstrating that the repository cannot currently validate its behaviour.
+* **Automated testing is failing catastrophically.** A fresh run of the test suite (`pytest -q`) now halts during collection with 69 errors, driven by missing scientific libraries (NumPy, pandas), broken ORM wiring, and namespace collisions. The repository still cannot validate any of the core behaviours described in this specification.
 
   ```text
   $ pytest -q
-  E   ImportError: cannot import name 'get_timescale_session' from 'services.common.config'
-  E   ImportError: cannot import name 'ensure_admin_access' from 'services.common.security'
+  E   ModuleNotFoundError: No module named 'numpy'
+  E   ImportError: cannot import name 'ADMIN_ACCOUNTS' from 'services.common.security'
   ...
-  E   AttributeError: '_SelectStatement' object has no attribute 'limit'
-  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! Interrupted: 92 errors during collection !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  E   ModuleNotFoundError: No module named 'secrets.test_authorization'; 'secrets' is not a package
+  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! Interrupted: 69 errors during collection !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
   ```
 
-* **Administrator guard crashes when invoked.** `services/common/security.py` calls `cast(...)` without importing it; invoking `_get_session_store` therefore raises `NameError`, preventing `ensure_admin_access` and the rest of the FastAPI dependency stack from authorising administrative requests. The infrastructure scaling API inherits this dependency and now fails every request with a 500 response, leaving operators unable to audit or adjust autoscaling behaviour.【F:services/common/security.py†L118-L176】【535722†L1-L24】【7ea8cb†L1-L103】
-* **Alert deduplication endpoints raise 500s at import time.** The alerts router wraps FastAPI decorators with `cast(...)`, but `services/alerts/alert_dedupe.py` never imports `typing.cast`, so the module throws a `NameError` during import and prevents `/alerts` from registering at all, breaking operational alert suppression in both simulation and production modes.【F:services/alerts/alert_dedupe.py†L1-L113】【b4acd5†L1-L17】
+* **Administrator guard exports are inaccessible.** Importing the guard constants and helper functions from `services.common.security` fails (`ImportError: cannot import name 'ADMIN_ACCOUNTS'…` and missing `reload_admin_accounts`/`set_default_session_store` attributes), so the autoscaling, governance, and secrets APIs cannot enforce director-only controls during startup or request handling.【9b25d1†L13-L58】
+* **Secrets test modules are shadowed by the Python standard library.** Pytest attempts to import `secrets.test_*`, but the stdlib `secrets` package takes precedence and raises `ModuleNotFoundError`, which prevents every secrets-service test (and the associated API coverage) from running at all.【9b25d1†L58-L90】
 * **Simulation-mode persistence silently downgrades to a stub.** Importing `shared.sim_mode` currently fails with `ModuleNotFoundError: No module named 'sqlalchemy'`; the OMS catches that exception and swaps in an in-memory stub that never writes to Timescale or enforces account-scoped simulation switches, violating the safety requirements for live isolation.【7e276b†L1-L6】【F:services/oms/oms_service.py†L77-L175】
 * **Timescale session helpers have no safe defaults for local testing.** Calling `get_timescale_session("company")` without hand-crafted environment variables immediately raises `RuntimeError`, so any service importing the helper during tests or local runs aborts before it can inject sqlite fallbacks or dependency overrides.【F:services/common/config.py†L145-L202】【89615a†L1-L6】
 * **Existing audit findings remain unresolved.** The remediation task board documents P0 issues spanning database adapters, hedging safeguards, TLS enforcement, and observability; none of these fixes are present, leaving critical requirements unmet.【F:docs/AUDIT_REPORT.md†L1-L76】
