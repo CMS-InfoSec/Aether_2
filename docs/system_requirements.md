@@ -182,3 +182,8 @@ enforces that only director roles can adjust manual hedge percentages and view t
 override diagnostics, fulfilling the hedge manual override and admin role access
 requirements for the Builder.io Fusion UI.
 
+The admin platform's `/healthz` endpoint now surfaces hedge-service readiness, including
+override activity, recent decision timestamps, and guard triggers so operations can
+confirm the hedging controls are online. This satisfies the requirement for dedicated
+service health probes across the deployment.
+

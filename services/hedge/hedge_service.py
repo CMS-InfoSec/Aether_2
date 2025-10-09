@@ -307,6 +307,27 @@ class HedgeService:
     def get_last_diagnostics(self) -> Optional[HedgeDiagnostics]:
         return self._last_diagnostics
 
+    def health_status(self) -> Dict[str, object]:
+        """Return operational metadata used by service health checks."""
+
+        override = self._override
+        latest_record = self._history[0] if self._history else None
+        diagnostics = self._last_diagnostics
+
+        payload: Dict[str, object] = {
+            "mode": "override" if override else "auto",
+            "override_active": override is not None,
+            "history_depth": len(self._history),
+            "last_decision_at": latest_record.timestamp.isoformat() if latest_record else None,
+            "last_target_pct": latest_record.target_pct if latest_record else None,
+            "last_guard_triggered": bool(diagnostics.guard_triggered if diagnostics else False),
+        }
+
+        if diagnostics and diagnostics.guard_reason:
+            payload["last_guard_reason"] = diagnostics.guard_reason
+
+        return payload
+
     def _build_diagnostics(self, metrics: HedgeMetricsRequest) -> HedgeDiagnostics:
         volatility_score = self._clamp(metrics.volatility / self._volatility_reference, 0.0, 1.0)
         drawdown_score = self._clamp(metrics.drawdown, 0.0, 1.0)
