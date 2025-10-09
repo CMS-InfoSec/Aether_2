@@ -452,7 +452,12 @@ def _resolve_database_url() -> tuple[Optional[str], Optional[RuntimeError]]:
 def _engine_options(url: str) -> Dict[str, Any]:
     options: Dict[str, Any] = {"future": True, "pool_pre_ping": True}
     sa_url = make_url(url)
-    if sa_url.get_backend_name().startswith("postgresql"):
+    backend = getattr(sa_url, "get_backend_name", None)
+    if callable(backend):
+        backend_name = backend()
+    else:  # SQLAlchemy 2.0+ exposes ``backend_name`` instead of the helper
+        backend_name = getattr(sa_url, "backend_name", sa_url.drivername)
+    if backend_name.startswith("postgresql"):
         options.update(
             pool_size=int(os.getenv("AUTH_DATABASE_POOL_SIZE", "10")),
             max_overflow=int(os.getenv("AUTH_DATABASE_MAX_OVERFLOW", "20")),
@@ -467,7 +472,12 @@ def _engine_options(url: str) -> Dict[str, Any]:
 
 def _resolve_schema(url: str) -> Optional[str]:
     sa_url = make_url(url)
-    if sa_url.get_backend_name().startswith("postgresql"):
+    backend = getattr(sa_url, "get_backend_name", None)
+    if callable(backend):
+        backend_name = backend()
+    else:
+        backend_name = getattr(sa_url, "backend_name", sa_url.drivername)
+    if backend_name.startswith("postgresql"):
         override = os.getenv("AUTH_DATABASE_SCHEMA")
         if override is None:
             schema = "auth"
