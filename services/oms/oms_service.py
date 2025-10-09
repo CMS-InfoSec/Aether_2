@@ -2593,10 +2593,14 @@ class AccountContext:
         if not record.side:
             return
 
-        filled_qty = record.result.filled_qty
+        total_filled_qty = record.result.filled_qty
         avg_price = record.result.avg_price
         mid_px = record.pre_trade_mid
         if mid_px is None or mid_px <= 0:
+            return
+
+        incremental_qty = total_filled_qty - record.recorded_qty
+        if incremental_qty <= 0:
             return
 
         normalized_side = record.side.lower()
@@ -2606,7 +2610,7 @@ class AccountContext:
         direction = Decimal("1") if normalized_side == "buy" else Decimal("-1")
         impact_ratio = (avg_price - mid_px) / mid_px
         impact_bps = impact_ratio * direction * Decimal("10000")
-        pnl_value = (mid_px - avg_price) * filled_qty * direction
+        pnl_value = (mid_px - avg_price) * incremental_qty * direction
 
         trade_entry = TradeLogEntry(
             timestamp=datetime.now(timezone.utc),
@@ -2615,7 +2619,7 @@ class AccountContext:
             exchange_order_id=record.result.exchange_order_id,
             symbol=record.symbol,
             side=normalized_side,
-            quantity=filled_qty,
+            quantity=incremental_qty,
             price=avg_price,
             pnl=pnl_value,
             pre_trade_mid=mid_px,
@@ -2636,7 +2640,7 @@ class AccountContext:
             client_order_id=record.client_id,
             symbol=record.symbol,
             side=record.side,
-            filled_qty=filled_qty,
+            filled_qty=incremental_qty,
             avg_price=avg_price,
             pre_trade_mid=mid_px,
             impact_bps=impact_bps,
@@ -2644,10 +2648,11 @@ class AccountContext:
             simulated=record.origin == "SIM",
         )
 
+        record.recorded_qty = total_filled_qty
         async with self._orders_lock:
             current = self._orders.get(record.client_id)
             if current:
-                current.recorded_qty = filled_qty
+                current.recorded_qty = total_filled_qty
 
 
 
