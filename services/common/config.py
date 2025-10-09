@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sys
@@ -11,6 +12,8 @@ from pathlib import Path
 from typing import Any, Dict
 
 from shared.postgres import normalize_postgres_dsn, normalize_postgres_schema
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -142,6 +145,10 @@ def _sanitize_schema_name(raw: str, *, default: bool) -> str:
     return candidate
 
 
+def _allow_test_fallbacks() -> bool:
+    return "pytest" in sys.modules or os.getenv("AETHER_ALLOW_INSECURE_TEST_DEFAULTS") == "1"
+
+
 def _resolve_timescale_dsn(account_id: str) -> str:
     """Return a configured Timescale/PostgreSQL DSN for the given account."""
 
@@ -157,6 +164,13 @@ def _resolve_timescale_dsn(account_id: str) -> str:
             )
         normalized: str = normalize_postgres_dsn(stripped, label="Timescale DSN")
         return normalized
+
+    if _allow_test_fallbacks():
+        logger.warning(
+            "Timescale DSN for account '%s' is not configured; using in-memory sqlite fallback for tests.",
+            account_id,
+        )
+        return "sqlite:///:memory:"
 
     raise RuntimeError(
         "Timescale DSN is not configured. Set TIMESCALE_DSN or "

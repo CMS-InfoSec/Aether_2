@@ -10,6 +10,12 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional, Sequence, TypeVar, cast
 
 from prometheus_client import Gauge
+
+try:  # pragma: no cover - metrics helper optional when FastAPI unavailable
+    from metrics import setup_metrics
+except ModuleNotFoundError:  # pragma: no cover - fallback stub for optional dependency
+    def setup_metrics(*_: Any, **__: Any) -> None:
+        return None
 from sqlalchemy import Column, DateTime, Float, String, create_engine, func, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
@@ -201,6 +207,7 @@ class StablecoinResponse(BaseModel):
 
 
 app = FastAPI(title="Cross-Asset Analytics Service", version="1.0.0")
+setup_metrics(app, service_name="crossasset-analytics-service")
 setattr(app.state, DATABASE_URL_STATE_KEY, None)
 setattr(app.state, ENGINE_STATE_KEY, None)
 setattr(app.state, SESSIONMAKER_STATE_KEY, None)

@@ -20,9 +20,16 @@ from metrics import (
     setup_metrics,
     traced_span,
 )
+from shared.health import setup_health_checks
 
 app = FastAPI(title="Risk Service")
 setup_metrics(app, service_name="risk-service")
+setup_health_checks(
+    app,
+    {
+        "risk_engine": lambda: RiskEngine(account_id="__health__"),
+    },
+)
 
 
 app.include_router(cvar_router)

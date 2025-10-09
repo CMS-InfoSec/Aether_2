@@ -352,6 +352,16 @@ class RiskValidationResponse(BaseModel):
     valid: bool = Field(..., description="Whether the order passes risk checks")
     reasons: List[str] = Field(default_factory=list, description="Reasons for any failure")
     fee: FeeBreakdown = Field(..., description="Fees applied in validation")
+    take_profit: float | None = Field(
+        default=None,
+        gt=0.0,
+        description="Recommended take-profit trigger price in quote currency",
+    )
+    stop_loss: float | None = Field(
+        default=None,
+        gt=0.0,
+        description="Recommended stop-loss trigger price in quote currency",
+    )
 
 
 class OrderPlacementRequest(BaseModel):

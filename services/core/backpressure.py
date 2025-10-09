@@ -16,6 +16,8 @@ from typing import Any, Awaitable, Callable, Deque, Dict, Iterable, Mapping, Mut
 
 from fastapi import FastAPI
 
+from metrics import setup_metrics
+
 from shared.pydantic_compat import BaseModel, Field
 
 from common.schemas.contracts import IntentEvent
@@ -384,6 +386,7 @@ backpressure_controller = IntentBackpressure(
 )
 
 app = FastAPI(title="Backpressure Controller", version="1.0.0")
+setup_metrics(app, service_name="backpressure-controller")
 
 
 @_app_get(app, "/backpressure/status", response_model=BackpressureStatus)

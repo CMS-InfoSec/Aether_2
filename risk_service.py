@@ -50,10 +50,12 @@ from services.common.compliance import (
 from services.common.security import require_admin_account
 from services.common.spot import require_spot_http
 from battle_mode import BattleModeController, create_battle_mode_tables
+from shared.health import setup_health_checks
 
 from cost_throttler import CostThrottler
 from services.risk.position_sizer import PositionSizer
 from services.common.adapters import RedisFeastAdapter, TimescaleAdapter
+from shared.exits import compute_exit_targets
 from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
 from shared.spot import filter_spot_symbols, is_spot_symbol, normalize_spot_symbol
 
@@ -97,6 +99,11 @@ SHUTDOWN_TIMEOUT = float(os.getenv("RISK_SHUTDOWN_TIMEOUT", os.getenv("SERVICE_S
 _CAPITAL_ALLOCATOR_URL = os.getenv("CAPITAL_ALLOCATOR_URL")
 _CAPITAL_ALLOCATOR_TIMEOUT = float(os.getenv("CAPITAL_ALLOCATOR_TIMEOUT", "1.5"))
 _CAPITAL_ALLOCATOR_TOLERANCE = float(os.getenv("CAPITAL_ALLOCATOR_NAV_TOLERANCE", "0.02"))
+try:
+    _CAPITAL_ALLOCATOR_DRAWDOWN_LIMIT = float(os.getenv("CAPITAL_ALLOCATOR_MAX_DRAWDOWN", "1.0"))
+except ValueError:
+    _CAPITAL_ALLOCATOR_DRAWDOWN_LIMIT = 1.0
+_CAPITAL_ALLOCATOR_DRAWDOWN_LIMIT = max(_CAPITAL_ALLOCATOR_DRAWDOWN_LIMIT, 0.0)
 _BATTLE_MODE_VOL_THRESHOLD = float(os.getenv("BATTLE_MODE_VOL_THRESHOLD", "1.0"))
 DEFAULT_EXCHANGE = os.getenv("PRIMARY_EXCHANGE", "kraken")
 
@@ -497,6 +504,82 @@ def _filter_spot_instruments(symbols: Iterable[str]) -> List[str]:
     return filter_spot_symbols(symbols, logger=logger)
 
 
+def _health_check_database() -> Dict[str, object]:
+    """Ensure the managed Timescale/PostgreSQL backing store is reachable."""
+
+    with ENGINE.connect() as connection:
+        connection.execute(select(1))
+
+    engine_url = getattr(ENGINE, "url", None)
+    if hasattr(engine_url, "set"):
+        redacted_url = str(engine_url.set(password="***"))
+    elif hasattr(engine_url, "render_as_string"):
+        redacted_url = engine_url.render_as_string(hide_password=True)  # type: ignore[call-arg]
+    elif engine_url is not None:
+        redacted_url = str(engine_url)
+    else:  # pragma: no cover - defensive fallback when URL metadata unavailable
+        redacted_url = "unknown"
+
+    dialect = getattr(ENGINE, "dialect", None)
+    return {
+        "dialect": getattr(dialect, "name", "unknown"),
+        "driver": getattr(dialect, "driver", "unknown"),
+        "url": redacted_url,
+    }
+
+
+async def _health_check_capital_allocator() -> Dict[str, object]:
+    """Verify the capital allocator dependency responds successfully."""
+
+    url = os.getenv("CAPITAL_ALLOCATOR_URL", _CAPITAL_ALLOCATOR_URL)
+    if not url:
+        return {"configured": False}
+
+    endpoint = url.rstrip("/") + "/allocator/status"
+    try:
+        async with httpx.AsyncClient(timeout=_CAPITAL_ALLOCATOR_TIMEOUT) as client:
+            response = await client.get(endpoint)
+            response.raise_for_status()
+    except httpx.HTTPStatusError as exc:  # pragma: no cover - defensive network guard
+        raise RuntimeError(
+            f"Capital allocator returned status {exc.response.status_code}"
+        ) from exc
+    except httpx.RequestError as exc:
+        raise RuntimeError("Capital allocator dependency unreachable") from exc
+
+    return {"configured": True, "status_code": response.status_code}
+
+
+async def _health_check_universe_service() -> Dict[str, object]:
+    """Confirm the trading universe service is reachable and well-formed."""
+
+    endpoint = _UNIVERSE_SERVICE_URL.rstrip("/") + "/universe/approved"
+    try:
+        async with httpx.AsyncClient(timeout=_UNIVERSE_SERVICE_TIMEOUT) as client:
+            response = await client.get(endpoint)
+            response.raise_for_status()
+    except httpx.HTTPStatusError as exc:  # pragma: no cover - defensive network guard
+        raise RuntimeError(
+            f"Universe service returned status {exc.response.status_code}"
+        ) from exc
+    except httpx.RequestError as exc:
+        raise RuntimeError("Universe service dependency unreachable") from exc
+
+    try:
+        payload = response.json()
+    except ValueError as exc:  # pragma: no cover - malformed upstream payload
+        raise RuntimeError("Universe service returned invalid JSON") from exc
+
+    symbols = payload.get("symbols")
+    if not isinstance(symbols, list):
+        raise RuntimeError("Universe service payload missing 'symbols' list")
+
+    return {
+        "status_code": response.status_code,
+        "symbol_count": len(symbols),
+    }
+
+
 class TradeIntent(BaseModel):
     """Represents the incoming trading intent from the policy layer."""
 
@@ -581,6 +664,14 @@ class RiskValidationResponse(BaseModel):
         None,
         description="Timestamp until which trading is halted due to hard limits",
     )
+    take_profit: Optional[float] = Field(
+        None,
+        description="Recommended take-profit trigger price derived from policy and volatility",
+    )
+    stop_loss: Optional[float] = Field(
+        None,
+        description="Recommended stop-loss trigger price derived from policy and volatility",
+    )
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -647,6 +738,14 @@ class BattleModeToggleRequest(BaseModel):
 
 app = FastAPI(title="Risk Validation Service", version="1.0.0")
 setup_metrics(app, service_name="risk-service")
+setup_health_checks(
+    app,
+    {
+        "database": _health_check_database,
+        "capital_allocator": _health_check_capital_allocator,
+        "universe_service": _health_check_universe_service,
+    },
+)
 COST_THROTTLER = CostThrottler()
 EXCHANGE_ADAPTER = get_exchange_adapter(DEFAULT_EXCHANGE)
 
@@ -1011,6 +1110,11 @@ async def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
     intent = context.request.intent
     trade_notional = context.intended_notional
     normalized_instrument = normalize_spot_symbol(intent.instrument_id)
+    base_price = float(intent.price)
+    exit_take_profit, exit_stop_loss = compute_exit_targets(
+        price=base_price,
+        side=intent.side,
+    )
 
     def _register_violation(
         message: str, *, cooldown: bool = False, details: Optional[Dict[str, object]] = None
@@ -1202,6 +1306,13 @@ async def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
             scaled_notional_cap = base_size * float(target_vol) / current_vol
         elif nav_cap_for_trade:
             scaled_notional_cap = nav_cap_for_trade
+
+    if atr_value is not None and atr_value > 0:
+        exit_take_profit, exit_stop_loss = compute_exit_targets(
+            price=base_price,
+            side=intent.side,
+            atr=atr_value,
+        )
 
     volatility_metric: Optional[float] = None
     volatility_source: Optional[str] = None
@@ -1445,6 +1556,8 @@ async def _evaluate(context: RiskEvaluationContext) -> RiskValidationResponse:
         reasons=reasons,
         adjusted_qty=adjusted_quantity,
         cooldown=cooldown_until,
+        take_profit=exit_take_profit,
+        stop_loss=exit_stop_loss,
     )
 
 
@@ -2048,6 +2161,23 @@ def _apply_allocator_guard(
     current_nav = float(state.net_asset_value or 0.0)
     trade_amount = float(trade_notional or 0.0)
     tolerance = max(_CAPITAL_ALLOCATOR_TOLERANCE, 0.0)
+
+    drawdown_limit = max(_CAPITAL_ALLOCATOR_DRAWDOWN_LIMIT, 0.0)
+    drawdown_ratio = float(allocator_state.drawdown_ratio or 0.0)
+    if drawdown_limit and drawdown_ratio >= drawdown_limit:
+        register_violation_with_context(
+            (
+                "Account drawdown exceeds configured limit; trading suspended until "
+                "drawdown recovers"
+            ),
+            True,
+            {
+                "drawdown_ratio": drawdown_ratio,
+                "drawdown_limit": drawdown_limit,
+            },
+        )
+        suggested_quantities.append(0.0)
+        return
 
     if allocator_state.throttled and intent.side == "buy":
         register_violation_with_context(
