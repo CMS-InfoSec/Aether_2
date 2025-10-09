@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import httpx
 import pytest
 
 import exchange_adapter
@@ -9,6 +10,7 @@ class _DummyResponse:
     def __init__(self, payload: dict[str, object]) -> None:
         self._payload = payload
         self.status_code = 200
+        self.text = ""
 
     def raise_for_status(self) -> None:
         return None
@@ -120,4 +122,118 @@ async def test_get_balance_uses_authorization_header(monkeypatch: pytest.MonkeyP
     assert url.endswith("/oms/accounts/beta/balances")
     assert headers["Authorization"] == "Bearer balance-token"
     assert headers["X-Account-ID"] == "beta"
+
+
+@pytest.mark.asyncio
+async def test_place_order_converts_rate_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _RateLimitResponse:
+        status_code = 429
+        text = "rate limited"
+
+        def json(self) -> dict[str, object]:
+            return {"error": "rate limited"}
+
+    class _RateLimitClient:
+        def __init__(self, *args, **kwargs) -> None:
+            return None
+
+        async def __aenter__(self) -> "_RateLimitClient":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def post(self, url: str, **kwargs):  # type: ignore[override]
+            return _RateLimitResponse()
+
+        async def get(self, url: str, **kwargs):  # pragma: no cover - unused here
+            return _RateLimitResponse()
+
+    monkeypatch.setattr(exchange_adapter.httpx, "AsyncClient", _RateLimitClient)
+
+    class _StubSessionManager:
+        async def token_for_account(self, account_id: str) -> str:
+            return "stub-token"
+
+    adapter = exchange_adapter.KrakenAdapter(
+        primary_url="http://oms", session_manager=_StubSessionManager()
+    )
+
+    with pytest.raises(exchange_adapter.ExchangeRateLimitError) as excinfo:
+        await adapter.place_order("alpha", {"symbol": "eth/usd"})
+
+    assert "rate limited" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_place_order_converts_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _TimeoutClient:
+        def __init__(self, *args, **kwargs) -> None:
+            return None
+
+        async def __aenter__(self) -> "_TimeoutClient":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def post(self, url: str, **kwargs):  # type: ignore[override]
+            raise httpx.TimeoutException("timeout")
+
+        async def get(self, url: str, **kwargs):  # pragma: no cover - unused here
+            raise httpx.TimeoutException("timeout")
+
+    monkeypatch.setattr(exchange_adapter.httpx, "AsyncClient", _TimeoutClient)
+
+    class _StubSessionManager:
+        async def token_for_account(self, account_id: str) -> str:
+            return "stub-token"
+
+    adapter = exchange_adapter.KrakenAdapter(
+        primary_url="http://oms", session_manager=_StubSessionManager()
+    )
+
+    with pytest.raises(exchange_adapter.ExchangeTimeoutError):
+        await adapter.place_order("alpha", {"symbol": "eth/usd"})
+
+
+@pytest.mark.asyncio
+async def test_place_order_converts_validation_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _ValidationResponse:
+        status_code = 400
+        text = ""
+
+        def json(self) -> dict[str, object]:
+            return {"errors": ["invalid precision"]}
+
+    class _ValidationClient:
+        def __init__(self, *args, **kwargs) -> None:
+            return None
+
+        async def __aenter__(self) -> "_ValidationClient":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def post(self, url: str, **kwargs):  # type: ignore[override]
+            return _ValidationResponse()
+
+        async def get(self, url: str, **kwargs):  # pragma: no cover - unused here
+            return _ValidationResponse()
+
+    monkeypatch.setattr(exchange_adapter.httpx, "AsyncClient", _ValidationClient)
+
+    class _StubSessionManager:
+        async def token_for_account(self, account_id: str) -> str:
+            return "stub-token"
+
+    adapter = exchange_adapter.KrakenAdapter(
+        primary_url="http://oms", session_manager=_StubSessionManager()
+    )
+
+    with pytest.raises(exchange_adapter.ExchangeValidationError) as excinfo:
+        await adapter.place_order("alpha", {"symbol": "eth/usd"})
+
+    assert "invalid precision" in str(excinfo.value)
 
