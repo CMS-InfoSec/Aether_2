@@ -181,6 +181,9 @@ _DB_URL = _database_url()
 _DB_URL = _database_url()
 
 
+_DB_URL = _database_url()
+
+
 def _engine_options(url: str) -> dict[str, object]:
     options: dict[str, object] = {"future": True}
     if url.startswith("sqlite://"):
@@ -308,6 +311,17 @@ else:
 
         def commit(self) -> None:  # pragma: no cover - commits are implicit
             return None
+
+        def __del__(self) -> None:  # pragma: no cover - ensure locks are released
+            self.close()
+
+    Engine = Engine  # type: ignore[assignment]
+    Session = InMemorySession  # type: ignore[assignment]
+
+    def SessionLocal() -> InMemorySession:  # type: ignore[override]
+        return InMemorySession()
+
+    ENGINE = None
 
         def __del__(self) -> None:  # pragma: no cover - ensure locks are released
             self.close()
