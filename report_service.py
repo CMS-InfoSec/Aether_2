@@ -458,6 +458,9 @@ def _daily_pnl_summary(
                 "net_pnl",
                 "gross_exposure",
                 "net_exposure",
+                "starting_nav",
+                "ending_nav",
+                "daily_return_pct",
             ]
         )
 
@@ -475,6 +478,42 @@ def _daily_pnl_summary(
     frame["net_pnl"] = _column(("net_pnl", "net", "pnl_net"))
     frame["gross_exposure"] = _column(("gross_exposure", "gross", "total_gross_exposure"))
     frame["net_exposure"] = _column(("net_exposure", "net", "total_net_exposure"))
+    frame["nav_value"] = _column(
+        (
+            "nav",
+            "net_asset_value",
+            "ending_balance",
+            "equity",
+            "balance",
+            "portfolio_value",
+        )
+    )
+
+    timestamp_column = _first_column(
+        frame,
+        (
+            "curve_ts",
+            "valuation_ts",
+            "ts",
+            "created_at",
+            "bucket_start",
+            "timestamp",
+        ),
+    )
+    if timestamp_column is not None:
+        event_ts = pd.to_datetime(frame[timestamp_column])
+        try:
+            event_ts = event_ts.dt.tz_localize(None)
+        except TypeError:
+            # Already timezone naive.
+            pass
+    else:
+        event_ts = pd.Series(
+            [datetime.combine(report_date, datetime.min.time())] * len(frame), index=frame.index
+        )
+    frame["event_ts"] = event_ts
+
+    frame.sort_values(["session_date", "account_id", "event_ts"], inplace=True)
 
     grouped = (
         frame.groupby(["session_date", "account_id"], dropna=False)
@@ -484,9 +523,19 @@ def _daily_pnl_summary(
             net_pnl=("net_pnl", "sum"),
             gross_exposure=("gross_exposure", "max"),
             net_exposure=("net_exposure", "max"),
+            starting_nav=("nav_value", "first"),
+            ending_nav=("nav_value", "last"),
         )
         .reset_index()
     )
+
+    denominator = grouped["starting_nav"].replace({0.0: pd.NA})
+    denominator = denominator.fillna(grouped["ending_nav"].replace({0.0: pd.NA}))
+    denominator = denominator.fillna(grouped["gross_exposure"].replace({0.0: pd.NA}))
+    denominator = denominator.fillna(grouped["net_exposure"].replace({0.0: pd.NA}))
+    grouped["daily_return_pct"] = (grouped["net_pnl"] / denominator) * 100
+    grouped["daily_return_pct"] = grouped["daily_return_pct"].fillna(0.0)
+
     return grouped
 
 
@@ -551,6 +600,9 @@ def _merge_daily_components(
         "net_pnl",
         "gross_exposure",
         "net_exposure",
+        "starting_nav",
+        "ending_nav",
+        "daily_return_pct",
         "risk_breaches",
         "critical_breaches",
     ):
@@ -567,7 +619,17 @@ def _merge_daily_components(
     if "gross_notional" not in frame.columns:
         frame["gross_notional"] = 0.0
 
-    for missing in ("trade_count", "executed_qty", "realized_pnl", "net_pnl", "gross_exposure", "net_exposure"):
+    for missing in (
+        "trade_count",
+        "executed_qty",
+        "realized_pnl",
+        "net_pnl",
+        "gross_exposure",
+        "net_exposure",
+        "starting_nav",
+        "ending_nav",
+        "daily_return_pct",
+    ):
         if missing not in frame.columns:
             frame[missing] = 0.0
 
@@ -591,6 +653,9 @@ def _merge_daily_components(
             "net_pnl",
             "gross_exposure",
             "net_exposure",
+            "starting_nav",
+            "ending_nav",
+            "daily_return_pct",
             "risk_breaches",
             "critical_breaches",
         ]
