@@ -10,6 +10,7 @@ expected fills, fees and slippage attribution.  Results are persisted via the
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -106,7 +107,11 @@ class _SingleOrderPolicy(_PolicyBase):
 
 
 if not TYPE_CHECKING and _ACTUAL_POLICY is not _PolicyBase:
-    _SingleOrderPolicy.__bases__ = (_ACTUAL_POLICY,)
+    if inspect.isclass(_ACTUAL_POLICY):
+        try:
+            _SingleOrderPolicy.__bases__ = (_ACTUAL_POLICY,)
+        except TypeError:  # pragma: no cover - optional dependency mismatch
+            pass
 
 
 @dataclass
