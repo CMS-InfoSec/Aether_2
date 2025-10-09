@@ -11,11 +11,14 @@ from typing import Any, Callable, TypeVar, cast
 
 from fastapi import Depends, FastAPI
 
+from metrics import setup_metrics
+
 from services.common.adapters import RedisFeastAdapter
 from services.common.schemas import ApprovedUniverseResponse, FeeBreakdown
 from services.common.security import require_admin_account
 
 app = FastAPI(title="Universe Service")
+setup_metrics(app, service_name="universe-service")
 
 RouteFn = TypeVar("RouteFn", bound=Callable[..., Any])
 
