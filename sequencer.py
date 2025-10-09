@@ -54,6 +54,7 @@ else:
 import httpx
 
 from metrics import (
+    get_request_id,
     increment_rejected_intents,
     increment_trades_submitted,
     observe_oms_submit_latency,
@@ -62,9 +63,9 @@ from metrics import (
     set_pipeline_latency,
     setup_metrics,
     traced_span,
-    get_request_id,
 )
 
+from shared.health import setup_health_checks
 from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 
@@ -1170,6 +1171,7 @@ pipeline = SequencerPipeline(
 
 app = FastAPI(title="Sequencer Service", version="1.0.0")
 setup_metrics(app, service_name="sequencer")
+setup_health_checks(app, {"pipeline": lambda: pipeline})
 
 
 @app.post("/sequencer/submit_intent", response_model=SequencerResponse)

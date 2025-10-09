@@ -6,6 +6,7 @@ import types
 
 import pytest
 from fastapi import APIRouter
+from fastapi.testclient import TestClient
 
 
 def _install_package(name: str) -> types.ModuleType:
@@ -124,6 +125,10 @@ class RedisSessionStore(SessionStoreProtocol):  # pragma: no cover - structural 
     def __init__(self, client, ttl_minutes: int = 60) -> None:
         self.client = client
         self.ttl_minutes = ttl_minutes
+        self._sessions: dict[str, object] = {}
+
+    def get(self, token: str):  # pragma: no cover - behaviour not under test
+        return self._sessions.get(token)
 
 
 def build_session_store_from_url(redis_url: str, *, ttl_minutes: int = 60) -> RedisSessionStore:
@@ -133,6 +138,16 @@ def build_session_store_from_url(redis_url: str, *, ttl_minutes: int = 60) -> Re
 class PostgresAdminRepository(AdminRepositoryProtocol):
     def __init__(self, dsn: str) -> None:  # pragma: no cover - behaviour not under test
         self.dsn = dsn
+        self._admins: dict[str, object] = {}
+
+    def add(self, admin) -> None:  # pragma: no cover - behaviour not under test
+        self._admins[getattr(admin, "email", "")] = admin
+
+    def delete(self, email: str) -> None:  # pragma: no cover - behaviour not under test
+        self._admins.pop(email, None)
+
+    def get_by_email(self, email: str):  # pragma: no cover - behaviour not under test
+        return self._admins.get(email)
 
 
 class AuthService:
@@ -265,6 +280,10 @@ class _ScalingController:
 
     async def stop(self) -> None:  # pragma: no cover - behaviour not under test
         return None
+
+    @property
+    def status(self) -> types.SimpleNamespace:  # pragma: no cover - behaviour not under test
+        return types.SimpleNamespace(oms_replicas=1, gpu_nodes=0, pending_jobs=0)
 
 
 def build_scaling_controller_from_env() -> _ScalingController:
@@ -435,4 +454,20 @@ def test_create_app_rejects_memory_session_store_outside_tests(
         RuntimeError, match="memory:// DSNs are only supported when running tests"
     ):
         app_module.create_app(admin_repository=app_module.InMemoryAdminRepository())
+
+
+def test_healthz_endpoint_reports_component_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ADMIN_POSTGRES_DSN", "postgresql://example.com/admin")
+    monkeypatch.setenv("SESSION_REDIS_URL", "redis://localhost/0")
+
+    application = app_module.create_app()
+
+    client = TestClient(application)
+    response = client.get("/healthz")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "ok"
+    checks = payload["checks"]
+    assert set(checks.keys()) == {"admin_repository", "session_store", "scaling_controller"}
+    assert all(entry["status"] == "ok" for entry in checks.values())
 

@@ -41,6 +41,8 @@ from typing import Any, Dict, Optional
 import httpx
 import pyotp
 from fastapi import Depends, FastAPI, Header, HTTPException, status
+
+from metrics import setup_metrics
 from pydantic import BaseModel, Field, SecretStr
 
 
@@ -430,6 +432,7 @@ def _load_default_auth_service() -> AuthService:
 
 auth_service = _load_default_auth_service()
 app = FastAPI(title="Auth Service", version="1.0.0")
+setup_metrics(app, service_name="auth-service")
 
 
 async def get_auth_service() -> AuthService:
