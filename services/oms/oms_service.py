@@ -2610,6 +2610,7 @@ class AccountContext:
         direction = Decimal("1") if normalized_side == "buy" else Decimal("-1")
         impact_ratio = (avg_price - mid_px) / mid_px
         impact_bps = impact_ratio * direction * Decimal("10000")
+        filled_qty = incremental_qty
         pnl_value = (mid_px - avg_price) * filled_qty * direction
 
         trade_entry = TradeLogEntry(
