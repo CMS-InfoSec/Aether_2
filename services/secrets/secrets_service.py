@@ -12,6 +12,12 @@ from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+try:  # pragma: no cover - metrics helper optional when FastAPI unavailable
+    from metrics import setup_metrics
+except ModuleNotFoundError:  # pragma: no cover - fallback noop when metrics module missing
+    def setup_metrics(*_: object, **__: object) -> None:
+        return None
+
 try:  # pragma: no cover - FastAPI is optional in some unit tests
     from fastapi import (
         BackgroundTasks,
@@ -208,6 +214,7 @@ LOGGER = logging.getLogger(__name__)
 SECRETS_LOGGER = logging.getLogger("secrets_log")
 
 app = FastAPI(title="Kraken Secrets Service")
+setup_metrics(app, service_name="secrets-service")
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
 app.add_middleware(ForwardedSchemeMiddleware)
 

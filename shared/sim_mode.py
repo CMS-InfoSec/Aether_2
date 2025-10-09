@@ -22,9 +22,20 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from functools import partial
 from threading import Lock
-from typing import Awaitable, Dict, Iterator, Optional, Tuple
+from typing import Awaitable, Dict, Iterable, Iterator, Optional, Tuple
 
-from sqlalchemy import Boolean, Column, DateTime, Integer, Numeric, String, Text, create_engine, select, text
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    create_engine,
+    select,
+    text,
+)
 from sqlalchemy.engine import Engine
 from sqlalchemy.engine.url import make_url
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
@@ -150,10 +161,15 @@ class Base(DeclarativeBase):
 class SimModeStateORM(Base):
     __tablename__ = "sim_mode_state"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(String(128), primary_key=True)
     active = Column(Boolean, nullable=False, default=False)
     reason = Column(Text, nullable=True)
-    ts = Column(DateTime(timezone=True), nullable=False, default=_utcnow, server_default=text("CURRENT_TIMESTAMP"))
+    ts = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=_utcnow,
+        server_default=text("CURRENT_TIMESTAMP"),
+    )
 
 
 class SimBrokerOrderORM(Base):
@@ -217,66 +233,126 @@ def session_scope() -> Iterator[Session]:
 
 @dataclass(frozen=True)
 class SimModeStatus:
+    account_id: str
     active: bool
     reason: Optional[str]
     ts: datetime
 
 
 class SimModeRepository:
-    """Persistence and caching layer for the simulation mode flag."""
+    """Persistence and caching layer for per-account simulation mode flags."""
 
     def __init__(self) -> None:
         self._lock = Lock()
-        self._cache: Tuple[SimModeStatus, float] | None = None
+        self._cache: dict[str, Tuple[SimModeStatus, float]] = {}
         self._cache_ttl = 2.0
-        self._ensure_row()
 
-    def _ensure_row(self) -> None:
-        with session_scope() as session:
-            row = session.execute(select(SimModeStateORM).limit(1)).scalar_one_or_none()
-            if row is None:
-                session.add(SimModeStateORM(active=False, reason=None, ts=_utcnow()))
+    def _load_row(self, session: Session, account_id: str) -> SimModeStateORM:
+        row = (
+            session.execute(
+                select(SimModeStateORM).where(SimModeStateORM.account_id == account_id).limit(1)
+            )
+            .scalar_one_or_none()
+        )
+        if row is None:
+            row = SimModeStateORM(account_id=account_id, active=False, reason=None, ts=_utcnow())
+            session.add(row)
+            session.flush()
+        return row
 
-    def get_status(self, *, use_cache: bool = True) -> SimModeStatus:
+    def get_status(self, account_id: str, *, use_cache: bool = True) -> SimModeStatus:
         if use_cache:
             with self._lock:
-                if self._cache is not None:
-                    status, expires = self._cache
+                cached = self._cache.get(account_id)
+                if cached is not None:
+                    status, expires = cached
                     if expires >= time.monotonic():
                         return status
 
         with session_scope() as session:
-            row = session.execute(select(SimModeStateORM).limit(1)).scalar_one()
-            status = SimModeStatus(active=bool(row.active), reason=row.reason, ts=row.ts)
+            row = self._load_row(session, account_id)
+            status = SimModeStatus(
+                account_id=row.account_id,
+                active=bool(row.active),
+                reason=row.reason,
+                ts=row.ts,
+            )
 
         if use_cache:
             with self._lock:
                 expires = time.monotonic() + self._cache_ttl
-                self._cache = (status, expires)
+                self._cache[account_id] = (status, expires)
         return status
 
-    async def get_status_async(self, *, use_cache: bool = True) -> SimModeStatus:
+    def get_many(self, account_ids: Iterable[str], *, use_cache: bool = True) -> list[SimModeStatus]:
+        statuses: list[SimModeStatus] = []
+        missing: list[str] = []
+        now = time.monotonic()
+
+        if use_cache:
+            with self._lock:
+                for account_id in account_ids:
+                    cached = self._cache.get(account_id)
+                    if cached is not None:
+                        status, expires = cached
+                        if expires >= now:
+                            statuses.append(status)
+                            continue
+                    missing.append(account_id)
+        else:
+            missing.extend(account_ids)
+
+        if missing:
+            with session_scope() as session:
+                for account_id in missing:
+                    row = self._load_row(session, account_id)
+                    status = SimModeStatus(
+                        account_id=row.account_id,
+                        active=bool(row.active),
+                        reason=row.reason,
+                        ts=row.ts,
+                    )
+                    statuses.append(status)
+                    if use_cache:
+                        expires = time.monotonic() + self._cache_ttl
+                        with self._lock:
+                            self._cache[account_id] = (status, expires)
+
+        statuses.sort(key=lambda item: item.account_id)
+        return statuses
+
+    async def get_status_async(self, account_id: str, *, use_cache: bool = True) -> SimModeStatus:
         loop = asyncio.get_running_loop()
-        func = partial(self.get_status, use_cache=use_cache)
+        func = partial(self.get_status, account_id, use_cache=use_cache)
         return await loop.run_in_executor(None, func)
 
-    def set_status(self, active: bool, reason: Optional[str]) -> SimModeStatus:
+    async def get_many_async(
+        self, account_ids: Iterable[str], *, use_cache: bool = True
+    ) -> list[SimModeStatus]:
+        loop = asyncio.get_running_loop()
+        func = partial(self.get_many, list(account_ids), use_cache=use_cache)
+        return await loop.run_in_executor(None, func)
+
+    def set_status(self, account_id: str, active: bool, reason: Optional[str]) -> SimModeStatus:
         now = _utcnow()
         with session_scope() as session:
-            row = session.execute(select(SimModeStateORM).limit(1)).scalar_one()
+            row = self._load_row(session, account_id)
             row.active = active
             row.reason = reason
             row.ts = now
             session.add(row)
-        status = SimModeStatus(active=active, reason=reason, ts=now)
+
+        status = SimModeStatus(account_id=account_id, active=active, reason=reason, ts=now)
         with self._lock:
             expires = time.monotonic() + self._cache_ttl
-            self._cache = (status, expires)
+            self._cache[account_id] = (status, expires)
         return status
 
-    async def set_status_async(self, active: bool, reason: Optional[str]) -> SimModeStatus:
+    async def set_status_async(
+        self, account_id: str, active: bool, reason: Optional[str]
+    ) -> SimModeStatus:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self.set_status, active, reason)
+        return await loop.run_in_executor(None, self.set_status, account_id, active, reason)
 
 
 sim_mode_repository = SimModeRepository()

@@ -34,6 +34,7 @@ from typing import Any, Awaitable, Callable, Iterable, List, Mapping, Optional, 
 from services.common.adapters import TimescaleAdapter
 from services.common.precision import _parse_asset_pairs
 from services.oms.kraken_rest import KrakenRESTClient, KrakenRESTError
+from shared import hedge_logging
 from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 
@@ -531,7 +532,14 @@ class HedgingService:
         target_allocation = self._target_allocation(risk_score)
         if self._should_rebalance(target_allocation):
             last_close = bars[-1].close
-            self._rebalance(target_allocation, last_close, risk_score)
+            self._rebalance(
+                target_allocation,
+                last_close,
+                risk_score,
+                drawdown_pct=drawdown_pct,
+                atr=atr,
+                realized_vol=realized_vol,
+            )
         else:
             self.state.last_risk_score = risk_score
             self.state.last_update = datetime.now(timezone.utc)
@@ -581,7 +589,16 @@ class HedgingService:
         delta = target_allocation - self.state.current_allocation
         return abs(delta) >= self.config.rebalance_tolerance_usd
 
-    def _rebalance(self, target_allocation: float, price: float, risk_score: float) -> None:
+    def _rebalance(
+        self,
+        target_allocation: float,
+        price: float,
+        risk_score: float,
+        *,
+        drawdown_pct: float,
+        atr: Optional[float],
+        realized_vol: Optional[float],
+    ) -> None:
         if price <= 0:
             raise ValueError("Cannot rebalance using non-positive prices")
 
@@ -631,6 +648,25 @@ class HedgingService:
         )
 
         self.oms.submit_hedge_order(order)
+
+        previous_allocation = Decimal(str(self.state.current_allocation))
+        entry = hedge_logging.HedgeLogEntry(
+            timestamp=datetime.now(timezone.utc),
+            account_id=self.config.account_id,
+            symbol=self.config.hedge_symbol,
+            side=side.lower(),
+            previous_allocation=previous_allocation,
+            target_allocation=Decimal(str(target_allocation)),
+            delta_usd=delta_usd,
+            quantity=quantity_dec,
+            price=price_dec,
+            risk_score=Decimal(str(risk_score)),
+            drawdown_pct=Decimal(str(drawdown_pct)),
+            atr=None if atr is None else Decimal(str(atr)),
+            realized_vol=None if realized_vol is None else Decimal(str(realized_vol)),
+            order_id=order.client_order_id,
+        )
+        hedge_logging.log_hedge_event(entry)
 
         self.timescale.record_instrument_exposure(
             self.config.hedge_symbol, float(delta_usd)

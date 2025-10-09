@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import importlib
+from typing import Any, Awaitable, Callable, Dict
 import logging
 import os
 import sys
@@ -31,8 +32,10 @@ from auth.service import (
 from metrics import setup_metrics
 from services.alert_manager import setup_alerting
 from services.alerts.alert_dedupe import router as alert_dedupe_router, setup_alert_dedupe
+from services.hedge.hedge_service import get_hedge_service
 from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
 from shared.correlation import CorrelationIdMiddleware
+from shared.health import setup_health_checks
 from shared.session_config import load_session_ttl_minutes
 from scaling_controller import (
     build_scaling_controller_from_env,
@@ -211,6 +214,17 @@ def create_app(
     app = FastAPI(title="Aether Admin Platform", lifespan=_lifespan)
     setup_metrics(app, service_name="admin-platform")
     app.add_middleware(CorrelationIdMiddleware)
+
+    health_checks: Dict[str, Callable[[], Awaitable[Any] | Any]] = {
+        "admin_repository": lambda: admin_repository.get_by_email(
+            _ADMIN_REPOSITORY_HEALTHCHECK_EMAIL
+        ),
+        "session_store": lambda: session_store.get("__health__"),
+        "scaling_controller": lambda: scaling_controller.status,
+        "hedge_service": lambda: get_hedge_service().health_status(),
+    }
+
+    setup_health_checks(app, health_checks)
 
     def _get_auth_service() -> AuthService:
         return auth_service
