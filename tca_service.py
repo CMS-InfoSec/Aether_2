@@ -288,9 +288,7 @@ else:
 
         stub_select = getattr(_sa, "select", None)
         if callable(stub_select):  # pragma: no cover - runtime patching
-            stub_select.__code__ = _select.__code__
-            stub_select.__defaults__ = _select.__defaults__
-            stub_select.__kwdefaults__ = _select.__kwdefaults__
+            setattr(_sa, "select", _select)
 
 
 def SessionLocal() -> Any:
