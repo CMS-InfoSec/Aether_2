@@ -22,6 +22,14 @@ for name in __all__:
 status = getattr(_stub, "status", None)
 run_in_threadpool = getattr(_stub, "run_in_threadpool", None)
 
+_status_exports: dict[str, object] = {}
+if status is not None:
+    _status_exports = {
+        name: getattr(status, name)
+        for name in dir(status)
+        if name.isupper()
+    }
+
 # Ensure commonly imported FastAPI submodules resolve to the stub implementations.
 _submodules = {
     "fastapi.testclient": {"TestClient": getattr(_stub, "TestClient", None)},
@@ -48,6 +56,7 @@ _submodules = {
     "fastapi.concurrency": {"run_in_threadpool": getattr(_stub, "run_in_threadpool", None)},
     "fastapi.middleware": {},
     "fastapi.middleware.cors": {"CORSMiddleware": getattr(_stub, "CORSMiddleware", None)},
+    "fastapi.status": _status_exports,
 }
 
 for module_name, attributes in _submodules.items():
