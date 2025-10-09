@@ -10,7 +10,8 @@ import os
 import re
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from types import ModuleType
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, TYPE_CHECKING, Protocol, TypeVar, cast
 
 try:  # pragma: no cover - metrics helper optional when FastAPI unavailable
     from metrics import setup_metrics
@@ -568,11 +569,14 @@ def validate_kraken_credentials(
 ) -> bool:
     account_reference = account_id or _mask_identifier(api_key)
     if not _looks_base64(api_secret):
-        LOGGER.info(
-            "Skipping Kraken credential validation for %s because secret is not base64 encoded",
+        LOGGER.warning(
+            "Rejected Kraken credential validation for %s: secret is not base64 encoded",
             account_reference,
         )
-        return True
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Kraken API secret must be base64 encoded.",
+        )
     try:
         return _run_validation(api_key, api_secret, account_reference)
     except HTTPException:
