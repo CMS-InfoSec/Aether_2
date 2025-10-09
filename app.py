@@ -32,6 +32,7 @@ from auth.service import (
 from metrics import setup_metrics
 from services.alert_manager import setup_alerting
 from services.alerts.alert_dedupe import router as alert_dedupe_router, setup_alert_dedupe
+from services.hedge.hedge_service import get_hedge_service
 from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
 from shared.correlation import CorrelationIdMiddleware
 from shared.health import setup_health_checks
@@ -220,6 +221,7 @@ def create_app(
         ),
         "session_store": lambda: session_store.get("__health__"),
         "scaling_controller": lambda: scaling_controller.status,
+        "hedge_service": lambda: get_hedge_service().health_status(),
     }
 
     setup_health_checks(app, health_checks)
