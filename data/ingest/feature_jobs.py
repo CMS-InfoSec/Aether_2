@@ -11,7 +11,12 @@ import os
 import sys
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Iterable, List, Mapping, MutableMapping, Optional
+from typing import Any, Deque, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple
+
+
+class MissingDependencyError(RuntimeError):
+    """Raised when an optional dependency is required for feature ingestion."""
+
 
 aiokafka_spec = importlib.util.find_spec("aiokafka")
 if aiokafka_spec is not None:  # pragma: no cover - optional dependency
@@ -31,9 +36,31 @@ if feast_spec is not None:  # pragma: no cover - optional dependency
 else:  # pragma: no cover - optional dependency
     FeatureStore = None  # type: ignore
 
-from sqlalchemy import Column, DateTime, Float, MetaData, String, Table, Text, create_engine
-from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.engine import Engine
+_SQLALCHEMY_AVAILABLE = True
+_SQLALCHEMY_IMPORT_ERROR: Exception | None = None
+
+try:  # pragma: no cover - optional dependency
+    from sqlalchemy import Column, DateTime, Float, MetaData, String, Table, Text, create_engine
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from sqlalchemy.engine import Engine
+except Exception as exc:  # pragma: no cover - executed when SQLAlchemy absent
+    _SQLALCHEMY_AVAILABLE = False
+    _SQLALCHEMY_IMPORT_ERROR = exc
+else:
+    if not hasattr(Table, "c"):
+        _SQLALCHEMY_AVAILABLE = False
+        _SQLALCHEMY_IMPORT_ERROR = RuntimeError("SQLAlchemy table metadata is unavailable")
+
+if not _SQLALCHEMY_AVAILABLE:
+    Column = DateTime = Float = String = Text = None  # type: ignore[assignment]
+    Engine = Any  # type: ignore[assignment]
+
+    def create_engine(*_: object, **__: object) -> "_InMemoryEngine":  # type: ignore[override]
+        return _InMemoryEngine(url="memory://feature-jobs")
+
+    def pg_insert(*_: object, **__: object) -> None:  # type: ignore[override]
+        raise MissingDependencyError("SQLAlchemy is required for feature job persistence")
+
 
 from shared.postgres import normalize_sqlalchemy_dsn
 
@@ -167,29 +194,115 @@ class FeatureState:
         }
 
 
-metadata = MetaData()
+if _SQLALCHEMY_AVAILABLE:
+    metadata = MetaData()
 
-microstructure_table = Table(
-    "market_microstructure_features",
-    metadata,
-    Column("symbol", String, primary_key=True),
-    Column("event_timestamp", DateTime(timezone=True), primary_key=True),
-    Column("created_at", DateTime(timezone=True), nullable=False),
-    Column("rolling_vwap", Float),
-    Column("spread", Float),
-    Column("order_book_imbalance", Float),
-)
+    microstructure_table = Table(
+        "market_microstructure_features",
+        metadata,
+        Column("symbol", String, primary_key=True),
+        Column("event_timestamp", DateTime(timezone=True), primary_key=True),
+        Column("created_at", DateTime(timezone=True), nullable=False),
+        Column("rolling_vwap", Float),
+        Column("spread", Float),
+        Column("order_book_imbalance", Float),
+    )
+
+    late_events_table = Table(
+        "market_data_late_events",
+        metadata,
+        Column("stream", String, primary_key=True),
+        Column("symbol", String, primary_key=True),
+        Column("event_timestamp", DateTime(timezone=True), primary_key=True),
+        Column("arrival_timestamp", DateTime(timezone=True), primary_key=True),
+        Column("payload", Text, nullable=False),
+    )
+else:
+    class _FallbackMetadata:
+        def create_all(self, *_: object, **__: object) -> None:
+            return None
+
+    metadata = _FallbackMetadata()
+    microstructure_table = None
+    late_events_table = None
 
 
-late_events_table = Table(
-    "market_data_late_events",
-    metadata,
-    Column("stream", String, primary_key=True),
-    Column("symbol", String, primary_key=True),
-    Column("event_timestamp", DateTime(timezone=True), primary_key=True),
-    Column("arrival_timestamp", DateTime(timezone=True), primary_key=True),
-    Column("payload", Text, nullable=False),
-)
+@dataclass
+class _InMemoryFeatureStorage:
+    offline: Dict[Tuple[str, dt.datetime], Mapping[str, Any]] = field(default_factory=dict)
+    created_at: Dict[Tuple[str, dt.datetime], dt.datetime] = field(default_factory=dict)
+    late_events: Dict[Tuple[str, str, dt.datetime, dt.datetime], Dict[str, Any]] = field(
+        default_factory=dict
+    )
+
+    def upsert_feature(
+        self,
+        *,
+        symbol: str,
+        event_ts: dt.datetime,
+        created_at: dt.datetime,
+        features: Mapping[str, float],
+    ) -> None:
+        key = (symbol, event_ts)
+        self.offline[key] = {
+            "symbol": symbol,
+            "event_timestamp": event_ts,
+            "created_at": created_at,
+            **features,
+        }
+        self.created_at[key] = created_at
+
+    def list_features(self) -> List[Mapping[str, Any]]:
+        return list(self.offline.values())
+
+    def record_late_event(
+        self,
+        *,
+        stream: str,
+        symbol: str,
+        event_ts: dt.datetime,
+        arrival_ts: dt.datetime,
+        payload: str,
+    ) -> None:
+        key = (stream, symbol, event_ts, arrival_ts)
+        self.late_events[key] = {
+            "stream": stream,
+            "symbol": symbol,
+            "event_timestamp": event_ts,
+            "arrival_timestamp": arrival_ts,
+            "payload": payload,
+        }
+
+    def list_late_events(self) -> List[Mapping[str, Any]]:
+        return list(self.late_events.values())
+
+
+@dataclass
+class _InMemoryEngine:
+    url: str
+    storage: _InMemoryFeatureStorage = field(default_factory=_InMemoryFeatureStorage)
+
+    def begin(self) -> "_InMemoryConnection":
+        return _InMemoryConnection(self.storage)
+
+
+class _InMemoryConnection:
+    def __init__(self, storage: _InMemoryFeatureStorage) -> None:
+        self._storage = storage
+
+    def __enter__(self) -> "_InMemoryConnection":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: Any,
+    ) -> bool:
+        return False
+
+    def execute(self, *_: object, **__: object) -> None:
+        raise MissingDependencyError("SQLAlchemy is required for feature job persistence")
 
 
 def _json_default(value: Any) -> Any:
@@ -213,9 +326,25 @@ class FeatureWriter:
         self.engine = engine
         self.store = store
         self.feature_view = feature_view
-        metadata.create_all(
-            engine, tables=[microstructure_table, late_events_table]
+        self._memory_storage: _InMemoryFeatureStorage | None = None
+        self._offline_supported = bool(
+            _SQLALCHEMY_AVAILABLE
+            and microstructure_table is not None
+            and late_events_table is not None
+            and hasattr(engine, "begin")
         )
+        if self._offline_supported:
+            metadata.create_all(
+                engine, tables=[microstructure_table, late_events_table]
+            )
+        else:
+            if isinstance(engine, _InMemoryEngine):
+                self._memory_storage = engine.storage
+            else:
+                self._memory_storage = _InMemoryFeatureStorage()
+                # ensure a consistent engine attribute for callers expecting one.
+                self.engine = _InMemoryEngine(url=getattr(engine, "url", "memory://feature-jobs"))
+                self.engine.storage = self._memory_storage
 
     def persist(
         self, *, symbol: str, event_ts: dt.datetime, feature_payload: Mapping[str, float]
@@ -239,6 +368,16 @@ class FeatureWriter:
         created_at: dt.datetime,
         features: Mapping[str, float],
     ) -> None:
+        if not self._offline_supported or microstructure_table is None:
+            if self._memory_storage is None:
+                self._memory_storage = _InMemoryFeatureStorage()
+            self._memory_storage.upsert_feature(
+                symbol=symbol,
+                event_ts=event_ts,
+                created_at=created_at,
+                features=features,
+            )
+            return
         stmt = pg_insert(microstructure_table).values(
             symbol=symbol,
             event_timestamp=event_ts,
@@ -289,6 +428,17 @@ class FeatureWriter:
         payload_copy["lateness_ms"] = event.lateness_ms
         payload_copy["stream"] = stream
         serialised = json.dumps(payload_copy, default=_json_default)
+        if not self._offline_supported or late_events_table is None:
+            if self._memory_storage is None:
+                self._memory_storage = _InMemoryFeatureStorage()
+            self._memory_storage.record_late_event(
+                stream=stream,
+                symbol=symbol,
+                event_ts=event.event_ts,
+                arrival_ts=event.arrival_ts,
+                payload=serialised,
+            )
+            return
         stmt = pg_insert(late_events_table).values(
             stream=stream,
             symbol=symbol,
@@ -299,6 +449,10 @@ class FeatureWriter:
         stmt = stmt.on_conflict_do_nothing()
         with self.engine.begin() as connection:
             connection.execute(stmt)
+
+    @property
+    def memory_storage(self) -> _InMemoryFeatureStorage | None:
+        return self._memory_storage
 
 
 class MarketFeatureJob:
@@ -335,6 +489,9 @@ class MarketFeatureJob:
             store=self.store,
             feature_view=self.feature_view,
         )
+        # Normalise the engine reference in case the writer swapped to an in-memory
+        # backend because SQLAlchemy was unavailable.
+        self.engine = self.writer.engine
         self.service_name = "feature_jobs"
         self.trade_ordering = EventOrderingBuffer(
             stream_name="md.trades",
