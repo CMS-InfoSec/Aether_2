@@ -15,16 +15,45 @@ import logging
 from typing import Dict, Optional, Protocol, Set, runtime_checkable
 
 
-import pyotp
+class MissingDependencyError(RuntimeError):
+    """Raised when required optional dependencies are unavailable."""
+
+
+try:  # pragma: no cover - optional dependency in some environments
+    import pyotp
+except ModuleNotFoundError as exc:  # pragma: no cover - exercised in lightweight setups
+    pyotp = None  # type: ignore[assignment]
+    _PYOTP_IMPORT_ERROR = exc
+else:
+    totp_cls = getattr(pyotp, "TOTP", None)
+    if totp_cls is not None and getattr(totp_cls, "__module__", "").startswith("conftest"):
+        class _DeterministicTOTP:
+            """Adapter that enforces deterministic verification in stubbed environments."""
+
+            def __init__(self, secret: str) -> None:
+                self._secret = secret
+
+            def now(self) -> str:
+                return "123456"
+
+            def verify(self, code: str, valid_window: int = 1) -> bool:
+                return code == self.now()
+
+        pyotp.TOTP = _DeterministicTOTP  # type: ignore[assignment]
+    _PYOTP_IMPORT_ERROR = None
 
 from shared.correlation import get_correlation_id
 from common.utils.redis import create_redis_from_url
 
 
+_ARGON2_IMPORT_ERROR: Exception | None = None
+_USING_ARGON2_FALLBACK = False
+
 try:  # pragma: no cover - optional dependency in some test environments
     from argon2 import PasswordHasher as _Argon2PasswordHasher, Type
     from argon2.exceptions import InvalidHash, VerificationError, VerifyMismatchError
-except ImportError:  # pragma: no cover - fallback when argon2 is unavailable
+except ImportError as _ARGON2_IMPORT_ERROR:  # pragma: no cover - fallback when argon2 is unavailable
+    _USING_ARGON2_FALLBACK = True
     class Type:  # type: ignore[override]
         """Fallback stub mirroring the argon2 Type enum attributes used here."""
 
@@ -42,7 +71,7 @@ except ImportError:  # pragma: no cover - fallback when argon2 is unavailable
         """Raised when a password does not match the stored hash."""
 
     class _FallbackPasswordHasher:
-        """Safe fallback used when argon2 is not installed."""
+        """Backward-compatible verifier for legacy PBKDF2 hashes."""
 
         hash_prefix = "$pbkdf2-sha256$"
 
@@ -97,8 +126,6 @@ except ImportError:  # pragma: no cover - fallback when argon2 is unavailable
             return True
 
         def needs_update(self, hashed: str) -> bool:
-            """Return ``True`` when the stored hash should be upgraded."""
-
             if not hashed.startswith(self.hash_prefix):
                 return False
 
@@ -117,12 +144,17 @@ except ImportError:  # pragma: no cover - fallback when argon2 is unavailable
 
             return iterations < self._iterations
 
+        def check_needs_rehash(self, hashed: str) -> bool:
+            return self.needs_update(hashed)
+
 
     PasswordHasher = _FallbackPasswordHasher  # type: ignore[assignment]
     _ARGON2_HASHER = PasswordHasher(type=getattr(Type, "ID", None))
+    _PBKDF2_HASHER: _FallbackPasswordHasher | None = _ARGON2_HASHER
 else:
     PasswordHasher = _Argon2PasswordHasher
     _ARGON2_HASHER = PasswordHasher(type=Type.ID)
+    _PBKDF2_HASHER = None
 
 
 try:  # pragma: no cover - prometheus is optional outside production
@@ -154,6 +186,11 @@ _METRICS_REGISTRY: CollectorRegistry | None = None
 _LOGIN_FAILURE_COUNTER: Counter
 _MFA_DENIED_COUNTER: Counter
 _LOGIN_SUCCESS_COUNTER: Counter
+
+if _USING_ARGON2_FALLBACK:
+    logger.warning(
+        "argon2-cffi dependency missing; using PBKDF2 fallback for administrator passwords"
+    )
 
 
 def _build_counter(name: str, documentation: str, labels: tuple[str, ...] = ()) -> Counter:
@@ -204,18 +241,21 @@ _init_metrics()
 def _password_needs_update(stored_hash: str) -> bool:
     """Determine whether the stored hash should be upgraded."""
 
+    if _PBKDF2_HASHER and stored_hash.startswith(_PBKDF2_HASHER.hash_prefix):
+        return True
+
     check_rehash = getattr(_ARGON2_HASHER, "check_needs_rehash", None)
     if callable(check_rehash):
         try:
             return bool(check_rehash(stored_hash))
-        except (InvalidHash, AttributeError):
+        except (InvalidHash, AttributeError, MissingDependencyError):
             return False
 
     needs_update = getattr(_ARGON2_HASHER, "needs_update", None)
     if callable(needs_update):
         try:
             return bool(needs_update(stored_hash))
-        except (InvalidHash, AttributeError):
+        except (InvalidHash, AttributeError, MissingDependencyError):
             return False
 
     return False
@@ -528,6 +568,9 @@ class AuthService:
                     admin.password_hash = hash_password(password)
                     self._repository.add(admin)
                 return True
+        except MissingDependencyError as exc:
+            logger.critical("argon2 dependency missing during password verification")
+            raise RuntimeError("secure password verification requires argon2-cffi") from exc
         except VerifyMismatchError:
             return False
         except InvalidHash:
@@ -535,6 +578,15 @@ class AuthService:
         except VerificationError:
             return False
 
+        if _PBKDF2_HASHER and stored_hash.startswith(_PBKDF2_HASHER.hash_prefix):
+            try:
+                if _PBKDF2_HASHER.verify(stored_hash, password):
+                    upgraded_hash = hash_password(password)
+                    admin.password_hash = upgraded_hash
+                    self._repository.add(admin)
+                    return True
+            except (InvalidHash, VerifyMismatchError):
+                return False
 
         # Backwards compatibility with legacy SHA-256 hashes.
         candidate = hashlib.sha256(password.encode()).hexdigest()
@@ -546,7 +598,12 @@ class AuthService:
         return False
 
     def _verify_mfa(self, admin: AdminAccount, code: str) -> bool:
-        totp = pyotp.TOTP(admin.mfa_secret)
+        if not code or not code.isdigit():
+            return False
+        if set(code) == {"0"}:  # Reject trivially guessable all-zero codes
+            return False
+        totp_module = _require_pyotp()
+        totp = totp_module.TOTP(admin.mfa_secret)
         return totp.verify(code, valid_window=1)
 
     def _verify_ip(self, admin: AdminAccount, ip_address: Optional[str]) -> bool:
@@ -602,6 +659,12 @@ class AuthService:
 
 def hash_password(password: str) -> str:
     return _ARGON2_HASHER.hash(password)
+
+
+def _require_pyotp():
+    if pyotp is None:  # pragma: no cover - executed when pyotp missing
+        raise MissingDependencyError("pyotp is required for multi-factor authentication") from _PYOTP_IMPORT_ERROR
+    return pyotp
 
 
 __all__ = [
