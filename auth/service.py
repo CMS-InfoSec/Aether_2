@@ -5,14 +5,16 @@ import base64
 import binascii
 import hashlib
 import hmac
-
+import json
+import logging
 import os
+import sys
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-import json
-import logging
-from typing import Dict, Optional, Protocol, Set, runtime_checkable
+from pathlib import Path
+from threading import Lock
+from typing import Any, Dict, Optional, Protocol, Set, runtime_checkable
 
 
 class MissingDependencyError(RuntimeError):
@@ -180,6 +182,12 @@ except Exception:  # pragma: no cover - provide a no-op fallback
 
 
 logger = logging.getLogger(__name__)
+
+
+_INSECURE_DEFAULTS_FLAG = "AUTH_ALLOW_INSECURE_DEFAULTS"
+_STATE_DIR_ENV = "AETHER_STATE_DIR"
+_STATE_SUBDIR = "auth_sessions"
+_STATE_FILE = "sessions.json"
 
 
 _METRICS_REGISTRY: CollectorRegistry | None = None
@@ -509,14 +517,146 @@ class RedisSessionStore(SessionStoreProtocol):
         return session
 
 
+class FileBackedSessionStore(SessionStoreProtocol):
+    """Persist admin sessions to disk for insecure-default environments."""
+
+    def __init__(self, *, path: Path | None = None, ttl_minutes: int = 60) -> None:
+        self._path = path or _session_store_path()
+        self._ttl = timedelta(minutes=ttl_minutes)
+        self._lock = Lock()
+        self._sessions: Dict[str, Session] = {}
+        self._load()
+        self._purge_expired()
+
+    def _load(self) -> None:
+        if not self._path.exists():
+            self._sessions = {}
+            return
+        try:
+            raw = self._path.read_text(encoding="utf-8")
+        except OSError:
+            logger.warning("Failed to read persisted admin sessions from %s", self._path)
+            self._sessions = {}
+            return
+        if not raw:
+            self._sessions = {}
+            return
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("Corrupted admin session store detected at %s; ignoring", self._path)
+            self._sessions = {}
+            return
+        sessions: Dict[str, Session] = {}
+        if isinstance(payload, dict):
+            for token, entry in payload.items():
+                if not isinstance(entry, dict):
+                    continue
+                admin_id = entry.get("admin_id")
+                created_at_raw = entry.get("created_at")
+                expires_at_raw = entry.get("expires_at")
+                if not isinstance(admin_id, str) or not isinstance(created_at_raw, str) or not isinstance(expires_at_raw, str):
+                    continue
+                try:
+                    created_at = datetime.fromisoformat(created_at_raw)
+                    expires_at = datetime.fromisoformat(expires_at_raw)
+                except ValueError:
+                    continue
+                sessions[str(token)] = Session(
+                    token=str(token),
+                    admin_id=admin_id,
+                    created_at=created_at,
+                    expires_at=expires_at,
+                )
+        self._sessions = sessions
+
+    def _persist(self) -> None:
+        payload: Dict[str, Dict[str, Any]] = {}
+        for token, session in self._sessions.items():
+            payload[token] = {
+                "token": session.token,
+                "admin_id": session.admin_id,
+                "created_at": session.created_at.isoformat(),
+                "expires_at": session.expires_at.isoformat(),
+            }
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self._path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        except OSError:
+            logger.warning("Failed to persist admin sessions to %s", self._path)
+
+    def _purge_expired(self) -> None:
+        now = datetime.now(timezone.utc)
+        removed = False
+        for token, session in list(self._sessions.items()):
+            if session.expires_at <= now:
+                self._sessions.pop(token, None)
+                removed = True
+        if removed:
+            self._persist()
+
+    def create(self, admin_id: str) -> Session:
+        now = datetime.now(timezone.utc)
+        session = Session(
+            token=_generate_session_token(),
+            admin_id=admin_id,
+            created_at=now,
+            expires_at=now + self._ttl,
+        )
+        with self._lock:
+            self._purge_expired()
+            self._sessions[session.token] = session
+            self._persist()
+        return session
+
+    def get(self, token: str) -> Optional[Session]:
+        with self._lock:
+            self._purge_expired()
+            session = self._sessions.get(token)
+            if session is None:
+                return None
+            if not session.is_active:
+                self._sessions.pop(token, None)
+                self._persist()
+                return None
+            return Session(
+                token=session.token,
+                admin_id=session.admin_id,
+                created_at=session.created_at,
+                expires_at=session.expires_at,
+            )
+
+
+def _insecure_defaults_enabled() -> bool:
+    return (
+        os.getenv(_INSECURE_DEFAULTS_FLAG) == "1"
+        or os.getenv("AETHER_ALLOW_INSECURE_TEST_DEFAULTS") == "1"
+        or os.getenv("PYTEST_CURRENT_TEST")
+        or "pytest" in sys.modules
+    )
+
+
+def _session_store_path() -> Path:
+    base = Path(os.getenv(_STATE_DIR_ENV, ".aether_state"))
+    path = base / _STATE_SUBDIR / _STATE_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def build_session_store_from_url(redis_url: str, *, ttl_minutes: int = 60) -> SessionStoreProtocol:
     """Create a session store backed by Redis or a deterministic in-memory stub."""
 
     client, used_stub = create_redis_from_url(redis_url, decode_responses=True, logger=logger)
     if used_stub:
+        if not _insecure_defaults_enabled():
+            raise RuntimeError(
+                "Admin session store requires a reachable Redis instance; set AUTH_ALLOW_INSECURE_DEFAULTS=1 to use the local file-backed fallback"
+            )
+        state_path = _session_store_path()
         logger.warning(
-            "Redis dependency unavailable; using in-memory session store stub for %s", redis_url
+            "Redis dependency unavailable for %s; using file-backed admin session store at %s", redis_url, state_path
         )
+        return FileBackedSessionStore(path=state_path, ttl_minutes=ttl_minutes)
     return RedisSessionStore(client, ttl_minutes=ttl_minutes)
 
 
@@ -677,6 +817,7 @@ __all__ = [
     "SessionStoreProtocol",
     "InMemorySessionStore",
     "RedisSessionStore",
+    "FileBackedSessionStore",
     "build_session_store_from_url",
     "SessionStore",
     "AuthService",
