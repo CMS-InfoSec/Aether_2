@@ -20,6 +20,8 @@ from typing import (
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
+from services.common.security import require_admin_account
+
 ValidatorFn = TypeVar("ValidatorFn", bound=Callable[..., Any])
 
 
@@ -399,39 +401,57 @@ async def evaluate_hedge(
 async def set_override(
     payload: HedgeOverrideRequest,
     service: HedgeService = Depends(get_hedge_service),
+    account_id: str = Depends(require_admin_account),
 ) -> Dict[str, object]:
     """Override the computed hedge target percentage."""
 
+    del account_id  # Guard is enforced via dependency injection.
     override = service.set_override(target_pct=payload.target_pct, reason=payload.reason)
     return override.as_dict()
 
 
 @_router_delete("/override", status_code=status.HTTP_204_NO_CONTENT)
-async def clear_override(service: HedgeService = Depends(get_hedge_service)) -> None:
+async def clear_override(
+    service: HedgeService = Depends(get_hedge_service),
+    account_id: str = Depends(require_admin_account),
+) -> None:
     """Clear the active hedge override."""
 
+    del account_id
     service.clear_override()
 
 
 @_router_get("/override", response_model=Optional[Dict[str, object]])
-async def get_override(service: HedgeService = Depends(get_hedge_service)) -> Optional[Dict[str, object]]:
+async def get_override(
+    service: HedgeService = Depends(get_hedge_service),
+    account_id: str = Depends(require_admin_account),
+) -> Optional[Dict[str, object]]:
     """Return the active hedge override if present."""
 
+    del account_id
     override = service.get_override()
     return override.as_dict() if override else None
 
 
 @_router_get("/history", response_model=List[HedgeHistoryResponse])
-async def get_history(service: HedgeService = Depends(get_hedge_service)) -> List[Dict[str, object]]:
+async def get_history(
+    service: HedgeService = Depends(get_hedge_service),
+    account_id: str = Depends(require_admin_account),
+) -> List[Dict[str, object]]:
     """Return hedge history records with diagnostics."""
 
+    del account_id
     return [record.as_dict() for record in service.get_history()]
 
 
 @_router_get("/diagnostics", response_model=Optional[Dict[str, object]])
-async def get_last_diagnostics(service: HedgeService = Depends(get_hedge_service)) -> Optional[Dict[str, object]]:
+async def get_last_diagnostics(
+    service: HedgeService = Depends(get_hedge_service),
+    account_id: str = Depends(require_admin_account),
+) -> Optional[Dict[str, object]]:
     """Return the latest hedge diagnostics snapshot."""
 
+    del account_id
     diagnostics = service.get_last_diagnostics()
     return diagnostics.as_dict() if diagnostics else None
 
