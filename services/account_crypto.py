@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
 from functools import lru_cache
 from pathlib import Path
 
@@ -38,26 +39,57 @@ def _insecure_defaults_enabled() -> bool:
     return "pytest" in sys.modules
 
 
-def _load_or_generate_local_key() -> bytes:
-    path = _local_key_path()
+def _read_local_key(path: Path) -> bytes | None:
     try:
         existing = path.read_text(encoding="ascii").strip()
     except FileNotFoundError:
-        existing = ""
+        return None
     except (OSError, UnicodeDecodeError) as exc:  # pragma: no cover - defensive warning
         LOGGER.warning("Failed to read local encryption key from %s: %s", path, exc)
-        existing = ""
+        return None
 
-    if existing:
-        return existing.encode("ascii")
+    if not existing:
+        return None
 
+    return existing.encode("ascii")
+
+
+def _load_or_generate_local_key() -> bytes:
     from cryptography.fernet import Fernet
 
-    key_bytes = Fernet.generate_key()
-    try:
-        path.write_text(key_bytes.decode("ascii"), encoding="ascii")
-    except OSError as exc:  # pragma: no cover - persistence best-effort
-        LOGGER.warning("Failed to persist generated encryption key to %s: %s", path, exc)
+    path = _local_key_path()
+
+    while True:
+        existing = _read_local_key(path)
+        if existing is not None:
+            return existing
+
+        key_bytes = Fernet.generate_key()
+        key_text = key_bytes.decode("ascii")
+
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            time.sleep(0.05)
+            continue
+        except OSError as exc:  # pragma: no cover - persistence best-effort
+            LOGGER.warning("Failed to open %s for writing local encryption key: %s", path, exc)
+            break
+
+        try:
+            with os.fdopen(fd, "w", encoding="ascii") as handle:
+                handle.write(key_text)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError as exc:  # pragma: no cover - persistence best-effort
+            LOGGER.warning("Failed to persist generated encryption key to %s: %s", path, exc)
+        return key_bytes
+
+    # Fall back to a best-effort read if exclusive creation fails repeatedly.
+    existing = _read_local_key(path)
+    if existing is not None:
+        return existing
+
     return key_bytes
 
 
