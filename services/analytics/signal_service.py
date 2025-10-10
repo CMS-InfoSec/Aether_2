@@ -98,6 +98,7 @@ from services.analytics.market_data_store import (
     MarketDataUnavailable,
     TimescaleMarketDataAdapter,
     Trade,
+    using_local_market_data,
 )
 from services.common import security
 from services.common.security import require_admin_account
@@ -616,6 +617,9 @@ SESSION_STORE: SessionStoreProtocol | None = None
 
 
 def _resolve_market_data_dsn() -> str:
+    if using_local_market_data():
+        return "local+json://signal-market-data"
+
     allow_sqlite = "pytest" in sys.modules
     for env_var in (_PRIMARY_DSN_ENV, _FALLBACK_DSN_ENV):
         raw = os.getenv(env_var)

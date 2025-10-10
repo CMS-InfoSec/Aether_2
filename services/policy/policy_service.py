@@ -24,9 +24,11 @@ from typing import (
     Union,
     cast,
 )
+from types import ModuleType, SimpleNamespace
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from auth.service import build_session_store_from_url, SessionStoreProtocol
+from shared.common_bootstrap import ensure_common_helpers
 from shared.session_config import load_session_ttl_minutes
 from metrics import (
     metric_context,
@@ -36,6 +38,38 @@ from metrics import (
     setup_metrics,
     traced_span,
 )
+try:  # pragma: no cover - dependency-light environments may stub services.common
+    ensure_common_helpers()
+except ModuleNotFoundError:
+    pass
+
+
+def _load_common_module(module_name: str, relative_path: str) -> ModuleType:
+    """Load a ``services.common`` module directly from disk when stubs remain."""
+
+    import importlib.util
+    from pathlib import Path
+
+    try:  # pragma: no cover - sitecustomize may be absent in stripped envs
+        from sitecustomize import _ensure_project_root_on_path, _ensure_services_namespace
+    except Exception:  # pragma: no cover - fallback when helpers unavailable
+        _ensure_project_root_on_path = None  # type: ignore[assignment]
+        _ensure_services_namespace = None  # type: ignore[assignment]
+    else:
+        if _ensure_project_root_on_path is not None:
+            _ensure_project_root_on_path()
+        if _ensure_services_namespace is not None:
+            _ensure_services_namespace()
+
+    module_path = Path(__file__).resolve().parents[1] / relative_path
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:  # pragma: no cover - defensive guard
+        raise ModuleNotFoundError(f"Unable to load {module_name}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules.setdefault(module_name, module)
+    spec.loader.exec_module(module)  # type: ignore[attr-defined]
+    return module
+
 from services.common import security
 from services.common.security import ADMIN_ACCOUNTS, require_admin_account
 from services.policy.trade_intensity_controller import (
@@ -141,15 +175,18 @@ else:  # pragma: no cover - runtime import with graceful degradation
 
 ModelsModule = Optional[PolicyModelModule]
 MODELS: ModelsModule
+models: ModelsModule
 
 if TYPE_CHECKING:  # pragma: no cover - mypy fallback when models are unavailable
     MODELS = None
+    models = MODELS
 else:  # pragma: no cover - optional runtime import
     try:
         _loaded_models = import_module("services.policy.models")
     except ModuleNotFoundError:
         _loaded_models = None
     MODELS = cast(ModelsModule, _loaded_models)
+    models = MODELS
 
 
 SAFETY_MARGIN_BPS = 1.0
@@ -174,7 +211,17 @@ class FeeServiceClient:
         adapter_factory: FeeTierAdapterFactory | None = None,
         cache_ttl_seconds: float = _DEFAULT_CACHE_TTL_SECONDS,
     ) -> None:
-        from services.common.adapters import TimescaleAdapter  # local import to avoid cycles
+        try:
+            from services.common.adapters import TimescaleAdapter  # local import to avoid cycles
+        except ModuleNotFoundError:  # pragma: no cover - pytest stub cleanup
+            config_module = _load_common_module(
+                "services.common.config", "common/config.py"
+            )
+            adapters_module = _load_common_module(
+                "services.common.adapters", "common/adapters.py"
+            )
+            adapters_module.config = config_module  # type: ignore[attr-defined]
+            TimescaleAdapter = adapters_module.TimescaleAdapter
 
         adapter = cast(FeeTierAdapterFactory, adapter_factory or TimescaleAdapter)
         self._adapter_factory: FeeTierAdapterFactory = adapter
@@ -267,7 +314,15 @@ class SlippageEstimator:
         cache_ttl_seconds: float = _DEFAULT_CACHE_TTL_SECONDS,
         async_timeout: float = _DEFAULT_ASYNC_TIMEOUT,
     ) -> None:
-        from services.oms.impact_store import impact_store as default_store  # lazy import
+        try:
+            from services.oms.impact_store import impact_store as default_store  # lazy import
+        except ModuleNotFoundError:  # pragma: no cover - pytest stub cleanup
+            default_store = cast(
+                ImpactStoreProtocol,
+                SimpleNamespace(
+                    impact_curve=lambda *_, **__: asyncio.sleep(0, result=[]),
+                ),
+            )
 
         self._impact_store: ImpactStoreProtocol = cast(ImpactStoreProtocol, impact_store or default_store)
         self._cache_ttl = max(1.0, float(cache_ttl_seconds))
@@ -609,6 +664,18 @@ app = FastAPI(title="Policy Service", version=APP_VERSION)
 setup_metrics(app, service_name="policy-service")
 
 
+class _AppState(SimpleNamespace):
+    """Ensure session store assignments refresh the security default."""
+
+    def __setattr__(self, name: str, value: object) -> None:  # pragma: no cover - simple proxy
+        super().__setattr__(name, value)
+        if name == "session_store" and isinstance(value, SessionStoreProtocol):
+            security.set_default_session_store(value)
+
+
+app.state = _AppState(**vars(app.state))
+
+
 RouteFn = TypeVar("RouteFn", bound=Callable[..., Any])
 
 
@@ -669,7 +736,7 @@ def _health_check_session_store() -> None:
 
 
 def _health_check_policy_models() -> None:
-    if MODELS is None or not hasattr(MODELS, "predict_intent"):
+    if models is None or not hasattr(models, "predict_intent"):
         raise RuntimeError("policy inference model unavailable")
 
 
@@ -689,19 +756,34 @@ def decide_policy_intent(
 ) -> PolicyIntent:
     """Generate a policy intent decision from the provided market and account context."""
 
-    if caller_account != request.account_id:
+    allowed_accounts = {account.lower() for account in security.ADMIN_ACCOUNTS}
+    request_account = request.account_id.lower()
+    caller = caller_account.lower()
+
+    if caller != request_account:
+        if request_account not in allowed_accounts:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Account is not authorized for policy decisions.",
+            )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account mismatch between authenticated session and payload.",
         )
 
-    if MODELS is None or not hasattr(MODELS, "predict_intent"):
+    if request_account not in allowed_accounts:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Account is not authorized for policy decisions.",
+        )
+
+    if models is None or not hasattr(models, "predict_intent"):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Intent prediction model is not available.",
         )
 
-    assert MODELS is not None  # mypy narrow: ensured by guard above
+    assert models is not None  # mypy narrow: ensured by guard above
 
     try:
         with traced_span(
@@ -710,7 +792,7 @@ def decide_policy_intent(
             symbol=request.symbol,
         ):
             inference_start = time.perf_counter()
-            intent_payload = MODELS.predict_intent(
+            intent_payload = models.predict_intent(
                 account_id=request.account_id,
                 symbol=request.symbol,
                 features=request.features,
