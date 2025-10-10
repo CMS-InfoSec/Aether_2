@@ -77,6 +77,7 @@ except Exception:  # pragma: no cover - exercised when SQLAlchemy is unavailable
 
 
 
+from shared.account_scope import SQLALCHEMY_AVAILABLE as _ACCOUNT_SCOPE_AVAILABLE, account_id_column
 from services.common.security import require_admin_account
 
 
@@ -444,7 +445,7 @@ class CapitalFlowType(str, enum.Enum):
     WITHDRAW = "withdraw"
 
 
-if _SQLALCHEMY_AVAILABLE:
+if _SQLALCHEMY_AVAILABLE and _ACCOUNT_SCOPE_AVAILABLE:
 
     class CapitalFlowRecord(Base):
         """ORM model for persisted capital flows."""
@@ -452,7 +453,7 @@ if _SQLALCHEMY_AVAILABLE:
         __tablename__ = "capital_flows"
 
         id = Column(Integer, primary_key=True, autoincrement=True)
-        account_id = Column(String, nullable=False, index=True)
+        account_id = account_id_column(index=True)
         type = Column(String, nullable=False)
         amount = Column(PreciseDecimal(_DECIMAL_PRECISION, _DECIMAL_SCALE), nullable=False)
         currency = Column(String, nullable=False)
@@ -464,7 +465,7 @@ if _SQLALCHEMY_AVAILABLE:
 
         __tablename__ = "nav_baselines"
 
-        account_id = Column(String, primary_key=True)
+        account_id = account_id_column(primary_key=True)
         currency = Column(String, nullable=False)
         baseline = Column(
             PreciseDecimal(_DECIMAL_PRECISION, _DECIMAL_SCALE),

@@ -58,6 +58,7 @@ except Exception:  # pragma: no cover - exercised in lightweight environments
         raise RuntimeError("SQLAlchemy is unavailable in this environment")
 
 from services.common.security import require_admin_account
+from shared.account_scope import SQLALCHEMY_AVAILABLE as _ACCOUNT_SCOPE_AVAILABLE, account_id_column
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -154,7 +155,7 @@ class _QueueStore:
         raise NotImplementedError
 
 
-if _SQLALCHEMY_AVAILABLE:
+if _SQLALCHEMY_AVAILABLE and _ACCOUNT_SCOPE_AVAILABLE:
 
     Base = declarative_base()
 
@@ -164,7 +165,7 @@ if _SQLALCHEMY_AVAILABLE:
         __tablename__ = "hitl_queue"
 
         intent_id = Column(String, primary_key=True)
-        account_id = Column(String, nullable=False)
+        account_id = account_id_column()
         trade_json = Column(Text, nullable=False)
         status = Column(String, nullable=False, default="pending")
         ts = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))

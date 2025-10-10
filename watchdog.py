@@ -45,6 +45,7 @@ from sqlalchemy.pool import StaticPool
 from common.schemas.contracts import IntentEvent
 from services.common.adapters import KafkaNATSAdapter
 from services.common.security import require_admin_account
+from shared.account_scope import account_id_column
 from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 try:  # pragma: no cover - LightGBM is optional in many environments
@@ -138,7 +139,7 @@ class WatchdogLog(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     intent_id = Column(String, nullable=False, unique=True, index=True)
-    account_id = Column(String, nullable=False, index=True)
+    account_id = account_id_column(index=True)
     reason = Column(Text, nullable=False)
     score = Column(Float, nullable=True)
     details_json = Column(JSON, nullable=False, default=dict)

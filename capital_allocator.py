@@ -21,7 +21,9 @@ except Exception:  # pragma: no cover - degrade gracefully when Alembic missing
     Config = None  # type: ignore[assignment]
 
 from fastapi import Depends, FastAPI, HTTPException
-from pydantic import BaseModel, Field, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from shared.account_scope import SQLALCHEMY_AVAILABLE as _ACCOUNT_SCOPE_AVAILABLE, account_id_column
 
 _SQLALCHEMY_AVAILABLE = True
 
@@ -88,7 +90,7 @@ except Exception:  # pragma: no cover - provide lightweight stand-ins
         return _SessionFactory(store)
 
 
-if _SQLALCHEMY_AVAILABLE:
+if _SQLALCHEMY_AVAILABLE and _ACCOUNT_SCOPE_AVAILABLE:
     make_url = _sa_make_url  # type: ignore[assignment]
 else:
 
@@ -588,7 +590,7 @@ if _SQLALCHEMY_AVAILABLE:
         __tablename__ = "capital_allocations"
 
         id = Column(Integer, primary_key=True, autoincrement=True)
-        account_id = Column(String, nullable=False, index=True)
+        account_id = account_id_column(index=True)
         pct = Column(Numeric(18, _PCT_SCALE), nullable=False)
         ts = Column(DateTime(timezone=True), nullable=False, index=True)
 

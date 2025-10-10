@@ -45,6 +45,7 @@ from common.schemas.contracts import FillEvent
 from services.common.adapters import KafkaNATSAdapter
 from shared.async_utils import dispatch_async
 from shared.postgres import normalize_sqlalchemy_dsn
+from shared.account_scope import SQLALCHEMY_AVAILABLE as _ACCOUNT_SCOPE_AVAILABLE, account_id_column
 
 
 LOGGER = logging.getLogger(__name__)
@@ -193,7 +194,7 @@ class Base(DeclarativeBase):
 class SimModeStateORM(Base):
     __tablename__ = "sim_mode_state"
 
-    account_id = Column(String(128), primary_key=True)
+    account_id = account_id_column(primary_key=True)
     active = Column(Boolean, nullable=False, default=False)
     reason = Column(Text, nullable=True)
     ts = Column(
@@ -208,7 +209,7 @@ class SimBrokerOrderORM(Base):
     __tablename__ = "sim_broker_orders"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    account_id = Column(String(128), nullable=False, index=True)
+    account_id = account_id_column(index=True)
     client_id = Column(String(128), nullable=False, index=True)
     symbol = Column(String(64), nullable=False)
     side = Column(String(8), nullable=False)
@@ -229,7 +230,7 @@ class SimBrokerFillORM(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     order_id = Column(Integer, nullable=False, index=True)
-    account_id = Column(String(128), nullable=False, index=True)
+    account_id = account_id_column(index=True)
     client_id = Column(String(128), nullable=False)
     symbol = Column(String(64), nullable=False)
     qty = Column(Numeric(36, 18), nullable=False)

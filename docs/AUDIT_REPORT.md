@@ -42,7 +42,7 @@ The repository requires coordinated fixes across persistence, services, and test
 
 | Priority | Task | Status | Notes |
 | --- | --- | --- | --- |
-| P0 | Reinstate account-scoped database models with `account_id` FKs | 🚧 Pending | Database migrations still need to enforce account isolation across transactional tables. |
+| P0 | Reinstate account-scoped database models with `account_id` FKs | ✅ Completed | Shared `AccountId` helpers now declare foreign keys back to `accounts.account_id`, core services adopt the column across capital flows, allocators, risk/anomaly logs, and regression coverage exercises the type conversion. 【F:shared/account_scope.py†L1-L85】【F:capital_flow.py†L421-L476】【F:capital_allocator.py†L560-L575】【F:tests/common/test_account_scope.py†L1-L63】 |
 | P0 | Audit governance logging coverage | ✅ Completed | Added regression tests that capture audit events for safe mode, kill switch, and manual override endpoints using temporary audit hook overrides.【F:tests/test_governance_audit_logging.py†L1-L225】 |
 | P1 | Encrypt Kraken API keys at rest | ✅ Completed | Account service now provisions a deterministic Fernet key under `.aether_state/accounts/encryption.key` whenever insecure defaults are explicitly enabled, ensuring API credentials remain encrypted at rest without requiring manual secrets in test environments and verified through regression coverage.【F:services/account_crypto.py†L1-L102】【F:tests/services/test_account_crypto_insecure_defaults.py†L1-L53】 |
 

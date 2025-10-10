@@ -29,6 +29,68 @@ from pydantic import BaseModel
 
 from services.common.adapters import RedisFeastAdapter, TimescaleAdapter
 from services.common.security import require_admin_account
+from shared.account_scope import SQLALCHEMY_AVAILABLE as _ACCOUNT_SCOPE_AVAILABLE, account_id_column
+
+try:  # pragma: no cover - SQLAlchemy is optional in insecure-default environments
+    from sqlalchemy import Column, DateTime, Float, Integer, MetaData, String, create_engine
+    from sqlalchemy.engine import Engine, URL
+    from sqlalchemy.engine.url import make_url
+    from sqlalchemy.exc import ArgumentError
+    from sqlalchemy.orm import Session, declarative_base, sessionmaker
+
+    _SQLALCHEMY_AVAILABLE = True
+except Exception:  # pragma: no cover - provide lightweight fallbacks when SQLAlchemy missing
+    Column = DateTime = Float = Integer = String = lambda *args, **kwargs: None  # type: ignore[assignment]
+
+    def _metadata_placeholder(*args: object, **kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(create_all=lambda *a, **k: None)
+
+    MetaData = _metadata_placeholder  # type: ignore[assignment]
+
+    class ArgumentError(Exception):
+        """Raised when a provided database URL is invalid under the fallback."""
+
+    class _FallbackURL:
+        """Minimal stand-in for :class:`sqlalchemy.engine.URL`."""
+
+        def __init__(self, raw: str) -> None:
+            parsed = urlparse(raw)
+            self._raw = raw
+            self.drivername = parsed.scheme or "sqlite"
+            self.host = parsed.hostname
+            self.database = parsed.path.lstrip("/")
+            self.query = dict(parse_qsl(parsed.query))
+
+        def render_as_string(self, hide_password: bool = False) -> str:
+            del hide_password  # parity with SQLAlchemy signature
+            return self._raw
+
+    URL = _FallbackURL  # type: ignore[assignment]
+
+    def make_url(raw: str) -> _FallbackURL:  # type: ignore[override]
+        return _FallbackURL(raw)
+
+    Engine = Any  # type: ignore[assignment]
+    Session = Any  # type: ignore[assignment]
+
+    def create_engine(*args: object, **kwargs: object) -> Any:  # pragma: no cover - not used in fallback
+        raise RuntimeError("SQLAlchemy is required to create a diversification engine")
+
+    def declarative_base(*, metadata: Any | None = None, **_: object) -> type:
+        base = type("_FallbackBase", (), {})
+        setattr(base, "metadata", metadata or _metadata_placeholder())
+        return base
+
+    def sessionmaker(*args: object, **kwargs: object) -> Callable[[], Session]:  # pragma: no cover - fallback factory
+        def _factory() -> Session:
+            return cast(Session, _NullSession())
+
+        return _factory
+
+    _SQLALCHEMY_AVAILABLE = False
+
+if '_SQLALCHEMY_AVAILABLE' in globals() and _SQLALCHEMY_AVAILABLE:
+    _SQLALCHEMY_AVAILABLE = _ACCOUNT_SCOPE_AVAILABLE
 
 try:  # pragma: no cover - SQLAlchemy is optional in insecure-default environments
     from sqlalchemy import Column, DateTime, Float, Integer, MetaData, String, create_engine
@@ -262,7 +324,7 @@ class DiversificationTargetRecord(Base):
     __tablename__ = "diversification_targets"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    account_id = Column(String, nullable=False, index=True)
+    account_id = account_id_column(index=True)
     symbol = Column(String, nullable=False)
     bucket = Column(String, nullable=True)
     weight = Column(Float, nullable=False)
@@ -278,7 +340,7 @@ class DiversificationActionRecord(Base):
     __tablename__ = "diversification_actions_log"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    account_id = Column(String, nullable=False, index=True)
+    account_id = account_id_column(index=True)
     action_type = Column(String, nullable=False)
     payload_json = Column(String, nullable=False)
     created_at = Column(
