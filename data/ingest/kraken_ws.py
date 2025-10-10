@@ -17,6 +17,10 @@ class MissingDependencyError(RuntimeError):
     """Raised when optional ingest dependencies are unavailable."""
 
 
+class _StreamRestart(RuntimeError):
+    """Internal signal used to trigger a WebSocket reconnection."""
+
+
 try:  # pragma: no cover - optional dependency
     import aiohttp
 except Exception as exc:  # pragma: no cover - executed when aiohttp missing
@@ -83,6 +87,9 @@ LOGGER = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 KRAKEN_WS_URL = os.getenv("KRAKEN_WS_URL", "wss://ws.kraken.com")
+_RECONNECT_BASE_SECONDS = 1.0
+_RECONNECT_MAX_SECONDS = 30.0
+_RECONNECT_BACKOFF_CAP = 5
 KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
 KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "kraken.marketdata")
 _SQLITE_FALLBACK_FLAG = "KRAKEN_WS_ALLOW_SQLITE_FOR_TESTS"
@@ -439,7 +446,66 @@ async def _consume_via_local_snapshots(
         await asyncio.sleep(_POLL_INTERVAL_SECONDS)
 
 
-async def consume(pairs: Sequence[str]) -> None:
+def _backoff_seconds(attempt: int) -> float:
+    """Return an exponential backoff capped at :data:`_RECONNECT_MAX_SECONDS`."""
+
+    if attempt <= 1:
+        return _RECONNECT_BASE_SECONDS
+    exponent = min(attempt - 1, _RECONNECT_BACKOFF_CAP)
+    return min(_RECONNECT_BASE_SECONDS * (2 ** exponent), _RECONNECT_MAX_SECONDS)
+
+
+async def _stream_websocket(
+    session: aiohttp.ClientSession,
+    engine: Engine | None,
+    producer: Producer | None,
+    pairs: Sequence[str],
+) -> None:
+    try:
+        ws = await subscribe(session, pairs)
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+        raise _StreamRestart(f"subscription failed: {exc}") from exc
+
+    try:
+        async for message in ws:
+            if message.type == aiohttp.WSMsgType.TEXT:
+                data = json.loads(message.data)
+                if isinstance(data, dict) and data.get("event") == "subscriptionStatus":
+                    LOGGER.info("Subscription update", extra=data)
+                    continue
+                if not isinstance(data, list) or len(data) < 4:
+                    continue
+                channel_data = data[1]
+                if not isinstance(channel_data, dict):
+                    continue
+                market = data[3]
+                updates = flatten_updates(market, channel_data)
+                if not updates:
+                    continue
+                persist_updates(engine, updates)
+                publish_updates(producer, updates)
+                await publish_to_nats(updates)
+                continue
+
+            if message.type in {
+                aiohttp.WSMsgType.CLOSE,
+                aiohttp.WSMsgType.CLOSED,
+                aiohttp.WSMsgType.CLOSING,
+            }:
+                raise _StreamRestart("websocket closed by remote host")
+            if message.type == aiohttp.WSMsgType.ERROR:
+                raise _StreamRestart("websocket error frame received")
+        raise _StreamRestart("websocket stream ended")
+    except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError) as exc:
+        raise _StreamRestart(f"websocket error: {exc}") from exc
+    finally:
+        try:
+            await ws.close()
+        except Exception:  # pragma: no cover - best-effort cleanup
+            LOGGER.exception("Failed to close Kraken WebSocket", exc_info=True)
+
+
+async def consume(pairs: Sequence[str], *, max_cycles: int | None = None) -> None:
     _require_sqlalchemy()
     engine: Engine | None = None
     if (
@@ -452,31 +518,52 @@ async def consume(pairs: Sequence[str]) -> None:
     producer = kafka_producer()
 
     if aiohttp is None and _insecure_defaults_enabled():
-        await _consume_via_local_snapshots(engine, producer, pairs)
+        await _consume_via_local_snapshots(engine, producer, pairs, iterations=max_cycles)
         return
 
     _require_aiohttp()
-    async with aiohttp.ClientSession() as session:
-        ws = await subscribe(session, pairs)
-        async for message in ws:
-            if message.type != aiohttp.WSMsgType.TEXT:
-                continue
-            data = json.loads(message.data)
-            if isinstance(data, dict) and data.get("event") == "subscriptionStatus":
-                LOGGER.info("Subscription update", extra=data)
-                continue
-            if not isinstance(data, list) or len(data) < 4:
-                continue
-            channel_data = data[1]
-            if not isinstance(channel_data, dict):
-                continue
-            market = data[3]
-            updates = flatten_updates(market, channel_data)
-            if not updates:
-                continue
-            persist_updates(engine, updates)
-            publish_updates(producer, updates)
-            await publish_to_nats(updates)
+    reconnect_attempt = 0
+    cycles = 0
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                await _stream_websocket(session, engine, producer, pairs)
+        except _StreamRestart as exc:
+            cycles += 1
+            reconnect_attempt += 1
+            if max_cycles is not None and cycles >= max_cycles:
+                LOGGER.info(
+                    "Kraken WebSocket stream finished after %s cycles (%s); stopping without reconnect.",
+                    cycles,
+                    exc,
+                )
+                break
+            delay = _backoff_seconds(reconnect_attempt)
+            LOGGER.warning(
+                "Kraken WebSocket disconnected (%s); reconnecting in %.1f seconds.",
+                exc,
+                delay,
+            )
+            await asyncio.sleep(delay)
+            continue
+        except Exception as exc:
+            cycles += 1
+            reconnect_attempt += 1
+            if max_cycles is not None and cycles >= max_cycles:
+                LOGGER.error(
+                    "Kraken WebSocket encountered unrecoverable error after %s cycles: %s",
+                    cycles,
+                    exc,
+                )
+                raise
+            delay = _backoff_seconds(reconnect_attempt)
+            LOGGER.exception(
+                "Kraken WebSocket error; retrying in %.1f seconds.",
+                delay,
+                exc_info=exc,
+            )
+            await asyncio.sleep(delay)
+            continue
 
 
 def main() -> None:
