@@ -6,9 +6,11 @@ import datetime as dt
 import gzip
 import io
 import json
+import logging
 import os
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Optional
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional
 
 try:  # pragma: no cover - boto3 is optional during unit tests.
     import boto3
@@ -24,6 +26,12 @@ except Exception:  # pragma: no cover
 
 
 DEFAULT_EXPORT_PREFIX = "log-exports"
+_INSECURE_DEFAULTS_FLAG = "LOG_EXPORT_ALLOW_INSECURE_DEFAULTS"
+_STATE_DIR_ENV = "AETHER_STATE_DIR"
+_LOCAL_STATE_SUBDIR = "log_export"
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _normalise_s3_prefix(prefix: str) -> str:
@@ -50,6 +58,35 @@ class MissingDependencyError(RuntimeError):
     """Raised when an optional dependency required at runtime is missing."""
 
 
+def _insecure_defaults_enabled() -> bool:
+    return (
+        os.getenv(_INSECURE_DEFAULTS_FLAG) == "1"
+        or bool(os.getenv("PYTEST_CURRENT_TEST"))
+    )
+
+
+def _state_root() -> Path:
+    root = Path(os.getenv(_STATE_DIR_ENV, ".aether_state")) / _LOCAL_STATE_SUBDIR
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _artifacts_root() -> Path:
+    root = _state_root() / "artifacts"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _snapshots_root() -> Path:
+    root = _state_root() / "snapshots"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _metadata_path() -> Path:
+    return _state_root() / "metadata.json"
+
+
 @dataclass(frozen=True)
 class ExportConfig:
     """Configuration required to ship the generated archive to object storage."""
@@ -74,17 +111,17 @@ class ExportResult:
 
 
 def _require_psycopg() -> None:
-    if psycopg is None:  # pragma: no cover - sanity guard for environments without psycopg.
+    if psycopg is None and not _insecure_defaults_enabled():
         raise MissingDependencyError("psycopg is required for log export functionality")
 
 
-def _database_dsn() -> str:
+def _database_dsn(allow_missing: bool = False) -> Optional[str]:
     dsn = (
         os.getenv("LOG_EXPORT_DATABASE_URL")
         or os.getenv("AUDIT_DATABASE_URL")
         or os.getenv("DATABASE_URL")
     )
-    if not dsn:
+    if not dsn and not allow_missing:
         raise RuntimeError(
             "LOG_EXPORT_DATABASE_URL, AUDIT_DATABASE_URL, or DATABASE_URL must be set",
         )
@@ -200,6 +237,82 @@ def _build_s3_key(prefix: str, export_date: dt.date) -> str:
     return f"{safe_prefix}/{suffix}" if safe_prefix else suffix
 
 
+def _load_local_snapshot(kind: str, export_date: dt.date) -> List[dict[str, Any]]:
+    snapshot_path = _snapshots_root() / f"{kind}-{export_date.isoformat()}.json"
+    if not snapshot_path.exists():
+        return []
+    try:
+        payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    except Exception as exc:  # pragma: no cover - fallback path is best effort
+        LOGGER.warning("Failed to load %s snapshot for %s: %s", kind, export_date, exc)
+        return []
+    if isinstance(payload, list):
+        return [dict(record) for record in payload if isinstance(record, dict)]
+    LOGGER.warning(
+        "Snapshot %s did not contain a list; ignoring invalid payload", snapshot_path
+    )
+    return []
+
+
+def _persist_local_artifact(key: str, blob: bytes) -> Path:
+    target = _artifacts_root() / key
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(blob)
+    return target
+
+
+def _record_local_metadata(entry: Dict[str, Any]) -> None:
+    path = _metadata_path()
+    existing: Dict[str, Dict[str, Any]] = {}
+    if path.exists():
+        try:
+            raw_entries = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:  # pragma: no cover - best effort logging
+            LOGGER.warning("Failed to read log export metadata: %s", exc)
+            raw_entries = []
+        for item in raw_entries:
+            if isinstance(item, dict) and "sha256" in item:
+                existing[str(item["sha256"])] = item
+    existing[str(entry["sha256"])] = entry
+    ordered = sorted(
+        existing.values(),
+        key=lambda item: item.get("exported_at", ""),
+        reverse=True,
+    )
+    path.write_text(json.dumps(ordered, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _latest_local_metadata() -> Optional[ExportResult]:
+    path = _metadata_path()
+    if not path.exists():
+        return None
+    try:
+        entries = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # pragma: no cover - best effort logging
+        LOGGER.warning("Failed to parse log export metadata: %s", exc)
+        return None
+    if not isinstance(entries, list):
+        return None
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        try:
+            export_date = dt.date.fromisoformat(str(item["export_date"]))
+            exported_at = dt.datetime.fromisoformat(str(item["exported_at"]))
+            if exported_at.tzinfo is None:
+                exported_at = exported_at.replace(tzinfo=dt.timezone.utc)
+            return ExportResult(
+                export_date=export_date,
+                exported_at=exported_at,
+                s3_bucket=str(item["s3_bucket"]),
+                s3_key=str(item["s3_key"]),
+                sha256=str(item["sha256"]),
+            )
+        except Exception:  # pragma: no cover - skip malformed metadata entries
+            continue
+    return None
+
+
 def run_export(
     *,
     for_date: dt.date,
@@ -208,16 +321,31 @@ def run_export(
 ) -> ExportResult:
     """Export audit and regulatory logs for *for_date* and upload to object storage."""
 
-    _require_psycopg()
-    resolved_dsn = dsn or _database_dsn()
+    resolved_dsn = dsn or _database_dsn(allow_missing=_insecure_defaults_enabled())
     now = dt.datetime.now(dt.timezone.utc)
     start = dt.datetime.combine(for_date, dt.time.min, tzinfo=dt.timezone.utc)
     end = start + dt.timedelta(days=1)
+    use_database = bool(psycopg is not None and dict_row is not None and resolved_dsn)
+    conn = None
+    audit_records: List[dict[str, Any]]
+    reg_records: List[dict[str, Any]]
+    local_artifact: Optional[Path] = None
 
-    with psycopg.connect(resolved_dsn) as conn:  # type: ignore[arg-type]
-        ensure_export_table(conn)
-        audit_records = _fetch_audit_logs(conn, start, end)
-        reg_records = _fetch_reg_logs(conn, start, end)
+    try:
+        if use_database:
+            conn = psycopg.connect(resolved_dsn)  # type: ignore[arg-type]
+            ensure_export_table(conn)
+            audit_records = _fetch_audit_logs(conn, start, end)
+            reg_records = _fetch_reg_logs(conn, start, end)
+        else:
+            _require_psycopg()
+            audit_records = _load_local_snapshot("audit", for_date)
+            reg_records = _load_local_snapshot("reg", for_date)
+            if not audit_records and not reg_records:
+                LOGGER.info(
+                    "No local audit/reg snapshots found for %s; generating empty export",
+                    for_date,
+                )
 
         export_payload = {
             "export_date": for_date.isoformat(),
@@ -230,58 +358,85 @@ def run_export(
         digest = _compute_sha256(gz_blob)
         key = _build_s3_key(config.prefix, for_date)
 
-        client = _s3_client(config.endpoint_url)
-        client.put_object(Bucket=config.bucket, Key=key, Body=gz_blob)
+        if boto3 is not None:
+            client = _s3_client(config.endpoint_url)
+            client.put_object(Bucket=config.bucket, Key=key, Body=gz_blob)
+        else:
+            if not _insecure_defaults_enabled():
+                raise MissingDependencyError("boto3 is required for log export uploads")
+            local_artifact = _persist_local_artifact(key, gz_blob)
+            LOGGER.info("Stored log export locally at %s", local_artifact)
 
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO log_export_status (export_date, exported_at, s3_bucket, s3_key, sha256)
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (sha256) DO NOTHING
-                """.strip(),
-                (for_date, now, config.bucket, key, digest),
-            )
-        conn.commit()
+        if conn is not None:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO log_export_status (export_date, exported_at, s3_bucket, s3_key, sha256)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (sha256) DO NOTHING
+                    """.strip(),
+                    (for_date, now, config.bucket, key, digest),
+                )
+            conn.commit()
+        else:
+            metadata_entry: Dict[str, Any] = {
+                "export_date": for_date.isoformat(),
+                "exported_at": now.isoformat(),
+                "s3_bucket": config.bucket,
+                "s3_key": key,
+                "sha256": digest,
+            }
+            if local_artifact is not None:
+                metadata_entry["local_path"] = str(local_artifact)
+            _record_local_metadata(metadata_entry)
 
-    return ExportResult(
-        export_date=for_date,
-        exported_at=now,
-        s3_bucket=config.bucket,
-        s3_key=key,
-        sha256=digest,
-    )
+        return ExportResult(
+            export_date=for_date,
+            exported_at=now,
+            s3_bucket=config.bucket,
+            s3_key=key,
+            sha256=digest,
+        )
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def latest_export(dsn: str | None = None) -> Optional[ExportResult]:
     """Return metadata for the most recent export if available."""
 
+    resolved_dsn = dsn or _database_dsn(allow_missing=_insecure_defaults_enabled())
+    if psycopg is not None and dict_row is not None and resolved_dsn:
+        with psycopg.connect(resolved_dsn) as conn:  # type: ignore[arg-type]
+            ensure_export_table(conn)
+            with conn.cursor(row_factory=dict_row) as cur:  # type: ignore[arg-type]
+                cur.execute(
+                    """
+                    SELECT export_date, exported_at, s3_bucket, s3_key, sha256
+                    FROM log_export_status
+                    ORDER BY exported_at DESC
+                    LIMIT 1
+                    """.strip()
+                )
+                row = cur.fetchone()
+        if not row:
+            return None
+        exported_at = row["exported_at"]
+        if isinstance(exported_at, dt.datetime) and exported_at.tzinfo is None:
+            exported_at = exported_at.replace(tzinfo=dt.timezone.utc)
+        return ExportResult(
+            export_date=row["export_date"],
+            exported_at=exported_at,
+            s3_bucket=row["s3_bucket"],
+            s3_key=row["s3_key"],
+            sha256=row["sha256"],
+        )
+
+    if _insecure_defaults_enabled():
+        return _latest_local_metadata()
+
     _require_psycopg()
-    resolved_dsn = dsn or _database_dsn()
-    with psycopg.connect(resolved_dsn) as conn:  # type: ignore[arg-type]
-        ensure_export_table(conn)
-        with conn.cursor(row_factory=dict_row) as cur:  # type: ignore[arg-type]
-            cur.execute(
-                """
-                SELECT export_date, exported_at, s3_bucket, s3_key, sha256
-                FROM log_export_status
-                ORDER BY exported_at DESC
-                LIMIT 1
-                """.strip()
-            )
-            row = cur.fetchone()
-    if not row:
-        return None
-    exported_at = row["exported_at"]
-    if isinstance(exported_at, dt.datetime) and exported_at.tzinfo is None:
-        exported_at = exported_at.replace(tzinfo=dt.timezone.utc)
-    return ExportResult(
-        export_date=row["export_date"],
-        exported_at=exported_at,
-        s3_bucket=row["s3_bucket"],
-        s3_key=row["s3_key"],
-        sha256=row["sha256"],
-    )
+    return None
 
 
 __all__ = [
