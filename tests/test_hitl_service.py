@@ -6,6 +6,7 @@ import importlib
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Iterator, Tuple
 
 import pytest
@@ -192,4 +193,43 @@ def test_approve_trade_allows_matching_admin(hitl_client: Tuple[TestClient, Any]
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "approved"
+
+
+def test_sqlalchemy2_sessions_initialise(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = importlib.import_module("hitl_service")
+
+    class _ProbeSession:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def get(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+        def scalars(self, *args: Any, **kwargs: Any) -> list[Any]:
+            return []
+
+        def execute(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
+            return SimpleNamespace(rowcount=0)
+
+        def close(self) -> None:
+            self.closed = True
+
+    def _sessionmaker_factory(*args: Any, **kwargs: Any):
+        def _factory() -> _ProbeSession:
+            return _ProbeSession()
+
+        return _factory
+
+    monkeypatch.setattr(module, "create_engine", lambda url, **_: SimpleNamespace(url=url))
+    monkeypatch.setattr(module, "sessionmaker", lambda **__: _sessionmaker_factory())
+    monkeypatch.setattr(
+        module,
+        "Base",
+        SimpleNamespace(metadata=SimpleNamespace(create_all=lambda **__: None)),
+    )
+    engine, session_factory, store = module._initialise_sqlalchemy_backend("postgresql://example")
+
+    assert engine is not None
+    assert session_factory is not None
+    assert store is not None
 
