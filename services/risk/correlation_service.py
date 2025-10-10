@@ -77,7 +77,9 @@ _DEFAULT_CORRELATION_DB_URL = "sqlite:///./risk_correlations.db"
 def _database_url() -> str:
     """Resolve the correlation service database connection string."""
 
-    allow_sqlite = "pytest" in sys.modules
+    allow_sqlite = os.getenv("RISK_CORRELATION_ALLOW_SQLITE") == "1"
+    if not allow_sqlite and "pytest" in sys.modules:
+        allow_sqlite = os.getenv("PYTEST_CURRENT_TEST") is not None
     raw = (
         os.getenv("RISK_CORRELATION_DATABASE_URL")
         or os.getenv("TIMESCALE_DSN")
