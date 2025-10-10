@@ -23,6 +23,10 @@ from typing import (
 
 from shared.audit import AuditLogEntry, AuditLogStore, TimescaleAuditLogger
 from shared.spot import is_spot_symbol, normalize_spot_symbol
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
 from services.common.config import TimescaleSession, get_timescale_session
 
 

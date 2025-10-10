@@ -1,9 +1,14 @@
 """Hedge management service with override support and diagnostics."""
 from __future__ import annotations
 
+import json
+import logging
+import os
 from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from pathlib import Path
+from threading import Lock
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -13,7 +18,9 @@ from typing import (
     Iterable,
     List,
     Literal,
+    Mapping,
     Optional,
+    Tuple,
     TypeVar,
     cast,
 )
@@ -69,6 +76,18 @@ else:  # pragma: no cover - runtime import with graceful fallback
             return decorator
 
 
+LOGGER = logging.getLogger(__name__)
+
+
+def _parse_datetime(value: object) -> Optional[datetime]:
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
+
+
 @dataclass
 class HedgeOverride:
     """Operator supplied override for the hedge target percentage."""
@@ -83,6 +102,29 @@ class HedgeOverride:
             "reason": self.reason,
             "created_at": self.created_at,
         }
+
+    def to_json_dict(self) -> Dict[str, object]:
+        return {
+            "target_pct": self.target_pct,
+            "reason": self.reason,
+            "created_at": self.created_at.isoformat(),
+        }
+
+    @staticmethod
+    def from_json_dict(payload: Mapping[str, object]) -> Optional["HedgeOverride"]:
+        created_at = _parse_datetime(payload.get("created_at"))
+        reason = payload.get("reason")
+        target = payload.get("target_pct")
+
+        if created_at is None or not isinstance(reason, str):
+            return None
+
+        try:
+            target_pct = float(target)
+        except (TypeError, ValueError):
+            return None
+
+        return HedgeOverride(target_pct=target_pct, reason=reason, created_at=created_at)
 
 
 @dataclass
@@ -103,6 +145,65 @@ class HedgeDiagnostics:
         data = asdict(self)
         data["auto_target_pct"] = self.adjusted_target_pct
         return data
+
+    def to_json_dict(self) -> Dict[str, object]:
+        payload = {
+            "volatility": self.volatility,
+            "drawdown": self.drawdown,
+            "stablecoin_price": self.stablecoin_price,
+            "base_target_pct": self.base_target_pct,
+            "adjusted_target_pct": self.adjusted_target_pct,
+            "guard_triggered": self.guard_triggered,
+            "guard_reason": self.guard_reason,
+            "stablecoin_deviation": self.stablecoin_deviation,
+            "components": dict(self.components),
+        }
+        return payload
+
+    @staticmethod
+    def from_json_dict(payload: Mapping[str, object]) -> Optional["HedgeDiagnostics"]:
+        try:
+            volatility = float(payload["volatility"])
+            drawdown = float(payload["drawdown"])
+            stablecoin_price = float(payload["stablecoin_price"])
+            base_target_pct = float(payload["base_target_pct"])
+            adjusted_target_pct = float(payload["adjusted_target_pct"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        guard_triggered_raw = payload.get("guard_triggered", False)
+        guard_triggered = bool(guard_triggered_raw)
+
+        guard_reason_raw = payload.get("guard_reason")
+        guard_reason = guard_reason_raw if isinstance(guard_reason_raw, str) else None
+
+        deviation_raw = payload.get("stablecoin_deviation", 0.0)
+        try:
+            stablecoin_deviation = float(deviation_raw)
+        except (TypeError, ValueError):
+            stablecoin_deviation = 0.0
+
+        components_payload = payload.get("components", {})
+        components: Dict[str, float] = {}
+        if isinstance(components_payload, Mapping):
+            for key, value in components_payload.items():
+                try:
+                    components[str(key)] = float(value)
+                except (TypeError, ValueError):
+                    continue
+
+        return HedgeDiagnostics(
+            volatility=volatility,
+            drawdown=drawdown,
+            stablecoin_price=stablecoin_price,
+            base_target_pct=base_target_pct,
+            adjusted_target_pct=adjusted_target_pct,
+            guard_triggered=guard_triggered,
+            guard_reason=guard_reason,
+            stablecoin_deviation=stablecoin_deviation,
+            components=components,
+        )
+
 
 
 @dataclass
@@ -129,6 +230,60 @@ class HedgeHistoryRecord:
         if self.override:
             payload["override"] = self.override.as_dict()
         return payload
+
+    def to_json_dict(self) -> Dict[str, object]:
+        payload: Dict[str, object] = {
+            "timestamp": self.timestamp.isoformat(),
+            "mode": self.mode,
+            "target_pct": self.target_pct,
+        }
+        if self.reason:
+            payload["reason"] = self.reason
+        if self.diagnostics:
+            payload["diagnostics"] = self.diagnostics.to_json_dict()
+        if self.override:
+            payload["override"] = self.override.to_json_dict()
+        return payload
+
+    @staticmethod
+    def from_json_dict(payload: Mapping[str, object]) -> Optional["HedgeHistoryRecord"]:
+        timestamp = _parse_datetime(payload.get("timestamp"))
+        mode = payload.get("mode")
+
+        if timestamp is None or mode not in {"auto", "override", "override_cleared"}:
+            return None
+
+        target_pct_raw = payload.get("target_pct")
+        try:
+            target_pct = float(target_pct_raw)
+        except (TypeError, ValueError):
+            return None
+
+        reason_raw = payload.get("reason")
+        reason = reason_raw if isinstance(reason_raw, str) else None
+
+        diagnostics_payload = payload.get("diagnostics")
+        diagnostics = (
+            HedgeDiagnostics.from_json_dict(diagnostics_payload)
+            if isinstance(diagnostics_payload, Mapping)
+            else None
+        )
+
+        override_payload = payload.get("override")
+        override = (
+            HedgeOverride.from_json_dict(override_payload)
+            if isinstance(override_payload, Mapping)
+            else None
+        )
+
+        return HedgeHistoryRecord(
+            timestamp=timestamp,
+            mode=cast(Literal["auto", "override", "override_cleared"], mode),
+            target_pct=target_pct,
+            reason=reason,
+            diagnostics=diagnostics,
+            override=override,
+        )
 
 
 @dataclass
@@ -205,6 +360,81 @@ class HedgeHistoryResponse(BaseModel):
     override: Optional[Dict[str, object]] = None
 
 
+class HedgeOverrideStateStore:
+    """Persist hedge overrides and history for crash recovery."""
+
+    def __init__(self, *, history_limit: int, state_path: Optional[Path] = None) -> None:
+        self._history_limit = max(int(history_limit), 1)
+        self._path = state_path or self._default_state_path()
+        self._lock = Lock()
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _default_state_path() -> Path:
+        root = Path(os.getenv("AETHER_STATE_DIR", ".aether_state"))
+        path = root / "hedge_service" / "override_state.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def load(self) -> Tuple[Optional[HedgeOverride], List[HedgeHistoryRecord]]:
+        with self._lock:
+            try:
+                raw = self._path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                return None, []
+            except OSError as exc:
+                LOGGER.warning("Failed to read hedge override state from %s: %s", self._path, exc)
+                return None, []
+
+        if not raw.strip():
+            return None, []
+
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            LOGGER.warning("Failed to decode hedge override state from %s: %s", self._path, exc)
+            return None, []
+
+        override_payload = payload.get("override")
+        history_payload = payload.get("history")
+
+        override = (
+            HedgeOverride.from_json_dict(override_payload)
+            if isinstance(override_payload, Mapping)
+            else None
+        )
+
+        history: List[HedgeHistoryRecord] = []
+        if isinstance(history_payload, list):
+            for entry in history_payload[: self._history_limit]:
+                if not isinstance(entry, Mapping):
+                    continue
+                record = HedgeHistoryRecord.from_json_dict(entry)
+                if record is not None:
+                    history.append(record)
+
+        return override, history
+
+    def persist(
+        self, override: Optional[HedgeOverride], history: Iterable[HedgeHistoryRecord]
+    ) -> None:
+        history_payload = [
+            record.to_json_dict() for record in list(history)[: self._history_limit]
+        ]
+        payload = {
+            "override": override.to_json_dict() if override else None,
+            "history": history_payload,
+        }
+
+        serialized = json.dumps(payload)
+
+        with self._lock:
+            try:
+                self._path.write_text(serialized, encoding="utf-8")
+            except OSError as exc:
+                LOGGER.warning("Failed to persist hedge override state to %s: %s", self._path, exc)
+
+
 class HedgeService:
     """Encapsulates hedge logic, overrides, and diagnostics."""
 
@@ -216,10 +446,16 @@ class HedgeService:
         stablecoin_threshold: float = 0.02,
         guard_floor_pct: float = 85.0,
         volatility_reference: float = 1.5,
+        state_store: Optional[HedgeOverrideStateStore] = None,
     ) -> None:
-        self._override: Optional[HedgeOverride] = None
-        self._history: Deque[HedgeHistoryRecord] = deque(maxlen=history_limit)
-        self._last_diagnostics: Optional[HedgeDiagnostics] = None
+        self._state_store = state_store or HedgeOverrideStateStore(history_limit=history_limit)
+        persisted_override, persisted_history = self._state_store.load()
+
+        self._override: Optional[HedgeOverride] = persisted_override
+        self._history: Deque[HedgeHistoryRecord] = deque(persisted_history, maxlen=history_limit)
+        self._last_diagnostics: Optional[HedgeDiagnostics] = (
+            self._history[0].diagnostics if self._history else None
+        )
         self._stablecoin_peg = stablecoin_peg
         self._stablecoin_threshold = stablecoin_threshold
         self._guard_floor_pct = guard_floor_pct
@@ -367,6 +603,13 @@ class HedgeService:
 
     def _append_history(self, record: HedgeHistoryRecord) -> None:
         self._history.appendleft(record)
+        self._persist_state()
+
+    def _persist_state(self) -> None:
+        try:
+            self._state_store.persist(self._override, self._history)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            LOGGER.warning("Failed to persist hedge override snapshot: %s", exc)
 
     @staticmethod
     def _clamp(value: float, lower: float, upper: float) -> float:
@@ -477,4 +720,4 @@ async def get_last_diagnostics(
     return diagnostics.as_dict() if diagnostics else None
 
 
-__all__ = ["get_hedge_service", "router", "HedgeService"]
+__all__ = ["get_hedge_service", "router", "HedgeService", "HedgeOverrideStateStore"]
