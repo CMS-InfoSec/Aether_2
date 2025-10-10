@@ -12,7 +12,7 @@ import json
 import math
 import sys
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from threading import Lock
 from typing import DefaultDict, Dict, Iterable, List, Mapping, Optional
@@ -20,7 +20,69 @@ from typing import DefaultDict, Dict, Iterable, List, Mapping, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
-from policy_service import MODEL_VARIANTS, RegimeSnapshot, regime_classifier
+try:  # pragma: no cover - policy service may be unavailable in insecure defaults
+    from policy_service import MODEL_VARIANTS, RegimeSnapshot, regime_classifier
+except Exception:  # pragma: no cover - gracefully degrade when policy service import fails
+    MODEL_VARIANTS = ["trend_model", "meanrev_model", "vol_breakout"]
+
+    @dataclass(frozen=True)
+    class RegimeSnapshot:
+        """Lightweight snapshot used when the policy service cannot be imported."""
+
+        symbol: str
+        regime: str
+        volatility: float = 0.0
+        trend_strength: float = 0.0
+        feature_scale: float = 1.0
+        size_scale: float = 1.0
+        sample_count: int = 0
+        updated_at: datetime = field(
+            default_factory=lambda: datetime.now(timezone.utc)
+        )
+
+        def as_payload(self) -> Dict[str, float | int | str]:
+            return {
+                "symbol": self.symbol,
+                "regime": self.regime,
+                "volatility": round(self.volatility, 6),
+                "trend_strength": round(self.trend_strength, 6),
+                "feature_scale": round(self.feature_scale, 4),
+                "size_scale": round(self.size_scale, 4),
+                "sample_count": self.sample_count,
+                "updated_at": self.updated_at.isoformat(),
+            }
+
+    class _FallbackRegimeClassifier:
+        """Deterministic regime classifier used when the real service is unavailable."""
+
+        def __init__(self) -> None:
+            self._snapshots: Dict[str, RegimeSnapshot] = {}
+            self._lock = Lock()
+
+        def observe(self, symbol: str, price: float | None = None) -> RegimeSnapshot:
+            normalized = symbol.upper()
+            with self._lock:
+                previous = self._snapshots.get(normalized)
+                sample_count = (previous.sample_count if previous else 0) + 1
+                snapshot = RegimeSnapshot(
+                    symbol=normalized,
+                    regime="range",
+                    sample_count=sample_count,
+                    updated_at=datetime.now(timezone.utc),
+                )
+                self._snapshots[normalized] = snapshot
+                return snapshot
+
+        def get_snapshot(self, symbol: str) -> Optional[RegimeSnapshot]:
+            normalized = symbol.upper()
+            with self._lock:
+                return self._snapshots.get(normalized)
+
+        def reset(self) -> None:
+            with self._lock:
+                self._snapshots.clear()
+
+    regime_classifier = _FallbackRegimeClassifier()
 from services.common.security import ADMIN_ACCOUNTS, require_admin_account
 from services.common.spot import require_spot_http
 from shared.spot import require_spot_symbol

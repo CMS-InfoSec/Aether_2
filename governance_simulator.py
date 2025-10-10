@@ -41,6 +41,10 @@ except Exception as exc:  # pragma: no cover - exercised when sandbox dependenci
             detail="Configuration sandbox backend is unavailable in this environment.",
         )
 
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
 from services.common.config import get_timescale_session
 from services.common.security import require_admin_account
 from shared.correlation import CorrelationIdMiddleware

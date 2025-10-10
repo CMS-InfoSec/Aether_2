@@ -42,6 +42,10 @@ from services.analytics.market_data_store import (
     MarketDataUnavailable,
     TimescaleMarketDataAdapter,
 )
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
 from services.common.config import get_timescale_session
 from services.common import security
 from services.common.security import require_admin_account
