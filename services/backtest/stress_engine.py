@@ -126,6 +126,10 @@ except Exception as exc:  # pragma: no cover - executed when SQLAlchemy is missi
     def func() -> None:  # type: ignore[override]
         raise MissingDependencyError("SQLAlchemy is required for stress test persistence") from exc
 
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
 from services.common.config import TimescaleSession, get_timescale_session
 
 

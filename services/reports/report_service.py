@@ -43,6 +43,10 @@ except ImportError:  # pragma: no cover - gracefully degrade when psycopg2 absen
     sql = None  # type: ignore[assignment]
     RealDictCursor = Any  # type: ignore[assignment]
 
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
 from services.common.config import TimescaleSession, get_timescale_session
 from services.common.security import require_admin_account
 from services.models.model_server import get_active_model

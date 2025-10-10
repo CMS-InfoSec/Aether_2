@@ -19,6 +19,10 @@ from sqlalchemy.orm import Session, sessionmaker
 from common.schemas.contracts import FillEvent, IntentEvent, OrderEvent, RiskDecisionEvent
 from common.utils import tracing
 from services.common.adapters import KafkaNATSAdapter
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
 from services.common.config import TimescaleSession, get_timescale_session
 
 LOGGER = logging.getLogger(__name__)

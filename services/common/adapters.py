@@ -39,6 +39,10 @@ from services.secrets.secure_secrets import (
     EnvelopeEncryptor,
 )
 
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
 from services.common.config import (
     FeastClient,
     KafkaProducer,

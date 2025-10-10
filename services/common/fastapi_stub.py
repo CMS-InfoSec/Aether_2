@@ -22,7 +22,21 @@ from contextlib import ExitStack, asynccontextmanager
 from dataclasses import dataclass
 from inspect import Parameter, Signature, isclass, iscoroutine, isgenerator, signature
 from types import ModuleType, SimpleNamespace
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple, Type
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+    Type,
+    Union,
+    get_args,
+    get_origin,
+)
 
 try:  # pragma: no cover - prefer the real FastAPI implementation when available
     import importlib.util
@@ -143,6 +157,55 @@ class _PathParameter(_ParameterMarker):
     ) -> Any:
         key = self.alias or name
         return path_params.get(key, self.default)
+
+
+def _coerce_value(annotation: Any, value: Any) -> Any:
+    """Best-effort conversion of query/path parameters to annotated types."""
+
+    if value is None:
+        return None
+
+    if annotation in (Signature.empty, Parameter.empty, Any):
+        return value
+
+    origin = get_origin(annotation)
+    if origin is Union:
+        candidates = [arg for arg in get_args(annotation) if arg is not type(None)]
+        if not candidates:
+            return value
+        for candidate in candidates:
+            coerced = _coerce_value(candidate, value)
+            if coerced is not None:
+                return coerced
+        return value
+
+    if annotation is bool and isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "off"}:
+            return False
+        return value
+
+    if annotation in {int, float} and isinstance(value, str):
+        try:
+            return annotation(value)
+        except (TypeError, ValueError):
+            return value
+
+    if annotation is date and isinstance(value, str):
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            return value
+
+    if annotation is datetime and isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return value
+
+    return value
 
 
 def Depends(dependency: Callable[..., Any] | None) -> _Dependency:
@@ -732,7 +795,8 @@ async def _call_endpoint(
             continue
 
         if isinstance(default, _ParameterMarker):
-            resolved_kwargs[name] = default.resolve(request, query_params, path_params, name)
+            value = default.resolve(request, query_params, path_params, name)
+            resolved_kwargs[name] = _coerce_value(annotation, value)
             continue
 
         if _is_pydantic_model(annotation):
@@ -754,11 +818,11 @@ async def _call_endpoint(
             continue
 
         if name in path_params:
-            resolved_kwargs[name] = path_params[name]
+            resolved_kwargs[name] = _coerce_value(annotation, path_params[name])
             continue
 
         if name in query_params:
-            resolved_kwargs[name] = query_params[name]
+            resolved_kwargs[name] = _coerce_value(annotation, query_params[name])
             continue
 
         if name in body_mapping:
