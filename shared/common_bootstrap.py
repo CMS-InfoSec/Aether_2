@@ -6,7 +6,7 @@ import importlib.util
 import sys
 from pathlib import Path
 from types import ModuleType
-from typing import Dict, Mapping, Tuple
+from typing import Callable, Dict, Mapping, Tuple
 
 try:  # pragma: no cover - defensive import when sitecustomize missing
     from sitecustomize import _ensure_common_namespace, _ensure_services_namespace
@@ -16,6 +16,9 @@ except Exception:  # pragma: no cover - sitecustomize not executed
 
 # Modules that routinely receive pytest stubs.  We ensure the real implementations
 # are loaded while preserving any overrides that tests intentionally provide.
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_TESTS_ROOT = _PROJECT_ROOT / "tests"
+
 _COMMON_MODULES = (
     "services",
     "services.common",
@@ -74,9 +77,13 @@ def _reload_with_overrides(module_name: str) -> ModuleType:
     """Return the implementation for ``module_name`` preserving stub overrides."""
 
     existing = sys.modules.get(module_name)
-    if existing is None or getattr(existing, "__file__", None):
+    if existing is None:
         module = importlib.import_module(module_name)
         return module
+
+    module_file = getattr(existing, "__file__", None)
+    if module_file and not str(module_file).startswith(str(_TESTS_ROOT)):
+        return existing
 
     overrides: Dict[str, object] = {
         key: value
@@ -178,4 +185,55 @@ def ensure_common_helpers() -> None:
         _ensure_services_namespace()
     if _ensure_common_namespace is not None:
         _ensure_common_namespace()
+
+    _install_module_guard()
+
+
+class _ModuleGuard(dict):
+    __slots__ = ("_guarded", "_ensurer", "_installing")
+
+    def __init__(
+        self,
+        base: Mapping[str, ModuleType],
+        guarded: tuple[str, ...],
+        ensurer: "Callable[[], None]",
+    ) -> None:
+        super().__init__(base)
+        self._guarded = guarded
+        self._ensurer = ensurer
+        self._installing = False
+
+    def __setitem__(self, key: str, value: object) -> None:  # type: ignore[override]
+        super().__setitem__(key, value)
+        if self._installing:
+            return
+        if key not in self._guarded:
+            return
+        if isinstance(value, ModuleType):
+            module_file = getattr(value, "__file__", None)
+            if module_file and not str(module_file).startswith(str(_TESTS_ROOT)):
+                return
+        self._installing = True
+        try:
+            self._ensurer()
+        finally:
+            self._installing = False
+
+
+_MODULE_GUARD_INSTALLED = False
+
+
+def _install_module_guard() -> None:
+    global _MODULE_GUARD_INSTALLED
+    if _MODULE_GUARD_INSTALLED:
+        return
+
+    modules = sys.modules
+    if isinstance(modules, _ModuleGuard):
+        _MODULE_GUARD_INSTALLED = True
+        return
+
+    guard = _ModuleGuard(modules, tuple(_COMMON_MODULES), ensure_common_helpers)
+    sys.modules = guard  # type: ignore[assignment]
+    _MODULE_GUARD_INSTALLED = True
 
