@@ -7,8 +7,11 @@ import datetime as dt
 import hashlib
 import importlib
 import importlib.util
+import json
 import os
+import shutil
 import tarfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Mapping, Optional
@@ -27,6 +30,11 @@ def _optional_import(module_name: str) -> object | None:
     return importlib.import_module(module_name)
 
 
+_INSECURE_DEFAULTS_FLAG = "KNOWLEDGE_PACK_ALLOW_INSECURE_DEFAULTS"
+_STATE_DIR_ENV = "AETHER_STATE_DIR"
+_STATE_SUBDIR = "knowledge_pack"
+
+
 boto3 = _optional_import("boto3")
 psycopg = _optional_import("psycopg")
 
@@ -36,6 +44,52 @@ router = APIRouter(prefix="/knowledge", tags=["knowledge"])
 
 class MissingDependencyError(RuntimeError):
     """Raised when an optional dependency required at runtime is missing."""
+
+
+def _insecure_defaults_enabled() -> bool:
+    """Return ``True`` when local fallbacks are explicitly allowed."""
+
+    return os.getenv(_INSECURE_DEFAULTS_FLAG) == "1" or bool(
+        os.getenv("PYTEST_CURRENT_TEST")
+    )
+
+
+def _default_state_base() -> Path:
+    return Path(os.getenv(_STATE_DIR_ENV, ".aether_state"))
+
+
+def _state_root(explicit: Path | None = None) -> Path:
+    """Return the final directory for local knowledge-pack state."""
+
+    root = explicit or (_default_state_base() / _STATE_SUBDIR)
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _state_dir_from_base(base: Path | None = None) -> Path:
+    """Normalise *base* into the knowledge-pack state directory."""
+
+    if base is None:
+        return _state_root()
+    candidate = Path(base)
+    if candidate.name == _STATE_SUBDIR:
+        return _state_root(candidate)
+    return _state_root(candidate / _STATE_SUBDIR)
+
+
+def _artifacts_root(base: Path | None = None) -> Path:
+    """Directory that stores persisted tarballs under insecure defaults."""
+
+    root_dir = _state_dir_from_base(base)
+    root = root_dir / "artifacts"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _metadata_path(base: Path | None = None) -> Path:
+    """Path to the JSON metadata file for local pack history."""
+
+    return _state_dir_from_base(base) / "metadata.json"
 
 
 class MissingArtifactError(RuntimeError):
@@ -108,25 +162,29 @@ class PackRecord:
 
 
 def _require_psycopg() -> None:
-    if psycopg is None:  # pragma: no cover - sanity guard when dependency missing.
+    if psycopg is None and not _insecure_defaults_enabled():  # pragma: no cover
         raise MissingDependencyError("psycopg is required for knowledge pack exports")
 
 
 def _require_boto3() -> None:
-    if boto3 is None:  # pragma: no cover - sanity guard when dependency missing.
+    if boto3 is None and not _insecure_defaults_enabled():  # pragma: no cover
         raise MissingDependencyError("boto3 is required for knowledge pack exports")
 
 
-def _database_dsn() -> str:
+def _database_dsn(*, allow_missing: bool = False) -> str | None:
     dsn = os.getenv("KNOWLEDGE_PACK_DATABASE_URL") or os.getenv("DATABASE_URL")
-    if not dsn:
+    if not dsn and not allow_missing:
         raise RuntimeError("KNOWLEDGE_PACK_DATABASE_URL or DATABASE_URL must be set")
     return dsn
 
 
-def _storage_config_from_env() -> ObjectStorageConfig:
+def _storage_config_from_env(
+    *, allow_missing: bool = False
+) -> ObjectStorageConfig | None:
     bucket = os.getenv("KNOWLEDGE_PACK_BUCKET") or os.getenv("EXPORT_BUCKET")
     if not bucket:
+        if allow_missing:
+            return None
         raise RuntimeError("KNOWLEDGE_PACK_BUCKET or EXPORT_BUCKET must be configured")
     prefix = os.getenv("KNOWLEDGE_PACK_PREFIX") or os.getenv(
         "EXPORT_PREFIX", "knowledge-packs"
@@ -282,14 +340,98 @@ def _s3_client(config: ObjectStorageConfig):  # pragma: no cover - trivial wrapp
 class KnowledgePackRepository:
     """Persistence helper for knowledge pack metadata."""
 
-    def __init__(self, *, dsn: str | None = None) -> None:
-        _require_psycopg()
-        self._dsn = dsn or _database_dsn()
+    def __init__(
+        self,
+        *,
+        dsn: str | None = None,
+        state_dir: Path | None = None,
+    ) -> None:
+        self._state_dir = state_dir
+        self._metadata_lock = threading.Lock()
+        resolved_dsn = dsn or _database_dsn(allow_missing=_insecure_defaults_enabled())
+        self._use_local_metadata = psycopg is None or not resolved_dsn
+        if self._use_local_metadata:
+            if not _insecure_defaults_enabled():
+                _require_psycopg()
+                raise RuntimeError(
+                    "Knowledge pack metadata requires psycopg or insecure defaults",
+                )
+            self._state_dir = _state_dir_from_base(self._state_dir)
+            self._dsn = None
+        else:
+            self._dsn = resolved_dsn
 
+    # Database-backed helpers -------------------------------------------------
     def _connect(self):  # pragma: no cover - minimal wrapper
+        if self._dsn is None or psycopg is None:
+            raise RuntimeError("Local metadata store in use")
         return psycopg.connect(self._dsn)
 
+    # Local metadata helpers --------------------------------------------------
+    def _local_metadata_path(self) -> Path:
+        return _metadata_path(self._state_dir)
+
+    def _write_local_metadata(self, record: PackRecord) -> None:
+        path = self._local_metadata_path()
+        payload: list[dict[str, object]] = []
+        if path.exists():
+            try:
+                payload_raw = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:  # pragma: no cover - metadata corruption fallback
+                payload_raw = []
+            if isinstance(payload_raw, list):
+                payload = [item for item in payload_raw if isinstance(item, dict)]
+
+        entry = {
+            "object_key": record.object_key,
+            "sha256": record.sha256,
+            "created_at": record.created_at.isoformat(),
+            "size": record.size,
+        }
+        payload = [item for item in payload if item.get("object_key") != record.object_key]
+        payload.append(entry)
+        payload.sort(key=lambda item: item.get("created_at", ""))
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+    def _load_latest_local_record(self) -> PackRecord | None:
+        path = self._local_metadata_path()
+        if not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # pragma: no cover - metadata corruption fallback
+            return None
+        if not isinstance(payload, list):
+            return None
+        latest: Optional[dict[str, object]] = None
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            if latest is None or str(item.get("created_at", "")) > str(
+                latest.get("created_at", "")
+            ):
+                latest = item
+        if not latest:
+            return None
+        created_at = dt.datetime.fromisoformat(str(latest["created_at"]))
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=dt.timezone.utc)
+        return PackRecord(
+            object_key=str(latest["object_key"]),
+            sha256=str(latest["sha256"]),
+            created_at=created_at,
+            size=int(latest["size"]),
+        )
+
+    # Public API --------------------------------------------------------------
     def ensure_table(self) -> None:
+        if self._use_local_metadata:
+            path = self._local_metadata_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not path.exists():
+                path.write_text("[]", encoding="utf-8")
+            return
+
         create_sql = """
             CREATE TABLE IF NOT EXISTS knowledge_packs (
                 id TEXT PRIMARY KEY,
@@ -304,6 +446,11 @@ class KnowledgePackRepository:
             conn.commit()
 
     def record_pack(self, record: PackRecord) -> None:
+        if self._use_local_metadata:
+            with self._metadata_lock:
+                self._write_local_metadata(record)
+            return
+
         insert_sql = """
             INSERT INTO knowledge_packs (id, hash, ts, size)
             VALUES (%s, %s, %s, %s)
@@ -321,6 +468,9 @@ class KnowledgePackRepository:
             conn.commit()
 
     def latest_pack(self) -> PackRecord | None:
+        if self._use_local_metadata:
+            return self._load_latest_local_record()
+
         query_sql = """
             SELECT id, hash, ts, size
             FROM knowledge_packs
@@ -341,6 +491,16 @@ class KnowledgePackRepository:
             size=int(size),
         )
 
+    @property
+    def uses_local_store(self) -> bool:
+        return self._use_local_metadata
+
+    def local_artifact_path(self, record: PackRecord) -> Path:
+        if not self._use_local_metadata:
+            raise RuntimeError("Local store is not active")
+        filename = Path(record.object_key).name
+        return _artifacts_root(self._state_dir) / filename
+
 
 def _object_key(config: ObjectStorageConfig, output_file: Path) -> str:
     filename = output_file.name
@@ -349,26 +509,12 @@ def _object_key(config: ObjectStorageConfig, output_file: Path) -> str:
     return filename
 
 
-def _upload_tarball(
-    *,
-    file_path: Path,
-    sha256_hash: str,
-    storage_config: ObjectStorageConfig,
-    metadata: Optional[Mapping[str, str]] = None,
-) -> str:
-    client = _s3_client(storage_config)
-    object_key = _object_key(storage_config, file_path)
-    headers = {"sha256": sha256_hash}
-    if metadata:
-        headers.update(metadata)
-    with file_path.open("rb") as handle:
-        client.upload_fileobj(
-            handle,
-            storage_config.bucket,
-            object_key,
-            ExtraArgs={"Metadata": headers},
-        )
-    return object_key
+def _persist_local_tarball(file_path: Path, *, state_dir: Path | None = None) -> Path:
+    target_dir = _artifacts_root(state_dir)
+    target = target_dir / file_path.name
+    if file_path.resolve() != target.resolve():
+        shutil.copy2(file_path, target)
+    return target
 
 
 def _url_ttl_seconds() -> int:
@@ -384,19 +530,37 @@ def create_pack(
     *,
     output: Path,
     inputs: PackInputs,
-    storage_config: ObjectStorageConfig,
+    storage_config: ObjectStorageConfig | None,
     repository: KnowledgePackRepository,
 ) -> PackRecord:
     tarball = _tarball_contents(inputs, output)
     sha256_hash = _compute_sha256(tarball)
     size = tarball.stat().st_size
     created_at = dt.datetime.now(dt.timezone.utc)
-    object_key = _upload_tarball(
-        file_path=tarball,
-        sha256_hash=sha256_hash,
-        storage_config=storage_config,
-        metadata={"created_at": created_at.isoformat()},
-    )
+    client = None
+    if storage_config is not None:
+        try:
+            client = _s3_client(storage_config)
+        except MissingDependencyError:
+            client = None
+    if client is not None:
+        object_key = _object_key(storage_config, tarball)
+        headers = {"created_at": created_at.isoformat(), "sha256": sha256_hash}
+        with tarball.open("rb") as handle:
+            client.upload_fileobj(
+                handle,
+                storage_config.bucket,
+                object_key,
+                ExtraArgs={"Metadata": headers},
+            )
+    else:
+        if not _insecure_defaults_enabled():
+            _require_boto3()
+            raise RuntimeError("Unable to upload knowledge pack without object storage")
+        local_path = _persist_local_tarball(
+            tarball, state_dir=getattr(repository, "_state_dir", None)
+        )
+        object_key = f"local/{local_path.name}"
     record = PackRecord(
         object_key=object_key,
         sha256=sha256_hash,
@@ -412,19 +576,29 @@ def create_pack(
 def latest_pack(_actor: str = Depends(require_admin_account)) -> Dict[str, object]:
     """Return the download URL for the most recent knowledge pack."""
 
-    _require_psycopg()
-    _require_boto3()
     repo = KnowledgePackRepository()
     record = repo.latest_pack()
     if record is None:
         raise HTTPException(status_code=404, detail="No knowledge pack available")
-    config = _storage_config_from_env()
-    client = _s3_client(config)
-    url = client.generate_presigned_url(
-        "get_object",
-        Params={"Bucket": config.bucket, "Key": record.object_key},
-        ExpiresIn=_url_ttl_seconds(),
-    )
+    uses_local = getattr(repo, "uses_local_store", False)
+    if uses_local:
+        if hasattr(repo, "local_artifact_path"):
+            path = repo.local_artifact_path(record)
+        else:
+            path = _artifacts_root().joinpath(Path(record.object_key).name)
+        url = path.resolve().as_uri()
+    else:
+        _require_psycopg()
+        _require_boto3()
+        config = _storage_config_from_env()
+        if config is None:
+            raise RuntimeError("Object storage configuration is required")
+        client = _s3_client(config)
+        url = client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": config.bucket, "Key": record.object_key},
+            ExpiresIn=_url_ttl_seconds(),
+        )
     return {
         "id": record.object_key,
         "hash": record.sha256,
@@ -445,10 +619,10 @@ def _parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
 
 
 def _cmd_create(out: str) -> PackRecord:
-    _require_psycopg()
-    _require_boto3()
     inputs = resolve_inputs()
-    storage_config = _storage_config_from_env()
+    storage_config = _storage_config_from_env(
+        allow_missing=_insecure_defaults_enabled()
+    )
     repository = KnowledgePackRepository()
     output = Path(out).expanduser().resolve()
     return create_pack(
