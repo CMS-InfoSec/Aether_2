@@ -158,7 +158,11 @@ def model_dump(instance: _BaseModelProtocol, **kwargs: Any) -> Dict[str, Any]:
         try:
             return dump(**kwargs)
         except TypeError:
-            clean_kwargs = {key: value for key, value in kwargs.items() if key != "by_alias"}
+            clean_kwargs = {
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"by_alias", "mode"}
+            }
             return dump(**clean_kwargs)
     clean_kwargs = {key: value for key, value in kwargs.items() if key != "by_alias"}
     return instance.dict(**clean_kwargs)
