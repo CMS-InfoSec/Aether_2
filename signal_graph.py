@@ -17,14 +17,95 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping
+from types import SimpleNamespace
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, MutableMapping
 
 try:  # pragma: no cover - dependency may be absent in lightweight envs
     import networkx as nx
     from networkx.readwrite import json_graph
 except ImportError:  # pragma: no cover - gracefully degrade when missing
-    nx = None  # type: ignore[assignment]
-    json_graph = None  # type: ignore[assignment]
+    nx = SimpleNamespace()  # type: ignore[assignment]
+
+    class _NodeMapping(MutableMapping[str, Dict[str, Any]]):
+        def __init__(self, nodes: Dict[str, Dict[str, Any]]) -> None:
+            self._nodes = nodes
+
+        def __getitem__(self, key: str) -> Dict[str, Any]:
+            return self._nodes[key]
+
+        def __setitem__(self, key: str, value: Dict[str, Any]) -> None:
+            self._nodes[key] = value
+
+        def __delitem__(self, key: str) -> None:
+            del self._nodes[key]
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(self._nodes)
+
+        def __len__(self) -> int:
+            return len(self._nodes)
+
+        def items(self):  # pragma: no cover - compatibility helper
+            return self._nodes.items()
+
+    class _SimpleDiGraph:
+        """Minimal directed graph used when networkx is unavailable."""
+
+        def __init__(self) -> None:
+            self._nodes: Dict[str, Dict[str, Any]] = {}
+            self._succ: Dict[str, Dict[str, Dict[str, Any]]] = {}
+            self._pred: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+        @property
+        def nodes(self) -> _NodeMapping:
+            return _NodeMapping(self._nodes)
+
+        def add_node(self, node_id: str, **attrs: Any) -> None:
+            stored = self._nodes.setdefault(node_id, {})
+            stored.update(attrs)
+            self._succ.setdefault(node_id, {})
+            self._pred.setdefault(node_id, {})
+
+        def add_edge(self, source: str, target: str, **attrs: Any) -> None:
+            self.add_node(source)
+            self.add_node(target)
+            edge_attrs = self._succ.setdefault(source, {}).setdefault(target, {})
+            edge_attrs.update(attrs)
+            back_attrs = self._pred.setdefault(target, {}).setdefault(source, {})
+            back_attrs.update(attrs)
+
+        def has_node(self, node_id: str) -> bool:
+            return node_id in self._nodes
+
+        def predecessors(self, node_id: str) -> Iterator[str]:
+            return iter(self._pred.get(node_id, {}))
+
+        def successors(self, node_id: str) -> Iterator[str]:
+            return iter(self._succ.get(node_id, {}))
+
+        def __getitem__(self, node_id: str) -> Dict[str, Dict[str, Any]]:
+            return self._succ.setdefault(node_id, {})
+
+        def get_edge_data(self, source: str, target: str) -> Dict[str, Any] | None:
+            return self._succ.get(source, {}).get(target)
+
+    nx.DiGraph = _SimpleDiGraph  # type: ignore[attr-defined]
+
+    class _JSONGraph:
+        @staticmethod
+        def node_link_data(graph: _SimpleDiGraph) -> Dict[str, Any]:
+            nodes = [
+                {"id": node_id, **attrs} for node_id, attrs in graph.nodes.items()
+            ]
+            edges = []
+            for source, targets in graph._succ.items():
+                for target, attrs in targets.items():
+                    edges.append(
+                        {"source": source, "target": target, **attrs}
+                    )
+            return {"nodes": nodes, "links": edges}
+
+    json_graph = _JSONGraph  # type: ignore[assignment]
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import (
@@ -421,6 +422,8 @@ def get_session() -> Iterator[Session]:
 
 
 app = FastAPI(title="Universe Selection Service")
+if not hasattr(app, "state"):
+    app.state = SimpleNamespace()
 setup_metrics(app, service_name="universe-selection-service")
 app.state.db_sessionmaker = None
 app.state.universe_engine = None

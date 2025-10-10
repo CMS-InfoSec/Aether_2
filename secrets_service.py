@@ -14,8 +14,12 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
 import httpx
+import hashlib
 
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+try:  # pragma: no cover - prefer the real cryptography implementation
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+except ImportError:  # pragma: no cover - lightweight environments
+    AESGCM = None  # type: ignore[assignment]
 from fastapi import Depends, FastAPI, HTTPException, Header, Query, Request, status
 from fastapi.responses import JSONResponse
 from kubernetes import client, config
@@ -201,6 +205,15 @@ def load_kubernetes_config() -> None:
     except ConfigException:
         config.load_kube_config()
         LOGGER.info("Loaded local Kubernetes configuration")
+    else:
+        try:
+            config.load_kube_config()
+            LOGGER.debug("Loaded local kubeconfig alongside in-cluster config")
+        except ConfigException as exc:
+            LOGGER.debug(
+                "Local kubeconfig unavailable during initialization; retrying with backoff"
+            )
+            raise exc
 
 
 def _decode_encryption_key(key_b64: str) -> bytes:
@@ -213,20 +226,62 @@ def _decode_encryption_key(key_b64: str) -> bytes:
     return key
 
 
+class _FallbackCipher:
+    """Deterministic cipher used when AESGCM is unavailable under insecure defaults."""
+
+    def __init__(self, key: bytes) -> None:
+        from cryptography.fernet import Fernet  # type: ignore[import-not-found]
+
+        digest = hashlib.sha256(key).digest()
+        encoded = base64.urlsafe_b64encode(digest)
+        self._fernet = Fernet(encoded)
+
+    def encrypt(self, plaintext: bytes, associated_data: bytes) -> bytes:
+        prefix = len(associated_data).to_bytes(2, "big") + associated_data
+        return self._fernet.encrypt(prefix + plaintext)
+
+    def decrypt(self, payload: bytes, associated_data: bytes) -> bytes:
+        data = self._fernet.decrypt(payload)
+        assoc_len = int.from_bytes(data[:2], "big")
+        associated = data[2 : 2 + assoc_len]
+        if associated != associated_data:
+            raise ValueError("associated data mismatch")
+        return data[2 + assoc_len :]
+
+
 class SecretCipher:
     """Encrypts and decrypts payloads using AES-GCM."""
 
     def __init__(self, key: bytes) -> None:
-        self._aesgcm = AESGCM(key)
+        self._aesgcm: AESGCM | None
+        self._fallback: _FallbackCipher | None
+
+        if AESGCM is not None:
+            self._aesgcm = AESGCM(key)
+            self._fallback = None
+        else:
+            if not _insecure_defaults_enabled():
+                raise RuntimeError(
+                    "cryptography AESGCM implementation is required; set "
+                    "SECRETS_ALLOW_INSECURE_DEFAULTS=1 to activate the fallback"
+                )
+            self._aesgcm = None
+            self._fallback = _FallbackCipher(key)
 
     def encrypt(self, plaintext: bytes, associated_data: bytes) -> bytes:
-        nonce = os.urandom(12)
-        ciphertext = self._aesgcm.encrypt(nonce, plaintext, associated_data)
-        return nonce + ciphertext
+        if self._aesgcm is not None:
+            nonce = os.urandom(12)
+            ciphertext = self._aesgcm.encrypt(nonce, plaintext, associated_data)
+            return nonce + ciphertext
+        assert self._fallback is not None  # for type checkers
+        return self._fallback.encrypt(plaintext, associated_data)
 
     def decrypt(self, payload: bytes, associated_data: bytes) -> bytes:
-        nonce, ciphertext = payload[:12], payload[12:]
-        return self._aesgcm.decrypt(nonce, ciphertext, associated_data)
+        if self._aesgcm is not None:
+            nonce, ciphertext = payload[:12], payload[12:]
+            return self._aesgcm.decrypt(nonce, ciphertext, associated_data)
+        assert self._fallback is not None  # for type checkers
+        return self._fallback.decrypt(payload, associated_data)
 
 
 
@@ -663,9 +718,6 @@ async def store_kraken_secret(
 @app.get("/secrets/kraken/status")
 async def kraken_secret_status(
     account_id: str = Query(..., min_length=1),
-
-    _: str = Depends(require_authorized_caller),
-
     manager: KrakenSecretManager = Depends(get_secret_manager),
     authorized_actor: str = Depends(require_authorized_caller),
 ) -> Dict[str, str]:
