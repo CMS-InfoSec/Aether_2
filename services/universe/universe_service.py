@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import (
@@ -40,12 +41,12 @@ from pydantic import BaseModel, Field
 try:  # pragma: no cover - SQLAlchemy is optional in lightweight environments
     from sqlalchemy import Boolean, Column, DateTime, Float, String, create_engine, func, select
     from sqlalchemy.dialects.postgresql import JSONB, UUID as PGUUID
-    from sqlalchemy.engine import Engine, URL
-    from sqlalchemy.engine.url import make_url
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.engine.url import URL as _SQLALCHEMY_URL, make_url as _sqlalchemy_make_url
     from sqlalchemy.exc import ArgumentError
     from sqlalchemy.orm import Session, declarative_base, sessionmaker
     SQLALCHEMY_AVAILABLE = True
-except ModuleNotFoundError:  # pragma: no cover - allow import without SQLAlchemy
+except (ModuleNotFoundError, ImportError):  # pragma: no cover - allow import without SQLAlchemy helpers
     from urllib.parse import parse_qsl, urlparse
 
     SQLALCHEMY_AVAILABLE = False
@@ -121,6 +122,9 @@ except ModuleNotFoundError:  # pragma: no cover - allow import without SQLAlchem
 
     class ArgumentError(ValueError):
         pass
+else:  # pragma: no cover - exercised when SQLAlchemy is fully available
+    URL = _SQLALCHEMY_URL  # type: ignore[assignment]
+    make_url = _sqlalchemy_make_url
 
 from services.common.security import require_admin_account
 from shared.spot import filter_spot_symbols, is_spot_symbol, normalize_spot_symbol
@@ -418,6 +422,8 @@ def get_session() -> Iterator[Session]:
 
 
 app = FastAPI(title="Universe Selection Service")
+if not hasattr(app, "state"):
+    app.state = SimpleNamespace()
 setup_metrics(app, service_name="universe-selection-service")
 app.state.db_sessionmaker = None
 app.state.universe_engine = None
