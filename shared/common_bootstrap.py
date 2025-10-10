@@ -8,6 +8,12 @@ from pathlib import Path
 from types import ModuleType
 from typing import Dict, Mapping, Tuple
 
+try:  # pragma: no cover - defensive import when sitecustomize missing
+    from sitecustomize import _ensure_common_namespace, _ensure_services_namespace
+except Exception:  # pragma: no cover - sitecustomize not executed
+    _ensure_services_namespace = None  # type: ignore[assignment]
+    _ensure_common_namespace = None  # type: ignore[assignment]
+
 # Modules that routinely receive pytest stubs.  We ensure the real implementations
 # are loaded while preserving any overrides that tests intentionally provide.
 _COMMON_MODULES = (
@@ -16,6 +22,8 @@ _COMMON_MODULES = (
     "services.common.config",
     "services.common.security",
     "services.common.adapters",
+    "services.common.precision",
+    "services.common.schemas",
 )
 
 # Parent attributes that should always refer to the canonical submodules once the
@@ -25,6 +33,8 @@ _PARENT_SUBMODULES: Mapping[str, str] = {
     "config": "services.common.config",
     "security": "services.common.security",
     "adapters": "services.common.adapters",
+    "precision": "services.common.precision",
+    "schemas": "services.common.schemas",
 }
 
 # Convenience re-exports surfaced by ``services.common``.  When the package is
@@ -78,9 +88,6 @@ def _reload_with_overrides(module_name: str) -> ModuleType:
     try:
         module = importlib.import_module(module_name)
     except ModuleNotFoundError:
-        if existing is not None:
-            sys.modules[module_name] = existing
-            return existing
         module_path = Path(__file__).resolve().parents[1] / (
             module_name.replace(".", "/") + ".py"
         )
@@ -91,6 +98,9 @@ def _reload_with_overrides(module_name: str) -> ModuleType:
                 sys.modules[module_name] = module
                 spec.loader.exec_module(module)
                 return module
+        if existing is not None:
+            sys.modules[module_name] = existing
+            return existing
         raise
 
     # Re-apply pytest's overrides so tests depending on the stubbed behaviour
@@ -138,4 +148,9 @@ def ensure_common_helpers() -> None:
         setattr(parent, attribute, getattr(loaded[module_name], source_attr))
 
     _ensure_fastapi_stub()
+
+    if _ensure_services_namespace is not None:
+        _ensure_services_namespace()
+    if _ensure_common_namespace is not None:
+        _ensure_common_namespace()
 

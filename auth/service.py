@@ -57,9 +57,6 @@ except ModuleNotFoundError:  # pragma: no cover - redis helpers optional in test
 _ARGON2_IMPORT_ERROR: Exception | None = None
 _USING_ARGON2_FALLBACK = False
 
-_ARGON2_IMPORT_ERROR: Exception | None = None
-_USING_ARGON2_FALLBACK = False
-
 try:  # pragma: no cover - optional dependency in some test environments
     from argon2 import PasswordHasher as _Argon2PasswordHasher, Type
     from argon2.exceptions import InvalidHash, VerificationError, VerifyMismatchError

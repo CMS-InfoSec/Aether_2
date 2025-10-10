@@ -1152,17 +1152,18 @@ class TestClient:
             if account_id and security_module is not None:
                 try:
                     existing = set(getattr(security_module, "ADMIN_ACCOUNTS", set()))
-                    if str(account_id) not in existing:
+                    sanitized_account = str(account_id).strip()
+                    if sanitized_account and sanitized_account not in existing:
                         subject = _extract_jwt_subject(token) if token else None
                         session_admin = getattr(session, "admin_id", None)
                         trusted_sources = {
-                            value.strip()
+                            value.strip().lower()
                             for value in (subject, session_admin)
                             if isinstance(value, str) and value.strip()
                         }
-                        if trusted_sources & {admin.strip() for admin in existing}:
+                        if sanitized_account.strip().lower() in trusted_sources:
                             updated = set(existing)
-                            updated.add(str(account_id))
+                            updated.add(sanitized_account)
                             security_module.reload_admin_accounts(updated)
                 except Exception:  # pragma: no cover - defensive guard for minimal stubs
                     pass
