@@ -11,10 +11,8 @@ PostgreSQL or SQLite backend which keeps the unit tests lightweight.
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 from uuid import UUID, uuid4
@@ -44,6 +42,11 @@ from sqlalchemy.pool import StaticPool
 
 import yaml
 
+from services.account_crypto import (
+    decrypt_value as _decrypt,
+    encrypt_value as _encrypt,
+    fernet_key as _fernet_key,
+)
 from services.k8s_sync_service import sync_account_secret
 from services.kraken_test_service import test_kraken_connection
 from shared.accounts_config import resolve_accounts_database_url
@@ -147,41 +150,6 @@ class AuditLog(Base):
 
 # Ensure tables exist for environments without migrations (tests).
 Base.metadata.create_all(ENGINE)
-
-
-# ---------------------------------------------------------------------------
-# Encryption helpers
-# ---------------------------------------------------------------------------
-
-
-@lru_cache(maxsize=1)
-def _fernet_key() -> bytes:
-    key = os.getenv("ACCOUNT_ENCRYPTION_KEY")
-    if not key:
-        raise RuntimeError("ACCOUNT_ENCRYPTION_KEY environment variable is required")
-    try:
-        return key.encode("ascii")
-    except Exception as exc:  # pragma: no cover - defensive
-        raise RuntimeError("ACCOUNT_ENCRYPTION_KEY must be ASCII encodable") from exc
-
-
-@lru_cache(maxsize=1)
-def _fernet() -> "Fernet":  # type: ignore[name-defined]
-    from cryptography.fernet import Fernet
-
-    return Fernet(_fernet_key())
-
-
-def _encrypt(value: str) -> str:
-    if value == "":
-        raise ValueError("Cannot encrypt empty value")
-    token = _fernet().encrypt(value.encode("utf-8"))
-    return token.decode("ascii")
-
-
-def _decrypt(value: str) -> str:
-    token = _fernet().decrypt(value.encode("ascii"))
-    return token.decode("utf-8")
 
 
 # ---------------------------------------------------------------------------
