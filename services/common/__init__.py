@@ -27,6 +27,7 @@ _SUBMODULE_NAMES: Dict[str, str] = {
     "config": "services.common.config",
     "security": "services.common.security",
     "fastapi_stub": "services.common.fastapi_stub",
+    "schemas": "services.common.schemas",
 }
 
 _REEXPORTS: Dict[str, Tuple[str, str]] = {
@@ -106,6 +107,7 @@ adapters = _import_real_module(_SUBMODULE_NAMES["adapters"])
 config = _import_real_module(_SUBMODULE_NAMES["config"])
 security = _import_real_module(_SUBMODULE_NAMES["security"])
 fastapi_stub = _import_real_module(_SUBMODULE_NAMES["fastapi_stub"])
+schemas = _import_real_module(_SUBMODULE_NAMES["schemas"])
 
 
 __all__ = sorted({*(_REEXPORTS.keys()), *(_SUBMODULE_NAMES.keys())})

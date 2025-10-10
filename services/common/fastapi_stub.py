@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 from datetime import date, datetime, timezone
 from collections.abc import MutableMapping
 from contextlib import ExitStack, asynccontextmanager
@@ -206,6 +207,12 @@ def _coerce_value(annotation: Any, value: Any) -> Any:
             return value
 
     return value
+
+
+def _allow_admin_autoload() -> bool:
+    """Return ``True`` when widening the admin set has been explicitly enabled."""
+
+    return os.getenv("AETHER_ALLOW_INSECURE_TEST_DEFAULTS") == "1"
 
 
 def Depends(dependency: Callable[..., Any] | None) -> _Dependency:
@@ -910,25 +917,27 @@ class TestClient:
         self.app = app
         self._lifespan_cm = None
         self._entered = False
+        self._event_handlers = self._resolve_event_handlers()
         self._ensure_started()
 
     def _ensure_started(self) -> None:
         if self._entered:
             return
-        lifespan_factory = getattr(self.app.router, "lifespan_context", None)
+        router = getattr(self.app, "router", None)
+        lifespan_factory = getattr(router, "lifespan_context", None)
         if lifespan_factory is not None:
             self._lifespan_cm = lifespan_factory(self.app)
             enter = getattr(self._lifespan_cm, "__aenter__", None)
             if enter is not None:
                 _run_async(lambda: enter())
-        for handler in self.app.event_handlers.get("startup", []):
+        for handler in self._event_handlers.get("startup", []):
             _run_async(lambda: handler())
         self._entered = True
 
     def _shutdown(self, exc_type=None, exc=None, tb=None) -> None:
         if not self._entered:
             return
-        for handler in reversed(self.app.event_handlers.get("shutdown", [])):
+        for handler in reversed(self._event_handlers.get("shutdown", [])):
             _run_async(lambda: handler())
         if self._lifespan_cm is not None:
             exit_ = getattr(self._lifespan_cm, "__aexit__", None)
@@ -936,6 +945,22 @@ class TestClient:
                 _run_async(lambda: exit_(exc_type, exc, tb))
         self._lifespan_cm = None
         self._entered = False
+
+    def _resolve_event_handlers(self) -> Dict[str, List[Callable[..., Any]]]:
+        """Return the app's event handlers while tolerating bare stubs.
+
+        Several test suites monkeypatch ``fastapi.FastAPI`` with extremely
+        small placeholders that only expose ``router`` and ``state``.  Accessing
+        ``event_handlers`` on those objects raised ``AttributeError`` which in
+        turn broke every consumer of the compatibility shim.  We coerce any
+        missing attribute into an empty ``dict`` so lifecycle hooks remain
+        optional just like they are in the real FastAPI test client.
+        """
+
+        handlers = getattr(self.app, "event_handlers", None)
+        if isinstance(handlers, MutableMapping):
+            return {str(key): list(value) for key, value in handlers.items()}
+        return {}
 
     def __enter__(self) -> "TestClient":  # pragma: no cover - simple context protocol
         self._ensure_started()
@@ -1149,7 +1174,7 @@ class TestClient:
                     headers["X-Account-ID"] = str(account_id)
                     lower_header_keys.add("x-account-id")
         if not override_present:
-            if account_id and security_module is not None:
+            if account_id and security_module is not None and _allow_admin_autoload():
                 try:
                     existing = set(getattr(security_module, "ADMIN_ACCOUNTS", set()))
                     sanitized_account = str(account_id).strip()
