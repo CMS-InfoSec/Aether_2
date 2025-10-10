@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 from importlib.machinery import ModuleSpec
 from pathlib import Path
@@ -50,3 +51,21 @@ if spec is not None:
     if str(_SERVICES_DIR) not in locations:
         locations.append(str(_SERVICES_DIR))
         spec.submodule_search_locations = locations
+
+
+def _register_test_mirrors() -> None:
+    """Expose ``tests.services`` modules through the ``services`` namespace."""
+
+    tests_dir = Path(__file__).resolve().parent
+    for path in tests_dir.glob("test_*.py"):
+        module_name = path.stem
+        alias = f"services.{module_name}"
+        if alias in sys.modules:
+            continue
+
+        real_name = f"{__name__}.{module_name}"
+        module = importlib.import_module(real_name)
+        sys.modules[alias] = module
+
+
+_register_test_mirrors()

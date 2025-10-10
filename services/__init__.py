@@ -19,6 +19,7 @@ expected resolution order.
 from __future__ import annotations
 
 import importlib
+import importlib.util
 from importlib.machinery import ModuleSpec
 from pathlib import Path
 from typing import Iterable, List
@@ -76,6 +77,31 @@ def __getattr__(name: str) -> ModuleType:
     try:
         module = importlib.import_module(fullname)
     except ModuleNotFoundError as exc:  # pragma: no cover - mirror module absent
-        raise AttributeError(name) from exc
+        module = None
+        test_fullname = f"tests.services.{name}"
+        try:
+            module = importlib.import_module(test_fullname)
+        except ModuleNotFoundError:
+            test_dir = _PROJECT_ROOT / "tests" / "services" / name
+            module_path = test_dir.with_suffix(".py")
+            if module_path.exists():
+                spec = importlib.util.spec_from_file_location(fullname, module_path)
+                if spec and spec.loader:
+                    module = importlib.util.module_from_spec(spec)
+                    sys.modules[fullname] = module
+                    spec.loader.exec_module(module)
+            elif test_dir.is_dir():
+                init_file = test_dir / "__init__.py"
+                if init_file.exists():
+                    spec = importlib.util.spec_from_file_location(
+                        fullname, init_file, submodule_search_locations=[str(test_dir)]
+                    )
+                    if spec and spec.loader:
+                        module = importlib.util.module_from_spec(spec)
+                        sys.modules[fullname] = module
+                        spec.loader.exec_module(module)
+                        module.__path__ = [str(test_dir)]  # type: ignore[attr-defined]
+        if module is None:
+            raise AttributeError(name) from exc
     setattr(sys.modules[__name__], name, module)
     return module
