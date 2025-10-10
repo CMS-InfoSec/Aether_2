@@ -12,7 +12,8 @@ from __future__ import annotations
 
 from collections import defaultdict
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
+import math
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Sequence
 
 __all__ = [
@@ -20,8 +21,10 @@ __all__ = [
     "Series",
     "NA",
     "merge",
+    "date_range",
     "to_datetime",
     "to_numeric",
+    "isna",
     "read_parquet",
 ]
 
@@ -164,6 +167,35 @@ class _SeriesImpl:
     def __ne__(self, other: Any) -> "_SeriesImpl":  # pragma: no cover - simple
         return _SeriesImpl([value != other for value in self._data], index=self.index)
 
+    def _compare(self, other: Any, op: Callable[[Any, Any], bool]) -> "_SeriesImpl":
+        if isinstance(other, _SeriesImpl):
+            comparisons = [op(a, b) for a, b in zip(self._data, other._data)]
+        else:
+            comparisons = [False if _is_na(a) else op(a, other) for a in self._data]
+        return _SeriesImpl(comparisons, index=self.index)
+
+    def __lt__(self, other: Any) -> "_SeriesImpl":  # pragma: no cover - simple
+        return self._compare(other, lambda a, b: a < b)
+
+    def __le__(self, other: Any) -> "_SeriesImpl":  # pragma: no cover - simple
+        return self._compare(other, lambda a, b: a <= b)
+
+    def __gt__(self, other: Any) -> "_SeriesImpl":  # pragma: no cover - simple
+        return self._compare(other, lambda a, b: a > b)
+
+    def __ge__(self, other: Any) -> "_SeriesImpl":  # pragma: no cover - simple
+        return self._compare(other, lambda a, b: a >= b)
+
+    def __and__(self, other: Any) -> "_SeriesImpl":  # pragma: no cover - simple
+        if isinstance(other, _SeriesImpl):
+            return _SeriesImpl([bool(a) and bool(b) for a, b in zip(self._data, other._data)], index=self.index)
+        return _SeriesImpl([bool(a) and bool(other) for a in self._data], index=self.index)
+
+    def __or__(self, other: Any) -> "_SeriesImpl":  # pragma: no cover - simple
+        if isinstance(other, _SeriesImpl):
+            return _SeriesImpl([bool(a) or bool(b) for a, b in zip(self._data, other._data)], index=self.index)
+        return _SeriesImpl([bool(a) or bool(other) for a in self._data], index=self.index)
+
     # ------------------------------------------------------------------
     # Pandas-like helpers
     # ------------------------------------------------------------------
@@ -249,8 +281,62 @@ class _SeriesImpl:
     def tolist(self) -> List[Any]:
         return list(self._data)
 
+    def to_numpy(self) -> List[Any]:  # pragma: no cover - simple alias
+        return list(self._data)
+
     def copy(self) -> "_SeriesImpl":  # pragma: no cover - simple
         return _SeriesImpl(list(self._data), index=self.index)
+
+    def drop_duplicates(self) -> "_SeriesImpl":
+        seen: List[Any] = []
+        unique: List[Any] = []
+        for value in self._data:
+            if value not in seen:
+                seen.append(value)
+                unique.append(value)
+        return _SeriesImpl(unique)
+
+    def quantile(self, q: float) -> Any:
+        values = [float(value) for value in self._data if not _is_na(value)]
+        if not values:
+            return None
+        values.sort()
+        if q <= 0:
+            return values[0]
+        if q >= 1:
+            return values[-1]
+        position = (len(values) - 1) * q
+        lower = math.floor(position)
+        upper = math.ceil(position)
+        if lower == upper:
+            return values[lower]
+        fraction = position - lower
+        return values[lower] + (values[upper] - values[lower]) * fraction
+
+    def between(self, left: float, right: float, inclusive: str = "both") -> "_SeriesImpl":
+        results = []
+        for value in self._data:
+            if _is_na(value):
+                results.append(False)
+                continue
+            lower_ok = value >= left if inclusive in {"both", "right"} else value > left
+            upper_ok = value <= right if inclusive in {"both", "left"} else value < right
+            results.append(lower_ok and upper_ok)
+        return _SeriesImpl(results, index=self.index)
+
+    def clip(self, lower: float | None = None, upper: float | None = None) -> "_SeriesImpl":
+        clipped: List[Any] = []
+        for value in self._data:
+            if _is_na(value):
+                clipped.append(value)
+                continue
+            new_value = value
+            if lower is not None and value < lower:
+                new_value = lower
+            if upper is not None and new_value > upper:
+                new_value = upper
+            clipped.append(new_value)
+        return _SeriesImpl(clipped, index=self.index)
 
     # ------------------------------------------------------------------
     # Accessors
@@ -466,7 +552,10 @@ class _LocIndexer:
         if column_selector is None or column_selector == slice(None):
             return _DataFrameImpl(selected_rows, columns=self._frame.columns)
         if isinstance(column_selector, str):
-            return _SeriesImpl([row.get(column_selector) for row in selected_rows])
+            values = [row.get(column_selector) for row in selected_rows]
+            if len(values) == 1:
+                return values[0]
+            return _SeriesImpl(values)
         if isinstance(column_selector, Sequence):
             return _DataFrameImpl(
                 [{column: row.get(column) for column in column_selector} for row in selected_rows],
@@ -497,10 +586,22 @@ class _LocIndexer:
     def _select_rows(self, selector: Any) -> List[Dict[str, Any]]:
         if selector is None or selector == slice(None):
             return [dict(row) for row in self._frame._rows]
+        if isinstance(selector, int):
+            if selector < 0:
+                selector += len(self._frame._rows)
+            if selector < 0 or selector >= len(self._frame._rows):
+                raise IndexError("Row index out of range")
+            return [dict(self._frame._rows[selector])]
         if isinstance(selector, list):
             if selector and isinstance(selector[0], bool):
                 return [dict(row) for row, flag in zip(self._frame._rows, selector) if flag]
             return [dict(self._frame._rows[idx]) for idx in selector]
+        if isinstance(selector, _SeriesImpl):
+            return [
+                dict(row)
+                for row, flag in zip(self._frame._rows, selector._data)
+                if bool(flag)
+            ]
         raise TypeError("Unsupported row selector")
 
     def _row_indices(self, selector: Any) -> List[int]:
@@ -508,6 +609,8 @@ class _LocIndexer:
             return list(range(len(self._frame._rows)))
         if isinstance(selector, list) and selector and isinstance(selector[0], bool):
             return [idx for idx, flag in enumerate(selector) if flag]
+        if isinstance(selector, _SeriesImpl):
+            return [idx for idx, flag in enumerate(selector._data) if bool(flag)]
         raise TypeError("Unsupported row selector for assignment")
 
 
@@ -641,7 +744,7 @@ def merge(
     return _DataFrameImpl(rows)
 
 
-def to_datetime(values: Iterable[Any]) -> _SeriesImpl:
+def to_datetime(values: Iterable[Any], utc: bool | None = None) -> _SeriesImpl:
     converted: List[Any] = []
     for value in values:
         if isinstance(value, datetime):
@@ -658,6 +761,18 @@ def to_datetime(values: Iterable[Any]) -> _SeriesImpl:
             converted.append(datetime.fromisoformat(normalised))
             continue
         converted.append(value)
+
+    if utc:
+        coerced: List[Any] = []
+        for value in converted:
+            if isinstance(value, datetime):
+                if value.tzinfo is None:
+                    coerced.append(value.replace(tzinfo=timezone.utc))
+                else:
+                    coerced.append(value.astimezone(timezone.utc))
+            else:
+                coerced.append(value)
+        converted = coerced
     return _SeriesImpl(converted)
 
 
@@ -675,6 +790,47 @@ def to_numeric(values: Iterable[Any], errors: str = "raise") -> _SeriesImpl:
             else:  # pragma: no cover - defensive branch
                 raise
     return _SeriesImpl(converted)
+
+
+def isna(value: Any) -> bool:
+    return _is_na(value)
+
+
+def _parse_frequency(freq: str) -> timedelta:
+    if not freq:
+        raise ValueError("Frequency string must not be empty")
+    freq = freq.strip().lower()
+    number_part = ""
+    unit_part = ""
+    for char in freq:
+        if char.isdigit():
+            number_part += char
+        else:
+            unit_part += char
+    amount = int(number_part or 1)
+    unit_map = {
+        "s": timedelta(seconds=1),
+        "sec": timedelta(seconds=1),
+        "m": timedelta(minutes=1),
+        "min": timedelta(minutes=1),
+        "h": timedelta(hours=1),
+        "hour": timedelta(hours=1),
+        "d": timedelta(days=1),
+        "day": timedelta(days=1),
+    }
+    if unit_part not in unit_map:
+        raise ValueError(f"Unsupported frequency '{freq}'")
+    return unit_map[unit_part] * amount
+
+
+def date_range(start: datetime, periods: int, freq: str) -> _SeriesImpl:
+    if not isinstance(start, datetime):
+        raise TypeError("start must be a datetime instance")
+    if periods < 0:
+        raise ValueError("periods must be non-negative")
+    delta = _parse_frequency(freq)
+    values = [start + i * delta for i in range(periods)]
+    return _SeriesImpl(values)
 
 
 # Public constructors mirroring pandas naming.

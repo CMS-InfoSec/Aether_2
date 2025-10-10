@@ -80,6 +80,7 @@ def _make_minimal_config(module: ModuleType):
 
 def test_run_training_job_requires_numpy(monkeypatch: pytest.MonkeyPatch) -> None:
     module_name = "ml_training_workflow_missing_numpy"
+    monkeypatch.setenv("ML_ALLOW_INSECURE_DEFAULTS", "0")
     _install_dependency_stubs(monkeypatch, missing=frozenset({"numpy"}))
     module = _load_workflow_module(module_name)
     try:
@@ -92,6 +93,7 @@ def test_run_training_job_requires_numpy(monkeypatch: pytest.MonkeyPatch) -> Non
 
 def test_run_training_job_requires_pandas(monkeypatch: pytest.MonkeyPatch) -> None:
     module_name = "ml_training_workflow_missing_pandas"
+    monkeypatch.setenv("ML_ALLOW_INSECURE_DEFAULTS", "0")
     _install_dependency_stubs(monkeypatch, missing=frozenset({"pandas"}))
     module = _load_workflow_module(module_name)
     try:
@@ -104,6 +106,7 @@ def test_run_training_job_requires_pandas(monkeypatch: pytest.MonkeyPatch) -> No
 
 def test_run_training_job_requires_torch(monkeypatch: pytest.MonkeyPatch) -> None:
     module_name = "ml_training_workflow_missing_torch"
+    monkeypatch.setenv("ML_ALLOW_INSECURE_DEFAULTS", "0")
     _install_dependency_stubs(monkeypatch, missing=frozenset({"torch"}))
     module = _load_workflow_module(module_name)
     try:
