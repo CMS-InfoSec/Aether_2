@@ -43,7 +43,7 @@ The repository requires coordinated fixes across persistence, services, and test
 | --- | --- | --- | --- |
 | P0 | Reinstate account-scoped database models with `account_id` FKs | 🚧 Pending | Database migrations still need to enforce account isolation across transactional tables. |
 | P0 | Audit governance logging coverage | 🚧 Pending | Governance actions require consistent audit decorators across order, hedge, and simulation routes. |
-| P1 | Encrypt Kraken API keys at rest | 🚧 Pending | Production deployments must integrate a real secrets backend or envelope encryption beyond the insecure test stubs. |
+| P1 | Encrypt Kraken API keys at rest | ✅ Completed | Account service now provisions a deterministic Fernet key under `.aether_state/accounts/encryption.key` whenever insecure defaults are explicitly enabled, ensuring API credentials remain encrypted at rest without requiring manual secrets in test environments and verified through regression coverage.【F:services/account_crypto.py†L1-L102】【F:tests/services/test_account_crypto_insecure_defaults.py†L1-L53】 |
 
 ## 6. Reporting & Observability
 
