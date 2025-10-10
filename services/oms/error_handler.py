@@ -10,6 +10,10 @@ from datetime import datetime, timezone
 from typing import Awaitable, Callable, Iterable, List, Optional, Sequence, Tuple
 
 from shared.correlation import get_correlation_id
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
 from services.common.config import TimescaleSession, get_timescale_session
 from services.oms.kraken_rest import KrakenRESTError
 from services.oms.kraken_ws import KrakenWSError, KrakenWSTimeout, OrderAck

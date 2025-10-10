@@ -41,6 +41,10 @@ if TYPE_CHECKING:  # pragma: no cover - imported for static type checking only.
 else:  # pragma: no cover - runtime fallback when psycopg2 is absent.
     TimescaleConnection = Any  # type: ignore[assignment]
 
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
 from services.common.config import get_timescale_session
 from services.common.security import require_admin_account
 
