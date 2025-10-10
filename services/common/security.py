@@ -31,6 +31,23 @@ except Exception:  # pragma: no cover - provide minimal stand-ins
             session = Session(token=admin_id, admin_id=admin_id)
             return session
 
+__all__ = [
+    "ADMIN_ACCOUNTS",
+    "DIRECTOR_ACCOUNTS",
+    "AuthenticatedPrincipal",
+    "Session",
+    "SessionStoreProtocol",
+    "reload_admin_accounts",
+    "set_default_session_store",
+    "get_admin_accounts",
+    "get_director_accounts",
+    "require_authenticated_principal",
+    "require_admin_account",
+    "ensure_admin_access",
+    "require_mfa_context",
+    "require_dual_director_confirmation",
+]
+
 _DEFAULT_ADMIN_ACCOUNTS = frozenset({"company", "director-1", "director-2"})
 _ADMIN_ENV_VARIABLE = "AETHER_ADMIN_ACCOUNTS"
 

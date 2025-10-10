@@ -803,6 +803,32 @@ app.state.seasonality_engine = None
 app.state.seasonality_sessionmaker = None
 
 
+def _app_on_event(event: str):
+    """Return a decorator compatible with FastAPI's ``app.on_event`` API."""
+
+    handler = getattr(app, "on_event", None)
+    if callable(handler):
+        return handler(event)
+
+    def decorator(func):
+        return func
+
+    return decorator
+
+
+def _app_get(path: str, *args: Any, **kwargs: Any):
+    """Return a decorator compatible with FastAPI's ``app.get`` method."""
+
+    handler = getattr(app, "get", None)
+    if callable(handler):
+        return handler(path, *args, **kwargs)
+
+    def decorator(func):
+        return func
+
+    return decorator
+
+
 def _resolve_session_store_dsn() -> str:
     for env_var in ("SESSION_REDIS_URL", "SESSION_STORE_URL", "SESSION_BACKEND_DSN"):
         raw = os.getenv(env_var)
