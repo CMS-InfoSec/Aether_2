@@ -16,7 +16,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from threading import RLock
-from typing import Any, Dict, Iterable, Iterator, List, MutableMapping, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, MutableMapping, Optional, Protocol, Tuple
 
 try:  # pragma: no cover - requests is optional during local testing
     import requests  # type: ignore[import-not-found]
@@ -206,8 +206,25 @@ if TYPE_CHECKING:
         metadata: Any  # pragma: no cover - provided by SQLAlchemy
         registry: Any  # pragma: no cover - provided by SQLAlchemy
 else:  # pragma: no cover - runtime base when SQLAlchemy is available
-    try:
-        from sqlalchemy.orm import declarative_base
+    if SQLALCHEMY_AVAILABLE:
+        try:
+            from sqlalchemy.orm import DeclarativeBase as _DeclarativeBase  # type: ignore[attr-defined]
+
+            class Base(_DeclarativeBase):
+                """Declarative base used when SQLAlchemy is installed."""
+
+                pass
+
+        except Exception:
+            Base = declarative_base()  # type: ignore[assignment]
+            Base.__doc__ = "Declarative base used when SQLAlchemy is installed."
+    else:
+
+        class Base:  # type: ignore[no-redef]
+            """Fallback base used when SQLAlchemy is not available."""
+
+            metadata: Any = None  # pragma: no cover - assigned dynamically in tests
+            registry: Any = None  # pragma: no cover - assigned dynamically in tests
 
 if SQLALCHEMY_AVAILABLE:
 

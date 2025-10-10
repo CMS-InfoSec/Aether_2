@@ -36,8 +36,12 @@ except ImportError:  # pragma: no cover - fallback when FastAPI is stubbed out
         Query,
         StreamingResponse,
     )
-from psycopg2 import sql
-from psycopg2.extras import RealDictCursor
+try:  # pragma: no cover - psycopg2 is optional in some environments
+    from psycopg2 import sql
+    from psycopg2.extras import RealDictCursor
+except ImportError:  # pragma: no cover - gracefully degrade when psycopg2 absent
+    sql = None  # type: ignore[assignment]
+    RealDictCursor = Any  # type: ignore[assignment]
 
 from services.common.config import TimescaleSession, get_timescale_session
 from services.common.security import require_admin_account
@@ -353,6 +357,11 @@ class DailyReportService:
 
     @contextmanager
     def _session(self, config: TimescaleSession) -> Iterator[RealDictCursor]:
+        if sql is None:
+            raise RuntimeError(
+                "psycopg2 is required to build capital reports; install the dependency first"
+            )
+
         import psycopg2
 
         conn = psycopg2.connect(config.dsn)
@@ -384,6 +393,11 @@ class DailyReportService:
         return dict(row) if row else None
 
     def _fetch_fills(self, cursor: RealDictCursor, params: Mapping[str, Any]) -> List[Dict[str, Any]]:
+        if sql is None:
+            raise RuntimeError(
+                "psycopg2 is required to fetch fills; install the dependency first"
+            )
+
         from psycopg2 import errors
 
         try:
