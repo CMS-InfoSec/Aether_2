@@ -129,18 +129,23 @@ def _require_sqlalchemy() -> None:
         raise MissingDependencyError("SQLAlchemy is required for Kraken ingest") from _SQLALCHEMY_IMPORT_ERROR
 
 
-def _resolve_database_url() -> str:
+def _resolve_database_url() -> str | None:
     """Return the configured Timescale/PostgreSQL DSN used for persistence."""
 
-    raw_url = os.getenv("DATABASE_URL", "")
-    if not raw_url.strip():
+    raw_url = os.getenv("DATABASE_URL", "").strip()
+    if not raw_url:
+        if _insecure_defaults_enabled():
+            LOGGER.warning(
+                "DATABASE_URL is not configured; Kraken ingest will persist JSON snapshots locally",
+            )
+            return None
         raise RuntimeError(
             "Kraken ingest requires DATABASE_URL to be set to a PostgreSQL/Timescale DSN."
         )
 
     allow_sqlite = "pytest" in sys.modules or os.getenv(_SQLITE_FALLBACK_FLAG) == "1"
     database_url = normalize_sqlalchemy_dsn(
-        raw_url.strip(),
+        raw_url,
         allow_sqlite=allow_sqlite,
         label="Kraken ingest database URL",
     )
@@ -437,7 +442,12 @@ async def _consume_via_local_snapshots(
 async def consume(pairs: Sequence[str]) -> None:
     _require_sqlalchemy()
     engine: Engine | None = None
-    if _SQLALCHEMY_AVAILABLE and metadata is not None and orderbook_events_table is not None:
+    if (
+        DATABASE_URL
+        and _SQLALCHEMY_AVAILABLE
+        and metadata is not None
+        and orderbook_events_table is not None
+    ):
         engine = create_engine(DATABASE_URL, future=True)
     producer = kafka_producer()
 
