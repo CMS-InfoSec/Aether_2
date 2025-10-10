@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import os
 import sys
 import time
 from decimal import Decimal
@@ -29,9 +30,71 @@ AccountClient = Tuple[TestClient, object]
 
 @pytest.fixture()
 def risk_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[AccountClient]:
-    if importlib.util.find_spec("sqlalchemy") is None:
-        pytest.skip("sqlalchemy is required for risk service tests")
+    monkeypatch.setenv("RISK_ALLOW_INSECURE_DEFAULTS", "1")
     with risk_service_instance(tmp_path, monkeypatch) as module:
+        class _StubExchangeAdapter:
+            name = "stub"
+
+            def supports(self, operation: str) -> bool:
+                return False
+
+        monkeypatch.setattr(module, "EXCHANGE_ADAPTER", _StubExchangeAdapter(), raising=False)
+
+        async def _stub_universe_snapshot() -> module.UniverseSnapshot:
+            return module.UniverseSnapshot(
+                symbols={"BTC-USD", "ETH-USD", "SOL-USD"},
+                generated_at=module.datetime.now(module.timezone.utc),
+                thresholds={},
+            )
+
+        monkeypatch.setattr(module, "_get_approved_universe", _stub_universe_snapshot, raising=False)
+
+        class _StubSizingResult:
+            max_position = 1_000_000.0
+            fee_bps_estimate = 10.0
+            volatility = 0.1
+            nav = 1_000_000.0
+
+        class _StubPositionSizer:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                return None
+
+            async def suggest_max_position(self, *args: object, **kwargs: object) -> _StubSizingResult:
+                return _StubSizingResult()
+
+        monkeypatch.setattr(module, "PositionSizer", _StubPositionSizer, raising=False)
+
+        async def _noop_refresh(account_id: str) -> None:
+            return None
+
+        monkeypatch.setattr(module, "_refresh_usage_from_balance", _noop_refresh, raising=False)
+
+        async def _noop_allocator(account_id: str):
+            return None
+
+        monkeypatch.setattr(module, "_query_allocator_state", _noop_allocator, raising=False)
+
+        def _stub_load_usage(account_id: str) -> module.AccountUsage:
+            stored = module._STUB_ACCOUNT_USAGE.get(account_id, {})
+            if stored:
+                return module.AccountUsage(
+                    account_id=account_id,
+                    realized_daily_loss=module._as_decimal(stored.get("realized_daily_loss")),
+                    fees_paid=module._as_decimal(stored.get("fees_paid")),
+                    net_asset_value=module._as_decimal(stored.get("net_asset_value")),
+                    var_95=module._maybe_decimal(stored.get("var_95")),
+                    var_99=module._maybe_decimal(stored.get("var_99")),
+                )
+            return module.AccountUsage(
+                account_id=account_id,
+                realized_daily_loss=module.DECIMAL_ZERO,
+                fees_paid=module.DECIMAL_ZERO,
+                net_asset_value=module.DECIMAL_ZERO,
+                var_95=None,
+                var_99=None,
+            )
+
+        monkeypatch.setattr(module, "_load_account_usage", _stub_load_usage, raising=False)
         with TestClient(module.app) as client:
             yield client, module
 

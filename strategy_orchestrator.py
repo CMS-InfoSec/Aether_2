@@ -101,16 +101,27 @@ class _InMemoryStrategySession:
                 total = sum(record.max_nav_pct for record in self._store.values())
                 return SimpleNamespace(
                     scalar=lambda: total,
-                    scalars=lambda: SimpleNamespace(all=lambda: [total]),
+                    scalar_one_or_none=lambda: total,
+                    scalars=lambda: SimpleNamespace(
+                        first=lambda: total,
+                        one_or_none=lambda: total,
+                        all=lambda: [total],
+                    ),
                 )
             if entity is StrategyRecord:
                 rows = list(self._store.values())
                 return SimpleNamespace(
-                    scalars=lambda: SimpleNamespace(all=lambda: rows),
+                    scalars=lambda: SimpleNamespace(
+                        all=lambda: rows,
+                        first=lambda: rows[0] if rows else None,
+                        one_or_none=lambda: rows[0] if rows else None,
+                    ),
                     scalar=lambda: rows[0] if rows else None,
+                    scalar_one_or_none=lambda: rows[0] if rows else None,
                 )
         return SimpleNamespace(
             scalar=lambda: None,
+            scalar_one_or_none=lambda: None,
             scalars=lambda: SimpleNamespace(all=lambda: []),
         )
 
@@ -122,6 +133,35 @@ class _InMemoryStrategySession:
 
     def close(self) -> None:  # pragma: no cover - simple no-op
         return None
+
+
+def _extract_scalar(result: Any) -> Any:
+    """Return the first scalar value from a SQLAlchemy result across versions."""
+
+    for method_name in ("scalar_one_or_none", "scalar_one", "scalar"):
+        method = getattr(result, method_name, None)
+        if callable(method):
+            try:
+                return method()
+            except TypeError:  # pragma: no cover - defensive guard
+                continue
+
+    scalars_callable = getattr(result, "scalars", None)
+    if callable(scalars_callable):
+        stream = scalars_callable()
+        for accessor in ("first", "one_or_none", "one"):
+            method = getattr(stream, accessor, None)
+            if callable(method):
+                try:
+                    return method()
+                except TypeError:  # pragma: no cover - compatibility shim
+                    continue
+        all_method = getattr(stream, "all", None)
+        if callable(all_method):
+            values = all_method()
+            return values[0] if values else None
+
+    return None
 
 
 @dataclass(slots=True)
@@ -212,7 +252,14 @@ class StrategyRegistry:
         with self._lock:
             with self._session_scope() as session:
                 existing = session.get(StrategyRecord, name)
-                total_allocated = session.execute(select(func.sum(StrategyRecord.max_nav_pct))).scalar() or 0.0
+                total_allocated_raw = _extract_scalar(
+                    session.execute(select(func.sum(StrategyRecord.max_nav_pct)))
+                )
+                total_allocated = (
+                    float(total_allocated_raw)
+                    if total_allocated_raw is not None
+                    else 0.0
+                )
                 if existing is not None:
                     total_allocated -= existing.max_nav_pct
                 if total_allocated + max_nav_pct > 1.0 + 1e-6:
