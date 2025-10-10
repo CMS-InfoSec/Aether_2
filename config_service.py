@@ -387,9 +387,10 @@ def reset_state(application: Optional[FastAPI] = None) -> None:
     """Reset in-memory and database state (used in tests)."""
 
     engine = _get_config_engine(application or app)
-    if _SQLALCHEMY_AVAILABLE:
-        Base.metadata.drop_all(bind=engine)
-        Base.metadata.create_all(bind=engine)
+    metadata = getattr(Base, "metadata", None)
+    if _SQLALCHEMY_AVAILABLE and hasattr(metadata, "drop_all"):
+        metadata.drop_all(bind=engine)
+        metadata.create_all(bind=engine)
     else:
         engine.reset()
     _pending_guarded.clear()

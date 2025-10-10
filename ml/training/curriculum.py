@@ -26,6 +26,7 @@ from collections import Counter
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from types import ModuleType
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 if TYPE_CHECKING:  # pragma: no cover - imported for type checking only
@@ -41,7 +42,50 @@ else:  # pragma: no cover - runtime fallbacks when optional deps are missing
     DataLoader = Any  # type: ignore[assignment]
     Dataset = Any  # type: ignore[assignment]
 
-from ml.experiment_tracking.mlflow_utils import MLFlowConfig, mlflow_run
+_ML_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+_PROJECT_ROOT = _ML_PACKAGE_ROOT.parent
+
+
+def _ensure_module(fullname: str, *, package: bool, path: Path) -> ModuleType:
+    import importlib.util
+    import sys
+
+    existing = sys.modules.get(fullname)
+    if isinstance(existing, ModuleType) and getattr(existing, "__file__", None) == str(path):
+        return existing
+
+    submodule_locations = [str(path.parent)] if package else None
+    spec = importlib.util.spec_from_file_location(fullname, path, submodule_search_locations=submodule_locations)
+    if spec is None or spec.loader is None:  # pragma: no cover - defensive guard
+        raise ModuleNotFoundError(fullname)
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[fullname] = module
+    spec.loader.exec_module(module)
+    if package:
+        module.__path__ = [str(path.parent)]  # type: ignore[attr-defined]
+    return module
+
+
+def _load_mlflow_helpers() -> Tuple[type, Any]:
+    package = _ensure_module("ml", package=True, path=_ML_PACKAGE_ROOT / "__init__.py")
+    experiment_tracking = _ensure_module(
+        "ml.experiment_tracking",
+        package=True,
+        path=_ML_PACKAGE_ROOT / "experiment_tracking" / "__init__.py",
+    )
+    module = _ensure_module(
+        "ml.experiment_tracking.mlflow_utils",
+        package=False,
+        path=_ML_PACKAGE_ROOT / "experiment_tracking" / "mlflow_utils.py",
+    )
+    return module.MLFlowConfig, module.mlflow_run
+
+
+try:
+    from ml.experiment_tracking.mlflow_utils import MLFlowConfig, mlflow_run
+except (KeyError, ModuleNotFoundError):  # pragma: no cover - exercised by optional-deps tests
+    MLFlowConfig, mlflow_run = _load_mlflow_helpers()
 
 LOGGER = logging.getLogger(__name__)
 
