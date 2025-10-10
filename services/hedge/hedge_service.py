@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from collections import deque
 from dataclasses import asdict, dataclass
@@ -30,6 +31,9 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from services.common.security import require_admin_account
 
 ValidatorFn = TypeVar("ValidatorFn", bound=Callable[..., Any])
+
+
+KillSwitchHandler = Callable[["HedgeMetricsRequest", "HedgeDiagnostics"], None]
 
 
 if TYPE_CHECKING:  # pragma: no cover - static analysis stubs for optional dependency
@@ -140,6 +144,8 @@ class HedgeDiagnostics:
     guard_reason: Optional[str]
     stablecoin_deviation: float
     components: Dict[str, float]
+    kill_switch_recommended: bool
+    kill_switch_reason: Optional[str]
 
     def as_dict(self) -> Dict[str, object]:
         data = asdict(self)
@@ -157,6 +163,8 @@ class HedgeDiagnostics:
             "guard_reason": self.guard_reason,
             "stablecoin_deviation": self.stablecoin_deviation,
             "components": dict(self.components),
+            "kill_switch_recommended": self.kill_switch_recommended,
+            "kill_switch_reason": self.kill_switch_reason,
         }
         return payload
 
@@ -192,6 +200,12 @@ class HedgeDiagnostics:
                 except (TypeError, ValueError):
                     continue
 
+        kill_switch_recommended = bool(payload.get("kill_switch_recommended", False))
+        kill_switch_reason_raw = payload.get("kill_switch_reason")
+        kill_switch_reason = (
+            kill_switch_reason_raw if isinstance(kill_switch_reason_raw, str) else None
+        )
+
         return HedgeDiagnostics(
             volatility=volatility,
             drawdown=drawdown,
@@ -202,6 +216,8 @@ class HedgeDiagnostics:
             guard_reason=guard_reason,
             stablecoin_deviation=stablecoin_deviation,
             components=components,
+            kill_switch_recommended=kill_switch_recommended,
+            kill_switch_reason=kill_switch_reason,
         )
 
 
@@ -317,6 +333,10 @@ class HedgeMetricsRequest(BaseModel):
     volatility: float = Field(..., ge=0.0, description="Annualized volatility on [0, inf) scale")
     drawdown: float = Field(..., ge=0.0, description="Normalized drawdown where 1 represents max tolerance")
     stablecoin_price: float = Field(..., gt=0.0, description="Observed stablecoin price in USD")
+    account_id: Optional[str] = Field(
+        default=None,
+        description="Optional account identifier for kill-switch integration.",
+    )
 
     @validator("volatility")
     def _validate_volatility(cls, value: float) -> float:
@@ -329,6 +349,15 @@ class HedgeMetricsRequest(BaseModel):
         if value > 5.0:
             raise ValueError("drawdown appears unreasonably high")
         return value
+
+    @validator("account_id")
+    def _normalise_account(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("account_id must not be empty")
+        return normalized
 
 
 class HedgeOverrideRequest(BaseModel):
@@ -447,6 +476,14 @@ class HedgeService:
         guard_floor_pct: float = 85.0,
         volatility_reference: float = 1.5,
         state_store: Optional[HedgeOverrideStateStore] = None,
+        min_auto_target_pct: float = 20.0,
+        max_auto_target_pct: float = 95.0,
+        volatility_exponent: float = 0.75,
+        drawdown_reference: float = 0.35,
+        drawdown_warning_threshold: float = 0.35,
+        drawdown_kill_threshold: float = 0.5,
+        drawdown_recovery_threshold: float = 0.25,
+        kill_switch_handler: Optional[KillSwitchHandler] = None,
     ) -> None:
         self._state_store = state_store or HedgeOverrideStateStore(history_limit=history_limit)
         persisted_override, persisted_history = self._state_store.load()
@@ -460,12 +497,36 @@ class HedgeService:
         self._stablecoin_threshold = stablecoin_threshold
         self._guard_floor_pct = guard_floor_pct
         self._volatility_reference = volatility_reference
+        self._volatility_exponent = max(volatility_exponent, 0.1)
+        self._drawdown_reference = max(drawdown_reference, 0.01)
+        self._drawdown_warning_threshold = max(drawdown_warning_threshold, 0.0)
+        self._min_auto_target_pct = max(0.0, min_auto_target_pct)
+        self._max_auto_target_pct = max(self._min_auto_target_pct, max_auto_target_pct)
+        self._drawdown_kill_threshold = max(0.0, drawdown_kill_threshold)
+        self._drawdown_recovery_threshold = self._clamp(
+            drawdown_recovery_threshold,
+            0.0,
+            self._drawdown_kill_threshold,
+        )
+        self._kill_switch_handler = kill_switch_handler
+        self._kill_switch_engaged = False
 
     def evaluate(self, metrics: HedgeMetricsRequest) -> HedgeDecision:
         """Compute hedge target, applying overrides and safeguards."""
 
         diagnostics = self._build_diagnostics(metrics)
         self._last_diagnostics = diagnostics
+
+        if diagnostics.kill_switch_recommended:
+            if self._kill_switch_handler and not self._kill_switch_engaged:
+                try:
+                    self._kill_switch_handler(metrics, diagnostics)
+                except Exception as exc:  # pragma: no cover - defensive logging path
+                    LOGGER.warning("Kill switch handler failed: %s", exc)
+                self._kill_switch_engaged = True
+        else:
+            if metrics.drawdown <= self._drawdown_recovery_threshold:
+                self._kill_switch_engaged = False
 
         decision_reason: Optional[str] = None
         override = self._override
@@ -476,8 +537,8 @@ class HedgeService:
         else:
             target_pct = diagnostics.adjusted_target_pct
             mode = "auto"
-            if diagnostics.guard_triggered:
-                decision_reason = diagnostics.guard_reason
+            if diagnostics.guard_triggered or diagnostics.kill_switch_recommended:
+                decision_reason = diagnostics.guard_reason or diagnostics.kill_switch_reason
 
         decision = HedgeDecision(
             timestamp=_utcnow(),
@@ -557,32 +618,74 @@ class HedgeService:
             "last_decision_at": latest_record.timestamp.isoformat() if latest_record else None,
             "last_target_pct": latest_record.target_pct if latest_record else None,
             "last_guard_triggered": bool(diagnostics.guard_triggered if diagnostics else False),
+            "kill_switch_recommended": bool(
+                diagnostics.kill_switch_recommended if diagnostics else False
+            ),
+            "kill_switch_engaged": self._kill_switch_engaged,
         }
 
         if diagnostics and diagnostics.guard_reason:
             payload["last_guard_reason"] = diagnostics.guard_reason
+        if diagnostics and diagnostics.kill_switch_reason:
+            payload["kill_switch_reason"] = diagnostics.kill_switch_reason
 
         return payload
 
     def _build_diagnostics(self, metrics: HedgeMetricsRequest) -> HedgeDiagnostics:
-        volatility_score = self._clamp(metrics.volatility / self._volatility_reference, 0.0, 1.0)
-        drawdown_score = self._clamp(metrics.drawdown, 0.0, 1.0)
-        base_score = 0.6 * volatility_score + 0.4 * drawdown_score
+        volatility_ratio = (
+            metrics.volatility / self._volatility_reference
+            if self._volatility_reference > 0
+            else metrics.volatility
+        )
+        volatility_ratio = max(volatility_ratio, 0.0)
+        volatility_signal = self._clamp(
+            math.pow(volatility_ratio, self._volatility_exponent),
+            0.0,
+            3.0,
+        )
+        normalized_volatility = self._clamp(volatility_signal / 3.0, 0.0, 1.0)
 
-        if metrics.drawdown > 0.5:
-            base_score = min(base_score + 0.1, 1.0)
+        drawdown_ratio = metrics.drawdown / self._drawdown_reference
+        drawdown_ratio = max(drawdown_ratio, 0.0)
+        drawdown_signal = 1.0 - math.exp(-drawdown_ratio)
+        drawdown_signal = self._clamp(drawdown_signal, 0.0, 1.0)
 
-        base_target_pct = self._clamp(base_score * 100.0, 0.0, 100.0)
+        combined_risk = max(
+            drawdown_signal,
+            0.55 * normalized_volatility + 0.45 * drawdown_signal,
+        )
+        if metrics.drawdown >= self._drawdown_warning_threshold:
+            combined_risk = min(combined_risk + 0.1, 1.0)
+
+        base_target_pct = self._min_auto_target_pct + (
+            self._max_auto_target_pct - self._min_auto_target_pct
+        ) * combined_risk
 
         stablecoin_deviation = abs(metrics.stablecoin_price - self._stablecoin_peg) / self._stablecoin_peg
         guard_triggered = stablecoin_deviation >= self._stablecoin_threshold
         adjusted_target_pct = base_target_pct
-        guard_reason: Optional[str] = None
+        guard_reasons: List[str] = []
         if guard_triggered:
             adjusted_target_pct = max(base_target_pct, self._guard_floor_pct)
-            guard_reason = (
+            guard_reasons.append(
                 f"Stablecoin peg deviation {stablecoin_deviation:.2%} exceeds {self._stablecoin_threshold:.2%}"
             )
+
+        kill_switch_recommended = metrics.drawdown >= self._drawdown_kill_threshold
+        kill_switch_reason: Optional[str] = None
+        if kill_switch_recommended:
+            adjusted_target_pct = max(adjusted_target_pct, self._max_auto_target_pct)
+            kill_switch_reason = (
+                "Drawdown {drawdown:.0%} exceeds kill switch threshold {threshold:.0%}".format(
+                    drawdown=metrics.drawdown,
+                    threshold=self._drawdown_kill_threshold,
+                )
+            )
+            guard_reasons.append(kill_switch_reason)
+
+        guard_reason: Optional[str] = None
+        if guard_reasons:
+            guard_reason = "; ".join(guard_reasons)
 
         diagnostics = HedgeDiagnostics(
             volatility=metrics.volatility,
@@ -594,10 +697,12 @@ class HedgeService:
             guard_reason=guard_reason,
             stablecoin_deviation=round(stablecoin_deviation, 4),
             components={
-                "volatility_score": round(volatility_score, 4),
-                "drawdown_score": round(drawdown_score, 4),
-                "base_score": round(base_score, 4),
+                "volatility_signal": round(normalized_volatility, 4),
+                "drawdown_signal": round(drawdown_signal, 4),
+                "combined_risk_score": round(combined_risk, 4),
             },
+            kill_switch_recommended=kill_switch_recommended,
+            kill_switch_reason=kill_switch_reason,
         )
         return diagnostics
 

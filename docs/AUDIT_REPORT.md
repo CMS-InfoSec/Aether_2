@@ -33,8 +33,8 @@ The repository requires coordinated fixes across persistence, services, and test
 | Priority | Task | Status | Notes |
 | --- | --- | --- | --- |
 | P0 | Persist hedge override state across restarts | ✅ Completed | Hedge overrides now save to `.aether_state/hedge_service/override_state.json` via `HedgeOverrideStateStore`, and regression coverage reloads overrides and history across service instances.【F:services/hedge/hedge_service.py†L1-L420】【F:tests/services/hedge/test_hedge_override_persistence.py†L1-L45】 |
-| P1 | Calibrate volatility-based hedge sizing | 🚧 Pending | Hedge sizing still needs volatility-aware tuning and targeted regression coverage. |
-| P1 | Add drawdown-aware kill switch | 🚧 Pending | Integration between the kill switch and hedging logic remains outstanding. |
+| P1 | Calibrate volatility-based hedge sizing | ✅ Completed | Hedge diagnostics now blend volatility and drawdown signals with configurable floors, and regression coverage asserts monotonic targets and guard behaviour.【F:services/hedge/hedge_service.py†L470-L707】【F:tests/services/hedge/test_hedge_auto_calibration.py†L21-L97】 |
+| P1 | Add drawdown-aware kill switch | ✅ Completed | The hedge service now raises kill-switch recommendations with optional handlers, persists the signal in health metadata, and tests cover handler re-arming semantics.【F:services/hedge/hedge_service.py†L470-L707】【F:tests/services/hedge/test_hedge_auto_calibration.py†L99-L160】【F:tests/services/hedge/test_hedge_service_health.py†L17-L41】 |
 
 ## 5. Accounts, Auth, and Governance
 
