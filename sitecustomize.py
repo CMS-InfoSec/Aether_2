@@ -60,6 +60,7 @@ def _extend_stdlib_secrets_namespace() -> None:
     if not _TESTS_SECRETS_DIR.is_dir():
         return
 
+    _ensure_project_root_on_path()
     stdlib_secrets = importlib.import_module("secrets")
     locations = [str(_TESTS_SECRETS_DIR)]
 
@@ -70,7 +71,7 @@ def _extend_stdlib_secrets_namespace() -> None:
         spec.submodule_search_locations = locations  # type: ignore[attr-defined]
 
 
-_extend_stdlib_secrets_namespace()
 _ensure_project_root_on_path()
+_extend_stdlib_secrets_namespace()
 _ensure_services_namespace()
 _ensure_common_namespace()

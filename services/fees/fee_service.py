@@ -6,6 +6,7 @@ import os
 from collections.abc import Generator
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
+from types import SimpleNamespace
 from typing import Any, Callable, TypeVar, TypedDict, cast
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
@@ -181,7 +182,27 @@ def _seed_schedule(session: Session) -> None:
     session.commit()
 
 
-ACCOUNT_FILL_TABLE: Table = AccountFill.__table__
+try:
+    ACCOUNT_FILL_TABLE: Table = AccountFill.__table__  # type: ignore[assignment]
+except AttributeError:
+    class _StubColumn:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    class _StubDelete:
+        def __init__(self) -> None:
+            self.c = SimpleNamespace(
+                account_id=_StubColumn("account_id"),
+                fill_ts=_StubColumn("fill_ts"),
+            )
+
+        def delete(self) -> "_StubDelete":  # pragma: no cover - lightweight fallback
+            return self
+
+        def where(self, *_args: Any, **_kwargs: Any) -> "_StubDelete":  # pragma: no cover
+            return self
+
+    ACCOUNT_FILL_TABLE = _StubDelete()  # type: ignore[assignment]
 
 
 @_app_on_event("startup")

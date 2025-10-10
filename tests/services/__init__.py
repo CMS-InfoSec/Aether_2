@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 from importlib.machinery import ModuleSpec
 from pathlib import Path
 
@@ -12,6 +13,13 @@ _SERVICES_DIR = _PROJECT_ROOT / "services"
 
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
+
+try:
+    _REAL_SERVICES = importlib.import_module("services")
+except ModuleNotFoundError:
+    _REAL_SERVICES = None  # type: ignore[assignment]
+else:
+    sys.modules.setdefault("services", _REAL_SERVICES)
 
 if str(_SERVICES_DIR) not in __path__:
     __path__.append(str(_SERVICES_DIR))  # type: ignore[attr-defined]

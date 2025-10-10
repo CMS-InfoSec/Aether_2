@@ -133,6 +133,30 @@ def _ensure_fastapi_stub() -> None:
         importlib.reload(module)
 
 
+def _ensure_httpx_module() -> None:
+    """Reload the lightweight ``httpx`` shim when pytest leaves placeholders."""
+
+    required_attrs = ("AsyncClient", "Request", "Response", "HTTPError")
+    module = sys.modules.get("httpx")
+    if isinstance(module, ModuleType) and getattr(module, "__file__", None):
+        if all(hasattr(module, attr) for attr in required_attrs):
+            return
+
+    overrides: Dict[str, object] = {}
+    if isinstance(module, ModuleType):
+        overrides = {
+            key: value
+            for key, value in module.__dict__.items()
+            if not key.startswith("__")
+        }
+
+    sys.modules.pop("httpx", None)
+    module = importlib.import_module("httpx")
+
+    for key, value in overrides.items():
+        setattr(module, key, value)
+
+
 def ensure_common_helpers() -> None:
     """Guarantee the real ``services.common`` helpers are available."""
 
@@ -148,6 +172,7 @@ def ensure_common_helpers() -> None:
         setattr(parent, attribute, getattr(loaded[module_name], source_attr))
 
     _ensure_fastapi_stub()
+    _ensure_httpx_module()
 
     if _ensure_services_namespace is not None:
         _ensure_services_namespace()
