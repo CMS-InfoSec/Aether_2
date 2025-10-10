@@ -1302,7 +1302,10 @@ def _run_async(factory: Callable[[], Any]) -> Any:
         return candidate
     try:
         return asyncio.run(candidate)
-    except RuntimeError:
+    except RuntimeError as exc:
+        message = str(exc)
+        if "asyncio.run() cannot be called" not in message:
+            raise
         new_loop = asyncio.new_event_loop()
         try:
             candidate = _resolve()

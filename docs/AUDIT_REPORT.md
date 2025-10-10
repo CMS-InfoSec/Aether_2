@@ -26,6 +26,7 @@ The repository requires coordinated fixes across persistence, services, and test
 | Priority | Task | Status | Notes |
 | --- | --- | --- | --- |
 | P0 | Fix CoinGecko historical backfill loader | ✅ Completed | The ingestion job guards optional dependencies, persists fallbacks to `.aether_state/coingecko/`, and normalises database DSNs so training data loads in CI environments.【F:data/ingest/coingecko_job.py†L86-L186】 |
+| P0 | Provide local market data fallback for analytics | ✅ Completed | `TimescaleMarketDataAdapter` now detects `MARKET_DATA_USE_LOCAL_STORE` or missing SQLAlchemy, serving data from the deterministic in-memory store while the signal service bypasses DSN resolution and tests seed both market and cross-asset payloads.【F:services/analytics/market_data_store.py†L56-L309】【F:services/analytics/signal_service.py†L610-L660】【F:tests/services/analytics/test_market_data_services.py†L45-L305】 |
 | P1 | Repair Kraken WebSocket listener auto-reconnect | ✅ Completed | `consume` now loops with exponential backoff via `_stream_websocket`, resubscribing after disconnects and exercising the path in new regression coverage.【F:data/ingest/kraken_ws.py†L360-L518】【F:tests/data/test_kraken_ws_reconnect.py†L1-L121】 |
 | P1 | Re-enable incremental model retraining | ✅ Completed | Insecure-default fallbacks unblock HPO/retraining flows by persisting study state locally and providing deterministic trainer stubs during tests.【F:ml/hpo/optuna_runner.py†L1-L286】【F:tests/ml/test_hpo_insecure_defaults.py†L1-L33】 |
 

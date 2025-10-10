@@ -12,7 +12,7 @@ import sys
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional, Sequence, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Optional, Sequence, TypeVar, cast
 
 from prometheus_client import Gauge
 
@@ -235,6 +235,71 @@ class LocalCrossAssetStore:
         with path.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, sort_keys=True)
 
+    @staticmethod
+    def _coerce_timestamp(value: object) -> datetime | None:
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        if isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value)
+            except ValueError:
+                return None
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        return None
+
+    def _extend_series(self, rows: list[dict[str, Any]], target_window: int) -> list[dict[str, Any]]:
+        extended = list(rows)
+        if not extended:
+            return extended
+
+        last_entry = extended[-1]
+        last_ts = self._coerce_timestamp(last_entry.get("bucket_start"))
+        if last_ts is None:
+            last_ts = datetime.now(tz=timezone.utc)
+
+        source_rows = list(rows)
+        index = 0
+        while len(extended) < target_window and source_rows:
+            index = (index + 1) % len(source_rows)
+            reference = source_rows[index]
+            last_ts += timedelta(minutes=1)
+            extended.append(
+                {
+                    "bucket_start": last_ts.isoformat(),
+                    "close": float(reference.get("close", 0.0)),
+                }
+            )
+        return extended
+
+    def seed_series(self, symbol: str, rows: Iterable[Mapping[str, Any]]) -> None:
+        """Persist deterministic series rows supplied by tests or fixtures."""
+
+        normalised: list[dict[str, Any]] = []
+        stablecoin = _series_key(symbol).split("_")[0] in {"USDT", "USDC", "DAI", "USD"}
+        for index, row in enumerate(rows):
+            if not isinstance(row, Mapping):
+                continue
+            bucket = row.get("bucket_start")
+            close = row.get("close")
+            if bucket is None or close is None:
+                continue
+            if isinstance(bucket, datetime):
+                bucket_str = bucket.astimezone(timezone.utc).isoformat()
+            else:
+                bucket_str = str(bucket)
+            close_value = float(close)
+            if stablecoin:
+                close_value = 1.0 + (0.0001 * (index % 5))
+            normalised.append({"bucket_start": bucket_str, "close": close_value})
+
+        path = self._series_path(symbol)
+        hyphen_symbol = symbol.replace("/", "-")
+        with self._lock:
+            if normalised:
+                self._write_json(path, normalised)
+                if hyphen_symbol != symbol:
+                    self._write_json(self._series_path(hyphen_symbol), normalised)
+
     def _generate_series(self, symbol: str, count: int) -> list[dict[str, Any]]:
         seed = int(hashlib.sha256(_series_key(symbol).encode("utf-8")).hexdigest()[:16], 16)
         rng = random.Random(seed)
@@ -265,7 +330,11 @@ class LocalCrossAssetStore:
         path = self._series_path(symbol)
         with self._lock:
             rows = self._read_json(path)
-            if len(rows) < target_window:
+            if rows:
+                if len(rows) < target_window:
+                    rows = self._extend_series(rows, target_window)
+                    self._write_json(path, rows)
+            else:
                 rows = self._generate_series(symbol, target_window)
                 self._write_json(path, rows)
             closes = [float(entry["close"]) for entry in rows[-window:]] if window else []
@@ -287,6 +356,22 @@ class LocalCrossAssetStore:
             existing.append(record)
             # Retain a bounded history to prevent unbounded growth in local runs.
             self._write_json(path, existing[-500:])
+
+
+def _ensure_local_store() -> LocalCrossAssetStore:
+    global LOCAL_STORE
+
+    if LOCAL_STORE is None:
+        LOCAL_STORE = LocalCrossAssetStore(_state_root())
+    return LOCAL_STORE
+
+
+def seed_local_series(series_payload: Mapping[str, Iterable[Mapping[str, Any]]]) -> None:
+    """Helper used by tests to prime the fallback store with deterministic data."""
+
+    store = _ensure_local_store()
+    for symbol, rows in series_payload.items():
+        store.seed_series(symbol, rows)
 
 
 class CrossAssetMetric(Base):
@@ -825,4 +910,5 @@ __all__ = [
     "LeadLagResponse",
     "BetaResponse",
     "StablecoinResponse",
+    "seed_local_series",
 ]
