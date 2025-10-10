@@ -9,6 +9,7 @@ which features were considered and when they were deployed.
 
 from __future__ import annotations
 
+import json
 import argparse
 import logging
 import math
@@ -56,6 +57,8 @@ except Exception:  # pragma: no cover - executed when psycopg is unavailable.
 
 
 LOGGER = logging.getLogger(__name__)
+
+from ml.insecure_defaults import insecure_defaults_enabled, state_dir, state_file
 
 
 class MissingDependencyError(RuntimeError):
@@ -313,7 +316,7 @@ class FeatureDiscoveryEngine:
         return grouped.transform(_rsi)
 
     def _compute_cross_correlation(self, returns: pd.Series) -> pd.Series:
-        """Compute rolling correlation of each symbol's returns with the cross-sectional mean."""
+        """Compute rolling correlation of each symbol's returns versus the market."""
 
         df = returns.unstack(level=0)
         market = df.mean(axis=1)
@@ -324,7 +327,7 @@ class FeatureDiscoveryEngine:
     # Modeling and scoring
     # ------------------------------------------------------------------
     def _derive_target(self, market_data: pd.DataFrame) -> pd.Series:
-        """Derive a simple forward return target for supervised evaluation."""
+        """Derive a simple forward return target for supervised learning."""
 
         close = market_data["close"].groupby(level=0)
         forward_return = close.shift(-1) / close - 1
@@ -341,11 +344,11 @@ class FeatureDiscoveryEngine:
             df = pd.DataFrame({"feature": series, "target": target})
             df = df.dropna()
             if df.empty:
-                LOGGER.debug("Skipping %s – insufficient data after dropna", candidate.name)
+                LOGGER.debug("Skipping %s – insufficient data for scoring", candidate.name)
                 scored.append(candidate)
                 continue
 
-            # Convert multi-index into explicit columns for modeling.
+            # Convert multi-index into explicit columns for LightGBM.
             df = df.reset_index().rename(columns={"level_0": "symbol", "level_1": "event_ts"})
             df = df.sort_values("event_ts")
             feature_values = df[["feature"]].values
@@ -362,11 +365,12 @@ class FeatureDiscoveryEngine:
                 X_test, y_test = feature_values[test_idx], target_values[test_idx]
                 if len(np.unique(y_train)) < 2:
                     LOGGER.debug(
-                        "Skipping split for %s due to single-class training labels", candidate.name
+                        "Skipping split for %s due to single-class training data",
+                        candidate.name,
                     )
                     continue
                 train_set = lgb.Dataset(X_train, label=y_train)
-                valid_set = lgb.Dataset(X_test, label=y_test, reference=train_set)
+                valid_set = lgb.Dataset(X_test, label=y_test)
                 params = {
                     "objective": "binary",
                     "learning_rate": 0.05,
@@ -417,7 +421,7 @@ class FeatureDiscoveryEngine:
             )
         return scored
 
-    def _time_series_splits(self, n_rows: int, n_splits: int = 5) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
+    def _time_series_splits(self, n_rows: int, n_splits: int = 5):
         """Generate expanding window splits for walk-forward validation."""
 
         if n_rows < n_splits + 1:
@@ -479,11 +483,11 @@ class FeatureDiscoveryEngine:
             return
         if self.config.feast_repo is None:
             LOGGER.warning(
-                "Feast repository path is not configured; skipping promotion for %d features",
+                "Feast repository path is not configured; skipping promotion of %d features",
                 len(features),
             )
             return
-        if FeatureStore is None or FeatureView is None or PostgreSQLSource is None:
+        if FeatureStore is None or FeatureView is None or PostgreSQLSource is None or Field is None:
             LOGGER.warning("Feast is not available in this environment; skipping promotion")
             return
 
@@ -499,7 +503,6 @@ class FeatureDiscoveryEngine:
                     SELECT symbol, event_ts, feature_value
                     FROM auto_feature_values
                     WHERE feature_name = '{feature_name_literal}'
-
                 """,
                 timestamp_field="event_ts",
             )
@@ -515,7 +518,6 @@ class FeatureDiscoveryEngine:
             applied_views.append(fv)
             store.apply([fv])
             LOGGER.info("Promoted feature %s to Feast", feature.name)
-
         if applied_views:
             store.refresh_registry()
 
@@ -544,6 +546,95 @@ class FeatureDiscoveryEngine:
             with conn.cursor() as cur:
                 cur.executemany(insert_sql, rows)
             conn.commit()
+
+
+class LocalFeatureDiscoveryEngine:
+    """Synthetic fallback used when dependencies are missing under insecure defaults."""
+
+    def __init__(self, config: FeatureDiscoveryConfig, missing: Sequence[str]) -> None:
+        self.config = config
+        self._missing = tuple(missing)
+        self._state_dir = state_dir("feature_discovery")
+        self.log_file = state_file("feature_discovery", "cycles.jsonl")
+
+    def run_once(self) -> None:
+        now = datetime.now(timezone.utc)
+        base_name = self.config.feature_prefix or "auto_feature"
+        candidates = [
+            {
+                "feature": f"{base_name}_momentum",
+                "score": 0.5,
+                "promoted": True,
+            },
+            {
+                "feature": f"{base_name}_volatility",
+                "score": 0.3,
+                "promoted": False,
+            },
+        ]
+        record = {
+            "ts": now.isoformat(),
+            "missing_dependencies": list(self._missing),
+            "candidates": candidates,
+        }
+        with self.log_file.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
+        LOGGER.info(
+            "Recorded synthetic feature discovery cycle using insecure-default fallback (missing: %s)",
+            ", ".join(self._missing) or "none",
+        )
+
+    def run_forever(self) -> None:
+        while True:
+            cycle_start = time.monotonic()
+            try:
+                self.run_once()
+            except Exception:  # pragma: no cover - defensive logging
+                LOGGER.exception("Local feature discovery cycle failed")
+            elapsed = timedelta(seconds=time.monotonic() - cycle_start)
+            sleep_for = max(self.config.scan_interval - elapsed, timedelta())
+            if sleep_for > timedelta():
+                time.sleep(sleep_for.total_seconds())
+
+
+def _missing_dependencies() -> List[str]:
+    missing: List[str] = []
+    if np is None:
+        missing.append("numpy")
+    if pd is None:
+        missing.append("pandas")
+    if lgb is None:
+        missing.append("lightgbm")
+    if psycopg is None or dict_row is None:
+        missing.append("psycopg")
+    return missing
+
+
+_MISSING_MESSAGES = {
+    "numpy": "numpy is required for auto feature discovery but is not installed.",
+    "pandas": "pandas is required for auto feature discovery but is not installed.",
+    "lightgbm": "LightGBM is required for auto feature discovery but is not installed.",
+    "psycopg": "psycopg is required for auto feature discovery but is not installed.",
+}
+
+
+def create_feature_discovery_engine(config: FeatureDiscoveryConfig) -> FeatureDiscoveryEngine | LocalFeatureDiscoveryEngine:
+    """Return a discovery engine appropriate for the current dependency set."""
+
+    missing = _missing_dependencies()
+    if not missing:
+        return FeatureDiscoveryEngine(config)
+
+    if insecure_defaults_enabled():
+        LOGGER.warning(
+            "Feature discovery dependencies missing (%s); using local fallback.",
+            ", ".join(missing),
+        )
+        return LocalFeatureDiscoveryEngine(config, missing)
+
+    message = _MISSING_MESSAGES.get(missing[0], f"{missing[0]} is required for auto feature discovery")
+    raise MissingDependencyError(message)
+
 
 
 def _configure_logging(verbose: bool = False) -> None:
@@ -595,7 +686,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         scan_interval=timedelta(minutes=args.interval_minutes),
         max_features=args.max_features,
     )
-    engine = FeatureDiscoveryEngine(config)
+    engine = create_feature_discovery_engine(config)
     if args.once:
         engine.run_once()
     else:

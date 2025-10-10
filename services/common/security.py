@@ -15,6 +15,14 @@ except ImportError:  # pragma: no cover - fallback when FastAPI is stubbed out
         status,
     )
 
+if getattr(status, "HTTP_200_OK", None) is None:
+    from shared.common_bootstrap import _ensure_fastapi_stub  # lightweight guard
+
+    _ensure_fastapi_stub()
+    from fastapi import status as _fastapi_status
+
+    status = _fastapi_status
+
 try:  # pragma: no cover - auth service dependencies may be unavailable
     from auth.service import Session, SessionStoreProtocol
 except Exception:  # pragma: no cover - provide minimal stand-ins
@@ -30,6 +38,23 @@ except Exception:  # pragma: no cover - provide minimal stand-ins
         def create(self, admin_id: str) -> Session:  # pragma: no cover - simple stub
             session = Session(token=admin_id, admin_id=admin_id)
             return session
+
+__all__ = [
+    "ADMIN_ACCOUNTS",
+    "DIRECTOR_ACCOUNTS",
+    "AuthenticatedPrincipal",
+    "Session",
+    "SessionStoreProtocol",
+    "reload_admin_accounts",
+    "set_default_session_store",
+    "get_admin_accounts",
+    "get_director_accounts",
+    "require_authenticated_principal",
+    "require_admin_account",
+    "ensure_admin_access",
+    "require_mfa_context",
+    "require_dual_director_confirmation",
+]
 
 _DEFAULT_ADMIN_ACCOUNTS = frozenset({"company", "director-1", "director-2"})
 _ADMIN_ENV_VARIABLE = "AETHER_ADMIN_ACCOUNTS"

@@ -25,6 +25,10 @@ except Exception:  # pragma: no cover - exercised when numpy is unavailable
 from fastapi import Depends, FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
 
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
 from services.common.config import get_timescale_session
 from services.common.security import require_admin_account
 from shared.correlation import CorrelationIdMiddleware
