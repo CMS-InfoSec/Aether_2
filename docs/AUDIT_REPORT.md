@@ -58,15 +58,15 @@ The repository requires coordinated fixes across persistence, services, and test
 
 | Priority | Task | Status | Notes |
 | --- | --- | --- | --- |
-| P0 | Update Helm values with per-account Kraken secrets | 🚧 Pending | Helm manifests still require dedicated secret mounts and documentation updates. |
-| P0 | Enforce HTTPS and secure headers | 🚧 Pending | TLS enforcement and secure header middleware remain to be wired through ingress manifests. |
+| P0 | Update Helm values with per-account Kraken secrets | ✅ Completed | Helm values expose projected secrets for company/director accounts with checksum-aware mounts and documented paths for every backend deployment.【F:deploy/helm/aether-platform/values.yaml†L1-L74】【F:deploy/helm/aether-platform/templates/backend-deployments.yaml†L1-L88】 |
+| P0 | Enforce HTTPS and secure headers | ✅ Completed | Ingress templates now enable forced TLS redirects, HSTS, and hardened security headers through chart defaults while remaining overridable per service.【F:deploy/helm/aether-platform/templates/backend-ingresses.yaml†L1-L60】【F:deploy/helm/aether-platform/values.yaml†L5-L24】 |
 | P1 | Document blue/green rollout process | 🚧 Pending | Deployment runbooks must outline canary, rollback, and health-check procedures. |
 
 ## 8. Documentation & Tooling
 
 | Priority | Task | Status | Notes |
 | --- | --- | --- | --- |
-| P0 | Rewrite README with setup + testing workflow | 🚧 Pending | Contributor documentation still needs an end-to-end setup and testing guide. |
+| P0 | Rewrite README with setup + testing workflow | ✅ Completed | README now documents environment setup, local state bootstrapping, insecure-default flags, and pytest execution paths for contributors.【F:README.md†L1-L88】 |
 | P1 | Generate OpenAPI spec snapshot | 🚧 Pending | The consolidated API definition remains to be exported and versioned. |
 | P1 | Add CI pipeline for lint + tests | 🚧 Pending | CI workflows for linting, testing, and safety checks must be introduced. |
 
