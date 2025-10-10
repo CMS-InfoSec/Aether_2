@@ -135,10 +135,20 @@ def _ensure_fastapi_stub() -> None:
     except ModuleNotFoundError:
         return
 
+    def _ensure_module(name: str) -> ModuleType:
+        submodule = sys.modules.get(name)
+        if not isinstance(submodule, ModuleType):
+            submodule = ModuleType(name)
+            sys.modules[name] = submodule
+        return submodule
+
+    # Core exports frequently accessed directly from ``fastapi``.
     for name in ("FastAPI", "APIRouter", "HTTPException", "Request", "Depends"):
         if getattr(module, name, None) is None:
             setattr(module, name, getattr(stub, name))
 
+    # Recreate the ``fastapi.status`` module so ``from fastapi import status`` works
+    # even if pytest previously replaced the attribute with a placeholder.
     status_module = getattr(module, "status", None)
     if not isinstance(status_module, ModuleType):
         status_module = getattr(stub, "status", None)
@@ -150,35 +160,74 @@ def _ensure_fastapi_stub() -> None:
             "HTTP_200_OK",
             "HTTP_201_CREATED",
             "HTTP_400_BAD_REQUEST",
+            "HTTP_401_UNAUTHORIZED",
+            "HTTP_403_FORBIDDEN",
+            "HTTP_404_NOT_FOUND",
             "HTTP_422_UNPROCESSABLE_ENTITY",
+            "HTTP_503_SERVICE_UNAVAILABLE",
         )
         for name in required_status:
             if getattr(status_module, name, None) is None:
                 setattr(status_module, name, getattr(stub.status, name))
         sys.modules["fastapi.status"] = status_module
 
-    responses_module = sys.modules.get("fastapi.responses")
-    if not isinstance(responses_module, ModuleType):
-        responses_module = ModuleType("fastapi.responses")
-        sys.modules["fastapi.responses"] = responses_module
-    setattr(module, "responses", responses_module)
+    # Populate common submodules expected by the production code and tests.
+    applications_module = _ensure_module("fastapi.applications")
+    setattr(module, "applications", applications_module)
+    if getattr(applications_module, "FastAPI", None) is None:
+        setattr(applications_module, "FastAPI", getattr(stub, "FastAPI", None))
 
+    routing_module = _ensure_module("fastapi.routing")
+    setattr(module, "routing", routing_module)
+    if getattr(routing_module, "APIRouter", None) is None:
+        setattr(routing_module, "APIRouter", getattr(stub, "APIRouter", None))
+
+    encoders_module = _ensure_module("fastapi.encoders")
+    setattr(module, "encoders", encoders_module)
+    if getattr(encoders_module, "jsonable_encoder", None) is None:
+        setattr(encoders_module, "jsonable_encoder", getattr(stub, "jsonable_encoder", None))
+
+    exceptions_module = _ensure_module("fastapi.exceptions")
+    setattr(module, "exceptions", exceptions_module)
+    for attr in ("HTTPException", "RequestValidationError"):
+        if getattr(exceptions_module, attr, None) is None:
+            setattr(exceptions_module, attr, getattr(stub, attr, None))
+
+    exception_handlers_module = _ensure_module("fastapi.exception_handlers")
+    setattr(module, "exception_handlers", exception_handlers_module)
+    handler = getattr(stub, "request_validation_exception_handler", None)
+    if getattr(exception_handlers_module, "request_validation_exception_handler", None) is None:
+        setattr(exception_handlers_module, "request_validation_exception_handler", handler)
+
+    concurrency_module = _ensure_module("fastapi.concurrency")
+    setattr(module, "concurrency", concurrency_module)
+    run_in_threadpool = getattr(stub, "run_in_threadpool", None)
+    if getattr(concurrency_module, "run_in_threadpool", None) is None:
+        setattr(concurrency_module, "run_in_threadpool", run_in_threadpool)
+
+    responses_module = _ensure_module("fastapi.responses")
+    setattr(module, "responses", responses_module)
     for attr in ("Response", "JSONResponse", "HTMLResponse", "StreamingResponse"):
         value = getattr(module, attr, None) or getattr(stub, attr, None)
         if value is not None:
             setattr(module, attr, value)
-            setattr(responses_module, attr, value)
+            if getattr(responses_module, attr, None) is None:
+                setattr(responses_module, attr, value)
 
-    testclient_module = sys.modules.get("fastapi.testclient")
-    if not isinstance(testclient_module, ModuleType):
-        testclient_module = ModuleType("fastapi.testclient")
-        sys.modules["fastapi.testclient"] = testclient_module
+    middleware_module = _ensure_module("fastapi.middleware")
+    setattr(module, "middleware", middleware_module)
+    cors_module = _ensure_module("fastapi.middleware.cors")
+    setattr(middleware_module, "cors", cors_module)
+    if getattr(cors_module, "CORSMiddleware", None) is None:
+        setattr(cors_module, "CORSMiddleware", getattr(stub, "CORSMiddleware", None))
+
+    testclient_module = _ensure_module("fastapi.testclient")
     setattr(module, "testclient", testclient_module)
-
     test_client = getattr(module, "TestClient", None) or getattr(stub, "TestClient", None)
     if test_client is not None:
         setattr(module, "TestClient", test_client)
-        setattr(testclient_module, "TestClient", test_client)
+        if getattr(testclient_module, "TestClient", None) is None:
+            setattr(testclient_module, "TestClient", test_client)
 
 
 def _ensure_httpx_module() -> None:
