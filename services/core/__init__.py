@@ -1,5 +1,10 @@
 """Core service primitives shared across the control plane."""
 
+from __future__ import annotations
+
+import importlib
+from typing import Any
+
 from . import backpressure as backpressure
 from . import cache_warmer as cache_warmer
 from . import sequencer as sequencer
@@ -42,3 +47,11 @@ __all__ = [
     "startup_router",
     "warmup_router",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    if name in {"backpressure", "cache_warmer", "sequencer"}:
+        module = importlib.import_module(f"{__name__}.{name}")
+        globals()[name] = module
+        return module
+    raise AttributeError(name)

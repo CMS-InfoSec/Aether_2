@@ -10,6 +10,7 @@ from types import ModuleType
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
 _SECRETS_SHIM = _PROJECT_ROOT / "secrets" / "__init__.py"
+_ML_PACKAGE = _PROJECT_ROOT / "ml" / "__init__.py"
 
 
 def _ensure_project_root_on_path() -> None:
@@ -56,6 +57,24 @@ def _ensure_common_namespace() -> None:
         spec.submodule_search_locations = locations  # type: ignore[attr-defined]
 
 
+def _ensure_ml_namespace() -> None:
+    """Attach the project ML package to pytest stubs missing search paths."""
+
+    ml_module = sys.modules.get("ml")
+    if ml_module is None:
+        return
+
+    ml_path = str(_PROJECT_ROOT / "ml")
+    locations = list(getattr(ml_module, "__path__", []) or [])
+    if ml_path not in locations:
+        locations.append(ml_path)
+        ml_module.__path__ = locations  # type: ignore[attr-defined]
+
+    spec: ModuleSpec | None = getattr(ml_module, "__spec__", None)
+    if spec is not None:
+        spec.submodule_search_locations = locations  # type: ignore[attr-defined]
+
+
 def _install_secrets_shim() -> None:
     """Ensure ``import secrets`` resolves to the in-repo compatibility shim."""
 
@@ -88,6 +107,18 @@ def _preload_services_package() -> None:
         pass
 
 
+def _preload_ml_package() -> None:
+    """Import the project ``ml`` package before pytest inserts stubs."""
+
+    if not _ML_PACKAGE.exists():
+        return
+
+    try:
+        importlib.import_module("ml")
+    except Exception:  # pragma: no cover - keep bootstrap resilient
+        pass
+
+
 def _ensure_fastapi_testclient() -> None:
     """Pre-import the FastAPI test client shim when available."""
 
@@ -108,8 +139,10 @@ def _ensure_fastapi_testclient() -> None:
 _ensure_project_root_on_path()
 _install_secrets_shim()
 _preload_services_package()
+_preload_ml_package()
 _ensure_services_namespace()
 _ensure_common_namespace()
+_ensure_ml_namespace()
 _ensure_fastapi_testclient()
 
 try:  # pragma: no cover - shared bootstrap may be unavailable in some contexts

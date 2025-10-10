@@ -27,6 +27,8 @@ _COMMON_MODULES = (
     "services.common.adapters",
     "services.common.precision",
     "services.common.schemas",
+    "services.auth",
+    "services.auth.jwt_tokens",
     "services.analytics",
     "services.oms",
 )
@@ -362,6 +364,8 @@ def ensure_common_helpers() -> None:
             _ensure_common_namespace()
 
         _install_module_guard()
+        if not reentrant_call:
+            _rehydrate_core_package()
     finally:
         if not reentrant_call:
             _ENSURING_COMMON_HELPERS = False
@@ -411,11 +415,30 @@ def _install_module_guard() -> None:
         _MODULE_GUARD_INSTALLED = True
         return
 
-    guard = _ModuleGuard(
-        modules,
-        tuple(_COMMON_MODULES + _RISK_MODULES),
-        ensure_common_helpers,
-    )
+    guarded = tuple(_COMMON_MODULES + _RISK_MODULES + ("services.core",))
+    guard = _ModuleGuard(modules, guarded, ensure_common_helpers)
     sys.modules = guard  # type: ignore[assignment]
     _MODULE_GUARD_INSTALLED = True
+
+
+def _rehydrate_core_package() -> None:
+    """Ensure the canonical ``services.core`` package is loaded."""
+
+    package_name = "services.core"
+    module = sys.modules.get(package_name)
+    package_dir = _PROJECT_ROOT / "services" / "core"
+    init_file = package_dir / "__init__.py"
+    if not init_file.exists():
+        return
+
+    if isinstance(module, ModuleType):
+        module_file = getattr(module, "__file__", None)
+        if module_file == str(init_file):
+            return
+
+    try:
+        importlib.import_module(package_name)
+    except Exception:
+        # Leave any existing stubs in place if the real module fails to load.
+        return
 

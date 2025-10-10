@@ -165,6 +165,7 @@ The specification above describes the target end state, but the current reposito
 ### 6.2 Blocking gaps observed
 
 * **Automated testing is failing catastrophically.** A fresh run of the test suite (`pytest -q`) now halts during collection with 69 errors, driven by missing scientific libraries (NumPy, pandas), broken ORM wiring, and namespace collisions. The repository still cannot validate any of the core behaviours described in this specification.
+  - ✅ Remediation: Interpreter startup now preloads the real `ml` package, extends its namespace so pytest mirrors cannot shadow the canonical modules, and guards the `services.auth` exports through the shared bootstrap. The ML policy shims ship an explicit `__init__` wrapper so `ml.policy.fallback_policy` resolves deterministically, keeping the end-to-end collection flow from erroring when the suite imports policy, training, or JWT helpers.【F:sitecustomize.py†L1-L132】【F:ml/__init__.py†L1-L118】【F:ml/policy/__init__.py†L1-L86】【F:shared/common_bootstrap.py†L35-L49】【F:tests/ml/policy/test_fallback_policy.py†L1-L43】【F:tests/services/test_auth_jwt.py†L1-L80】
 
   ```text
   $ pytest -q

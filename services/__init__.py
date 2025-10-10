@@ -105,31 +105,61 @@ def __getattr__(name: str) -> ModuleType:
     try:
         module = importlib.import_module(fullname)
     except ModuleNotFoundError as exc:  # pragma: no cover - mirror module absent
-        module = None
-        test_fullname = f"tests.services.{name}"
-        try:
-            module = importlib.import_module(test_fullname)
-        except ModuleNotFoundError:
-            test_dir = _PROJECT_ROOT / "tests" / "services" / name
-            module_path = test_dir.with_suffix(".py")
-            if module_path.exists():
-                spec = importlib.util.spec_from_file_location(fullname, module_path)
+        module = _load_test_mirror(name, fullname)
+        if module is None:
+            raise AttributeError(name) from exc
+    else:
+        if not _is_canonical_module(module):
+            replacement = _load_canonical_module(fullname)
+            if replacement is not None:
+                module = replacement
+    setattr(sys.modules[__name__], name, module)
+    return module
+
+
+def _is_canonical_module(module: ModuleType) -> bool:
+    module_file = getattr(module, "__file__", None)
+    if module_file is None:
+        return False
+    return str(module_file).startswith(_DEFAULT_PACKAGE_PATH)
+
+
+def _load_canonical_module(fullname: str) -> ModuleType | None:
+    module_path = _PROJECT_ROOT / (fullname.replace(".", "/") + ".py")
+    if not module_path.exists():
+        return None
+    spec = importlib.util.spec_from_file_location(fullname, module_path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[fullname] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_test_mirror(name: str, fullname: str) -> ModuleType | None:
+    module: ModuleType | None = None
+    test_fullname = f"tests.services.{name}"
+    try:
+        module = importlib.import_module(test_fullname)
+    except ModuleNotFoundError:
+        test_dir = _PROJECT_ROOT / "tests" / "services" / name
+        module_path = test_dir.with_suffix(".py")
+        if module_path.exists():
+            spec = importlib.util.spec_from_file_location(fullname, module_path)
+            if spec and spec.loader:
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[fullname] = module
+                spec.loader.exec_module(module)
+        elif test_dir.is_dir():
+            init_file = test_dir / "__init__.py"
+            if init_file.exists():
+                spec = importlib.util.spec_from_file_location(
+                    fullname, init_file, submodule_search_locations=[str(test_dir)]
+                )
                 if spec and spec.loader:
                     module = importlib.util.module_from_spec(spec)
                     sys.modules[fullname] = module
                     spec.loader.exec_module(module)
-            elif test_dir.is_dir():
-                init_file = test_dir / "__init__.py"
-                if init_file.exists():
-                    spec = importlib.util.spec_from_file_location(
-                        fullname, init_file, submodule_search_locations=[str(test_dir)]
-                    )
-                    if spec and spec.loader:
-                        module = importlib.util.module_from_spec(spec)
-                        sys.modules[fullname] = module
-                        spec.loader.exec_module(module)
-                        module.__path__ = [str(test_dir)]  # type: ignore[attr-defined]
-        if module is None:
-            raise AttributeError(name) from exc
-    setattr(sys.modules[__name__], name, module)
+                    module.__path__ = [str(test_dir)]  # type: ignore[attr-defined]
     return module
