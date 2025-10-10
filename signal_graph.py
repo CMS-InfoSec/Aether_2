@@ -19,9 +19,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping
 
-import networkx as nx
+try:  # pragma: no cover - dependency may be absent in lightweight envs
+    import networkx as nx
+    from networkx.readwrite import json_graph
+except ImportError:  # pragma: no cover - gracefully degrade when missing
+    nx = None  # type: ignore[assignment]
+    json_graph = None  # type: ignore[assignment]
+
 from fastapi import Depends, FastAPI, HTTPException, Query, status
-from networkx.readwrite import json_graph
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from services.common.security import require_admin_account
@@ -177,6 +182,11 @@ class GraphSnapshotStorage:
     def store_snapshot(self, graph: nx.DiGraph, generated_at: datetime) -> str:
         """Persist ``graph`` and return the object key used for storage."""
 
+        if json_graph is None:
+            raise RuntimeError(
+                "networkx is required to serialise signal graphs; install the dependency first"
+            )
+
         key = f"{self._prefix}/graph-{generated_at:%Y%m%dT%H%M%SZ}.json"
         payload = json.dumps(json_graph.node_link_data(graph), separators=(",", ":"))
 
@@ -222,6 +232,11 @@ class SignalGraphBuilder:
     """Construct the directed feature → model → trade → outcome graph."""
 
     def build(self, records: Iterable[SignalGraphRecord]) -> nx.DiGraph:
+        if nx is None:
+            raise RuntimeError(
+                "networkx is required to build signal graphs; install the dependency first"
+            )
+
         graph = nx.DiGraph()
 
         feature_stats: Dict[str, FeatureStats] = {}

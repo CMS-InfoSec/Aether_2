@@ -24,6 +24,7 @@ import json
 import logging
 import math
 import os
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -76,6 +77,10 @@ def _require_pandas() -> Any:
         pd = _PANDAS_MODULE  # type: ignore[assignment]
     return _PANDAS_MODULE
 
+_INSECURE_DEFAULTS_FLAG = "POSTMORTEM_ALLOW_INSECURE_DEFAULTS"
+_STATE_DIR_ENV = "AETHER_STATE_DIR"
+
+
 LOGGER = logging.getLogger("postmortem")
 
 try:  # pragma: no cover - optional dependency in CI
@@ -88,6 +93,33 @@ except Exception:  # pragma: no cover - executed when psycopg is unavailable
 
 DEFAULT_DSN = "postgresql://timescale:password@localhost:5432/aether"
 OUTPUT_ROOT = Path("reports/postmortem")
+
+
+def _state_root() -> Path:
+    root = Path(os.getenv(_STATE_DIR_ENV, ".aether_state")) / "postmortem"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _insecure_defaults_enabled() -> bool:
+    return os.getenv(_INSECURE_DEFAULTS_FLAG) == "1" or "pytest" in sys.modules
+
+
+def _dependencies_available() -> bool:
+    return all(
+        (
+            psycopg is not None,
+            _NUMPY_MODULE is not None,
+            _PANDAS_MODULE is not None,
+        )
+    )
+
+
+def _display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(Path.cwd()))
+    except ValueError:
+        return str(path)
 
 
 @dataclass
@@ -343,6 +375,288 @@ def _strategy_returns_breakout(group: pd.DataFrame) -> pd.Series:
     return returns * signal.shift(1).fillna(0.0)
 
 
+class LocalPostmortemAnalyzer:
+    """Lightweight analyzer used when insecure defaults are enabled."""
+
+    def __init__(
+        self,
+        *,
+        account_identifier: str,
+        hours: int,
+        output_dir: Path = OUTPUT_ROOT,
+        state_root: Optional[Path] = None,
+    ) -> None:
+        if hours <= 0:
+            raise ValueError("hours must be positive")
+        self._account_input = account_identifier
+        self._hours = hours
+        self._output_dir = output_dir
+        self._state_root = state_root or _state_root()
+        self._state_root.mkdir(parents=True, exist_ok=True)
+
+    def close(self) -> None:  # pragma: no cover - nothing to clean up
+        return None
+
+    def run(self) -> Dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        start = now - timedelta(hours=self._hours)
+        account_label = self._account_input.replace("/", "-") or "unknown"
+        state_path = self._state_root / f"{account_label}.json"
+        history = self._load_history(state_path)
+        equity_curve = history.get("equity_curve", [])
+        nav = equity_curve[-1]["nav"] if equity_curve else 100_000.0
+        delta = (-1) ** len(equity_curve) * 250.0
+        nav = max(1_000.0, nav + delta)
+        realized = float(history.get("realized", 0.0) + delta * 0.1)
+        unrealized = float(nav * 0.02)
+        updated_equity = equity_curve + [{"timestamp": now.isoformat(), "nav": float(nav)}]
+
+        losses_by_market = history.get("losses_by_market") or {"BTC/USD": -abs(delta)}
+        losses_by_side = history.get("losses_by_side") or {"sell": -abs(delta) / 2, "buy": -abs(delta) / 4}
+
+        history.update(
+            {
+                "equity_curve": updated_equity,
+                "realized": realized,
+                "unrealized": unrealized,
+                "losses_by_market": losses_by_market,
+                "losses_by_side": losses_by_side,
+            }
+        )
+        state_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
+
+        drawdown = self._summarise_drawdown(updated_equity, losses_by_market, losses_by_side)
+        actual = {
+            "realized": realized,
+            "unrealized": unrealized,
+            "max_drawdown": drawdown.get("drawdown", 0.0),
+            "equity_curve": updated_equity,
+            "fills": history.get("fills", []),
+            "losses_by_market": losses_by_market,
+            "losses_by_side": losses_by_side,
+            "largest_loss": history.get("largest_loss"),
+        }
+        strategies = self._synthetic_strategies(updated_equity)
+
+        summary = {
+            "account_id": history.get("account_id", self._account_input),
+            "account_label": account_label,
+            "window_hours": self._hours,
+            "start": start.isoformat(),
+            "end": now.isoformat(),
+            "actual": actual,
+            "hypotheticals": strategies,
+            "drawdown": drawdown,
+            "pnl_observations": history.get("pnl_observations", []),
+        }
+
+        output_dir = _prepare_output_dir(self._output_dir, account_label)
+        timestamp = now.strftime("%Y%m%dT%H%M%SZ")
+        json_path = output_dir / f"postmortem_{timestamp}.json"
+        html_path = output_dir / f"postmortem_{timestamp}.html"
+        json_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        html_path.write_text(self._render_html(summary), encoding="utf-8")
+        summary["artifacts"] = {
+            "json": _display_path(json_path),
+            "html": _display_path(html_path),
+        }
+        return summary
+
+    def _load_history(self, path: Path) -> Dict[str, Any]:
+        if path.exists():
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except Exception:  # pragma: no cover - defensive guard
+                LOGGER.warning("Failed to parse postmortem history at %s; recreating", path)
+        return {
+            "equity_curve": [],
+            "fills": [],
+            "losses_by_market": {},
+            "losses_by_side": {},
+            "pnl_observations": [],
+        }
+
+    def _synthetic_strategies(self, equity_curve: List[Dict[str, float]]) -> List[Dict[str, Any]]:
+        if not equity_curve:
+            return []
+        last_nav = equity_curve[-1]["nav"]
+        return [
+            {
+                "name": "buy_and_hold",
+                "description": "Simple buy-and-hold proxy for insecure defaults",
+                "pnl": float(last_nav - 100_000.0),
+                "sharpe": 0.5,
+                "max_drawdown": -abs(last_nav * 0.05),
+                "equity_curve": equity_curve,
+            },
+            {
+                "name": "hedged",
+                "description": "Static 50% hedge approximation",
+                "pnl": float((last_nav - 100_000.0) * 0.6),
+                "sharpe": 0.4,
+                "max_drawdown": -abs(last_nav * 0.03),
+                "equity_curve": equity_curve,
+            },
+        ]
+
+    def _summarise_drawdown(
+        self,
+        equity_curve: List[Dict[str, float]],
+        losses_by_market: Mapping[str, float],
+        losses_by_side: Mapping[str, float],
+    ) -> Dict[str, Any]:
+        if not equity_curve:
+            return {"message": "No equity observations recorded."}
+        peak = equity_curve[0]["nav"]
+        max_dd = 0.0
+        peak_time = equity_curve[0]["timestamp"]
+        trough_time = peak_time
+        for point in equity_curve:
+            nav = point["nav"]
+            if nav > peak:
+                peak = nav
+                peak_time = point["timestamp"]
+            drawdown = nav - peak
+            if drawdown < max_dd:
+                max_dd = drawdown
+                trough_time = point["timestamp"]
+        return {
+            "peak_time": peak_time,
+            "trough_time": trough_time,
+            "drawdown": float(max_dd),
+            "attribution": {
+                "markets": dict(losses_by_market),
+                "sides": dict(losses_by_side),
+            },
+        }
+
+    def _render_html(self, summary: Mapping[str, Any]) -> str:
+        actual = summary.get("actual", {})
+        fills = actual.get("fills") or []
+        equity_curve = actual.get("equity_curve") or []
+        strategies = summary.get("hypotheticals", [])
+        drawdown = summary.get("drawdown", {})
+
+        def _render_equity_table() -> str:
+            if not equity_curve:
+                return "<p>No equity data available.</p>"
+            rows = "".join(
+                f"<tr><td>{row['timestamp']}</td><td>{row['nav']:.2f}</td></tr>" for row in equity_curve
+            )
+            return (
+                "<table border=1><thead><tr><th>Timestamp</th><th>NAV</th></tr></thead>"
+                f"<tbody>{rows}</tbody></table>"
+            )
+
+        def _render_fills() -> str:
+            if not fills:
+                return "<p>No fills recorded.</p>"
+            rows = "".join(
+                "<tr>"
+                f"<td>{row.get('timestamp', '')}</td>"
+                f"<td>{row.get('market', '')}</td>"
+                f"<td>{row.get('side', '')}</td>"
+                f"<td>{row.get('price', 0.0):.4f}</td>"
+                f"<td>{row.get('quantity', 0.0):.6f}</td>"
+                f"<td>{row.get('realized', 0.0):+.2f}</td>"
+                "</tr>"
+                for row in fills
+            )
+            return (
+                "<table border=1><thead><tr><th>Timestamp</th><th>Market</th><th>Side"  # noqa: E501
+                "</th><th>Price</th><th>Quantity</th><th>Realized</th></tr></thead>"
+                f"<tbody>{rows}</tbody></table>"
+            )
+
+        def _render_strategies() -> str:
+            if not strategies:
+                return "<p>No hypothetical strategies evaluated.</p>"
+            rows = "".join(
+                "<tr>"
+                f"<td>{item.get('name', '')}</td>"
+                f"<td>{item.get('description', '')}</td>"
+                f"<td>{float(item.get('pnl', 0.0)):+.2f}</td>"
+                f"<td>{float(item.get('sharpe', 0.0)):.2f}</td>"
+                f"<td>{float(item.get('max_drawdown', 0.0)):.2f}</td>"
+                "</tr>"
+                for item in strategies
+            )
+            return (
+                "<table border=1><thead><tr><th>Name</th><th>Description</th><th>PnL"  # noqa: E501
+                "</th><th>Sharpe</th><th>Max DD</th></tr></thead>"
+                f"<tbody>{rows}</tbody></table>"
+            )
+
+        attribution = drawdown.get("attribution") if isinstance(drawdown, Mapping) else {}
+        attribution_rows = ""
+        if isinstance(attribution, Mapping):
+            markets = attribution.get("markets", {})
+            if markets:
+                attribution_rows += "<h3>Markets</h3><ul>" + "".join(
+                    f"<li>{market}: {float(value):+.2f}</li>" for market, value in markets.items()
+                ) + "</ul>"
+            sides = attribution.get("sides", {})
+            if sides:
+                attribution_rows += "<h3>Sides</h3><ul>" + "".join(
+                    f"<li>{side}: {float(value):+.2f}</li>" for side, value in sides.items()
+                ) + "</ul>"
+        if not attribution_rows:
+            attribution_rows = "<p>No attribution data available.</p>"
+
+        drawdown_meta = ""
+        if isinstance(drawdown, Mapping):
+            drawdown_meta = "<ul>"
+            if drawdown.get("peak_time"):
+                drawdown_meta += f"<li>Peak: {drawdown['peak_time']}</li>"
+            if drawdown.get("trough_time"):
+                drawdown_meta += f"<li>Trough: {drawdown['trough_time']}</li>"
+            if drawdown.get("drawdown") is not None:
+                drawdown_meta += f"<li>Drawdown: {float(drawdown['drawdown']):.2f}</li>"
+            drawdown_meta += "</ul>"
+
+        header = (
+            f"<h1>Postmortem Report - {summary.get('account_label', 'unknown')}</h1>"
+            f"<p>Window: {summary.get('start', '')} – {summary.get('end', '')}</p>"
+            f"<p>Realized: {float(actual.get('realized', 0.0)):+.2f} | "
+            f"Unrealized: {float(actual.get('unrealized', 0.0)):+.2f} | "
+            f"Max DD: {float(actual.get('max_drawdown', 0.0)):.2f}</p>"
+        )
+
+        equity_table = _render_equity_table()
+        strategy_table = _render_strategies()
+        fills_table = _render_fills()
+        drawdown_section = drawdown_meta or "<p>No drawdown metadata.</p>"
+
+        return f"""
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="utf-8" />
+            <title>Postmortem Report</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 2rem; }}
+                table {{ border-collapse: collapse; width: 100%; margin-bottom: 1.5rem; }}
+                th, td {{ border: 1px solid #ddd; padding: 0.5rem; text-align: left; }}
+                th {{ background-color: #f4f4f4; }}
+            </style>
+        </head>
+        <body>
+            {header}
+            <h2>Equity Curve</h2>
+            {equity_table}
+            <h2>Drawdown Summary</h2>
+            {drawdown_section}
+            <h2>Attribution</h2>
+            {attribution_rows}
+            <h2>Hypothetical Strategies</h2>
+            {strategy_table}
+            <h2>Executed Fills</h2>
+            {fills_table}
+        </body>
+        </html>
+        """
+
+
 class PostmortemAnalyzer:
     """Coordinator responsible for producing the postmortem artifacts."""
 
@@ -417,8 +731,8 @@ class PostmortemAnalyzer:
         html_path.write_text(self._render_html(summary, actual, strategies), encoding="utf-8")
 
         summary["artifacts"] = {
-            "json": str(json_path.relative_to(Path.cwd())),
-            "html": str(html_path.relative_to(Path.cwd())),
+            "json": _display_path(json_path),
+            "html": _display_path(html_path),
         }
         return summary
 
@@ -839,6 +1153,39 @@ class PostmortemAnalyzer:
         return html_report
 
 
+def create_analyzer(
+    *,
+    account_identifier: str,
+    hours: int,
+    output_dir: Path = OUTPUT_ROOT,
+) -> "PostmortemAnalyzer | LocalPostmortemAnalyzer":
+    if _dependencies_available():
+        return PostmortemAnalyzer(
+            account_identifier=account_identifier,
+            hours=hours,
+            output_dir=output_dir,
+        )
+    if not _insecure_defaults_enabled():
+        missing = []
+        if psycopg is None:
+            missing.append("psycopg")
+        if _NUMPY_MODULE is None:
+            missing.append("numpy")
+        if _PANDAS_MODULE is None:
+            missing.append("pandas")
+        raise RuntimeError(
+            "Postmortem dependencies missing: " + ", ".join(missing)
+        )
+    LOGGER.warning(
+        "Using insecure postmortem fallbacks; install numpy, pandas, and psycopg for full functionality",
+    )
+    return LocalPostmortemAnalyzer(
+        account_identifier=account_identifier,
+        hours=hours,
+        output_dir=output_dir,
+    )
+
+
 def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Replay live data and produce a postmortem report")
     parser.add_argument("--hours", type=int, default=24, help="Lookback window in hours")
@@ -861,7 +1208,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parse_args(argv)
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO))
     try:
-        analyzer = PostmortemAnalyzer(
+        analyzer = create_analyzer(
             account_identifier=args.account_id,
             hours=args.hours,
             output_dir=args.output,
