@@ -2,11 +2,16 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import importlib
+
 import pytest
 
 from fastapi.testclient import TestClient
 
-from services.risk import correlation_service as correlation
+try:
+    from services.risk import correlation_service as correlation
+except ImportError:  # pragma: no cover - fallback for namespace import issues
+    correlation = importlib.import_module("services.risk.correlation_service")
 
 
 def test_compute_correlation_matrix_expected_values() -> None:

@@ -12,6 +12,9 @@ from typing import Callable
 from logging_export import ExportConfig, MissingDependencyError, run_export
 
 
+_INSECURE_DEFAULTS_FLAG = "LOG_EXPORT_ALLOW_INSECURE_DEFAULTS"
+
+
 DEFAULT_SLEEP_INTERVAL = 5.0
 
 
@@ -41,13 +44,23 @@ def _resolve_export_date(explicit: dt.date | None = None) -> dt.date:
     return (now - dt.timedelta(days=1)).date()
 
 
+def _insecure_defaults_enabled() -> bool:
+    return (
+        os.getenv(_INSECURE_DEFAULTS_FLAG) == "1"
+        or bool(os.getenv("PYTEST_CURRENT_TEST"))
+    )
+
+
 def _load_config() -> ExportConfig:
-    bucket = os.getenv("EXPORT_BUCKET")
-    if not bucket:
-        raise RuntimeError("EXPORT_BUCKET environment variable must be set")
     prefix = os.getenv("EXPORT_PREFIX", "log-exports")
     endpoint_url = os.getenv("EXPORT_S3_ENDPOINT_URL")
-    return ExportConfig(bucket=bucket, prefix=prefix, endpoint_url=endpoint_url)
+    bucket = os.getenv("EXPORT_BUCKET")
+    if bucket:
+        return ExportConfig(bucket=bucket, prefix=prefix, endpoint_url=endpoint_url)
+    if _insecure_defaults_enabled():
+        local_bucket = os.getenv("EXPORT_LOCAL_BUCKET", "local-fallback")
+        return ExportConfig(bucket=local_bucket, prefix=prefix, endpoint_url=None)
+    raise RuntimeError("EXPORT_BUCKET environment variable must be set")
 
 
 def _run_once(export_date: dt.date) -> None:

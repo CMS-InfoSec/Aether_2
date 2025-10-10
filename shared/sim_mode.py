@@ -45,6 +45,7 @@ from common.schemas.contracts import FillEvent
 from services.common.adapters import KafkaNATSAdapter
 from shared.async_utils import dispatch_async
 from shared.postgres import normalize_sqlalchemy_dsn
+from shared.account_scope import SQLALCHEMY_AVAILABLE as _ACCOUNT_SCOPE_AVAILABLE, account_id_column
 
 
 LOGGER = logging.getLogger(__name__)
@@ -52,6 +53,38 @@ LOGGER = logging.getLogger(__name__)
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _scalar_one_or_none(result: object) -> Optional[object]:
+    """Return the first scalar from a SQLAlchemy result across supported versions."""
+
+    extractor = getattr(result, "scalar_one_or_none", None)
+    if callable(extractor):
+        return extractor()
+
+    legacy_scalar = getattr(result, "scalar", None)
+    if callable(legacy_scalar):
+        try:
+            return legacy_scalar()
+        except TypeError:  # pragma: no cover - incompatible signature
+            pass
+
+    scalars = getattr(result, "scalars", None)
+    if callable(scalars):
+        stream = scalars()
+        for accessor in ("first", "one_or_none", "one"):
+            method = getattr(stream, accessor, None)
+            if callable(method):
+                try:
+                    return method()
+                except TypeError:  # pragma: no cover - defensive
+                    continue
+        all_method = getattr(stream, "all", None)
+        if callable(all_method):
+            rows = all_method()
+            return rows[0] if rows else None
+
+    return None
 
 
 _TEST_DSN_ENV = "AETHER_SIM_MODE_TEST_DSN"
@@ -161,7 +194,7 @@ class Base(DeclarativeBase):
 class SimModeStateORM(Base):
     __tablename__ = "sim_mode_state"
 
-    account_id = Column(String(128), primary_key=True)
+    account_id = account_id_column(primary_key=True)
     active = Column(Boolean, nullable=False, default=False)
     reason = Column(Text, nullable=True)
     ts = Column(
@@ -176,7 +209,7 @@ class SimBrokerOrderORM(Base):
     __tablename__ = "sim_broker_orders"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    account_id = Column(String(128), nullable=False, index=True)
+    account_id = account_id_column(index=True)
     client_id = Column(String(128), nullable=False, index=True)
     symbol = Column(String(64), nullable=False)
     side = Column(String(8), nullable=False)
@@ -197,7 +230,7 @@ class SimBrokerFillORM(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     order_id = Column(Integer, nullable=False, index=True)
-    account_id = Column(String(128), nullable=False, index=True)
+    account_id = account_id_column(index=True)
     client_id = Column(String(128), nullable=False)
     symbol = Column(String(64), nullable=False)
     qty = Column(Numeric(36, 18), nullable=False)
@@ -248,12 +281,10 @@ class SimModeRepository:
         self._cache_ttl = 2.0
 
     def _load_row(self, session: Session, account_id: str) -> SimModeStateORM:
-        row = (
-            session.execute(
-                select(SimModeStateORM).where(SimModeStateORM.account_id == account_id).limit(1)
-            )
-            .scalar_one_or_none()
+        result = session.execute(
+            select(SimModeStateORM).where(SimModeStateORM.account_id == account_id)
         )
+        row = _scalar_one_or_none(result)
         if row is None:
             row = SimModeStateORM(account_id=account_id, active=False, reason=None, ts=_utcnow())
             session.add(row)
@@ -437,12 +468,14 @@ class SimBroker:
 
     def _persist_order(self, snapshot: SimulatedOrderSnapshot) -> None:
         with session_scope() as session:
-            row = session.execute(
-                select(SimBrokerOrderORM).where(
-                    SimBrokerOrderORM.account_id == snapshot.account_id,
-                    SimBrokerOrderORM.client_id == snapshot.client_id,
+            row = _scalar_one_or_none(
+                session.execute(
+                    select(SimBrokerOrderORM).where(
+                        SimBrokerOrderORM.account_id == snapshot.account_id,
+                        SimBrokerOrderORM.client_id == snapshot.client_id,
+                    )
                 )
-            ).scalar_one_or_none()
+            )
             if row is None:
                 row = SimBrokerOrderORM(
                     account_id=snapshot.account_id,
@@ -478,12 +511,14 @@ class SimBroker:
         if fill_qty <= 0:
             return
         with session_scope() as session:
-            row = session.execute(
-                select(SimBrokerOrderORM).where(
-                    SimBrokerOrderORM.account_id == snapshot.account_id,
-                    SimBrokerOrderORM.client_id == snapshot.client_id,
+            row = _scalar_one_or_none(
+                session.execute(
+                    select(SimBrokerOrderORM).where(
+                        SimBrokerOrderORM.account_id == snapshot.account_id,
+                        SimBrokerOrderORM.client_id == snapshot.client_id,
+                    )
                 )
-            ).scalar_one_or_none()
+            )
             order_id = row.id if row is not None else None
             session.add(
                 SimBrokerFillORM(
@@ -635,12 +670,14 @@ class SimBroker:
             if snapshot is not None:
                 return snapshot
         with session_scope() as session:
-            row = session.execute(
-                select(SimBrokerOrderORM).where(
-                    SimBrokerOrderORM.account_id == account_id,
-                    SimBrokerOrderORM.client_id == client_id,
+            row = _scalar_one_or_none(
+                session.execute(
+                    select(SimBrokerOrderORM).where(
+                        SimBrokerOrderORM.account_id == account_id,
+                        SimBrokerOrderORM.client_id == client_id,
+                    )
                 )
-            ).scalar_one_or_none()
+            )
             if row is None:
                 return None
             snapshot = SimulatedOrderSnapshot(
