@@ -10,9 +10,15 @@ from typing import Any, Callable, TypeVar, TypedDict, cast
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from sqlalchemy import create_engine, func, select
+from typing import TYPE_CHECKING
+
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.sql.schema import Table
+
+if TYPE_CHECKING:  # pragma: no cover - type checking only
+    from sqlalchemy.sql.schema import Table
+else:  # pragma: no cover - lightweight environments may lack sqlalchemy.sql
+    Table = Any  # type: ignore[misc,assignment]
 
 from metrics import setup_metrics
 

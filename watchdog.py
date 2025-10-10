@@ -14,19 +14,33 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
 from collections import defaultdict
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
 from fastapi import Depends, FastAPI, Query
 from pydantic import BaseModel, Field, ValidationError
-from sqlalchemy import JSON, Column, DateTime, Float, Integer, String, Text, create_engine, func, select
+from sqlalchemy import (
+    JSON,
+    Column,
+    DateTime,
+    Float,
+    Integer,
+    String,
+    Text,
+    create_engine,
+    func,
+    select,
+)
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from common.schemas.contracts import IntentEvent
 from services.common.adapters import KafkaNATSAdapter
@@ -43,26 +57,72 @@ LOGGER = logging.getLogger("watchdog")
 
 
 DATABASE_URL_ENV_VAR = "WATCHDOG_DATABASE_URL"
+_INSECURE_DEFAULTS_FLAG = "WATCHDOG_ALLOW_INSECURE_DEFAULTS"
+_STATE_DIR_ENV = "WATCHDOG_STATE_DIR"
+_DEFAULT_STATE_DIR = Path(".aether_state/watchdog")
+
+
+def _insecure_defaults_enabled() -> bool:
+    flag = os.getenv(_INSECURE_DEFAULTS_FLAG)
+    if flag == "1":
+        return True
+    if flag == "0":
+        return False
+    return "pytest" in sys.modules
+
+
+def _state_dir() -> Path:
+    root = Path(os.getenv(_STATE_DIR_ENV, _DEFAULT_STATE_DIR))
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _sqlite_fallback_url() -> str:
+    path = _state_dir() / "watchdog.sqlite"
+    return f"sqlite:///{path}"
 
 
 def _database_url() -> str:
     url = os.getenv(DATABASE_URL_ENV_VAR) or os.getenv("TIMESCALE_DSN")
+    allow_insecure = _insecure_defaults_enabled()
     if not url:
+        if allow_insecure:
+            fallback = _sqlite_fallback_url()
+            LOGGER.warning(
+                "No WATCHDOG_DATABASE_URL configured; falling back to local SQLite store at %s",
+                fallback,
+            )
+            return fallback
         raise RuntimeError(
             "WATCHDOG_DATABASE_URL or TIMESCALE_DSN must be set to a PostgreSQL/Timescale DSN"
         )
 
     normalized = url.strip()
-    if normalized.startswith("postgresql://"):
+    lowered = normalized.lower()
+
+    if lowered.startswith("postgresql://"):
         normalized = normalized.replace("postgresql://", "postgresql+psycopg://", 1)
-    elif normalized.startswith("postgresql+psycopg://") or normalized.startswith("postgresql+psycopg2://"):
-        pass
-    else:
+        lowered = normalized.lower()
+
+    if lowered.startswith(("postgresql+psycopg://", "postgresql+psycopg2://")):
+        return normalized
+
+    if lowered.startswith("sqlite"):
+        if allow_insecure:
+            LOGGER.warning(
+                "Permitting SQLite watchdog DSN '%s' due to %s=1", normalized, _INSECURE_DEFAULTS_FLAG
+            )
+            return normalized
         raise RuntimeError(
-            "Watchdog requires a PostgreSQL/Timescale DSN via WATCHDOG_DATABASE_URL or TIMESCALE_DSN"
+            f"SQLite watchdog DSNs require {_INSECURE_DEFAULTS_FLAG}=1 to be set explicitly"
         )
 
-    return normalized
+    if lowered.startswith("memory://") and allow_insecure:
+        return normalized
+
+    raise RuntimeError(
+        "Watchdog requires a PostgreSQL/Timescale DSN via WATCHDOG_DATABASE_URL or TIMESCALE_DSN"
+    )
 
 
 # Lazily initialized database engine/session
@@ -92,7 +152,28 @@ def _initialise_database(app: FastAPI) -> WatchdogRepository:
 
     if ENGINE is None or SessionLocal is None:
         database_url = _database_url()
-        ENGINE = create_engine(database_url, future=True, pool_pre_ping=True)
+        engine_options: Dict[str, Any] = {"future": True, "pool_pre_ping": True}
+        if database_url.startswith("sqlite://"):
+            engine_options.setdefault("connect_args", {"check_same_thread": False})
+            if database_url.endswith(":memory:"):
+                engine_options["poolclass"] = StaticPool
+
+        try:
+            ENGINE = create_engine(database_url, **engine_options)
+        except ModuleNotFoundError as exc:
+            if _insecure_defaults_enabled() and "psycopg" in repr(exc):
+                fallback_url = _sqlite_fallback_url()
+                LOGGER.warning(
+                    "psycopg unavailable; watchdog falling back to SQLite store at %s", fallback_url
+                )
+                fallback_options: Dict[str, Any] = {
+                    "future": True,
+                    "pool_pre_ping": True,
+                    "connect_args": {"check_same_thread": False},
+                }
+                ENGINE = create_engine(fallback_url, **fallback_options)
+            else:
+                raise
         SessionLocal = sessionmaker(
             bind=ENGINE, autoflush=False, expire_on_commit=False, future=True
         )
