@@ -39,6 +39,10 @@ except ModuleNotFoundError:  # pragma: no cover - exercised in tests via stubs.
         return lambda row: dict(row) if isinstance(row, Mapping) else row  # type: ignore[return-value]
 
 
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
 from services.common.config import get_timescale_session
 from services.common.security import require_admin_account
 from shared.audit import AuditLogStore, TimescaleAuditLogger

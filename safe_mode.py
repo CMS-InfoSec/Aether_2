@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from threading import Lock
 import logging
 import os
+from pathlib import Path
 import sys
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
@@ -133,6 +134,58 @@ class SafeModePersistedState:
         )
 
 
+class _FileBackedRedisState:
+    """Minimal Redis-compatible stub that persists values to disk."""
+
+    def __init__(self, *, path: Path) -> None:
+        self._path = path
+        self._lock = Lock()
+        self._state: Dict[str, Any] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not self._path.exists():
+            self._state = {}
+            return
+        try:
+            raw = self._path.read_text(encoding="utf-8")
+        except OSError:
+            self._state = {}
+            return
+        try:
+            payload = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            self._state = {}
+            return
+        if isinstance(payload, dict):
+            self._state = {str(key): value for key, value in payload.items()}
+        else:
+            self._state = {}
+
+    def _persist(self) -> None:
+        try:
+            self._path.write_text(json.dumps(self._state), encoding="utf-8")
+        except OSError:
+            LOGGER.warning("Failed to persist safe mode state to %s", self._path)
+
+    def get(self, key: str) -> Any:
+        with self._lock:
+            return self._state.get(key)
+
+    def set(self, key: str, value: Any) -> bool:
+        with self._lock:
+            self._state[str(key)] = value
+            self._persist()
+        return True
+
+    def delete(self, key: str) -> int:
+        with self._lock:
+            removed = 1 if key in self._state else 0
+            self._state.pop(key, None)
+            self._persist()
+        return removed
+
+
 class SafeModeStateStore:
     """Persist safe mode state using a shared Redis key for crash recovery."""
 
@@ -145,26 +198,44 @@ class SafeModeStateStore:
 
     @staticmethod
     def _create_default_client() -> Any:
-        allow_stub = "pytest" in sys.modules
+        allow_stub = "pytest" in sys.modules or os.getenv("AETHER_ALLOW_INSECURE_TEST_DEFAULTS") == "1"
+
+        state_file = SafeModeStateStore._state_file_path()
 
         raw_url = os.getenv("SAFE_MODE_REDIS_URL")
         if raw_url is None or not raw_url.strip():
             if allow_stub:
-                raw_url = "redis://localhost:6379/0"
-            else:
-                raise RuntimeError(
-                    "SAFE_MODE_REDIS_URL environment variable must be set before starting the safe mode service"
+                LOGGER.warning(
+                    "SAFE_MODE_REDIS_URL is not set; using file-backed safe mode store at %s", state_file
                 )
+                return _FileBackedRedisState(path=state_file)
+            raise RuntimeError(
+                "SAFE_MODE_REDIS_URL environment variable must be set before starting the safe mode service"
+            )
 
         redis_url = raw_url.strip()
         client, used_stub = create_redis_from_url(redis_url, decode_responses=True, logger=LOGGER)
 
-        if used_stub and not allow_stub:
+        if used_stub:
+            if allow_stub:
+                LOGGER.warning(
+                    "Redis client for %s is unavailable; using file-backed safe mode store at %s",
+                    redis_url,
+                    state_file,
+                )
+                return _FileBackedRedisState(path=state_file)
             raise RuntimeError(
                 "Failed to connect to Redis at SAFE_MODE_REDIS_URL; safe mode requires a reachable Redis instance"
             )
 
         return client
+
+    @staticmethod
+    def _state_file_path() -> Path:
+        root = Path(os.getenv("AETHER_STATE_DIR", ".aether_state"))
+        path = root / "safe_mode" / "state.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
 
     def load(self) -> SafeModePersistedState:
         with self._lock:
@@ -737,11 +808,19 @@ controller = SafeModeController()
 @app.post("/safe_mode/enter", response_model=Dict[str, object])
 def enter_safe_mode(
     request: Request,
-    payload: Dict[str, str] = Body(...),
+    payload: Dict[str, str] = Body({}),
     actor_account: str = Depends(require_admin_account),
 ) -> Dict[str, object]:
+    if isinstance(payload, dict) and payload:
+        body: Dict[str, str] = dict(payload)
+    else:
+        raw_body = getattr(request, "json", None)
+        resolved = raw_body() if callable(raw_body) else getattr(request, "_body", None)
+        body = dict(resolved) if isinstance(resolved, dict) else {}
     before_snapshot = dict(controller.status().to_response())
-    reason = payload.get("reason", "").strip()
+    reason = body.get("reason", "").strip()
+    if not reason:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="reason is required")
     try:
         controller.enter(reason=reason, actor=actor_account)
     except ValueError as exc:  # invalid reason

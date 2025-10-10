@@ -11,6 +11,10 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Deque, Dict, Optional
 
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
 from services.common.config import get_timescale_session
 from services.oms.kraken_rest import KrakenRESTClient, KrakenRESTError
 from services.oms.kraken_ws import KrakenWSClient, KrakenWSError, KrakenWSTimeout
