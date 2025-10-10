@@ -31,6 +31,20 @@ class Sample:
     value: float
 
 
+@dataclass(frozen=True)
+class Metric:
+    """Collection of samples emitted by a Prometheus collector."""
+
+    name: str
+    documentation: str
+    samples: List[Sample]
+    _type: str
+
+    def __post_init__(self) -> None:
+        # Provide the public ``.type`` attribute for compatibility with the real client.
+        object.__setattr__(self, "type", self._type)
+
+
 class CollectorRegistry:
     """Register and query metric collectors."""
 
@@ -47,17 +61,23 @@ class CollectorRegistry:
         except ValueError:
             pass
 
-    def collect(self) -> List["_MetricBase"]:
-        return list(self._collectors)
+    def collect(self) -> List[Metric]:
+        metrics: List[Metric] = []
+        for collector in self._collectors:
+            metrics.extend(list(collector.collect()))
+        return metrics
 
     def get_sample_value(
         self, name: str, labels: Mapping[str, str] | None = None
     ) -> float | None:
         label_map = {k: str(v) for k, v in (labels or {}).items()}
-        for collector in self._collectors:
-            value = collector.get_sample_value(name, label_map)
-            if value is not None:
-                return value
+        for metric in self.collect():
+            for sample in metric.samples:
+                if sample.name != name:
+                    continue
+                if label_map and sample.labels != label_map:
+                    continue
+                return sample.value
         return None
 
 
@@ -106,9 +126,11 @@ class _MetricBase:
             raise ValueError("Metric with labels requires .labels(...) before recording values")
         return self._get_child(())
 
-    def collect(self) -> Iterator[Sample]:
+    def collect(self) -> Iterator[Metric]:
+        samples: List[Sample] = []
         for child in self._children.values():
-            yield from child.samples()
+            samples.extend(list(child.samples()))
+        yield Metric(self.name, self.documentation, samples, self._type)
 
     def get_sample_value(self, name: str, labels: Mapping[str, str]) -> float | None:
         for child in self._children.values():
@@ -328,7 +350,7 @@ def generate_latest(registry: CollectorRegistry | None = None) -> bytes:
     for metric in registry.collect():
         lines.append(f"# HELP {metric.name} {metric.documentation}")
         lines.append(f"# TYPE {metric.name} {metric._type}")
-        for sample in metric.collect():
+        for sample in metric.samples:
             if sample.labels:
                 label_str = ",".join(
                     f"{key}=\"{value}\"" for key, value in sorted(sample.labels.items())
