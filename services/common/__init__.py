@@ -1,27 +1,23 @@
 """Shared service wiring helpers.
 
 This package collects the compatibility shims that allow the wider codebase to
-boot in environments where optional dependencies are missing.  The test suite
-historically replaced :mod:`services.common.adapters` or
-:mod:`services.common.security` with lightweight :class:`types.ModuleType`
-stubs during collection.  If those stubs were inserted before the real modules
-had been imported the application code ended up talking to incomplete
-implementations and exploded with :class:`ImportError` when it attempted to
-reach the production helpers.
+boot in environments where optional dependencies are missing.  Earlier
+iterations attempted to defend against this by inserting clever reload hooks
+that swapped stubs back out for the real modules.  In practice the indirection
+made the package brittle: legitimate imports such as
+``from services.common.security import ADMIN_ACCOUNTS`` started failing because
+the loader ended up handing pytest's temporary stubs back to the caller.
 
-To keep the package resilient we lazily proxy the commonly-used helpers instead
-of binding them eagerly at import time.  When an attribute such as
-``RedisFeastAdapter`` or ``require_admin_account`` is requested we attempt to
-retrieve it from the currently-loaded module.  If a stub is present but lacks
-the attribute we reload the real module from disk (when available) and cache the
-result.  This preserves the convenience imports that the services expect while
-remaining compatible with the test harness's dependency injection.
+The module below focuses on deterministically exposing the production helpers.
+Whenever we notice that a stub without a ``__file__`` attribute has been
+inserted we simply discard it and import the implementation from disk again.
+This keeps the convenience attributes working without making normal imports
+fragile.
 """
 
 from __future__ import annotations
 
 from importlib import import_module
-from importlib.util import find_spec
 import sys
 from types import ModuleType
 from typing import Any, Dict, Tuple
@@ -57,85 +53,39 @@ _REEXPORTS: Dict[str, Tuple[str, str]] = {
         "services.common.security",
         "require_admin_account",
     ),
+    "require_authenticated_principal": (
+        "services.common.security",
+        "require_authenticated_principal",
+    ),
+    "require_dual_director_confirmation": (
+        "services.common.security",
+        "require_dual_director_confirmation",
+    ),
+    "ensure_admin_access": ("services.common.security", "ensure_admin_access"),
 }
 
 
-def _load_module(name: str) -> ModuleType:
-    """Return the module identified by *name*.
-
-    The helper ensures that bare :class:`types.ModuleType` stubs created by the
-    test suite never permanently shadow the real implementation.  When a stub
-    lacking a ``__file__`` attribute is encountered we reload the module from
-    disk so that direct imports (``from services.common.adapters import
-    TimescaleAdapter``) resolve to the production helpers rather than the empty
-    placeholder.
-    """
+def _import_real_module(name: str) -> ModuleType:
+    """Return the implementation for *name*, dropping pytest stubs when needed."""
 
     module = sys.modules.get(name)
-    if isinstance(module, ModuleType):
-        if getattr(module, "__file__", None):
-            return module
-        module = _reload_from_source(name, module)
-        if isinstance(module, ModuleType):
-            return module
-        # ``_reload_from_source`` only returns ``None`` when the import spec
-        # cannot be resolved, in which case we fall back to a standard import.
+    if isinstance(module, ModuleType) and getattr(module, "__file__", None):
+        return module
+
+    if name in sys.modules:
+        # A stub without ``__file__`` was registered – discard it so the real
+        # implementation can load.
+        del sys.modules[name]
+
     module = import_module(name)
     return module
 
 
-def _reload_from_source(name: str, existing: ModuleType | None) -> ModuleType | None:
-    """Reload *name* from disk when a stub without attributes is installed."""
-
-    if existing is not None and getattr(existing, "__file__", None):
-        return existing
-
-    try:
-        spec = find_spec(name)
-    except (ValueError, ImportError):  # pragma: no cover - defensive guard
-        spec = None
-    if spec is None or spec.loader is None:
-        loader = None
-    else:
-        loader = spec.loader
-
-    # Remove the stub so ``import_module`` loads the real implementation.
-    sys.modules.pop(name, None)
-    try:
-        module = import_module(name)
-    except Exception:  # pragma: no cover - defensive guard
-        # Restore the stub if reloading fails to avoid breaking the caller.
-        if existing is not None:
-            sys.modules[name] = existing
-        raise
-
-    # When ``find_spec`` failed above we still succeed because ``import_module``
-    # consults the parent package's ``__path__``.  In that scenario ``loader`` is
-    # ``None``; to keep debuggers happy we simply return the imported module.
-    if loader is None:
-        return module
-
-    return module
-
-
 def _resolve_attribute(module_name: str, attribute: str) -> Any:
-    """Return *attribute* from *module_name*, reloading when required."""
-
-    module = sys.modules.get(module_name)
-    if module is not None and hasattr(module, attribute):
-        return getattr(module, attribute)
-
-    module = _reload_from_source(module_name, module)
-    if module is not None and hasattr(module, attribute):
-        return getattr(module, attribute)
-
-    # Final attempt – import the module normally which will succeed for real
-    # implementations and propagate the ImportError for missing dependencies.
-    module = import_module(module_name)
-    if hasattr(module, attribute):
-        return getattr(module, attribute)
-
-    raise AttributeError(f"module '{module_name}' has no attribute '{attribute}'")
+    module = _import_real_module(module_name)
+    value = getattr(module, attribute)
+    globals()[attribute] = value
+    return value
 
 
 def __getattr__(name: str) -> Any:
@@ -145,17 +95,15 @@ def __getattr__(name: str) -> Any:
         globals()[name] = value
         return value
     if name in _SUBMODULE_NAMES:
-        module = _load_module(_SUBMODULE_NAMES[name])
+        module = _import_real_module(_SUBMODULE_NAMES[name])
         globals()[name] = module
         return module
     raise AttributeError(f"module 'services.common' has no attribute '{name}'")
 
 
-# Provide convenient access to the core submodules so ``services.common.config``
-# and friends remain available as package attributes.
-adapters = _load_module(_SUBMODULE_NAMES["adapters"])
-config = _load_module(_SUBMODULE_NAMES["config"])
-security = _load_module(_SUBMODULE_NAMES["security"])
+adapters = _import_real_module(_SUBMODULE_NAMES["adapters"])
+config = _import_real_module(_SUBMODULE_NAMES["config"])
+security = _import_real_module(_SUBMODULE_NAMES["security"])
 
 
 __all__ = sorted({*(_REEXPORTS.keys()), *(_SUBMODULE_NAMES.keys())})
