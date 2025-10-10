@@ -122,24 +122,63 @@ def _reload_with_overrides(module_name: str) -> ModuleType:
 def _ensure_fastapi_stub() -> None:
     """Ensure the repository's FastAPI shim is loaded instead of pytest stubs."""
 
-    module = sys.modules.get("fastapi")
-    should_reload = False
-    if module is None:
-        should_reload = True
-    elif not isinstance(module, ModuleType) or getattr(module, "__file__", None) is None:
-        should_reload = True
-    else:
-        required_attrs = ("FastAPI", "APIRouter", "status")
-        if any(not hasattr(module, attr) for attr in required_attrs):
-            should_reload = True
-
-    if should_reload:
+    def _reload() -> ModuleType:
         sys.modules.pop("fastapi", None)
-        module = importlib.import_module("fastapi")
+        return importlib.import_module("fastapi")
+
+    module = sys.modules.get("fastapi")
+    if not isinstance(module, ModuleType) or getattr(module, "__file__", None) is None:
+        module = _reload()
+
+    try:
+        stub = importlib.import_module("services.common.fastapi_stub")
+    except ModuleNotFoundError:
+        return
+
+    for name in ("FastAPI", "APIRouter", "HTTPException", "Request", "Depends"):
+        if getattr(module, name, None) is None:
+            setattr(module, name, getattr(stub, name))
 
     status_module = getattr(module, "status", None)
-    if isinstance(status_module, ModuleType) and not hasattr(status_module, "HTTP_201_CREATED"):
-        importlib.reload(module)
+    if not isinstance(status_module, ModuleType):
+        status_module = getattr(stub, "status", None)
+        if isinstance(status_module, ModuleType):
+            setattr(module, "status", status_module)
+
+    if isinstance(status_module, ModuleType):
+        required_status = (
+            "HTTP_200_OK",
+            "HTTP_201_CREATED",
+            "HTTP_400_BAD_REQUEST",
+            "HTTP_422_UNPROCESSABLE_ENTITY",
+        )
+        for name in required_status:
+            if getattr(status_module, name, None) is None:
+                setattr(status_module, name, getattr(stub.status, name))
+        sys.modules["fastapi.status"] = status_module
+
+    responses_module = sys.modules.get("fastapi.responses")
+    if not isinstance(responses_module, ModuleType):
+        responses_module = ModuleType("fastapi.responses")
+        sys.modules["fastapi.responses"] = responses_module
+    setattr(module, "responses", responses_module)
+
+    for attr in ("Response", "JSONResponse", "HTMLResponse", "StreamingResponse"):
+        value = getattr(module, attr, None) or getattr(stub, attr, None)
+        if value is not None:
+            setattr(module, attr, value)
+            setattr(responses_module, attr, value)
+
+    testclient_module = sys.modules.get("fastapi.testclient")
+    if not isinstance(testclient_module, ModuleType):
+        testclient_module = ModuleType("fastapi.testclient")
+        sys.modules["fastapi.testclient"] = testclient_module
+    setattr(module, "testclient", testclient_module)
+
+    test_client = getattr(module, "TestClient", None) or getattr(stub, "TestClient", None)
+    if test_client is not None:
+        setattr(module, "TestClient", test_client)
+        setattr(testclient_module, "TestClient", test_client)
 
 
 def _ensure_httpx_module() -> None:
