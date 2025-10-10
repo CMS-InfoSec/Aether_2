@@ -72,7 +72,7 @@ try:  # pragma: no cover - optional dependency for unit tests
         FILLS_QUERY_FALLBACK,
         NAV_QUERY,
     )
-except ModuleNotFoundError:  # pragma: no cover - fallback when FastAPI not installed
+except Exception:  # pragma: no cover - fallback when report service dependencies missing
     FILLS_QUERY = """
 SELECT
     f.order_id::text AS order_id,

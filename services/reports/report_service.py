@@ -50,7 +50,7 @@ from shared.common_bootstrap import ensure_common_helpers
 
 try:  # pragma: no cover - used to mirror top-level helpers when available
     import report_service as _root_report_service  # type: ignore
-except ImportError:  # pragma: no cover - fall back to local implementations
+except Exception:  # pragma: no cover - fall back to local implementations
     _root_report_service = None  # type: ignore[assignment]
 
 ensure_common_helpers()
