@@ -31,6 +31,38 @@ _COMMON_MODULES = (
     "services.oms",
 )
 
+# Guard re-entrant ``ensure_common_helpers`` calls triggered from module level
+# imports.  The bootstrap is invoked at interpreter start as well as from
+# modules such as ``services.common.adapters``; when those modules call back
+# into the bootstrap we should avoid reloading optional extras (like the risk
+# service stack) until the outermost invocation completes.  Without this guard
+# Python observes partially initialised modules and raises circular-import
+# errors.
+_ENSURING_COMMON_HELPERS = False
+
+# Risk-service modules are routinely imported during test collection.  Pytest
+# fixtures still overwrite these modules with lightweight stand-ins, so we
+# proactively reload the canonical implementations to keep import resolution
+# stable for downstream tests.
+_RISK_MODULES = (
+    "services.risk",
+    "services.risk.main",
+    "services.risk.engine",
+    "services.risk.exit_rules",
+    "services.risk.position_sizer",
+    "services.risk.pretrade_sanity",
+    "services.risk.circuit_breakers",
+    "services.risk.correlation_service",
+    "services.risk.diversification_allocator",
+    "services.risk.nav_forecaster",
+    "services.risk.cvar_forecast",
+    "services.core.sequencer",
+)
+
+_CORE_MODULE_REQUIREMENTS: Mapping[str, Tuple[str, ...]] = {
+    "services.core.sequencer": ("TradingSequencer", "SequencerResult"),
+}
+
 # Parent attributes that should always refer to the canonical submodules once the
 # helpers are loaded.  This keeps ``services.common.config`` style imports working
 # even after pytest injects temporary stand-ins.
@@ -254,29 +286,85 @@ def _ensure_httpx_module() -> None:
         setattr(module, key, value)
 
 
+def preload_core_modules() -> None:
+    """Load core service modules so critical exports remain available."""
+
+    for module_name, required_attrs in _CORE_MODULE_REQUIREMENTS.items():
+        module: ModuleType | None
+        try:
+            module = importlib.import_module(module_name)
+        except ModuleNotFoundError:
+            module = None
+
+        missing = tuple(
+            attr for attr in required_attrs if module is None or not hasattr(module, attr)
+        )
+        if not missing:
+            continue
+
+        module_path = _PROJECT_ROOT / (module_name.replace(".", "/") + ".py")
+        if not module_path.exists():
+            continue
+
+        module = ModuleType(module_name)
+        module.__file__ = str(module_path)
+        module.__loader__ = None
+        module.__package__ = module_name.rpartition(".")[0]
+        code = module_path.read_text(encoding="utf-8")
+        exec(compile(code, str(module_path), "exec"), module.__dict__)
+        sys.modules[module_name] = module
+
+        parent_name, _, child_name = module_name.rpartition(".")
+        if parent_name:
+            try:
+                parent_module = importlib.import_module(parent_name)
+            except ModuleNotFoundError:
+                parent_module = None
+            if isinstance(parent_module, ModuleType):
+                setattr(parent_module, child_name, module)
+
+        # After reloading, ensure the module now exposes the required attributes.
+        for attr in required_attrs:
+            if not hasattr(module, attr):
+                setattr(module, attr, None)
+
 def ensure_common_helpers() -> None:
     """Guarantee the real ``services.common`` helpers are available."""
 
-    loaded: Dict[str, ModuleType] = {}
-    for name in _COMMON_MODULES:
-        loaded[name] = _reload_with_overrides(name)
+    global _ENSURING_COMMON_HELPERS
 
-    parent = loaded["services.common"]
-    for attribute, module_name in _PARENT_SUBMODULES.items():
-        setattr(parent, attribute, loaded[module_name])
+    reentrant_call = _ENSURING_COMMON_HELPERS
+    if not reentrant_call:
+        _ENSURING_COMMON_HELPERS = True
 
-    for attribute, (module_name, source_attr) in _PARENT_REEXPORTS.items():
-        setattr(parent, attribute, getattr(loaded[module_name], source_attr))
+    try:
+        loaded: Dict[str, ModuleType] = {}
+        for name in _COMMON_MODULES:
+            loaded[name] = _reload_with_overrides(name)
 
-    _ensure_fastapi_stub()
-    _ensure_httpx_module()
+        if not reentrant_call:
+            for name in _RISK_MODULES:
+                loaded[name] = _reload_with_overrides(name)
 
-    if _ensure_services_namespace is not None:
-        _ensure_services_namespace()
-    if _ensure_common_namespace is not None:
-        _ensure_common_namespace()
+        parent = loaded["services.common"]
+        for attribute, module_name in _PARENT_SUBMODULES.items():
+            setattr(parent, attribute, loaded[module_name])
 
-    _install_module_guard()
+        for attribute, (module_name, source_attr) in _PARENT_REEXPORTS.items():
+            setattr(parent, attribute, getattr(loaded[module_name], source_attr))
+
+        _ensure_fastapi_stub()
+        _ensure_httpx_module()
+
+        if _ensure_services_namespace is not None:
+            _ensure_services_namespace()
+        if _ensure_common_namespace is not None:
+            _ensure_common_namespace()
+
+        _install_module_guard()
+    finally:
+        if not reentrant_call:
+            _ENSURING_COMMON_HELPERS = False
 
 
 class _ModuleGuard(dict):
@@ -323,7 +411,11 @@ def _install_module_guard() -> None:
         _MODULE_GUARD_INSTALLED = True
         return
 
-    guard = _ModuleGuard(modules, tuple(_COMMON_MODULES), ensure_common_helpers)
+    guard = _ModuleGuard(
+        modules,
+        tuple(_COMMON_MODULES + _RISK_MODULES),
+        ensure_common_helpers,
+    )
     sys.modules = guard  # type: ignore[assignment]
     _MODULE_GUARD_INSTALLED = True
 

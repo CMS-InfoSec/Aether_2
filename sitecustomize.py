@@ -113,11 +113,18 @@ _ensure_common_namespace()
 _ensure_fastapi_testclient()
 
 try:  # pragma: no cover - shared bootstrap may be unavailable in some contexts
-    from shared.common_bootstrap import ensure_common_helpers
+    from shared.common_bootstrap import ensure_common_helpers, preload_core_modules
 except Exception:  # pragma: no cover - avoid hard failures during early startup
     ensure_common_helpers = None  # type: ignore[assignment]
+    preload_core_modules = None  # type: ignore[assignment]
 else:
     try:
         ensure_common_helpers()
     except Exception:  # pragma: no cover - defensive guard to keep import resilient
         pass
+
+    if preload_core_modules is not None:
+        try:
+            preload_core_modules()
+        except Exception:  # pragma: no cover - defensive guard
+            pass
