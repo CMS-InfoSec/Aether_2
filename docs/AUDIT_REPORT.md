@@ -31,7 +31,7 @@ The repository requires coordinated fixes across persistence, services, and test
 
 | Priority | Task | Status | Notes |
 | --- | --- | --- | --- |
-| P0 | Persist hedge override state across restarts | 🚧 Pending | Follow-up work required to durably store manual hedge overrides and reload them on service start. |
+| P0 | Persist hedge override state across restarts | ✅ Completed | Hedge overrides now save to `.aether_state/hedge_service/override_state.json` via `HedgeOverrideStateStore`, and regression coverage reloads overrides and history across service instances.【F:services/hedge/hedge_service.py†L1-L420】【F:tests/services/hedge/test_hedge_override_persistence.py†L1-L45】 |
 | P1 | Calibrate volatility-based hedge sizing | 🚧 Pending | Hedge sizing still needs volatility-aware tuning and targeted regression coverage. |
 | P1 | Add drawdown-aware kill switch | 🚧 Pending | Integration between the kill switch and hedging logic remains outstanding. |
 
