@@ -52,6 +52,7 @@ class AuditLogWriter:
         event_id = hashlib.sha256(
             f"{entity_id}:{event_time.isoformat()}".encode("utf-8")
         ).hexdigest()
+        metadata_json = json.dumps(metadata)
         payload = json.dumps(
             {
                 "entity": {
@@ -69,6 +70,7 @@ class AuditLogWriter:
             "target": entity_id,
             "created_at": event_time,
             "payload": payload,
+            "metadata": metadata_json,
         }
 
         insert_audit_log_sql = """

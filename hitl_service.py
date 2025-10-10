@@ -38,7 +38,7 @@ from pydantic import BaseModel, Field, PositiveFloat
 _SQLALCHEMY_AVAILABLE = True
 
 try:  # pragma: no cover - optional dependency in production
-    from sqlalchemy import Column, DateTime, String, Text, create_engine
+    from sqlalchemy import Column, DateTime, String, Text, create_engine, select
     from sqlalchemy.engine import Engine
     from sqlalchemy.orm import Session, declarative_base, sessionmaker
 except Exception:  # pragma: no cover - exercised in lightweight environments
@@ -58,6 +58,7 @@ except Exception:  # pragma: no cover - exercised in lightweight environments
         raise RuntimeError("SQLAlchemy is unavailable in this environment")
 
 from services.common.security import require_admin_account
+from shared.account_scope import SQLALCHEMY_AVAILABLE as _ACCOUNT_SCOPE_AVAILABLE, account_id_column
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -154,7 +155,7 @@ class _QueueStore:
         raise NotImplementedError
 
 
-if _SQLALCHEMY_AVAILABLE:
+if _SQLALCHEMY_AVAILABLE and _ACCOUNT_SCOPE_AVAILABLE:
 
     Base = declarative_base()
 
@@ -164,7 +165,7 @@ if _SQLALCHEMY_AVAILABLE:
         __tablename__ = "hitl_queue"
 
         intent_id = Column(String, primary_key=True)
-        account_id = Column(String, nullable=False)
+        account_id = account_id_column()
         trade_json = Column(Text, nullable=False)
         status = Column(String, nullable=False, default="pending")
         ts = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
@@ -227,12 +228,38 @@ if _SQLALCHEMY_AVAILABLE:
 
         def list_pending(self) -> List[QueueEntry]:
             with self._session() as session:
-                rows: List[HitlQueueEntry] = (
-                    session.query(HitlQueueEntry)
-                    .filter(HitlQueueEntry.status == "pending")
-                    .order_by(HitlQueueEntry.ts.asc())
-                    .all()
-                )
+                query = getattr(session, "query", None)
+                if callable(query):
+                    rows: List[HitlQueueEntry] = (
+                        query(HitlQueueEntry)
+                        .filter(HitlQueueEntry.status == "pending")
+                        .order_by(HitlQueueEntry.ts.asc())
+                        .all()
+                    )
+                else:
+                    statement = (
+                        select(HitlQueueEntry)
+                        .where(HitlQueueEntry.status == "pending")
+                        .order_by(HitlQueueEntry.ts)
+                    )
+                    result = session.execute(statement)
+                    stream = getattr(result, "scalars", None)
+                    if callable(stream):
+                        stream_result = stream()
+                        if hasattr(stream_result, "all"):
+                            rows = list(stream_result.all())
+                        else:
+                            try:
+                                rows = list(stream_result)
+                            except TypeError:
+                                rows = []
+                    elif hasattr(result, "all"):
+                        rows = list(result.all())
+                    else:
+                        try:
+                            rows = list(result)
+                        except TypeError:
+                            rows = []
                 return [self._convert(row) for row in rows]
 
         def get(self, intent_id: str) -> Optional[QueueEntry]:
@@ -338,13 +365,45 @@ def _initialise_sqlalchemy_backend(url: str) -> tuple[Optional[Engine], Optional
         try:
             has_query = callable(getattr(probe_session, "query", None))
             has_get = callable(getattr(probe_session, "get", None))
+            has_scalars = callable(getattr(probe_session, "scalars", None))
+            has_execute = callable(getattr(probe_session, "execute", None))
+
+            if not has_get and not has_scalars and not has_execute:
+                raise RuntimeError("SQLAlchemy session missing query/get helpers")
+
+            # Lightweight SQLAlchemy shims used in insecure-default environments expose the
+            # ORM API surface area but do not actually persist state.  Probe the identity map
+            # by inserting a synthetic queue entry and ensuring it can be retrieved via
+            # ``Session.get`` before committing to the SQLAlchemy backend.
+            probe_intent = "__hitl_sqlalchemy_probe__"
+            can_persist = True
+            add = getattr(probe_session, "add", None)
+            flush = getattr(probe_session, "flush", None)
+            get = getattr(probe_session, "get", None)
+            rollback = getattr(probe_session, "rollback", None)
+            if callable(add) and callable(get):
+                entry = HitlQueueEntry(
+                    intent_id=probe_intent,
+                    account_id="probe",
+                    trade_json="{}",
+                    status="pending",
+                    ts=datetime.now(timezone.utc),
+                )
+                try:
+                    add(entry)
+                    if callable(flush):
+                        flush()
+                    can_persist = get(HitlQueueEntry, probe_intent) is not None
+                finally:
+                    if callable(rollback):
+                        rollback()
+
+            if not can_persist:
+                raise RuntimeError("SQLAlchemy session is unable to persist HITL queue entries")
         finally:
             close = getattr(probe_session, "close", None)
             if callable(close):
                 close()
-
-        if not has_query or not has_get:
-            raise RuntimeError("SQLAlchemy session missing query/get helpers")
 
         Base.metadata.create_all(bind=engine)  # type: ignore[call-arg]
         return engine, session_factory, _SqlAlchemyQueueStore(session_factory)

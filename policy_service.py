@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 
+import importlib.util
 import logging
 import math
 import os
@@ -11,9 +12,11 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from pathlib import Path
 
 from decimal import ROUND_HALF_UP, Decimal
 from threading import Lock
+from types import ModuleType
 from typing import TYPE_CHECKING, Dict, List, MutableMapping, Sequence
 
 import httpx
@@ -25,27 +28,84 @@ from auth.service import (
     build_session_store_from_url,
 )
 
-from services.common import security
+from shared.common_bootstrap import ensure_common_helpers
+
+try:  # pragma: no cover - dependency-light environments may stub services.common
+    ensure_common_helpers()
+except ModuleNotFoundError:
+    pass
+
+def _load_local_module(module_name: str, relative_path: str) -> ModuleType:
+    """Load *module_name* from the repository even if pytest left a stub behind."""
+
+    spec = importlib.util.spec_from_file_location(
+        module_name, Path(__file__).resolve().parent / relative_path
+    )
+    if spec is None or spec.loader is None:
+        raise ModuleNotFoundError(f"Unable to load module {module_name}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules.setdefault(module_name, module)
+    spec.loader.exec_module(module)  # type: ignore[attr-defined]
+    return module
 
 
-from services.common.precision import (
-    PrecisionMetadataUnavailable,
-    precision_provider,
-)
-from services.common.schemas import (
-    ActionTemplate,
-    BookSnapshot,
-    ConfidenceMetrics,
-    FeeBreakdown,
-    PolicyDecisionRequest,
-    PolicyDecisionResponse,
-    PolicyState,
-)
-from services.policy.adaptive_horizon import get_horizon
-from services.risk.stablecoin_monitor import (
-    format_depeg_alert,
-    get_global_monitor,
-)
+try:
+    from services.common import security
+except (ImportError, AttributeError):  # pragma: no cover - fallback when bootstrap stubs remain
+    try:
+        import services.common.security as security
+    except ModuleNotFoundError:
+        security = _load_local_module("services.common.security", "services/common/security.py")
+
+
+try:
+    from services.common.precision import (
+        PrecisionMetadataUnavailable,
+        precision_provider,
+    )
+except ModuleNotFoundError:  # pragma: no cover - fallback when pytest leaves behind stubs
+    precision_module = _load_local_module(
+        "services.common.precision", "services/common/precision.py"
+    )
+    PrecisionMetadataUnavailable = precision_module.PrecisionMetadataUnavailable
+    precision_provider = precision_module.precision_provider
+try:
+    from services.common.schemas import (
+        ActionTemplate,
+        BookSnapshot,
+        ConfidenceMetrics,
+        FeeBreakdown,
+        PolicyDecisionRequest,
+        PolicyDecisionResponse,
+        PolicyState,
+    )
+except ModuleNotFoundError:  # pragma: no cover - fallback when pytest leaves behind stubs
+    schemas_module = _load_local_module("services.common.schemas", "services/common/schemas.py")
+    ActionTemplate = schemas_module.ActionTemplate
+    BookSnapshot = schemas_module.BookSnapshot
+    ConfidenceMetrics = schemas_module.ConfidenceMetrics
+    FeeBreakdown = schemas_module.FeeBreakdown
+    PolicyDecisionRequest = schemas_module.PolicyDecisionRequest
+    PolicyDecisionResponse = schemas_module.PolicyDecisionResponse
+    PolicyState = schemas_module.PolicyState
+try:
+    from services.policy.adaptive_horizon import get_horizon
+except ModuleNotFoundError:  # pragma: no cover - fallback when pytest leaves behind stubs
+    adaptive_module = _load_local_module(
+        "services.policy.adaptive_horizon", "services/policy/adaptive_horizon.py"
+    )
+    get_horizon = adaptive_module.get_horizon
+try:
+    from services.risk.stablecoin_monitor import (
+        format_depeg_alert,
+        get_global_monitor,
+    )
+except ModuleNotFoundError:  # pragma: no cover - fallback when pytest leaves behind stubs
+    monitor_module = _load_local_module(
+        "services.risk.stablecoin_monitor", "services/risk/stablecoin_monitor.py"
+    )
+    format_depeg_alert = monitor_module.format_depeg_alert
+    get_global_monitor = monitor_module.get_global_monitor
 
 from ml.policy.fallback_policy import FallbackDecision, FallbackPolicy
 
@@ -57,11 +117,18 @@ from metrics import (
     record_drift_score,
     setup_metrics,
 )
-from services.common.security import require_admin_account
+try:
+    from services.common.security import require_admin_account
+except ModuleNotFoundError:  # pragma: no cover - fallback when pytest leaves behind stubs
+    require_admin_account = security.require_admin_account
 from shared.health import setup_health_checks
 from shared.session_config import load_session_ttl_minutes
 from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
-from services.common.spot import require_spot_http
+try:
+    from services.common.spot import require_spot_http
+except ModuleNotFoundError:  # pragma: no cover - fallback when pytest leaves behind stubs
+    spot_module = _load_local_module("services.common.spot", "services/common/spot.py")
+    require_spot_http = spot_module.require_spot_http
 
 
 FEES_SERVICE_URL = os.getenv("FEES_SERVICE_URL", "http://fees-service")

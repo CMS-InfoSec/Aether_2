@@ -12,6 +12,10 @@ from typing import TYPE_CHECKING, Any, Protocol, Tuple
 
 from decimal import Decimal
 
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
 from services.common.config import get_redis_client
 
 if TYPE_CHECKING:  # pragma: no cover - optional dependency typing aid
