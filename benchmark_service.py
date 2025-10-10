@@ -39,12 +39,13 @@ except ImportError:  # pragma: no cover - exercised in lightweight environments
         return object()
 
 from services.common.security import require_admin_account
+from shared.account_scope import SQLALCHEMY_AVAILABLE as _ACCOUNT_SCOPE_AVAILABLE, account_id_column
 from shared.postgres import normalize_sqlalchemy_dsn
 
 LOGGER = logging.getLogger(__name__)
 
 
-if _SQLALCHEMY_AVAILABLE:
+if _SQLALCHEMY_AVAILABLE and _ACCOUNT_SCOPE_AVAILABLE:
     Base = declarative_base()
     metadata = getattr(Base, "metadata", None)
     if metadata is None or not hasattr(metadata, "drop_all"):
@@ -88,7 +89,7 @@ if _SQLALCHEMY_AVAILABLE:
 
         __tablename__ = "benchmark_curves"
 
-        account_id = Column(String, primary_key=True)
+        account_id = account_id_column(primary_key=True)
         benchmark = Column(String, primary_key=True)
         ts = Column(DateTime(timezone=True), primary_key=True)
         pnl = Column(Float, nullable=False, default=0.0)

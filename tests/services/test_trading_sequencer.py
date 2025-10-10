@@ -16,36 +16,41 @@ from services.common.config import TimescaleSession
 
 
 def _load_sequencer_module() -> ModuleType:
-    root = Path(__file__).resolve().parents[2]
-    services_pkg = ModuleType("services")
-    core_pkg = ModuleType("services.core")
-    services_pkg.__path__ = [str(root / "services")]
-    core_pkg.__path__ = [str(root / "services" / "core")]
-    sys.modules.setdefault("services", services_pkg)
-    sys.modules.setdefault("services.core", core_pkg)
+    try:
+        from shared.common_bootstrap import ensure_common_helpers
+    except Exception:  # pragma: no cover - bootstrap may be unavailable
+        ensure_common_helpers = None  # type: ignore[assignment]
 
-    if "services.common.adapters" not in sys.modules:
-        adapters_module = ModuleType("services.common.adapters")
+    if ensure_common_helpers is not None:
+        ensure_common_helpers()
 
-        class _StubKafkaAdapter:
-            def __init__(self, account_id: str) -> None:  # pragma: no cover - simple stub
-                self.account_id = account_id
+    try:
+        return importlib.import_module("services.core.sequencer")
+    except Exception:
+        root = Path(__file__).resolve().parents[2]
 
-            async def publish(self, topic: str, payload: Dict[str, Any]) -> None:  # pragma: no cover
-                return None
+        if "services.common.adapters" not in sys.modules:
+            adapters_module = ModuleType("services.common.adapters")
 
-        adapters_module.KafkaNATSAdapter = _StubKafkaAdapter
-        sys.modules["services.common.adapters"] = adapters_module
+            class _StubKafkaAdapter:
+                def __init__(self, account_id: str) -> None:  # pragma: no cover - simple stub
+                    self.account_id = account_id
 
-    spec = importlib.util.spec_from_file_location(
-        "services.core.sequencer", root / "services" / "core" / "sequencer.py"
-    )
-    if spec is None or spec.loader is None:  # pragma: no cover - defensive
-        raise RuntimeError("Failed to load sequencer module spec")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["services.core.sequencer"] = module
-    spec.loader.exec_module(module)
-    return module
+                async def publish(self, topic: str, payload: Dict[str, Any]) -> None:  # pragma: no cover
+                    return None
+
+            adapters_module.KafkaNATSAdapter = _StubKafkaAdapter
+            sys.modules["services.common.adapters"] = adapters_module
+
+        spec = importlib.util.spec_from_file_location(
+            "services.core.sequencer", root / "services" / "core" / "sequencer.py"
+        )
+        if spec is None or spec.loader is None:  # pragma: no cover - defensive
+            raise RuntimeError("Failed to load sequencer module spec")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["services.core.sequencer"] = module
+        spec.loader.exec_module(module)
+        return module
 
 
 sequencer_module = _load_sequencer_module()

@@ -59,6 +59,10 @@ else:
         description: str
         labels: Dict[str, str] = field(default_factory=dict)
 
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
 from services.common.config import TimescaleSession, get_timescale_session
 from services.secrets.signing import sign_kraken_request
 
@@ -68,7 +72,7 @@ try:  # pragma: no cover - optional dependency for unit tests
         FILLS_QUERY_FALLBACK,
         NAV_QUERY,
     )
-except ModuleNotFoundError:  # pragma: no cover - fallback when FastAPI not installed
+except Exception:  # pragma: no cover - fallback when report service dependencies missing
     FILLS_QUERY = """
 SELECT
     f.order_id::text AS order_id,

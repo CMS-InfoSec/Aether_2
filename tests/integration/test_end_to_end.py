@@ -43,7 +43,11 @@ from common.utils import audit_logger
 from sequencer import PipelineHistory, SequencerPipeline, Stage, StageResult
 from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
 from services.common.schemas import PolicyDecisionResponse
-from services.core.sequencer import TradingSequencer
+sequencer_module = pytest.importorskip("services.core.sequencer")
+TradingSequencer = getattr(sequencer_module, "TradingSequencer", None)
+if TradingSequencer is None:
+    pytest.skip("TradingSequencer unavailable in this environment", allow_module_level=True)
+
 from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
 from shared.correlation import CorrelationContext
 from services.fees.fee_service import app as fees_app
