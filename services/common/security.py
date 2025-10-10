@@ -15,6 +15,14 @@ except ImportError:  # pragma: no cover - fallback when FastAPI is stubbed out
         status,
     )
 
+if getattr(status, "HTTP_200_OK", None) is None:
+    from shared.common_bootstrap import _ensure_fastapi_stub  # lightweight guard
+
+    _ensure_fastapi_stub()
+    from fastapi import status as _fastapi_status
+
+    status = _fastapi_status
+
 try:  # pragma: no cover - auth service dependencies may be unavailable
     from auth.service import Session, SessionStoreProtocol
 except Exception:  # pragma: no cover - provide minimal stand-ins

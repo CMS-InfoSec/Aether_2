@@ -9,7 +9,9 @@ The repository requires coordinated fixes across persistence, services, and test
 | P0 | Provide deterministic Timescale substitutes for unit/integration tests | ✅ Completed | `get_timescale_session` provisions `.aether_state` SQLite fallbacks so services and tests keep running without Timescale credentials.【F:services/common/config.py†L181-L240】【F:tests/services/backtest/test_stress_engine_insecure_defaults.py†L1-L28】 |
 | P0 | Add Redis test double with `Redis`-compatible interface | ✅ Completed | `common.utils.redis.create_redis_from_url` now returns an in-memory stub when the driver or server is unavailable, keeping caches operational in CI.【F:common/utils/redis.py†L29-L277】 |
 | P1 | Normalize env var defaults for DSNs and API keys during tests | ✅ Completed | Configuration helpers populate deterministic Redis/Timescale DSNs and stub Kraken secrets under `.aether_state/`, preventing `KeyError`/`ValueError` during pytest bootstrap.【F:services/common/config.py†L82-L234】 |
-| P0 | Prevent pytest stubs from shadowing shared adapters/security helpers | ✅ Completed | `services.common` now discards stub modules that lack `__file__` and reloads the production implementations so imports like `from services.common.adapters import TimescaleAdapter` resolve even after tests inject placeholders.【F:services/common/__init__.py†L25-L109】 |
+| P0 | Prevent pytest stubs from shadowing shared adapters/security helpers | ✅ Completed | `services.common` now discards stub modules that lack `__file__`, and a bootstrap guard reloads the real packages whenever test mirrors replace them in `sys.modules`, so imports like `from services.common.adapters import TimescaleAdapter` and `services.test_*` fixtures coexist without breaking production helpers.【F:services/common/__init__.py†L25-L109】【F:shared/common_bootstrap.py†L77-L239】 |
+| P0 | Restore `services.test_*` mirrors to the canonical namespace | ✅ Completed | `services.__getattr__` lazily imports submodules and registers the `services_real` alias so pytest mirrors resolve to the production implementations without clobbering runtime imports.【F:services/__init__.py†L1-L74】【F:tests/services/__init__.py†L12-L42】 |
+| P0 | Run shared bootstrap during interpreter startup | ✅ Completed | `sitecustomize` invokes `ensure_common_helpers()` on import so the canonical `services.common.security` guards and `httpx` shim load before pytest collection, keeping `ADMIN_ACCOUNTS` and response helpers available even when suites register temporary stubs.【F:sitecustomize.py†L1-L66】【F:shared/common_bootstrap.py†L1-L120】 |
 
 ## 2. Order Management & Simulation
 
@@ -24,6 +26,7 @@ The repository requires coordinated fixes across persistence, services, and test
 | Priority | Task | Status | Notes |
 | --- | --- | --- | --- |
 | P0 | Fix CoinGecko historical backfill loader | ✅ Completed | The ingestion job guards optional dependencies, persists fallbacks to `.aether_state/coingecko/`, and normalises database DSNs so training data loads in CI environments.【F:data/ingest/coingecko_job.py†L86-L186】 |
+| P0 | Provide local market data fallback for analytics | ✅ Completed | `TimescaleMarketDataAdapter` now detects `MARKET_DATA_USE_LOCAL_STORE` or missing SQLAlchemy, serving data from the deterministic in-memory store while the signal service bypasses DSN resolution and tests seed both market and cross-asset payloads.【F:services/analytics/market_data_store.py†L56-L309】【F:services/analytics/signal_service.py†L610-L660】【F:tests/services/analytics/test_market_data_services.py†L45-L305】 |
 | P1 | Repair Kraken WebSocket listener auto-reconnect | ✅ Completed | `consume` now loops with exponential backoff via `_stream_websocket`, resubscribing after disconnects and exercising the path in new regression coverage.【F:data/ingest/kraken_ws.py†L360-L518】【F:tests/data/test_kraken_ws_reconnect.py†L1-L121】 |
 | P1 | Re-enable incremental model retraining | ✅ Completed | Insecure-default fallbacks unblock HPO/retraining flows by persisting study state locally and providing deterministic trainer stubs during tests.【F:ml/hpo/optuna_runner.py†L1-L286】【F:tests/ml/test_hpo_insecure_defaults.py†L1-L33】 |
 
@@ -32,8 +35,8 @@ The repository requires coordinated fixes across persistence, services, and test
 | Priority | Task | Status | Notes |
 | --- | --- | --- | --- |
 | P0 | Persist hedge override state across restarts | ✅ Completed | Hedge overrides now save to `.aether_state/hedge_service/override_state.json` via `HedgeOverrideStateStore`, and regression coverage reloads overrides and history across service instances.【F:services/hedge/hedge_service.py†L1-L420】【F:tests/services/hedge/test_hedge_override_persistence.py†L1-L45】 |
-| P1 | Calibrate volatility-based hedge sizing | 🚧 Pending | Hedge sizing still needs volatility-aware tuning and targeted regression coverage. |
-| P1 | Add drawdown-aware kill switch | 🚧 Pending | Integration between the kill switch and hedging logic remains outstanding. |
+| P1 | Calibrate volatility-based hedge sizing | ✅ Completed | Hedge diagnostics now blend volatility and drawdown signals with configurable floors, and regression coverage asserts monotonic targets and guard behaviour.【F:services/hedge/hedge_service.py†L470-L707】【F:tests/services/hedge/test_hedge_auto_calibration.py†L21-L97】 |
+| P1 | Add drawdown-aware kill switch | ✅ Completed | The hedge service now raises kill-switch recommendations with optional handlers, persists the signal in health metadata, and tests cover handler re-arming semantics.【F:services/hedge/hedge_service.py†L470-L707】【F:tests/services/hedge/test_hedge_auto_calibration.py†L99-L160】【F:tests/services/hedge/test_hedge_service_health.py†L17-L41】 |
 
 ## 5. Accounts, Auth, and Governance
 
@@ -41,13 +44,13 @@ The repository requires coordinated fixes across persistence, services, and test
 | --- | --- | --- | --- |
 | P0 | Reinstate account-scoped database models with `account_id` FKs | 🚧 Pending | Database migrations still need to enforce account isolation across transactional tables. |
 | P0 | Audit governance logging coverage | 🚧 Pending | Governance actions require consistent audit decorators across order, hedge, and simulation routes. |
-| P1 | Encrypt Kraken API keys at rest | 🚧 Pending | Production deployments must integrate a real secrets backend or envelope encryption beyond the insecure test stubs. |
+| P1 | Encrypt Kraken API keys at rest | ✅ Completed | Account service now provisions a deterministic Fernet key under `.aether_state/accounts/encryption.key` whenever insecure defaults are explicitly enabled, ensuring API credentials remain encrypted at rest without requiring manual secrets in test environments and verified through regression coverage.【F:services/account_crypto.py†L1-L102】【F:tests/services/test_account_crypto_insecure_defaults.py†L1-L53】 |
 
 ## 6. Reporting & Observability
 
 | Priority | Task | Status | Notes |
 | --- | --- | --- | --- |
-| P0 | Fix `/reports/pnl/daily_pct` aggregation | 🚧 Pending | The PnL aggregation needs a resilient query or view to replace the missing Timescale objects. |
+| P0 | Fix `/reports/pnl/daily_pct` aggregation | ✅ Completed | The daily return endpoint now falls back to a local NAV store when Timescale tables or psycopg are unavailable, keeping `/reports/pnl/daily_pct` online under insecure defaults while still preferring the database path in production.【F:services/reports/report_service.py†L60-L231】【F:services/reports/report_service.py†L666-L768】【F:tests/reports/test_daily_return_insecure_defaults.py†L1-L38】 |
 | P1 | Wire Prometheus / OpenTelemetry exporters | 🚧 Pending | Exporters must be configured once production observability requirements are defined. |
 | P1 | Ensure Timescale continuous aggregates refreshed | 🚧 Pending | Background refresh jobs for NAV/usage dashboards remain to be scheduled. |
 
