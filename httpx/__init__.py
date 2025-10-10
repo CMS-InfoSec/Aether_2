@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 from urllib.parse import parse_qsl, urljoin, urlparse
 
 try:  # pragma: no cover - prefer the real TestClient if FastAPI is installed
@@ -17,9 +18,11 @@ except Exception:  # pragma: no cover - defensive fallback
 __all__ = [
     "ASGITransport",
     "AsyncClient",
+    "BaseTransport",
     "Client",
     "HTTPError",
     "HTTPStatusError",
+    "MockTransport",
     "Request",
     "RequestError",
     "Response",
@@ -144,7 +147,22 @@ class Response:
             )
 
 
-class ASGITransport:
+class BaseTransport:
+    """Base transport interface used by the lightweight ``httpx`` shim."""
+
+    async def handle_async_request(
+        self,
+        method: str,
+        url: str,
+        *,
+        json: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Response:
+        raise NotImplementedError
+
+
+class ASGITransport(BaseTransport):
     """Bridge that routes requests into a FastAPI-style application."""
 
     def __init__(self, *, app: Any) -> None:
@@ -187,6 +205,30 @@ class ASGITransport:
         return Response(response.status_code, json_data=response.json(), request=request)
 
 
+class MockTransport(BaseTransport):
+    """Transport that routes requests into a user-provided handler."""
+
+    def __init__(self, handler: Callable[[Request], Response | Awaitable[Response]]) -> None:
+        self._handler = handler
+
+    async def handle_async_request(
+        self,
+        method: str,
+        url: str,
+        *,
+        json: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Response:
+        request = Request(method, url, headers=headers, params=params)
+        result = self._handler(request)
+        if inspect.isawaitable(result):  # pragma: no cover - async handlers are rare
+            result = await result
+        if not isinstance(result, Response):
+            raise TypeError("MockTransport handler must return an httpx.Response")
+        return result
+
+
 def _combine_url(url: str, params: Optional[Dict[str, Any]]) -> tuple[str, Dict[str, Any]]:
     parsed = urlparse(url)
     query = {key: value for key, value in parse_qsl(parsed.query, keep_blank_values=True)}
@@ -203,7 +245,7 @@ class AsyncClient:
         self,
         *,
         base_url: str | None = None,
-        transport: ASGITransport | None = None,
+        transport: BaseTransport | None = None,
         timeout: float | Timeout | None = None,
     ) -> None:
         self.base_url = (base_url or "").rstrip("/")
@@ -277,7 +319,7 @@ class Client:
         self,
         *,
         base_url: str | None = None,
-        transport: ASGITransport | None = None,
+        transport: BaseTransport | None = None,
         timeout: float | Timeout | None = None,
     ) -> None:
         self._async_client = AsyncClient(

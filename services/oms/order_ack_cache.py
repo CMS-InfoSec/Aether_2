@@ -10,6 +10,10 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any, Protocol
 
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
 from services.common.config import get_redis_client
 
 

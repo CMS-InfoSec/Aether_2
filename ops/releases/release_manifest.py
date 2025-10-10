@@ -65,9 +65,39 @@ except ImportError:  # pragma: no cover - optional dependency
 LOGGER = logging.getLogger("ops.release_manifest")
 _SQLITE_FALLBACK_FLAG = "CONFIG_ALLOW_SQLITE_FOR_TESTS"
 _RELEASE_SQLITE_FLAG = "RELEASE_MANIFEST_ALLOW_SQLITE_FOR_TESTS"
+_INSECURE_DEFAULTS_FLAG = "RELEASE_MANIFEST_ALLOW_INSECURE_DEFAULTS"
+_STATE_DIR_ENV = "AETHER_STATE_DIR"
+_STATE_SUBDIR = "release_manifest"
+
+
+def _insecure_defaults_enabled() -> bool:
+    return os.getenv(_INSECURE_DEFAULTS_FLAG) == "1" or bool(os.getenv("PYTEST_CURRENT_TEST"))
+
+
+def _state_root() -> Path:
+    base = Path(os.getenv(_STATE_DIR_ENV, ".aether_state"))
+    root = base / _STATE_SUBDIR
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _local_store_path() -> Path:
+    return _state_root() / "manifests.json"
+
+
+def _local_artifact_path(kind: str) -> Path:
+    directory = _state_root() / kind
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _using_local_store() -> bool:
+    return (not _SQLALCHEMY_AVAILABLE or os.getenv("RELEASE_MANIFEST_FORCE_LOCAL", "0") == "1") and _insecure_defaults_enabled()
 
 
 def _require_sqlalchemy(feature: str) -> None:
+    if _using_local_store():
+        return
     if not _SQLALCHEMY_AVAILABLE:
         raise RuntimeError(f"{feature} requires SQLAlchemy to be installed")
 
@@ -77,6 +107,9 @@ def _resolve_release_db_url() -> str:
 
     raw_url = os.getenv("RELEASE_MANIFEST_DATABASE_URL") or os.getenv("RELEASE_DATABASE_URL")
     if not raw_url:
+        if _insecure_defaults_enabled():
+            fallback_path = _state_root() / "release_manifest.db"
+            return f"sqlite:///{fallback_path}"
         raise RuntimeError(
             "RELEASE_MANIFEST_DATABASE_URL (or legacy RELEASE_DATABASE_URL) must be configured with a "
             "PostgreSQL/Timescale connection URI."
@@ -108,6 +141,9 @@ DEFAULT_RELEASE_DB_URL = _resolve_release_db_url()
 def _require_config_db_url() -> str:
     url = os.getenv("CONFIG_DATABASE_URL")
     if not url:
+        if _insecure_defaults_enabled():
+            fallback = _state_root() / "config_versions.db"
+            return f"sqlite:///{fallback}"
         raise RuntimeError(
             "CONFIG_DATABASE_URL must be set to collect configs for release manifests."
         )
@@ -318,6 +354,9 @@ def collect_model_versions(root: Path = DEFAULT_MODELS_DIR) -> Dict[str, str]:
 def collect_config_versions(database_url: str = DEFAULT_CONFIG_DB_URL) -> Dict[str, str]:
     """Fetch configuration versions from the config service database."""
 
+    if _using_local_store():
+        return {}
+
     if not _SQLALCHEMY_AVAILABLE:
         LOGGER.warning(
             "SQLAlchemy is unavailable; skipping config version collection for release manifests.",
@@ -366,6 +405,73 @@ def collect_config_versions(database_url: str = DEFAULT_CONFIG_DB_URL) -> Dict[s
 # ---------------------------------------------------------------------------
 
 
+def _load_local_store() -> Dict[str, Any]:
+    path = _local_store_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):  # pragma: no cover - corrupted state
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def _save_local_store(data: Dict[str, Any]) -> None:
+    payload = dict(data)
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+    _local_store_path().write_text(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def _persist_local_manifest(manifest: Manifest) -> Manifest:
+    store = _load_local_store()
+    manifests = store.get("manifests")
+    if not isinstance(manifests, dict):
+        manifests = {}
+    manifests[manifest.manifest_id] = manifest.to_dict()
+    store["manifests"] = manifests
+    _save_local_store(store)
+    return manifest
+
+
+def _fetch_local_manifest(manifest_id: str) -> Optional[Manifest]:
+    store = _load_local_store()
+    manifests = store.get("manifests")
+    if not isinstance(manifests, dict):
+        return None
+    entry = manifests.get(manifest_id)
+    if not isinstance(entry, dict):
+        return None
+    payload = _normalise_payload(entry.get("payload"))
+    ts_raw = entry.get("ts")
+    try:
+        ts = datetime.fromisoformat(ts_raw) if isinstance(ts_raw, str) else datetime.now(timezone.utc)
+    except ValueError:  # pragma: no cover - corrupted timestamp
+        ts = datetime.now(timezone.utc)
+    return Manifest(
+        manifest_id=str(entry.get("manifest_id", manifest_id)),
+        payload=payload,
+        manifest_hash=str(entry.get("manifest_hash", "")),
+        ts=ts,
+    )
+
+
+def _list_local_manifests(limit: Optional[int] = None) -> List[Manifest]:
+    store = _load_local_store()
+    manifests = store.get("manifests")
+    if not isinstance(manifests, dict):
+        return []
+    entries = [
+        _fetch_local_manifest(manifest_id)
+        for manifest_id in sorted(manifests.keys(), reverse=True)
+    ]
+    filtered = [manifest for manifest in entries if manifest is not None]
+    if limit is not None:
+        return filtered[:limit]
+    return filtered
+
+
 def create_manifest(
     manifest_id: Optional[str] = None,
     services_dir: Path = DEFAULT_SERVICES_DIR,
@@ -387,8 +493,11 @@ def create_manifest(
     return Manifest(manifest_id=manifest_id, payload=payload, manifest_hash=manifest_hash, ts=ts)
 
 
-def save_manifest(session: Session, manifest: Manifest) -> Manifest:
+def save_manifest(session: Session | None, manifest: Manifest) -> Manifest:
     """Persist the manifest to the releases table."""
+
+    if _using_local_store():
+        return _persist_local_manifest(manifest)
 
     _require_sqlalchemy("Saving release manifests")
 
@@ -409,7 +518,10 @@ def save_manifest(session: Session, manifest: Manifest) -> Manifest:
     )
 
 
-def fetch_manifest(session: Session, manifest_id: str) -> Optional[Manifest]:
+def fetch_manifest(session: Session | None, manifest_id: str) -> Optional[Manifest]:
+    if _using_local_store():
+        return _fetch_local_manifest(manifest_id)
+
     _require_sqlalchemy("Fetching release manifests")
 
     record: Optional[ReleaseRecord] = session.get(ReleaseRecord, manifest_id)
@@ -423,7 +535,10 @@ def fetch_manifest(session: Session, manifest_id: str) -> Optional[Manifest]:
     )
 
 
-def list_manifests(session: Session, limit: Optional[int] = None) -> List[Manifest]:
+def list_manifests(session: Session | None, limit: Optional[int] = None) -> List[Manifest]:
+    if _using_local_store():
+        return _list_local_manifests(limit)
+
     _require_sqlalchemy("Listing release manifests")
 
     stmt = select(ReleaseRecord).order_by(ReleaseRecord.ts.desc())
@@ -485,6 +600,13 @@ def write_manifest_artifacts(
     markdown_path: Path = DEFAULT_MARKDOWN_OUTPUT,
     hash_path: Path = DEFAULT_HASH_OUTPUT,
 ) -> None:
+    if _using_local_store():
+        if json_path == DEFAULT_JSON_OUTPUT:
+            json_path = _local_artifact_path("json") / json_path.name
+        if markdown_path == DEFAULT_MARKDOWN_OUTPUT:
+            markdown_path = _local_artifact_path("markdown") / markdown_path.name
+        if hash_path == DEFAULT_HASH_OUTPUT:
+            hash_path = _local_artifact_path("hash") / hash_path.name
     try:
         json_path.write_text(manifest_to_json(manifest))
     except OSError:  # pragma: no cover - filesystem failure
@@ -579,10 +701,12 @@ def verify_release_manifest_by_id(
 ) -> Tuple[Manifest, List[str]]:
     """Fetch a stored manifest and compare it with the live environment."""
 
-    _require_sqlalchemy("Verifying release manifests from the database")
-
-    with session_factory() as session:
-        manifest = fetch_manifest(session, manifest_id)
+    if _using_local_store():
+        manifest = _fetch_local_manifest(manifest_id)
+    else:
+        _require_sqlalchemy("Verifying release manifests from the database")
+        with session_factory() as session:
+            manifest = fetch_manifest(session, manifest_id)
 
     if manifest is None:
         raise LookupError(f"Manifest '{manifest_id}' was not found")
@@ -602,8 +726,6 @@ def verify_release_manifest_by_id(
 
 
 def create_command(args: argparse.Namespace) -> int:
-    _require_sqlalchemy("The release manifest 'create' command")
-
     manifest = create_manifest(
         manifest_id=args.id,
         services_dir=Path(args.services_dir),
@@ -611,10 +733,15 @@ def create_command(args: argparse.Namespace) -> int:
         config_db_url=args.config_db,
     )
 
-    with SessionLocal() as session:
-        if fetch_manifest(session, manifest.manifest_id):
+    if _using_local_store():
+        if fetch_manifest(None, manifest.manifest_id):
             raise SystemExit(f"Manifest '{manifest.manifest_id}' already exists")
-        manifest = save_manifest(session, manifest)
+        manifest = save_manifest(None, manifest)
+    else:
+        with SessionLocal() as session:
+            if fetch_manifest(session, manifest.manifest_id):
+                raise SystemExit(f"Manifest '{manifest.manifest_id}' already exists")
+            manifest = save_manifest(session, manifest)
 
     write_manifest_artifacts(
         manifest,
@@ -627,17 +754,17 @@ def create_command(args: argparse.Namespace) -> int:
 
 
 def list_command(args: argparse.Namespace) -> int:
-    _require_sqlalchemy("The release manifest 'list' command")
-
-    with SessionLocal() as session:
-        manifests = list_manifests(session, args.limit)
+    if _using_local_store():
+        manifests = list_manifests(None, args.limit)
+    else:
+        _require_sqlalchemy("The release manifest 'list' command")
+        with SessionLocal() as session:
+            manifests = list_manifests(session, args.limit)
     print(json.dumps([m.to_dict() for m in manifests], indent=2, sort_keys=True))
     return 0
 
 
 def verify_command(args: argparse.Namespace) -> int:
-    _require_sqlalchemy("The release manifest 'verify' command")
-
     try:
         _, mismatches = verify_release_manifest_by_id(
             args.id,
