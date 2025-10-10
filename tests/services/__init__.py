@@ -15,7 +15,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 _REAL_SPEC = importlib.util.spec_from_file_location(
-    "services_real",
+    "services",
     _SERVICES_DIR / "__init__.py",
     submodule_search_locations=[str(_SERVICES_DIR)],
 )
@@ -23,10 +23,10 @@ _REAL_SPEC = importlib.util.spec_from_file_location(
 _REAL_SERVICES = None
 if _REAL_SPEC is not None and _REAL_SPEC.loader is not None:
     module = importlib.util.module_from_spec(_REAL_SPEC)
-    sys.modules["services_real"] = module
     _REAL_SPEC.loader.exec_module(module)
     _REAL_SERVICES = module  # type: ignore[assignment]
     sys.modules["services"] = module
+    sys.modules.setdefault("services_real", module)
     globals().update(module.__dict__)
     __path__ = list(module.__path__)  # type: ignore[assignment]
 

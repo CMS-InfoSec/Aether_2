@@ -18,9 +18,12 @@ expected resolution order.
 
 from __future__ import annotations
 
+import importlib
 from importlib.machinery import ModuleSpec
 from pathlib import Path
 from typing import Iterable
+
+from types import ModuleType
 
 import sys
 
@@ -46,3 +49,17 @@ if spec is not None:
 
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
+
+sys.modules.setdefault("services_real", sys.modules[__name__])
+
+
+def __getattr__(name: str) -> ModuleType:
+    """Lazily import ``services.<name>`` and cache the submodule."""
+
+    fullname = f"{__name__}.{name}"
+    try:
+        module = importlib.import_module(fullname)
+    except ModuleNotFoundError as exc:  # pragma: no cover - mirror module absent
+        raise AttributeError(name) from exc
+    setattr(sys.modules[__name__], name, module)
+    return module
