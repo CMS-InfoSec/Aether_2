@@ -422,6 +422,8 @@ class BaseModel:
 
     @staticmethod
     def _coerce_value(annotation: Any, value: Any) -> Any:
+        if value is Ellipsis:
+            raise ValidationError("Field required")
         if annotation is None:
             return value
 

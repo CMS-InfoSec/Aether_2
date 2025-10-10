@@ -120,6 +120,7 @@ class _ParameterMarker:
         query_params: Dict[str, Any],
         path_params: Dict[str, Any],
         name: str,
+        body: Any,
     ) -> Any:
         return self.default
 
@@ -131,6 +132,7 @@ class _HeaderParameter(_ParameterMarker):
         query_params: Dict[str, Any],
         path_params: Dict[str, Any],
         name: str,
+        body: Any,
     ) -> Any:
         header_name = (self.alias or name).lower()
         return request.headers.get(header_name, self.default)
@@ -143,6 +145,7 @@ class _QueryParameter(_ParameterMarker):
         query_params: Dict[str, Any],
         path_params: Dict[str, Any],
         name: str,
+        body: Any,
     ) -> Any:
         key = self.alias or name
         return query_params.get(key, self.default)
@@ -155,9 +158,22 @@ class _PathParameter(_ParameterMarker):
         query_params: Dict[str, Any],
         path_params: Dict[str, Any],
         name: str,
+        body: Any,
     ) -> Any:
         key = self.alias or name
         return path_params.get(key, self.default)
+
+
+class _BodyParameter(_ParameterMarker):
+    def resolve(
+        self,
+        request: "Request",
+        query_params: Dict[str, Any],
+        path_params: Dict[str, Any],
+        name: str,
+        body: Any,
+    ) -> Any:
+        return body
 
 
 def _coerce_value(annotation: Any, value: Any) -> Any:
@@ -220,7 +236,7 @@ def Depends(dependency: Callable[..., Any] | None) -> _Dependency:
 
 
 def Body(default: Any = None, *_: Any, **__: Any) -> _ParameterMarker:
-    return _ParameterMarker(default)
+    return _BodyParameter(default)
 
 
 def Query(default: Any = None, *_: Any, alias: Optional[str] = None, **__: Any) -> _QueryParameter:
@@ -802,7 +818,7 @@ async def _call_endpoint(
             continue
 
         if isinstance(default, _ParameterMarker):
-            value = default.resolve(request, query_params, path_params, name)
+            value = default.resolve(request, query_params, path_params, name, body)
             resolved_kwargs[name] = _coerce_value(annotation, value)
             continue
 

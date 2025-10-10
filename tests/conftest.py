@@ -19,6 +19,13 @@ from urllib.parse import parse_qsl, urlparse, urlunparse
 import pytest
 
 try:
+    from shared.common_bootstrap import ensure_common_helpers
+except Exception:  # pragma: no cover - shared helpers may be unavailable in some suites
+    ensure_common_helpers = None  # type: ignore[assignment]
+else:
+    ensure_common_helpers()
+
+try:
     from services.oms import order_ack_cache as _order_ack_cache
 except Exception:  # pragma: no cover - services module may be unavailable in some suites
     _order_ack_cache = None  # type: ignore[assignment]
