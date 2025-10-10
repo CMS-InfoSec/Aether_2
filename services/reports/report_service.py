@@ -48,6 +48,11 @@ except ImportError:  # pragma: no cover - gracefully degrade when psycopg2 absen
 
 from shared.common_bootstrap import ensure_common_helpers
 
+try:  # pragma: no cover - used to mirror top-level helpers when available
+    import report_service as _root_report_service  # type: ignore
+except ImportError:  # pragma: no cover - fall back to local implementations
+    _root_report_service = None  # type: ignore[assignment]
+
 ensure_common_helpers()
 
 from services.common.config import TimescaleSession, get_timescale_session
@@ -1405,3 +1410,44 @@ __all__ = [
     "reset_daily_report_service_cache",
     "compute_daily_return_pct",
 ]
+def _query_dataframe(conn: Any, query: str, params: Mapping[str, Any]):
+    """Proxy to the canonical implementation when available."""
+
+    if _root_report_service is not None and hasattr(
+        _root_report_service, "_query_dataframe"
+    ):
+        return _root_report_service._query_dataframe(conn, query, params)
+    raise RuntimeError("_query_dataframe is not available without the root report_service module")
+
+
+def _proxy_root_function(name: str):
+    def _wrapper(*args, **kwargs):
+        if _root_report_service is None:
+            raise RuntimeError(f"{name} is unavailable without the root report_service module")
+        target = getattr(_root_report_service, name)
+        has_original = hasattr(_root_report_service, "_query_dataframe")
+        original = getattr(_root_report_service, "_query_dataframe", None)
+        try:
+            setattr(_root_report_service, "_query_dataframe", _query_dataframe)
+            return target(*args, **kwargs)
+        finally:
+            if has_original:
+                setattr(_root_report_service, "_query_dataframe", original)
+            else:
+                delattr(_root_report_service, "_query_dataframe")
+
+    _wrapper.__name__ = name
+    return _wrapper
+
+
+if _root_report_service is not None:
+    for _name in (
+        "_daily_fill_summary",
+        "_daily_pnl_summary",
+        "_daily_risk_summary",
+        "_merge_daily_components",
+        "_normalize_timestamp",
+        "_filter_spot_instruments",
+    ):
+        if hasattr(_root_report_service, _name):
+            globals()[_name] = _proxy_root_function(_name)
