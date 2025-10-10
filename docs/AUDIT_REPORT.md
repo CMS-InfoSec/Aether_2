@@ -47,7 +47,7 @@ The repository requires coordinated fixes across persistence, services, and test
 
 | Priority | Task | Status | Notes |
 | --- | --- | --- | --- |
-| P0 | Fix `/reports/pnl/daily_pct` aggregation | 🚧 Pending | The PnL aggregation needs a resilient query or view to replace the missing Timescale objects. |
+| P0 | Fix `/reports/pnl/daily_pct` aggregation | ✅ Completed | The daily return endpoint now falls back to a local NAV store when Timescale tables or psycopg are unavailable, keeping `/reports/pnl/daily_pct` online under insecure defaults while still preferring the database path in production.【F:services/reports/report_service.py†L60-L231】【F:services/reports/report_service.py†L666-L768】【F:tests/reports/test_daily_return_insecure_defaults.py†L1-L38】 |
 | P1 | Wire Prometheus / OpenTelemetry exporters | 🚧 Pending | Exporters must be configured once production observability requirements are defined. |
 | P1 | Ensure Timescale continuous aggregates refreshed | 🚧 Pending | Background refresh jobs for NAV/usage dashboards remain to be scheduled. |
 
