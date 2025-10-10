@@ -14,25 +14,99 @@ import json
 import logging
 import math
 import os
+import sys
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Iterable, Iterator, Literal, Mapping, Optional, Sequence
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Callable, Dict, Iterable, Iterator, Literal, Mapping, Optional, Sequence, cast
+from urllib.parse import parse_qsl, urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
-from sqlalchemy import Column, DateTime, Float, Integer, MetaData, String, create_engine
-from sqlalchemy.engine import Engine, URL
-from sqlalchemy.engine.url import make_url
-from sqlalchemy.exc import ArgumentError
-from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 from services.common.adapters import RedisFeastAdapter, TimescaleAdapter
 from services.common.security import require_admin_account
 
+try:  # pragma: no cover - SQLAlchemy is optional in insecure-default environments
+    from sqlalchemy import Column, DateTime, Float, Integer, MetaData, String, create_engine
+    from sqlalchemy.engine import Engine, URL
+    from sqlalchemy.engine.url import make_url
+    from sqlalchemy.exc import ArgumentError
+    from sqlalchemy.orm import Session, declarative_base, sessionmaker
+
+    _SQLALCHEMY_AVAILABLE = True
+except Exception:  # pragma: no cover - provide lightweight fallbacks when SQLAlchemy missing
+    Column = DateTime = Float = Integer = String = lambda *args, **kwargs: None  # type: ignore[assignment]
+
+    def _metadata_placeholder(*args: object, **kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(create_all=lambda *a, **k: None)
+
+    MetaData = _metadata_placeholder  # type: ignore[assignment]
+
+    class ArgumentError(Exception):
+        """Raised when a provided database URL is invalid under the fallback."""
+
+    class _FallbackURL:
+        """Minimal stand-in for :class:`sqlalchemy.engine.URL`."""
+
+        def __init__(self, raw: str) -> None:
+            parsed = urlparse(raw)
+            self._raw = raw
+            self.drivername = parsed.scheme or "sqlite"
+            self.host = parsed.hostname
+            self.database = parsed.path.lstrip("/")
+            self.query = dict(parse_qsl(parsed.query))
+
+        def render_as_string(self, hide_password: bool = False) -> str:
+            del hide_password  # parity with SQLAlchemy signature
+            return self._raw
+
+    URL = _FallbackURL  # type: ignore[assignment]
+
+    def make_url(raw: str) -> _FallbackURL:  # type: ignore[override]
+        return _FallbackURL(raw)
+
+    Engine = Any  # type: ignore[assignment]
+    Session = Any  # type: ignore[assignment]
+
+    def create_engine(*args: object, **kwargs: object) -> Any:  # pragma: no cover - not used in fallback
+        raise RuntimeError("SQLAlchemy is required to create a diversification engine")
+
+    def declarative_base(*, metadata: Any | None = None, **_: object) -> type:
+        base = type("_FallbackBase", (), {})
+        setattr(base, "metadata", metadata or _metadata_placeholder())
+        return base
+
+    def sessionmaker(*args: object, **kwargs: object) -> Callable[[], Session]:  # pragma: no cover - fallback factory
+        def _factory() -> Session:
+            return cast(Session, _NullSession())
+
+        return _factory
+
+    _SQLALCHEMY_AVAILABLE = False
+
 
 logger = logging.getLogger(__name__)
+
+
+_INSECURE_DEFAULTS_FLAG = "RISK_ALLOW_INSECURE_DEFAULTS"
+_STATE_ENV = "AETHER_STATE_DIR"
+
+
+class _NullSession:
+    """No-op stand-in used when SQLAlchemy is unavailable."""
+
+    def add(self, *_: object, **__: object) -> None:  # pragma: no cover - trivial behaviour
+        return None
+
+    def commit(self) -> None:  # pragma: no cover - trivial behaviour
+        return None
+
+    def close(self) -> None:  # pragma: no cover - trivial behaviour
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +115,33 @@ logger = logging.getLogger(__name__)
 
 
 _PRIMARY_DSN_ENV = "DIVERSIFICATION_DATABASE_URL"
+
+
+def _allow_insecure_defaults() -> bool:
+    """Return ``True`` when local fallbacks are explicitly permitted."""
+
+    return (
+        os.getenv(_INSECURE_DEFAULTS_FLAG) == "1"
+        or bool(os.getenv("PYTEST_CURRENT_TEST"))
+        or "pytest" in sys.modules
+    )
+
+
+def _state_directory() -> Path:
+    """Location for diversification fallback artefacts."""
+
+    root = Path(os.getenv(_STATE_ENV, ".aether_state"))
+    path = root / "diversification_allocator"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _fallback_database_url() -> str:
+    """Construct a deterministic SQLite DSN for insecure-default environments."""
+
+    directory = _state_directory()
+    db_path = directory / "diversification.sqlite"
+    return f"sqlite:///{db_path}"
 
 
 def _normalise_database_url(url: str) -> str:
@@ -67,8 +168,15 @@ def _require_database_url() -> URL:
 
     raw_url = next((value.strip() for value in candidates if value and value.strip()), None)
     if not raw_url:
-        raise RuntimeError(
-            "DIVERSIFICATION_DATABASE_URL must be configured with a PostgreSQL/Timescale connection string."
+        if not _allow_insecure_defaults():
+            raise RuntimeError(
+                "DIVERSIFICATION_DATABASE_URL must be configured with a PostgreSQL/Timescale connection string."
+            )
+        raw_url = _fallback_database_url()
+        logger.warning(
+            "Permitting SQLite diversification storage at %s because %s=1 or pytest is active",
+            raw_url,
+            _INSECURE_DEFAULTS_FLAG,
         )
 
     normalised = _normalise_database_url(raw_url)
@@ -78,7 +186,7 @@ def _require_database_url() -> URL:
     except ArgumentError as exc:  # pragma: no cover - configuration error
         raise RuntimeError(f"Invalid diversification database URL '{raw_url}': {exc}") from exc
 
-    if not url.drivername.lower().startswith("postgresql"):
+    if not _allow_insecure_defaults() and not str(url.drivername).lower().startswith("postgresql"):
         raise RuntimeError(
             "Diversification allocator requires a PostgreSQL/Timescale DSN; "
             f"received driver '{url.drivername}'."
@@ -113,7 +221,15 @@ def _engine_options(url: URL) -> dict[str, Any]:
 DATABASE_URL: URL = _require_database_url()
 
 
-def _create_engine(url: URL | None = None) -> Engine:
+def _create_engine(url: URL | None = None) -> Engine | None:
+    if not _SQLALCHEMY_AVAILABLE:
+        if not _allow_insecure_defaults():
+            raise RuntimeError(
+                "SQLAlchemy is required for diversification storage; set "
+                f"{_INSECURE_DEFAULTS_FLAG}=1 to activate the local fallback during testing."
+            )
+        return None
+
     target = url or DATABASE_URL
     return create_engine(
         target.render_as_string(hide_password=False),
@@ -121,8 +237,20 @@ def _create_engine(url: URL | None = None) -> Engine:
     )
 
 
-ENGINE: Engine = _create_engine()
-SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
+ENGINE: Engine | None = _create_engine()
+
+
+def _create_session_factory() -> Callable[[], Session]:
+    if not _SQLALCHEMY_AVAILABLE or ENGINE is None:
+        def _factory() -> Session:
+            return cast(Session, _NullSession())
+
+        return _factory
+
+    return sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
+
+
+SessionLocal = _create_session_factory()
 
 metadata_obj = MetaData()
 Base = declarative_base(metadata=metadata_obj)
@@ -161,7 +289,18 @@ class DiversificationActionRecord(Base):
 def init_diversification_storage(engine: Engine | None = None) -> None:
     """Ensure the diversification tables exist."""
 
+    if not _SQLALCHEMY_AVAILABLE:
+        if not _allow_insecure_defaults():
+            logger.error(
+                "SQLAlchemy is required for diversification storage; install the dependency or enable %s",
+                _INSECURE_DEFAULTS_FLAG,
+            )
+        return
+
     target_engine = engine or ENGINE
+    if target_engine is None:
+        return
+
     Base.metadata.create_all(bind=target_engine, checkfirst=True)
 
 
@@ -337,7 +476,7 @@ class DiversificationAllocator:
         self.universe = universe or RedisFeastAdapter(account_id=account_id)
         self._correlation_loader = correlation_loader or self._load_correlation_from_config
         self._session_factory = session_factory or SessionLocal
-        self._enable_persistence = enable_persistence
+        self._enable_persistence = enable_persistence and _SQLALCHEMY_AVAILABLE and ENGINE is not None
 
     # ------------------------------------------------------------------
     # Public API

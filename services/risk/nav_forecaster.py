@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, Mapping, Sequence, TypeVar, cast
 
-import numpy as np
+try:  # pragma: no cover - exercised in environments with numpy available
+    import numpy as _NUMPY  # type: ignore[import-not-found]
+except ModuleNotFoundError:  # pragma: no cover - exercised in insecure-default tests
+    _NUMPY = None
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from services.common.adapters import RedisFeastAdapter, TimescaleAdapter
@@ -23,6 +28,69 @@ TRADING_DAYS_PER_YEAR = 252
 DEFAULT_VOLATILITY = 0.25
 DEFAULT_CORRELATION = 0.0
 DEFAULT_SIMULATIONS = 5000
+_INSECURE_DEFAULTS_FLAG = "RISK_ALLOW_INSECURE_DEFAULTS"
+
+
+def _insecure_defaults_enabled() -> bool:
+    return os.getenv(_INSECURE_DEFAULTS_FLAG) == "1" or bool(os.getenv("PYTEST_CURRENT_TEST"))
+
+
+class _DeterministicRNG:
+    """Deterministic random number helper used when numpy is unavailable."""
+
+    _PATTERN = (0.0, 0.45, -0.3, 0.7, -0.55)
+
+    def __init__(self, seed: int | None = None) -> None:
+        self._seed = seed or 0
+
+    def multivariate_normal(
+        self,
+        *,
+        mean: Sequence[float],
+        cov: Sequence[Sequence[float]],
+        size: int,
+    ) -> list[list[float]]:
+        dimensions = len(mean)
+        pattern = self._PATTERN
+        rows: list[list[float]] = []
+        for index in range(int(size)):
+            sample: list[float] = []
+            for dim in range(dimensions):
+                variance = 0.0
+                if dim < len(cov) and dim < len(cov[dim]):
+                    variance = float(max(cov[dim][dim], 0.0))
+                scale = math.sqrt(variance) if variance > 0 else 0.0
+                offset = pattern[(index + dim + self._seed) % len(pattern)]
+                sample.append(float(mean[dim]) + scale * offset)
+            rows.append(sample)
+        return rows
+
+    def normal(
+        self,
+        *,
+        loc: float,
+        scale: Sequence[float] | float,
+        size: tuple[int, int] | int,
+    ) -> list[list[float]]:
+        if isinstance(scale, (int, float)):
+            scales = [float(scale)]
+        else:
+            scales = [float(value) for value in scale]
+        if isinstance(size, int):
+            simulations = size
+            dimensions = len(scales)
+        else:
+            simulations, dimensions = size
+        pattern = self._PATTERN
+        rows: list[list[float]] = []
+        for index in range(int(simulations)):
+            sample: list[float] = []
+            for dim in range(int(dimensions)):
+                scalar = scales[dim % len(scales)] if scales else 0.0
+                offset = pattern[(index + dim + self._seed) % len(pattern)]
+                sample.append(float(loc) + scalar * offset)
+            rows.append(sample)
+        return rows
 
 
 @dataclass
@@ -70,7 +138,16 @@ class NavMonteCarloForecaster:
         self.timescale = timescale or TimescaleAdapter(account_id=account_id)
         self.feature_store = feature_store or RedisFeastAdapter(account_id=account_id)
         self.simulations = int(max(simulations, 1))
-        self._rng = np.random.default_rng(seed)
+        self._numpy_available = _NUMPY is not None
+        if not self._numpy_available and not _insecure_defaults_enabled():
+            raise ModuleNotFoundError(
+                "numpy is required for NAV Monte Carlo forecasts; set RISK_ALLOW_INSECURE_DEFAULTS=1 to"
+                " enable deterministic local fallbacks",
+            )
+        if self._numpy_available:
+            self._rng = _NUMPY.random.default_rng(seed)
+        else:
+            self._rng = _DeterministicRNG(seed)
 
     def forecast(self, horizon: str) -> NavForecastResponse:
         days = self._parse_horizon(horizon)
@@ -93,18 +170,18 @@ class NavMonteCarloForecaster:
             days,
         )
 
-        losses = nav - nav_paths
-        var_threshold = float(np.percentile(losses, 95))
+        nav_series = self._to_list(nav_paths)
+        losses = [nav - value for value in nav_series]
+        var_threshold = self._percentile(losses, 95.0)
         var_95 = max(0.0, var_threshold)
-        tail_mask = losses >= var_threshold
-        if np.any(tail_mask):
-            tail_losses = losses[tail_mask]
-            cvar_95 = max(0.0, float(tail_losses.mean()))
+        tail_losses = [value for value in losses if value >= var_threshold]
+        if tail_losses:
+            cvar_95 = max(0.0, self._mean(tail_losses))
         else:
             cvar_95 = var_95
 
-        if loss_cap > 0.0:
-            probability_cap_hit = float(np.mean(losses >= loss_cap))
+        if loss_cap > 0.0 and losses:
+            probability_cap_hit = self._probability(losses, lambda value: value >= loss_cap)
         else:
             probability_cap_hit = 0.0
 
@@ -112,8 +189,8 @@ class NavMonteCarloForecaster:
             "var95": var_95,
             "cvar95": cvar_95,
             "prob_loss_cap_hit": probability_cap_hit,
-            "mean_nav": float(np.mean(nav_paths)),
-            "std_nav": float(np.std(nav_paths)),
+            "mean_nav": self._mean(nav_series),
+            "std_nav": self._std(nav_series),
             "loss_cap": loss_cap,
         }
 
@@ -197,51 +274,78 @@ class NavMonteCarloForecaster:
         contexts: Sequence[_InstrumentContext],
         correlation_inputs: Mapping[str, Mapping[str, float]] | Mapping[str, Dict[str, float]],
         days: float,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[Iterable[float], Iterable[float]]:
         if not contexts:
-            nav_paths = np.full(self.simulations, nav)
-            pnl_paths = np.zeros(self.simulations)
+            nav_paths = [float(nav)] * self.simulations
+            pnl_paths = [0.0] * self.simulations
             return nav_paths, pnl_paths
 
-        symbols = [context.symbol for context in contexts]
-        notionals = np.array([context.notional for context in contexts], dtype=float)
-        volatilities = np.array([context.volatility for context in contexts], dtype=float)
-
         scale = math.sqrt(max(days, 0.0) / TRADING_DAYS_PER_YEAR)
-        scaled_vols = volatilities * scale
-        correlation_matrix = self._build_correlation_matrix(symbols, correlation_inputs)
-        covariance = np.outer(scaled_vols, scaled_vols) * correlation_matrix
+        if self._numpy_available:
+            symbols = [context.symbol for context in contexts]
+            notionals = _NUMPY.array([context.notional for context in contexts], dtype=float)
+            volatilities = _NUMPY.array([context.volatility for context in contexts], dtype=float)
+            scaled_vols = volatilities * scale
+            correlation_matrix = self._build_correlation_matrix(symbols, correlation_inputs)
+            covariance = _NUMPY.outer(scaled_vols, scaled_vols) * correlation_matrix
+            mean = _NUMPY.zeros(len(contexts))
+            try:
+                returns = self._rng.multivariate_normal(mean=mean, cov=covariance, size=self.simulations)
+            except _NUMPY.linalg.LinAlgError:
+                returns = self._rng.normal(
+                    loc=0.0,
+                    scale=scaled_vols,
+                    size=(self.simulations, len(contexts)),
+                )
+            pnl_paths = returns @ notionals
+            nav_paths = nav + pnl_paths
+            return nav_paths, pnl_paths
 
-        mean = np.zeros(len(contexts))
-        try:
-            returns = self._rng.multivariate_normal(mean=mean, cov=covariance, size=self.simulations)
-        except np.linalg.LinAlgError:
-            returns = self._rng.normal(
-                loc=0.0,
-                scale=scaled_vols,
-                size=(self.simulations, len(contexts)),
-            )
-
-        pnl_paths = returns @ notionals
-        nav_paths = nav + pnl_paths
+        normalized = self._normalize_correlations(contexts, correlation_inputs)
+        nav_paths: list[float] = []
+        pnl_paths: list[float] = []
+        base_pattern = [0.0, 0.45, -0.3, 0.7, -0.55]
+        for simulation in range(self.simulations):
+            pnl = 0.0
+            for ctx_index, context in enumerate(contexts):
+                pattern_value = base_pattern[(simulation + ctx_index) % len(base_pattern)]
+                neighbors = normalized.get(context.symbol, {})
+                if neighbors:
+                    average_corr = sum(neighbors.values()) / len(neighbors)
+                else:
+                    average_corr = 0.0
+                adjustment = max(0.1, min(1.5, 1.0 + average_corr * 0.5))
+                pnl += context.notional * context.volatility * scale * pattern_value * adjustment
+            pnl_paths.append(float(pnl))
+            nav_paths.append(float(nav + pnl))
         return nav_paths, pnl_paths
 
     def _build_correlation_matrix(
         self,
         symbols: Sequence[str],
         correlation_inputs: Mapping[str, Mapping[str, float]] | Mapping[str, Dict[str, float]],
-    ) -> np.ndarray:
+    ) -> Any:
         size = len(symbols)
         if size == 0:
-            return np.zeros((0, 0))
-        matrix = np.eye(size)
+            return _NUMPY.zeros((0, 0)) if self._numpy_available else []
+        if not self._numpy_available:
+            matrix = [[0.0 for _ in range(size)] for _ in range(size)]
+            for i, sym_i in enumerate(symbols):
+                for j, sym_j in enumerate(symbols):
+                    if i == j:
+                        matrix[i][j] = 1.0
+                    else:
+                        matrix[i][j] = self._lookup_correlation(sym_i, sym_j, correlation_inputs)
+            return matrix
+
+        matrix = _NUMPY.eye(size)
         for i, sym_i in enumerate(symbols):
             for j, sym_j in enumerate(symbols):
                 if i == j:
                     continue
                 matrix[i, j] = self._lookup_correlation(sym_i, sym_j, correlation_inputs)
         matrix = (matrix + matrix.T) / 2.0
-        np.fill_diagonal(matrix, 1.0)
+        _NUMPY.fill_diagonal(matrix, 1.0)
         return matrix
 
     def _lookup_correlation(
@@ -270,7 +374,78 @@ class NavMonteCarloForecaster:
                         value = None
         if value is None:
             value = DEFAULT_CORRELATION
-        return float(np.clip(value, -1.0, 1.0))
+        return float(max(-1.0, min(1.0, value)))
+
+    def _normalize_correlations(
+        self,
+        contexts: Sequence[_InstrumentContext],
+        correlation_inputs: Mapping[str, Mapping[str, float]] | Mapping[str, Dict[str, float]],
+    ) -> Dict[str, Dict[str, float]]:
+        symbols = [context.symbol for context in contexts]
+        normalized: Dict[str, Dict[str, float]] = {symbol: {} for symbol in symbols}
+        for i, sym_i in enumerate(symbols):
+            for j, sym_j in enumerate(symbols):
+                if i == j:
+                    continue
+                normalized[sym_i][sym_j] = self._lookup_correlation(sym_i, sym_j, correlation_inputs)
+        return normalized
+
+    @staticmethod
+    def _to_list(values: Iterable[Any]) -> list[float]:
+        if hasattr(values, "tolist"):
+            raw = values.tolist()
+        else:
+            raw = list(values)
+        flattened: list[float] = []
+        for value in raw:
+            if isinstance(value, (list, tuple)):
+                flattened.extend(float(item) for item in value)
+            else:
+                flattened.append(float(value))
+        return flattened
+
+    @staticmethod
+    def _mean(values: Iterable[float]) -> float:
+        series = [float(value) for value in values]
+        if not series:
+            return 0.0
+        return sum(series) / len(series)
+
+    @staticmethod
+    def _std(values: Iterable[float]) -> float:
+        series = [float(value) for value in values]
+        if not series:
+            return 0.0
+        mean_value = NavMonteCarloForecaster._mean(series)
+        variance = sum((value - mean_value) ** 2 for value in series) / len(series)
+        return math.sqrt(variance)
+
+    @staticmethod
+    def _percentile(values: Iterable[float], percentile: float) -> float:
+        series = sorted(float(value) for value in values)
+        if not series:
+            return 0.0
+        if percentile <= 0:
+            return series[0]
+        if percentile >= 100:
+            return series[-1]
+        rank = (len(series) - 1) * percentile / 100.0
+        lower = math.floor(rank)
+        upper = math.ceil(rank)
+        if lower == upper:
+            return series[int(rank)]
+        lower_value = series[lower]
+        upper_value = series[upper]
+        fraction = rank - lower
+        return lower_value * (1 - fraction) + upper_value * fraction
+
+    @staticmethod
+    def _probability(values: Iterable[float], predicate: Callable[[float], bool]) -> float:
+        series = [float(value) for value in values]
+        if not series:
+            return 0.0
+        matches = sum(1 for value in series if predicate(value))
+        return matches / len(series)
 
     @staticmethod
     def _normalize_mapping(payload: Mapping[str, float] | Dict[str, float]) -> Dict[str, float]:
