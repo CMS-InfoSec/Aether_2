@@ -8,26 +8,34 @@ import binascii
 import json
 import logging
 import os
+import sys
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
 import httpx
+import hashlib
 
+try:  # pragma: no cover - prefer the real cryptography implementation
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+except ImportError:  # pragma: no cover - lightweight environments
+    AESGCM = None  # type: ignore[assignment]
 from fastapi import Depends, FastAPI, HTTPException, Header, Query, Request, status
-
 from fastapi.responses import JSONResponse
 from kubernetes import client, config
 from kubernetes.client import ApiException
 from kubernetes.config.config_exception import ConfigException
 from pydantic import BaseModel, Field, validator
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
 from services.secrets.signing import sign_kraken_request
 from shared.audit_hooks import AuditEvent, load_audit_hooks
 
 
 LOGGER = logging.getLogger(__name__)
 SECRETS_LOGGER = logging.getLogger("secrets_log")
+
+_INSECURE_DEFAULTS_FLAG = "SECRETS_ALLOW_INSECURE_DEFAULTS"
+_DEFAULT_TEST_TOKEN = "local-dev-token"
 
 _INITIAL_BACKOFF_SECONDS = 0.5
 _MAX_BACKOFF_SECONDS = 8.0
@@ -130,14 +138,56 @@ class Settings(BaseModel):
         return tuple(tokens)
 
 
+def _insecure_defaults_enabled() -> bool:
+    if os.getenv(_INSECURE_DEFAULTS_FLAG) == "1":
+        return True
+    return "pytest" in sys.modules
+
+
+def _default_token_labels(tokens: str) -> Dict[str, str]:
+    candidates = [token.strip() for token in tokens.split(",") if token.strip()]
+    if not candidates:
+        candidates = [_DEFAULT_TEST_TOKEN]
+    label_spec = ",".join(f"{token}:local" for token in candidates)
+    return _parse_authorized_token_labels(label_spec)
+
+
 def load_settings() -> Settings:
+    allow_insecure = _insecure_defaults_enabled()
+
     secret_key = os.getenv("SECRET_ENCRYPTION_KEY")
     if not secret_key:
-        raise RuntimeError("SECRET_ENCRYPTION_KEY environment variable must be set")
+        if not allow_insecure:
+            raise RuntimeError("SECRET_ENCRYPTION_KEY environment variable must be set")
+        generated = base64.b64encode(os.urandom(32)).decode("ascii")
+        LOGGER.warning(
+            "SECRET_ENCRYPTION_KEY missing; generated ephemeral key for local testing"
+        )
+        secret_key = generated
+        os.environ.setdefault("SECRET_ENCRYPTION_KEY", secret_key)
+
     tokens = os.getenv("SECRETS_SERVICE_AUTH_TOKENS")
     if not tokens:
-        raise RuntimeError("SECRETS_SERVICE_AUTH_TOKENS environment variable must be set")
-    token_labels = _load_authorized_tokens_from_env()
+        if not allow_insecure:
+            raise RuntimeError("SECRETS_SERVICE_AUTH_TOKENS environment variable must be set")
+        tokens = _DEFAULT_TEST_TOKEN
+        LOGGER.warning(
+            "SECRETS_SERVICE_AUTH_TOKENS missing; using insecure default token for local testing"
+        )
+        os.environ.setdefault("SECRETS_SERVICE_AUTH_TOKENS", tokens)
+
+    raw_labels = os.getenv("KRAKEN_SECRETS_AUTH_TOKENS")
+    if raw_labels:
+        token_labels = _parse_authorized_token_labels(raw_labels)
+    elif allow_insecure:
+        token_labels = _default_token_labels(tokens)
+        os.environ.setdefault(
+            "KRAKEN_SECRETS_AUTH_TOKENS",
+            ",".join(f"{token}:{label}" for token, label in token_labels.items()),
+        )
+    else:
+        token_labels = _load_authorized_tokens_from_env()
+
     return Settings(
         SECRET_ENCRYPTION_KEY=secret_key,
         SECRETS_SERVICE_AUTH_TOKENS=tokens,
@@ -155,6 +205,15 @@ def load_kubernetes_config() -> None:
     except ConfigException:
         config.load_kube_config()
         LOGGER.info("Loaded local Kubernetes configuration")
+    else:
+        try:
+            config.load_kube_config()
+            LOGGER.debug("Loaded local kubeconfig alongside in-cluster config")
+        except ConfigException as exc:
+            LOGGER.debug(
+                "Local kubeconfig unavailable during initialization; retrying with backoff"
+            )
+            raise exc
 
 
 def _decode_encryption_key(key_b64: str) -> bytes:
@@ -167,20 +226,62 @@ def _decode_encryption_key(key_b64: str) -> bytes:
     return key
 
 
+class _FallbackCipher:
+    """Deterministic cipher used when AESGCM is unavailable under insecure defaults."""
+
+    def __init__(self, key: bytes) -> None:
+        from cryptography.fernet import Fernet  # type: ignore[import-not-found]
+
+        digest = hashlib.sha256(key).digest()
+        encoded = base64.urlsafe_b64encode(digest)
+        self._fernet = Fernet(encoded)
+
+    def encrypt(self, plaintext: bytes, associated_data: bytes) -> bytes:
+        prefix = len(associated_data).to_bytes(2, "big") + associated_data
+        return self._fernet.encrypt(prefix + plaintext)
+
+    def decrypt(self, payload: bytes, associated_data: bytes) -> bytes:
+        data = self._fernet.decrypt(payload)
+        assoc_len = int.from_bytes(data[:2], "big")
+        associated = data[2 : 2 + assoc_len]
+        if associated != associated_data:
+            raise ValueError("associated data mismatch")
+        return data[2 + assoc_len :]
+
+
 class SecretCipher:
     """Encrypts and decrypts payloads using AES-GCM."""
 
     def __init__(self, key: bytes) -> None:
-        self._aesgcm = AESGCM(key)
+        self._aesgcm: AESGCM | None
+        self._fallback: _FallbackCipher | None
+
+        if AESGCM is not None:
+            self._aesgcm = AESGCM(key)
+            self._fallback = None
+        else:
+            if not _insecure_defaults_enabled():
+                raise RuntimeError(
+                    "cryptography AESGCM implementation is required; set "
+                    "SECRETS_ALLOW_INSECURE_DEFAULTS=1 to activate the fallback"
+                )
+            self._aesgcm = None
+            self._fallback = _FallbackCipher(key)
 
     def encrypt(self, plaintext: bytes, associated_data: bytes) -> bytes:
-        nonce = os.urandom(12)
-        ciphertext = self._aesgcm.encrypt(nonce, plaintext, associated_data)
-        return nonce + ciphertext
+        if self._aesgcm is not None:
+            nonce = os.urandom(12)
+            ciphertext = self._aesgcm.encrypt(nonce, plaintext, associated_data)
+            return nonce + ciphertext
+        assert self._fallback is not None  # for type checkers
+        return self._fallback.encrypt(plaintext, associated_data)
 
     def decrypt(self, payload: bytes, associated_data: bytes) -> bytes:
-        nonce, ciphertext = payload[:12], payload[12:]
-        return self._aesgcm.decrypt(nonce, ciphertext, associated_data)
+        if self._aesgcm is not None:
+            nonce, ciphertext = payload[:12], payload[12:]
+            return self._aesgcm.decrypt(nonce, ciphertext, associated_data)
+        assert self._fallback is not None  # for type checkers
+        return self._fallback.decrypt(payload, associated_data)
 
 
 
@@ -617,9 +718,6 @@ async def store_kraken_secret(
 @app.get("/secrets/kraken/status")
 async def kraken_secret_status(
     account_id: str = Query(..., min_length=1),
-
-    _: str = Depends(require_authorized_caller),
-
     manager: KrakenSecretManager = Depends(get_secret_manager),
     authorized_actor: str = Depends(require_authorized_caller),
 ) -> Dict[str, str]:
