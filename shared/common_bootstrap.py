@@ -346,7 +346,10 @@ def ensure_common_helpers() -> None:
 
         if not reentrant_call:
             for name in _RISK_MODULES:
-                loaded[name] = _reload_with_overrides(name)
+                try:
+                    loaded[name] = _reload_with_overrides(name)
+                except Exception:  # pragma: no cover - optional risk modules may fail
+                    continue
 
         parent = loaded["services.common"]
         for attribute, module_name in _PARENT_SUBMODULES.items():
@@ -369,6 +372,11 @@ def ensure_common_helpers() -> None:
     finally:
         if not reentrant_call:
             _ENSURING_COMMON_HELPERS = False
+        if not _MODULE_GUARD_INSTALLED:
+            try:
+                _install_module_guard()
+            except Exception:  # pragma: no cover - guard installation is best-effort
+                pass
 
 
 class _ModuleGuard(dict):
@@ -436,9 +444,18 @@ def _rehydrate_core_package() -> None:
         if module_file == str(init_file):
             return
 
+    previous = sys.modules.get(package_name)
+    if previous is not None:
+        sys.modules.pop(package_name, None)
+
     try:
-        importlib.import_module(package_name)
+        from services import _load_canonical_module
     except Exception:
-        # Leave any existing stubs in place if the real module fails to load.
+        if previous is not None:
+            sys.modules[package_name] = previous
         return
+
+    replacement = _load_canonical_module(package_name)
+    if replacement is None and previous is not None:
+        sys.modules[package_name] = previous
 

@@ -107,6 +107,24 @@ def _preload_services_package() -> None:
         pass
 
 
+def _preload_core_package() -> None:
+    """Ensure the lightweight ``services.core`` loader is registered early."""
+
+    try:
+        importlib.import_module("services.core")
+    except Exception:  # pragma: no cover - skip when dependencies are unavailable
+        pass
+
+
+def _preload_shared_package() -> None:
+    """Import the ``shared`` package before pytest can register lightweight stubs."""
+
+    try:
+        importlib.import_module("shared")
+    except Exception:  # pragma: no cover - keep bootstrap resilient
+        pass
+
+
 def _preload_ml_package() -> None:
     """Import the project ``ml`` package before pytest inserts stubs."""
 
@@ -139,6 +157,8 @@ def _ensure_fastapi_testclient() -> None:
 _ensure_project_root_on_path()
 _install_secrets_shim()
 _preload_services_package()
+_preload_core_package()
+_preload_shared_package()
 _preload_ml_package()
 _ensure_services_namespace()
 _ensure_common_namespace()

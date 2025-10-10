@@ -125,15 +125,17 @@ def _is_canonical_module(module: ModuleType) -> bool:
 
 
 def _load_canonical_module(fullname: str) -> ModuleType | None:
-    module_path = _PROJECT_ROOT / (fullname.replace(".", "/") + ".py")
-    if not module_path.exists():
+    dotted = fullname.replace(".", "/")
+    module_file = _PROJECT_ROOT / f"{dotted}.py"
+    package_dir = _PROJECT_ROOT / dotted
+
+    previous = sys.modules.pop(fullname, None)
+    try:
+        module = importlib.import_module(fullname)
+    except Exception:
+        if previous is not None:
+            sys.modules[fullname] = previous
         return None
-    spec = importlib.util.spec_from_file_location(fullname, module_path)
-    if spec is None or spec.loader is None:
-        return None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[fullname] = module
-    spec.loader.exec_module(module)
     return module
 
 
@@ -163,3 +165,9 @@ def _load_test_mirror(name: str, fullname: str) -> ModuleType | None:
                     spec.loader.exec_module(module)
                     module.__path__ = [str(test_dir)]  # type: ignore[attr-defined]
     return module
+
+
+try:  # pragma: no cover - avoid hard failures when optional deps are missing
+    importlib.import_module(f"{__name__}.core")
+except Exception:
+    pass
