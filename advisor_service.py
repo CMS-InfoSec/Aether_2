@@ -18,12 +18,14 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
-from dataclasses import dataclass, field
+import threading
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import ModuleType, SimpleNamespace, TracebackType
-from typing import Any, Callable, Dict, Iterable, List, Optional, cast
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, cast
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, status
@@ -118,22 +120,103 @@ def _require_database_url() -> str:
 class _InMemoryAdvisorStore:
     """Minimal persistence layer used when SQLAlchemy is unavailable."""
 
-    def __init__(self) -> None:
+    def __init__(self, key: str) -> None:
+        self._key = key
+        self._lock = threading.RLock()
         self._records: List[AdvisorQuery] = []
         self._next_id = 1
+        self._path = _state_directory() / f"{key}.json"
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            if not self._path.exists():
+                return
+            raw = json.loads(self._path.read_text(encoding="utf-8"))
+        except Exception:
+            LOGGER.warning(
+                "Failed to load advisor fallback state from %s", self._path, exc_info=True
+            )
+            return
+
+        records: List[AdvisorQuery] = []
+        for entry in raw.get("records", []):
+            try:
+                created_at = entry.get("created_at")
+                ts = (
+                    datetime.fromisoformat(created_at)
+                    if isinstance(created_at, str)
+                    else datetime.now(UTC)
+                )
+                context = entry.get("context", {})
+                if isinstance(context, Mapping):
+                    context = dict(context)
+                else:
+                    context = {}
+                records.append(
+                    AdvisorQuery(
+                        user_id=str(entry.get("user_id", "")),
+                        question=str(entry.get("question", "")),
+                        answer=str(entry.get("answer", "")),
+                        context=context,
+                        created_at=ts,
+                        id=entry.get("id"),
+                    )
+                )
+            except Exception:
+                LOGGER.debug(
+                    "Failed to deserialize advisor record from fallback state", exc_info=True
+                )
+        if records:
+            self._records = records
+            self._next_id = int(raw.get("next_id", len(records) + 1))
+
+    def _persist(self) -> None:
+        payload = {
+            "next_id": self._next_id,
+            "records": [
+                {
+                    "id": record.id,
+                    "user_id": record.user_id,
+                    "question": record.question,
+                    "answer": record.answer,
+                    "context": dict(record.context),
+                    "created_at": record.created_at.isoformat(),
+                }
+                for record in self._records
+            ],
+        }
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception:
+            LOGGER.warning(
+                "Failed to persist advisor fallback state to %s", self._path, exc_info=True
+            )
 
     def reset(self) -> None:
-        self._records.clear()
-        self._next_id = 1
+        with self._lock:
+            self._records.clear()
+            self._next_id = 1
+            try:
+                if self._path.exists():
+                    self._path.unlink()
+            except Exception:
+                LOGGER.debug(
+                    "Failed to remove advisor fallback state at %s", self._path, exc_info=True
+                )
 
     def add(self, record: "AdvisorQuery") -> None:
-        if getattr(record, "id", None) in (None, 0):
-            record.id = self._next_id  # type: ignore[attr-defined]
-            self._next_id += 1
-        self._records.append(record)
+        with self._lock:
+            if getattr(record, "id", None) in (None, 0):
+                record.id = self._next_id  # type: ignore[attr-defined]
+                self._next_id += 1
+            self._records.append(record)
+            self._persist()
 
     def all(self) -> List["AdvisorQuery"]:
-        return list(self._records)
+        with self._lock:
+            return [replace(record) for record in self._records]
 
 
 class _InMemoryQueryResult:
@@ -213,11 +296,21 @@ if _store_module is None:
 _IN_MEMORY_STORES = cast(Dict[str, _InMemoryAdvisorStore], getattr(_store_module, "stores"))
 
 
+def _normalize_store_key(url: str) -> str:
+    normalized = url.strip().lower()
+    return re.sub(r"[^a-z0-9._-]", "_", normalized) or "advisor"
+
+
+def _state_directory() -> Path:
+    root = Path(os.getenv("AETHER_STATE_DIR", ".aether_state"))
+    return root / "advisor"
+
+
 def _get_in_memory_store(url: str) -> _InMemoryAdvisorStore:
-    normalized = url.strip()
+    normalized = _normalize_store_key(url)
     store = _IN_MEMORY_STORES.get(normalized)
     if store is None:
-        store = _InMemoryAdvisorStore()
+        store = _InMemoryAdvisorStore(normalized)
         _IN_MEMORY_STORES[normalized] = store
     return store
 

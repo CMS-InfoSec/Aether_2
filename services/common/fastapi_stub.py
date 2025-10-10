@@ -16,13 +16,28 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 from datetime import date, datetime, timezone
 from collections.abc import MutableMapping
 from contextlib import ExitStack, asynccontextmanager
 from dataclasses import dataclass
 from inspect import Parameter, Signature, isclass, iscoroutine, isgenerator, signature
 from types import ModuleType, SimpleNamespace
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple, Type
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+    Type,
+    Union,
+    get_args,
+    get_origin,
+)
 
 try:  # pragma: no cover - prefer the real FastAPI implementation when available
     import importlib.util
@@ -105,6 +120,7 @@ class _ParameterMarker:
         query_params: Dict[str, Any],
         path_params: Dict[str, Any],
         name: str,
+        body: Any,
     ) -> Any:
         return self.default
 
@@ -116,6 +132,7 @@ class _HeaderParameter(_ParameterMarker):
         query_params: Dict[str, Any],
         path_params: Dict[str, Any],
         name: str,
+        body: Any,
     ) -> Any:
         header_name = (self.alias or name).lower()
         return request.headers.get(header_name, self.default)
@@ -128,6 +145,7 @@ class _QueryParameter(_ParameterMarker):
         query_params: Dict[str, Any],
         path_params: Dict[str, Any],
         name: str,
+        body: Any,
     ) -> Any:
         key = self.alias or name
         return query_params.get(key, self.default)
@@ -140,9 +158,77 @@ class _PathParameter(_ParameterMarker):
         query_params: Dict[str, Any],
         path_params: Dict[str, Any],
         name: str,
+        body: Any,
     ) -> Any:
         key = self.alias or name
         return path_params.get(key, self.default)
+
+
+class _BodyParameter(_ParameterMarker):
+    def resolve(
+        self,
+        request: "Request",
+        query_params: Dict[str, Any],
+        path_params: Dict[str, Any],
+        name: str,
+        body: Any,
+    ) -> Any:
+        return body
+
+
+def _coerce_value(annotation: Any, value: Any) -> Any:
+    """Best-effort conversion of query/path parameters to annotated types."""
+
+    if value is None:
+        return None
+
+    if annotation in (Signature.empty, Parameter.empty, Any):
+        return value
+
+    origin = get_origin(annotation)
+    if origin is Union:
+        candidates = [arg for arg in get_args(annotation) if arg is not type(None)]
+        if not candidates:
+            return value
+        for candidate in candidates:
+            coerced = _coerce_value(candidate, value)
+            if coerced is not None:
+                return coerced
+        return value
+
+    if annotation is bool and isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "off"}:
+            return False
+        return value
+
+    if annotation in {int, float} and isinstance(value, str):
+        try:
+            return annotation(value)
+        except (TypeError, ValueError):
+            return value
+
+    if annotation is date and isinstance(value, str):
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            return value
+
+    if annotation is datetime and isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return value
+
+    return value
+
+
+def _allow_admin_autoload() -> bool:
+    """Return ``True`` when widening the admin set has been explicitly enabled."""
+
+    return os.getenv("AETHER_ALLOW_INSECURE_TEST_DEFAULTS") == "1"
 
 
 def Depends(dependency: Callable[..., Any] | None) -> _Dependency:
@@ -150,7 +236,7 @@ def Depends(dependency: Callable[..., Any] | None) -> _Dependency:
 
 
 def Body(default: Any = None, *_: Any, **__: Any) -> _ParameterMarker:
-    return _ParameterMarker(default)
+    return _BodyParameter(default)
 
 
 def Query(default: Any = None, *_: Any, alias: Optional[str] = None, **__: Any) -> _QueryParameter:
@@ -268,6 +354,13 @@ class Request:
         self.client = SimpleNamespace(host=None, port=None)
         self._scope = scope
         self._receive = receive
+        self._body: Any = None
+
+    def set_body(self, body: Any) -> None:
+        self._body = body
+
+    def json(self) -> Any:
+        return self._body
 
 
 class Response:
@@ -489,23 +582,28 @@ async def request_validation_exception_handler(request: Request, exc: Exception)
     )
 
 
-status = SimpleNamespace(
-    HTTP_200_OK=200,
-    HTTP_201_CREATED=201,
-    HTTP_202_ACCEPTED=202,
-    HTTP_204_NO_CONTENT=204,
-    HTTP_400_BAD_REQUEST=400,
-    HTTP_401_UNAUTHORIZED=401,
-    HTTP_403_FORBIDDEN=403,
-    HTTP_404_NOT_FOUND=404,
-    HTTP_409_CONFLICT=409,
-    HTTP_412_PRECONDITION_FAILED=412,
-    HTTP_422_UNPROCESSABLE_ENTITY=422,
-    HTTP_422_UNPROCESSABLE_CONTENT=422,
-    HTTP_429_TOO_MANY_REQUESTS=429,
-    HTTP_500_INTERNAL_SERVER_ERROR=500,
-    HTTP_503_SERVICE_UNAVAILABLE=503,
-)
+_STATUS_CODES = {
+    "HTTP_200_OK": 200,
+    "HTTP_201_CREATED": 201,
+    "HTTP_202_ACCEPTED": 202,
+    "HTTP_204_NO_CONTENT": 204,
+    "HTTP_400_BAD_REQUEST": 400,
+    "HTTP_401_UNAUTHORIZED": 401,
+    "HTTP_403_FORBIDDEN": 403,
+    "HTTP_404_NOT_FOUND": 404,
+    "HTTP_409_CONFLICT": 409,
+    "HTTP_412_PRECONDITION_FAILED": 412,
+    "HTTP_422_UNPROCESSABLE_ENTITY": 422,
+    "HTTP_422_UNPROCESSABLE_CONTENT": 422,
+    "HTTP_429_TOO_MANY_REQUESTS": 429,
+    "HTTP_500_INTERNAL_SERVER_ERROR": 500,
+    "HTTP_502_BAD_GATEWAY": 502,
+    "HTTP_503_SERVICE_UNAVAILABLE": 503,
+}
+
+status = ModuleType("fastapi.status")
+for _name, _code in _STATUS_CODES.items():
+    setattr(status, _name, _code)
 
 
 def jsonable_encoder(value: Any, *args: Any, **kwargs: Any) -> Any:
@@ -642,7 +740,11 @@ def _to_json_compatible(value: Any) -> Any:
 
 def _dump_response_payload(value: Any) -> Any:
     if hasattr(value, "model_dump"):
-        return _to_json_compatible(value.model_dump())
+        try:
+            dumped = value.model_dump(exclude_none=True)  # type: ignore[call-arg]
+        except TypeError:
+            dumped = value.model_dump()
+        return _to_json_compatible(dumped)
     if hasattr(value, "dict"):
         try:
             return _to_json_compatible(value.dict())
@@ -716,7 +818,8 @@ async def _call_endpoint(
             continue
 
         if isinstance(default, _ParameterMarker):
-            resolved_kwargs[name] = default.resolve(request, query_params, path_params, name)
+            value = default.resolve(request, query_params, path_params, name, body)
+            resolved_kwargs[name] = _coerce_value(annotation, value)
             continue
 
         if _is_pydantic_model(annotation):
@@ -738,11 +841,11 @@ async def _call_endpoint(
             continue
 
         if name in path_params:
-            resolved_kwargs[name] = path_params[name]
+            resolved_kwargs[name] = _coerce_value(annotation, path_params[name])
             continue
 
         if name in query_params:
-            resolved_kwargs[name] = query_params[name]
+            resolved_kwargs[name] = _coerce_value(annotation, query_params[name])
             continue
 
         if name in body_mapping:
@@ -830,32 +933,50 @@ class TestClient:
         self.app = app
         self._lifespan_cm = None
         self._entered = False
+        self._event_handlers = self._resolve_event_handlers()
         self._ensure_started()
 
     def _ensure_started(self) -> None:
         if self._entered:
             return
-        lifespan_factory = getattr(self.app.router, "lifespan_context", None)
+        router = getattr(self.app, "router", None)
+        lifespan_factory = getattr(router, "lifespan_context", None)
         if lifespan_factory is not None:
             self._lifespan_cm = lifespan_factory(self.app)
             enter = getattr(self._lifespan_cm, "__aenter__", None)
             if enter is not None:
-                _run_async(enter())
-        for handler in self.app.event_handlers.get("startup", []):
-            _run_async(handler())
+                _run_async(lambda: enter())
+        for handler in self._event_handlers.get("startup", []):
+            _run_async(lambda: handler())
         self._entered = True
 
     def _shutdown(self, exc_type=None, exc=None, tb=None) -> None:
         if not self._entered:
             return
-        for handler in reversed(self.app.event_handlers.get("shutdown", [])):
-            _run_async(handler())
+        for handler in reversed(self._event_handlers.get("shutdown", [])):
+            _run_async(lambda: handler())
         if self._lifespan_cm is not None:
             exit_ = getattr(self._lifespan_cm, "__aexit__", None)
             if exit_ is not None:
-                _run_async(exit_(exc_type, exc, tb))
+                _run_async(lambda: exit_(exc_type, exc, tb))
         self._lifespan_cm = None
         self._entered = False
+
+    def _resolve_event_handlers(self) -> Dict[str, List[Callable[..., Any]]]:
+        """Return the app's event handlers while tolerating bare stubs.
+
+        Several test suites monkeypatch ``fastapi.FastAPI`` with extremely
+        small placeholders that only expose ``router`` and ``state``.  Accessing
+        ``event_handlers`` on those objects raised ``AttributeError`` which in
+        turn broke every consumer of the compatibility shim.  We coerce any
+        missing attribute into an empty ``dict`` so lifecycle hooks remain
+        optional just like they are in the real FastAPI test client.
+        """
+
+        handlers = getattr(self.app, "event_handlers", None)
+        if isinstance(handlers, MutableMapping):
+            return {str(key): list(value) for key, value in handlers.items()}
+        return {}
 
     def __enter__(self) -> "TestClient":  # pragma: no cover - simple context protocol
         self._ensure_started()
@@ -908,10 +1029,14 @@ class TestClient:
         request = self._build_request(headers=headers, params=params, path_params=path_params)
         request.url = SimpleNamespace(path=_normalize_path(path))
         request.method = method
+        if hasattr(request, "set_body"):
+            request.set_body(body)
+        else:  # pragma: no cover - compatibility guard for patched requests
+            setattr(request, "_body", body)
 
         try:
             payload = _run_async(
-                _call_endpoint(
+                lambda: _call_endpoint(
                     self.app,
                     route.endpoint,
                     request=request,
@@ -1065,20 +1190,21 @@ class TestClient:
                     headers["X-Account-ID"] = str(account_id)
                     lower_header_keys.add("x-account-id")
         if not override_present:
-            if account_id and security_module is not None:
+            if account_id and security_module is not None and _allow_admin_autoload():
                 try:
                     existing = set(getattr(security_module, "ADMIN_ACCOUNTS", set()))
-                    if str(account_id) not in existing:
+                    sanitized_account = str(account_id).strip()
+                    if sanitized_account and sanitized_account not in existing:
                         subject = _extract_jwt_subject(token) if token else None
                         session_admin = getattr(session, "admin_id", None)
                         trusted_sources = {
-                            value.strip()
+                            value.strip().lower()
                             for value in (subject, session_admin)
                             if isinstance(value, str) and value.strip()
                         }
-                        if trusted_sources & {admin.strip() for admin in existing}:
+                        if sanitized_account.strip().lower() in trusted_sources:
                             updated = set(existing)
-                            updated.add(str(account_id))
+                            updated.add(sanitized_account)
                             security_module.reload_admin_accounts(updated)
                 except Exception:  # pragma: no cover - defensive guard for minimal stubs
                     pass
@@ -1105,20 +1231,29 @@ class TestClient:
         return self._handle_call(normalized_method, url, json=json, headers=headers, params=params)
 
 
-def _run_async(coro: Any) -> Any:
+def _run_async(factory: Callable[[], Any]) -> Any:
     import asyncio
 
-    if not asyncio.iscoroutine(coro):
-        return coro
+    def _resolve() -> Any:
+        return factory()
+
+    candidate = _resolve()
+    if not asyncio.iscoroutine(candidate):
+        return candidate
     try:
-        return asyncio.run(coro)
+        return asyncio.run(candidate)
     except RuntimeError:
         new_loop = asyncio.new_event_loop()
         try:
-            return new_loop.run_until_complete(coro)
+            candidate = _resolve()
+            if asyncio.iscoroutine(candidate):
+                return new_loop.run_until_complete(candidate)
+            return candidate
         finally:
-            new_loop.run_until_complete(new_loop.shutdown_asyncgens())
-            new_loop.close()
+            try:
+                new_loop.run_until_complete(new_loop.shutdown_asyncgens())
+            finally:
+                new_loop.close()
 
 
 def _install_fastapi_module() -> None:

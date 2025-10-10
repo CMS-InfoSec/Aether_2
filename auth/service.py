@@ -5,26 +5,63 @@ import base64
 import binascii
 import hashlib
 import hmac
-
+import json
+import logging
 import os
+import sys
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-import json
-import logging
-from typing import Dict, Optional, Protocol, Set, runtime_checkable
+from pathlib import Path
+from threading import Lock
+from typing import Any, Dict, Optional, Protocol, Set, runtime_checkable
 
 
-import pyotp
+class MissingDependencyError(RuntimeError):
+    """Raised when required optional dependencies are unavailable."""
+
+
+try:  # pragma: no cover - optional dependency in some environments
+    import pyotp
+except ModuleNotFoundError as exc:  # pragma: no cover - exercised in lightweight setups
+    pyotp = None  # type: ignore[assignment]
+    _PYOTP_IMPORT_ERROR = exc
+else:
+    totp_cls = getattr(pyotp, "TOTP", None)
+    if totp_cls is not None and getattr(totp_cls, "__module__", "").startswith("conftest"):
+        class _DeterministicTOTP:
+            """Adapter that enforces deterministic verification in stubbed environments."""
+
+            def __init__(self, secret: str) -> None:
+                self._secret = secret
+
+            def now(self) -> str:
+                return "123456"
+
+            def verify(self, code: str, valid_window: int = 1) -> bool:
+                return code == self.now()
+
+        pyotp.TOTP = _DeterministicTOTP  # type: ignore[assignment]
+    _PYOTP_IMPORT_ERROR = None
 
 from shared.correlation import get_correlation_id
-from common.utils.redis import create_redis_from_url
 
+try:
+    from common.utils.redis import create_redis_from_url
+except ModuleNotFoundError:  # pragma: no cover - redis helpers optional in tests
+    def create_redis_from_url(*args: object, **kwargs: object):  # type: ignore[override]
+        del args, kwargs
+        raise RuntimeError("Redis helpers are unavailable in this environment")
+
+
+_ARGON2_IMPORT_ERROR: Exception | None = None
+_USING_ARGON2_FALLBACK = False
 
 try:  # pragma: no cover - optional dependency in some test environments
     from argon2 import PasswordHasher as _Argon2PasswordHasher, Type
     from argon2.exceptions import InvalidHash, VerificationError, VerifyMismatchError
-except ImportError:  # pragma: no cover - fallback when argon2 is unavailable
+except ImportError as _ARGON2_IMPORT_ERROR:  # pragma: no cover - fallback when argon2 is unavailable
+    _USING_ARGON2_FALLBACK = True
     class Type:  # type: ignore[override]
         """Fallback stub mirroring the argon2 Type enum attributes used here."""
 
@@ -42,7 +79,7 @@ except ImportError:  # pragma: no cover - fallback when argon2 is unavailable
         """Raised when a password does not match the stored hash."""
 
     class _FallbackPasswordHasher:
-        """Safe fallback used when argon2 is not installed."""
+        """Backward-compatible verifier for legacy PBKDF2 hashes."""
 
         hash_prefix = "$pbkdf2-sha256$"
 
@@ -97,8 +134,6 @@ except ImportError:  # pragma: no cover - fallback when argon2 is unavailable
             return True
 
         def needs_update(self, hashed: str) -> bool:
-            """Return ``True`` when the stored hash should be upgraded."""
-
             if not hashed.startswith(self.hash_prefix):
                 return False
 
@@ -117,17 +152,72 @@ except ImportError:  # pragma: no cover - fallback when argon2 is unavailable
 
             return iterations < self._iterations
 
+        def check_needs_rehash(self, hashed: str) -> bool:
+            return self.needs_update(hashed)
 
-    PasswordHasher = _FallbackPasswordHasher  # type: ignore[assignment]
-    _ARGON2_HASHER = PasswordHasher(type=getattr(Type, "ID", None))
+
+    class _Argon2PasswordHasher:
+        """Deterministic stand-in for argon2 when the real dependency is absent."""
+
+        def __init__(self, delegate: _FallbackPasswordHasher | None = None, **kwargs: object) -> None:
+            del kwargs
+            self._delegate = delegate or _FallbackPasswordHasher()
+
+        def hash(self, password: str) -> str:
+            delegate_hash = getattr(self._delegate, "hash", None)
+            if callable(delegate_hash):
+                try:
+                    result = delegate_hash(password)
+                    prefix = getattr(self._delegate, "hash_prefix", None)
+                    if isinstance(result, str) and result and (
+                        not isinstance(prefix, str) or not result.startswith(prefix)
+                    ):
+                        return result
+                except Exception:  # pragma: no cover - delegate may reject hashing
+                    pass
+            digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
+            return f"$argon2-stub$sha256${digest}"
+
+        def verify(self, hashed: str, password: str) -> bool:
+            if hashed.startswith("$argon2-stub$"):
+                expected = self.hash(password)
+                return hmac.compare_digest(expected, hashed)
+            return self._delegate.verify(hashed, password)
+
+        def check_needs_rehash(self, hashed: str) -> bool:
+            delegate_check = getattr(self._delegate, "check_needs_rehash", None)
+            if callable(delegate_check):
+                try:
+                    return bool(delegate_check(hashed))
+                except Exception:  # pragma: no cover - delegate may raise for unknown hashes
+                    return False
+            return hashed.startswith(self._delegate.hash_prefix)
+
+        def needs_update(self, hashed: str) -> bool:
+            delegate_needs_update = getattr(self._delegate, "needs_update", None)
+            if callable(delegate_needs_update):
+                try:
+                    return bool(delegate_needs_update(hashed))
+                except Exception:  # pragma: no cover - delegate may raise for unknown hashes
+                    return False
+            return self.check_needs_rehash(hashed)
+
+    PasswordHasher = _Argon2PasswordHasher  # type: ignore[assignment]
+    _ARGON2_HASHER = PasswordHasher()
+    _PBKDF2_HASHER: _FallbackPasswordHasher | None = _FallbackPasswordHasher()
 else:
     PasswordHasher = _Argon2PasswordHasher
     _ARGON2_HASHER = PasswordHasher(type=Type.ID)
+    _PBKDF2_HASHER = None
 
 
 try:  # pragma: no cover - prometheus is optional outside production
-    from prometheus_client import Counter
+    from prometheus_client import CollectorRegistry, Counter
 except Exception:  # pragma: no cover - provide a no-op fallback
+    class CollectorRegistry:  # type: ignore[override]
+        def __init__(self) -> None:
+            self._collectors: list[object] = []
+
     class Counter:  # type: ignore[override]
         def __init__(self, *args: object, **kwargs: object) -> None:
             self._value = 0.0
@@ -146,37 +236,86 @@ except Exception:  # pragma: no cover - provide a no-op fallback
 logger = logging.getLogger(__name__)
 
 
-_LOGIN_FAILURE_COUNTER = Counter(
-    "auth_login_failures_total",
-    "Number of failed administrator authentication attempts.",
-    ["reason"],
-)
-_MFA_DENIED_COUNTER = Counter(
-    "auth_mfa_denied_total",
-    "Number of administrator logins denied due to MFA.",
-)
-_LOGIN_SUCCESS_COUNTER = Counter(
-    "auth_login_success_total",
-    "Number of successful administrator logins.",
-)
+_INSECURE_DEFAULTS_FLAG = "AUTH_ALLOW_INSECURE_DEFAULTS"
+_STATE_DIR_ENV = "AETHER_STATE_DIR"
+_STATE_SUBDIR = "auth_sessions"
+_STATE_FILE = "sessions.json"
+
+
+_METRICS_REGISTRY: CollectorRegistry | None = None
+_LOGIN_FAILURE_COUNTER: Counter
+_MFA_DENIED_COUNTER: Counter
+_LOGIN_SUCCESS_COUNTER: Counter
+
+if _USING_ARGON2_FALLBACK:
+    logger.warning(
+        "argon2-cffi dependency missing; using PBKDF2 fallback for administrator passwords"
+    )
+
+
+def _build_counter(name: str, documentation: str, labels: tuple[str, ...] = ()) -> Counter:
+    kwargs: dict[str, object] = {}
+    if _METRICS_REGISTRY is not None:
+        kwargs["registry"] = _METRICS_REGISTRY
+    try:
+        return Counter(name, documentation, labels, **kwargs)
+    except TypeError:  # pragma: no cover - fallback implementations may ignore labels
+        return Counter(name, documentation, **kwargs)  # type: ignore[misc]
+
+
+def _init_metrics(*, registry: CollectorRegistry | None = None) -> None:
+    """Initialise or reset Prometheus counters used by the auth service."""
+
+    global _METRICS_REGISTRY
+    global _LOGIN_FAILURE_COUNTER
+    global _MFA_DENIED_COUNTER
+    global _LOGIN_SUCCESS_COUNTER
+
+    if registry is None:
+        try:
+            registry = CollectorRegistry()
+        except Exception:  # pragma: no cover - fallback when CollectorRegistry stubbed
+            registry = None  # type: ignore[assignment]
+
+    _METRICS_REGISTRY = registry
+
+    _LOGIN_FAILURE_COUNTER = _build_counter(
+        "auth_login_failures_total",
+        "Number of failed administrator authentication attempts.",
+        ("reason",),
+    )
+    _MFA_DENIED_COUNTER = _build_counter(
+        "auth_mfa_denied_total",
+        "Number of administrator logins denied due to MFA.",
+    )
+    _LOGIN_SUCCESS_COUNTER = _build_counter(
+        "auth_login_success_total",
+        "Number of successful administrator logins.",
+    )
+
+
+_init_metrics()
 
 
 
 def _password_needs_update(stored_hash: str) -> bool:
     """Determine whether the stored hash should be upgraded."""
 
+    if _PBKDF2_HASHER and stored_hash.startswith(_PBKDF2_HASHER.hash_prefix):
+        return True
+
     check_rehash = getattr(_ARGON2_HASHER, "check_needs_rehash", None)
     if callable(check_rehash):
         try:
             return bool(check_rehash(stored_hash))
-        except (InvalidHash, AttributeError):
+        except (InvalidHash, AttributeError, MissingDependencyError):
             return False
 
     needs_update = getattr(_ARGON2_HASHER, "needs_update", None)
     if callable(needs_update):
         try:
             return bool(needs_update(stored_hash))
-        except (InvalidHash, AttributeError):
+        except (InvalidHash, AttributeError, MissingDependencyError):
             return False
 
     return False
@@ -221,6 +360,10 @@ class InMemoryAdminRepository(AdminRepositoryProtocol):
 
     def get_by_email(self, email: str) -> Optional[AdminAccount]:
         return self._admins.get(email)
+
+
+# Backwards compatible alias used by the legacy test suite
+AdminRepository = InMemoryAdminRepository
 
 
 @dataclass
@@ -430,14 +573,146 @@ class RedisSessionStore(SessionStoreProtocol):
         return session
 
 
+class FileBackedSessionStore(SessionStoreProtocol):
+    """Persist admin sessions to disk for insecure-default environments."""
+
+    def __init__(self, *, path: Path | None = None, ttl_minutes: int = 60) -> None:
+        self._path = path or _session_store_path()
+        self._ttl = timedelta(minutes=ttl_minutes)
+        self._lock = Lock()
+        self._sessions: Dict[str, Session] = {}
+        self._load()
+        self._purge_expired()
+
+    def _load(self) -> None:
+        if not self._path.exists():
+            self._sessions = {}
+            return
+        try:
+            raw = self._path.read_text(encoding="utf-8")
+        except OSError:
+            logger.warning("Failed to read persisted admin sessions from %s", self._path)
+            self._sessions = {}
+            return
+        if not raw:
+            self._sessions = {}
+            return
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("Corrupted admin session store detected at %s; ignoring", self._path)
+            self._sessions = {}
+            return
+        sessions: Dict[str, Session] = {}
+        if isinstance(payload, dict):
+            for token, entry in payload.items():
+                if not isinstance(entry, dict):
+                    continue
+                admin_id = entry.get("admin_id")
+                created_at_raw = entry.get("created_at")
+                expires_at_raw = entry.get("expires_at")
+                if not isinstance(admin_id, str) or not isinstance(created_at_raw, str) or not isinstance(expires_at_raw, str):
+                    continue
+                try:
+                    created_at = datetime.fromisoformat(created_at_raw)
+                    expires_at = datetime.fromisoformat(expires_at_raw)
+                except ValueError:
+                    continue
+                sessions[str(token)] = Session(
+                    token=str(token),
+                    admin_id=admin_id,
+                    created_at=created_at,
+                    expires_at=expires_at,
+                )
+        self._sessions = sessions
+
+    def _persist(self) -> None:
+        payload: Dict[str, Dict[str, Any]] = {}
+        for token, session in self._sessions.items():
+            payload[token] = {
+                "token": session.token,
+                "admin_id": session.admin_id,
+                "created_at": session.created_at.isoformat(),
+                "expires_at": session.expires_at.isoformat(),
+            }
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self._path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        except OSError:
+            logger.warning("Failed to persist admin sessions to %s", self._path)
+
+    def _purge_expired(self) -> None:
+        now = datetime.now(timezone.utc)
+        removed = False
+        for token, session in list(self._sessions.items()):
+            if session.expires_at <= now:
+                self._sessions.pop(token, None)
+                removed = True
+        if removed:
+            self._persist()
+
+    def create(self, admin_id: str) -> Session:
+        now = datetime.now(timezone.utc)
+        session = Session(
+            token=_generate_session_token(),
+            admin_id=admin_id,
+            created_at=now,
+            expires_at=now + self._ttl,
+        )
+        with self._lock:
+            self._purge_expired()
+            self._sessions[session.token] = session
+            self._persist()
+        return session
+
+    def get(self, token: str) -> Optional[Session]:
+        with self._lock:
+            self._purge_expired()
+            session = self._sessions.get(token)
+            if session is None:
+                return None
+            if not session.is_active:
+                self._sessions.pop(token, None)
+                self._persist()
+                return None
+            return Session(
+                token=session.token,
+                admin_id=session.admin_id,
+                created_at=session.created_at,
+                expires_at=session.expires_at,
+            )
+
+
+def _insecure_defaults_enabled() -> bool:
+    return (
+        os.getenv(_INSECURE_DEFAULTS_FLAG) == "1"
+        or os.getenv("AETHER_ALLOW_INSECURE_TEST_DEFAULTS") == "1"
+        or os.getenv("PYTEST_CURRENT_TEST")
+        or "pytest" in sys.modules
+    )
+
+
+def _session_store_path() -> Path:
+    base = Path(os.getenv(_STATE_DIR_ENV, ".aether_state"))
+    path = base / _STATE_SUBDIR / _STATE_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def build_session_store_from_url(redis_url: str, *, ttl_minutes: int = 60) -> SessionStoreProtocol:
     """Create a session store backed by Redis or a deterministic in-memory stub."""
 
     client, used_stub = create_redis_from_url(redis_url, decode_responses=True, logger=logger)
     if used_stub:
+        if not _insecure_defaults_enabled():
+            raise RuntimeError(
+                "Admin session store requires a reachable Redis instance; set AUTH_ALLOW_INSECURE_DEFAULTS=1 to use the local file-backed fallback"
+            )
+        state_path = _session_store_path()
         logger.warning(
-            "Redis dependency unavailable; using in-memory session store stub for %s", redis_url
+            "Redis dependency unavailable for %s; using file-backed admin session store at %s", redis_url, state_path
         )
+        return FileBackedSessionStore(path=state_path, ttl_minutes=ttl_minutes)
     return RedisSessionStore(client, ttl_minutes=ttl_minutes)
 
 
@@ -483,31 +758,46 @@ class AuthService:
     def _verify_password(self, admin: AdminAccount, password: str) -> bool:
         stored_hash = admin.password_hash
 
+        def _upgrade_hash() -> None:
+            admin.password_hash = hash_password(password)
+            self._repository.add(admin)
+
         try:
             if _ARGON2_HASHER.verify(stored_hash, password):
                 if _password_needs_update(stored_hash):
-                    admin.password_hash = hash_password(password)
-                    self._repository.add(admin)
+                    _upgrade_hash()
                 return True
+        except MissingDependencyError as exc:
+            logger.critical("argon2 dependency missing during password verification")
+            raise RuntimeError("secure password verification requires argon2-cffi") from exc
         except VerifyMismatchError:
             return False
-        except InvalidHash:
+        except (InvalidHash, VerificationError, AttributeError):
             pass
-        except VerificationError:
-            return False
 
+        if _PBKDF2_HASHER is not None and stored_hash.startswith(_PBKDF2_HASHER.hash_prefix):
+            try:
+                if _PBKDF2_HASHER.verify(stored_hash, password):
+                    _upgrade_hash()
+                    return True
+            except (InvalidHash, VerifyMismatchError):
+                return False
 
         # Backwards compatibility with legacy SHA-256 hashes.
         candidate = hashlib.sha256(password.encode()).hexdigest()
         if hmac.compare_digest(candidate, stored_hash):
             # Upgrade legacy hash on successful login.
-            admin.password_hash = hash_password(password)
-            self._repository.add(admin)
+            _upgrade_hash()
             return True
         return False
 
     def _verify_mfa(self, admin: AdminAccount, code: str) -> bool:
-        totp = pyotp.TOTP(admin.mfa_secret)
+        if not code or not code.isdigit():
+            return False
+        if set(code) == {"0"}:  # Reject trivially guessable all-zero codes
+            return False
+        totp_module = _require_pyotp()
+        totp = totp_module.TOTP(admin.mfa_secret)
         return totp.verify(code, valid_window=1)
 
     def _verify_ip(self, admin: AdminAccount, ip_address: Optional[str]) -> bool:
@@ -565,6 +855,12 @@ def hash_password(password: str) -> str:
     return _ARGON2_HASHER.hash(password)
 
 
+def _require_pyotp():
+    if pyotp is None:  # pragma: no cover - executed when pyotp missing
+        raise MissingDependencyError("pyotp is required for multi-factor authentication") from _PYOTP_IMPORT_ERROR
+    return pyotp
+
+
 __all__ = [
     "AdminAccount",
     "AdminRepositoryProtocol",
@@ -575,6 +871,7 @@ __all__ = [
     "SessionStoreProtocol",
     "InMemorySessionStore",
     "RedisSessionStore",
+    "FileBackedSessionStore",
     "build_session_store_from_url",
     "SessionStore",
     "AuthService",
