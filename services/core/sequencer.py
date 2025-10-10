@@ -19,11 +19,32 @@ from sqlalchemy.orm import Session, sessionmaker
 from common.schemas.contracts import FillEvent, IntentEvent, OrderEvent, RiskDecisionEvent
 from common.utils import tracing
 from services.common.adapters import KafkaNATSAdapter
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
 from services.common.config import TimescaleSession, get_timescale_session
 
 LOGGER = logging.getLogger(__name__)
 
 tracing.init_tracing("core-trading-sequencer")
+
+
+def _model_dump(model: Any) -> Dict[str, Any]:
+    """Return a serialisable representation compatible with Pydantic v1/v2."""
+
+    dump = getattr(model, "model_dump", None)
+    if callable(dump):
+        try:
+            return cast(Dict[str, Any], dump(mode="json"))
+        except TypeError:
+            return cast(Dict[str, Any], dump())
+
+    legacy_dump = getattr(model, "dict", None)
+    if callable(legacy_dump):
+        return cast(Dict[str, Any], legacy_dump())
+
+    raise TypeError(f"Object {model!r} does not support Pydantic-style dumping")
 
 
 class RiskServiceClient(Protocol):
@@ -242,11 +263,11 @@ class TradingSequencer:
             if isinstance(event.intent, Mapping):
                 intent_payload: Dict[str, Any] = dict(event.intent)
                 intent_payload["correlation_id"] = correlation_id
-                event_data = event.model_dump(mode="json")
+                event_data = _model_dump(event)
                 event_data["intent"] = intent_payload
                 event = IntentEvent.model_validate(event_data)
 
-            intent_dump = event.model_dump(mode="json")
+            intent_dump = _model_dump(event)
             tracing.attach_correlation(intent_dump, mutate=True)
 
             lifecycle_logger = await self._lifecycle_logger(event.account_id)
@@ -277,7 +298,7 @@ class TradingSequencer:
                         decision=decision_payload,
                         ts=datetime.now(timezone.utc),
                     )
-                    decision_dump = decision_event.model_dump(mode="json")
+                    decision_dump = _model_dump(decision_event)
                     tracing.attach_correlation(decision_dump, mutate=True)
                     await self._publish(
                         adapter,
@@ -329,7 +350,7 @@ class TradingSequencer:
                             status=str(order_payload.get("status") or "submitted"),
                             ts=datetime.now(timezone.utc),
                         )
-                        order_dump = order_event.model_dump(mode="json")
+                        order_dump = _model_dump(order_event)
                         order_dump["details"] = dict(order_payload)
                         tracing.attach_correlation(order_dump, mutate=True)
                         await self._publish(
@@ -362,7 +383,7 @@ class TradingSequencer:
                                 fill_id=str(fill_identifier or uuid.uuid4()),
                             ):
                                 fill_event = self._build_fill_event(event, fill_payload)
-                                fill_dump = fill_event.model_dump(mode="json")
+                                fill_dump = _model_dump(fill_event)
                                 fill_dump["details"] = fill_payload
                                 tracing.attach_correlation(fill_dump, mutate=True)
                                 await self._publish(
@@ -460,7 +481,7 @@ class TradingSequencer:
                     ts=completed_at,
                 )
 
-        intent_result = event.model_dump(mode="json")
+        intent_result = _model_dump(event)
         tracing.attach_correlation(intent_result, mutate=True)
 
         return SequencerResult(
@@ -551,7 +572,7 @@ def _to_dict(value: Any) -> Dict[str, Any]:
     if value is None:
         return {}
     if isinstance(value, BaseModel):
-        return value.model_dump(mode="json")
+        return _model_dump(value)
     if is_dataclass(value) and not isinstance(value, type):
         return asdict(value)
     if isinstance(value, Mapping):
