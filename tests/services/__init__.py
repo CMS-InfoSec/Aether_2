@@ -69,6 +69,10 @@ def _register_test_mirrors() -> None:
     """Expose ``tests.services`` modules through the ``services`` namespace."""
 
     tests_dir = Path(__file__).resolve().parent
+    try:
+        importlib.import_module("services.core")
+    except Exception:
+        pass
     for path in tests_dir.glob("test_*.py"):
         module_name = path.stem
         alias = f"services.{module_name}"

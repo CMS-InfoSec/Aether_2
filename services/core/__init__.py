@@ -76,6 +76,9 @@ _OBJECT_EXPORTS: Dict[str, Tuple[str, str]] = {
 def _load_module(name: str) -> ModuleType:
     module_name = _MODULE_EXPORTS[name]
     module = importlib.import_module(module_name)
+    if getattr(module, "__file__", None) is None:
+        sys.modules.pop(module_name, None)
+        module = importlib.import_module(module_name)
     globals()[name] = module
     return module
 
@@ -83,7 +86,12 @@ def _load_module(name: str) -> ModuleType:
 def _load_object(name: str) -> Any:
     module_name, attribute = _OBJECT_EXPORTS[name]
     module = importlib.import_module(module_name)
-    value = getattr(module, attribute)
+    try:
+        value = getattr(module, attribute)
+    except AttributeError:
+        sys.modules.pop(module_name, None)
+        module = importlib.import_module(module_name)
+        value = getattr(module, attribute)
     globals()[name] = value
     return value
 

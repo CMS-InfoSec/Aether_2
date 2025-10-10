@@ -409,8 +409,61 @@ class _ModuleGuard(dict):
         finally:
             self._installing = False
 
+    def setdefault(self, key: str, value: object | None = None) -> object:  # type: ignore[override]
+        if key in self:
+            return super().setdefault(key, value)
+        self.__setitem__(key, value)
+        return self[key]
+
 
 _MODULE_GUARD_INSTALLED = False
+
+
+def _ensure_services_package() -> ModuleType | None:
+    """Load the canonical ``services`` package when pytest inserts a stub."""
+
+    module = sys.modules.get("services")
+    services_dir = _PROJECT_ROOT / "services"
+    init_file = services_dir / "__init__.py"
+    if not init_file.exists():
+        return module if isinstance(module, ModuleType) else None
+
+    if isinstance(module, ModuleType):
+        module_file = getattr(module, "__file__", None)
+        if module_file == str(init_file):
+            return module
+
+        overrides: Dict[str, object] = {
+            key: value
+            for key, value in module.__dict__.items()
+            if not key.startswith("__")
+        }
+    else:
+        overrides = {}
+
+    previous = module if isinstance(module, ModuleType) else None
+    if previous is not None:
+        sys.modules.pop("services", None)
+
+    spec = importlib.util.spec_from_file_location(
+        "services",
+        init_file,
+        submodule_search_locations=[str(services_dir)],
+    )
+    if spec is None or spec.loader is None:
+        if previous is not None:
+            sys.modules["services"] = previous
+        return previous
+
+    package = importlib.util.module_from_spec(spec)
+    sys.modules["services"] = package
+    spec.loader.exec_module(package)
+
+    for key, value in overrides.items():
+        if not hasattr(package, key):
+            setattr(package, key, value)
+
+    return package
 
 
 def _install_module_guard() -> None:
@@ -448,14 +501,19 @@ def _rehydrate_core_package() -> None:
     if previous is not None:
         sys.modules.pop(package_name, None)
 
-    try:
-        from services import _load_canonical_module
-    except Exception:
+    services_pkg = _ensure_services_package()
+    if services_pkg is None:
         if previous is not None:
             sys.modules[package_name] = previous
         return
 
-    replacement = _load_canonical_module(package_name)
+    loader = getattr(services_pkg, "_load_canonical_module", None)
+    if not callable(loader):
+        if previous is not None:
+            sys.modules[package_name] = previous
+        return
+
+    replacement = loader(package_name)
     if replacement is None and previous is not None:
         sys.modules[package_name] = previous
 
