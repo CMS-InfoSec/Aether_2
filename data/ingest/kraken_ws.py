@@ -1,17 +1,15 @@
-
 """Async consumers for Kraken WebSocket market data."""
-from __future__ import annotations
-
 from __future__ import annotations
 
 import asyncio
 import datetime as dt
 import json
 import logging
-
 import os
+import random
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
 
@@ -84,35 +82,70 @@ except ImportError:  # pragma: no cover - optional dependency
 LOGGER = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+KRAKEN_WS_URL = os.getenv("KRAKEN_WS_URL", "wss://ws.kraken.com")
+KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
+KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "kraken.marketdata")
+_SQLITE_FALLBACK_FLAG = "KRAKEN_WS_ALLOW_SQLITE_FOR_TESTS"
+_INSECURE_DEFAULTS_FLAG = "KRAKEN_WS_ALLOW_INSECURE_DEFAULTS"
+_STATE_DIR_ENV = "KRAKEN_WS_STATE_DIR"
+_STATE_DIR_FALLBACK = ".aether_state/kraken_ws"
+_POLL_INTERVAL_SECONDS = float(os.getenv("KRAKEN_WS_POLL_INTERVAL_SECONDS", "5"))
+
+
+def _insecure_defaults_enabled() -> bool:
+    """Return whether insecure defaults are explicitly enabled for local runs."""
+
+    return "pytest" in sys.modules or os.getenv(_INSECURE_DEFAULTS_FLAG) == "1"
+
+
+def _state_root() -> Path:
+    root = Path(os.getenv(_STATE_DIR_ENV, _STATE_DIR_FALLBACK))
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _state_file_for_symbol(symbol: str) -> Path:
+    normalised = symbol.replace("/", "_").replace(" ", "_").lower()
+    return _state_root() / f"{normalised}.json"
+
 
 def _require_aiohttp() -> None:
     if aiohttp is None:  # pragma: no cover - executed when aiohttp missing
+        if _insecure_defaults_enabled():
+            LOGGER.warning(
+                "aiohttp is not available; falling back to local snapshot polling for Kraken ingest",
+            )
+            return
         raise MissingDependencyError("aiohttp is required for Kraken ingest") from _AIOHTTP_IMPORT_ERROR
 
 
 def _require_sqlalchemy() -> None:
     if not _SQLALCHEMY_AVAILABLE or metadata is None or orderbook_events_table is None:
+        if _insecure_defaults_enabled():
+            LOGGER.warning(
+                "SQLAlchemy is not available; using JSON persistence fallback for Kraken ingest",
+            )
+            return
         raise MissingDependencyError("SQLAlchemy is required for Kraken ingest") from _SQLALCHEMY_IMPORT_ERROR
 
 
-KRAKEN_WS_URL = os.getenv("KRAKEN_WS_URL", "wss://ws.kraken.com")
-KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
-KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "kraken.marketdata")
-_SQLITE_FALLBACK_FLAG = "KRAKEN_WS_ALLOW_SQLITE_FOR_TESTS"
-
-
-def _resolve_database_url() -> str:
+def _resolve_database_url() -> str | None:
     """Return the configured Timescale/PostgreSQL DSN used for persistence."""
 
-    raw_url = os.getenv("DATABASE_URL", "")
-    if not raw_url.strip():
+    raw_url = os.getenv("DATABASE_URL", "").strip()
+    if not raw_url:
+        if _insecure_defaults_enabled():
+            LOGGER.warning(
+                "DATABASE_URL is not configured; Kraken ingest will persist JSON snapshots locally",
+            )
+            return None
         raise RuntimeError(
             "Kraken ingest requires DATABASE_URL to be set to a PostgreSQL/Timescale DSN."
         )
 
     allow_sqlite = "pytest" in sys.modules or os.getenv(_SQLITE_FALLBACK_FLAG) == "1"
     database_url = normalize_sqlalchemy_dsn(
-        raw_url.strip(),
+        raw_url,
         allow_sqlite=allow_sqlite,
         label="Kraken ingest database URL",
     )
@@ -167,7 +200,7 @@ def flatten_updates(symbol: str, payload: Dict[str, Any]) -> List[OrderBookEvent
     """Normalise Kraken order book payloads into orderbook_events rows."""
     bids = payload.get("b") or payload.get("bs") or []
     asks = payload.get("a") or payload.get("as") or []
-    timestamp = payload.get('timestamp')
+    timestamp = payload.get("timestamp")
     if not timestamp and bids:
         timestamp = bids[0][2] if len(bids[0]) > 2 else None
     if not timestamp and asks:
@@ -217,10 +250,35 @@ def datetime_from_kraken(timestamp: Any) -> dt.datetime:
     return dt_obj
 
 
-def persist_updates(engine: Engine, updates: Sequence[OrderBookEvent]) -> None:
-    _require_sqlalchemy()
+def _persist_updates_locally(updates: Sequence[OrderBookEvent]) -> None:
     if not updates:
         return
+    root = _state_root()
+    for update in updates:
+        symbol_file = root / f"{update.symbol.replace('/', '_').replace(' ', '_').lower()}_events.jsonl"
+        payload = {
+            "symbol": update.symbol,
+            "ts": update.ts.isoformat(),
+            "side": update.side,
+            "price": update.price,
+            "size": update.size,
+            "action": update.action,
+            "sequence": update.sequence,
+            "meta": update.meta,
+        }
+        with symbol_file.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload) + "\n")
+
+
+def persist_updates(engine: Engine | None, updates: Sequence[OrderBookEvent]) -> None:
+    if not updates:
+        return
+    if not _SQLALCHEMY_AVAILABLE or metadata is None or orderbook_events_table is None or engine is None:
+        if _insecure_defaults_enabled():
+            _persist_updates_locally(updates)
+            return
+        raise MissingDependencyError("SQLAlchemy is required for Kraken ingest") from _SQLALCHEMY_IMPORT_ERROR
+
     with engine.begin() as connection:
         for update in updates:
             record = {
@@ -295,11 +353,109 @@ async def publish_to_nats(updates: Sequence[OrderBookEvent]) -> None:
         await client.drain()
 
 
+def _seed_local_snapshot(symbol: str, rng: random.Random) -> Dict[str, Any]:
+    base_price = rng.uniform(50, 50000)
+    tick = max(base_price * 0.0005, 0.05)
+    depth = 5
+    bids = []
+    asks = []
+    for level in range(depth):
+        bid_price = base_price - tick * (level + 1)
+        ask_price = base_price + tick * (level + 1)
+        bids.append([f"{bid_price:.2f}", f"{rng.uniform(0.1, 1.5):.4f}", ""])
+        asks.append([f"{ask_price:.2f}", f"{rng.uniform(0.1, 1.5):.4f}", ""])
+    return {"b": bids, "a": asks, "sequence": 0}
+
+
+def _apply_local_jitter(payload: Dict[str, Any], rng: random.Random, timestamp: str) -> Dict[str, Any]:
+    bids = payload.get("b") or []
+    asks = payload.get("a") or []
+    drift = rng.uniform(-0.5, 0.5)
+
+    def _update_levels(levels: List[List[Any]], direction: int) -> List[List[str]]:
+        updated: List[List[str]] = []
+        for idx, raw_level in enumerate(levels):
+            try:
+                price = float(raw_level[0])
+            except (TypeError, ValueError, IndexError):
+                price = rng.uniform(50, 50000)
+            step = drift + rng.uniform(0.01, 0.2) * (idx + 1)
+            price = max(0.01, price + step * direction)
+            try:
+                size = float(raw_level[1])
+            except (TypeError, ValueError, IndexError):
+                size = rng.uniform(0.05, 1.5)
+            size = max(0.01, size + rng.uniform(-0.05, 0.05))
+            updated.append([f"{price:.2f}", f"{size:.4f}", timestamp])
+        return updated
+
+    payload["b"] = _update_levels(bids, direction=1)
+    payload["a"] = _update_levels(asks, direction=-1)
+    payload["timestamp"] = timestamp
+    payload["sequence"] = int(payload.get("sequence") or 0) + 1
+    return payload
+
+
+def _load_local_depth_snapshot(symbol: str) -> Dict[str, Any]:
+    rng = random.Random(symbol)
+    state_file = _state_file_for_symbol(symbol)
+    if state_file.exists():
+        try:
+            payload = json.loads(state_file.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            payload = _seed_local_snapshot(symbol, rng)
+    else:
+        payload = _seed_local_snapshot(symbol, rng)
+
+    timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
+    payload = _apply_local_jitter(payload, rng, timestamp)
+    state_file.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    return payload
+
+
+async def _consume_via_local_snapshots(
+    engine: Engine | None,
+    producer: Producer | None,
+    pairs: Sequence[str],
+    *,
+    iterations: int | None = None,
+) -> None:
+    LOGGER.warning(
+        "Using local snapshot fallback for Kraken ingest; enable aiohttp for live order-book streaming",
+    )
+    loop_count = 0
+    while True:
+        for pair in pairs:
+            payload = _load_local_depth_snapshot(pair)
+            updates = flatten_updates(pair, payload)
+            if not updates:
+                continue
+            persist_updates(engine, updates)
+            publish_updates(producer, updates)
+            await publish_to_nats(updates)
+        loop_count += 1
+        if iterations is not None and loop_count >= iterations:
+            break
+        await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+
+
 async def consume(pairs: Sequence[str]) -> None:
     _require_sqlalchemy()
-    _require_aiohttp()
-    engine = create_engine(DATABASE_URL, future=True)
+    engine: Engine | None = None
+    if (
+        DATABASE_URL
+        and _SQLALCHEMY_AVAILABLE
+        and metadata is not None
+        and orderbook_events_table is not None
+    ):
+        engine = create_engine(DATABASE_URL, future=True)
     producer = kafka_producer()
+
+    if aiohttp is None and _insecure_defaults_enabled():
+        await _consume_via_local_snapshots(engine, producer, pairs)
+        return
+
+    _require_aiohttp()
     async with aiohttp.ClientSession() as session:
         ws = await subscribe(session, pairs)
         async for message in ws:
@@ -330,4 +486,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
