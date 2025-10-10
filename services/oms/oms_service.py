@@ -1050,6 +1050,9 @@ class AccountContext:
             else:
                 self.ws_client.set_rest_client(self.rest_client)
 
+            if hasattr(self.ws_client, "set_request_id"):
+                self.ws_client.set_request_id(get_request_id())
+
             await self.ws_client.ensure_connected()
             await self.ws_client.subscribe_private(["openOrders", "ownTrades"])
             await self.routing.start(self.ws_client, self.rest_client)
@@ -2817,6 +2820,7 @@ async def _startup() -> None:
 @app.post("/oms/place", response_model=OMSPlaceResponse)
 async def place_order(
     payload: OMSPlaceRequest,
+    request: Request,
     account_id: str = Depends(require_authorized_account),
 ) -> OMSPlaceResponse:
     if payload.account_id != account_id:
@@ -2829,6 +2833,13 @@ async def place_order(
 
     account = await manager.get_account(payload.account_id)
     with bind_metric_context(account_id=payload.account_id, symbol=payload.symbol):
+        request_id = get_request_id() or request.headers.get("X-Request-ID")
+        ws_client = getattr(account, "ws_client", None)
+        if request_id and ws_client is not None and hasattr(ws_client, "set_request_id"):
+            try:
+                ws_client.set_request_id(request_id)
+            except Exception:  # pragma: no cover - defensive guard for stubbed clients
+                pass
         result = await account.place_order(payload)
     return result
 

@@ -21,7 +21,7 @@ from __future__ import annotations
 import importlib
 from importlib.machinery import ModuleSpec
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, List
 
 from types import ModuleType
 
@@ -30,17 +30,33 @@ import sys
 __all__: list[str] = []
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_DEFAULT_PACKAGE_PATH = str(Path(__file__).resolve().parent)
 _TESTS_DIRS: Iterable[Path] = (
     _PROJECT_ROOT / "tests" / "services",
 )
 
-_locations = list(__path__)  # type: ignore[name-defined]
-for candidate in _TESTS_DIRS:
-    if candidate.is_dir():
-        location = str(candidate)
-        if location not in _locations:
-            _locations.append(location)
+def _build_search_path() -> List[str]:
+    """Return the list of search locations for the ``services`` namespace."""
 
+    locations: List[str] = []
+
+    existing = globals().get("__path__")
+    if existing:
+        locations.extend(existing)  # type: ignore[arg-type]
+
+    if _DEFAULT_PACKAGE_PATH not in locations:
+        locations.append(_DEFAULT_PACKAGE_PATH)
+
+    for candidate in _TESTS_DIRS:
+        if candidate.is_dir():
+            location = str(candidate)
+            if location not in locations:
+                locations.append(location)
+
+    return locations
+
+
+_locations = _build_search_path()
 __path__ = _locations  # type: ignore[assignment]
 
 spec: ModuleSpec | None = globals().get("__spec__")

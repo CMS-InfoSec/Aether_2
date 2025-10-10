@@ -88,11 +88,29 @@ def _preload_services_package() -> None:
         pass
 
 
+def _ensure_fastapi_testclient() -> None:
+    """Pre-import the FastAPI test client shim when available."""
+
+    try:
+        import fastapi.testclient as _testclient
+    except Exception:  # pragma: no cover - optional dependency may be absent
+        pass
+    else:
+        if not hasattr(_testclient, "TestClient"):
+            try:
+                import importlib
+
+                importlib.reload(_testclient)
+            except Exception:  # pragma: no cover - keep import resilient
+                pass
+
+
 _ensure_project_root_on_path()
 _install_secrets_shim()
 _preload_services_package()
 _ensure_services_namespace()
 _ensure_common_namespace()
+_ensure_fastapi_testclient()
 
 try:  # pragma: no cover - shared bootstrap may be unavailable in some contexts
     from shared.common_bootstrap import ensure_common_helpers

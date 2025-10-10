@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import uuid
 from datetime import date, datetime, timezone
 from collections.abc import MutableMapping
 from contextlib import ExitStack, asynccontextmanager
@@ -45,6 +46,11 @@ try:  # pragma: no cover - prefer the real FastAPI implementation when available
 except Exception:  # pragma: no cover - extremely defensive
     importlib = None  # type: ignore[assignment]
     sys = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - metrics may be unavailable in minimal environments
+    import metrics as _metrics_module  # type: ignore[import]
+except Exception:  # pragma: no cover - keep the stub usable without metrics
+    _metrics_module = None
 
 try:  # pragma: no cover - pydantic may be unavailable in some environments
     from pydantic import ValidationError as PydanticValidationError  # type: ignore
@@ -361,6 +367,41 @@ class Request:
 
     def json(self) -> Any:
         return self._body
+
+
+def _bind_request_id(request: "Request") -> tuple[Optional[object], Optional[str]]:
+    """Mirror ``RequestTracingMiddleware`` in environments using the stub."""
+
+    global _metrics_module
+    if _metrics_module is None:
+        try:  # pragma: no cover - lazy import for test environments
+            import metrics as _metrics_module  # type: ignore[import, assignment]
+        except Exception:
+            return None, None
+    if _metrics_module is None or not hasattr(_metrics_module, "_REQUEST_ID"):
+        return None, None
+
+    headers = getattr(request, "headers", {}) or {}
+    request_id: Optional[str] = None
+    if isinstance(headers, Mapping):
+        request_id = headers.get("X-Request-ID") or headers.get("x-request-id")
+
+    if not request_id:
+        request_id = str(uuid.uuid4())
+
+    token = _metrics_module._REQUEST_ID.set(request_id)
+    return token, request_id
+
+
+def _reset_request_id(token: Optional[object]) -> None:
+    if _metrics_module is None or not hasattr(_metrics_module, "_REQUEST_ID"):
+        return
+    if token is None:
+        return
+    try:
+        _metrics_module._REQUEST_ID.reset(token)
+    except Exception:  # pragma: no cover - mismatched token provided
+        pass
 
 
 class Response:
@@ -1034,6 +1075,7 @@ class TestClient:
         else:  # pragma: no cover - compatibility guard for patched requests
             setattr(request, "_body", body)
 
+        token, request_id = _bind_request_id(request)
         try:
             payload = _run_async(
                 lambda: _call_endpoint(
@@ -1053,33 +1095,51 @@ class TestClient:
                     key.lower() for key in headers.keys()
                 }:
                     headers["content-type"] = payload.media_type
-                return _ClientResponse(
+                if request_id and "x-request-id" not in {
+                    key.lower() for key in headers.keys()
+                }:
+                    headers["x-request-id"] = request_id
+                response = _ClientResponse(
                     status_code=status_code,
                     payload=content,
                     headers=headers,
                     media_type=payload.media_type,
                 )
-            return _ClientResponse(
-                status_code=status_code,
-                payload=_dump_response_payload(payload),
-                headers={"content-type": "application/json"},
-                media_type="application/json",
-            )
+            else:
+                headers = {"content-type": "application/json"}
+                if request_id:
+                    headers.setdefault("x-request-id", request_id)
+                response = _ClientResponse(
+                    status_code=status_code,
+                    payload=_dump_response_payload(payload),
+                    headers=headers,
+                    media_type="application/json",
+                )
         except RequestValidationError as exc:
-            return _ClientResponse(
+            headers = {"content-type": "application/json"}
+            if request_id:
+                headers.setdefault("x-request-id", request_id)
+            response = _ClientResponse(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 payload={"detail": exc.errors},
-                headers={"content-type": "application/json"},
+                headers=headers,
                 media_type="application/json",
             )
         except HTTPException as exc:
             detail = exc.detail if exc.detail is not None else ""
-            return _ClientResponse(
+            headers = {"content-type": "application/json"}
+            if request_id:
+                headers.setdefault("x-request-id", request_id)
+            response = _ClientResponse(
                 status_code=exc.status_code,
                 payload={"detail": detail},
-                headers={"content-type": "application/json"},
+                headers=headers,
                 media_type="application/json",
             )
+        finally:
+            _reset_request_id(token)
+
+        return response
 
     def get(
         self,

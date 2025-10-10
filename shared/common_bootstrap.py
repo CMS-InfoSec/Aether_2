@@ -27,6 +27,8 @@ _COMMON_MODULES = (
     "services.common.adapters",
     "services.common.precision",
     "services.common.schemas",
+    "services.analytics",
+    "services.oms",
 )
 
 # Parent attributes that should always refer to the canonical submodules once the
