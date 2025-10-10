@@ -20,6 +20,10 @@ except Exception:  # pragma: no cover - fallback when psycopg2 is unavailable
     sql = None  # type: ignore[assignment]
     RealDictCursor = Any  # type: ignore[assignment]
 
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
 from services.common.config import get_timescale_session
 from services.common.security import require_admin_account
 
