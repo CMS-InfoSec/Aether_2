@@ -18,6 +18,10 @@ from decimal import Decimal
 from threading import Lock
 from typing import Any, DefaultDict, Dict, Iterable, List, Tuple
 
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
 from services.common.config import get_timescale_session
 
 try:  # pragma: no cover - optional dependency in CI
