@@ -70,6 +70,34 @@ if str(_PROJECT_ROOT) not in sys.path:
 sys.modules.setdefault("services_real", sys.modules[__name__])
 
 
+def _register_test_mirrors() -> None:
+    """Expose ``tests/services`` modules under the ``services`` namespace."""
+
+    tests_dir = _PROJECT_ROOT / "tests" / "services"
+    if not tests_dir.is_dir():
+        return
+
+    for path in sorted(tests_dir.glob("test_*.py")):
+        alias = f"{__name__}.{path.stem}"
+        if alias in sys.modules:
+            continue
+
+        spec = importlib.util.spec_from_file_location(alias, path)
+        if spec is None or spec.loader is None:
+            continue
+
+        module = importlib.util.module_from_spec(spec)
+        try:
+            sys.modules[alias] = module
+            spec.loader.exec_module(module)
+        except Exception:  # pragma: no cover - optional deps may be absent
+            sys.modules.pop(alias, None)
+            continue
+
+
+_register_test_mirrors()
+
+
 def __getattr__(name: str) -> ModuleType:
     """Lazily import ``services.<name>`` and cache the submodule."""
 
