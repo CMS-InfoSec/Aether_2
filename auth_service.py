@@ -518,12 +518,15 @@ def _initialise_database(*, require: bool = False) -> Optional[sessionmaker[OrmS
 
     engine = create_engine(url, **_engine_options(url))
     schema = _resolve_schema(url)
+    table = getattr(AuthSession, "__table__", None)
     if schema:
         Base.metadata.schema = schema
-        AuthSession.__table__.schema = schema
+        if table is not None:
+            table.schema = schema
     else:
         Base.metadata.schema = None
-        AuthSession.__table__.schema = None
+        if table is not None:
+            table.schema = None
 
     session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True)
     Base.metadata.create_all(bind=engine)

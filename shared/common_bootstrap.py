@@ -80,6 +80,29 @@ def _reload_with_overrides(module_name: str) -> ModuleType:
     return module
 
 
+def _ensure_fastapi_stub() -> None:
+    """Ensure the repository's FastAPI shim is loaded instead of pytest stubs."""
+
+    module = sys.modules.get("fastapi")
+    should_reload = False
+    if module is None:
+        should_reload = True
+    elif not isinstance(module, ModuleType) or getattr(module, "__file__", None) is None:
+        should_reload = True
+    else:
+        required_attrs = ("FastAPI", "APIRouter", "status")
+        if any(not hasattr(module, attr) for attr in required_attrs):
+            should_reload = True
+
+    if should_reload:
+        sys.modules.pop("fastapi", None)
+        module = importlib.import_module("fastapi")
+
+    status_module = getattr(module, "status", None)
+    if isinstance(status_module, ModuleType) and not hasattr(status_module, "HTTP_201_CREATED"):
+        importlib.reload(module)
+
+
 def ensure_common_helpers() -> None:
     """Guarantee the real ``services.common`` helpers are available."""
 
@@ -93,4 +116,6 @@ def ensure_common_helpers() -> None:
 
     for attribute, (module_name, source_attr) in _PARENT_REEXPORTS.items():
         setattr(parent, attribute, getattr(loaded[module_name], source_attr))
+
+    _ensure_fastapi_stub()
 
