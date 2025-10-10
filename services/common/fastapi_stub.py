@@ -1294,29 +1294,35 @@ class TestClient:
 def _run_async(factory: Callable[[], Any]) -> Any:
     import asyncio
 
-    def _resolve() -> Any:
-        return factory()
-
-    candidate = _resolve()
-    if not asyncio.iscoroutine(candidate):
-        return candidate
     try:
-        return asyncio.run(candidate)
-    except RuntimeError as exc:
-        message = str(exc)
-        if "asyncio.run() cannot be called" not in message:
-            raise
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = None
+
+    if running_loop is not None:
         new_loop = asyncio.new_event_loop()
         try:
-            candidate = _resolve()
-            if asyncio.iscoroutine(candidate):
+            candidate = factory()
+            if not asyncio.iscoroutine(candidate):
+                return candidate
+            try:
                 return new_loop.run_until_complete(candidate)
-            return candidate
+            except Exception:
+                try:
+                    candidate.close()
+                except Exception:
+                    pass
+                raise
         finally:
             try:
                 new_loop.run_until_complete(new_loop.shutdown_asyncgens())
             finally:
                 new_loop.close()
+
+    candidate = factory()
+    if not asyncio.iscoroutine(candidate):
+        return candidate
+    return asyncio.run(candidate)
 
 
 def _install_fastapi_module() -> None:
