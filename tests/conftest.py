@@ -30,6 +30,27 @@ try:
 except Exception:  # pragma: no cover - services module may be unavailable in some suites
     _order_ack_cache = None  # type: ignore[assignment]
 
+try:
+    from services.common.adapters import KafkaNATSAdapter
+except Exception:  # pragma: no cover - adapters may be unavailable in lightweight suites
+    KafkaNATSAdapter = None  # type: ignore[assignment]
+else:
+    if not hasattr(KafkaNATSAdapter, "reset"):
+
+        @classmethod
+        def _reset_adapter(cls, account_id: str | None = None) -> None:
+            buffer = getattr(cls, "_fallback_buffer", {})
+            published = getattr(cls, "_published_events", {})
+            if account_id is None:
+                buffer.clear()
+                published.clear()
+            else:
+                normalized = str(account_id)
+                buffer.pop(normalized, None)
+                published.pop(normalized, None)
+
+        setattr(KafkaNATSAdapter, "reset", _reset_adapter)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
