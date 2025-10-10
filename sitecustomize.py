@@ -75,3 +75,13 @@ _ensure_project_root_on_path()
 _extend_stdlib_secrets_namespace()
 _ensure_services_namespace()
 _ensure_common_namespace()
+
+try:  # pragma: no cover - shared bootstrap may be unavailable in some contexts
+    from shared.common_bootstrap import ensure_common_helpers
+except Exception:  # pragma: no cover - avoid hard failures during early startup
+    ensure_common_helpers = None  # type: ignore[assignment]
+else:
+    try:
+        ensure_common_helpers()
+    except Exception:  # pragma: no cover - defensive guard to keep import resilient
+        pass

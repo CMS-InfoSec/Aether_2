@@ -10,6 +10,7 @@ The repository requires coordinated fixes across persistence, services, and test
 | P0 | Add Redis test double with `Redis`-compatible interface | ✅ Completed | `common.utils.redis.create_redis_from_url` now returns an in-memory stub when the driver or server is unavailable, keeping caches operational in CI.【F:common/utils/redis.py†L29-L277】 |
 | P1 | Normalize env var defaults for DSNs and API keys during tests | ✅ Completed | Configuration helpers populate deterministic Redis/Timescale DSNs and stub Kraken secrets under `.aether_state/`, preventing `KeyError`/`ValueError` during pytest bootstrap.【F:services/common/config.py†L82-L234】 |
 | P0 | Prevent pytest stubs from shadowing shared adapters/security helpers | ✅ Completed | `services.common` now discards stub modules that lack `__file__` and reloads the production implementations so imports like `from services.common.adapters import TimescaleAdapter` resolve even after tests inject placeholders.【F:services/common/__init__.py†L25-L109】 |
+| P0 | Run shared bootstrap during interpreter startup | ✅ Completed | `sitecustomize` invokes `ensure_common_helpers()` on import so the canonical `services.common.security` guards and `httpx` shim load before pytest collection, keeping `ADMIN_ACCOUNTS` and response helpers available even when suites register temporary stubs.【F:sitecustomize.py†L1-L66】【F:shared/common_bootstrap.py†L1-L120】 |
 
 ## 2. Order Management & Simulation
 
