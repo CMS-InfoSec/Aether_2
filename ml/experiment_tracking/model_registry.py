@@ -8,8 +8,12 @@ when MLflow is not available or when invalid parameters are supplied.
 
 from __future__ import annotations
 
+import json
 import os
-from typing import List, Mapping, Optional
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional
 
 # Provide stub configuration values so local development environments have a
 # deterministic tracking location without requiring additional setup.
@@ -27,6 +31,8 @@ except Exception:  # pragma: no cover - defensive guard for optional import.
     ModelVersion = object  # type: ignore[assignment]
     MlflowClient = object  # type: ignore[assignment]
 
+from ml.insecure_defaults import insecure_defaults_enabled, state_file
+
 
 _ALLOWED_STAGES = {
     "staging": "Staging",
@@ -34,6 +40,75 @@ _ALLOWED_STAGES = {
     "prod": "Production",
     "production": "Production",
 }
+
+
+@dataclass(frozen=True)
+class LocalModelVersion:
+    """Lightweight stand-in for :class:`mlflow.ModelVersion`."""
+
+    name: str
+    version: int
+    current_stage: str
+    run_id: str
+    source: str
+    tags: Mapping[str, str]
+    created_at: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "version": self.version,
+            "current_stage": self.current_stage,
+            "run_id": self.run_id,
+            "source": self.source,
+            "tags": dict(self.tags),
+            "created_at": self.created_at,
+        }
+
+
+def _local_registry_enabled() -> bool:
+    return mlflow is None and insecure_defaults_enabled()
+
+
+def _local_registry_path(name: str) -> Path:
+    safe_name = name.replace("/", "-") or "default"
+    return state_file("model_registry", f"{safe_name}.json")
+
+
+def _load_local_versions(name: str) -> List[Dict[str, Any]]:
+    path = _local_registry_path(name)
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):  # pragma: no cover - corrupted state
+        return []
+    versions = data.get("versions")
+    if not isinstance(versions, list):
+        return []
+    normalized: List[Dict[str, Any]] = []
+    for entry in versions:
+        if isinstance(entry, dict):
+            normalized.append(entry)
+    return normalized
+
+
+def _write_local_versions(name: str, versions: List[Dict[str, Any]]) -> None:
+    path = _local_registry_path(name)
+    payload = {"versions": versions, "updated_at": datetime.now(timezone.utc).isoformat()}
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def _local_model_version(record: Dict[str, Any], name: str) -> LocalModelVersion:
+    return LocalModelVersion(
+        name=name,
+        version=int(record.get("version", 0)),
+        current_stage=str(record.get("current_stage", "None")),
+        run_id=str(record.get("run_id", "")),
+        source=str(record.get("source", "")),
+        tags={k: str(v) for k, v in dict(record.get("tags", {})).items()},
+        created_at=str(record.get("created_at", datetime.now(timezone.utc).isoformat())),
+    )
 
 
 def _require_mlflow() -> MlflowClient:
@@ -91,6 +166,24 @@ def register_model(
         raise ValueError("name must be provided when registering a model")
 
     target_stage = _normalize_stage(stage)
+
+    if _local_registry_enabled():
+        if not run_id:
+            raise ValueError("run_id must be provided when registering a model")
+        versions = _load_local_versions(name)
+        next_version = (max((int(v.get("version", 0)) for v in versions), default=0) + 1)
+        record = {
+            "version": next_version,
+            "current_stage": target_stage,
+            "run_id": run_id,
+            "source": f"runs:/{run_id}/model",
+            "tags": dict(tags or {}),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        versions.append(record)
+        _write_local_versions(name, versions)
+        return _local_model_version(record, name)
+
     client = _require_mlflow()
     model_uri = f"runs:/{run_id}/model"
 
@@ -138,6 +231,19 @@ def get_latest_model(name: str, stage: str) -> Optional[ModelVersion]:
         raise ValueError("name must be provided when fetching the latest model")
 
     target_stage = _normalize_stage(stage)
+
+    if _local_registry_enabled():
+        versions = _load_local_versions(name)
+        matching = [
+            entry
+            for entry in versions
+            if str(entry.get("current_stage", "")).lower() == target_stage.lower()
+        ]
+        if not matching:
+            return None
+        record = max(matching, key=lambda item: int(item.get("version", 0)))
+        return _local_model_version(record, name)
+
     client = _require_mlflow()
 
     try:
@@ -174,6 +280,13 @@ def list_models(name: str) -> List[ModelVersion]:
 
     if not name:
         raise ValueError("name must be provided when listing models")
+
+    if _local_registry_enabled():
+        versions = _load_local_versions(name)
+        return [
+            _local_model_version(entry, name)
+            for entry in sorted(versions, key=lambda item: int(item.get("version", 0)), reverse=True)
+        ]
 
     client = _require_mlflow()
 

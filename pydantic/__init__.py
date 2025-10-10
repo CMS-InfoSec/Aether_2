@@ -273,6 +273,11 @@ class BaseModel:
             setattr(self, key, value)
         self.model_fields_set = provided_fields
 
+        model_validators = self._model_validators()
+        validated_self = self._apply_model_validators(model_validators, "after", self)
+        if validated_self is not self:
+            self.__dict__.update(validated_self.__dict__)
+
     def dict(self, *, exclude_none: bool = False) -> Dict[str, Any]:
         return self.model_dump(exclude_none=exclude_none)
 
@@ -357,6 +362,28 @@ class BaseModel:
         setattr(cls, "__field_validators__", mapping)
         return mapping
 
+    @classmethod
+    def _model_validators(
+        cls,
+    ) -> Dict[str, list[Callable[["BaseModel"], "BaseModel" | None]]]:
+        cached = getattr(cls, "__model_validators__", None)
+        if cached is not None:
+            return cached
+
+        mapping: Dict[str, list[Callable[["BaseModel"], "BaseModel" | None]]] = {
+            "before": [],
+            "after": [],
+        }
+        for name, attribute in cls.__dict__.items():
+            if not getattr(attribute, "__pydantic_model_validator__", False):
+                continue
+            bound = getattr(cls, name)
+            mode: str = getattr(attribute, "__pydantic_model_mode__", "after")
+            mapping.setdefault(mode, []).append(bound)
+
+        setattr(cls, "__model_validators__", mapping)
+        return mapping
+
     @staticmethod
     def _apply_field_validators(
         validators: Dict[str, Dict[str, Iterable[Callable[[Any], Any]]]],
@@ -374,6 +401,24 @@ class BaseModel:
             except Exception as exc:  # pragma: no cover - error propagation
                 raise ValidationError(str(exc)) from exc
         return value
+
+    @staticmethod
+    def _apply_model_validators(
+        validators: Dict[str, list[Callable[["BaseModel"], "BaseModel" | None]]],
+        mode: str,
+        instance: "BaseModel",
+    ) -> "BaseModel":
+        funcs = validators.get(mode, [])
+        current = instance
+        for func in funcs:
+            try:
+                result = func(current)
+            except Exception as exc:  # pragma: no cover - propagate validation errors
+                raise ValidationError(str(exc)) from exc
+            if result is None:
+                continue
+            current = result
+        return current
 
     @staticmethod
     def _coerce_value(annotation: Any, value: Any) -> Any:
