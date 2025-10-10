@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import json
+import json as jsonlib
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Dict, Optional
@@ -22,6 +22,7 @@ __all__ = [
     "Client",
     "HTTPError",
     "HTTPStatusError",
+    "ReadTimeout",
     "MockTransport",
     "Request",
     "RequestError",
@@ -41,6 +42,19 @@ class HTTPError(RequestError):
 
 class TimeoutException(HTTPError):
     """Raised when a request exceeds the configured timeout."""
+
+
+class ReadTimeout(TimeoutException):
+    """Compatibility alias for :class:`httpx.ReadTimeout`."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request: Request | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.request = request
 
 
 class HTTPStatusError(HTTPError):
@@ -106,10 +120,17 @@ class Response:
         status_code: int,
         *,
         json_data: Any | None = None,
+        json: Any | None = None,
         text: str | None = None,
         content: bytes | None = None,
         request: Request | None = None,
     ) -> None:
+        if json is not None and json_data is not None:
+            raise TypeError("Only one of 'json' or 'json_data' may be provided")
+
+        if json is not None:
+            json_data = json
+
         self.status_code = int(status_code)
         self.request = request
         self._json = json_data if json_data is not None else _MISSING
@@ -125,7 +146,7 @@ class Response:
                 self.text = ""
         elif json_data is not None:
             try:
-                self.text = json.dumps(json_data)
+                self.text = jsonlib.dumps(json_data)
             except (TypeError, ValueError):
                 self.text = ""
             self.content = self.text.encode("utf-8")
@@ -138,7 +159,7 @@ class Response:
             return self._json
         if not self.text:
             raise ValueError("Response does not contain JSON data")
-        return json.loads(self.text)
+        return jsonlib.loads(self.text)
 
     def raise_for_status(self) -> None:
         if 400 <= self.status_code:
