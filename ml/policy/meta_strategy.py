@@ -9,6 +9,7 @@ features and we expose the resulting allocation through a FastAPI endpoint.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Mapping, Optional, Sequence
@@ -53,35 +54,108 @@ _SCIENTIFIC_STACK_AVAILABLE = all(
 
 
 class _FallbackClassifier:
-    """Lightweight classifier used when the scientific stack is unavailable."""
+    """Logistic-regression style classifier without third-party dependencies."""
+
+    _LEARNING_RATE = 0.1
+    _EPOCHS = 50
+    _L2 = 0.001
 
     def __init__(self) -> None:
         self.classes_: List[str] = list(STRATEGIES)
-        self._weights: Dict[str, float] = {
-            name: 1.0 / len(STRATEGIES) for name in STRATEGIES
-        }
+        self._weights: Dict[str, List[float]] = {}
+        self._feature_count = 0
 
     def fit(
         self, feature_matrix: Sequence[Sequence[float]], labels: Sequence[object]
     ) -> "_FallbackClassifier":
-        counts: Dict[str, int] = {name: 0 for name in STRATEGIES}
-        for label in labels:
-            counts[str(label)] = counts.get(str(label), 0) + 1
-        total = sum(counts.values())
-        if total:
-            self._weights = {
-                name: counts.get(name, 0) / total for name in STRATEGIES
-            }
-        else:  # pragma: no cover - defensive fallback
-            self._weights = {
-                name: 1.0 / len(STRATEGIES) for name in STRATEGIES
-            }
+        samples = list(feature_matrix)
+        if not samples:
+            self._weights = {name: [0.0] for name in STRATEGIES}
+            return self
+
+        self._feature_count = len(samples[0]) if samples[0] else 0
+        if any(len(sample) != self._feature_count for sample in samples):
+            raise ValueError("Feature matrix contains inconsistent sample lengths")
+
+        if self._feature_count == 0:
+            counts: Dict[str, int] = {name: 0 for name in STRATEGIES}
+            for label in labels:
+                counts[str(label)] = counts.get(str(label), 0) + 1
+            total = sum(counts.values())
+            if total:
+                self._weights = {
+                    name: [counts.get(name, 0) / total]
+                    for name in STRATEGIES
+                }
+            else:  # pragma: no cover - defensive fallback
+                self._weights = {name: [1.0 / len(STRATEGIES)] for name in STRATEGIES}
+            return self
+
+        for name in STRATEGIES:
+            if name not in self._weights or len(self._weights[name]) != self._feature_count + 1:
+                self._weights[name] = [0.0] * (self._feature_count + 1)
+
+        encoded_labels = [str(label) for label in labels]
+        for _ in range(self._EPOCHS):
+            for features, label in zip(samples, encoded_labels):
+                for strategy in STRATEGIES:
+                    weights = self._weights[strategy]
+                    activation = self._dot(weights, features)
+                    probability = self._sigmoid(activation)
+                    target = 1.0 if label == strategy else 0.0
+                    error = target - probability
+                    for idx, value in enumerate(features):
+                        weights[idx] += self._LEARNING_RATE * (
+                            error * value - self._L2 * weights[idx]
+                        )
+                    # Bias term is stored in the last position.
+                    weights[-1] += self._LEARNING_RATE * error
+
         return self
 
     def predict_proba(
-        self, _feature_matrix: Sequence[Sequence[float]]
+        self, feature_matrix: Sequence[Sequence[float]]
     ) -> List[List[float]]:
-        return [[self._weights.get(name, 0.0) for name in STRATEGIES]]
+        probabilities: List[List[float]] = []
+        for features in feature_matrix:
+            if len(features) != self._feature_count:
+                raise ValueError("Feature vector length does not match trained model")
+            scores = []
+            for strategy in STRATEGIES:
+                weights = self._weights.get(strategy)
+                if not weights:
+                    scores.append(0.0)
+                    continue
+                activation = self._dot(weights, features)
+                scores.append(activation)
+            probabilities.append(self._softmax(scores))
+        return probabilities
+
+    def _dot(self, weights: Sequence[float], features: Sequence[float]) -> float:
+        # Bias term stored at the end of the weight vector.
+        total = weights[-1]
+        for weight, value in zip(weights[:-1], features):
+            total += weight * value
+        return total
+
+    @staticmethod
+    def _sigmoid(value: float) -> float:
+        if value < -60:
+            return 0.0
+        if value > 60:
+            return 1.0
+        return 1.0 / (1.0 + math.exp(-value))
+
+    @staticmethod
+    def _softmax(scores: Sequence[float]) -> List[float]:
+        if not scores:
+            return [0.0 for _ in STRATEGIES]
+        max_score = max(scores)
+        exp_scores = [math.exp(score - max_score) for score in scores]
+        total = sum(exp_scores)
+        if total == 0:
+            return [1.0 / len(scores)] * len(scores)
+        return [score / total for score in exp_scores]
 
 
 @dataclass
