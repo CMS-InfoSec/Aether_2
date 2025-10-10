@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import sys
+from pathlib import Path
 from types import ModuleType
 from typing import Dict, Mapping, Tuple
 
 # Modules that routinely receive pytest stubs.  We ensure the real implementations
 # are loaded while preserving any overrides that tests intentionally provide.
 _COMMON_MODULES = (
+    "services",
     "services.common",
     "services.common.config",
     "services.common.security",
@@ -72,7 +75,24 @@ def _reload_with_overrides(module_name: str) -> ModuleType:
     }
     # Drop the stub so the real module can be imported.
     sys.modules.pop(module_name, None)
-    module = importlib.import_module(module_name)
+    try:
+        module = importlib.import_module(module_name)
+    except ModuleNotFoundError:
+        if existing is not None:
+            sys.modules[module_name] = existing
+            return existing
+        module_path = Path(__file__).resolve().parents[1] / (
+            module_name.replace(".", "/") + ".py"
+        )
+        if module_path.exists():
+            spec = importlib.util.spec_from_file_location(module_name, module_path)
+            if spec and spec.loader:
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = module
+                spec.loader.exec_module(module)
+                return module
+        raise
+
     # Re-apply pytest's overrides so tests depending on the stubbed behaviour
     # keep operating against the canonical implementation.
     for key, value in overrides.items():

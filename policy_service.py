@@ -25,7 +25,29 @@ from auth.service import (
     build_session_store_from_url,
 )
 
-from services.common import security
+from shared.common_bootstrap import ensure_common_helpers
+
+try:  # pragma: no cover - dependency-light environments may stub services.common
+    ensure_common_helpers()
+except ModuleNotFoundError:
+    pass
+
+try:
+    from services.common import security
+except (ImportError, AttributeError):  # pragma: no cover - fallback when bootstrap stubs remain
+    try:
+        import services.common.security as security
+    except ModuleNotFoundError:
+        import importlib.util
+        from pathlib import Path
+
+        security_path = Path(__file__).resolve().parent / "services" / "common" / "security.py"
+        spec = importlib.util.spec_from_file_location("services.common.security", security_path)
+        if spec is None or spec.loader is None:  # pragma: no cover - defensive guard
+            raise
+        security = importlib.util.module_from_spec(spec)
+        sys.modules.setdefault("services.common.security", security)
+        spec.loader.exec_module(security)  # type: ignore[attr-defined]
 
 
 from services.common.precision import (

@@ -422,7 +422,13 @@ def _install_sqlalchemy_stub() -> None:
 
     orm = ModuleType("sqlalchemy.orm")
     orm.__spec__ = ModuleSpec("sqlalchemy.orm", loader=None)
-    
+    orm.Mapped = Any  # type: ignore[attr-defined]
+
+    def _mapped_column(*args: object, **kwargs: object) -> _Column:
+        return _Column(*(args or (None,)), **kwargs)
+
+    orm.mapped_column = _mapped_column  # type: ignore[attr-defined]
+
     class Session:
         def __init__(self, bind: object | None = None) -> None:
             self.bind = bind
@@ -550,6 +556,7 @@ def _install_sqlalchemy_stub() -> None:
     orm.declarative_base = declarative_base
     orm.DeclarativeBase = DeclarativeBase
     orm.registry = _registry
+    orm.relationship = lambda *a, **k: None  # type: ignore[attr-defined]
     sys.modules["sqlalchemy.orm"] = orm
 
     engine = ModuleType("sqlalchemy.engine")
