@@ -141,10 +141,11 @@ class TimescaleMarketDataAdapter:
 
         try:
             with self._engine.connect() as conn:
-                rows = conn.execute(
+                result = conn.execute(
                     stmt,
                     {"symbol": normalized, "start": start, "limit": limit},
-                ).all()
+                )
+                rows = self._all_rows(result)
         except SQLAlchemyError as exc:
             LOGGER.exception("Failed to load trades for %s", normalized)
             raise MarketDataUnavailable(f"Unable to load trades for {normalized}") from exc
@@ -181,7 +182,8 @@ class TimescaleMarketDataAdapter:
 
         try:
             with self._engine.connect() as conn:
-                row = conn.execute(stmt, {"symbol": normalized, "depth": depth}).first()
+                result = conn.execute(stmt, {"symbol": normalized, "depth": depth})
+                row = self._first_row(result)
         except SQLAlchemyError as exc:
             LOGGER.exception("Failed to load order book for %s", normalized)
             raise MarketDataUnavailable(f"Unable to load order book for {normalized}") from exc
@@ -211,7 +213,10 @@ class TimescaleMarketDataAdapter:
 
         try:
             with self._engine.connect() as conn:
-                rows = conn.execute(stmt, {"symbol": normalized, "limit": max(1, length)}).all()
+                result = conn.execute(
+                    stmt, {"symbol": normalized, "limit": max(1, length)}
+                )
+                rows = self._all_rows(result)
         except SQLAlchemyError as exc:
             LOGGER.exception("Failed to load price history for %s", normalized)
             raise MarketDataUnavailable(f"Unable to load price history for {normalized}") from exc
@@ -287,6 +292,62 @@ class TimescaleMarketDataAdapter:
                 size = float(entry[1])
                 levels.append([price, size])
         return levels
+
+    @staticmethod
+    def _all_rows(result: object) -> List[Sequence[object]]:
+        """Normalise SQLAlchemy result objects into row sequences."""
+
+        if result is None:
+            return []
+
+        for accessor in ("all", "fetchall"):
+            method = getattr(result, accessor, None)
+            if callable(method):
+                rows = method()
+                if rows is None:
+                    return []
+                return list(rows)
+
+        rows_attr = getattr(result, "rows", None)
+        if callable(rows_attr):
+            rows_candidate = rows_attr()
+            if rows_candidate is not None:
+                return list(rows_candidate)
+        elif rows_attr is not None:
+            return list(rows_attr)
+
+        data_attr = getattr(result, "data", None)
+        if callable(data_attr):
+            data_candidate = data_attr()
+            if data_candidate is not None:
+                return list(data_candidate)
+        elif data_attr is not None:
+            return list(data_attr)
+
+        if isinstance(result, Iterable) and not isinstance(result, (str, bytes, bytearray)):
+            return list(result)
+
+        return []
+
+    @classmethod
+    def _first_row(cls, result: object) -> Sequence[object] | None:
+        """Return the first row from a SQLAlchemy result or fallback shim."""
+
+        if result is None:
+            return None
+
+        first = getattr(result, "first", None)
+        if callable(first):
+            return first()
+
+        fetchone = getattr(result, "fetchone", None)
+        if callable(fetchone):
+            return fetchone()
+
+        rows = cls._all_rows(result)
+        if rows:
+            return rows[0]
+        return None
 
 
 __all__ = [
