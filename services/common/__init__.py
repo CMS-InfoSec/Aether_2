@@ -63,13 +63,23 @@ _REEXPORTS: Dict[str, Tuple[str, str]] = {
 def _load_module(name: str) -> ModuleType:
     """Return the module identified by *name*.
 
-    The helper respects any existing stub installed by the test suite but falls
-    back to the normal import mechanism when the module has not been loaded yet.
+    The helper ensures that bare :class:`types.ModuleType` stubs created by the
+    test suite never permanently shadow the real implementation.  When a stub
+    lacking a ``__file__`` attribute is encountered we reload the module from
+    disk so that direct imports (``from services.common.adapters import
+    TimescaleAdapter``) resolve to the production helpers rather than the empty
+    placeholder.
     """
 
     module = sys.modules.get(name)
     if isinstance(module, ModuleType):
-        return module
+        if getattr(module, "__file__", None):
+            return module
+        module = _reload_from_source(name, module)
+        if isinstance(module, ModuleType):
+            return module
+        # ``_reload_from_source`` only returns ``None`` when the import spec
+        # cannot be resolved, in which case we fall back to a standard import.
     module = import_module(name)
     return module
 
@@ -80,9 +90,14 @@ def _reload_from_source(name: str, existing: ModuleType | None) -> ModuleType | 
     if existing is not None and getattr(existing, "__file__", None):
         return existing
 
-    spec = find_spec(name)
+    try:
+        spec = find_spec(name)
+    except (ValueError, ImportError):  # pragma: no cover - defensive guard
+        spec = None
     if spec is None or spec.loader is None:
-        return existing
+        loader = None
+    else:
+        loader = spec.loader
 
     # Remove the stub so ``import_module`` loads the real implementation.
     sys.modules.pop(name, None)
@@ -93,6 +108,13 @@ def _reload_from_source(name: str, existing: ModuleType | None) -> ModuleType | 
         if existing is not None:
             sys.modules[name] = existing
         raise
+
+    # When ``find_spec`` failed above we still succeed because ``import_module``
+    # consults the parent package's ``__path__``.  In that scenario ``loader`` is
+    # ``None``; to keep debuggers happy we simply return the imported module.
+    if loader is None:
+        return module
+
     return module
 
 

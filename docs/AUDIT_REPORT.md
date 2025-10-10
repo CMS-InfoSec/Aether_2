@@ -9,6 +9,7 @@ The repository requires coordinated fixes across persistence, services, and test
 | P0 | Provide deterministic Timescale substitutes for unit/integration tests | ✅ Completed | `get_timescale_session` provisions `.aether_state` SQLite fallbacks so services and tests keep running without Timescale credentials.【F:services/common/config.py†L181-L240】【F:tests/services/backtest/test_stress_engine_insecure_defaults.py†L1-L28】 |
 | P0 | Add Redis test double with `Redis`-compatible interface | ✅ Completed | `common.utils.redis.create_redis_from_url` now returns an in-memory stub when the driver or server is unavailable, keeping caches operational in CI.【F:common/utils/redis.py†L29-L277】 |
 | P1 | Normalize env var defaults for DSNs and API keys during tests | ✅ Completed | Configuration helpers populate deterministic Redis/Timescale DSNs and stub Kraken secrets under `.aether_state/`, preventing `KeyError`/`ValueError` during pytest bootstrap.【F:services/common/config.py†L82-L234】 |
+| P0 | Prevent pytest stubs from shadowing shared adapters/security helpers | ✅ Completed | `services.common` now reloads the real submodules whenever a stub without `__file__` is detected, ensuring imports like `from services.common.adapters import TimescaleAdapter` resolve even after tests inject placeholders.【F:services/common/__init__.py†L63-L166】 |
 
 ## 2. Order Management & Simulation
 
