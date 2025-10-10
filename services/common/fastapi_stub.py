@@ -22,7 +22,21 @@ from contextlib import ExitStack, asynccontextmanager
 from dataclasses import dataclass
 from inspect import Parameter, Signature, isclass, iscoroutine, isgenerator, signature
 from types import ModuleType, SimpleNamespace
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple, Type
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+    Type,
+    Union,
+    get_args,
+    get_origin,
+)
 
 try:  # pragma: no cover - prefer the real FastAPI implementation when available
     import importlib.util
@@ -143,6 +157,55 @@ class _PathParameter(_ParameterMarker):
     ) -> Any:
         key = self.alias or name
         return path_params.get(key, self.default)
+
+
+def _coerce_value(annotation: Any, value: Any) -> Any:
+    """Best-effort conversion of query/path parameters to annotated types."""
+
+    if value is None:
+        return None
+
+    if annotation in (Signature.empty, Parameter.empty, Any):
+        return value
+
+    origin = get_origin(annotation)
+    if origin is Union:
+        candidates = [arg for arg in get_args(annotation) if arg is not type(None)]
+        if not candidates:
+            return value
+        for candidate in candidates:
+            coerced = _coerce_value(candidate, value)
+            if coerced is not None:
+                return coerced
+        return value
+
+    if annotation is bool and isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "off"}:
+            return False
+        return value
+
+    if annotation in {int, float} and isinstance(value, str):
+        try:
+            return annotation(value)
+        except (TypeError, ValueError):
+            return value
+
+    if annotation is date and isinstance(value, str):
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            return value
+
+    if annotation is datetime and isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return value
+
+    return value
 
 
 def Depends(dependency: Callable[..., Any] | None) -> _Dependency:
@@ -268,6 +331,13 @@ class Request:
         self.client = SimpleNamespace(host=None, port=None)
         self._scope = scope
         self._receive = receive
+        self._body: Any = None
+
+    def set_body(self, body: Any) -> None:
+        self._body = body
+
+    def json(self) -> Any:
+        return self._body
 
 
 class Response:
@@ -489,23 +559,28 @@ async def request_validation_exception_handler(request: Request, exc: Exception)
     )
 
 
-status = SimpleNamespace(
-    HTTP_200_OK=200,
-    HTTP_201_CREATED=201,
-    HTTP_202_ACCEPTED=202,
-    HTTP_204_NO_CONTENT=204,
-    HTTP_400_BAD_REQUEST=400,
-    HTTP_401_UNAUTHORIZED=401,
-    HTTP_403_FORBIDDEN=403,
-    HTTP_404_NOT_FOUND=404,
-    HTTP_409_CONFLICT=409,
-    HTTP_412_PRECONDITION_FAILED=412,
-    HTTP_422_UNPROCESSABLE_ENTITY=422,
-    HTTP_422_UNPROCESSABLE_CONTENT=422,
-    HTTP_429_TOO_MANY_REQUESTS=429,
-    HTTP_500_INTERNAL_SERVER_ERROR=500,
-    HTTP_503_SERVICE_UNAVAILABLE=503,
-)
+_STATUS_CODES = {
+    "HTTP_200_OK": 200,
+    "HTTP_201_CREATED": 201,
+    "HTTP_202_ACCEPTED": 202,
+    "HTTP_204_NO_CONTENT": 204,
+    "HTTP_400_BAD_REQUEST": 400,
+    "HTTP_401_UNAUTHORIZED": 401,
+    "HTTP_403_FORBIDDEN": 403,
+    "HTTP_404_NOT_FOUND": 404,
+    "HTTP_409_CONFLICT": 409,
+    "HTTP_412_PRECONDITION_FAILED": 412,
+    "HTTP_422_UNPROCESSABLE_ENTITY": 422,
+    "HTTP_422_UNPROCESSABLE_CONTENT": 422,
+    "HTTP_429_TOO_MANY_REQUESTS": 429,
+    "HTTP_500_INTERNAL_SERVER_ERROR": 500,
+    "HTTP_502_BAD_GATEWAY": 502,
+    "HTTP_503_SERVICE_UNAVAILABLE": 503,
+}
+
+status = ModuleType("fastapi.status")
+for _name, _code in _STATUS_CODES.items():
+    setattr(status, _name, _code)
 
 
 def jsonable_encoder(value: Any, *args: Any, **kwargs: Any) -> Any:
@@ -642,7 +717,11 @@ def _to_json_compatible(value: Any) -> Any:
 
 def _dump_response_payload(value: Any) -> Any:
     if hasattr(value, "model_dump"):
-        return _to_json_compatible(value.model_dump())
+        try:
+            dumped = value.model_dump(exclude_none=True)  # type: ignore[call-arg]
+        except TypeError:
+            dumped = value.model_dump()
+        return _to_json_compatible(dumped)
     if hasattr(value, "dict"):
         try:
             return _to_json_compatible(value.dict())
@@ -716,7 +795,8 @@ async def _call_endpoint(
             continue
 
         if isinstance(default, _ParameterMarker):
-            resolved_kwargs[name] = default.resolve(request, query_params, path_params, name)
+            value = default.resolve(request, query_params, path_params, name)
+            resolved_kwargs[name] = _coerce_value(annotation, value)
             continue
 
         if _is_pydantic_model(annotation):
@@ -738,11 +818,11 @@ async def _call_endpoint(
             continue
 
         if name in path_params:
-            resolved_kwargs[name] = path_params[name]
+            resolved_kwargs[name] = _coerce_value(annotation, path_params[name])
             continue
 
         if name in query_params:
-            resolved_kwargs[name] = query_params[name]
+            resolved_kwargs[name] = _coerce_value(annotation, query_params[name])
             continue
 
         if name in body_mapping:
@@ -840,20 +920,20 @@ class TestClient:
             self._lifespan_cm = lifespan_factory(self.app)
             enter = getattr(self._lifespan_cm, "__aenter__", None)
             if enter is not None:
-                _run_async(enter())
+                _run_async(lambda: enter())
         for handler in self.app.event_handlers.get("startup", []):
-            _run_async(handler())
+            _run_async(lambda: handler())
         self._entered = True
 
     def _shutdown(self, exc_type=None, exc=None, tb=None) -> None:
         if not self._entered:
             return
         for handler in reversed(self.app.event_handlers.get("shutdown", [])):
-            _run_async(handler())
+            _run_async(lambda: handler())
         if self._lifespan_cm is not None:
             exit_ = getattr(self._lifespan_cm, "__aexit__", None)
             if exit_ is not None:
-                _run_async(exit_(exc_type, exc, tb))
+                _run_async(lambda: exit_(exc_type, exc, tb))
         self._lifespan_cm = None
         self._entered = False
 
@@ -908,10 +988,14 @@ class TestClient:
         request = self._build_request(headers=headers, params=params, path_params=path_params)
         request.url = SimpleNamespace(path=_normalize_path(path))
         request.method = method
+        if hasattr(request, "set_body"):
+            request.set_body(body)
+        else:  # pragma: no cover - compatibility guard for patched requests
+            setattr(request, "_body", body)
 
         try:
             payload = _run_async(
-                _call_endpoint(
+                lambda: _call_endpoint(
                     self.app,
                     route.endpoint,
                     request=request,
@@ -1105,20 +1189,29 @@ class TestClient:
         return self._handle_call(normalized_method, url, json=json, headers=headers, params=params)
 
 
-def _run_async(coro: Any) -> Any:
+def _run_async(factory: Callable[[], Any]) -> Any:
     import asyncio
 
-    if not asyncio.iscoroutine(coro):
-        return coro
+    def _resolve() -> Any:
+        return factory()
+
+    candidate = _resolve()
+    if not asyncio.iscoroutine(candidate):
+        return candidate
     try:
-        return asyncio.run(coro)
+        return asyncio.run(candidate)
     except RuntimeError:
         new_loop = asyncio.new_event_loop()
         try:
-            return new_loop.run_until_complete(coro)
+            candidate = _resolve()
+            if asyncio.iscoroutine(candidate):
+                return new_loop.run_until_complete(candidate)
+            return candidate
         finally:
-            new_loop.run_until_complete(new_loop.shutdown_asyncgens())
-            new_loop.close()
+            try:
+                new_loop.run_until_complete(new_loop.shutdown_asyncgens())
+            finally:
+                new_loop.close()
 
 
 def _install_fastapi_module() -> None:

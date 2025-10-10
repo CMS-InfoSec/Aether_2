@@ -31,6 +31,10 @@ from uuid import uuid4
 from common.schemas.contracts import FillEvent, OrderEvent
 from config.simulation import SimulationConfig, get_simulation_config
 from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
 from services.common.config import get_timescale_session
 from shared.async_utils import dispatch_async
 from shared.spot import is_spot_symbol, normalize_spot_symbol
