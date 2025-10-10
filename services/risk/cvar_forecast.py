@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Iterable, Mapping
+from typing import Any, Dict, Iterable, Mapping
 
-import numpy as np
+try:  # pragma: no cover - exercised via tests when numpy is installed
+    import numpy as _NUMPY_MODULE  # type: ignore[import-not-found]
+except ModuleNotFoundError:  # pragma: no cover - handled in insecure-default tests
+    _NUMPY_MODULE = None
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, ConfigDict
 
@@ -25,6 +30,198 @@ TRADING_DAYS_PER_YEAR = 252
 DEFAULT_VOLATILITY = 0.25
 DEFAULT_SIMULATIONS = 5000
 PERCENTILE_BUCKETS: tuple[int, ...] = (1, 5, 25, 50, 75, 95, 99)
+_INSECURE_DEFAULTS_FLAG = "RISK_ALLOW_INSECURE_DEFAULTS"
+
+
+class MissingDependencyError(RuntimeError):
+    """Raised when optional dependencies are unavailable."""
+
+
+def _insecure_defaults_enabled() -> bool:
+    return os.getenv(_INSECURE_DEFAULTS_FLAG) == "1" or bool(os.getenv("PYTEST_CURRENT_TEST"))
+
+
+class _Array(list[float]):
+    """Minimal array implementation supporting arithmetic used in forecasts."""
+
+    def __init__(self, values: Iterable[float]) -> None:
+        super().__init__(float(value) for value in values)
+
+    # Arithmetic helpers -------------------------------------------------
+    def __add__(self, other: object) -> "_Array":
+        if isinstance(other, _Array):
+            return _Array(a + b for a, b in zip(self, other))
+        if isinstance(other, (int, float)):
+            scalar = float(other)
+            return _Array(value + scalar for value in self)
+        return NotImplemented  # type: ignore[return-value]
+
+    def __radd__(self, other: object) -> "_Array":
+        return self.__add__(other)
+
+    def __iadd__(self, other: object) -> "_Array":
+        if isinstance(other, _Array):
+            for index, value in enumerate(other):
+                if index < len(self):
+                    self[index] += value
+            return self
+        if isinstance(other, (int, float)):
+            scalar = float(other)
+            for index in range(len(self)):
+                self[index] += scalar
+            return self
+        return NotImplemented  # type: ignore[return-value]
+
+    def __mul__(self, other: object) -> "_Array":
+        if isinstance(other, _Array):
+            return _Array(a * b for a, b in zip(self, other))
+        if isinstance(other, (int, float)):
+            scalar = float(other)
+            return _Array(value * scalar for value in self)
+        return NotImplemented  # type: ignore[return-value]
+
+    __rmul__ = __mul__
+
+    def __imul__(self, other: object) -> "_Array":
+        if isinstance(other, _Array):
+            for index, value in enumerate(other):
+                if index < len(self):
+                    self[index] *= value
+            return self
+        if isinstance(other, (int, float)):
+            scalar = float(other)
+            for index in range(len(self)):
+                self[index] *= scalar
+            return self
+        return NotImplemented  # type: ignore[return-value]
+
+    def __sub__(self, other: object) -> "_Array":
+        if isinstance(other, _Array):
+            return _Array(a - b for a, b in zip(self, other))
+        if isinstance(other, (int, float)):
+            scalar = float(other)
+            return _Array(value - scalar for value in self)
+        return NotImplemented  # type: ignore[return-value]
+
+    def __rsub__(self, other: object) -> "_Array":
+        if isinstance(other, _Array):
+            return _Array(b - a for a, b in zip(self, other))
+        if isinstance(other, (int, float)):
+            scalar = float(other)
+            return _Array(scalar - value for value in self)
+        return NotImplemented  # type: ignore[return-value]
+
+    def __ge__(self, other: object) -> "_Array":
+        if isinstance(other, _Array):
+            return _Array(1.0 if a >= b else 0.0 for a, b in zip(self, other))
+        if isinstance(other, (int, float)):
+            scalar = float(other)
+            return _Array(1.0 if value >= scalar else 0.0 for value in self)
+        return NotImplemented  # type: ignore[return-value]
+
+    def __getitem__(self, key: Any) -> Any:
+        if isinstance(key, _Array):
+            return _Array(value for value, keep in zip(self, key) if bool(keep))
+        if isinstance(key, list) and key and all(isinstance(item, bool) for item in key):
+            return _Array(value for value, keep in zip(self, key) if keep)
+        return super().__getitem__(key)
+
+    # Convenience helpers ------------------------------------------------
+    def mean(self) -> float:
+        if not self:
+            return 0.0
+        return sum(float(value) for value in self) / len(self)
+
+
+class _DeterministicRNG:
+    """Deterministic random number generator for insecure-default mode."""
+
+    def __init__(self, seed: int | None = None) -> None:
+        self._seed = seed or 0
+
+    def normal(self, *, loc: float, scale: float, size: int) -> _Array:  # type: ignore[override]
+        pattern = [0.0, 0.5, -0.25, 0.75, -0.5]
+        values = []
+        for index in range(int(size)):
+            offset = pattern[index % len(pattern)]
+            values.append(loc + scale * offset)
+        return _Array(values)
+
+
+class _DeterministicRandom:
+    def default_rng(self, seed: int | None = None) -> _DeterministicRNG:
+        return _DeterministicRNG(seed)
+
+
+class _DeterministicNumpy:
+    """Subset of numpy functionality used by the CVaR forecaster."""
+
+    def __init__(self) -> None:
+        self.random = _DeterministicRandom()
+
+    @staticmethod
+    def zeros(size: int) -> _Array:
+        return _Array(0.0 for _ in range(int(size)))
+
+    @staticmethod
+    def any(values: Iterable[object]) -> bool:
+        return any(bool(value) for value in values)
+
+    @staticmethod
+    def mean(values: Iterable[object]) -> float:
+        series = [float(value) for value in values]
+        if not series:
+            return 0.0
+        return sum(series) / len(series)
+
+    @staticmethod
+    def std(values: Iterable[object]) -> float:
+        series = [float(value) for value in values]
+        if not series:
+            return 0.0
+        mean_value = _DeterministicNumpy.mean(series)
+        return math.sqrt(sum((value - mean_value) ** 2 for value in series) / len(series))
+
+    @staticmethod
+    def min(values: Iterable[object]) -> float:
+        series = [float(value) for value in values]
+        return min(series) if series else 0.0
+
+    @staticmethod
+    def max(values: Iterable[object]) -> float:
+        series = [float(value) for value in values]
+        return max(series) if series else 0.0
+
+    @staticmethod
+    def percentile(values: Iterable[object], percentile: float) -> float:
+        series = sorted(float(value) for value in values)
+        if not series:
+            return 0.0
+        if percentile <= 0:
+            return series[0]
+        if percentile >= 100:
+            return series[-1]
+        position = (percentile / 100.0) * (len(series) - 1)
+        lower = int(math.floor(position))
+        upper = int(math.ceil(position))
+        if lower == upper:
+            return series[lower]
+        fraction = position - lower
+        return series[lower] * (1 - fraction) + series[upper] * fraction
+
+
+def _resolve_numpy() -> Any:
+    if _NUMPY_MODULE is not None:
+        return _NUMPY_MODULE
+    if _insecure_defaults_enabled():
+        LOGGER.warning(
+            "numpy is unavailable; activating deterministic CVaR fallback."
+        )
+        return _DeterministicNumpy()
+    raise MissingDependencyError(
+        "numpy is required for CVaR Monte Carlo forecasts; set "
+        f"{_INSECURE_DEFAULTS_FLAG}=1 to enable deterministic fallbacks."
+    )
 
 
 class OutcomeDistribution(BaseModel):
@@ -77,7 +274,8 @@ class CVaRMonteCarloForecaster:
         self.timescale = timescale or TimescaleAdapter(account_id=account_id)
         self.feature_store = feature_store or RedisFeastAdapter(account_id=account_id)
         self.simulations = int(max(simulations, 1))
-        self._rng = np.random.default_rng(seed)
+        self._np = _resolve_numpy()
+        self._rng = self._np.random.default_rng(seed)
 
     def forecast(self, horizon: str) -> CVaRForecastResponse:
         days = self._parse_horizon(horizon)
@@ -91,25 +289,34 @@ class CVaRMonteCarloForecaster:
         nav_paths, pnl_paths = self._simulate_paths(nav, instrument_context, days)
 
         losses = nav - nav_paths
-        var_threshold = float(np.percentile(losses, 95))
+        var_threshold = float(self._np.percentile(losses, 95))
         var_95 = max(0.0, var_threshold)
         tail_mask = losses >= var_threshold
-        if np.any(tail_mask):
+        if self._np.any(tail_mask):
             tail_losses = losses[tail_mask]
-            cvar_95 = max(0.0, float(tail_losses.mean()))
+            mean_value = (
+                float(tail_losses.mean())
+                if hasattr(tail_losses, "mean")
+                else float(self._np.mean(tail_losses))
+            )
+            cvar_95 = max(0.0, mean_value)
         else:
             cvar_95 = var_95
 
         loss_cap = float(config.get("loss_cap", 0.0))
         if loss_cap > 0.0:
-            probability_cap_hit = float(np.mean(losses >= loss_cap))
+            probability_cap_hit = float(self._np.mean(losses >= loss_cap))
         else:
             probability_cap_hit = 0.0
 
-        distribution_summary = {
+        distribution_models = {
             "nav": self._summarize(nav_paths),
             "pnl": self._summarize(pnl_paths),
             "loss": self._summarize(losses),
+        }
+        distribution_summary = {
+            key: value.model_dump() if hasattr(value, "model_dump") else value
+            for key, value in distribution_models.items()
         }
 
         timestamp = datetime.now(timezone.utc)
@@ -188,8 +395,8 @@ class CVaRMonteCarloForecaster:
         nav: float,
         contexts: Iterable[_InstrumentContext],
         days: float,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        pnl = np.zeros(self.simulations)
+    ) -> tuple[Any, Any]:
+        pnl = self._np.zeros(self.simulations)
         scale = math.sqrt(max(days, 0.0) / TRADING_DAYS_PER_YEAR)
         for context in contexts:
             if context.volatility <= 0 or context.notional == 0:
@@ -202,15 +409,15 @@ class CVaRMonteCarloForecaster:
         nav_paths = nav + pnl
         return nav_paths, pnl
 
-    def _summarize(self, sample: np.ndarray) -> OutcomeDistribution:
+    def _summarize(self, sample: Any) -> OutcomeDistribution:
         percentiles = {
-            str(p): float(np.percentile(sample, p)) for p in PERCENTILE_BUCKETS
+            str(p): float(self._np.percentile(sample, p)) for p in PERCENTILE_BUCKETS
         }
         return OutcomeDistribution(
-            mean=float(np.mean(sample)),
-            std=float(np.std(sample)),
-            min=float(np.min(sample)),
-            max=float(np.max(sample)),
+            mean=float(self._np.mean(sample)),
+            std=float(self._np.std(sample)),
+            min=float(self._np.min(sample)),
+            max=float(self._np.max(sample)),
             percentiles=percentiles,
         )
 

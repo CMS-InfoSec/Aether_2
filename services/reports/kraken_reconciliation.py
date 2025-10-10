@@ -59,6 +59,10 @@ else:
         description: str
         labels: Dict[str, str] = field(default_factory=dict)
 
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
 from services.common.config import TimescaleSession, get_timescale_session
 from services.secrets.signing import sign_kraken_request
 
