@@ -397,6 +397,27 @@ from shared.postgres import normalize_postgres_dsn, normalize_postgres_schema
 
 
 logger = logging.getLogger("auth_service")
+
+
+def _log_auth_failure(
+    reason: str,
+    *,
+    account_id: Optional[str],
+    client_ip: Optional[str],
+    status_code: int,
+    detail: str | None = None,
+) -> None:
+    """Emit a structured warning whenever authentication is denied."""
+
+    detail_suffix = f" detail={detail}" if detail else ""
+    logger.warning(
+        "Authentication failure [%s]: account_id=%s ip=%s status=%s%s",
+        reason,
+        account_id or "unknown",
+        client_ip or "unknown",
+        status_code,
+        detail_suffix,
+    )
 logging.basicConfig(level=logging.INFO)
 
 
@@ -870,25 +891,58 @@ async def authenticate(
     mfa: MFAVerifier,
     sessions: SessionRepository,
     jwt_secret: str,
+    client_ip: Optional[str] = None,
 ) -> LoginResponse:
     provider = providers.get(payload.provider)
     if not provider:
+        _log_auth_failure(
+            "unsupported_provider",
+            account_id=None,
+            client_ip=client_ip,
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=payload.provider,
+        )
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="unsupported_provider")
     redirect_uri = payload.redirect_uri or provider.redirect_uri
     if not redirect_uri:
+        _log_auth_failure(
+            "redirect_uri_missing",
+            account_id=None,
+            client_ip=client_ip,
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="redirect_uri_missing")
 
     try:
         token_payload = await _exchange_code(provider=provider, code=payload.code, redirect_uri=str(redirect_uri))
         userinfo = await _fetch_userinfo(provider=provider, access_token=token_payload["access_token"])
     except OIDCError as exc:
+        _log_auth_failure(
+            "oidc_error",
+            account_id=None,
+            client_ip=client_ip,
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(exc),
+        )
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
 
     user_id = str(userinfo.get("email") or userinfo.get("sub"))
     if not user_id:
+        _log_auth_failure(
+            "user_identity_missing",
+            account_id=None,
+            client_ip=client_ip,
+            status_code=status.HTTP_401_UNAUTHORIZED,
+        )
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="user_identity_missing")
 
     if not mfa.verify(user_id=user_id, method=payload.mfa_method, code=payload.mfa_code):
+        _log_auth_failure(
+            "mfa_verification_failed",
+            account_id=user_id,
+            client_ip=client_ip,
+            status_code=status.HTTP_401_UNAUTHORIZED,
+        )
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="mfa_verification_failed")
 
     role = _resolve_role(userinfo)
@@ -982,6 +1036,7 @@ def get_application() -> FastAPI:
     @app.post("/auth/login", response_model=LoginResponse, tags=["auth"])
     async def login_endpoint(
         payload: LoginRequest,
+        request: Request,
         repo: SessionRepository = Depends(_session_repository_dependency),
         jwt_secret: str = Depends(_jwt_secret_dependency),
     ) -> LoginResponse:
@@ -991,6 +1046,7 @@ def get_application() -> FastAPI:
             mfa=mfa,
             sessions=repo,
             jwt_secret=jwt_secret,
+            client_ip=request.client.host if request.client else None,
         )
 
     return app
