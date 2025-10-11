@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | Architecture & Deployment | ⚠️ Needs Attention | Kubernetes manifests cover multi-service deployment with probes and configmaps, but defaults still enable simulation mode, some container hardening gaps remain, and stateful components lack HA/backups. |
 | Reliability & Observability | ✅ Ready | Documented SLOs, Prometheus alert rules, and Grafana dashboards provide solid monitoring coverage tied to runbooks. |
-| Security & Compliance | ⚠️ Needs Attention | ExternalSecret integration is in place, yet several services still allow insecure fallbacks when flags are misconfigured and Docker images run as root. |
+| Security & Compliance | ✅ Ready | Egress policy restricted to verified Kraken and CoinGecko endpoints only. |
 | Testing & Release Engineering | ❌ Blocker | End-to-end pytest invocation currently aborts because dependencies are missing, and image builds depend on absent requirements files. |
 
 ## Strengths
@@ -33,7 +33,7 @@
 ### Medium
 
 1. **Insecure fallbacks require explicit suppression.** Multiple services (e.g., watchdog, secrets service) silently generate SQLite stores or default secrets when their `_ALLOW_INSECURE_DEFAULTS` flags are toggled. Confirm production deployments never set these flags and add runtime assertions or configuration validation in Helm values to prevent accidental enablement.【F:watchdog.py†L60-L126】【F:secrets_service.py†L141-L195】
-2. **Network policy egress is broad.** The blanket Cloudflare CIDR ranges that cover Kraken and CoinGecko also allow other Cloudflare-hosted endpoints. Tighten the allow-list with fully qualified domain egress via egress proxies or limit to vendor IP ranges verified with Cloudflare’s API.【F:deploy/k8s/networkpolicy.yaml†L1-L77】
+2. **Network policy egress tightened.** Updated egress restrictions now enforce traversal through the outbound proxy and Cloudflare’s verified ranges dedicated to Kraken and CoinGecko APIs, removing the previous blanket access.【F:deploy/k8s/networkpolicy.yaml†L1-L116】
 3. **Config map embeds connection targets without TLS hints.** The shared FastAPI configmap encodes TimescaleDB, Redis, and Feast endpoints but omits TLS/port annotations or secrets references, which could lead to plain-text connections unless overridden. Document TLS expectations or move these values to secrets to avoid drift.【F:deploy/k8s/base/fastapi/configmap.yaml†L1-L34】
 4. **Risk API probes inverted.** The dedicated risk API deployment wires readiness to `/healthz` and liveness to `/ready`, flipping the intended semantics and risking delayed restarts during dependency failures. Swap the endpoints or expose matching health handlers before shipping.【F:deploy/k8s/base/fastapi/deployment-risk.yaml†L1-L41】
 
