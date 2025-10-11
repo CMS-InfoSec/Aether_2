@@ -3,16 +3,13 @@ kind: StatefulSet
 metadata:
   name: timescaledb
   labels:
-
     app.kubernetes.io/name: timescaledb
     app.kubernetes.io/component: database
-
 spec:
   serviceName: timescaledb
-  replicas: 1
+  replicas: 3
   selector:
     matchLabels:
-
       app.kubernetes.io/name: timescaledb
   template:
     metadata:
@@ -33,14 +30,12 @@ spec:
             requests:
               cpu: 500m
               memory: 1Gi
-
             limits:
               cpu: 1
               memory: 2Gi
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
-
       securityContext:
         fsGroup: 999
   volumeClaimTemplates:
@@ -49,7 +44,71 @@ spec:
       spec:
         accessModes:
           - ReadWriteOnce
+        storageClassName: standard
         resources:
           requests:
             storage: 50Gi
-
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: timescaledb-backup
+  labels:
+    app.kubernetes.io/name: timescaledb
+    app.kubernetes.io/component: database
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: timescaledb-pgdump
+  labels:
+    app.kubernetes.io/name: timescaledb
+    app.kubernetes.io/component: database
+spec:
+  schedule: "0 2 * * *"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: pgdump
+              image: timescale/timescaledb-ha:pg15.3
+              imagePullPolicy: IfNotPresent
+              envFrom:
+                - secretRef:
+                    name: timescaledb-secrets
+              env:
+                - name: PGHOST
+                  value: timescaledb
+                - name: PGPORT
+                  value: "5432"
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: timescaledb-secrets
+                      key: POSTGRES_PASSWORD
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -euo pipefail
+                  BACKUP_FILE="/backups/timescaledb-$(date +%Y%m%d%H%M%S).sql.gz"
+                  export PGPASSWORD
+                  pg_dumpall -h "$PGHOST" -p "$PGPORT" -U "$POSTGRES_USER" | gzip > "$BACKUP_FILE"
+              volumeMounts:
+                - name: backup-storage
+                  mountPath: /backups
+          volumes:
+            - name: backup-storage
+              persistentVolumeClaim:
+                claimName: timescaledb-backup
