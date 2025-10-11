@@ -240,6 +240,153 @@
           }
         }
       }
+    },
+    "/secrets/status": {
+      "get": {
+        "operationId": "getSecretsStatus",
+        "summary": "Fetch the current Kraken credential rotation status for the caller.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MfaContext"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved credential status information.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretsStatusResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication credentials were missing or invalid."
+          },
+          "403": {
+            "description": "Caller is not authorized to access Kraken credential data."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/secrets/audit": {
+      "get": {
+        "operationId": "getSecretsAuditTrail",
+        "summary": "Return the credential rotation audit trail for the authenticated account.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MfaContext"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Audit history retrieved successfully.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SecretsAuditEntry"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication credentials were missing or invalid."
+          },
+          "403": {
+            "description": "Caller is not authorized to access Kraken credential data."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "SecretsStatusResponse": {
+        "type": "object",
+        "properties": {
+          "last_rotated_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "ISO-8601 timestamp for the most recent credential rotation.",
+            "format": "date-time"
+          },
+          "last_rotated_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Identifier for the actor that last rotated the credentials."
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Human friendly message describing the credential freshness."
+          }
+        },
+        "additionalProperties": false
+      },
+      "SecretsAuditEntry": {
+        "type": "object",
+        "required": [
+          "actor",
+          "rotated_at"
+        ],
+        "properties": {
+          "actor": {
+            "type": "string",
+            "description": "Actor responsible for the rotation event."
+          },
+          "rotated_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "ISO-8601 timestamp describing when rotation completed."
+          },
+          "notes": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional contextual note associated with the rotation event."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "parameters": {
+      "MfaContext": {
+        "name": "X-MFA-Context",
+        "in": "header",
+        "required": false,
+        "schema": {
+          "type": "string"
+        },
+        "description": "MFA verification context token issued by the authentication service."
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
     }
   }
 }

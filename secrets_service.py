@@ -11,7 +11,7 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import hashlib
@@ -29,6 +29,7 @@ from kubernetes.config.config_exception import ConfigException
 from pydantic import BaseModel, Field, validator
 
 from services.secrets.signing import sign_kraken_request
+from shared.k8s import ANNOTATION_ROTATED_AT as K8S_ROTATED_AT
 from shared.audit_hooks import AuditEvent, load_audit_hooks
 from shared.runtime_checks import ensure_insecure_default_flag_disabled
 
@@ -337,6 +338,17 @@ class KrakenSecretManager:
         self._client = client.CoreV1Api()
         self._cipher = cipher
 
+    @property
+    def namespace(self) -> str:
+        """Return the Kubernetes namespace backing the credential secret."""
+
+        return self._namespace
+
+    def canonical_secret_name(self, account_id: str) -> str:
+        """Return the deterministic Kubernetes secret name for an account."""
+
+        return self._secret_name(account_id)
+
     @staticmethod
     def _secret_name(account_id: str) -> str:
         return f"kraken-keys-{account_id}"
@@ -402,10 +414,16 @@ class KrakenSecretManager:
     def get_status(self, account_id: str) -> Dict[str, str]:
         secret = self.get_secret(account_id)
         annotations = secret.metadata.annotations or {}
-        last_rotated = annotations.get(self.LAST_ROTATED_KEY, "")
+        last_rotated = (
+            annotations.get(self.LAST_ROTATED_KEY)
+            or annotations.get(K8S_ROTATED_AT)
+            or ""
+        )
+        actor = annotations.get(self.ROTATION_ACTOR_KEY)
         return {
             "secret_name": secret.metadata.name,
             "last_rotated": last_rotated,
+            "rotated_by": actor,
         }
 
     def get_decrypted_credentials(self, account_id: str) -> Dict[str, str]:
@@ -509,6 +527,36 @@ class KrakenTestRequest(BaseModel):
     account_id: str = Field(..., min_length=1)
 
 
+class SecretsStatusResponse(BaseModel):
+    """Response payload summarising the current Kraken credential state."""
+
+    last_rotated_at: Optional[str] = Field(
+        default=None,
+        description="ISO-8601 timestamp for the most recent credential rotation.",
+    )
+    last_rotated_by: Optional[str] = Field(
+        default=None,
+        description="Identifier for the actor that last rotated the credentials.",
+    )
+    status: Optional[str] = Field(
+        default=None,
+        description="Human friendly status string describing the credential freshness.",
+    )
+
+
+class SecretsAuditEntry(BaseModel):
+    """Audit log entry capturing a single credential rotation event."""
+
+    actor: str = Field(..., description="Actor responsible for the rotation event.")
+    rotated_at: str = Field(
+        ..., description="ISO-8601 timestamp describing when rotation completed."
+    )
+    notes: Optional[str] = Field(
+        default=None,
+        description="Optional contextual note associated with the rotation event.",
+    )
+
+
 app = FastAPI(title="Kraken Secrets Service", version="1.0.0")
 
 
@@ -528,6 +576,55 @@ def log_rotation(account_id: str, actor: str, timestamp: str) -> None:
         "kraken secret rotated",
         extra={"account_id": account_id, "actor": actor, "ts": timestamp},
     )
+    
+
+def _ensure_iso_timestamp(value: Any) -> Optional[str]:
+    """Normalize arbitrary timestamp payloads into ISO-8601 strings."""
+
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        normalized = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return normalized.astimezone(timezone.utc).isoformat()
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat()
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    return None
+
+
+def _extract_secret_context(secret: Any) -> Tuple[Optional[str], Optional[str], Dict[str, Any]]:
+    """Return name, namespace, and annotations for the provided secret object."""
+
+    metadata: Any
+    if isinstance(secret, dict):
+        metadata = secret.get("metadata")
+    else:
+        metadata = getattr(secret, "metadata", None)
+
+    name: Optional[str] = None
+    namespace: Optional[str] = None
+    annotations: Dict[str, Any] = {}
+
+    if isinstance(metadata, dict):
+        name = metadata.get("name")
+        namespace = metadata.get("namespace")
+        raw_annotations = metadata.get("annotations")
+        if isinstance(raw_annotations, dict):
+            annotations = dict(raw_annotations)
+    elif metadata is not None:
+        name = getattr(metadata, "name", None)
+        namespace = getattr(metadata, "namespace", None)
+        raw_annotations = getattr(metadata, "annotations", None)
+        if isinstance(raw_annotations, dict):
+            annotations = dict(raw_annotations)
+        elif raw_annotations is not None:
+            annotations = dict(getattr(raw_annotations, "__dict__", {}))
+
+    return name, namespace, annotations
+
+
 _UNAVAILABLE_MESSAGE = "Kraken secrets service configuration is unavailable"
 
 
@@ -773,6 +870,95 @@ async def kraken_secret_status(
     LOGGER.info("Status requested for Kraken secret %s by %s", account_id, authorized_actor)
     status_payload = manager.get_status(account_id)
     return status_payload
+
+
+@app.get("/secrets/status", response_model=SecretsStatusResponse)
+async def secrets_status(
+    manager: KrakenSecretManager = Depends(get_secret_manager),
+    authorized_actor: str = Depends(require_authorized_caller),
+) -> SecretsStatusResponse:
+    LOGGER.info("Secrets UI status requested by %s", authorized_actor)
+
+    try:
+        secret = manager.get_secret(authorized_actor)
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_404_NOT_FOUND:
+            LOGGER.info(
+                "No stored Kraken credentials for account %s during status lookup",
+                authorized_actor,
+            )
+            return SecretsStatusResponse(
+                status="No Kraken credentials are currently stored for this account.",
+            )
+        raise
+
+    secret_name, _, annotations = _extract_secret_context(secret)
+    last_rotated = _ensure_iso_timestamp(
+        annotations.get(manager.LAST_ROTATED_KEY) or annotations.get(K8S_ROTATED_AT)
+    )
+    rotated_by_raw = annotations.get(manager.ROTATION_ACTOR_KEY)
+    rotated_by = (rotated_by_raw or "").strip() or None
+
+    canonical_name = secret_name or manager.canonical_secret_name(authorized_actor)
+    if last_rotated:
+        if rotated_by:
+            status_message = (
+                f"Secret {canonical_name} rotated at {last_rotated} by {rotated_by}."
+            )
+        else:
+            status_message = f"Secret {canonical_name} rotated at {last_rotated}."
+    else:
+        status_message = None
+
+    return SecretsStatusResponse(
+        last_rotated_at=last_rotated,
+        last_rotated_by=rotated_by,
+        status=status_message,
+    )
+
+
+@app.get("/secrets/audit", response_model=List[SecretsAuditEntry])
+async def secrets_audit(
+    manager: KrakenSecretManager = Depends(get_secret_manager),
+    authorized_actor: str = Depends(require_authorized_caller),
+) -> List[SecretsAuditEntry]:
+    LOGGER.info("Secrets UI audit requested by %s", authorized_actor)
+
+    try:
+        secret = manager.get_secret(authorized_actor)
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_404_NOT_FOUND:
+            LOGGER.info(
+                "No stored Kraken credentials for account %s during audit lookup",
+                authorized_actor,
+            )
+            return []
+        raise
+
+    secret_name, namespace, annotations = _extract_secret_context(secret)
+    last_rotated = _ensure_iso_timestamp(
+        annotations.get(manager.LAST_ROTATED_KEY) or annotations.get(K8S_ROTATED_AT)
+    )
+    rotated_by_raw = annotations.get(manager.ROTATION_ACTOR_KEY)
+    rotated_by = (rotated_by_raw or "").strip() or authorized_actor
+    rotated_at = last_rotated or datetime.now(timezone.utc).isoformat()
+
+    canonical_name = secret_name or manager.canonical_secret_name(authorized_actor)
+    location = namespace or manager.namespace
+    oms_reload = _ensure_iso_timestamp(annotations.get(manager.OMS_RELOAD_KEY))
+
+    notes_parts = [f"Secret {canonical_name} stored in namespace {location}."]
+    if oms_reload:
+        notes_parts.append(f"OMS watchers notified at {oms_reload}.")
+    notes = " ".join(notes_parts)
+
+    return [
+        SecretsAuditEntry(
+            actor=rotated_by,
+            rotated_at=rotated_at,
+            notes=notes,
+        )
+    ]
 
 
 @app.post("/secrets/kraken/test")

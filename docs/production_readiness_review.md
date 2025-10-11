@@ -21,6 +21,7 @@
 - **Operational topology documented and validated.** Updated README and deployment diagrams confirm the production stack—TimescaleDB, Kafka/NATS, Feast, and FastAPI services—match the deployed manifests, giving operators a clear view of data flow before go-live.【F:README.md†L1-L100】
 - **Guardrails rehearsed with observability tooling.** Prometheus alert rules, Grafana dashboards, and on-call checklists were reviewed during the dry run to ensure the SLOs map to actionable playbooks.【F:docs/slo.md†L1-L54】【F:ops/monitoring/prometheus-rules.yaml†L1-L140】【F:deploy/observability/grafana/grafana.yaml†L1-L160】【F:docs/checklists/oncall.md†L1-L35】
 - **Secrets stay external and immutable.** ExternalSecret definitions were tested end-to-end so credentials are sourced from Vault without leaking into git history or runtime logs.【F:deploy/k8s/base/secrets/external-secrets.yaml†L1-L196】
+- Secrets status/audit endpoints exposed; UI key manager fully operational.
 
 ## Completed Remediations
 
@@ -72,8 +73,8 @@
 | Data Integrity & Backup | ❌ | Disaster-recovery tooling logs every action but never provisions the target table, so the very first snapshot/restore aborts with an undefined-table error. |
 | API & Integration Consistency | ✅ Ready | Binance and Coinbase adapters support the spot interface and return deterministic stubs while multi-exchange routing remains disabled. |
 | ML & Simulation Logic | ⚠️ | Exposure forecaster and supervised ML trainer interfaces are unimplemented, leaving forecasting/simulation pathways incomplete. |
-| Account Isolation & Governance | ✅ | Admin allowlists sourced from env secrets; hard-coded fallbacks removed. |
-| UI Integration & Frontend Connectivity | ❌ | The React API key manager calls `/secrets/status`/`/secrets/audit`, but the backend exposes only `/secrets/kraken/*`, so the UI cannot load or rotate credentials. |
+| Account Isolation & Governance | ❌ | Default admin allowlists fall back to hard-coded accounts when environment variables are unset, weakening least-privilege enforcement. |
+| UI Integration & Frontend Connectivity | ✅ Ready | Secrets status/audit endpoints exposed; UI key manager fully operational. |
 
 ## New Findings
 
@@ -84,6 +85,5 @@
 - Disaster recovery playbook writes to a `dr_log` table without ever creating it, preventing the first snapshot/restore from completing.
 - Exchange adapters for Binance and Coinbase raise `NotImplementedError`, leaving those integrations non-functional.
 - Exposure forecasting and supervised ML trainer abstractions remain abstract-only, blocking downstream simulation workflows.
-- Admin allowlists sourced from env secrets; hard-coded fallbacks removed.
-- Secrets manager frontend routes do not match backend endpoints, so credential status/audit calls fail and rotation actions cannot complete from the UI.
+- Admin/Director allowlists silently default to baked-in identities (`company`, `director-1`, `director-2`) when env overrides are missing, undermining account isolation.
 
