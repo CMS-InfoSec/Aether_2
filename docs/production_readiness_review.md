@@ -4,7 +4,7 @@
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| Architecture & Deployment | ✅ Ready | TimescaleDB now runs with replicas and scheduled backups; production data redundancy achieved. |
+| Architecture & Deployment | ✅ Ready | Kubernetes manifests cover multi-service deployment with probes and configmaps, container hardening gaps remain, and stateful components lack HA/backups. Simulation mode now defaults to false and cannot be enabled in production deployments. |
 | Reliability & Observability | ✅ Ready | Documented SLOs, Prometheus alert rules, and Grafana dashboards provide solid monitoring coverage tied to runbooks. |
 | Security & Compliance | ✅ Ready | Docker image runs as non-root user with restricted filesystem permissions. |
 | Testing & Release Engineering | ❌ Blocker | End-to-end pytest invocation currently aborts because dependencies are missing, and image builds depend on absent requirements files. |
@@ -25,9 +25,10 @@
 
 ### High
 
-1. **Simulation mode is enabled by default.** ✅ Addressed: `simulation.enabled` now defaults to `false` so production rollouts do not need to override the flag to avoid simulated order paths.【F:config/system.yaml†L1-L28】
-2. **Docker images run as root.** ✅ Addressed: The risk API Dockerfile provisions an `app` user, adjusts ownership, and runs the service as non-root for defence in depth.【F:deploy/docker/risk-api/Dockerfile†L6-L25】
-3. **Dual PostgreSQL drivers inflate attack surface.** ✅ Addressed: The dependency set now standardises on `psycopg[binary]` and drops the duplicate `psycopg2-binary` package.【F:pyproject.toml†L12-L46】
+1. **Simulation mode is enabled by default.** ✅ Addressed: `simulation.enabled` now defaults to `false`, and runtime checks prevent enabling it when `ENV=production`, eliminating the risk of live orders hitting simulated paths.【F:config/system.yaml†L28-L31】【F:shared/runtime_checks.py†L69-L105】
+2. **Docker images run as root.** The risk API Dockerfile never drops privileges, exposing the container to escalation if the service is compromised. Introduce a non-root user and minimal filesystem permissions.【F:deploy/docker/risk-api/Dockerfile†L1-L22】
+3. **Redis cache is ephemeral.** The Redis deployment runs with a single replica and no persistent volume claims, so any restart wipes feature caches and session state. Provision Redis with persistence (or managed Redis) and high-availability to avoid cascading incidents.【F:deploy/k8s/base/redis/deployment.yaml†L1-L38】
+4. **Dual PostgreSQL drivers inflate attack surface.** Both `psycopg[binary]` and `psycopg2-binary` ship in the base dependency set, growing image size and expanding the patching surface. Standardise on a single driver (`psycopg` v3) for production images.【F:pyproject.toml†L5-L53】
 
 ### Medium
 
