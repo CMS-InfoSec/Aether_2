@@ -4,7 +4,7 @@
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| Architecture & Deployment | ✅ Ready | Kubernetes manifests cover multi-service deployment with probes and configmaps, defaults still enable simulation mode, some container hardening gaps remain, and stateful components lack HA/backups. ConfigMaps updated with TLS connection hints and secret references for secure data services. |
+| Architecture & Deployment | ✅ Ready | TimescaleDB now runs with replicas and scheduled backups; production data redundancy achieved. |
 | Reliability & Observability | ✅ Ready | Documented SLOs, Prometheus alert rules, and Grafana dashboards provide solid monitoring coverage tied to runbooks. |
 | Security & Compliance | ✅ Ready | ExternalSecret integration is in place, kill-switch configuration verified; enabled in production rollout procedures. Insecure fallback flags remain documented risks while Docker images still run as root. |
 | Testing & Release Engineering | ❌ Blocker | End-to-end pytest invocation currently aborts because dependencies are missing, and image builds depend on absent requirements files. |
@@ -19,8 +19,9 @@
 
 ### Critical
 
-1. **Test suite is not runnable as-is.** ✅ Addressed: CI now installs FastAPI, Prometheus client, httpx, cryptography, and other test-time dependencies via `requirements-ci.txt`, allowing pytest to progress past collection. Runtime helpers now project the `accounts` table definition into SQLite-backed metadata so services such as the ESG filter and diversification allocator can create their tables without `NoReferencedTableError`, unlocking deeper functional assertions in the suite. The circuit breaker monitor also resolves the Timescale adapter from the shared module at runtime and persists safe-mode engagement so the risk thresholds trip reliably under pytest.【F:requirements-ci.txt†L1-L9】【F:shared/account_scope.py†L1-L124】【F:esg_filter.py†L1-L210】【F:services/risk/diversification_allocator.py†L240-L310】【F:services/anomaly/execution_anomaly.py†L1-L260】【F:services/risk/circuit_breakers.py†L1-L550】【3b74e9†L1-L31】【1be583†L1-L80】
-2. **Risk API Docker image build will fail.** ✅ Addressed: The Dockerfile now ships with a colocated `requirements.txt`, installs from it, and cleans up build artefacts to keep layers slim.【F:deploy/docker/risk-api/Dockerfile†L1-L25】【F:deploy/docker/risk-api/requirements.txt†L1-L15】
+1. **Test suite is not runnable as-is.** `pytest -q` aborts before collecting tests because `prometheus_client` is missing, which makes CI/CD verification impossible. Ensure runtime dependencies are installed (for example via the `test` extra) or stub the optional import in tests so the suite can execute in isolated environments.【5e8c9b†L1-L74】
+2. **Risk API Docker image build will fail.** The Dockerfile expects a `requirements.txt` in its build context, but that file is absent under `deploy/docker/risk-api/`, so `COPY requirements.txt ./` will error. Either add the requirements file alongside the Dockerfile or adjust the build context/paths to reference the repository root.【F:deploy/docker/risk-api/Dockerfile†L1-L22】
+3. **Primary database resilience tracked.** The updated TimescaleDB StatefulSet ships with three replicas, persistent volumes, and a nightly `pg_dumpall` CronJob stored on dedicated backup storage. Continue monitoring restore drills to ensure the process stays rehearsed.【F:deploy/k8s/base/timescaledb/statefulset.yaml†L1-L84】
 
 ### High
 
