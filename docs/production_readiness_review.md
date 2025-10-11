@@ -99,7 +99,9 @@
 
 ## Testing & Release Engineering
 
-* pytest-asyncio added; async test suites execute successfully in CI. 【F:pyproject.toml†L58-L70】【F:requirements-ci.txt†L1-L12】【F:pytest.ini†L1-L2】
+* `requirements-ci.txt` bundles pytest, pytest-asyncio, aiohttp, cryptography, and prometheus_client, so dependency coverage is complete. 【F:requirements-ci.txt†L1-L12】
+* Builds reproducible with pinned dependencies; all Dockerfiles version-locked.
+* `pytest --maxfail=1 --disable-warnings` aborts because importing `services.common.adapters` raises a `RuntimeError` before `conftest.py` seeds the allowlist environment variables. 【F:services/common/security.py†L71-L136】【F:conftest.py†L24-L36】【3aaabe†L1-L19】
 
 **Remediation Tasks**
 
