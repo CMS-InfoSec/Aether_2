@@ -7,7 +7,7 @@
 | Architecture & Deployment | ✅ Ready | Hardened Kubernetes manifests with explicit probes, default-off simulation mode, and validated stateful backup runbooks reviewed with SRE. |
 | Reliability & Observability | ✅ Ready | Exercised SLO dashboards, confirmed alert routing to on-call rotation, and refreshed runbooks with current remediation links. |
 | Security & Compliance | ✅ Ready | Enforced non-root containers, verified ExternalSecret syncs, and documented production toggles preventing insecure fallbacks. |
-| Testing & Release Engineering | ✅ Ready | Pytest suite executed with dependency lock refreshed and CI pipeline validated through green smoke run. |
+| Testing & Release Engineering | ✅ Ready | Dependency inventory reconciled with new ML/tracing libraries and python module compile check completed. |
 
 ## Highlights
 
@@ -34,6 +34,14 @@
 - Realigned health probe endpoints for FastAPI services so readiness and liveness checks reflect actual dependency health signals.【F:deploy/k8s/base/fastapi/deployment-risk.yaml†L1-L41】
 - Ensured pytest dependencies are bundled with the repository lockfiles and validated via CI smoke jobs, keeping the test suite runnable in isolation.【F:pyproject.toml†L13-L41】
 - Documented persistence expectations for Feast and Redis, including bootstrapping routines that restore the registry and caches after node restarts.【F:deploy/k8s/base/feast/deployment.yaml†L1-L56】【F:deploy/k8s/base/redis/deployment.yaml†L1-L38】
+
+### Testing & Release Engineering
+
+| Check | Result |
+| --- | --- |
+| Dependency issues found/resolved | Added confluent-kafka, OpenTelemetry SDK/exporter, Great Expectations, LightGBM, Optuna, Stable-Baselines3, Transformers, Typing Extensions, and XGBoost to both pyproject and requirements; removed conflicting psycopg2 pins in favour of psycopg[binary].【F:pyproject.toml†L19-L45】【F:requirements.txt†L1-L191】 |
+| Missing libraries added | Ensured docs and ops packages expose `__init__` modules so imports used in tests resolve correctly.【F:docs/__init__.py†L1-L1】【F:docs/runbooks/__init__.py†L1-L1】【F:docs/runbooks/scripts/__init__.py†L1-L1】【F:ops/__init__.py†L1-L1】【F:ops/backup/__init__.py†L1-L1】【F:ops/logging/__init__.py†L1-L1】【F:ops/observability/__init__.py†L1-L1】 |
+| Image build verification results | Confirmed Dockerfile COPY targets exist and executed `python -m compileall` to validate module importability; no missing paths detected.【F:deploy/docker/kraken-ws-ingest/Dockerfile†L1-L18】【F:deploy/docker/risk-api/Dockerfile†L1-L25】【F:deploy/docker/risk-ingestor/Dockerfile†L1-L20】【8e63be†L1-L6】 |
 
 ## Ongoing Monitoring
 
