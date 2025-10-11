@@ -7,7 +7,7 @@
 | Architecture & Deployment | ✅ Ready | Kubernetes manifests cover multi-service deployment with probes and configmaps, container hardening gaps remain, and stateful components lack HA/backups. Simulation mode now defaults to false and cannot be enabled in production deployments. |
 | Reliability & Observability | ✅ Ready | Documented SLOs, Prometheus alert rules, and Grafana dashboards provide solid monitoring coverage tied to runbooks. |
 | Security & Compliance | ⚠️ Needs Attention | ExternalSecret integration is in place, yet several services still allow insecure fallbacks when flags are misconfigured and Docker images run as root. |
-| Testing & Release Engineering | ⚠️ Needs Attention | Risk API Docker image builds successfully when invoked from the repository root so the shared dependency manifest is available in the build context. |
+| Testing & Release Engineering | ⚠️ Needs Attention | Test suite executes successfully with restored dependencies and stubbed metrics; CI pipeline now passes smoke tests. |
 
 ## Strengths
 

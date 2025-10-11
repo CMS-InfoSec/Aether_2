@@ -7,7 +7,11 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
-from prometheus_client import CollectorRegistry
+
+try:  # pragma: no cover - prefer the real Prometheus client when available
+    from prometheus_client import CollectorRegistry
+except ModuleNotFoundError:  # pragma: no cover - fallback to local metrics shim
+    from metrics import CollectorRegistry  # type: ignore[attr-defined]
 
 from services.alerts.alert_dedupe import (
     AlertDedupeMetrics,

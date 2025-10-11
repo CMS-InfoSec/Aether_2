@@ -17,8 +17,26 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
 import websockets
-from aiokafka import AIOKafkaProducer
-from aiokafka.errors import KafkaError
+
+try:  # pragma: no cover - prefer the real aiokafka dependency when available
+    from aiokafka import AIOKafkaProducer
+    from aiokafka.errors import KafkaError
+except ModuleNotFoundError:  # pragma: no cover - fallback stub for tests without Kafka
+    class KafkaError(Exception):
+        """Placeholder Kafka error used when aiokafka is not installed."""
+
+    class AIOKafkaProducer:  # type: ignore[override]
+        def __init__(self, *args, **kwargs) -> None:  # noqa: ANN001 - test stub
+            raise RuntimeError("aiokafka is required to run Kraken ingestion")
+
+        async def start(self) -> None:  # pragma: no cover - test stub
+            raise RuntimeError("aiokafka is required to run Kraken ingestion")
+
+        async def stop(self) -> None:  # pragma: no cover - test stub
+            return None
+
+        async def send_and_wait(self, *args, **kwargs) -> None:  # pragma: no cover - test stub
+            raise RuntimeError("aiokafka is required to run Kraken ingestion")
 
 from shared.spot import is_spot_symbol, normalize_spot_symbol
 

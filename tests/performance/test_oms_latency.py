@@ -8,10 +8,18 @@ from typing import Dict, List
 import pytest
 
 pytest.importorskip("fastapi")
-pytest.importorskip("prometheus_client")
+
+try:  # pragma: no cover - prefer the real Prometheus client when available
+    from prometheus_client import CollectorRegistry, Counter, Histogram, generate_latest
+except ModuleNotFoundError:  # pragma: no cover - fallback to local metrics shim
+    from metrics import (  # type: ignore[attr-defined]
+        CollectorRegistry,
+        Counter,
+        Histogram,
+        generate_latest,
+    )
 
 from fastapi.testclient import TestClient
-from prometheus_client import CollectorRegistry, Counter, Histogram, generate_latest
 
 import sequencer
 from sequencer import PipelineHistory, SequencerPipeline, Stage, StageResult

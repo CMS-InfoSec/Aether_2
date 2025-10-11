@@ -15,12 +15,23 @@ from fastapi.testclient import TestClient
 
 pytest.importorskip("locust")
 from locust import Environment, User, constant, task
-from prometheus_client import CollectorRegistry, Histogram, generate_latest
+
+try:  # pragma: no cover - prefer the real Prometheus client when available
+    from prometheus_client import CollectorRegistry, Histogram, generate_latest
+except ModuleNotFoundError:  # pragma: no cover - fallback to local metrics shim
+    from metrics import (  # type: ignore[attr-defined]
+        CollectorRegistry,
+        Histogram,
+        generate_latest,
+    )
 
 from sequencer import app
 
 
-gevent = pytest.importorskip("gevent")
+try:  # pragma: no cover - gevent may be unavailable in lean CI images
+    gevent = pytest.importorskip("gevent")
+except Exception as exc:  # pragma: no cover - surface clear skip reason
+    pytest.skip(f"gevent is unavailable for load tests: {exc}", allow_module_level=True)
 
 
 TARGET_REQUESTS_PER_MINUTE = 100

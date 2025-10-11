@@ -17,7 +17,11 @@ pytest.importorskip("services.common.security")
 pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
-from prometheus_client import generate_latest
+
+try:  # pragma: no cover - prefer the real Prometheus client when available
+    from prometheus_client import generate_latest
+except ModuleNotFoundError:  # pragma: no cover - fallback to local metrics shim
+    from metrics import generate_latest  # type: ignore[attr-defined]
 
 from tests.helpers.risk import MANAGED_RISK_DSN, patch_sqlalchemy_for_risk
 
