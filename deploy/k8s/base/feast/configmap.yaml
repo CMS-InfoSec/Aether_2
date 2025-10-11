@@ -12,7 +12,7 @@ data:
     provider: kubernetes
     online_store:
       type: redis
-      connection_string: redis:6379
+      connection_string: redis-master:6379
     offline_store:
       type: postgres
       host: ${FEAST_OFFLINE_HOST:-timescaledb}
