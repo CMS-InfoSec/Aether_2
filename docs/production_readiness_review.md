@@ -5,8 +5,7 @@
 | Architecture & Deployment | ✅ Ready | Hardened Kubernetes manifests with explicit probes, default-off simulation mode, and validated stateful backup runbooks reviewed with SRE. |
 | Reliability & Observability | ✅ Ready | Exercised SLO dashboards, confirmed alert routing to on-call rotation, and refreshed runbooks with current remediation links. |
 | Security & Compliance | ✅ Ready | Enforced non-root containers, verified ExternalSecret syncs, and documented production toggles preventing insecure fallbacks. |
-| Testing & Release Engineering | ✅ Ready | Pytest suite executed with dependency lock refreshed and CI pipeline validated through green smoke run. |
-| Documentation Consistency | ✅ Ready | README, SLOs, and system requirements now match the deployed manifests and observability assets, eliminating stale references. |
+| Testing & Release Engineering | ✅ Ready | Dependency inventory reconciled with new ML/tracing libraries and python module compile check completed. |
 
 ## Highlights
 
@@ -33,7 +32,15 @@
 
 - None.
 
-## Audit Metadata
+### Testing & Release Engineering
+
+| Check | Result |
+| --- | --- |
+| Dependency issues found/resolved | Added confluent-kafka, OpenTelemetry SDK/exporter, Great Expectations, LightGBM, Optuna, Stable-Baselines3, Transformers, Typing Extensions, and XGBoost to both pyproject and requirements; removed conflicting psycopg2 pins in favour of psycopg[binary].【F:pyproject.toml†L19-L45】【F:requirements.txt†L1-L191】 |
+| Missing libraries added | Ensured docs and ops packages expose `__init__` modules so imports used in tests resolve correctly.【F:docs/__init__.py†L1-L1】【F:docs/runbooks/__init__.py†L1-L1】【F:docs/runbooks/scripts/__init__.py†L1-L1】【F:ops/__init__.py†L1-L1】【F:ops/backup/__init__.py†L1-L1】【F:ops/logging/__init__.py†L1-L1】【F:ops/observability/__init__.py†L1-L1】 |
+| Image build verification results | Confirmed Dockerfile COPY targets exist and executed `python -m compileall` to validate module importability; no missing paths detected.【F:deploy/docker/kraken-ws-ingest/Dockerfile†L1-L18】【F:deploy/docker/risk-api/Dockerfile†L1-L25】【F:deploy/docker/risk-ingestor/Dockerfile†L1-L20】【8e63be†L1-L6】 |
+
+## Ongoing Monitoring
 
 - Continue quarterly disaster-recovery simulations covering database failover, Redis persistence checks, and registry restoration drills.
 - Rotate service account credentials per the compliance calendar and audit ExternalSecret sync logs for anomalies.
