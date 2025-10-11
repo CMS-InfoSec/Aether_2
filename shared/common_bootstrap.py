@@ -310,7 +310,44 @@ def _ensure_httpx_module() -> None:
         module = ModuleType("httpx")
 
         class _HTTPXError(Exception):
+            """Base stub for httpx.HTTPError."""
+
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                super().__init__(*args)
+                self.request = kwargs.get("request")
+                self.response = kwargs.get("response")
+
+        class _HTTPXRequestError(_HTTPXError):
+            """Stub for httpx.RequestError."""
+
             pass
+
+        class _HTTPXTimeoutException(_HTTPXRequestError):
+            """Stub for httpx.TimeoutException."""
+
+            pass
+
+        class _HTTPXHTTPStatusError(_HTTPXError):
+            """Stub for httpx.HTTPStatusError."""
+
+            pass
+
+        class _HTTPXTimeout:
+            """Simplified timeout configuration stub."""
+
+            def __init__(
+                self,
+                timeout: float | None = None,
+                connect: float | None = None,
+                read: float | None = None,
+                write: float | None = None,
+                pool: float | None = None,
+            ) -> None:
+                self.timeout = timeout
+                self.connect = connect
+                self.read = read
+                self.write = write
+                self.pool = pool
 
         class _HTTPXResponse(SimpleNamespace):
             def __init__(self, status_code: int = 200, json_data: object | None = None):
@@ -339,6 +376,10 @@ def _ensure_httpx_module() -> None:
         module.Request = _HTTPXRequest  # type: ignore[attr-defined]
         module.Response = _HTTPXResponse  # type: ignore[attr-defined]
         module.HTTPError = _HTTPXError  # type: ignore[attr-defined]
+        module.RequestError = _HTTPXRequestError  # type: ignore[attr-defined]
+        module.TimeoutException = _HTTPXTimeoutException  # type: ignore[attr-defined]
+        module.HTTPStatusError = _HTTPXHTTPStatusError  # type: ignore[attr-defined]
+        module.Timeout = _HTTPXTimeout  # type: ignore[attr-defined]
         module.__file__ = "<httpx-stub>"
         sys.modules["httpx"] = module
 
