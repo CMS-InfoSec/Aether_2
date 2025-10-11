@@ -1,6 +1,7 @@
-from typing import List
+from typing import Any, Dict, List
 
 import services.hedge.hedge_service as hedge_service
+from shared.audit_hooks import AuditHooks
 
 
 def _build_service(*, state_path=None, **kwargs: object) -> hedge_service.HedgeService:
@@ -159,3 +160,93 @@ def test_kill_switch_handler_invoked_once_and_rearmed(tmp_path) -> None:
     )
     assert len(triggers) == 2
     assert triggers[-1].startswith("Alpha:")
+
+
+def test_kill_switch_engages_without_handler(tmp_path) -> None:
+    service = _build_service(
+        state_path=tmp_path / "state.json",
+        drawdown_kill_threshold=0.4,
+        drawdown_recovery_threshold=0.2,
+    )
+
+    breach = _evaluate(
+        service,
+        volatility=0.7,
+        drawdown=0.45,
+        stablecoin_price=1.0,
+    )
+
+    assert breach.diagnostics.kill_switch_recommended is True
+    assert service.health_status()["kill_switch_engaged"] is True
+
+    recovery = _evaluate(
+        service,
+        volatility=0.4,
+        drawdown=0.15,
+        stablecoin_price=1.0,
+    )
+
+    assert recovery.diagnostics.kill_switch_recommended is False
+    assert service.health_status()["kill_switch_engaged"] is False
+
+
+def test_hedge_decision_emits_telemetry_and_governance(tmp_path) -> None:
+    events: List[Dict[str, Any]] = []
+    telemetry: List[Dict[str, Any]] = []
+
+    def _log_event(
+        *,
+        actor: str,
+        action: str,
+        entity: str,
+        before: Dict[str, Any],
+        after: Dict[str, Any],
+        ip_hash: str | None,
+    ) -> None:
+        events.append(
+            {
+                "actor": actor,
+                "action": action,
+                "entity": entity,
+                "before": dict(before),
+                "after": dict(after),
+                "ip_hash": ip_hash,
+            }
+        )
+
+    hooks = AuditHooks(log=_log_event, hash_ip=lambda value: f"hash:{value}" if value else None)
+
+    def _telemetry(decision: hedge_service.HedgeDecision, metrics: hedge_service.HedgeMetricsRequest) -> None:
+        telemetry.append(
+            {
+                "mode": decision.mode,
+                "target": decision.target_pct,
+                "account": metrics.account_id,
+            }
+        )
+
+    service = _build_service(
+        state_path=tmp_path / "state.json",
+        telemetry_sink=_telemetry,
+        audit_hooks=hooks,
+    )
+
+    metrics = hedge_service.HedgeMetricsRequest(
+        volatility=0.9,
+        drawdown=0.32,
+        stablecoin_price=1.0,
+        account_id="Alpha",
+    )
+
+    decision = service.evaluate(metrics)
+
+    assert telemetry, "expected telemetry sink to capture hedge decision"
+    telemetry_entry = telemetry[-1]
+    assert telemetry_entry["mode"] == "auto"
+    assert telemetry_entry["target"] == decision.target_pct
+
+    assert events, "expected governance hooks to capture hedge decision"
+    audit_event = events[-1]
+    assert audit_event["action"] == "hedge.decision.auto"
+    assert audit_event["entity"] == "hedge:alpha"
+    assert audit_event["after"]["target_pct"] == decision.target_pct
