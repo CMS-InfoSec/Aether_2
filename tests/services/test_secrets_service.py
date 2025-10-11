@@ -108,6 +108,23 @@ def configured_settings(monkeypatch, secrets_service_module):
     return settings, secrets_service_module
 
 
+def test_load_settings_defaults_mfa_tokens_to_auth_tokens(
+    monkeypatch, secrets_service_module
+):
+    encryption_key = base64.b64encode(b"x" * 32).decode("utf-8")
+    monkeypatch.setenv("SECRET_ENCRYPTION_KEY", encryption_key)
+    monkeypatch.setenv("SECRETS_SERVICE_AUTH_TOKENS", "token-1,token-2")
+    monkeypatch.setenv("KRAKEN_SECRETS_AUTH_TOKENS", "token-1:alpha,token-2:beta")
+    monkeypatch.delenv("KRAKEN_SECRETS_MFA_TOKENS", raising=False)
+    monkeypatch.setattr(
+        secrets_service_module, "_insecure_defaults_enabled", lambda: False
+    )
+
+    settings = secrets_service_module.load_settings()
+
+    assert settings.authorized_mfa_tokens == ("token-1", "token-2")
+
+
 def test_require_authorized_caller_accepts_known_token(configured_settings):
     settings, secrets_service = configured_settings
     assert settings.authorized_token_ids == ("token-1", "token-2")
