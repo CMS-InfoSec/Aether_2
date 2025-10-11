@@ -32,6 +32,17 @@ spec:
               path: /varz
               port: monitoring
             initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: monitoring
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
           resources:
             requests:
               cpu: 100m
@@ -39,9 +50,30 @@ spec:
             limits:
               cpu: 500m
               memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
           volumeMounts:
             - name: data
               mountPath: /data
       volumes:
         - name: data
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: nats-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nats-data
+  labels:
+    app.kubernetes.io/name: nats
+    app.kubernetes.io/component: messaging
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi

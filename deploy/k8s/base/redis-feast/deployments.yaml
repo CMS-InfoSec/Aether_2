@@ -1,10 +1,11 @@
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: redis-master
   labels:
     app: redis
 spec:
+  serviceName: redis-master
   replicas: 1
   selector:
     matchLabels:
@@ -20,12 +21,27 @@ spec:
       containers:
         - name: redis
           image: redis:7.2.4-alpine
-          ports:
-            - containerPort: 6379
           command:
             - redis-server
             - --save
             - ""
+          ports:
+            - containerPort: 6379
+              name: redis
+          readinessProbe:
+            tcpSocket:
+              port: redis
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
+          livenessProbe:
+            tcpSocket:
+              port: redis
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 2
+            failureThreshold: 3
           resources:
             requests:
               cpu: 100m
@@ -33,6 +49,24 @@ spec:
             limits:
               cpu: 500m
               memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: redis-data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: redis-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 10Gi
 ---
 apiVersion: v1
 kind: Service
@@ -44,8 +78,9 @@ spec:
     app: redis
     role: master
   ports:
-    - port: 6379
-      targetPort: 6379
+    - name: redis
+      port: 6379
+      targetPort: redis
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -69,11 +104,26 @@ spec:
           image: feastdev/feature-server:0.36.1
           ports:
             - containerPort: 6566
+              name: grpc
           env:
             - name: REDIS_HOST
               value: redis-master
             - name: REDIS_PORT
               value: "6379"
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
           resources:
             requests:
               cpu: 200m
@@ -81,6 +131,12 @@ spec:
             limits:
               cpu: 1
               memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
 ---
 apiVersion: v1
 kind: Service
@@ -93,4 +149,4 @@ spec:
   ports:
     - name: grpc
       port: 6566
-      targetPort: 6566
+      targetPort: grpc

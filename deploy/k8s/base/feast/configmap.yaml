@@ -15,9 +15,9 @@ data:
       connection_string: redis:6379
     offline_store:
       type: postgres
-      host: timescaledb
-      port: 5432
-      database: marketdata
-      db_schema: feast
-      user: risk_engine
-      password: changeme
+      host: ${FEAST_OFFLINE_HOST:-timescaledb}
+      port: ${FEAST_OFFLINE_PORT:-5432}
+      database: ${FEAST_OFFLINE_DB:-marketdata}
+      db_schema: ${FEAST_OFFLINE_SCHEMA:-feast}
+      user: ${FEAST_OFFLINE_USER}
+      password: ${FEAST_OFFLINE_PASSWORD}

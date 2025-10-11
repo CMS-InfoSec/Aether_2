@@ -32,6 +32,20 @@ spec:
               value: "yes"
             - name: KAFKA_CFG_LOG_DIRS
               value: /bitnami/kafka/data
+          readinessProbe:
+            tcpSocket:
+              port: kafka
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            tcpSocket:
+              port: kafka
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
           volumeMounts:
             - name: data
               mountPath: /bitnami/kafka/data
@@ -42,6 +56,12 @@ spec:
             limits:
               cpu: 1
               memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
   volumeClaimTemplates:
     - metadata:
         name: data
