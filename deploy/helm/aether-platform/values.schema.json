@@ -4,14 +4,13 @@
   "title": "Aether Platform Helm Values",
   "type": "object",
   "additionalProperties": true,
-  "required": [
-    "simulation",
-    "runtimeSafety"
-  ],
   "properties": {
     "simulation": {
       "type": "object",
       "description": "Controls access to the simulation workloads. These must remain disabled in production clusters.",
+      "default": {
+        "enabled": false
+      },
       "required": [
         "enabled"
       ],
@@ -19,6 +18,7 @@
         "enabled": {
           "type": "boolean",
           "const": false,
+          "default": false,
           "description": "Simulation traffic is disabled by default to prevent accidental activation in production."
         }
       },
@@ -27,6 +27,9 @@
     "runtimeSafety": {
       "type": "object",
       "description": "Global runtime safety flags that harden the chart against insecure defaults.",
+      "default": {
+        "_ALLOW_INSECURE_DEFAULTS": false
+      },
       "required": [
         "_ALLOW_INSECURE_DEFAULTS"
       ],
