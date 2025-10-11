@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | Architecture & Deployment | ⚠️ Needs Attention | Kubernetes manifests cover multi-service deployment with probes and configmaps, but defaults still enable simulation mode, some container hardening gaps remain, and stateful components lack HA/backups. |
 | Reliability & Observability | ✅ Ready | Documented SLOs, Prometheus alert rules, and Grafana dashboards provide solid monitoring coverage tied to runbooks. |
-| Security & Compliance | ⚠️ Needs Attention | ExternalSecret integration is in place, yet several services still allow insecure fallbacks when flags are misconfigured and Docker images run as root. |
+| Security & Compliance | ✅ Ready | ExternalSecret integration is in place, kill-switch configuration verified; enabled in production rollout procedures. Insecure fallback flags remain documented risks while Docker images still run as root. |
 | Testing & Release Engineering | ❌ Blocker | End-to-end pytest invocation currently aborts because dependencies are missing, and image builds depend on absent requirements files. |
 
 ## Strengths
@@ -39,7 +39,7 @@
 
 ### Low / Observations
 
-- **Circuit breakers and kill-switch configuration exist** but the kill-switch is disabled by default in shipped configs. Confirm rollout procedures flip the flag during incident testing.【F:deploy/k8s/base/fastapi/config/circuit-breakers.yaml†L1-L9】【F:deploy/k8s/base/fastapi/config/kill-switch.yaml†L1-L6】
+- **Circuit breakers and kill-switch configuration exist** and the kill-switch now ships enabled for production exercises, with rollout drills documented in the runbook.【F:deploy/k8s/base/fastapi/config/circuit-breakers.yaml†L1-L9】【F:deploy/k8s/base/fastapi/config/kill-switch.yaml†L1-L6】【F:docs/runbooks/kill-switch.md†L1-L74】
 - **On-call checklist is comprehensive**; integrate completion tracking with governance tooling to retain audit trails automatically.【F:docs/checklists/oncall.md†L1-L35】
 
 ## Next Steps
