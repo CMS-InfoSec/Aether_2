@@ -14,6 +14,7 @@
 
 ## Architecture & Deployment
 
+* All workloads define CPU and memory requests/limits so schedulers can plan capacity predictably. 【F:deploy/observability/grafana/grafana.yaml†L1-L39】【F:deploy/k8s/dr_policy.yaml†L169-L250】
 * `fastapi-secrets` only exposes JWT/API credentials. The FastAPI deployments pull `REDIS_URL`/`NATS_URL` keys from that secret, so the pods fail configuration resolution until those keys are added. 【F:deploy/k8s/base/fastapi/deployments.yaml†L27-L114】【F:deploy/k8s/base/secrets/external-secrets.yaml†L179-L204】
 * The Secrets Service requires a `secrets-service-config` secret containing `SECRET_ENCRYPTION_KEY`, but the base manifest intentionally omits it. Operators currently follow the rotation runbook to apply it manually, leaving no GitOps trace. 【F:deploy/k8s/base/aether-services/secret-secrets-service-config.yaml†L1-L6】【F:docs/runbooks/secrets-service-key-rotation.md†L27-L92】
 * Risk Service also needs `COMPLIANCE_DATABASE_URL` and `COMPLIANCE_DB_SSLMODE`, yet no ExternalSecret or sealed secret ships those values (`compliance-service-database` is undeclared), so the deployment dereferences a secret that Git never provisions. 【F:deploy/k8s/base/aether-services/deployment-risk.yaml†L41-L72】【F:deploy/k8s/base/secrets/external-secrets.yaml†L1-L204】
