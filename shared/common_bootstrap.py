@@ -8,7 +8,10 @@ from pathlib import Path
 from types import ModuleType
 from typing import Callable, Dict, Mapping, Tuple
 
-from shared.runtime_checks import assert_insecure_defaults_disabled
+from shared.runtime_checks import (
+    assert_insecure_defaults_disabled,
+    assert_simulation_disabled_in_production,
+)
 
 try:  # pragma: no cover - defensive import when sitecustomize missing
     from sitecustomize import (
@@ -350,6 +353,7 @@ def ensure_common_helpers() -> None:
     try:
         if not reentrant_call:
             assert_insecure_defaults_disabled()
+            assert_simulation_disabled_in_production()
 
         loaded: Dict[str, ModuleType] = {}
         for name in _COMMON_MODULES:
