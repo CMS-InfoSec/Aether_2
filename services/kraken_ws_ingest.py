@@ -80,6 +80,12 @@ WS_SEQUENCE_GAP_RATIO = Gauge(
     labelnames=("pair",),
 )
 
+RISK_MARKETDATA_LATEST_TIMESTAMP_SECONDS = Gauge(
+    "risk_marketdata_latest_timestamp_seconds",
+    "Unix timestamp of the most recent normalized market data event emitted by the ingestor.",
+    labelnames=("service",),
+)
+
 
 class HeartbeatTimeout(RuntimeError):
     """Raised when Kraken heartbeats stop flowing."""
@@ -439,6 +445,13 @@ class KrakenIngestor:
         if window:
             ratio = sum(window) / len(window)
             WS_SEQUENCE_GAP_RATIO.labels(pair=pair).set(ratio)
+
+        try:
+            RISK_MARKETDATA_LATEST_TIMESTAMP_SECONDS.labels(
+                service="marketdata-ingestor"
+            ).set(timestamp)
+        except Exception:  # pragma: no cover - defensive guard for optional metrics
+            logging.debug("Failed to record market data freshness metric", exc_info=True)
 
 
 def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
