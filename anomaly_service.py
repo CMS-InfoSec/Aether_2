@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from services.alert_manager import RiskEvent, get_alert_manager_instance
 from services.common.adapters import TimescaleAdapter
 from services.common.security import require_admin_account
+from shared.account_scope import account_id_column
 from shared.postgres import normalize_sqlalchemy_dsn
 from shared.pydantic_compat import BaseModel, Field
 
@@ -101,7 +102,7 @@ class AnomalyLog(Base):
             ...
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    account_id = Column(String, nullable=False, index=True)
+    account_id = account_id_column(index=True)
     anomaly_type = Column(String, nullable=False)
     details_json = Column(JSON, nullable=False, default=dict)
     ts = Column(DateTime(timezone=True), nullable=False, index=True)

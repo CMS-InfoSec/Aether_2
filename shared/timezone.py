@@ -1,66 +1,73 @@
-"""Utilities for formatting timestamps in Europe/London with DST awareness."""
+"""Timezone helpers for London-aware formatting without heavy dependencies."""
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Any
+from datetime import datetime, timedelta, timezone
+from typing import Final
 
-from zoneinfo import ZoneInfo
+try:  # pragma: no cover - prefer stdlib tzdata when available
+    from zoneinfo import ZoneInfo  # type: ignore[attr-defined]
+except (ModuleNotFoundError, KeyError):  # pragma: no cover - stripped tzdata
+    ZoneInfo = None  # type: ignore[assignment]
 
-_LONDON_TZ = ZoneInfo("Europe/London")
+_UTC: Final = timezone.utc
+_GMT: Final = timezone(timedelta(0), name="GMT")
+_BST: Final = timezone(timedelta(hours=1), name="BST")
 
-
-def _coerce_datetime(value: Any) -> datetime:
-    """Convert *value* to :class:`datetime`.
-
-    ``pandas.Timestamp`` and ``numpy.datetime64`` instances expose ``to_pydatetime``
-    which we invoke when available so downstream code can operate on the standard
-    library ``datetime`` type. Values that are already ``datetime`` instances are
-    returned as-is. For naive datetimes we assume they are expressed in UTC because
-    that is the platform-wide storage convention.
-    """
-
-    if isinstance(value, datetime):
-        candidate = value
-    elif hasattr(value, "to_pydatetime"):
-        candidate = value.to_pydatetime()  # type: ignore[assignment]
-    else:
-        raise TypeError(f"Unsupported timestamp type: {type(value)!r}")
-
-    if candidate.tzinfo is None:
-        return candidate.replace(tzinfo=timezone.utc)
-    return candidate
+if ZoneInfo is not None:  # pragma: no branch - mainline path
+    try:
+        _LONDON_TZ: Final | None = ZoneInfo("Europe/London")
+    except Exception:  # pragma: no cover - tzdata missing at runtime
+        _LONDON_TZ = None
+else:  # pragma: no cover - fallback approximation
+    _LONDON_TZ = None
 
 
-def as_london_time(value: Any) -> datetime:
-    """Return *value* converted to the Europe/London timezone.
+def _coerce_utc(instant: datetime) -> datetime:
+    """Return *instant* as an aware datetime in UTC."""
 
-    The helper accepts ``datetime`` objects and pandas timestamps. DST transitions
-    are handled via :mod:`zoneinfo`, ensuring the correct GMT/BST offset is applied
-    for reporting and frontend presentation layers.
-    """
-
-    aware = _coerce_datetime(value)
-    return aware.astimezone(_LONDON_TZ)
+    if instant.tzinfo is None:
+        return instant.replace(tzinfo=_UTC)
+    return instant.astimezone(_UTC)
 
 
-def format_london_time(value: Any, fmt: str = "%Y-%m-%d %H:%M:%S %Z") -> str:
-    """Format *value* using the Europe/London timezone.
+def _fallback_offset(instant: datetime) -> timezone:
+    """Approximate the Europe/London offset when tzdata is unavailable."""
 
-    Parameters
-    ----------
-    value:
-        Any datetime-like object accepted by :func:`as_london_time`.
-    fmt:
-        ``strftime``-style format string. Defaults to ``"%Y-%m-%d %H:%M:%S %Z"``.
+    year = instant.year
 
-    Returns
-    -------
-    str
-        A string representation of ``value`` with DST-aware timezone information.
-    """
+    def _last_sunday(month: int) -> datetime:
+        last_day = max(
+            day
+            for day in range(31, 24, -1)
+            if datetime(year, month, day).weekday() == 6
+        )
+        return datetime(year, month, last_day, 1, tzinfo=_UTC)
 
-    return as_london_time(value).strftime(fmt)
+    dst_start = _last_sunday(3)
+    dst_end = _last_sunday(10)
+
+    if dst_start <= instant < dst_end:
+        return _BST
+    return _GMT
+
+
+def as_london_time(instant: datetime) -> datetime:
+    """Convert *instant* to Europe/London time, preserving microseconds."""
+
+    utc = _coerce_utc(instant)
+    if _LONDON_TZ is not None:
+        return utc.astimezone(_LONDON_TZ)
+
+    offset = _fallback_offset(utc)
+    return utc.astimezone(offset)
+
+
+def format_london_time(instant: datetime) -> str:
+    """Format *instant* using ``YYYY-MM-DD HH:MM:SS <TZ>`` semantics."""
+
+    local = as_london_time(instant)
+    return f"{local:%Y-%m-%d %H:%M:%S} {local.tzname()}"
 
 
 __all__ = ["as_london_time", "format_london_time"]
