@@ -9,6 +9,7 @@ from types import ModuleType
 from typing import Callable, Dict, Mapping, Tuple
 
 from shared.runtime_checks import (
+    assert_account_allowlists_configured,
     assert_insecure_defaults_disabled,
     assert_simulation_disabled_in_production,
 )
@@ -352,6 +353,7 @@ def ensure_common_helpers() -> None:
 
     try:
         if not reentrant_call:
+            assert_account_allowlists_configured()
             assert_insecure_defaults_disabled()
             assert_simulation_disabled_in_production()
 
