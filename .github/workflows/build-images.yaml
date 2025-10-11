@@ -17,6 +17,10 @@ on:
       - 'common/**'
       - 'src/**'
 
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   kaniko-build:
     runs-on: ubuntu-latest
@@ -24,21 +28,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Log in to GHCR
-        env:
-          GHCR_AUTH: ${{ secrets.GHCR_AUTH }}
-        run: |
-          if [ -z "$GHCR_AUTH" ]; then
-            echo "GHCR_AUTH secret must be provided" >&2
-            exit 1
-          fi
-          AUTH_DECODED=$(echo "$GHCR_AUTH" | base64 --decode)
-          USERNAME=${AUTH_DECODED%%:*}
-          PASSWORD=${AUTH_DECODED#*:}
-          if [ -z "$USERNAME" ] || [ -z "$PASSWORD" ] || [ "$USERNAME" = "$AUTH_DECODED" ]; then
-            echo "GHCR_AUTH must be a base64-encoded 'username:token' string" >&2
-            exit 1
-          fi
-          echo "$PASSWORD" | docker login ghcr.io --username "$USERNAME" --password-stdin
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build Risk API Image
         uses: int128/kaniko-action@v1
         with:
