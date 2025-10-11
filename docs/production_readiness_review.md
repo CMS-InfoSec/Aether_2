@@ -66,7 +66,7 @@
 | Data Integrity & Backup | ❌ | Disaster-recovery tooling logs every action but never provisions the target table, so the very first snapshot/restore aborts with an undefined-table error. |
 | API & Integration Consistency | ⚠️ | Binance and Coinbase adapters are stubs that raise `NotImplementedError`, blocking multi-exchange routing until completed. |
 | ML & Simulation Logic | ⚠️ | Exposure forecaster and supervised ML trainer interfaces are unimplemented, leaving forecasting/simulation pathways incomplete. |
-| Account Isolation & Governance | ❌ | Default admin allowlists fall back to hard-coded accounts when environment variables are unset, weakening least-privilege enforcement. |
+| Account Isolation & Governance | ✅ | Admin allowlists sourced from env secrets; hard-coded fallbacks removed. |
 | UI Integration & Frontend Connectivity | ❌ | The React API key manager calls `/secrets/status`/`/secrets/audit`, but the backend exposes only `/secrets/kraken/*`, so the UI cannot load or rotate credentials. |
 
 ## New Findings
@@ -78,6 +78,6 @@
 - Disaster recovery playbook writes to a `dr_log` table without ever creating it, preventing the first snapshot/restore from completing.
 - Exchange adapters for Binance and Coinbase raise `NotImplementedError`, leaving those integrations non-functional.
 - Exposure forecasting and supervised ML trainer abstractions remain abstract-only, blocking downstream simulation workflows.
-- Admin/Director allowlists silently default to baked-in identities (`company`, `director-1`, `director-2`) when env overrides are missing, undermining account isolation.
+- Admin allowlists sourced from env secrets; hard-coded fallbacks removed.
 - Secrets manager frontend routes do not match backend endpoints, so credential status/audit calls fail and rotation actions cannot complete from the UI.
 

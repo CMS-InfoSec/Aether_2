@@ -56,8 +56,8 @@ __all__ = [
     "require_dual_director_confirmation",
 ]
 
-_DEFAULT_ADMIN_ACCOUNTS = frozenset({"company", "director-1", "director-2"})
-_ADMIN_ENV_VARIABLE = "AETHER_ADMIN_ACCOUNTS"
+_ADMIN_ENV_VARIABLE = "ADMIN_ALLOWLIST"
+_DIRECTOR_ENV_VARIABLE = "DIRECTOR_ALLOWLIST"
 
 
 def _sanitize_account_id(value: str) -> str:
@@ -68,21 +68,38 @@ def _normalize_account_id(value: str) -> str:
     return _sanitize_account_id(value).lower()
 
 
-def _load_admin_accounts_from_env() -> set[str]:
-    raw = os.environ.get(_ADMIN_ENV_VARIABLE)
-    if not raw:
-        return set(_DEFAULT_ADMIN_ACCOUNTS)
-    accounts = {
+def _parse_allowlist(variable: str) -> set[str]:
+    raw = os.environ.get(variable)
+    if raw is None or not raw.strip():
+        raise RuntimeError(
+            f"{variable} is required but was not provided. Configure the environment "
+            "variable with a comma-separated list of account identifiers."
+        )
+    values = {
         _sanitize_account_id(part)
         for part in raw.split(",")
         if _sanitize_account_id(part)
     }
-    if not accounts:
-        return set(_DEFAULT_ADMIN_ACCOUNTS)
-    return accounts
+    if not values:
+        raise RuntimeError(
+            f"{variable} must contain at least one non-empty account identifier."
+        )
+    return values
 
 
-def reload_admin_accounts(source: Optional[Iterable[str]] = None) -> set[str]:
+def _load_admin_accounts_from_env() -> set[str]:
+    return _parse_allowlist(_ADMIN_ENV_VARIABLE)
+
+
+def _load_director_accounts_from_env() -> set[str]:
+    return _parse_allowlist(_DIRECTOR_ENV_VARIABLE)
+
+
+def reload_admin_accounts(
+    source: Optional[Iterable[str]] = None,
+    *,
+    director_source: Optional[Iterable[str]] = None,
+) -> set[str]:
     """Refresh administrator accounts from the configured source."""
 
     if source is None:
@@ -93,20 +110,29 @@ def reload_admin_accounts(source: Optional[Iterable[str]] = None) -> set[str]:
             for account in source
             if _sanitize_account_id(account)
         }
-    if not accounts:
-        accounts = set(_DEFAULT_ADMIN_ACCOUNTS)
+        if not accounts:
+            raise RuntimeError(
+                "ADMIN_ALLOWLIST must contain at least one account identifier."
+            )
 
     ADMIN_ACCOUNTS.clear()
     ADMIN_ACCOUNTS.update(accounts)
 
-    DIRECTOR_ACCOUNTS.clear()
-    DIRECTOR_ACCOUNTS.update(
-        {
-            account
-            for account in ADMIN_ACCOUNTS
-            if _normalize_account_id(account).startswith("director-")
+    if director_source is None:
+        directors = _load_director_accounts_from_env()
+    else:
+        directors = {
+            _sanitize_account_id(account)
+            for account in director_source
+            if _sanitize_account_id(account)
         }
-    )
+        if not directors:
+            raise RuntimeError(
+                "DIRECTOR_ALLOWLIST must contain at least one account identifier."
+            )
+
+    DIRECTOR_ACCOUNTS.clear()
+    DIRECTOR_ACCOUNTS.update(directors)
     return set(ADMIN_ACCOUNTS)
 
 
