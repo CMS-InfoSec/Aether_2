@@ -15,6 +15,9 @@
 {{- $promPort := $svcProm.port | default $promDefaultPort -}}
 {{- $promScheme := $svcProm.scheme | default $promDefaultScheme -}}
 {{- $krakenAccounts := $global.krakenSecrets.accounts | default (list) -}}
+{{- $accountAllowlists := $global.accountAllowlists | default (dict) -}}
+{{- $adminAllowlist := $accountAllowlists.admin | default (dict) -}}
+{{- $directorAllowlist := $accountAllowlists.director | default (dict) -}}
 {{- $annotations := dict -}}
 {{- if $hasKraken }}
 {{- $_ := set $annotations $global.krakenSecrets.annotationKey (default "" $global.krakenSecrets.checksum) -}}
@@ -76,6 +79,20 @@ spec:
             {{- if $sessionRedis }}
             - name: SESSION_REDIS_URL
               value: {{ $sessionRedis | quote }}
+            {{- end }}
+            {{- if and ($adminAllowlist.secretName) ($adminAllowlist.secretKey) }}
+            - name: ADMIN_ALLOWLIST
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $adminAllowlist.secretName }}
+                  key: {{ $adminAllowlist.secretKey }}
+            {{- end }}
+            {{- if and ($directorAllowlist.secretName) ($directorAllowlist.secretKey) }}
+            - name: DIRECTOR_ALLOWLIST
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $directorAllowlist.secretName }}
+                  key: {{ $directorAllowlist.secretKey }}
             {{- end }}
             {{- if $releaseManifestEnabled }}
             - name: RELEASE_MANIFEST_DATABASE_URL

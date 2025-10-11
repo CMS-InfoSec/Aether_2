@@ -17,6 +17,7 @@ spurious import failures during the readiness checks.
 from __future__ import annotations
 
 import sys
+import os
 from pathlib import Path
 
 
@@ -28,5 +29,8 @@ def _ensure_repo_root_on_path() -> None:
     if repo_str not in sys.path:
         sys.path.insert(0, repo_str)
 
+
+os.environ.setdefault("ADMIN_ALLOWLIST", "company,director-1,director-2")
+os.environ.setdefault("DIRECTOR_ALLOWLIST", "director-1,director-2")
 
 _ensure_repo_root_on_path()

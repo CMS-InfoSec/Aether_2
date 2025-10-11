@@ -19,6 +19,7 @@ from yaml import safe_load
 _GLOBAL_ALLOW_FLAG = "AETHER_ALLOW_INSECURE_DEFAULTS"
 _SYSTEM_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "system.yaml"
 _ENV_FLAG = "ENV"
+_REQUIRED_ALLOWLIST_ENV = ("ADMIN_ALLOWLIST", "DIRECTOR_ALLOWLIST")
 
 
 def _is_test_environment() -> bool:
@@ -102,6 +103,26 @@ def assert_insecure_defaults_disabled(
     )
 
 
+def assert_account_allowlists_configured() -> None:
+    """Ensure administrator and director allowlists are configured via secrets."""
+
+    if _is_test_environment():
+        return
+
+    missing = [
+        variable
+        for variable in _REQUIRED_ALLOWLIST_ENV
+        if not (os.getenv(variable) or "")
+    ]
+
+    if missing:
+        formatted = ", ".join(sorted(missing))
+        raise RuntimeError(
+            "Required account allowlists are not configured. Set the following "
+            f"environment variables via Kubernetes secrets: {formatted}."
+        )
+
+
 def _load_system_config() -> dict[str, object]:
     """Return the parsed ``system.yaml`` configuration."""
 
@@ -142,6 +163,7 @@ def assert_simulation_disabled_in_production() -> None:
 
 
 __all__ = [
+    "assert_account_allowlists_configured",
     "assert_insecure_defaults_disabled",
     "assert_simulation_disabled_in_production",
 ]

@@ -38,6 +38,13 @@ global:
         envVar: AETHER_DIRECTOR_2_KRAKEN_SECRET_PATH
         mountSubPath: director-2
         secretName: kraken-keys-director-2
+  accountAllowlists:
+    admin:
+      secretName: platform-account-allowlists
+      secretKey: admins
+    director:
+      secretName: platform-account-allowlists
+      secretKey: directors
   podSecurityContext:
     runAsNonRoot: true
     runAsUser: 1000

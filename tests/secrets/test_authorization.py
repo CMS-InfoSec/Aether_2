@@ -46,6 +46,7 @@ def secrets_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     monkeypatch.setenv("KRAKEN_SECRETS_SERVICE_TOKENS", "service-token-123")
     monkeypatch.setenv("SECRETS_SERVICE_AUTH_TOKENS", "service-token-123")
     monkeypatch.setenv("KRAKEN_SECRETS_AUTH_TOKENS", "service-token-123:svc")
+    monkeypatch.setenv("KRAKEN_SECRETS_MFA_TOKENS", "mfa-token-123")
 
     import kubernetes.config as k8s_config
 
@@ -61,6 +62,7 @@ def secrets_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
         SECRET_ENCRYPTION_KEY=base64.b64encode(b"a" * 32).decode(),
         SECRETS_SERVICE_AUTH_TOKENS="service-token-123",
         authorized_token_labels={"service-token-123": "svc"},
+        KRAKEN_SECRETS_MFA_TOKENS="mfa-token-123",
     )
     module.SETTINGS = settings
     module.STATE.settings = settings
@@ -94,7 +96,11 @@ def test_store_secret_allows_authorized_admin(secrets_client: TestClient) -> Non
     response = secrets_client.post(
         "/secrets/kraken",
         json={"account_id": "acct", "api_key": "key", "api_secret": "secret"},
-        headers={"X-Admin-ID": "admin@example.com", "Authorization": "Bearer service-token-123"},
+        headers={
+            "X-Admin-ID": "admin@example.com",
+            "Authorization": "Bearer service-token-123",
+            "X-MFA-Token": "mfa-token-123",
+        },
     )
 
     assert response.status_code == 201
@@ -114,7 +120,10 @@ def test_store_secret_rejects_actor_mismatch(secrets_client: TestClient) -> None
             "api_secret": "secret",
             "actor": "spoofed",
         },
-        headers={"Authorization": "Bearer service-token-123"},
+        headers={
+            "Authorization": "Bearer service-token-123",
+            "X-MFA-Token": "mfa-token-123",
+        },
     )
 
     assert response.status_code == 400
@@ -134,7 +143,10 @@ def test_status_allows_service_token(secrets_client: TestClient) -> None:
     response = secrets_client.get(
         "/secrets/kraken/status",
         params={"account_id": "acct"},
-        headers={"Authorization": "Bearer service-token-123"},
+        headers={
+            "Authorization": "Bearer service-token-123",
+            "X-MFA-Token": "mfa-token-123",
+        },
     )
 
     assert response.status_code == 200
@@ -155,7 +167,10 @@ def test_test_endpoint_allows_service_token(secrets_client: TestClient) -> None:
     response = secrets_client.post(
         "/secrets/kraken/test",
         json={"account_id": "acct"},
-        headers={"Authorization": "Bearer service-token-123"},
+        headers={
+            "Authorization": "Bearer service-token-123",
+            "X-MFA-Token": "mfa-token-123",
+        },
     )
 
     assert response.status_code == 200
@@ -178,7 +193,10 @@ def test_store_secret_validates_credentials(secrets_client: TestClient) -> None:
     response = secrets_client.post(
         "/secrets/kraken",
         json={"account_id": "acct", "api_key": "key", "api_secret": "secret"},
-        headers={"Authorization": "Bearer service-token-123"},
+        headers={
+            "Authorization": "Bearer service-token-123",
+            "X-MFA-Token": "mfa-token-123",
+        },
     )
 
     assert response.status_code == 201
@@ -199,7 +217,10 @@ def test_store_secret_rejects_invalid_credentials(secrets_client: TestClient) ->
     response = secrets_client.post(
         "/secrets/kraken",
         json={"account_id": "acct", "api_key": "key", "api_secret": "secret"},
-        headers={"Authorization": "Bearer service-token-123"},
+        headers={
+            "Authorization": "Bearer service-token-123",
+            "X-MFA-Token": "mfa-token-123",
+        },
     )
 
     assert response.status_code == 401
@@ -223,7 +244,10 @@ def test_store_secret_handles_kraken_errors(secrets_client: TestClient) -> None:
     response_http = secrets_client.post(
         "/secrets/kraken",
         json={"account_id": "acct", "api_key": "key", "api_secret": "secret"},
-        headers={"Authorization": "Bearer service-token-123"},
+        headers={
+            "Authorization": "Bearer service-token-123",
+            "X-MFA-Token": "mfa-token-123",
+        },
     )
 
     assert response_http.status_code == 502
