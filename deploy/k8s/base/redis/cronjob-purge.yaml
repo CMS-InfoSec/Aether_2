@@ -1,0 +1,51 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: redis-purge-idle-keys
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/component: cache
+spec:
+  schedule: "30 3 * * *"
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: redis-purge
+              image: redis:7.2-alpine
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -euo pipefail
+                  HOST="${REDIS_HOST:-redis}"
+                  PORT="${REDIS_PORT:-6379}"
+                  MAX_IDLE="${REDIS_MAX_IDLE_SECONDS:-2592000}"
+                  deleted=0
+                  for key in $(redis-cli -h "$HOST" -p "$PORT" --scan); do
+                    idle=$(redis-cli -h "$HOST" -p "$PORT" --raw OBJECT IDLETIME "$key" 2>/dev/null || echo 0)
+                    if [ "$idle" -ge "$MAX_IDLE" ]; then
+                      if redis-cli -h "$HOST" -p "$PORT" UNLINK "$key" >/dev/null 2>&1; then
+                        deleted=$((deleted + 1))
+                      fi
+                    fi
+                  done
+                  echo "Purged $deleted idle keys (threshold ${MAX_IDLE}s)"
+              env:
+                - name: REDIS_HOST
+                  value: redis
+                - name: REDIS_PORT
+                  value: "6379"
+                - name: REDIS_MAX_IDLE_SECONDS
+                  value: "2592000"
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 200m
+                  memory: 128Mi

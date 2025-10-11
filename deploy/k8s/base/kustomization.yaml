@@ -8,7 +8,12 @@ resources:
   - kafka
   - nats
   - fastapi
+  - secrets/clusterissuer.yaml
+  - secrets/tls-certificates.yaml
+  - secrets/cert-manager-renewal-cronjob.yaml
   - secrets/external-secrets.yaml
+  - secrets/fastapi-credentials-external-secret.yaml
+  - secrets/fastapi-secrets-external-secret.yaml
   - ingress
   - networkpolicies
   - aether-services
