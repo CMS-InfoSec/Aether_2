@@ -162,16 +162,18 @@ except ImportError as _ARGON2_IMPORT_ERROR:  # pragma: no cover - fallback when 
         def __init__(self, delegate: _FallbackPasswordHasher | None = None, **kwargs: object) -> None:
             del kwargs
             self._delegate = delegate or _FallbackPasswordHasher()
+            # Surface the same prefix/iteration metadata as the PBKDF2 delegate
+            # so callers can introspect the fallback exactly like the real
+            # argon2 password hasher.
+            self.hash_prefix = getattr(self._delegate, "hash_prefix", "$argon2-stub$")
+            self._iterations = getattr(self._delegate, "_iterations", 0)
 
         def hash(self, password: str) -> str:
             delegate_hash = getattr(self._delegate, "hash", None)
             if callable(delegate_hash):
                 try:
                     result = delegate_hash(password)
-                    prefix = getattr(self._delegate, "hash_prefix", None)
-                    if isinstance(result, str) and result and (
-                        not isinstance(prefix, str) or not result.startswith(prefix)
-                    ):
+                    if isinstance(result, str) and result:
                         return result
                 except Exception:  # pragma: no cover - delegate may reject hashing
                     pass
