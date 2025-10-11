@@ -37,14 +37,17 @@ import services.common.config as config
 def _clear_config_cache():
     config.get_timescale_session.cache_clear()
     config.get_redis_client.cache_clear()
+    config._clear_timescale_schema_registry()
     try:
         yield
     finally:
         config.get_timescale_session.cache_clear()
         config.get_redis_client.cache_clear()
+        config._clear_timescale_schema_registry()
 
 
 def test_get_timescale_session_requires_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "_allow_test_fallbacks", lambda: False)
     monkeypatch.delenv("TIMESCALE_DSN", raising=False)
     monkeypatch.delenv("AETHER_COMPANY_TIMESCALE_DSN", raising=False)
 
@@ -55,6 +58,7 @@ def test_get_timescale_session_requires_config(monkeypatch: pytest.MonkeyPatch) 
 def test_get_redis_client_requires_explicit_configuration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(config, "_allow_test_fallbacks", lambda: False)
     monkeypatch.delenv("AETHER_COMPANY_REDIS_DSN", raising=False)
 
     with pytest.raises(RuntimeError, match="Redis DSN is not configured"):
@@ -64,6 +68,7 @@ def test_get_redis_client_requires_explicit_configuration(
 def test_get_redis_client_rejects_blank_configuration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(config, "_allow_test_fallbacks", lambda: False)
     monkeypatch.setenv("AETHER_COMPANY_REDIS_DSN", "   ")
 
     with pytest.raises(RuntimeError, match="is set but empty"):
@@ -175,3 +180,23 @@ def test_get_timescale_session_rejects_overlong_override(monkeypatch: pytest.Mon
 
     with pytest.raises(RuntimeError, match="63 characters or fewer"):
         config.get_timescale_session("company")
+
+
+def test_get_timescale_session_detects_schema_collisions(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TIMESCALE_DSN", "postgresql://user:pass@host:5432/db")
+
+    primary = config.get_timescale_session("director-1")
+    assert primary.account_schema == "acct_director_1"
+
+    with pytest.raises(RuntimeError, match="schema 'acct_director_1'"):
+        config.get_timescale_session("director_1")
+
+
+def test_get_timescale_session_allows_repeat_registration(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TIMESCALE_DSN", "postgresql://user:pass@host:5432/db")
+
+    first = config.get_timescale_session("Company")
+    second = config.get_timescale_session("company")
+
+    assert first.account_schema == "acct_company"
+    assert second.account_schema == "acct_company"

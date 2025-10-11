@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import sys
+import threading
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -53,6 +54,8 @@ class KrakenCredentials:
 
 _SECRET_PATH_REGISTRY: Dict[str, Path] = {}
 _SECRET_PATH_USAGE: Dict[Path, str] = {}
+_TIMESCALE_SCHEMA_REGISTRY: Dict[str, str] = {}
+_TIMESCALE_SCHEMA_LOCK = threading.RLock()
 
 
 def _env(account_id: str, suffix: str, default: str) -> str:
@@ -239,7 +242,8 @@ def get_timescale_session(account_id: str) -> TimescaleSession:
             prefix_if_missing="acct_",
             allow_leading_digit_prefix=True,
         )
-    return TimescaleSession(dsn=dsn, account_schema=schema)
+    registered_schema = _register_timescale_schema(account_id, schema)
+    return TimescaleSession(dsn=dsn, account_schema=registered_schema)
 
 
 def _register_secret_path(account_id: str, path: Path) -> Path:
@@ -318,3 +322,32 @@ __all__ = [
     "get_timescale_session",
     "get_kraken_credentials",
 ]
+
+
+def _normalize_account_id(account_id: str) -> str:
+    return account_id.strip().lower()
+
+
+def _register_timescale_schema(account_id: str, schema: str) -> str:
+    """Ensure account-specific Timescale schemas remain unique."""
+
+    normalized_account = _normalize_account_id(account_id)
+    sanitized_schema = schema.strip()
+    if not sanitized_schema:
+        raise RuntimeError("Timescale schema cannot be empty once configured")
+
+    with _TIMESCALE_SCHEMA_LOCK:
+        existing = _TIMESCALE_SCHEMA_REGISTRY.get(sanitized_schema)
+        if existing is not None and existing != normalized_account:
+            raise RuntimeError(
+                "Timescale schema conflict detected between accounts "
+                f"'{existing}' and '{normalized_account}' for schema '{sanitized_schema}'."
+            )
+        _TIMESCALE_SCHEMA_REGISTRY[sanitized_schema] = normalized_account
+    return sanitized_schema
+
+
+def _clear_timescale_schema_registry() -> None:
+    with _TIMESCALE_SCHEMA_LOCK:
+        _TIMESCALE_SCHEMA_REGISTRY.clear()
+

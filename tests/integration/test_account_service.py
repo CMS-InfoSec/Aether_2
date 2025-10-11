@@ -74,6 +74,61 @@ def client(account_module, admin_user):
     app.dependency_overrides.clear()
 
 
+def test_director_can_create_account(account_module, client, monkeypatch):
+    def _director_user() -> account_module.CurrentUser:  # type: ignore[name-defined]
+        return account_module.CurrentUser(  # type: ignore[attr-defined]
+            user_id=uuid4(),
+            role=account_module.Role.DIRECTOR,
+            account_ids=set(),
+        )
+
+    client.app.dependency_overrides[account_module.get_current_user] = _director_user
+    monkeypatch.setattr(account_module, "sync_account_secret", lambda *args, **kwargs: None)
+    monkeypatch.setattr(account_module, "test_kraken_connection", lambda *args, **kwargs: None)
+
+    response = client.post(
+        "/accounts/create",
+        json={
+            "name": "Director Ops",
+            "owner_user_id": str(uuid4()),
+            "base_currency": "USD",
+            "sim_mode": False,
+            "hedge_auto": True,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["name"] == "Director Ops"
+
+
+def test_auditor_cannot_create_account(account_module, client, monkeypatch):
+    def _auditor_user() -> account_module.CurrentUser:  # type: ignore[name-defined]
+        return account_module.CurrentUser(  # type: ignore[attr-defined]
+            user_id=uuid4(),
+            role="auditor",
+            account_ids=set(),
+        )
+
+    client.app.dependency_overrides[account_module.get_current_user] = _auditor_user
+    monkeypatch.setattr(account_module, "sync_account_secret", lambda *args, **kwargs: None)
+    monkeypatch.setattr(account_module, "test_kraken_connection", lambda *args, **kwargs: None)
+
+    response = client.post(
+        "/accounts/create",
+        json={
+            "name": "Read Only",
+            "owner_user_id": str(uuid4()),
+            "base_currency": "USD",
+            "sim_mode": False,
+            "hedge_auto": True,
+        },
+    )
+
+    assert response.status_code == 403
+    assert "Only admin or director roles" in response.json()["detail"]
+
+
 def _create_account(client: TestClient, *, owner: UUID | None = None, with_keys: bool = False):
     owner_id = owner or uuid4()
     payload = {
@@ -90,7 +145,11 @@ def _create_account(client: TestClient, *, owner: UUID | None = None, with_keys:
         })
     response = client.post("/accounts/create", json=payload)
     assert response.status_code == 200
-    return response.json()
+    data = response.json()
+    account_identifier = data.get("account_id")
+    if isinstance(account_identifier, UUID):
+        data["account_id"] = str(account_identifier)
+    return data
 
 
 def test_create_account_with_api_keys(account_module, client, monkeypatch):
