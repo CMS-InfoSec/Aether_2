@@ -8,10 +8,8 @@ import importlib
 import json
 import logging
 import os
-import sys
 from collections import deque
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple
 
 
@@ -56,8 +54,8 @@ if not _SQLALCHEMY_AVAILABLE:
     Column = DateTime = Float = String = Text = None  # type: ignore[assignment]
     Engine = Any  # type: ignore[assignment]
 
-    def create_engine(*_: object, **__: object) -> "_InMemoryEngine":  # type: ignore[override]
-        return _InMemoryEngine(url="memory://feature-jobs")
+    def create_engine(*_: object, **__: object) -> Engine:  # type: ignore[override]
+        raise MissingDependencyError("SQLAlchemy is required for feature job persistence")
 
     def pg_insert(*_: object, **__: object) -> None:  # type: ignore[override]
         raise MissingDependencyError("SQLAlchemy is required for feature job persistence")
@@ -70,18 +68,6 @@ from services.ingest import EventOrderingBuffer, OrderedEvent
 LOGGER = logging.getLogger(__name__)
 
 _SQLITE_FALLBACK_FLAG = "FEATURE_JOBS_ALLOW_SQLITE_FOR_TESTS"
-_INSECURE_DEFAULTS_FLAG = "FEATURE_JOBS_ALLOW_INSECURE_DEFAULTS"
-_STATE_DIR_ENV = "AETHER_STATE_DIR"
-
-
-def _state_root() -> Path:
-    root = Path(os.getenv(_STATE_DIR_ENV, ".aether_state")) / "feature_jobs"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
-
-
-def _insecure_defaults_enabled() -> bool:
-    return os.getenv(_INSECURE_DEFAULTS_FLAG) == "1"
 
 
 def _resolve_database_url() -> str:
@@ -89,17 +75,11 @@ def _resolve_database_url() -> str:
 
     raw_url = os.getenv("DATABASE_URL", "")
     if not raw_url.strip():
-        if _insecure_defaults_enabled():
-            state_path = _state_root() / "feature_jobs.sqlite"
-            LOGGER.warning(
-                "DATABASE_URL missing; using insecure local sqlite fallback at %s", state_path
-            )
-            return f"sqlite+pysqlite:///{state_path}"
         raise RuntimeError(
             "Feature jobs ingestion requires DATABASE_URL to be set to a PostgreSQL/Timescale DSN."
         )
 
-    allow_sqlite = "pytest" in sys.modules or os.getenv(_SQLITE_FALLBACK_FLAG) == "1"
+    allow_sqlite = os.getenv(_SQLITE_FALLBACK_FLAG) == "1"
     database_url = normalize_sqlalchemy_dsn(
         raw_url.strip(),
         allow_sqlite=allow_sqlite,
@@ -246,90 +226,29 @@ else:
     late_events_table = None
 
 
-@dataclass
-class _InMemoryFeatureStorage:
-    offline: Dict[Tuple[str, dt.datetime], Mapping[str, Any]] = field(default_factory=dict)
-    created_at: Dict[Tuple[str, dt.datetime], dt.datetime] = field(default_factory=dict)
-    late_events: Dict[Tuple[str, str, dt.datetime, dt.datetime], Dict[str, Any]] = field(
-        default_factory=dict
-    )
-
-    def upsert_feature(
-        self,
-        *,
-        symbol: str,
-        event_ts: dt.datetime,
-        created_at: dt.datetime,
-        features: Mapping[str, float],
-    ) -> None:
-        key = (symbol, event_ts)
-        self.offline[key] = {
-            "symbol": symbol,
-            "event_timestamp": event_ts,
-            "created_at": created_at,
-            **features,
-        }
-        self.created_at[key] = created_at
-
-    def list_features(self) -> List[Mapping[str, Any]]:
-        return list(self.offline.values())
-
-    def record_late_event(
-        self,
-        *,
-        stream: str,
-        symbol: str,
-        event_ts: dt.datetime,
-        arrival_ts: dt.datetime,
-        payload: str,
-    ) -> None:
-        key = (stream, symbol, event_ts, arrival_ts)
-        self.late_events[key] = {
-            "stream": stream,
-            "symbol": symbol,
-            "event_timestamp": event_ts,
-            "arrival_timestamp": arrival_ts,
-            "payload": payload,
-        }
-
-    def list_late_events(self) -> List[Mapping[str, Any]]:
-        return list(self.late_events.values())
-
-
-@dataclass
-class _InMemoryEngine:
-    url: str
-    storage: _InMemoryFeatureStorage = field(default_factory=_InMemoryFeatureStorage)
-
-    def begin(self) -> "_InMemoryConnection":
-        return _InMemoryConnection(self.storage)
-
-
-class _InMemoryConnection:
-    def __init__(self, storage: _InMemoryFeatureStorage) -> None:
-        self._storage = storage
-
-    def __enter__(self) -> "_InMemoryConnection":
-        return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: Any,
-    ) -> bool:
-        return False
-
-    def execute(self, *_: object, **__: object) -> None:
-        raise MissingDependencyError("SQLAlchemy is required for feature job persistence")
-
-
 def _json_default(value: Any) -> Any:
     if isinstance(value, dt.datetime):
         return value.isoformat()
     if isinstance(value, dt.date):
         return value.isoformat()
     return value
+
+
+def _is_spot_usd_symbol(symbol: str) -> bool:
+    """Return ``True`` when ``symbol`` represents a supported USD spot market."""
+
+    normalised = symbol.upper().strip()
+    if normalised.count("/") != 1:
+        return False
+    base, quote = normalised.split("/")
+    if quote != "USD" or not base:
+        return False
+    disallowed_markers = ("PERP", "FUT", "SWAP", "FWD", "MARGIN", "TEST")
+    if any(marker in normalised for marker in disallowed_markers):
+        return False
+    if any(char in normalised for char in (" ", ":", ".")):
+        return False
+    return True
 
 
 class FeatureWriter:
@@ -341,33 +260,19 @@ class FeatureWriter:
         engine: Engine,
         store: FeatureStore | None,
         feature_view: str,
-        state_dir: Optional[Path] = None,
     ) -> None:
+        if (
+            not _SQLALCHEMY_AVAILABLE
+            or microstructure_table is None
+            or late_events_table is None
+        ):
+            raise MissingDependencyError(
+                "SQLAlchemy is required for feature job persistence"
+            ) from _SQLALCHEMY_IMPORT_ERROR
         self.engine = engine
         self.store = store
         self.feature_view = feature_view
-        self._state_dir = state_dir
-        self._memory_storage: _InMemoryFeatureStorage | None = None
-        self._offline_supported = bool(
-            _SQLALCHEMY_AVAILABLE
-            and microstructure_table is not None
-            and late_events_table is not None
-            and hasattr(engine, "begin")
-            and not isinstance(engine, _InMemoryEngine)
-            and not _insecure_defaults_enabled()
-        )
-        if self._offline_supported:
-            metadata.create_all(
-                engine, tables=[microstructure_table, late_events_table]
-            )
-        else:
-            if isinstance(engine, _InMemoryEngine):
-                self._memory_storage = engine.storage
-            else:
-                self._memory_storage = _InMemoryFeatureStorage()
-                # ensure a consistent engine attribute for callers expecting one.
-                self.engine = _InMemoryEngine(url=getattr(engine, "url", "memory://feature-jobs"))
-                self.engine.storage = self._memory_storage
+        metadata.create_all(engine, tables=[microstructure_table, late_events_table])
 
     def persist(
         self, *, symbol: str, event_ts: dt.datetime, feature_payload: Mapping[str, float]
@@ -391,17 +296,6 @@ class FeatureWriter:
         created_at: dt.datetime,
         features: Mapping[str, float],
     ) -> None:
-        if not self._offline_supported or microstructure_table is None:
-            if self._memory_storage is None:
-                self._memory_storage = _InMemoryFeatureStorage()
-            self._memory_storage.upsert_feature(
-                symbol=symbol,
-                event_ts=event_ts,
-                created_at=created_at,
-                features=features,
-            )
-            self._persist_memory_snapshot()
-            return
         stmt = pg_insert(microstructure_table).values(
             symbol=symbol,
             event_timestamp=event_ts,
@@ -452,18 +346,6 @@ class FeatureWriter:
         payload_copy["lateness_ms"] = event.lateness_ms
         payload_copy["stream"] = stream
         serialised = json.dumps(payload_copy, default=_json_default)
-        if not self._offline_supported or late_events_table is None:
-            if self._memory_storage is None:
-                self._memory_storage = _InMemoryFeatureStorage()
-            self._memory_storage.record_late_event(
-                stream=stream,
-                symbol=symbol,
-                event_ts=event.event_ts,
-                arrival_ts=event.arrival_ts,
-                payload=serialised,
-            )
-            self._persist_late_events_snapshot()
-            return
         stmt = pg_insert(late_events_table).values(
             stream=stream,
             symbol=symbol,
@@ -474,28 +356,6 @@ class FeatureWriter:
         stmt = stmt.on_conflict_do_nothing()
         with self.engine.begin() as connection:
             connection.execute(stmt)
-
-    @property
-    def memory_storage(self) -> _InMemoryFeatureStorage | None:
-        return self._memory_storage
-
-    def _persist_memory_snapshot(self) -> None:
-        if not (_insecure_defaults_enabled() and self._state_dir and self._memory_storage):
-            return
-        snapshot = {
-            "features": self._memory_storage.list_features(),
-        }
-        path = self._state_dir / "offline_features.json"
-        path.write_text(json.dumps(snapshot, default=_json_default, indent=2), encoding="utf-8")
-
-    def _persist_late_events_snapshot(self) -> None:
-        if not (_insecure_defaults_enabled() and self._state_dir and self._memory_storage):
-            return
-        payload = {
-            "late_events": self._memory_storage.list_late_events(),
-        }
-        path = self._state_dir / "late_events.json"
-        path.write_text(json.dumps(payload, default=_json_default, indent=2), encoding="utf-8")
 
 
 class MarketFeatureJob:
@@ -520,8 +380,6 @@ class MarketFeatureJob:
         self.window = dt.timedelta(seconds=window_seconds)
         self.book_levels = book_levels
         self.state: MutableMapping[str, FeatureState] = {}
-        self._state_dir = _state_root()
-        self._events_path = self._state_dir / "events.jsonl"
         self.engine = engine or create_engine(DATABASE_URL)
         self.max_lateness_ms = max_lateness_ms
         self.store = (
@@ -533,11 +391,7 @@ class MarketFeatureJob:
             engine=self.engine,
             store=self.store,
             feature_view=self.feature_view,
-            state_dir=self._state_dir,
         )
-        # Normalise the engine reference in case the writer swapped to an in-memory
-        # backend because SQLAlchemy was unavailable.
-        self.engine = self.writer.engine
         self.service_name = "feature_jobs"
         self.trade_ordering = EventOrderingBuffer(
             stream_name="md.trades",
@@ -565,75 +419,15 @@ class MarketFeatureJob:
     def _timestamp_from_payload(self, payload: Mapping[str, Any]) -> dt.datetime:
         return self._parse_timestamp(payload.get("event_ts") or payload.get("timestamp"))
 
-    def _process_local_events(self) -> None:
-        events = self._load_local_events()
-        for payload in events:
-            stream = str(payload.get("stream") or payload.get("type") or "md.trades")
-            event_ts = self._timestamp_from_payload(payload)
-            ordered = OrderedEvent(
-                stream=stream,
-                payload=payload,
-                event_ts=event_ts,
-                arrival_ts=event_ts,
-                key=str(payload.get("symbol", "")).upper() or None,
-                lateness_ms=0,
-                is_late=False,
-            )
-            if stream == "md.book" or payload.get("type") == "book":
-                self.process_book(ordered)
-            else:
-                self.process_trade(ordered)
-        self._flush_ordering_buffers()
-
-    def _load_local_events(self) -> List[Mapping[str, Any]]:
-        events: List[Mapping[str, Any]] = []
-        if self._events_path.exists():
-            for line in self._events_path.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                try:
-                    events.append(json.loads(line))
-                except json.JSONDecodeError:
-                    LOGGER.warning("Skipping malformed local event line")
-        if events:
-            return events
-        events = self._generate_synthetic_events()
-        self._persist_local_events(events)
-        return events
-
-    def _persist_local_events(self, events: Iterable[Mapping[str, Any]]) -> None:
-        lines = [json.dumps(event, default=_json_default) for event in events]
-        self._events_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
-
-    def _generate_synthetic_events(self) -> List[Mapping[str, Any]]:
-        now = dt.datetime.now(tz=dt.timezone.utc)
-        events: List[Mapping[str, Any]] = []
-        price = 20_000.0
-        for offset in range(10):
-            ts = now - dt.timedelta(minutes=10 - offset)
-            price += 25.0
-            trade = {
-                "stream": "md.trades",
-                "type": "trade",
-                "symbol": "BTC/USD",
-                "price": price,
-                "quantity": 0.1 + offset * 0.01,
-                "event_ts": ts.isoformat(),
-            }
-            book = {
-                "stream": "md.book",
-                "type": "book",
-                "symbol": "BTC/USD",
-                "bids": [[price - 30.0, 1.0 + offset * 0.05]],
-                "asks": [[price + 30.0, 0.9 + offset * 0.05]],
-                "event_ts": ts.isoformat(),
-            }
-            events.extend([trade, book])
-        return events
 
     def process_trade(self, event: OrderedEvent) -> None:
         payload = event.payload
         symbol = str(payload["symbol"]).upper()
+        if not _is_spot_usd_symbol(symbol):
+            LOGGER.debug(
+                "Skipping non-USD or derivative trade event", extra={"symbol": symbol}
+            )
+            return
         price = float(payload["price"])
         quantity = float(payload.get("quantity", payload.get("size", 0.0)))
         timestamp = event.event_ts
@@ -646,6 +440,12 @@ class MarketFeatureJob:
     def process_book(self, event: OrderedEvent) -> None:
         payload = event.payload
         symbol = str(payload["symbol"]).upper()
+        if not _is_spot_usd_symbol(symbol):
+            LOGGER.debug(
+                "Skipping non-USD or derivative order book event",
+                extra={"symbol": symbol},
+            )
+            return
         timestamp = event.event_ts
         bids = self._parse_levels(payload.get("bids", []))
         asks = self._parse_levels(payload.get("asks", []))
@@ -663,6 +463,12 @@ class MarketFeatureJob:
 
     def _record_late_event(self, event: OrderedEvent) -> None:
         payload_symbol = str(event.payload.get("symbol", "UNKNOWN")).upper()
+        if not _is_spot_usd_symbol(payload_symbol):
+            LOGGER.debug(
+                "Ignoring late event for unsupported symbol",
+                extra={"symbol": payload_symbol},
+            )
+            return
         LOGGER.warning(
             "Late event routed to compensating path",
             extra={
@@ -683,14 +489,7 @@ class MarketFeatureJob:
 
     async def run(self) -> None:
         if AIOKafkaConsumer is None:
-            if not _insecure_defaults_enabled():
-                raise RuntimeError("aiokafka is required to run the streaming feature job")
-            LOGGER.warning(
-                "aiokafka missing; replaying local feature events from %s",
-                self._events_path,
-            )
-            self._process_local_events()
-            return
+            raise RuntimeError("aiokafka is required to run the streaming feature job")
         consumer = AIOKafkaConsumer(
             "md.trades",
             "md.book",

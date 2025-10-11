@@ -18,6 +18,9 @@ from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, 
 
 from uuid import UUID, uuid4
 
+LOGGER = logging.getLogger(__name__)
+LOGGER.addHandler(logging.NullHandler())
+
 _PANDAS_ERROR = "pandas is required for CoinGecko data loading functionality"
 _REQUESTS_ERROR = "requests is required for CoinGecko data downloads"
 _SQLALCHEMY_ERROR = "sqlalchemy is required for CoinGecko persistence"
@@ -124,8 +127,6 @@ def _require_gx():
         raise MissingDependencyError(_GX_ERROR)
     return _GX_MODULE
 
-
-LOGGER = logging.getLogger(__name__)
 
 COINGECKO_API = "https://api.coingecko.com/api/v3"
 GRANULARITY_TO_PANDAS = {

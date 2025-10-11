@@ -24,8 +24,6 @@ from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from ml.insecure_defaults import insecure_defaults_enabled
-
 try:  # pragma: no cover - SQLAlchemy is optional in lightweight environments.
     from sqlalchemy import text
     from sqlalchemy.engine import Engine
@@ -56,36 +54,12 @@ class MissingDependencyError(RuntimeError):
     """Raised when optional ML training dependencies are unavailable."""
 
 
-class _NumpyFallback:
-    inf = float("inf")
-    nan = float("nan")
-
-    class _ErrState:
-        def __enter__(self) -> None:  # pragma: no cover - trivial
-            return None
-
-        def __exit__(self, exc_type, exc, tb) -> bool:  # pragma: no cover - trivial
-            return False
-
-    def errstate(self, **kwargs: Any) -> "_NumpyFallback._ErrState":
-        return self._ErrState()
-
-    @staticmethod
-    def concatenate(arrays: Sequence[Sequence[Any]]) -> List[Any]:
-        result: List[Any] = []
-        for array in arrays:
-            result.extend(list(array))
-        return result
-
-
 @lru_cache(maxsize=1)
 def _require_numpy():
     try:
         import numpy as numpy_module  # type: ignore import-not-found
     except ModuleNotFoundError as exc:  # pragma: no cover - exercised via tests
-        if not insecure_defaults_enabled():
-            raise MissingDependencyError("numpy is required for the ML training workflow") from exc
-        numpy_module = _NumpyFallback()
+        raise MissingDependencyError("numpy is required for the ML training workflow") from exc
     return numpy_module
 
 

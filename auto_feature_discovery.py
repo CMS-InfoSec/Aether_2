@@ -58,7 +58,6 @@ except Exception:  # pragma: no cover - executed when psycopg is unavailable.
 
 LOGGER = logging.getLogger(__name__)
 
-from ml.insecure_defaults import insecure_defaults_enabled, state_dir, state_file
 
 
 class MissingDependencyError(RuntimeError):
@@ -202,105 +201,27 @@ class FeatureDiscoveryEngine:
             conn.commit()
 
 
-class LocalFeatureDiscoveryEngine:
-    """Synthetic fallback used when dependencies are missing under insecure defaults."""
-
-    def __init__(self, config: FeatureDiscoveryConfig, missing: Sequence[str]) -> None:
-        self.config = config
-        self._missing = tuple(missing)
-        self._state_dir = state_dir("feature_discovery")
-        self.log_file = state_file("feature_discovery", "cycles.jsonl")
-
-    def run_once(self) -> None:
-        now = datetime.now(timezone.utc)
-        base_name = self.config.feature_prefix or "auto_feature"
-        candidates = [
-            {
-                "feature": f"{base_name}_momentum",
-                "score": 0.5,
-                "promoted": True,
-            },
-            {
-                "feature": f"{base_name}_volatility",
-                "score": 0.3,
-                "promoted": False,
-            },
-        ]
-        record = {
-            "ts": now.isoformat(),
-            "missing_dependencies": list(self._missing),
-            "candidates": candidates,
-        }
-        with self.log_file.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record) + "\n")
-        LOGGER.info(
-            "Recorded synthetic feature discovery cycle using insecure-default fallback (missing: %s)",
-            ", ".join(self._missing) or "none",
-        )
-
-    def run_forever(self) -> None:
-        while True:
-            cycle_start = time.monotonic()
-            try:
-                self.run_once()
-            except Exception:  # pragma: no cover - defensive logging
-                LOGGER.exception("Local feature discovery cycle failed")
-            elapsed = timedelta(seconds=time.monotonic() - cycle_start)
-            sleep_for = max(self.config.scan_interval - elapsed, timedelta())
-            if sleep_for > timedelta():
-                time.sleep(sleep_for.total_seconds())
-
-
-def _missing_dependencies() -> List[str]:
-    missing: List[str] = []
-    if np is None:
-        missing.append("numpy")
-    if pd is None:
-        missing.append("pandas")
-    if lgb is None:
-        missing.append("lightgbm")
-    if psycopg is None or dict_row is None:
-        missing.append("psycopg")
-    return missing
-
-
-_MISSING_MESSAGES = {
-    "numpy": "numpy is required for auto feature discovery but is not installed.",
-    "pandas": "pandas is required for auto feature discovery but is not installed.",
-    "lightgbm": "LightGBM is required for auto feature discovery but is not installed.",
-    "psycopg": "psycopg is required for auto feature discovery but is not installed.",
-}
-
-
-def create_feature_discovery_engine(config: FeatureDiscoveryConfig) -> FeatureDiscoveryEngine | LocalFeatureDiscoveryEngine:
-    """Return a discovery engine appropriate for the current dependency set."""
-
-    missing = _missing_dependencies()
-    if not missing:
-        return FeatureDiscoveryEngine(config)
-
-    if insecure_defaults_enabled():
-        LOGGER.warning(
-            "Feature discovery dependencies missing (%s); using local fallback.",
-            ", ".join(missing),
-        )
-        return LocalFeatureDiscoveryEngine(config, missing)
-
-    message = _MISSING_MESSAGES.get(missing[0], f"{missing[0]} is required for auto feature discovery")
-    raise MissingDependencyError(message)
-
     def _load_market_data(self) -> pd.DataFrame:
         """Fetch OHLCV and order book snapshots for the configured lookback window."""
 
         start_ts = datetime.now(timezone.utc) - self.config.lookback
         end_ts = datetime.now(timezone.utc)
         with self._connect() as conn:
+            usd_filter = f"""
+                AND {self.config.symbol_column} LIKE %(usd_pattern)s
+                AND POSITION('/' IN {self.config.symbol_column}) > 0
+                AND {self.config.symbol_column} NOT ILIKE '%%PERP%%'
+                AND {self.config.symbol_column} NOT ILIKE '%%FUT%%'
+                AND {self.config.symbol_column} NOT ILIKE '%%SWAP%%'
+                AND {self.config.symbol_column} NOT ILIKE '%%TEST%%'
+            """
             ohlcv_sql = f"""
                 SELECT {self.config.symbol_column} AS symbol,
                        {self.config.timestamp_column} AS event_ts,
                        open, high, low, close, volume
                 FROM {self.config.ohlcv_table}
                 WHERE {self.config.timestamp_column} BETWEEN %(start)s AND %(end)s
+                {usd_filter}
                 ORDER BY event_ts
             """
             order_sql = f"""
@@ -309,9 +230,10 @@ def create_feature_discovery_engine(config: FeatureDiscoveryConfig) -> FeatureDi
                        best_bid, best_ask, bid_volume, ask_volume
                 FROM {self.config.order_book_table}
                 WHERE {self.config.timestamp_column} BETWEEN %(start)s AND %(end)s
+                {usd_filter}
                 ORDER BY event_ts
             """
-            params = {"start": start_ts, "end": end_ts}
+            params = {"start": start_ts, "end": end_ts, "usd_pattern": "%/USD"}
             ohlcv = pd.read_sql(ohlcv_sql, conn, params=params)
             try:
                 order_book = pd.read_sql(order_sql, conn, params=params)
@@ -636,55 +558,6 @@ def create_feature_discovery_engine(config: FeatureDiscoveryConfig) -> FeatureDi
             conn.commit()
 
 
-class LocalFeatureDiscoveryEngine:
-    """Synthetic fallback used when dependencies are missing under insecure defaults."""
-
-    def __init__(self, config: FeatureDiscoveryConfig, missing: Sequence[str]) -> None:
-        self.config = config
-        self._missing = tuple(missing)
-        self._state_dir = state_dir("feature_discovery")
-        self.log_file = state_file("feature_discovery", "cycles.jsonl")
-
-    def run_once(self) -> None:
-        now = datetime.now(timezone.utc)
-        base_name = self.config.feature_prefix or "auto_feature"
-        candidates = [
-            {
-                "feature": f"{base_name}_momentum",
-                "score": 0.5,
-                "promoted": True,
-            },
-            {
-                "feature": f"{base_name}_volatility",
-                "score": 0.3,
-                "promoted": False,
-            },
-        ]
-        record = {
-            "ts": now.isoformat(),
-            "missing_dependencies": list(self._missing),
-            "candidates": candidates,
-        }
-        with self.log_file.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record) + "\n")
-        LOGGER.info(
-            "Recorded synthetic feature discovery cycle using insecure-default fallback (missing: %s)",
-            ", ".join(self._missing) or "none",
-        )
-
-    def run_forever(self) -> None:
-        while True:
-            cycle_start = time.monotonic()
-            try:
-                self.run_once()
-            except Exception:  # pragma: no cover - defensive logging
-                LOGGER.exception("Local feature discovery cycle failed")
-            elapsed = timedelta(seconds=time.monotonic() - cycle_start)
-            sleep_for = max(self.config.scan_interval - elapsed, timedelta())
-            if sleep_for > timedelta():
-                time.sleep(sleep_for.total_seconds())
-
-
 def _missing_dependencies() -> List[str]:
     missing: List[str] = []
     if np is None:
@@ -706,22 +579,17 @@ _MISSING_MESSAGES = {
 }
 
 
-def create_feature_discovery_engine(config: FeatureDiscoveryConfig) -> FeatureDiscoveryEngine | LocalFeatureDiscoveryEngine:
-    """Return a discovery engine appropriate for the current dependency set."""
+    
+def create_feature_discovery_engine(config: FeatureDiscoveryConfig) -> FeatureDiscoveryEngine:
+    """Return a discovery engine, raising if required dependencies are missing."""
 
     missing = _missing_dependencies()
-    if not missing:
-        return FeatureDiscoveryEngine(config)
-
-    if insecure_defaults_enabled():
-        LOGGER.warning(
-            "Feature discovery dependencies missing (%s); using local fallback.",
-            ", ".join(missing),
+    if missing:
+        message = _MISSING_MESSAGES.get(
+            missing[0], f"{missing[0]} is required for auto feature discovery"
         )
-        return LocalFeatureDiscoveryEngine(config, missing)
-
-    message = _MISSING_MESSAGES.get(missing[0], f"{missing[0]} is required for auto feature discovery")
-    raise MissingDependencyError(message)
+        raise MissingDependencyError(message)
+    return FeatureDiscoveryEngine(config)
 
 
 
