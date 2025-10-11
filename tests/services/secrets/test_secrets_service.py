@@ -13,7 +13,7 @@ from services.common import security
 from services.secrets import secrets_service
 
 
-MFA_HEADERS = {"X-MFA-Context": "verified"}
+MFA_HEADERS = {"X-MFA-Token": "verified"}
 
 
 @pytest.fixture()

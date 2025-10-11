@@ -17,7 +17,7 @@ def test_upsert_rejects_mismatched_account(client: TestClient) -> None:
     response = client.post(
         "/secrets/kraken",
         json={"account_id": "company", "api_key": "a", "api_secret": "b"},
-        headers={"X-Account-ID": "director-1", "X-MFA-Context": "verified"},
+        headers={"X-Account-ID": "director-1", "X-MFA-Token": "verified"},
     )
 
     assert response.status_code == 403
@@ -28,7 +28,7 @@ def test_status_returns_not_found_without_rotation(client: TestClient) -> None:
     response = client.get(
         "/secrets/kraken/status",
         params={"account_id": "company"},
-        headers={"X-Account-ID": "company", "X-MFA-Context": "verified"},
+        headers={"X-Account-ID": "company", "X-MFA-Token": "verified"},
     )
 
     assert response.status_code == 404
@@ -38,8 +38,8 @@ def test_mfa_context_must_be_verified(client: TestClient) -> None:
     response = client.post(
         "/secrets/kraken",
         json={"account_id": "company", "api_key": "a", "api_secret": "b"},
-        headers={"X-Account-ID": "company", "X-MFA-Context": "unverified"},
+        headers={"X-Account-ID": "company", "X-MFA-Token": "unverified"},
     )
 
-    assert response.status_code == 403
-    assert response.json()["detail"] == "MFA context is invalid or incomplete."
+    assert response.status_code == 401
+    assert response.json()["detail"] == "MFA token is invalid or incomplete."

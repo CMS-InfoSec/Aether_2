@@ -75,7 +75,11 @@ def test_require_mfa_context_uses_session_state() -> None:
     store = InMemorySessionStore()
     session = store.create("director-1")
     request = _build_request(store)
-    account = require_mfa_context(request, authorization=f"Bearer {session.token}")
+    account = require_mfa_context(
+        request,
+        authorization=f"Bearer {session.token}",
+        x_mfa_token="verified",
+    )
     assert account == "director-1"
 
 

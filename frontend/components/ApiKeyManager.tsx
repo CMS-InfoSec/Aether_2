@@ -64,7 +64,7 @@ const ApiKeyManager: React.FC = () => {
           method: "GET",
           headers: {
             Accept: "application/json",
-            "X-MFA-Context": mfaContext,
+            "X-MFA-Token": mfaContext,
             ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
           },
           signal,
@@ -118,7 +118,7 @@ const ApiKeyManager: React.FC = () => {
           method: "GET",
           headers: {
             Accept: "application/json",
-            "X-MFA-Context": mfaContext,
+            "X-MFA-Token": mfaContext,
             ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
           },
           signal,
@@ -227,7 +227,7 @@ const ApiKeyManager: React.FC = () => {
         headers: {
           "Content-Type": "application/json",
           Accept: "application/json",
-          "X-MFA-Context": mfaContext,
+          "X-MFA-Token": mfaContext,
           ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
         },
         body: JSON.stringify(payload),

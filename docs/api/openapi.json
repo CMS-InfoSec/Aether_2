@@ -247,7 +247,7 @@
         "summary": "Fetch the current Kraken credential rotation status for the caller.",
         "parameters": [
           {
-            "$ref": "#/components/parameters/MfaContext"
+            "$ref": "#/components/parameters/MfaToken"
           }
         ],
         "responses": {
@@ -281,7 +281,7 @@
         "summary": "Return the credential rotation audit trail for the authenticated account.",
         "parameters": [
           {
-            "$ref": "#/components/parameters/MfaContext"
+            "$ref": "#/components/parameters/MfaToken"
           }
         ],
         "responses": {
@@ -459,14 +459,14 @@
       }
     },
     "parameters": {
-      "MfaContext": {
-        "name": "X-MFA-Context",
+      "MfaToken": {
+        "name": "X-MFA-Token",
         "in": "header",
         "required": true,
         "schema": {
           "type": "string"
         },
-        "description": "MFA verification context token issued by the authentication service."
+        "description": "MFA verification token issued by the authentication service; must accompany bearer credentials."
       }
     },
     "securitySchemes": {
