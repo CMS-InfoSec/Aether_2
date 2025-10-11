@@ -311,6 +311,53 @@
           }
         ]
       }
+    },
+    "/secrets/rotate": {
+      "post": {
+        "operationId": "rotateSecrets",
+        "summary": "Rotate Kraken API credentials via the secrets microservice.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MfaContext"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SecretsRotateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Credentials rotated successfully.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretsRotateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Request payload failed validation."
+          },
+          "401": {
+            "description": "Authentication credentials were missing or invalid."
+          },
+          "403": {
+            "description": "Caller is not authorized to access Kraken credential data."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
     }
   },
   "components": {
@@ -368,13 +415,54 @@
           }
         },
         "additionalProperties": false
+      },
+      "SecretsRotateRequest": {
+        "type": "object",
+        "required": [
+          "api_key",
+          "api_secret"
+        ],
+        "properties": {
+          "api_key": {
+            "type": "string",
+            "minLength": 10,
+            "maxLength": 128,
+            "description": "Kraken API key issued by the exchange."
+          },
+          "api_secret": {
+            "type": "string",
+            "minLength": 20,
+            "maxLength": 512,
+            "description": "Kraken API secret associated with the API key."
+          }
+        },
+        "additionalProperties": false
+      },
+      "SecretsRotateResponse": {
+        "type": "object",
+        "required": [
+          "secret_name",
+          "last_rotated"
+        ],
+        "properties": {
+          "secret_name": {
+            "type": "string",
+            "description": "Kubernetes secret storing the encrypted credentials."
+          },
+          "last_rotated": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Timestamp describing when the credentials were rotated."
+          }
+        },
+        "additionalProperties": false
       }
     },
     "parameters": {
       "MfaContext": {
         "name": "X-MFA-Context",
         "in": "header",
-        "required": false,
+        "required": true,
         "schema": {
           "type": "string"
         },
