@@ -268,6 +268,9 @@ def _install_sqlalchemy_stub() -> None:
         def create_all(self, *args: object, **kwargs: object) -> None:  # pragma: no cover - noop
             return None
 
+        def drop_all(self, *args: object, **kwargs: object) -> None:  # pragma: no cover - noop
+            return None
+
     class _ExcludedAccessor:
         def __getattr__(self, name: str) -> str:
             return f"excluded.{name}"
@@ -356,6 +359,9 @@ def _install_sqlalchemy_stub() -> None:
             return self
 
         def where(self, *args: object, **kwargs: object) -> "_SelectStatement":
+            return self
+
+        def select_from(self, *args: object, **kwargs: object) -> "_SelectStatement":
             return self
 
         def group_by(self, *args: object, **kwargs: object) -> "_SelectStatement":
@@ -497,6 +503,7 @@ def _install_sqlalchemy_stub() -> None:
                         values = []
                     return SimpleNamespace(
                         scalars=lambda: _scalar_result(values),
+                        scalar_one=lambda: values[0] if values else None,
                         scalar_one_or_none=lambda: values[0] if values else None,
                     )
 
@@ -504,10 +511,15 @@ def _install_sqlalchemy_stub() -> None:
                     values = list(memory_runs)
                     return SimpleNamespace(
                         scalars=lambda: _scalar_result(values),
+                        scalar_one=lambda: values[0] if values else None,
                         scalar_one_or_none=lambda: values[0] if values else None,
                     )
 
-            return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: []))
+            return SimpleNamespace(
+                scalars=lambda: SimpleNamespace(all=lambda: []),
+                scalar_one=lambda: None,
+                scalar_one_or_none=lambda: None,
+            )
 
         def get(self, *args: object, **kwargs: object) -> None:
             return None
@@ -556,6 +568,7 @@ def _install_sqlalchemy_stub() -> None:
             return Session(bind=bind)
 
         _factory.bind = bind  # type: ignore[attr-defined]
+        _factory.close_all = lambda: None  # type: ignore[attr-defined]
         return _factory
 
     orm.Session = Session
@@ -573,7 +586,7 @@ def _install_sqlalchemy_stub() -> None:
             return cls
 
     class DeclarativeBase(metaclass=_BaseMeta):
-        metadata = SimpleNamespace(create_all=lambda *a, **k: None)
+        metadata = MetaData()
 
         def __init__(self, **kwargs: object) -> None:
             for key, value in kwargs.items():

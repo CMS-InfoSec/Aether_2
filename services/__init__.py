@@ -60,6 +60,10 @@ def _build_search_path() -> List[str]:
 _locations = _build_search_path()
 __path__ = _locations  # type: ignore[assignment]
 
+_THIS_MODULE: ModuleType | None = sys.modules.get(__name__)
+if not isinstance(_THIS_MODULE, ModuleType):
+    _THIS_MODULE = None
+
 spec: ModuleSpec | None = globals().get("__spec__")
 if spec is not None:
     spec.submodule_search_locations = list(_locations)
@@ -113,7 +117,16 @@ def __getattr__(name: str) -> ModuleType:
             replacement = _load_canonical_module(fullname)
             if replacement is not None:
                 module = replacement
-    setattr(sys.modules[__name__], name, module)
+    target: ModuleType | None = sys.modules.get(__name__)
+    if not isinstance(target, ModuleType):
+        target = _THIS_MODULE
+        if isinstance(target, ModuleType):
+            sys.modules[__name__] = target
+
+    if isinstance(target, ModuleType):
+        setattr(target, name, module)
+    else:  # pragma: no cover - defensive fallback for exotic loaders
+        globals()[name] = module
     return module
 
 

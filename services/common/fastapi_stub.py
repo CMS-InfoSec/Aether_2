@@ -1246,6 +1246,11 @@ class TestClient:
                         except Exception:  # pragma: no cover - defensive guard
                             pass
         account_id = headers.get("X-Account-ID")
+        if account_id is None:
+            for key, value in headers.items():
+                if isinstance(key, str) and key.lower() == "x-account-id":
+                    account_id = value
+                    break
         if account_id is None and isinstance(json, dict):
             account_id = json.get("account_id")
         if account_id is None and isinstance(params, dict):
