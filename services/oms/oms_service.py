@@ -1645,6 +1645,19 @@ class AccountContext:
             return None
 
     async def place_order(self, request: OMSPlaceRequest) -> OMSPlaceResponse:
+        normalized_symbol = normalize_spot_symbol(request.symbol)
+        if not normalized_symbol or not is_spot_symbol(normalized_symbol):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Only USD spot instruments are supported.",
+            )
+        if not normalized_symbol.endswith("-USD"):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Only USD-quoted spot instruments are supported.",
+            )
+        request.symbol = normalized_symbol
+
         sim_active = await self._is_simulation_active()
         if sim_active:
             await self.credentials.start()
@@ -1935,6 +1948,11 @@ class AccountContext:
                 record = self._orders.get(request.client_id)
 
             if record and record.transport == "simulation":
+                if not sim_active:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Unknown order for cancellation",
+                    )
                 snapshot = await self._cancel_sim_order(request.client_id)
                 if snapshot is None:
                     raise HTTPException(
@@ -1945,7 +1963,7 @@ class AccountContext:
                 await self._store_sim_record(sim_record)
                 return self._snapshot_to_response(snapshot)
 
-            if record is None:
+            if record is None and sim_active:
                 sim_snapshot = await self._lookup_sim_snapshot(request.client_id)
                 if sim_snapshot is not None:
                     snapshot = await self._cancel_sim_order(request.client_id)
@@ -2504,6 +2522,8 @@ class AccountContext:
             record = self._orders.get(client_id)
         if record is not None:
             return record
+        if not await self._is_simulation_active():
+            return None
         snapshot = await self._lookup_sim_snapshot(client_id)
         if snapshot is None:
             return None

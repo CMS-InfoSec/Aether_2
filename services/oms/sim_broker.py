@@ -22,10 +22,10 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 import logging
 from threading import Lock
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set
 from uuid import uuid4
 
 from common.schemas.contracts import FillEvent, OrderEvent
@@ -48,6 +48,55 @@ except Exception:  # pragma: no cover - gracefully degrade without psycopg
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+_DEFAULT_KRAKEN_USD_PAIRS: Set[str] = {
+    "BTC-USD",
+    "ETH-USD",
+    "LTC-USD",
+    "BCH-USD",
+    "XRP-USD",
+    "ADA-USD",
+    "DOT-USD",
+    "LINK-USD",
+    "SOL-USD",
+    "DOGE-USD",
+}
+
+
+def _load_allowed_pairs(pairs: Optional[Iterable[str]]) -> Set[str]:
+    try:
+        from services.oms import main as oms_main  # type: ignore
+    except Exception:  # pragma: no cover - optional during bootstrap
+        oms_main = None
+
+    allowed: Set[str] = set()
+    if pairs is not None:
+        for symbol in pairs:
+            normalized = normalize_spot_symbol(symbol)
+            if normalized:
+                allowed.add(normalized)
+    elif oms_main is not None:
+        try:
+            metadata = getattr(oms_main, "MARKET_METADATA", {})
+        except Exception:  # pragma: no cover - defensive guard
+            metadata = {}
+        if isinstance(metadata, dict):
+            for symbol in metadata:
+                if isinstance(symbol, str) and symbol.endswith("-USD"):
+                    allowed.add(symbol)
+    if not allowed:
+        allowed.update(_DEFAULT_KRAKEN_USD_PAIRS)
+    return {symbol for symbol in allowed if symbol}
+
+
+def _decimal_or_none(value: Any) -> Optional[Decimal]:
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value))
+    except (ArithmeticError, InvalidOperation, ValueError, TypeError):
+        raise ValueError(f"Unable to coerce value {value!r} to Decimal")
 
 
 @dataclass
@@ -81,6 +130,10 @@ class SimulatedOrder:
     avg_price: Decimal = Decimal("0")
     metadata: Dict[str, Any] = field(default_factory=dict)
     fills: List[SimulatedFill] = field(default_factory=list)
+    stop_loss: Optional[Decimal] = None
+    take_profit: Optional[Decimal] = None
+    stop_loss_triggered: bool = False
+    take_profit_triggered: bool = False
 
 
 class SimBroker:
@@ -92,6 +145,7 @@ class SimBroker:
         *,
         kafka_factory: type[KafkaNATSAdapter] = KafkaNATSAdapter,
         timescale_factory: type[TimescaleAdapter] = TimescaleAdapter,
+        allowed_symbols: Optional[Iterable[str]] = None,
     ) -> None:
         self.account_id = account_id
         self._lock = Lock()
@@ -101,6 +155,7 @@ class SimBroker:
         self._kafka = kafka_factory(account_id=account_id)
         self._timescale = timescale_factory(account_id=account_id)
         self._config: SimulationConfig = get_simulation_config(account_id)
+        self._allowed_symbols: Set[str] = _load_allowed_pairs(allowed_symbols)
 
     # ------------------------------------------------------------------
     # Public API
@@ -116,18 +171,32 @@ class SimBroker:
         market_data: Mapping[str, Any],
         limit_price: float | Decimal | None = None,
         metadata: Optional[Mapping[str, Any]] = None,
+        stop_loss: float | Decimal | None = None,
+        take_profit: float | Decimal | None = None,
     ) -> Dict[str, Any]:
         """Place a simulated order and return the resulting execution summary."""
 
         normalized_symbol = normalize_spot_symbol(symbol)
         if not normalized_symbol or not is_spot_symbol(normalized_symbol):
             raise ValueError(f"SimBroker only supports spot instruments; received {symbol!r}")
+        if normalized_symbol not in self._allowed_symbols:
+            raise ValueError(
+                f"Symbol {normalized_symbol!r} is not recognised as a Kraken USD spot pair"
+            )
 
         normalized_side = self._normalize_side(side)
         normalized_type = self._normalize_type(order_type)
 
         limit = Decimal(str(limit_price)) if limit_price is not None else None
         quantity_decimal = Decimal(str(quantity))
+        metadata_dict = dict(metadata or {})
+        take_profit_value = _decimal_or_none(
+            take_profit if take_profit is not None else metadata_dict.get("take_profit")
+        )
+        stop_loss_value = _decimal_or_none(
+            stop_loss if stop_loss is not None else metadata_dict.get("stop_loss")
+        )
+
         now = datetime.now(timezone.utc)
         order = SimulatedOrder(
             order_id=str(uuid4()),
@@ -141,8 +210,11 @@ class SimBroker:
             status="open",
             created_at=now,
             updated_at=now,
-            metadata=dict(metadata or {}),
+            metadata={},
+            stop_loss=stop_loss_value,
+            take_profit=take_profit_value,
         )
+        self._update_order_metadata(order, metadata_dict)
 
         with self._lock:
             self._orders[order.order_id] = order
@@ -196,7 +268,7 @@ class SimBroker:
         if qty <= 0:
             return
         price = self._apply_slippage(order, market_data)
-        self._apply_fill(order, qty, price, liquidity="taker")
+        self._apply_fill(order, qty, price, liquidity="taker", market_data=market_data)
 
     def _fill_limit_order(
         self, order: SimulatedOrder, market_data: Mapping[str, Any]
@@ -218,10 +290,16 @@ class SimBroker:
         liquidity = "maker"
         if qty < order.remaining_qty:
             order.status = "partial"
-        self._apply_fill(order, qty, price, liquidity)
+        self._apply_fill(order, qty, price, liquidity, market_data=market_data)
 
     def _apply_fill(
-        self, order: SimulatedOrder, qty: Decimal, price: Decimal, liquidity: str
+        self,
+        order: SimulatedOrder,
+        qty: Decimal,
+        price: Decimal,
+        liquidity: str,
+        *,
+        market_data: Mapping[str, Any],
     ) -> None:
         qty = qty.quantize(Decimal("0.00000001"))
         price = price.quantize(Decimal("0.00000001"))
@@ -247,6 +325,8 @@ class SimBroker:
         order.status = "filled" if order.remaining_qty == 0 else "partial"
         order.updated_at = datetime.now(timezone.utc)
 
+        self._enforce_protective_levels(order, price, market_data)
+
         fill = SimulatedFill(
             fill_id=str(uuid4()),
             order_id=order.order_id,
@@ -264,7 +344,109 @@ class SimBroker:
         if order.status == "filled":
             self._emit_order_event(order, status="filled")
 
+    def _enforce_protective_levels(
+        self,
+        order: SimulatedOrder,
+        execution_price: Decimal,
+        market_data: Mapping[str, Any],
+    ) -> None:
+        stop_loss = order.stop_loss
+        take_profit = order.take_profit
+
+        if stop_loss is not None:
+            if order.side == "buy" and stop_loss >= execution_price:
+                raise ValueError("stop-loss must be below the execution price for buy orders")
+            if order.side == "sell" and stop_loss <= execution_price:
+                raise ValueError("stop-loss must be above the execution price for sell orders")
+            order.stop_loss_triggered = self._stop_loss_triggered(
+                order.side, stop_loss, market_data, execution_price
+            )
+        else:
+            order.stop_loss_triggered = False
+
+        if take_profit is not None:
+            if order.side == "buy" and take_profit <= execution_price:
+                raise ValueError("take-profit must be above the execution price for buy orders")
+            if order.side == "sell" and take_profit >= execution_price:
+                raise ValueError("take-profit must be below the execution price for sell orders")
+            order.take_profit_triggered = self._take_profit_triggered(
+                order.side, take_profit, market_data, execution_price
+            )
+        else:
+            order.take_profit_triggered = False
+
+        self._update_order_metadata(order)
+
+    @staticmethod
+    def _iter_prices(
+        market_data: Mapping[str, Any], keys: Iterable[str]
+    ) -> Iterable[Decimal]:
+        for key in keys:
+            value = market_data.get(key)
+            if value is None:
+                continue
+            try:
+                yield Decimal(str(value))
+            except (ArithmeticError, InvalidOperation, ValueError, TypeError):
+                continue
+
+    def _stop_loss_triggered(
+        self,
+        side: str,
+        threshold: Decimal,
+        market_data: Mapping[str, Any],
+        execution_price: Decimal,
+    ) -> bool:
+        candidates = list(
+            self._iter_prices(
+                market_data,
+                ("low", "last_price", "last", "best_bid", "bid", "close"),
+            )
+        )
+        candidates.append(execution_price)
+        if side == "buy":
+            return any(price <= threshold for price in candidates)
+        return any(price >= threshold for price in candidates)
+
+    def _take_profit_triggered(
+        self,
+        side: str,
+        threshold: Decimal,
+        market_data: Mapping[str, Any],
+        execution_price: Decimal,
+    ) -> bool:
+        candidates = list(
+            self._iter_prices(
+                market_data,
+                ("high", "last_price", "last", "best_ask", "ask", "close"),
+            )
+        )
+        candidates.append(execution_price)
+        if side == "buy":
+            return any(price >= threshold for price in candidates)
+        return any(price <= threshold for price in candidates)
+
+    def _update_order_metadata(
+        self, order: SimulatedOrder, overrides: Optional[Mapping[str, Any]] = None
+    ) -> Dict[str, Any]:
+        metadata = dict(order.metadata)
+        if overrides:
+            metadata.update(dict(overrides))
+        if order.take_profit is not None:
+            metadata["take_profit"] = float(order.take_profit)
+        else:
+            metadata.pop("take_profit", None)
+        if order.stop_loss is not None:
+            metadata["stop_loss"] = float(order.stop_loss)
+        else:
+            metadata.pop("stop_loss", None)
+        metadata["take_profit_triggered"] = order.take_profit_triggered
+        metadata["stop_loss_triggered"] = order.stop_loss_triggered
+        order.metadata = metadata
+        return metadata
+
     def _format_order_response(self, order: SimulatedOrder) -> Dict[str, Any]:
+        metadata = self._update_order_metadata(order)
         return {
             "order_id": order.order_id,
             "client_order_id": order.client_order_id,
@@ -277,6 +459,13 @@ class SimBroker:
             "remaining_qty": float(order.remaining_qty),
             "avg_price": float(order.avg_price) if order.filled_qty > 0 else 0.0,
             "limit_price": float(order.limit_price) if order.limit_price else None,
+            "take_profit": float(order.take_profit)
+            if order.take_profit is not None
+            else None,
+            "stop_loss": float(order.stop_loss) if order.stop_loss is not None else None,
+            "take_profit_triggered": order.take_profit_triggered,
+            "stop_loss_triggered": order.stop_loss_triggered,
+            "metadata": metadata,
             "created_at": order.created_at,
             "updated_at": order.updated_at,
             "fills": [
@@ -300,7 +489,7 @@ class SimBroker:
             status=status,
             ts=datetime.now(timezone.utc),
         )
-        payload = event.model_dump(mode="json")
+        payload = event.model_dump()
         payload["simulated"] = True
         payload["client_order_id"] = order.client_order_id
         dispatch_async(
@@ -319,7 +508,7 @@ class SimBroker:
             liquidity=fill.liquidity,
             ts=fill.ts,
         )
-        payload = event.model_dump(mode="json")
+        payload = event.model_dump()
         payload["simulated"] = True
         payload["order_id"] = order.order_id
         payload["client_order_id"] = order.client_order_id
@@ -330,6 +519,7 @@ class SimBroker:
         )
 
     def _persist_order(self, order: SimulatedOrder) -> None:
+        metadata = self._update_order_metadata(order)
         record = {
             "order_id": order.order_id,
             "account_id": self.account_id,
@@ -342,11 +532,23 @@ class SimBroker:
             "status": order.status,
             "filled_qty": float(order.filled_qty),
             "avg_price": float(order.avg_price) if order.filled_qty > 0 else 0.0,
-            "metadata": json.dumps(order.metadata) if order.metadata else None,
+            "metadata": json.dumps(metadata) if metadata else None,
             "created_at": order.created_at,
             "updated_at": order.updated_at,
         }
         self._memory_orders[order.order_id] = record
+
+        ack_payload = dict(record)
+        ack_payload["simulated"] = True
+        ack_payload["take_profit"] = (
+            float(order.take_profit) if order.take_profit is not None else None
+        )
+        ack_payload["stop_loss"] = (
+            float(order.stop_loss) if order.stop_loss is not None else None
+        )
+        ack_payload["take_profit_triggered"] = order.take_profit_triggered
+        ack_payload["stop_loss_triggered"] = order.stop_loss_triggered
+        self._timescale.record_ack(ack_payload)
 
         if psycopg is None or sql is None:  # pragma: no cover - DB unavailable
             return
