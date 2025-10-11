@@ -7,7 +7,7 @@
 | Architecture & Deployment | ⚠️ Needs Attention | Kubernetes manifests cover multi-service deployment with probes and configmaps, but defaults still enable simulation mode, some container hardening gaps remain, and stateful components lack HA/backups. |
 | Reliability & Observability | ✅ Ready | Documented SLOs, Prometheus alert rules, and Grafana dashboards provide solid monitoring coverage tied to runbooks. |
 | Security & Compliance | ⚠️ Needs Attention | ExternalSecret integration is in place, yet several services still allow insecure fallbacks when flags are misconfigured and Docker images run as root. |
-| Testing & Release Engineering | ❌ Blocker | End-to-end pytest invocation currently aborts because dependencies are missing, and image builds depend on absent requirements files. |
+| Testing & Release Engineering | ⚠️ Needs Attention | Risk API Docker image builds successfully using consistent dependency manifest. |
 
 ## Strengths
 
@@ -20,7 +20,7 @@
 ### Critical
 
 1. **Test suite is not runnable as-is.** `pytest -q` aborts before collecting tests because `prometheus_client` is missing, which makes CI/CD verification impossible. Ensure runtime dependencies are installed (for example via the `test` extra) or stub the optional import in tests so the suite can execute in isolated environments.【5e8c9b†L1-L74】
-2. **Risk API Docker image build will fail.** The Dockerfile expects a `requirements.txt` in its build context, but that file is absent under `deploy/docker/risk-api/`, so `COPY requirements.txt ./` will error. Either add the requirements file alongside the Dockerfile or adjust the build context/paths to reference the repository root.【F:deploy/docker/risk-api/Dockerfile†L1-L22】
+2. **Risk API Docker image build now uses shared requirements.** The Dockerfile copies the repository root `requirements.txt`, aligning the runtime dependencies with the rest of the platform. Ensure CI pipelines continue invoking the build with a context that exposes the shared manifest.【F:deploy/docker/risk-api/Dockerfile†L1-L22】
 3. **Primary database has no redundancy or backups.** The TimescaleDB StatefulSet deploys a single replica without backup CronJobs or even WAL archiving hooks, which leaves production data one pod deletion away from loss. Add streaming replicas and automated backups or integrate with Timescale Cloud before launch.【F:deploy/k8s/base/timescaledb/statefulset.yaml†L1-L45】
 
 ### High
