@@ -15,6 +15,11 @@ try:  # pragma: no cover - FastAPI is optional in some unit tests
 except ImportError:  # pragma: no cover - fallback when FastAPI is stubbed out
     from services.common.fastapi_stub import FastAPI  # type: ignore[misc]
 
+try:  # pragma: no cover - FastAPI optional in some unit tests
+    from fastapi.middleware.cors import CORSMiddleware
+except ImportError:  # pragma: no cover - fallback when FastAPI is stubbed out
+    from services.common.fastapi_stub import CORSMiddleware  # type: ignore[misc]
+
 from audit_mode import configure_audit_mode
 from accounts.service import AccountsService
 from auth.routes import get_auth_service, router as auth_router
@@ -220,6 +225,23 @@ def create_app(
             await scaling_controller.stop()
 
     app = FastAPI(title="Aether Admin Platform", lifespan=_lifespan)
+    allowed_origins = [
+        origin
+        for origin in (
+            "https://builder.io",
+            "https://app.builder.io",
+            os.getenv("BUILDER_FUSION_ORIGIN", "https://fusion.builder.io"),
+            os.getenv("ADDITIONAL_CORS_ORIGIN", ""),
+        )
+        if origin
+    ]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins or ["https://fusion.builder.io"],
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["*"]
+    )
     setup_metrics(app, service_name="admin-platform")
     app.add_middleware(CorrelationIdMiddleware)
 
@@ -254,6 +276,7 @@ def create_app(
     _maybe_include_router(app, "services.core.sim_mode", "router")
     _maybe_include_router(app, "services.hedge.hedge_service", "router")
     _maybe_include_router(app, "services.builder.routes", "router")
+    _maybe_include_router(app, "services.builder.routes", "secrets_router")
 
 
     app.include_router(scaling_router)
