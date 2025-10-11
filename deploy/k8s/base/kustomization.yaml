@@ -9,6 +9,8 @@ resources:
   - nats
   - fastapi
   - secrets/external-secrets.yaml
+  - secrets/fastapi-credentials-external-secret.yaml
+  - secrets/fastapi-secrets-external-secret.yaml
   - ingress
   - networkpolicies
   - aether-services

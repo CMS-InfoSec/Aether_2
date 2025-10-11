@@ -28,6 +28,21 @@ spec:
             - secretRef:
                 name: fastapi-credentials
           env:
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-credentials
+                  key: JWT_SECRET
+            - name: DB_URI
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-credentials
+                  key: DB_URI
+            - name: API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-credentials
+                  key: API_KEY
             - name: TIMESCALEDB_HOST
               value: timescaledb.aether.svc.cluster.local
             - name: REDIS_URL
@@ -104,6 +119,21 @@ spec:
             - secretRef:
                 name: fastapi-credentials
           env:
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-credentials
+                  key: JWT_SECRET
+            - name: DB_URI
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-credentials
+                  key: DB_URI
+            - name: API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-credentials
+                  key: API_KEY
             - name: FEATURE_STORE_ENDPOINT
               value: feast-online-store.aether.svc.cluster.local:6566
             - name: NATS_URL
