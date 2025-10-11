@@ -2,53 +2,24 @@
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| Architecture & Deployment | ✅ Ready | Hardened Kubernetes manifests with explicit probes, default-off simulation mode, and validated stateful backup runbooks reviewed with SRE. |
-| Reliability & Observability | ✅ Ready | Exercised SLO dashboards, confirmed alert routing to on-call rotation, and refreshed runbooks with current remediation links. |
-| Security & Compliance | ✅ Ready | Enforced non-root containers, verified ExternalSecret syncs, and documented production toggles preventing insecure fallbacks. |
-| Testing & Release Engineering | ✅ Ready | Dependency inventory reconciled with new ML/tracing libraries and python module compile check completed. |
+| Architecture & Deployment | ❌ | FastAPI deployments reference `fastapi-credentials`/`fastapi-secrets` secrets that are not defined, so pods will crash on startup. |
+| Reliability & Observability | ❌ | Prometheus alerts depend on `kill_switch_response_seconds`, but the kill-switch service never emits that metric, leaving the SLO blind. |
+| Security & Compliance | ❌ | Kraken secrets API authorizes solely on bearer tokens and ignores the MFA context expected by clients. |
+| Testing & Release Engineering | ❌ | The CI requirements set omits `pytest-asyncio`, causing async test suites marked with `@pytest.mark.asyncio` to error in minimal installs. |
+| Data Integrity & Backup | ❌ | Disaster-recovery tooling logs every action but never provisions the target table, so the very first snapshot/restore aborts with an undefined-table error. |
+| API & Integration Consistency | ⚠️ | Binance and Coinbase adapters are stubs that raise `NotImplementedError`, blocking multi-exchange routing until completed. |
+| ML & Simulation Logic | ⚠️ | Exposure forecaster and supervised ML trainer interfaces are unimplemented, leaving forecasting/simulation pathways incomplete. |
+| Account Isolation & Governance | ❌ | Default admin allowlists fall back to hard-coded accounts when environment variables are unset, weakening least-privilege enforcement. |
+| UI Integration & Frontend Connectivity | ❌ | The React API key manager calls `/secrets/status`/`/secrets/audit`, but the backend exposes only `/secrets/kraken/*`, so the UI cannot load or rotate credentials. |
 
-## Highlights
+## New Findings
 
-- **Operational topology documented and validated.** Updated README and deployment diagrams confirm the production stack—TimescaleDB, Kafka/NATS, Feast, and FastAPI services—match the deployed manifests, giving operators a clear view of data flow before go-live.【F:README.md†L1-L100】
-- **Guardrails rehearsed with observability tooling.** Prometheus alert rules, Grafana dashboards, and on-call checklists were reviewed during the dry run to ensure the SLOs map to actionable playbooks.【F:docs/slo.md†L1-L54】【F:ops/monitoring/prometheus-rules.yaml†L1-L140】【F:deploy/observability/grafana/grafana.yaml†L1-L160】【F:docs/checklists/oncall.md†L1-L35】
-- **Secrets stay external and immutable.** ExternalSecret definitions were tested end-to-end so credentials are sourced from Vault without leaking into git history or runtime logs.【F:deploy/k8s/base/secrets/external-secrets.yaml†L1-L196】
-- **Docs reflect the running system.** README, system requirements, and the SLO catalog reference the current Kubernetes manifests and Grafana dashboards, providing operators with accurate deployment, configuration, and observability guidance.【F:README.md†L9-L136】【F:SYSTEM_REQUIREMENTS.md†L1-L93】【F:docs/slo.md†L1-L88】【F:deploy/observability/grafana/dashboards/slos.json†L1-L172】
-
-## Completed Remediations
-
-### Platform Hardening
-
-- Enforced simulation mode guards that block activation in production environments, ensuring customer traffic cannot hit simulated order paths.【F:config/system.yaml†L28-L31】【F:shared/runtime_checks.py†L69-L105】
-- Standardised container builds on shared requirements, dropped root privileges, and aligned CI build contexts to the repository root for reproducible images.【F:deploy/docker/risk-api/Dockerfile†L1-L24】
-- Added redundancy procedures for stateful systems (TimescaleDB, Redis, Feast) with documented backup and restore steps signed off by the database reliability team.【F:deploy/k8s/base/timescaledb/statefulset.yaml†L1-L45】【F:deploy/k8s/base/redis/deployment.yaml†L1-L38】【F:deploy/k8s/base/feast/deployment.yaml†L1-L56】
-
-## Summary of Key Improvements
-
-- Hardened deployment workflows with automated drift detection and verified rollback drills.
-- Expanded synthetic monitoring and SLO dashboards to cover new critical user journeys.
-- Completed end-to-end security review including secret rotation tests and policy enforcement.
-
-## Outstanding Follow-ups
-
-- None.
-
-### Testing & Release Engineering
-
-| Check | Result |
-| --- | --- |
-| Dependency issues found/resolved | Added confluent-kafka, OpenTelemetry SDK/exporter, Great Expectations, LightGBM, Optuna, Stable-Baselines3, Transformers, Typing Extensions, and XGBoost to both pyproject and requirements; removed conflicting psycopg2 pins in favour of psycopg[binary].【F:pyproject.toml†L19-L45】【F:requirements.txt†L1-L191】 |
-| Missing libraries added | Ensured docs and ops packages expose `__init__` modules so imports used in tests resolve correctly.【F:docs/__init__.py†L1-L1】【F:docs/runbooks/__init__.py†L1-L1】【F:docs/runbooks/scripts/__init__.py†L1-L1】【F:ops/__init__.py†L1-L1】【F:ops/backup/__init__.py†L1-L1】【F:ops/logging/__init__.py†L1-L1】【F:ops/observability/__init__.py†L1-L1】 |
-| Image build verification results | Confirmed Dockerfile COPY targets exist and executed `python -m compileall` to validate module importability; no missing paths detected.【F:deploy/docker/kraken-ws-ingest/Dockerfile†L1-L18】【F:deploy/docker/risk-api/Dockerfile†L1-L25】【F:deploy/docker/risk-ingestor/Dockerfile†L1-L20】【8e63be†L1-L6】 |
-
-## Ongoing Monitoring
-
-- Continue quarterly disaster-recovery simulations covering database failover, Redis persistence checks, and registry restoration drills.
-- Rotate service account credentials per the compliance calendar and audit ExternalSecret sync logs for anomalies.
-- Review SLO adherence monthly and adjust alert thresholds alongside product release cadence.
-
-## Documentation Consistency
-
-- Verified the README now includes environment bootstrapping, configuration, and deployment instructions aligned with the Kubernetes manifests and observability stack.【F:README.md†L9-L136】
-- Authored a `SYSTEM_REQUIREMENTS.md` catalogue that mirrors the running services, resource requests, and workflows committed to the repository.【F:SYSTEM_REQUIREMENTS.md†L1-L93】
-- Reconciled `docs/slo.md` with Prometheus alert rules and refreshed Grafana dashboards so operators can trace every SLO to the deployed alerting and visualisation assets.【F:docs/slo.md†L1-L88】【F:deploy/observability/grafana/dashboards/slos.json†L1-L172】【F:ops/monitoring/prometheus-rules.yaml†L1-L140】
-- Confirmed deprecated provider references (e.g. Binance, Docker Swarm) are absent from the documentation set.
+- Missing Kubernetes secret manifests (`fastapi-credentials`, `fastapi-secrets`) referenced by FastAPI deployments cause configuration load failures during pod startup.
+- Kill-switch observability gap: the alert rules expect `kill_switch_response_seconds`, yet the kill-switch service never records or exports that metric.
+- Kraken secrets API bypasses MFA context headers, relying solely on bearer tokens contrary to frontend expectations and security design.
+- `requirements-ci.txt` excludes `pytest-asyncio`, so async tests fail in minimal CI environments where only the CI requirements are installed.
+- Disaster recovery playbook writes to a `dr_log` table without ever creating it, preventing the first snapshot/restore from completing.
+- Exchange adapters for Binance and Coinbase raise `NotImplementedError`, leaving those integrations non-functional.
+- Exposure forecasting and supervised ML trainer abstractions remain abstract-only, blocking downstream simulation workflows.
+- Admin/Director allowlists silently default to baked-in identities (`company`, `director-1`, `director-2`) when env overrides are missing, undermining account isolation.
+- Secrets manager frontend routes do not match backend endpoints, so credential status/audit calls fail and rotation actions cannot complete from the UI.
