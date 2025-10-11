@@ -1,16 +1,22 @@
 """FastAPI routes tailored for the Builder.io administrative UI."""
 from __future__ import annotations
 
+import logging
 import math
 import os
 import sys
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, EmailStr, Field
 
 from accounts.service import AccountsService, AdminProfile
+from services.builder.secrets_client import (
+    SecretsServiceConfigurationError,
+    SecretsServiceTransportError,
+    request_json,
+)
 from services.common.security import (
     AuthenticatedPrincipal,
     require_authenticated_principal,
@@ -23,6 +29,10 @@ from shared.sim_mode import SimModeStatus, sim_mode_repository
 from shared.trade_logging import read_trade_log
 
 router = APIRouter(prefix="/builder", tags=["builder"])
+secrets_router = APIRouter(prefix="/secrets", tags=["secrets"])
+
+
+_logger = logging.getLogger(__name__)
 
 
 _ALLOW_INSECURE_HTTP = "pytest" in sys.modules or os.getenv("BUILDER_ALLOW_INSECURE_HTTP") == "1"
@@ -170,6 +180,38 @@ class ApiKeyUploadResponse(BaseModel):
     account_id: str
     secret_name: str
     rotated_at: datetime
+
+
+class SecretsStatusModel(BaseModel):
+    last_rotated_at: str | None = Field(
+        default=None,
+        description="ISO-8601 timestamp for the most recent credential rotation.",
+    )
+    last_rotated_by: str | None = Field(
+        default=None,
+        description="Identifier for the actor that last rotated the credentials.",
+    )
+    status: str | None = Field(
+        default=None,
+        description="Human friendly message describing the credential freshness.",
+    )
+
+
+class SecretsAuditEntryModel(BaseModel):
+    actor: str = Field(..., description="Actor responsible for the rotation event.")
+    rotated_at: datetime = Field(
+        ..., description="ISO-8601 timestamp describing when rotation completed."
+    )
+    notes: str | None = Field(
+        default=None, description="Optional contextual note for the rotation event."
+    )
+
+
+class SecretsRotateResponseModel(BaseModel):
+    secret_name: str = Field(..., description="Kubernetes secret storing the credentials.")
+    last_rotated: datetime = Field(
+        ..., description="Timestamp describing when the credentials were rotated."
+    )
 
 
 def _profile_step(profile: AdminProfile | None) -> OnboardingStep:
@@ -347,6 +389,104 @@ def _load_hedge_status(service: HedgeService) -> HedgeStatusModel:
     )
 
 
+def _parse_iso_timestamp(raw: str | None) -> datetime:
+    if not raw:
+        return datetime.now(timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return datetime.now(timezone.utc)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _extract_error_detail(response_json: Any, fallback: str) -> str:
+    if isinstance(response_json, dict):
+        detail = response_json.get("detail")
+        if isinstance(detail, str) and detail:
+            return detail
+    if isinstance(response_json, list) and response_json:
+        first = response_json[0]
+        if isinstance(first, dict):
+            detail = first.get("msg") or first.get("detail")
+            if isinstance(detail, str) and detail:
+                return detail
+        if isinstance(first, str) and first:
+            return first
+    return fallback
+
+
+def _require_mfa_header(raw_header: str | None) -> str:
+    value = (raw_header or "").strip()
+    if not value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="X-MFA-Context header is required for secrets operations.",
+        )
+    return value
+
+
+async def _call_secrets_service(
+    method: str,
+    path: str,
+    *,
+    account_id: str,
+    mfa_context: str,
+    payload: Mapping[str, Any] | None = None,
+) -> Mapping[str, Any] | list[Any]:
+    try:
+        response = await request_json(
+            method,
+            path,
+            account_id=account_id,
+            mfa_context=mfa_context,
+            json=payload,
+        )
+    except SecretsServiceConfigurationError as exc:
+        _logger.error("Secrets service configuration error: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Secrets service configuration is incomplete.",
+        ) from exc
+    except SecretsServiceTransportError as exc:
+        _logger.error("Secrets service transport failure", exc_info=exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Unable to contact the secrets service.",
+        ) from exc
+
+    if response.status_code >= 400:
+        try:
+            payload_body = response.json()
+        except ValueError:
+            payload_body = response.text
+        detail = (
+            _extract_error_detail(
+                payload_body,
+                str(payload_body or "Secrets service request failed."),
+            )
+            if not isinstance(payload_body, str)
+            else payload_body or "Secrets service request failed."
+        )
+        raise HTTPException(status_code=response.status_code, detail=detail)
+
+    content_type = response.headers.get("content-type", "")
+    if "application/json" not in content_type:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Secrets service returned an unexpected response type.",
+        )
+
+    try:
+        return response.json()
+    except ValueError as exc:  # pragma: no cover - defensive guard
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Secrets service returned invalid JSON.",
+        ) from exc
+
+
 @router.get("/onboarding", response_model=OnboardingState)
 async def get_onboarding_state(
     request: Request,
@@ -480,3 +620,118 @@ async def upload_api_key(
     accounts_service = _get_accounts_service(request)
     accounts_service.set_kraken_credentials_status(principal.account_id, True)
     return ApiKeyUploadResponse(account_id=principal.account_id, secret_name=secret_name, rotated_at=rotated_at)
+
+
+@secrets_router.get("/status", response_model=SecretsStatusModel)
+async def get_secrets_status(
+    request: Request,
+    principal: AuthenticatedPrincipal = Depends(require_authenticated_principal),
+    _: str = Depends(require_mfa_context),
+    mfa_header: str = Header(..., alias="X-MFA-Context"),
+    __: None = Depends(_require_https),
+) -> SecretsStatusModel:
+    mfa_context = _require_mfa_header(mfa_header)
+    payload = await _call_secrets_service(
+        "GET",
+        "/secrets/status",
+        account_id=principal.account_id,
+        mfa_context=mfa_context,
+    )
+    if not isinstance(payload, Mapping):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Secrets service returned an unexpected payload.",
+        )
+    last_rotated_at = payload.get("last_rotated_at")
+    last_rotated_by = payload.get("last_rotated_by")
+    status_message = payload.get("status")
+    return SecretsStatusModel(
+        last_rotated_at=str(last_rotated_at) if last_rotated_at is not None else None,
+        last_rotated_by=str(last_rotated_by) if last_rotated_by is not None else None,
+        status=str(status_message) if status_message is not None else None,
+    )
+
+
+@secrets_router.get("/audit", response_model=list[SecretsAuditEntryModel])
+async def get_secrets_audit(
+    request: Request,
+    principal: AuthenticatedPrincipal = Depends(require_authenticated_principal),
+    _: str = Depends(require_mfa_context),
+    mfa_header: str = Header(..., alias="X-MFA-Context"),
+    __: None = Depends(_require_https),
+) -> list[SecretsAuditEntryModel]:
+    mfa_context = _require_mfa_header(mfa_header)
+    payload = await _call_secrets_service(
+        "GET",
+        "/secrets/audit",
+        account_id=principal.account_id,
+        mfa_context=mfa_context,
+    )
+    if not isinstance(payload, list):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Secrets service returned an unexpected payload.",
+        )
+    entries: list[SecretsAuditEntryModel] = []
+    for item in payload:
+        if not isinstance(item, Mapping):
+            continue
+        actor = str(item.get("actor") or principal.account_id)
+        rotated_at_raw = item.get("rotated_at")
+        rotated_at = (
+            _parse_iso_timestamp(str(rotated_at_raw))
+            if rotated_at_raw is not None
+            else datetime.now(timezone.utc)
+        )
+        notes_value = item.get("notes")
+        notes = str(notes_value) if isinstance(notes_value, str) else None
+        entries.append(SecretsAuditEntryModel(actor=actor, rotated_at=rotated_at, notes=notes))
+    return entries
+
+
+@secrets_router.post("/rotate", response_model=SecretsRotateResponseModel, status_code=status.HTTP_200_OK)
+async def rotate_secrets(
+    payload: ApiKeyUploadRequest,
+    request: Request,
+    principal: AuthenticatedPrincipal = Depends(require_authenticated_principal),
+    _: str = Depends(require_mfa_context),
+    mfa_header: str = Header(..., alias="X-MFA-Context"),
+    __: None = Depends(_require_https),
+) -> SecretsRotateResponseModel:
+    mfa_context = _require_mfa_header(mfa_header)
+    rotation_payload = {
+        "account_id": principal.account_id,
+        "api_key": payload.api_key,
+        "api_secret": payload.api_secret,
+    }
+    rotation = await _call_secrets_service(
+        "POST",
+        "/secrets/kraken",
+        account_id=principal.account_id,
+        mfa_context=mfa_context,
+        payload=rotation_payload,
+    )
+    if not isinstance(rotation, Mapping):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Secrets service returned an unexpected payload.",
+        )
+    secret_name = str(rotation.get("secret_name") or "")
+    rotated_at_raw = rotation.get("last_rotated")
+    rotated_at = (
+        _parse_iso_timestamp(str(rotated_at_raw))
+        if rotated_at_raw is not None
+        else datetime.now(timezone.utc)
+    )
+
+    auditor = _get_auditor(request)
+    auditor.record(
+        action="builder.api_key.rotate",
+        actor_id=principal.account_id,
+        before=None,
+        after={"secret_name": secret_name, "rotated_at": rotated_at.isoformat()},
+    )
+    accounts_service = _get_accounts_service(request)
+    accounts_service.set_kraken_credentials_status(principal.account_id, True)
+
+    return SecretsRotateResponseModel(secret_name=secret_name, last_rotated=rotated_at)

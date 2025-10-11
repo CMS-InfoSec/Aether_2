@@ -196,6 +196,13 @@ spec:
           ports:
             - containerPort: 5432
               name: postgres
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
@@ -226,11 +233,18 @@ spec:
           command:
             - /bin/sh
             - -c
-            - |
+            - | 
               set -euo pipefail
               while true; do
                 wal-g wal-receive --confirm && sleep 30;
               done
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data

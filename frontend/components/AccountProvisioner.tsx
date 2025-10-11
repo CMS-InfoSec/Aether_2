@@ -1,4 +1,5 @@
 import React, { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { withErrorBoundary } from "./withErrorBoundary";
 import { formatLondonTime } from "./timezone";
 import { useAuthClaims } from "./useAuthClaims";
 
@@ -456,4 +457,6 @@ const AccountProvisioner: React.FC = () => {
   );
 };
 
-export default AccountProvisioner;
+export default withErrorBoundary(AccountProvisioner, {
+  componentName: "Account Provisioner",
+});
