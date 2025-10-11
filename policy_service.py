@@ -175,28 +175,48 @@ def _configure_session_store(application: FastAPI) -> SessionStoreProtocol:
         store = existing
     else:
         raw_url = os.getenv("SESSION_REDIS_URL")
-        if raw_url is None:
-            raise RuntimeError(
-                "SESSION_REDIS_URL is not configured. Provide a redis:// DSN for the shared session store."
-            )
-
-        redis_url = raw_url.strip()
-        if not redis_url:
-            raise RuntimeError(
-                "SESSION_REDIS_URL is set but empty; configure a redis:// or rediss:// DSN."
-            )
-
-        normalized = redis_url.lower()
-        if normalized.startswith("memory://") and "pytest" not in sys.modules:
-            raise RuntimeError(
-                "SESSION_REDIS_URL must use a redis:// or rediss:// DSN outside pytest so policy sessions persist across restarts."
-            )
-
-        ttl_minutes = load_session_ttl_minutes()
-        if normalized.startswith("memory://"):
-            store = InMemorySessionStore(ttl_minutes=ttl_minutes)
+        allow_ephemeral = os.getenv("AETHER_ALLOW_EPHEMERAL_SESSIONS", "0") in {
+            "1",
+            "true",
+            "yes",
+        }
+        pytest_active = "pytest" in sys.modules
+        if raw_url is None or not raw_url.strip():
+            if pytest_active or allow_ephemeral:
+                logger.warning(
+                    "SESSION_REDIS_URL is not configured; using in-memory session store for tests",
+                )
+                ttl_minutes = load_session_ttl_minutes()
+                store = InMemorySessionStore(ttl_minutes=ttl_minutes)
+            else:
+                raise RuntimeError(
+                    "SESSION_REDIS_URL is not configured. Provide a redis:// DSN for the shared session store."
+                )
         else:
-            store = build_session_store_from_url(redis_url, ttl_minutes=ttl_minutes)
+            redis_url = raw_url.strip()
+            normalized = redis_url.lower()
+            if not normalized:
+                if pytest_active or allow_ephemeral:
+                    logger.warning(
+                        "SESSION_REDIS_URL is empty; using in-memory session store for tests",
+                    )
+                    ttl_minutes = load_session_ttl_minutes()
+                    store = InMemorySessionStore(ttl_minutes=ttl_minutes)
+                else:
+                    raise RuntimeError(
+                        "SESSION_REDIS_URL is set but empty; configure a redis:// or rediss:// DSN."
+                    )
+            else:
+                if normalized.startswith("memory://") and not (pytest_active or allow_ephemeral):
+                    raise RuntimeError(
+                        "SESSION_REDIS_URL must use a redis:// or rediss:// DSN outside pytest so policy sessions persist across restarts."
+                    )
+
+                ttl_minutes = load_session_ttl_minutes()
+                if normalized.startswith("memory://"):
+                    store = InMemorySessionStore(ttl_minutes=ttl_minutes)
+                else:
+                    store = build_session_store_from_url(redis_url, ttl_minutes=ttl_minutes)
 
         application.state.session_store = store
 

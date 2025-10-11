@@ -739,7 +739,11 @@ async def scaling_status(
 __all__ = [
     "ScalingController",
     "ScalingStatus",
+    "NullGPUManager",
+    "LinodeGPUManager",
+    "OmsDeploymentScaler",
     "build_scaling_controller_from_env",
     "configure_scaling_controller",
+    "http_json_field_getter",
     "router",
 ]
