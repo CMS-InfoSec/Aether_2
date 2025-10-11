@@ -60,6 +60,7 @@ The repository requires coordinated fixes across persistence, services, and test
 | --- | --- | --- | --- |
 | P0 | Fix `/reports/pnl/daily_pct` aggregation | ✅ Completed | The daily return endpoint now falls back to a local NAV store when Timescale tables or psycopg are unavailable, keeping `/reports/pnl/daily_pct` online under insecure defaults while still preferring the database path in production.【F:services/reports/report_service.py†L60-L231】【F:services/reports/report_service.py†L666-L768】【F:tests/reports/test_daily_return_insecure_defaults.py†L1-L38】 |
 | P1 | Wire Prometheus / OpenTelemetry exporters | ✅ Completed | `metrics.configure_observability` starts the embedded Prometheus exporter and configures OTLP tracing whenever the relevant environment variables are set, keeping scrape and trace targets aligned across services.【F:metrics.py†L1-L352】【F:metrics.py†L828-L851】 |
+| P0 | Restore Prometheus scrape endpoint without third-party client | ✅ Completed | The vendored Prometheus shim now starts a background HTTP server and serves generated metrics so `/metrics` endpoints remain available even when the upstream library is missing, preserving observability in dependency-light environments.【F:prometheus_client/__init__.py†L366-L404】 |
 | P1 | Ensure Timescale continuous aggregates refreshed | ✅ Completed | `ops/refresh_continuous_aggregates.py` refreshes materialised views via psycopg when available and logs manual follow-ups when running against lightweight environments.【F:ops/refresh_continuous_aggregates.py†L1-L102】 |
 
 ## 7. Deployment & Ops
@@ -88,7 +89,6 @@ The repository requires coordinated fixes across persistence, services, and test
 ## Outstanding Fixes and Follow-Ups
 
 - **Non-Kraken exchange adapters remain placeholders.** Binance and Coinbase integrations still raise `NotImplementedError`, so multi-exchange rollouts cannot proceed until real REST/WebSocket bindings ship.【F:exchange_adapter.py†L588-L664】
-- **Metrics exporter still depends on the Prometheus stub.** The lightweight `start_http_server` merely logs a warning; production deployments must restore the official client to expose scrape endpoints again.【F:metrics.py†L137-L152】
 - **Load-testing harness relies on insecure-default stubs.** The bundled `locust` module only works when insecure defaults are enabled and exits in production, so the genuine Locust/Gevent stack must be reinstated before capacity testing.【F:locust/__init__.py†L18-L135】
 - **Scientific stack needs the real NumPy/pandas toolchain.** Core ML and backtesting modules still gate their functionality behind dependency checks, leaving training and simulation unavailable until those libraries are installed.【F:ml/models/supervised.py†L46-L102】【F:backtest_engine.py†L18-L70】
 - **Kafka connectivity is replaced by a no-op shim.** The vendored `aiokafka` package records payloads in-memory and never reaches an actual Kafka broker, preventing live ingestion and OMS fan-out until the real client library is restored.【F:aiokafka/__init__.py†L13-L58】
