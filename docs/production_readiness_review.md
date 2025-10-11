@@ -10,7 +10,7 @@
 | API & Integration Consistency | ✅ Ready | Exchange adapters expose spot operations with multi-exchange gating and FastAPI services register `/metrics` endpoints via shared middleware. 【F:exchange_adapter.py†L592-L696】【F:metrics.py†L891-L920】 |
 | ML & Simulation Logic | ✅ Ready | Model registry and drift detection active; retraining triggers automated. 【F:training_service.py†L603-L657】【F:services/policy/model_server.py†L580-L625】【F:ml/monitoring/live_monitor.py†L1-L172】 |
 | Account Isolation & Governance | ❌ Needs Fix | Services crash without the `platform-account-allowlists` secret that carries admin/director scopes, and the repository provides no ExternalSecret or sealed secret for it. 【F:deploy/helm/aether-platform/values.yaml†L41-L66】【b22d38†L1-L4】 |
-| UI Integration & Frontend Connectivity | ✅ Ready | Secrets Service routes for status and audit feeds exist, matching Builder.io Fusion UI expectations. 【F:secrets_service.py†L864-L992】 |
+| UI Integration & Frontend Connectivity | ✅ Ready | Secrets Service routes for status and audit feeds exist, matching Builder.io Fusion UI expectations, and frontend error boundaries plus API timeout handling are implemented. 【F:secrets_service.py†L864-L992】【F:frontend/components/ErrorBoundary.tsx†L1-L198】【F:frontend/components/apiClient.ts†L1-L274】 |
 
 ## Architecture & Deployment
 
@@ -129,6 +129,7 @@
 ## UI Integration & Frontend Connectivity
 
 * The Secrets Service exposes `/secrets/status`, `/secrets/audit`, and `/secrets/kraken/status`, matching the Builder.io Fusion frontend contract. 【F:secrets_service.py†L864-L992】
+* React error boundaries now wrap each administrative panel, and the global fetch interceptor retries transient outages while surfacing user-friendly messages when retries exhaust. 【F:frontend/components/withErrorBoundary.tsx†L1-L36】【F:frontend/components/ErrorBoundary.tsx†L1-L198】【F:frontend/components/apiClient.ts†L1-L274】
 
 ## Highlights
 

@@ -1,4 +1,5 @@
 import React, { FormEvent, useEffect, useMemo, useState } from "react";
+import { withErrorBoundary } from "./withErrorBoundary";
 import { formatLondonTime } from "./timezone";
 import { useAuthClaims } from "./useAuthClaims";
 
@@ -864,4 +865,6 @@ const Dashboard: React.FC = () => {
   );
 };
 
-export default Dashboard;
+export default withErrorBoundary(Dashboard, {
+  componentName: "Risk Dashboard",
+});
