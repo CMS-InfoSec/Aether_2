@@ -26,6 +26,7 @@ from prometheus_client import (
 )
 
 from metrics import AccountSegment, SymbolTier
+from shared.health import setup_health_checks
 
 LOGGER = logging.getLogger(__name__)
 
@@ -182,6 +183,15 @@ class LatencyMetrics:
     def registry(self) -> CollectorRegistry:
         return self._registry
 
+    def health_snapshot(self) -> Dict[str, Any]:
+        return {
+            "tracked_metrics": sorted(self._histograms.keys()),
+            "active_windows": {
+                name: len(windows)
+                for name, windows in self._windows.items()
+            },
+        }
+
     def observe(
         self,
         metric: str,
@@ -275,6 +285,7 @@ def create_metrics_app(metrics: LatencyMetrics) -> FastAPI:
     """Return a FastAPI application exposing the Prometheus registry."""
 
     app = FastAPI()
+    setup_health_checks(app, {"latency_metrics": metrics.health_snapshot})
 
     @app.get("/metrics")
     def metrics_endpoint() -> Response:

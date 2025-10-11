@@ -39,12 +39,43 @@ except ImportError:  # pragma: no cover - fallback when FastAPI is stubbed out
         Query,
         StreamingResponse,
     )
-try:  # pragma: no cover - psycopg2 is optional in some environments
-    from psycopg2 import sql
+try:  # pragma: no cover - prefer psycopg (v3) when available
+    import psycopg
+    from psycopg import sql as psycopg_sql
+    from psycopg.rows import dict_row as psycopg_dict_row
+except ImportError:  # pragma: no cover - runtime may only ship psycopg2
+    psycopg = None  # type: ignore[assignment]
+    psycopg_sql = None  # type: ignore[assignment]
+    psycopg_dict_row = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - psycopg2 remains the fallback driver
+    import psycopg2
+    from psycopg2 import sql as psycopg2_sql
     from psycopg2.extras import RealDictCursor
 except ImportError:  # pragma: no cover - gracefully degrade when psycopg2 absent
-    sql = None  # type: ignore[assignment]
+    psycopg2 = None  # type: ignore[assignment]
+    psycopg2_sql = None  # type: ignore[assignment]
     RealDictCursor = Any  # type: ignore[assignment]
+
+try:  # pragma: no cover - align undefined column handling across drivers
+    from psycopg import errors as psycopg_errors
+except Exception:  # pragma: no cover - psycopg may be unavailable
+    psycopg_errors = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - align undefined column handling across drivers
+    from psycopg2 import errors as psycopg2_errors
+except Exception:  # pragma: no cover - psycopg2 may be unavailable
+    psycopg2_errors = None  # type: ignore[assignment]
+
+_SQL_MODULE = psycopg_sql or psycopg2_sql
+_UNDEFINED_COLUMN_ERRORS: tuple[type[BaseException], ...] = tuple(
+    error
+    for error in (
+        getattr(psycopg_errors, "UndefinedColumn", None),
+        getattr(psycopg2_errors, "UndefinedColumn", None),
+    )
+    if error is not None
+)
 
 from shared.common_bootstrap import ensure_common_helpers
 
@@ -545,55 +576,71 @@ class DailyReportService:
     # ------------------------------------------------------------------
 
     @contextmanager
-    def _session(self, config: TimescaleSession) -> Iterator[RealDictCursor]:
-        if sql is None:
+    def _session(self, config: TimescaleSession) -> Iterator[Any]:
+        if _SQL_MODULE is None:
             raise RuntimeError(
-                "psycopg2 is required to build capital reports; install the dependency first"
+                "A PostgreSQL driver (psycopg or psycopg2) is required to build capital reports"
             )
 
-        import psycopg2
-
-        conn = psycopg2.connect(config.dsn)
+        connection: Any | None = None
+        cursor: Any | None = None
         try:
-            conn.autocommit = True
-            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                cursor.execute(
-                    sql.SQL("SET search_path TO {}, public").format(
-                        sql.Identifier(config.account_schema)
-                    )
+            if psycopg is not None:
+                assert psycopg_dict_row is not None  # nosec - guarded by import
+                connection = psycopg.connect(config.dsn)
+                connection.autocommit = True
+                cursor = connection.cursor(row_factory=psycopg_dict_row)
+            elif psycopg2 is not None:
+                connection = psycopg2.connect(config.dsn)
+                connection.autocommit = True
+                cursor = connection.cursor(cursor_factory=RealDictCursor)
+            else:  # pragma: no cover - guarded by _SQL_MODULE check
+                raise RuntimeError(
+                    "A PostgreSQL driver (psycopg or psycopg2) is required to build capital reports"
                 )
-                yield cursor
+
+            cursor.execute(
+                _SQL_MODULE.SQL("SET search_path TO {}, public").format(
+                    _SQL_MODULE.Identifier(config.account_schema)
+                )
+            )
+            yield cursor
         finally:
-            conn.close()
+            if cursor is not None:
+                cursor.close()
+            if connection is not None:
+                connection.close()
 
     def _timescale(self, account_id: str) -> TimescaleSession:
         return get_timescale_session(account_id)
 
     @staticmethod
-    def _fetch(cursor: RealDictCursor, query: str, params: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    def _fetch(cursor: Any, query: str, params: Mapping[str, Any]) -> List[Dict[str, Any]]:
         cursor.execute(query, params)
         rows = cursor.fetchall()
         return [dict(row) for row in rows]
 
     @staticmethod
-    def _fetch_one(cursor: RealDictCursor, query: str, params: Mapping[str, Any]) -> Dict[str, Any] | None:
+    def _fetch_one(cursor: Any, query: str, params: Mapping[str, Any]) -> Dict[str, Any] | None:
         cursor.execute(query, params)
         row = cursor.fetchone()
         return dict(row) if row else None
 
-    def _fetch_fills(self, cursor: RealDictCursor, params: Mapping[str, Any]) -> List[Dict[str, Any]]:
-        if sql is None:
+    def _fetch_fills(self, cursor: Any, params: Mapping[str, Any]) -> List[Dict[str, Any]]:
+        if _SQL_MODULE is None:
             raise RuntimeError(
-                "psycopg2 is required to fetch fills; install the dependency first"
+                "A PostgreSQL driver (psycopg or psycopg2) is required to fetch fills"
             )
-
-        from psycopg2 import errors
 
         try:
             return self._fetch(cursor, FILLS_QUERY, params)
-        except errors.UndefinedColumn:
-            LOGGER.debug("slippage_bps column missing on fills table, falling back to zero values")
-            return self._fetch(cursor, FILLS_QUERY_FALLBACK, params)
+        except Exception as exc:
+            if _UNDEFINED_COLUMN_ERRORS and isinstance(exc, _UNDEFINED_COLUMN_ERRORS):
+                LOGGER.debug(
+                    "slippage_bps column missing on fills table, falling back to zero values"
+                )
+                return self._fetch(cursor, FILLS_QUERY_FALLBACK, params)
+            raise
 
     def _record_local_nav(
         self,
@@ -654,6 +701,21 @@ class DailyReportService:
         fees = _as_float(fees_row.get("fees", 0.0))
         slippage = self._compute_slippage(fills)
         generated_at = datetime.now(timezone.utc)
+
+        try:  # pragma: no cover - metrics module optional in lightweight tests
+            from metrics import record_account_daily_pnl
+
+            record_account_daily_pnl(
+                target_account,
+                realized=realized,
+                unrealized=unrealized,
+                fees=fees,
+                service="reports",
+            )
+        except Exception:  # pragma: no cover - metrics emission is best effort
+            LOGGER.debug(
+                "Failed to record daily PnL metrics for account %s", target_account, exc_info=True
+            )
 
         return DailyReport(
             account_id=target_account,

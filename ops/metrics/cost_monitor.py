@@ -23,6 +23,7 @@ from prometheus_client import (
     Gauge,
     generate_latest,
 )
+from shared.health import setup_health_checks
 
 try:  # pragma: no cover - kubernetes client optional for tests
     from kubernetes import client, config
@@ -615,6 +616,7 @@ def create_app(config: Optional[CostMonitorConfig] = None) -> FastAPI:
     monitor = CostMonitor(config=config)
     app = FastAPI()
     app.state.monitor = monitor
+    setup_health_checks(app, {"cost_monitor": monitor.status_snapshot})
 
     @app.on_event("startup")
     async def _startup() -> None:
