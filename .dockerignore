@@ -1,0 +1,23 @@
+# Global ignore rules for Docker build contexts rooted at the repository.
+.git
+.gitignore
+**/__pycache__
+*.py[cod]
+*.pyo
+*.pyd
+*.swp
+*.swo
+*.log
+.env
+.env.*
+venv/
+ENV/
+.idea/
+.vscode/
+.eggs/
+*.egg-info/
+dist/
+build/
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache

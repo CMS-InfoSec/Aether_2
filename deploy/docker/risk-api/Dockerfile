@@ -13,11 +13,13 @@ RUN apt-get update \
     && addgroup --system app \
     && adduser --system --ingroup app app
 
-COPY ../../requirements.txt /tmp/requirements.txt
+COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r /tmp/requirements.txt \
     && rm /tmp/requirements.txt
 
+# Copy the repository contents that are needed at runtime. The build context
+# must be the repository root (e.g. `docker build -f deploy/docker/risk-api/Dockerfile .`).
 COPY . .
 RUN chown -R app:app /app
 
