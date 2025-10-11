@@ -183,25 +183,37 @@ def list_kill_events(
 ) -> List[Dict[str, Any]]:
     """Return recent kill switch events for the organisation."""
 
-    _ = actor_account  # ensure dependency is enforced without lint noise
+    start_time = time.perf_counter()
+    outcome_label = "error"
 
-    normalized: str | None = None
-    if account_id is not None:
-        normalized = _normalize_account(account_id)
+    try:
+        _ = actor_account  # ensure dependency is enforced without lint noise
 
-    events = TimescaleAdapter.all_kill_events(account_id=normalized, limit=limit)
+        normalized: str | None = None
+        if account_id is not None:
+            normalized = _normalize_account(account_id)
 
-    response: List[Dict[str, Any]] = []
-    for event in events:
-        response.append(
-            {
-                "account_id": event["account_id"],
-                "reason": event["reason"],
-                "ts": event["ts"].isoformat(),
-                "channels_sent": list(event.get("channels_sent", [])),
-            }
-        )
-    return response
+        events = TimescaleAdapter.all_kill_events(account_id=normalized, limit=limit)
+
+        response: List[Dict[str, Any]] = []
+        for event in events:
+            response.append(
+                {
+                    "account_id": event["account_id"],
+                    "reason": event["reason"],
+                    "ts": event["ts"].isoformat(),
+                    "channels_sent": list(event.get("channels_sent", [])),
+                }
+            )
+
+        outcome_label = "ok"
+        return response
+    finally:
+        duration = time.perf_counter() - start_time
+        try:
+            KILL_SWITCH_RESPONSE_SECONDS.labels(status=outcome_label).observe(duration)
+        except Exception:  # pragma: no cover - defensive guard for optional deps
+            LOGGER.debug("Prometheus histogram unavailable; skipping metric update")
 
 
 @app.get("/metrics")
