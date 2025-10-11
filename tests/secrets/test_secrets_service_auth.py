@@ -41,6 +41,8 @@ def secrets_context(monkeypatch: pytest.MonkeyPatch) -> Generator[SimpleNamespac
     token = "valid-token"
     monkeypatch.setenv("SECRET_ENCRYPTION_KEY", base64.b64encode(b"0" * 32).decode())
     monkeypatch.setenv("KRAKEN_SECRETS_AUTH_TOKENS", f"{token}:admin")
+    monkeypatch.setenv("SECRETS_SERVICE_AUTH_TOKENS", token)
+    monkeypatch.setenv("KRAKEN_SECRETS_MFA_TOKENS", "valid-mfa")
 
     fake_config_module = ModuleType("kubernetes.config")
     fake_config_module.load_incluster_config = lambda: None
@@ -107,7 +109,7 @@ def client(secrets_context: SimpleNamespace) -> TestClient:
 
 
 def _auth_header(token: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {token}"}
+    return {"Authorization": f"Bearer {token}", "X-MFA-Token": "valid-mfa"}
 
 
 def test_store_secret_requires_authorization(client: TestClient) -> None:
@@ -157,6 +159,11 @@ def test_status_endpoint_requires_authorization(client: TestClient) -> None:
 def test_status_endpoint_authorized_success(
     client: TestClient, secrets_context: SimpleNamespace
 ) -> None:
+    client.post(
+        "/secrets/kraken",
+        json={"account_id": "acct", "api_key": "key", "api_secret": "secret"},
+        headers=_auth_header(secrets_context.token),
+    )
     response = client.get(
         "/secrets/kraken/status",
         params={"account_id": "acct"},
