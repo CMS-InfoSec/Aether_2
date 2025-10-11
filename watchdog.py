@@ -46,6 +46,7 @@ from common.schemas.contracts import IntentEvent
 from services.common.adapters import KafkaNATSAdapter
 from services.common.security import require_admin_account
 from shared.account_scope import account_id_column
+from shared.runtime_checks import ensure_insecure_default_flag_disabled
 from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 try:  # pragma: no cover - LightGBM is optional in many environments
@@ -62,10 +63,12 @@ _INSECURE_DEFAULTS_FLAG = "WATCHDOG_ALLOW_INSECURE_DEFAULTS"
 _STATE_DIR_ENV = "WATCHDOG_STATE_DIR"
 _DEFAULT_STATE_DIR = Path(".aether_state/watchdog")
 
+ensure_insecure_default_flag_disabled(_INSECURE_DEFAULTS_FLAG)
 
 def _insecure_defaults_enabled() -> bool:
     flag = os.getenv(_INSECURE_DEFAULTS_FLAG)
     if flag == "1":
+        ensure_insecure_default_flag_disabled(_INSECURE_DEFAULTS_FLAG)
         return True
     if flag == "0":
         return False
