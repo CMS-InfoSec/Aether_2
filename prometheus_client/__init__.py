@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import ModuleType
 from typing import Dict, Iterable, Iterator, List, Mapping, MutableMapping, Tuple
 import sys
+import threading
 
 CONTENT_TYPE_LATEST = "text/plain; version=0.0.4"
 
@@ -361,9 +363,45 @@ def generate_latest(registry: CollectorRegistry | None = None) -> bytes:
     return "\n".join(lines).encode("utf-8")
 
 
-def start_http_server(_port: int, addr: str = "0.0.0.0") -> None:  # pragma: no cover
-    del _port, addr
-    return None
+_HTTP_SERVERS: List["_ThreadingServer"] = []
+
+
+class _ThreadingServer(ThreadingHTTPServer):  # pragma: no cover - exercised in integration tests
+    """Threading HTTP server that holds a registry reference for handlers."""
+
+    def __init__(self, server_address, RequestHandlerClass, *, registry: CollectorRegistry) -> None:
+        self.registry = registry
+        super().__init__(server_address, RequestHandlerClass)
+
+
+def start_http_server(port: int, addr: str = "0.0.0.0", registry: CollectorRegistry | None = None) -> None:
+    """Expose the metrics registry over HTTP similar to the real client."""
+
+    registry = registry or REGISTRY
+
+    class _Handler(BaseHTTPRequestHandler):  # pragma: no cover - behaviour verified via higher-level tests
+        server_version = "PrometheusStub/1.0"
+
+        def do_GET(self) -> None:  # noqa: N802 - signature defined by BaseHTTPRequestHandler
+            if self.path not in {"/", "/metrics"}:
+                self.send_response(404)
+                self.end_headers()
+                return
+
+            payload = generate_latest(getattr(self.server, "registry", REGISTRY))
+            self.send_response(200)
+            self.send_header("Content-Type", CONTENT_TYPE_LATEST)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format: str, *args) -> None:  # noqa: A003 - match base signature
+            return  # suppress stderr noise
+
+    server = _ThreadingServer((addr, port), _Handler, registry=registry)
+    thread = threading.Thread(target=server.serve_forever, name="prometheus-http", daemon=True)
+    thread.start()
+    _HTTP_SERVERS.append(server)
 
 
 _metrics_module = ModuleType("prometheus_client.metrics")
