@@ -10,6 +10,10 @@ from fastapi import APIRouter
 from fastapi.testclient import TestClient
 
 
+_INSTALLED_MODULES: list[tuple[str, types.ModuleType | None, str | None, str | None, object]] = []
+_MISSING = object()
+
+
 def _install_package(name: str) -> types.ModuleType:
     module = types.ModuleType(name)
     module.__path__ = []  # type: ignore[attr-defined]
@@ -18,11 +22,35 @@ def _install_package(name: str) -> types.ModuleType:
 
 
 def _install_module(name: str, module: types.ModuleType) -> None:
-    sys.modules[name] = module
+    previous = sys.modules.get(name)
     package_name, _, attr = name.rpartition(".")
+    package_attr = None
     if package_name:
         package = sys.modules.setdefault(package_name, _install_package(package_name))
+        package_attr = getattr(package, attr, _MISSING)
         setattr(package, attr, module)
+    sys.modules[name] = module
+    _INSTALLED_MODULES.append((name, previous, package_name or None, attr or None, package_attr))
+
+
+def teardown_module(module: types.ModuleType) -> None:  # pragma: no cover - pytest hook
+    del module  # Only used for pytest signature compatibility.
+    while _INSTALLED_MODULES:
+        name, previous, package_name, attr, package_attr = _INSTALLED_MODULES.pop()
+        if previous is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = previous
+        if package_name and attr:
+            package = sys.modules.get(package_name)
+            if package is not None:
+                if package_attr is _MISSING:
+                    try:
+                        delattr(package, attr)
+                    except AttributeError:
+                        pass
+                else:
+                    setattr(package, attr, package_attr)
 
 
 # Stub audit mode wiring to avoid pulling optional dependencies during import.
@@ -351,13 +379,33 @@ def configure_scaling_controller(controller: _ScalingController) -> None:  # pra
     controller.configured = True
 
 
+class _NullGPUManager:
+    async def list_gpu_nodes(self) -> list[str]:  # pragma: no cover - behaviour not under test
+        return []
+
+    async def provision_gpu_pool(self) -> list[str]:  # pragma: no cover - behaviour not under test
+        return []
+
+    async def deprovision_gpu_pool(self) -> None:  # pragma: no cover - behaviour not under test
+        return None
+
+
 scaling_controller_module.build_scaling_controller_from_env = build_scaling_controller_from_env  # type: ignore[attr-defined]
 scaling_controller_module.configure_scaling_controller = configure_scaling_controller  # type: ignore[attr-defined]
 scaling_controller_module.router = APIRouter()
+scaling_controller_module.ScalingController = _ScalingController  # type: ignore[attr-defined]
+scaling_controller_module.NullGPUManager = _NullGPUManager  # type: ignore[attr-defined]
 _install_module("scaling_controller", scaling_controller_module)
 
 
 import app as app_module
+
+
+def _restore_modules() -> None:
+    teardown_module(sys.modules[__name__])
+
+
+_restore_modules()
 
 
 def test_create_app_uses_postgres_repository_when_dsn(monkeypatch: pytest.MonkeyPatch) -> None:

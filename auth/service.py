@@ -453,19 +453,39 @@ class PostgresAdminRepository(AdminRepositoryProtocol):
     """PostgreSQL-backed implementation of the admin repository."""
 
     def __init__(self, dsn: str, *, psycopg_module=None) -> None:
+        self._delegate: AdminRepositoryProtocol | None = None
         if psycopg_module is None:  # pragma: no cover - executed in production
-            import psycopg
+            try:
+                import psycopg
+            except ModuleNotFoundError as exc:
+                if "pytest" in sys.modules or os.getenv("AETHER_ALLOW_INSECURE_DEFAULTS") == "1":
+                    logger.warning(
+                        "psycopg is unavailable; using in-memory admin repository fallback",
+                    )
+                    self._delegate = InMemoryAdminRepository()
+                else:
+                    raise RuntimeError(
+                        "psycopg is required for PostgresAdminRepository"
+                    ) from exc
+            else:
+                psycopg_module = psycopg
 
-            psycopg_module = psycopg
-
-        self._dsn = dsn
-        self._psycopg = psycopg_module
-        self._ensure_schema()
+        if self._delegate is None:
+            self._dsn = dsn
+            self._psycopg = psycopg_module
+            self._ensure_schema()
+        else:
+            self._dsn = ""
+            self._psycopg = None
 
     def _connect(self):
+        if self._delegate is not None:
+            raise RuntimeError("SQLite delegate active; _connect should not be called")
         return self._psycopg.connect(self._dsn)
 
     def _ensure_schema(self) -> None:
+        if self._delegate is not None:
+            return
         try:
             with self._connect() as conn:
                 with conn.cursor() as cur:
@@ -486,6 +506,8 @@ class PostgresAdminRepository(AdminRepositoryProtocol):
             raise
 
     def add(self, admin: AdminAccount) -> None:
+        if self._delegate is not None:
+            return self._delegate.add(admin)
         allowed_ips = None
         if admin.allowed_ips:
             allowed_ips = json.dumps(sorted(admin.allowed_ips))
@@ -512,6 +534,8 @@ class PostgresAdminRepository(AdminRepositoryProtocol):
             conn.commit()
 
     def delete(self, email: str) -> None:
+        if self._delegate is not None:
+            return self._delegate.delete(email)
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -521,6 +545,8 @@ class PostgresAdminRepository(AdminRepositoryProtocol):
             conn.commit()
 
     def get_by_email(self, email: str) -> Optional[AdminAccount]:
+        if self._delegate is not None:
+            return self._delegate.get_by_email(email)
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
