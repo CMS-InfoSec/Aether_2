@@ -26,6 +26,7 @@ class AuditLogEntry:
     id: uuid.UUID
     action: str
     actor_id: str
+    account_id: str
     before: MappingProxyType
     after: MappingProxyType
     correlation_id: Optional[str]
@@ -79,6 +80,12 @@ class AuditLogStore:
         self._backoff_seconds = max(0.0, float(backoff_seconds))
         self._sleep: SleepFn = sleep_fn or time.sleep
 
+    @property
+    def account_id(self) -> str:
+        """Return the account identifier associated with the store."""
+
+        return self._account_id
+
     def _get_backend(self) -> AuditLogBackend:
         if self._backend_impl is None:
             from services.common.adapters import TimescaleAdapter  # local import to avoid cycles
@@ -92,6 +99,7 @@ class AuditLogStore:
             "after": dict(entry.after),
             "correlation_id": entry.correlation_id,
             "entry_id": str(entry.id),
+            "account_id": entry.account_id,
         }
         record = {
             "actor": entry.actor_id,
@@ -99,6 +107,7 @@ class AuditLogStore:
             "target": entry.correlation_id,
             "created_at": entry.created_at,
             "payload": payload,
+            "account_id": entry.account_id,
         }
 
         attempt = 0
@@ -130,16 +139,23 @@ class AuditLogStore:
             correlation_id = payload.get("correlation_id") or raw.get("target")
             created_at = _coerce_datetime(raw.get("created_at"))
             raw_id: Any = payload.get("entry_id") or raw.get("id") or raw.get("log_id")
+            raw_account: Any = raw.get("account_id") or payload.get("account_id")
             try:
                 entry_id = raw_id if isinstance(raw_id, uuid.UUID) else uuid.UUID(str(raw_id))
             except (TypeError, ValueError):
                 entry_id = uuid.uuid4()
 
+            account_id = (
+                str(raw_account)
+                if isinstance(raw_account, (str, uuid.UUID))
+                else self._account_id
+            )
             entries.append(
                 AuditLogEntry(
                     id=entry_id,
                     action=str(raw.get("action", "")),
                     actor_id=str(raw.get("actor", "")),
+                    account_id=account_id,
                     before=before,
                     after=after,
                     correlation_id=correlation_id,
@@ -165,11 +181,13 @@ class TimescaleAuditLogger:
         before: Optional[Dict[str, Any]],
         after: Optional[Dict[str, Any]],
         correlation_id: Optional[str] = None,
+        account_id: Optional[str] = None,
     ) -> AuditLogEntry:
         entry = AuditLogEntry(
             id=uuid.uuid4(),
             action=action,
             actor_id=actor_id,
+            account_id=account_id or self._store.account_id,
             before=MappingProxyType(dict(before or {})),
             after=MappingProxyType(dict(after or {})),
             correlation_id=correlation_id,

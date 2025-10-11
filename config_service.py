@@ -9,7 +9,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Generator, Iterable, List, Mapping, Optional, Set, Tuple
 from types import SimpleNamespace
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
@@ -67,7 +67,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 try:  # pragma: no cover - support alternative namespace packages
-    from services.common.security import require_admin_account
+from services.common.security import require_admin_account
+from shared.audit import AuditLogStore, TimescaleAuditLogger
 except ModuleNotFoundError:  # pragma: no cover - fallback when installed under package namespace
     try:
         from aether.services.common.security import require_admin_account
@@ -90,6 +91,57 @@ except ModuleNotFoundError:  # pragma: no cover - fallback when installed under 
 
 LOGGER = logging.getLogger("config_service")
 _SQLITE_FALLBACK_FLAG = "CONFIG_ALLOW_SQLITE_FOR_TESTS"
+
+
+_CONFIG_AUDIT_LOGGERS: Dict[str, TimescaleAuditLogger] = {}
+_DEFAULT_CONFIG_AUDIT_ACCOUNT = "aether-audit"
+
+
+def _config_audit_logger(account_id: str) -> TimescaleAuditLogger:
+    normalized = (account_id or "").strip() or _DEFAULT_CONFIG_AUDIT_ACCOUNT
+    logger_instance = _CONFIG_AUDIT_LOGGERS.get(normalized)
+    if logger_instance is None:
+        store = AuditLogStore(account_id=normalized)
+        logger_instance = TimescaleAuditLogger(store)
+        _CONFIG_AUDIT_LOGGERS[normalized] = logger_instance
+    return logger_instance
+
+
+def _log_config_audit(
+    *,
+    account_id: str,
+    actor: str,
+    action: str,
+    entity: str,
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    client_ip: Optional[str],
+    failure_message: str,
+) -> None:
+    logger_instance = _config_audit_logger(account_id)
+    before_payload = dict(before)
+    after_payload = dict(after)
+    if client_ip:
+        after_payload = dict(after_payload)
+        after_payload.setdefault("client_ip", client_ip)
+    try:
+        logger_instance.record(
+            action=action,
+            actor_id=actor,
+            before=before_payload,
+            after=after_payload,
+            correlation_id=entity,
+            account_id=account_id,
+        )
+    except Exception:  # pragma: no cover - audit logging must not block config changes
+        LOGGER.exception(
+            failure_message,
+            extra={
+                "account_id": account_id,
+                "actor": actor,
+                "entity": entity,
+            },
+        )
 
 
 if not _SQLALCHEMY_AVAILABLE:
@@ -621,6 +673,7 @@ def update_config(
                 "required_approvals": required_approvals,
             }
             _log_config_audit(
+                account_id=account_id,
                 actor=admin_account,
                 action="config.change.requested",
                 entity=entity,
@@ -656,6 +709,7 @@ def update_config(
         )
 
         _log_config_audit(
+            account_id=account_id,
             actor=admin_account,
             action="config.change.approved",
             entity=entity,
@@ -686,6 +740,7 @@ def update_config(
     )
 
     _log_config_audit(
+        account_id=account_id,
         actor=admin_account,
         action="config.change.applied",
         entity=entity,

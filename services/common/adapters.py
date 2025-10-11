@@ -604,8 +604,7 @@ class _TimescaleStore:
         payload_json = _json_dumps(stored)
         sql = (
             f"INSERT INTO {table} (id, payload, recorded_at) VALUES (%s, %s::jsonb, %s)"
-            " ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload,"
-            " recorded_at = EXCLUDED.recorded_at"
+            " ON CONFLICT (id) DO NOTHING"
         )
         self._with_retry(
             lambda conn: self._execute(conn, sql, (str(entry_id), payload_json, created_at))

@@ -38,6 +38,7 @@ from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from services.common.security import require_admin_account
+from shared.audit import AuditLogStore, TimescaleAuditLogger
 from shared.postgres import normalize_sqlalchemy_dsn
 from shared.pydantic_compat import model_dump
 
@@ -50,6 +51,11 @@ except Exception:  # pragma: no cover - gracefully degrade when MLflow absent.
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+_TRAINING_AUDIT_LOGGER = TimescaleAuditLogger(
+    AuditLogStore(account_id="training-service")
+)
 
 
 def _resolve_artifact_root(raw: str | None, *, default: Path) -> Path:
@@ -964,6 +970,26 @@ async def start_training(
     )
     payload = TrainingStartResponse(run_id=run_id, correlation_id=correlation_id, status="queued")
     setattr(payload, "status_code", status.HTTP_202_ACCEPTED)
+    before_snapshot = request.model_dump(mode="json")
+    before_snapshot["correlation_id"] = correlation_id
+    after_snapshot = payload.model_dump(mode="json")
+    try:
+        _TRAINING_AUDIT_LOGGER.record(
+            action="training.run.started",
+            actor_id=actor,
+            before=before_snapshot,
+            after=after_snapshot,
+            correlation_id=run_id,
+        )
+    except Exception:  # pragma: no cover - audit logging must not block training runs
+        logger.exception(
+            "Failed to record audit log for training start",
+            extra={
+                "run_id": run_id,
+                "actor": actor,
+                "correlation_id": correlation_id,
+            },
+        )
     return payload
 
 
@@ -1036,12 +1062,33 @@ async def promote_model(
         request.stage,
         extra={"correlation_id": correlation_id, "requested_by": actor},
     )
-    return PromotionResponse(
+    response = PromotionResponse(
         run_id=request.model_run_id,
         stage=request.stage,
         status="promoted",
         correlation_id=correlation_id,
     )
+    before_snapshot = {"model_run_id": request.model_run_id, "target_stage": request.stage}
+    after_snapshot = response.model_dump(mode="json")
+    after_snapshot["metrics"] = metrics
+    try:
+        _TRAINING_AUDIT_LOGGER.record(
+            action="training.run.promoted",
+            actor_id=actor,
+            before=before_snapshot,
+            after=after_snapshot,
+            correlation_id=request.model_run_id,
+        )
+    except Exception:  # pragma: no cover - audit logging must not block promotions
+        logger.exception(
+            "Failed to record audit log for model promotion",
+            extra={
+                "model_run_id": request.model_run_id,
+                "actor": actor,
+                "correlation_id": correlation_id,
+            },
+        )
+    return response
 
 
 @app.get("/ml/train/status", response_model=StatusResponse)

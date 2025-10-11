@@ -4,6 +4,9 @@ import pytest
 
 import sys
 import types
+import uuid
+from dataclasses import replace
+from types import MappingProxyType
 from typing import Any, Mapping
 
 if "cryptography" not in sys.modules:
@@ -36,7 +39,12 @@ if "cryptography" not in sys.modules:
     sys.modules["cryptography.hazmat.primitives.ciphers.aead"] = aead_mod
 
 from services.common.adapters import TimescaleAdapter
-from shared.audit import AuditLogStore, SensitiveActionRecorder, TimescaleAuditLogger
+from shared.audit import (
+    AuditLogEntry,
+    AuditLogStore,
+    SensitiveActionRecorder,
+    TimescaleAuditLogger,
+)
 
 
 class _FlakyBackend:
@@ -72,6 +80,7 @@ def test_audit_log_entries_are_immutable():
 
     entries = list(store.all())
     assert entries[0] == entry
+    assert entries[0].account_id == "immutable"
 
 
 def test_audit_log_store_persists_entries_across_instances():
@@ -91,6 +100,7 @@ def test_audit_log_store_persists_entries_across_instances():
     persisted = list(fresh_store.all())
 
     assert persisted == [entry]
+    assert persisted[0].account_id == "persistence"
     with pytest.raises(TypeError):
         persisted[0].before["feature"] = True
 
@@ -114,3 +124,43 @@ def test_audit_log_store_retries_transient_errors():
 
     assert backend.attempts == 2
     assert list(store.all()) == [entry]
+
+
+class _AppendOnlyBackend:
+    def __init__(self) -> None:
+        self.records: dict[str, Mapping[str, Any]] = {}
+
+    def record_audit_log(self, record: Mapping[str, Any]) -> None:
+        entry_id = str(record.get("id"))
+        if entry_id in self.records:
+            return
+        self.records[entry_id] = dict(record)
+
+    def audit_logs(self) -> list[Mapping[str, Any]]:
+        return [dict(value) for value in self.records.values()]
+
+
+def test_audit_log_entries_are_append_only():
+    backend = _AppendOnlyBackend()
+    store = AuditLogStore(account_id="append-only", backend=backend)
+
+    entry_id = uuid.uuid4()
+    original = AuditLogEntry(
+        id=entry_id,
+        action="trade.submit",
+        actor_id="desk-1",
+        account_id="append-only",
+        before=MappingProxyType({"intent": "buy"}),
+        after=MappingProxyType({"status": "submitted"}),
+        correlation_id="order-1",
+    )
+    tampered = replace(
+        original,
+        after=MappingProxyType({"status": "cancelled"}),
+    )
+
+    store.append(original)
+    store.append(tampered)
+
+    entries = list(store.all())
+    assert entries == [original]

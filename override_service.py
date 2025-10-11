@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from shared.account_scope import account_id_column
+from shared.audit import AuditLogStore, TimescaleAuditLogger
 from shared.audit_hooks import AuditEvent, load_audit_hooks
 from shared.postgres import normalize_sqlalchemy_dsn
 
@@ -51,6 +52,20 @@ _POOL_SIZE_ENV = "OVERRIDE_DB_POOL_SIZE"
 _MAX_OVERFLOW_ENV = "OVERRIDE_DB_MAX_OVERFLOW"
 _POOL_TIMEOUT_ENV = "OVERRIDE_DB_POOL_TIMEOUT"
 _POOL_RECYCLE_ENV = "OVERRIDE_DB_POOL_RECYCLE"
+
+
+_OVERRIDE_AUDIT_LOGGERS: Dict[str, TimescaleAuditLogger] = {}
+_DEFAULT_OVERRIDE_AUDIT_ACCOUNT = "aether-audit"
+
+
+def _override_audit_logger(account_id: str) -> TimescaleAuditLogger:
+    normalized = (account_id or "").strip() or _DEFAULT_OVERRIDE_AUDIT_ACCOUNT
+    logger_instance = _OVERRIDE_AUDIT_LOGGERS.get(normalized)
+    if logger_instance is None:
+        store = AuditLogStore(account_id=normalized)
+        logger_instance = TimescaleAuditLogger(store)
+        _OVERRIDE_AUDIT_LOGGERS[normalized] = logger_instance
+    return logger_instance
 
 
 Base = declarative_base()
@@ -251,6 +266,34 @@ def record_override(
             f"Audit logging disabled; skipping override.human_decision for {payload.intent_id}"
         ),
     )
+
+    audit_logger = _override_audit_logger(normalized_account)
+    before_snapshot = {"intent_id": payload.intent_id, "account_id": normalized_account}
+    after_snapshot = {
+        "decision": payload.decision.value,
+        "reason": payload.reason,
+        "account_id": normalized_account,
+        "actor": admin_account,
+        "recorded_at": entry.ts.isoformat(),
+    }
+    try:
+        audit_logger.record(
+            action="override.human_decision",
+            actor_id=admin_account,
+            before=before_snapshot,
+            after=after_snapshot,
+            correlation_id=payload.intent_id,
+            account_id=normalized_account,
+        )
+    except Exception:  # pragma: no cover - override logging must not fail request
+        LOGGER.exception(
+            "Failed to persist override audit log",
+            extra={
+                "intent_id": payload.intent_id,
+                "account_id": normalized_account,
+                "actor": admin_account,
+            },
+        )
 
     session.refresh(entry)
     return OverrideRecord.model_validate(entry)
