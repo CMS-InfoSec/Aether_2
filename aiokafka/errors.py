@@ -1,7 +1,11 @@
-"""Error types mirrored from :mod:`aiokafka.errors` for test environments."""
+"""Proxy to :mod:`aiokafka.errors`."""
 
-class KafkaError(Exception):
-    """Base error raised by the aiokafka compatibility layer."""
+from __future__ import annotations
 
+from shared.dependency_loader import load_dependency
 
-__all__ = ["KafkaError"]
+_real_errors = load_dependency(
+    "aiokafka.errors", install_hint="pip install aiokafka"
+)
+
+globals().update(vars(_real_errors))

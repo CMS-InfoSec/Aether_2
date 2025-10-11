@@ -1,9 +1,11 @@
-"""Starlette request compatibility shims for environments without Starlette."""
+"""Proxy to :mod:`starlette.requests`."""
 
 from __future__ import annotations
 
-from services.common.fastapi_stub import Request as _Request
+from shared.dependency_loader import load_dependency
 
-__all__ = ["Request"]
+_real_requests = load_dependency(
+    "starlette.requests", install_hint="pip install starlette"
+)
 
-Request = _Request
+globals().update(vars(_real_requests))

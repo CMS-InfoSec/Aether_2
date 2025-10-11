@@ -1,23 +1,11 @@
-"""Minimal Starlette datastructures for middleware stubs."""
+"""Proxy to :mod:`starlette.datastructures` from the real package."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Iterable, Mapping
+from shared.dependency_loader import load_dependency
 
-__all__ = ["Headers"]
+_real_datastructures = load_dependency(
+    "starlette.datastructures", install_hint="pip install starlette"
+)
 
-
-@dataclass
-class Headers:
-    """Simplified representation of the ASGI headers mapping."""
-
-    items: Mapping[str, str] | Iterable[tuple[str, str]]
-
-    def get(self, key: str, default: str | None = None) -> str | None:
-        if isinstance(self.items, Mapping):
-            return self.items.get(key, default)
-        for candidate, value in self.items:
-            if candidate.lower() == key.lower():
-                return value
-        return default
+globals().update(vars(_real_datastructures))

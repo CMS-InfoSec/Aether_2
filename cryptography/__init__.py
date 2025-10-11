@@ -1,5 +1,11 @@
-"""Lightweight cryptography compatibility package for dependency-light tests."""
+"""Proxy to the real :mod:`cryptography` package."""
 
-from .fernet import Fernet, InvalidToken
+from __future__ import annotations
 
-__all__ = ["Fernet", "InvalidToken"]
+from shared.dependency_loader import load_dependency
+
+_real_crypto = load_dependency(
+    "cryptography", install_hint="pip install cryptography"
+)
+
+globals().update(vars(_real_crypto))

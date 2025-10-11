@@ -1,34 +1,11 @@
-"""Small stub of Starlette's :mod:`trustedhost` middleware."""
+"""Proxy to :mod:`starlette.middleware.trustedhost`."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Iterable, Sequence
+from shared.dependency_loader import load_dependency
 
-__all__ = ["TrustedHostMiddleware"]
+_real_trustedhost = load_dependency(
+    "starlette.middleware.trustedhost", install_hint="pip install starlette"
+)
 
-
-def _normalize_hosts(hosts: Iterable[str] | None, *, default: Sequence[str]) -> tuple[str, ...]:
-    if hosts is None:
-        return tuple(default)
-    return tuple(str(host) for host in hosts)
-
-
-@dataclass
-class TrustedHostMiddleware:
-    """Records configuration for tests without performing any filtering."""
-
-    app: object | None = None
-    allowed_hosts: tuple[str, ...] = ("*",)
-    disallowed_hosts: tuple[str, ...] = ()
-
-    def __init__(
-        self,
-        app: object,
-        *,
-        allowed_hosts: Iterable[str] | None = None,
-        disallowed_hosts: Iterable[str] | None = None,
-    ) -> None:
-        self.app = app
-        self.allowed_hosts = _normalize_hosts(allowed_hosts, default=("*",))
-        self.disallowed_hosts = _normalize_hosts(disallowed_hosts, default=())
+globals().update(vars(_real_trustedhost))

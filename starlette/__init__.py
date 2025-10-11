@@ -1,9 +1,11 @@
-"""Minimal Starlette compatibility layer for tests."""
+"""Delegate to the upstream Starlette package with informative errors."""
 
 from __future__ import annotations
 
-from services.common.fastapi_stub import status as _status
+from shared.dependency_loader import load_dependency
 
-status = _status
+_real_starlette = load_dependency(
+    "starlette", install_hint="pip install starlette"
+)
 
-__all__ = ["status"]
+globals().update(vars(_real_starlette))
