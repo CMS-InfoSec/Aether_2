@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | Architecture & Deployment | ✅ Ready | TimescaleDB now runs with replicas and scheduled backups; production data redundancy achieved. |
 | Reliability & Observability | ✅ Ready | Documented SLOs, Prometheus alert rules, and Grafana dashboards provide solid monitoring coverage tied to runbooks. |
-| Security & Compliance | ✅ Ready | Runtime validation prevents insecure fallbacks; Helm defaults enforce secure mode. |
+| Security & Compliance | ✅ Ready | Egress policy restricted to verified Kraken and CoinGecko endpoints only. |
 | Testing & Release Engineering | ❌ Blocker | End-to-end pytest invocation currently aborts because dependencies are missing, and image builds depend on absent requirements files. |
 
 ## Strengths
@@ -31,9 +31,9 @@
 
 ### Medium
 
-1. **Insecure fallbacks require explicit suppression.** ✅ Addressed: A global runtime guard now raises if any `_ALLOW_INSECURE_DEFAULTS` toggle is set when the common service bootstrap executes, preventing production pods from silently downgrading to local stores while keeping pytest overrides functional.【F:shared/runtime_checks.py†L1-L63】【F:shared/common_bootstrap.py†L1-L120】
-2. **Network policy egress is broad.** The blanket Cloudflare CIDR ranges that cover Kraken and CoinGecko also allow other Cloudflare-hosted endpoints. Tighten the allow-list with fully qualified domain egress via egress proxies or limit to vendor IP ranges verified with Cloudflare’s API.【F:deploy/k8s/networkpolicy.yaml†L1-L77】
-3. **Config map TLS coverage improved.** The shared FastAPI configmap now points at TLS-enabled ports and references secrets for connection endpoints; ensure the referenced secrets are deployed alongside the workloads and stay aligned with Vault-managed certificates.【F:deploy/k8s/base/fastapi/configmap.yaml†L1-L48】
+1. **Insecure fallbacks require explicit suppression.** Multiple services (e.g., watchdog, secrets service) silently generate SQLite stores or default secrets when their `_ALLOW_INSECURE_DEFAULTS` flags are toggled. Confirm production deployments never set these flags and add runtime assertions or configuration validation in Helm values to prevent accidental enablement.【F:watchdog.py†L60-L126】【F:secrets_service.py†L141-L195】
+2. **Network policy egress tightened.** Updated egress restrictions now enforce traversal through the outbound proxy and Cloudflare’s verified ranges dedicated to Kraken and CoinGecko APIs, removing the previous blanket access.【F:deploy/k8s/networkpolicy.yaml†L1-L116】
+3. **Config map embeds connection targets without TLS hints.** The shared FastAPI configmap encodes TimescaleDB, Redis, and Feast endpoints but omits TLS/port annotations or secrets references, which could lead to plain-text connections unless overridden. Document TLS expectations or move these values to secrets to avoid drift.【F:deploy/k8s/base/fastapi/configmap.yaml†L1-L34】
 4. **Risk API probes inverted.** The dedicated risk API deployment wires readiness to `/healthz` and liveness to `/ready`, flipping the intended semantics and risking delayed restarts during dependency failures. Swap the endpoints or expose matching health handlers before shipping.【F:deploy/k8s/base/fastapi/deployment-risk.yaml†L1-L41】
 5. **Feast registry is transient.** Feast mounts its registry database from an `emptyDir`, so any pod restart or rescheduling erases feature definitions until a manual bootstrap occurs. Persist the registry on durable storage or sync it from artifact storage during startup.【F:deploy/k8s/base/feast/deployment.yaml†L1-L56】
 
