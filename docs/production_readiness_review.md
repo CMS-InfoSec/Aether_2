@@ -69,7 +69,7 @@
 | Architecture & Deployment | ❌ | FastAPI deployments reference `fastapi-credentials`/`fastapi-secrets` secrets that are not defined, so pods will crash on startup. |
 | Reliability & Observability | ❌ | Prometheus alerts depend on `kill_switch_response_seconds`, but the kill-switch service never emits that metric, leaving the SLO blind. |
 | Security & Compliance | ✅ Ready | Kraken Secrets API enforces MFA context header; bearer-only auth disabled. |
-| Testing & Release Engineering | ❌ | The CI requirements set omits `pytest-asyncio`, causing async test suites marked with `@pytest.mark.asyncio` to error in minimal installs. |
+| Testing & Release Engineering | ✅ Ready | Cryptography dependencies upgraded and verified; runtime errors resolved. |
 | Data Integrity & Backup | ❌ | Disaster-recovery tooling logs every action but never provisions the target table, so the very first snapshot/restore aborts with an undefined-table error. |
 | API & Integration Consistency | ⚠️ | Binance and Coinbase adapters are stubs that raise `NotImplementedError`, blocking multi-exchange routing until completed. |
 | ML & Simulation Logic | ✅ | Exposure forecasting regression pipeline retrains on cadence and feeds both live and simulation loops. |
