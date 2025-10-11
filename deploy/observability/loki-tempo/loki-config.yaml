@@ -34,5 +34,9 @@ data:
         cache_location: /loki/cache
       filesystem:
         directory: /loki/chunks
+    limits_config:
+      retention_period: 21d
+      reject_old_samples: true
+      reject_old_samples_max_age: 168h
     ruler:
       alertmanager_url: http://prometheus:9093

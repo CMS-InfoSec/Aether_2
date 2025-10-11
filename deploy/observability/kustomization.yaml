@@ -5,6 +5,7 @@ resources:
   - prometheus
   - grafana
   - loki-tempo
+  - logging
 commonLabels:
   app.kubernetes.io/part-of: aether-observability
 

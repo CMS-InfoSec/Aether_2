@@ -1,0 +1,6 @@
+resources:
+  - fluent-bit-serviceaccount.yaml
+  - fluent-bit-clusterrole.yaml
+  - fluent-bit-clusterrolebinding.yaml
+  - fluent-bit-configmap.yaml
+  - fluent-bit-daemonset.yaml
