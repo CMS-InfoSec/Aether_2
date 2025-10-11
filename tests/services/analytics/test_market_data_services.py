@@ -43,6 +43,8 @@ def _load_module(module_name: str, relative_path: str):
 
 
 os.environ.setdefault("SESSION_REDIS_URL", "memory://signal-service-tests")
+os.environ.setdefault("ANALYTICS_ALLOW_INSECURE_DEFAULTS", "1")
+os.environ["MARKET_DATA_USE_LOCAL_STORE"] = "1"
 
 _load_module("services", "services/__init__.py")
 _load_module("services.common", "services/common/__init__.py")
@@ -68,7 +70,11 @@ def _reload_signal_service():
     sys.modules.pop(module_name, None)
     return _load_module(module_name, "services/analytics/signal_service.py")
 
-from services.analytics.market_data_store import TimescaleMarketDataAdapter
+from services.analytics.market_data_store import (
+    TimescaleMarketDataAdapter,
+    seed_local_market_data,
+    using_local_market_data,
+)
 
 FIXTURE_PATH = Path(__file__).resolve().parent.parent.parent / "fixtures" / "market_data" / "signal_service_fixture.json"
 
@@ -91,6 +97,11 @@ def fixture_payload() -> dict:
 
 @pytest.fixture()
 def market_data_dsn(tmp_path, fixture_payload: dict):
+    if using_local_market_data():
+        seed_local_market_data(fixture_payload)
+        yield "local+json://signal-market-data"
+        return
+
     database_path = tmp_path / "signal-timescale.db"
     dsn = f"sqlite:///{database_path}"
     engine = create_engine(dsn, future=True)
@@ -249,6 +260,14 @@ def test_signal_routes_allow_admin(signal_client: TestClient, signal_admin_heade
 
 @pytest.fixture()
 def crossasset_client(fixture_payload: dict):
+    if getattr(crossasset_service, "USE_LOCAL_STORE", False) or os.getenv("MARKET_DATA_USE_LOCAL_STORE") == "1":
+        crossasset_service.USE_LOCAL_STORE = True
+        crossasset_service.seed_local_series(fixture_payload["bars"])
+        series, _ = crossasset_service.LOCAL_STORE.load_series("USDT/USD", 5)
+        assert abs(series[-1] - 1.0) < 0.2
+        assert crossasset_service.USE_LOCAL_STORE is True
+        return TestClient(crossasset_service.app)
+
     engine = create_engine(
         "sqlite://",
         future=True,
@@ -411,6 +430,7 @@ def test_signal_crossasset_rejects_non_spot(signal_client: TestClient, signal_ad
 def test_signal_service_requires_dsn(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("SIGNAL_DATABASE_URL", raising=False)
     monkeypatch.delenv("TIMESCALE_DSN", raising=False)
+    monkeypatch.setenv("MARKET_DATA_USE_LOCAL_STORE", "0")
     module = _reload_signal_service()
     with pytest.raises(RuntimeError, match="SIGNAL_DATABASE_URL or TIMESCALE_DSN"):
         with TestClient(module.app):
@@ -466,6 +486,7 @@ def test_signal_service_rejects_memory_session_store_without_pytest(
 
 def test_signal_service_normalises_timescale_dsn(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("SIGNAL_DATABASE_URL", "timescale://user:pass@localhost:5432/analytics")
+    monkeypatch.setenv("MARKET_DATA_USE_LOCAL_STORE", "0")
     module = _reload_signal_service()
     resolved = module._resolve_market_data_dsn()
     assert resolved.startswith("postgresql+psycopg2://")

@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import json
 import logging
+import importlib
 import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
+
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
 
 try:  # pragma: no cover - FastAPI is optional in some unit tests
     from fastapi import APIRouter, Depends, Query
@@ -20,7 +25,7 @@ except ImportError:  # pragma: no cover - fallback when FastAPI is stubbed out
 
 from services.common.security import require_admin_account
 from services.reports.report_service import compute_daily_return_pct
-from services.risk import portfolio_risk
+portfolio_risk = importlib.import_module("services.risk.portfolio_risk")
 from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 

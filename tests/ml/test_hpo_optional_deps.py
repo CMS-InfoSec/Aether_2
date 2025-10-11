@@ -226,6 +226,7 @@ def _install_dependency_stubs(
 
 def test_optuna_runner_requires_numpy(monkeypatch: pytest.MonkeyPatch) -> None:
     module_name = "tests.ml.hpo_missing_numpy"
+    monkeypatch.setenv("ML_ALLOW_INSECURE_DEFAULTS", "0")
     _install_dependency_stubs(monkeypatch, missing=frozenset({"numpy"}))
 
     module = _load_optuna_module(module_name)
@@ -239,6 +240,7 @@ def test_optuna_runner_requires_numpy(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_optuna_runner_requires_pandas(monkeypatch: pytest.MonkeyPatch) -> None:
     module_name = "tests.ml.hpo_missing_pandas"
+    monkeypatch.setenv("ML_ALLOW_INSECURE_DEFAULTS", "0")
     _install_dependency_stubs(monkeypatch, missing=frozenset({"pandas"}))
 
     module = _load_optuna_module(module_name)
@@ -259,6 +261,7 @@ def test_optuna_runner_requires_pandas(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_optuna_runner_requires_optuna(monkeypatch: pytest.MonkeyPatch) -> None:
     module_name = "tests.ml.hpo_missing_optuna"
+    monkeypatch.setenv("ML_ALLOW_INSECURE_DEFAULTS", "0")
     _install_dependency_stubs(monkeypatch, missing=frozenset({"optuna"}))
 
     module = _load_optuna_module(module_name)

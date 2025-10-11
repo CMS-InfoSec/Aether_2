@@ -3,6 +3,19 @@ global:
   ingressClassName: nginx
   tls:
     issuer: letsencrypt-production
+  ingressSecurity:
+    enforceHttps: true
+    hsts:
+      enabled: true
+      maxAge: 31536000
+      includeSubdomains: true
+      preload: true
+    headers:
+      Content-Security-Policy: "default-src 'self'; frame-ancestors 'none'; img-src 'self' data:; object-src 'none'"
+      Referrer-Policy: "no-referrer"
+      X-Content-Type-Options: "nosniff"
+      X-Frame-Options: "DENY"
+      X-XSS-Protection: "1; mode=block"
   krakenSecrets:
     enabled: true
     basePath: /var/run/secrets/kraken

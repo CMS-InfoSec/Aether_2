@@ -29,6 +29,8 @@ import sys
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
+from shared.account_scope import SQLALCHEMY_AVAILABLE as _ACCOUNT_SCOPE_AVAILABLE, account_id_column
+
 _SQLALCHEMY_AVAILABLE = True
 
 try:  # pragma: no cover - optional dependency used in production
@@ -234,7 +236,7 @@ def _get_in_memory_db(url: str) -> _InMemoryBehaviorDatabase:
     return db
 
 
-if _SQLALCHEMY_AVAILABLE:
+if _SQLALCHEMY_AVAILABLE and _ACCOUNT_SCOPE_AVAILABLE:
 
     class BehaviorLog(Base):
         """SQLAlchemy model backing the ``behavior_log`` table."""
@@ -244,7 +246,7 @@ if _SQLALCHEMY_AVAILABLE:
             __table_args__ = {"schema": DATABASE_SCHEMA}
 
         id = Column(Integer, primary_key=True, autoincrement=True)
-        account_id = Column(String, nullable=False, index=True)
+        account_id = account_id_column(index=True)
         anomaly_type = Column(String, nullable=False)
         details_json = Column(JSON, nullable=False, default=dict)
         ts = Column(DateTime(timezone=True), nullable=False, index=True)

@@ -59,6 +59,7 @@ from shared.exits import compute_exit_targets
 from shared.pydantic_compat import model_dump
 from shared.graceful_shutdown import flush_logging_handlers, setup_graceful_shutdown
 from shared.spot import filter_spot_symbols, is_spot_symbol, normalize_spot_symbol
+from shared.account_scope import account_id_column
 
 
 logger = logging.getLogger(__name__)
@@ -127,7 +128,7 @@ class AccountRiskUsage(Base):
 
     __tablename__ = "account_risk_usage"
 
-    account_id = Column(String, primary_key=True)
+    account_id = account_id_column(primary_key=True)
     realized_daily_loss = Column(
         Numeric(precision=NUMERIC_PRECISION, scale=NUMERIC_SCALE),
         nullable=False,
@@ -154,7 +155,7 @@ class PositionSizeLog(Base):
     __tablename__ = "position_size_log"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    account_id = Column(String, nullable=False, index=True)
+    account_id = account_id_column(index=True)
     symbol = Column(String, nullable=False)
     volatility = Column(Float, nullable=False)
     size = Column(Float, nullable=False)
@@ -181,7 +182,7 @@ class AccountRiskLimit(Base):
 
     __tablename__ = "account_risk_limits"
 
-    account_id = Column(String, primary_key=True)
+    account_id = account_id_column(primary_key=True)
     max_daily_loss = Column(Numeric(precision=NUMERIC_PRECISION, scale=NUMERIC_SCALE), nullable=False)
     fee_budget = Column(Numeric(precision=NUMERIC_PRECISION, scale=NUMERIC_SCALE), nullable=False)
     max_nav_pct_per_trade = Column(
