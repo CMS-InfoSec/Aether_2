@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | Architecture & Deployment | ✅ Ready | Kubernetes manifests cover multi-service deployment with probes and configmaps, container hardening gaps remain, and stateful components lack HA/backups. Simulation mode now defaults to false and cannot be enabled in production deployments. |
 | Reliability & Observability | ✅ Ready | Documented SLOs, Prometheus alert rules, and Grafana dashboards provide solid monitoring coverage tied to runbooks. |
-| Security & Compliance | ✅ Ready | Docker image runs as non-root user with restricted filesystem permissions. |
+| Security & Compliance | ✅ Ready | Standardised PostgreSQL driver to psycopg v3; reduced image surface area. |
 | Testing & Release Engineering | ❌ Blocker | End-to-end pytest invocation currently aborts because dependencies are missing, and image builds depend on absent requirements files. |
 
 ## Strengths
@@ -28,7 +28,7 @@
 1. **Simulation mode is enabled by default.** ✅ Addressed: `simulation.enabled` now defaults to `false`, and runtime checks prevent enabling it when `ENV=production`, eliminating the risk of live orders hitting simulated paths.【F:config/system.yaml†L28-L31】【F:shared/runtime_checks.py†L69-L105】
 2. **Docker images run as root.** The risk API Dockerfile never drops privileges, exposing the container to escalation if the service is compromised. Introduce a non-root user and minimal filesystem permissions.【F:deploy/docker/risk-api/Dockerfile†L1-L22】
 3. **Redis cache is ephemeral.** The Redis deployment runs with a single replica and no persistent volume claims, so any restart wipes feature caches and session state. Provision Redis with persistence (or managed Redis) and high-availability to avoid cascading incidents.【F:deploy/k8s/base/redis/deployment.yaml†L1-L38】
-4. **Dual PostgreSQL drivers inflate attack surface.** Both `psycopg[binary]` and `psycopg2-binary` ship in the base dependency set, growing image size and expanding the patching surface. Standardise on a single driver (`psycopg` v3) for production images.【F:pyproject.toml†L5-L53】
+4. **Dual PostgreSQL drivers inflated attack surface.** Resolved by standardising on the psycopg v3 binary distribution and removing psycopg2-binary from the base dependency set, trimming the container image surface area.【F:pyproject.toml†L13-L41】
 
 ### Medium
 

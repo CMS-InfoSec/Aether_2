@@ -16,6 +16,7 @@ dependencies = [
     "boto3==1.40.45",
     "alembic==1.16.5",
     "sqlalchemy==2.0.43",
+    # Standardise on psycopg v3 binary distribution.
     "psycopg[binary]==3.2.10",
     "asyncpg==0.30.0",
     "timescale-vector==0.0.7",
