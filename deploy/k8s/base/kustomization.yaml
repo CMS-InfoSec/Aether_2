@@ -15,6 +15,9 @@ resources:
   - secrets/external-secrets.yaml
   - secrets/fastapi-credentials-external-secret.yaml
   - secrets/fastapi-secrets-external-secret.yaml
+  - secrets/secrets-service-config-external-secret.yaml
+  - secrets/kraken-keys-external-secrets.yaml
+  - secrets/fastapi-tls-external-secrets.yaml
   - ingress
   - networkpolicies
   - aether-services
