@@ -14,10 +14,22 @@ from statistics import mean
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, MutableMapping, Optional, Sequence
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from psycopg2 import sql
-from psycopg2.extras import RealDictCursor
+try:  # pragma: no cover - prefer the real driver when available
+    from psycopg2 import sql
+    from psycopg2.extras import RealDictCursor
+except Exception:  # pragma: no cover - dependency-light environments
+    sql = None  # type: ignore[assignment]
+
+    class RealDictCursor:  # type: ignore[empty-body]
+        """Placeholder cursor used when psycopg2 is unavailable."""
+
+        pass
 
 from reports.storage import ArtifactStorage, StoredArtifact, TimescaleSession as StorageSession, build_storage_from_env
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
 from services.common.config import TimescaleSession, get_timescale_session
 from services.common.security import ensure_admin_access
 
@@ -118,6 +130,9 @@ class ReportService:
 
     @contextmanager
     def _session(self) -> Iterator[RealDictCursor]:
+        if sql is None:
+            raise RuntimeError("psycopg2 is required for report persistence")
+
         import psycopg2
 
         conn = psycopg2.connect(self._timescale.dsn)

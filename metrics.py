@@ -6,7 +6,10 @@ from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Any, Awaitable, Callable, Dict, Generator, Optional
+import logging
+import os
+from types import SimpleNamespace
+from typing import Any, Awaitable, Callable, Dict, Generator, Iterable, Optional
 from uuid import uuid4
 
 from fastapi import FastAPI, Request, Response
@@ -19,43 +22,133 @@ try:  # pragma: no cover - prometheus client may be unavailable in lightweight t
         Gauge,
         Histogram,
         generate_latest,
+        start_http_server,
     )
 except ImportError:  # pragma: no cover - provide a no-op metrics backend
     CONTENT_TYPE_LATEST = "text/plain; version=0.0.4"  # type: ignore[assignment]
 
     class CollectorRegistry:  # type: ignore[override]
-        pass
+        """Lightweight registry compatible with the Prometheus client interface."""
+
+        def __init__(self) -> None:
+            self._collectors: Dict[int, object] = {}
+            self._names_to_collectors: Dict[str, object] = {}
+
+        def register(self, collector: object) -> None:
+            self._collectors[id(collector)] = collector
+            name = getattr(collector, "_name", None)
+            if isinstance(name, str):
+                self._names_to_collectors[name] = collector
+
+        def unregister(self, collector: object) -> None:
+            self._collectors.pop(id(collector), None)
+            name = getattr(collector, "_name", None)
+            if isinstance(name, str):
+                self._names_to_collectors.pop(name, None)
+
+        def collect(self):  # pragma: no cover - used in optional dependency paths
+            for collector in list(self._collectors.values()):
+                if hasattr(collector, "collect"):
+                    yield from collector.collect()
+
+        def get_sample_value(
+            self, name: str, labels: Optional[Dict[str, str]] = None
+        ) -> float | None:
+            collector = self._names_to_collectors.get(name)
+            if collector is None:
+                for candidate in self._collectors.values():
+                    if getattr(candidate, "_name", None) == name:
+                        collector = candidate
+                        break
+            if collector is None or not hasattr(collector, "collect"):
+                return None
+            for family in collector.collect():
+                samples = getattr(family, "samples", [])
+                for sample in samples:
+                    if labels:
+                        if all(sample.labels.get(k) == v for k, v in labels.items()):
+                            return sample.value
+                    else:
+                        return sample.value
+            return None
+
+    @dataclass
+    class _Sample:
+        name: str
+        labels: Dict[str, str]
+        value: float
 
     class _Metric:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            self._value = 0.0
+        def __init__(
+            self,
+            name: str,
+            documentation: str,
+            labelnames: Optional[Iterable[str]] = None,
+            *,
+            registry: CollectorRegistry | None = None,
+        ) -> None:
+            self._name = name
+            self._documentation = documentation
+            self._labelnames = tuple(labelnames or ())
+            self._values: Dict[tuple[str, ...], float] = {}
+            if registry is not None:
+                try:
+                    registry.register(self)
+                except AttributeError:  # pragma: no cover - defensive guard
+                    pass
 
         def labels(self, *args: Any, **kwargs: Any) -> "_Metric":
+            if args and kwargs:
+                raise ValueError("Use either positional or keyword labels, not both")
+            if args:
+                key = tuple(str(value) for value in args)
+            else:
+                key = tuple(str(kwargs.get(name, "")) for name in self._labelnames)
+            self._current_key = key
+            self._values.setdefault(key, 0.0)
             return self
 
         def inc(self, amount: float = 1.0) -> None:
-            self._value += amount
+            key = getattr(self, "_current_key", ())
+            self._values[key] = self._values.get(key, 0.0) + amount
 
         def dec(self, amount: float = 1.0) -> None:
-            self._value -= amount
+            key = getattr(self, "_current_key", ())
+            self._values[key] = self._values.get(key, 0.0) - amount
 
         def set(self, value: float) -> None:
-            self._value = value
+            key = getattr(self, "_current_key", ())
+            self._values[key] = value
 
         def observe(self, value: float) -> None:
-            self._value = value
+            self.set(value)
 
-    def Counter(*args: Any, **kwargs: Any) -> _Metric:  # type: ignore[override]
-        return _Metric()
+        def collect(self):  # pragma: no cover - exercised via registry.collect
+            samples = [
+                _Sample(
+                    name=self._name,
+                    labels={name: label for name, label in zip(self._labelnames, key)},
+                    value=value,
+                )
+                for key, value in self._values.items()
+            ]
+            yield SimpleNamespace(name=self._name, documentation=self._documentation, samples=samples)
 
-    def Gauge(*args: Any, **kwargs: Any) -> _Metric:  # type: ignore[override]
-        return _Metric()
+    def Counter(name: str, documentation: str, labelnames=(), **kwargs: Any) -> _Metric:  # type: ignore[override]
+        return _Metric(name, documentation, labelnames, **kwargs)
 
-    def Histogram(*args: Any, **kwargs: Any) -> _Metric:  # type: ignore[override]
-        return _Metric()
+    def Gauge(name: str, documentation: str, labelnames=(), **kwargs: Any) -> _Metric:  # type: ignore[override]
+        return _Metric(name, documentation, labelnames, **kwargs)
+
+    def Histogram(name: str, documentation: str, labelnames=(), **kwargs: Any) -> _Metric:  # type: ignore[override]
+        return _Metric(name, documentation, labelnames, **kwargs)
 
     def generate_latest(*args: Any, **kwargs: Any) -> bytes:  # type: ignore[override]
         return b""
+
+    def start_http_server(*args: Any, **kwargs: Any) -> None:  # type: ignore[override]
+        logger = logging.getLogger(__name__)
+        logger.warning("prometheus_client.start_http_server unavailable; exporter disabled")
 try:  # pragma: no cover - optional dependency in lightweight test environments
     from starlette.middleware.base import BaseHTTPMiddleware
 except ImportError:  # pragma: no cover - exercised in unit-only environments
@@ -73,6 +166,138 @@ except Exception:  # pragma: no cover - fall back to no-op tracing
     trace = None  # type: ignore
     Span = object  # type: ignore
     SpanKind = None  # type: ignore
+
+
+logger = logging.getLogger(__name__)
+
+_REGISTRY = CollectorRegistry()
+
+_PROMETHEUS_EXPORTER_STARTED = False
+_TRACING_CONFIGURED = False
+_TRACING_SERVICE_NAME: Optional[str] = None
+
+
+def _configure_prometheus_exporter_from_env() -> None:
+    """Start a Prometheus scrape endpoint when configured via environment variables."""
+
+    global _PROMETHEUS_EXPORTER_STARTED
+    if _PROMETHEUS_EXPORTER_STARTED:
+        return
+
+    port_env = os.getenv("PROMETHEUS_EXPORTER_PORT")
+    if not port_env:
+        return
+
+    try:
+        port = int(port_env)
+    except ValueError:
+        logger.warning(
+            "Invalid PROMETHEUS_EXPORTER_PORT value '%s'; expected an integer", port_env
+        )
+        return
+
+    addr = os.getenv("PROMETHEUS_EXPORTER_ADDR", "0.0.0.0")
+    try:
+        start_http_server(port, addr=addr, registry=_REGISTRY)
+    except Exception as exc:  # pragma: no cover - depends on prometheus client implementation
+        logger.warning(
+            "Failed to start Prometheus exporter on %s:%s: %s", addr, port, exc
+        )
+        return
+
+    _PROMETHEUS_EXPORTER_STARTED = True
+    logger.info("Prometheus exporter listening on %s:%s", addr, port)
+
+
+def _parse_otlp_headers(raw: Optional[str]) -> Dict[str, str]:
+    if not raw:
+        return {}
+    headers: Dict[str, str] = {}
+    for item in raw.split(","):
+        key, _, value = item.partition("=")
+        if not key or not _:
+            continue
+        headers[key.strip()] = value.strip()
+    return headers
+
+
+def _configure_tracing_from_env(service_name: str, *, endpoint: Optional[str] = None) -> None:
+    """Wire an OTLP exporter when OpenTelemetry is installed and configured."""
+
+    global _TRACING_CONFIGURED, _TRACING_SERVICE_NAME
+    if _TRACING_CONFIGURED:
+        return
+
+    endpoint = endpoint or os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+    if not endpoint:
+        return
+
+    if trace is None:
+        logger.warning(
+            "OpenTelemetry API unavailable; skipping OTLP tracing exporter for %s",
+            service_name,
+        )
+        return
+
+    try:  # pragma: no cover - depends on optional OpenTelemetry SDK
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    except Exception as exc:  # pragma: no cover - optional dependency may be missing
+        logger.warning(
+            "OpenTelemetry SDK unavailable; skipping OTLP exporter for %s: %s",
+            service_name,
+            exc,
+        )
+        return
+
+    headers = _parse_otlp_headers(os.getenv("OTEL_EXPORTER_OTLP_HEADERS"))
+    insecure = os.getenv("OTEL_EXPORTER_OTLP_INSECURE") == "1"
+    certificate = os.getenv("OTEL_EXPORTER_OTLP_CERTIFICATE")
+    timeout_env = os.getenv("OTEL_EXPORTER_OTLP_TIMEOUT")
+    exporter_kwargs: Dict[str, Any] = {"endpoint": endpoint}
+    if headers:
+        exporter_kwargs["headers"] = headers
+    if insecure:
+        exporter_kwargs["insecure"] = True
+    if certificate:
+        exporter_kwargs["certificates"] = certificate
+    if timeout_env:
+        try:
+            exporter_kwargs["timeout"] = float(timeout_env)
+        except ValueError:
+            logger.warning(
+                "Invalid OTEL_EXPORTER_OTLP_TIMEOUT value '%s'; ignoring", timeout_env
+            )
+
+    try:
+        exporter = OTLPSpanExporter(**exporter_kwargs)
+    except Exception as exc:  # pragma: no cover - depends on exporter implementation
+        logger.warning(
+            "Failed to initialise OTLP exporter for %s: %s", service_name, exc
+        )
+        return
+
+    resource = Resource.create({"service.name": service_name})
+    provider = TracerProvider(resource=resource)
+    provider.add_span_processor(BatchSpanProcessor(exporter))
+    try:
+        trace.set_tracer_provider(provider)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Failed to register tracer provider for %s: %s", service_name, exc)
+        return
+
+    _TRACING_CONFIGURED = True
+    _TRACING_SERVICE_NAME = service_name
+    logger.info("Configured OTLP tracing exporter for %s", service_name)
+
+
+def configure_observability(service_name: str) -> None:
+    """Configure Prometheus and OpenTelemetry exporters based on environment settings."""
+
+    _configure_prometheus_exporter_from_env()
+    _configure_tracing_from_env(service_name)
 
 
 _REGISTRY = CollectorRegistry()
@@ -604,6 +829,7 @@ def setup_metrics(app: FastAPI, service_name: str = "service") -> None:
     """Attach Prometheus /metrics endpoint and tracing middleware."""
 
     init_metrics(service_name)
+    configure_observability(_SERVICE_NAME)
 
     if not any(
         getattr(middleware, "cls", None) is RequestTracingMiddleware
@@ -1055,4 +1281,5 @@ __all__ = [
     "observe_scaling_evaluation",
     "get_request_id",
     "traced_span",
+    "_REGISTRY",
 ]

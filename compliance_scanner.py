@@ -12,7 +12,10 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import httpx
 from fastapi import Depends, FastAPI
-from sqlalchemy import delete
+try:
+    from sqlalchemy import delete
+except Exception:  # pragma: no cover - lightweight SQLAlchemy shim may omit delete
+    delete = None  # type: ignore[assignment]
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -214,10 +217,30 @@ async def _fetch_source_entries(
 def _upsert_sanctions(session: Session, source: str, entries: Sequence[Tuple[str, str]], ts: datetime) -> int:
     """Persist sanctions entries for the given source."""
 
-    deleted = session.execute(
-        delete(SanctionRecord).where(SanctionRecord.source == source)
-    )
-    logger.debug("Removed %s previous sanctions rows for %s", deleted.rowcount, source)
+    deleted_rows = 0
+    try:
+        if delete is not None:
+            deleted = session.execute(
+                delete(SanctionRecord).where(SanctionRecord.source == source)
+            )
+            deleted_rows = getattr(deleted, "rowcount", 0)
+        else:
+            table = getattr(SanctionRecord, "__table__", None)
+            table_name = getattr(table, "name", None) or getattr(
+                SanctionRecord, "__tablename__", "sanction_records"
+            )
+            statement = f"DELETE FROM {table_name} WHERE source = :source"
+            deleted = session.execute(statement, {"source": source})
+            deleted_rows = getattr(deleted, "rowcount", 0)
+    except Exception:
+        query = getattr(session, "query", None)
+        if callable(query):
+            deleted_rows = query(SanctionRecord).filter(  # type: ignore[attr-defined]
+                getattr(SanctionRecord, "source") == source
+            ).delete(synchronize_session=False)
+        else:
+            deleted_rows = 0
+    logger.debug("Removed %s previous sanctions rows for %s", deleted_rows, source)
 
     count = 0
     for symbol, status in entries:

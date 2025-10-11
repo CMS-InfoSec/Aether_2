@@ -7,6 +7,7 @@ import pytest
 
 
 def test_policy_gradient_requires_torch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ML_ALLOW_INSECURE_DEFAULTS", "0")
     module = importlib.reload(importlib.import_module("ml.models.rl"))
 
     class _Space:

@@ -1,19 +1,86 @@
 # Aether Data Platform
 
-This repository provides reference infrastructure for ingesting, validating, and
-serving market data for the Aether research platform. The stack centres around
-TimescaleDB for historical storage, Kafka/NATS for real-time dissemination, and
-Feast/Redis for feature serving. **All trading logic is restricted to USD-quoted
-Kraken spot markets only.**
+This repository packages the services, data pipelines, and operational tooling
+that power Aether's USD spot-market trading platform. The stack centres around
+TimescaleDB for historical storage, Kafka/NATS for live dissemination, Feast/Redis
+for feature serving, and FastAPI-based microservices for policy, risk, and
+reporting flows. **Only Kraken USD spot markets are supported.**
 
-## Components
+## Quickstart
+
+1. **Create a Python environment** (the codebase targets Python 3.11+):
+
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate
+   pip install --upgrade pip
+   ```
+
+2. **Install dependencies**. The project uses an editable install with optional
+   extras for development and testing:
+
+   ```bash
+   pip install -e .[dev,test]
+   ```
+
+   The base install pulls runtime dependencies (FastAPI, SQLAlchemy, Pydantic,
+   Timescale/psycopg, Kafka/NATS clients, Redis/Feast, MLflow, PyTorch, etc.).
+   The ``dev`` and ``test`` extras add linting, typing, and pytest tooling.
+
+3. **Seed local state directories.** Several services persist test artefacts in
+   ``.aether_state/``. Create the structure once before running the suite:
+
+   ```bash
+   mkdir -p \
+     .aether_state/accounts \
+     .aether_state/capital_flow \
+     .aether_state/hedge_service \
+     .aether_state/kraken_ws \
+     .aether_state/stress_engine
+   ```
+
+4. **Run the test suite** once dependencies are installed:
+
+   ```bash
+   pytest -q
+   ```
+
+   You can target subsets during development, e.g. ``pytest tests/services -q``
+   or ``pytest tests/ml/test_auto_feature_discovery_insecure_defaults.py -q``.
+
+## Local Development Guide
+
+The repository follows the ``src/`` layout and is packaged as a single Python
+distribution. Key tooling is configured through ``pyproject.toml``.
+
+### Common tasks
+
+- **Formatting & linting**: ``ruff check --fix .`` runs lint rules and applies
+  formatting fixes. ``black .`` and ``isort .`` are also available if you prefer
+  dedicated formatters.
+- **Type checking**: ``mypy`` is configured via ``pyproject.toml``—invoke it with
+  ``mypy`` from the repository root.
+- **Regenerating API clients**: The FastAPI services expose OpenAPI schemas at
+  ``/openapi.json``. Use your preferred OpenAPI tooling (for example,
+  ``openapi-generator`` or ``datamodel-code-generator``) once the services are
+  running locally.
+
+### Insecure-default fallbacks
+
+Many services provide deterministic fallbacks for environments without the full
+dependency stack. Set ``AETHER_ALLOW_INSECURE_DEFAULTS=1`` (or the service-specific
+flag documented in ``shared/insecure_defaults.py``) during development to enable
+local JSON/SQLite storage while production deployments continue to require
+managed dependencies.
+
+## Component Overview
 
 - **Alembic migrations** (`data/alembic/`) establish TimescaleDB hypertables for
   market data, trading activity, and governance metadata.
 - **Ingestion jobs** (`data/ingest/`) provide batch and streaming collectors for
   CoinGecko and Kraken data sources.
 - **Feast repository** (`data/feast/`) exposes curated feature views backed by
-  the offline Timescale tables with Redis configured for online serving.
+  Timescale tables with Redis configured for online serving.
 - **Great Expectations** (`data/great_expectations/`) defines validation suites
   to ensure incoming datasets remain within the expected schema envelope.
 - **Argo Workflows** (`ops/workflows/`) schedules nightly batch ingestion and
@@ -21,36 +88,6 @@ Kraken spot markets only.**
 
 Refer to the inline documentation within each component for detailed usage
 instructions and configuration parameters.
-
-## Development Environment
-
-The repository is packaged as an installable Python distribution using the
-``src/`` layout.  During local development install dependencies in editable mode:
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -e .[dev]
-```
-
-The base install includes service runtime dependencies such as FastAPI,
-SQLAlchemy, Pydantic, Kafka/NATS clients, Redis/Feast, Timescale/psycopg, MLflow,
-and PyTorch.  The ``dev`` extra adds linting, formatting, typing, and testing
-tooling.  Continuous integration environments can install the ``test`` extra
-(``pip install .[test]``) to avoid bringing in development-only tools.
-
-### Tooling
-
-- **Static analysis**: ``ruff`` (linting) and ``mypy`` (type checking) use the
-  configuration embedded in ``pyproject.toml``.
-- **Formatting**: ``black`` and ``isort`` enforce consistent style.  Run
-  ``ruff check --fix .`` or ``black . && isort .`` before submitting changes.
-- **Testing**: ``pytest`` drives the unit test suite with ``hypothesis`` and
-  ``pytest-asyncio`` enabled for property-based and async testing scenarios.
-
-All tools read configuration from the checked-in ``pyproject.toml`` to provide a
-single source of truth for development conventions.
 
 ## Operational Readiness
 

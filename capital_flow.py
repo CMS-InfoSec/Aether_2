@@ -11,11 +11,15 @@ not silently fall back to local storage.
 from __future__ import annotations
 
 import enum
+import hashlib
+import json
 import os
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
+from pathlib import Path
+from threading import Lock
+from types import SimpleNamespace
 from typing import Any, Dict, Generator, Iterable, Optional
 
 
@@ -73,6 +77,7 @@ except Exception:  # pragma: no cover - exercised when SQLAlchemy is unavailable
 
 
 
+from shared.account_scope import SQLALCHEMY_AVAILABLE as _ACCOUNT_SCOPE_AVAILABLE, account_id_column
 from services.common.security import require_admin_account
 
 
@@ -229,33 +234,130 @@ if _SQLALCHEMY_AVAILABLE:
     Base = declarative_base()
 else:
 
+    _STATE_ROOT = Path(".aether_state") / "capital_flow"
+    _STATE_ROOT.mkdir(parents=True, exist_ok=True)
+
+    def _store_path(identifier: str) -> Path:
+        digest = hashlib.sha256(identifier.encode("utf-8")).hexdigest()
+        return _STATE_ROOT / f"{digest}.json"
+
     class _InMemoryStore:
         """Shared in-memory persistence used when SQLAlchemy is unavailable."""
 
-        def __init__(self) -> None:
+        def __init__(self, path: Path) -> None:
             self.flows: list[CapitalFlowRecord] = []
             self.baselines: Dict[str, NavBaselineRecord] = {}
             self._next_id = 1
+            self._lock = Lock()
+            self._path = path
+            self._load()
 
         def reset(self) -> None:
-            self.flows.clear()
-            self.baselines.clear()
-            self._next_id = 1
+            with self._lock:
+                self.flows.clear()
+                self.baselines.clear()
+                self._next_id = 1
+                self._persist()
 
         def snapshot(self) -> tuple[Dict[str, NavBaselineRecord], int, int]:
-            return ({key: replace(value) for key, value in self.baselines.items()}, len(self.flows), self._next_id)
+            with self._lock:
+                return (
+                    {key: replace(value) for key, value in self.baselines.items()},
+                    len(self.flows),
+                    self._next_id,
+                )
 
         def restore(self, snapshot: tuple[Dict[str, NavBaselineRecord], int, int]) -> None:
             baselines, flow_len, next_id = snapshot
-            self.baselines = {key: replace(value) for key, value in baselines.items()}
-            self.flows = self.flows[:flow_len]
-            self._next_id = next_id
+            with self._lock:
+                self.baselines = {key: replace(value) for key, value in baselines.items()}
+                self.flows = self.flows[:flow_len]
+                self._next_id = next_id
 
         def add_flow(self, record: "CapitalFlowRecord") -> None:
-            if getattr(record, "id", 0) in (0, None):
-                record.id = self._next_id
-                self._next_id += 1
-            self.flows.append(record)
+            with self._lock:
+                if getattr(record, "id", 0) in (0, None):
+                    record.id = self._next_id
+                    self._next_id += 1
+                self.flows.append(record)
+                self._persist()
+
+        def update_baseline(self, record: "NavBaselineRecord") -> None:
+            with self._lock:
+                self.baselines[record.account_id] = record
+                self._persist()
+
+        def _load(self) -> None:
+            if not self._path.exists():
+                return
+            try:
+                payload = json.loads(self._path.read_text(encoding="utf-8"))
+            except Exception:  # pragma: no cover - corrupted cache
+                return
+
+            with self._lock:
+                self.flows.clear()
+                for item in payload.get("flows", []):
+                    try:
+                        flow = CapitalFlowRecord(
+                            account_id=item["account_id"],
+                            type=item["type"],
+                            amount=Decimal(item["amount"]),
+                            currency=item["currency"],
+                            ts=datetime.fromisoformat(item["ts"]),
+                            id=int(item.get("id", 0)),
+                        )
+                    except Exception:  # pragma: no cover - corrupted entry
+                        continue
+                    self.flows.append(flow)
+
+                self.baselines = {}
+                for key, item in payload.get("baselines", {}).items():
+                    try:
+                        record = NavBaselineRecord(
+                            account_id=key,
+                            currency=item["currency"],
+                            baseline=Decimal(item["baseline"]),
+                            updated_at=datetime.fromisoformat(item["updated_at"]),
+                        )
+                    except Exception:  # pragma: no cover - corrupted entry
+                        continue
+                    self.baselines[key] = record
+
+                self._next_id = int(payload.get("next_id", len(self.flows) + 1))
+
+        def _persist(self) -> None:
+            data = {
+                "next_id": self._next_id,
+                "flows": [
+                    {
+                        "id": flow.id,
+                        "account_id": flow.account_id,
+                        "type": flow.type,
+                        "amount": format(flow.amount, "f"),
+                        "currency": flow.currency,
+                        "ts": flow.ts.isoformat(),
+                    }
+                    for flow in self.flows
+                ],
+                "baselines": {
+                    account_id: {
+                        "currency": record.currency,
+                        "baseline": format(record.baseline, "f"),
+                        "updated_at": record.updated_at.isoformat(),
+                    }
+                    for account_id, record in self.baselines.items()
+                },
+            }
+            try:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                self._path.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+            except Exception:  # pragma: no cover - filesystem failure
+                return
+
+        def persist(self) -> None:
+            with self._lock:
+                self._persist()
 
 
     _IN_MEMORY_STORES: Dict[str, _InMemoryStore] = {}
@@ -264,7 +366,7 @@ else:
     def _resolve_store(url: str) -> _InMemoryStore:
         store = _IN_MEMORY_STORES.get(url)
         if store is None:
-            store = _InMemoryStore()
+            store = _InMemoryStore(_store_path(url))
             _IN_MEMORY_STORES[url] = store
         return store
 
@@ -272,9 +374,10 @@ else:
     class _InMemoryEngine:
         def __init__(self, store: _InMemoryStore) -> None:
             self._store = store
+            self.dialect = SimpleNamespace(name="sqlite")
 
         def dispose(self) -> None:
-            self._store.reset()
+            self._store.persist()
 
 
     class _InMemorySession:
@@ -289,7 +392,7 @@ else:
 
         def add(self, obj: object) -> None:
             if isinstance(obj, NavBaselineRecord):
-                self._store.baselines[obj.account_id] = obj
+                self._store.update_baseline(obj)
             elif isinstance(obj, CapitalFlowRecord):
                 self._store.add_flow(obj)
             else:  # pragma: no cover - defensive guard
@@ -342,7 +445,7 @@ class CapitalFlowType(str, enum.Enum):
     WITHDRAW = "withdraw"
 
 
-if _SQLALCHEMY_AVAILABLE:
+if _SQLALCHEMY_AVAILABLE and _ACCOUNT_SCOPE_AVAILABLE:
 
     class CapitalFlowRecord(Base):
         """ORM model for persisted capital flows."""
@@ -350,7 +453,7 @@ if _SQLALCHEMY_AVAILABLE:
         __tablename__ = "capital_flows"
 
         id = Column(Integer, primary_key=True, autoincrement=True)
-        account_id = Column(String, nullable=False, index=True)
+        account_id = account_id_column(index=True)
         type = Column(String, nullable=False)
         amount = Column(PreciseDecimal(_DECIMAL_PRECISION, _DECIMAL_SCALE), nullable=False)
         currency = Column(String, nullable=False)
@@ -362,7 +465,7 @@ if _SQLALCHEMY_AVAILABLE:
 
         __tablename__ = "nav_baselines"
 
-        account_id = Column(String, primary_key=True)
+        account_id = account_id_column(primary_key=True)
         currency = Column(String, nullable=False)
         baseline = Column(
             PreciseDecimal(_DECIMAL_PRECISION, _DECIMAL_SCALE),

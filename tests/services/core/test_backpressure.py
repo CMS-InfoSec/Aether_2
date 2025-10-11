@@ -2,9 +2,14 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import importlib
+
 import pytest
 
-from services.core import backpressure
+try:
+    from services.core import backpressure
+except ImportError:  # pragma: no cover - fallback for namespace import issues
+    backpressure = importlib.import_module("services.core.backpressure")
 
 
 @pytest.mark.asyncio

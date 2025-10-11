@@ -63,6 +63,7 @@ if _SQLALCHEMY_AVAILABLE and not hasattr(Session, "__enter__"):
 from metrics import setup_metrics
 from services.common.security import require_admin_account
 from shared.postgres import normalize_sqlalchemy_dsn
+from shared.account_scope import SQLALCHEMY_AVAILABLE as _ACCOUNT_SCOPE_AVAILABLE, account_id_column
 
 
 logger = logging.getLogger(__name__)
@@ -141,7 +142,7 @@ def _engine_options(url: str) -> Dict[str, object]:
     return options
 
 
-if _SQLALCHEMY_AVAILABLE:
+if _SQLALCHEMY_AVAILABLE and _ACCOUNT_SCOPE_AVAILABLE:
     ENGINE: Engine | "_InMemoryEngine" = create_engine(
         DATABASE_URL, **_engine_options(DATABASE_URL)
     )
@@ -251,7 +252,7 @@ if _SQLALCHEMY_AVAILABLE:
         __tablename__ = "execution_anomaly_log"
 
         id = Column(Integer, primary_key=True, autoincrement=True)
-        account_id = Column(String, nullable=False, index=True)
+        account_id = account_id_column(index=True)
         symbol = Column(String, nullable=False, index=True)
         metrics_json = Column(JSON, nullable=False)
         severity = Column(String, nullable=False)
