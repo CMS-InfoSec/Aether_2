@@ -101,6 +101,7 @@ def configured_settings(monkeypatch, secrets_service_module):
     monkeypatch.setenv("SECRET_ENCRYPTION_KEY", encryption_key)
     monkeypatch.setenv("SECRETS_SERVICE_AUTH_TOKENS", "token-1,token-2")
     monkeypatch.setenv("KRAKEN_SECRETS_AUTH_TOKENS", "token-1:alpha,token-2:beta")
+    monkeypatch.setenv("KRAKEN_SECRETS_MFA_TOKENS", "mfa-token-1,mfa-token-2")
 
     settings = secrets_service_module.load_settings()
     monkeypatch.setattr(secrets_service_module, "SETTINGS", settings, raising=False)
@@ -112,15 +113,41 @@ def test_require_authorized_caller_accepts_known_token(configured_settings):
     assert settings.authorized_token_ids == ("token-1", "token-2")
     assert settings.authorized_token_labels["token-1"] == "alpha"
 
-    actor = asyncio.run(secrets_service.require_authorized_caller("Bearer token-1"))
+    actor = asyncio.run(
+        secrets_service.require_authorized_caller(
+            "Bearer token-1", x_mfa_token="mfa-token-1"
+        )
+    )
     assert actor == "alpha"
 
 
 def test_require_authorized_caller_rejects_unknown_token(configured_settings):
     _, secrets_service = configured_settings
     with pytest.raises(secrets_service.HTTPException) as excinfo:
-        asyncio.run(secrets_service.require_authorized_caller("Bearer unknown"))
+        asyncio.run(
+            secrets_service.require_authorized_caller(
+                "Bearer unknown", x_mfa_token="mfa-token-1"
+            )
+        )
     assert excinfo.value.status_code == secrets_service.status.HTTP_403_FORBIDDEN
+
+
+def test_require_authorized_caller_rejects_missing_mfa_token(configured_settings):
+    _, secrets_service = configured_settings
+    with pytest.raises(secrets_service.HTTPException) as excinfo:
+        asyncio.run(secrets_service.require_authorized_caller("Bearer token-1"))
+    assert excinfo.value.status_code == secrets_service.status.HTTP_401_UNAUTHORIZED
+
+
+def test_require_authorized_caller_rejects_unknown_mfa_token(configured_settings):
+    _, secrets_service = configured_settings
+    with pytest.raises(secrets_service.HTTPException) as excinfo:
+        asyncio.run(
+            secrets_service.require_authorized_caller(
+                "Bearer token-1", x_mfa_token="mfa-token-unknown"
+            )
+        )
+    assert excinfo.value.status_code == secrets_service.status.HTTP_401_UNAUTHORIZED
 
 
 def test_require_authorized_caller_returns_503_when_settings_unavailable(
@@ -131,6 +158,7 @@ def test_require_authorized_caller_returns_503_when_settings_unavailable(
     monkeypatch.delenv("SECRET_ENCRYPTION_KEY", raising=False)
     monkeypatch.delenv("SECRETS_SERVICE_AUTH_TOKENS", raising=False)
     monkeypatch.delenv("KRAKEN_SECRETS_AUTH_TOKENS", raising=False)
+    monkeypatch.delenv("KRAKEN_SECRETS_MFA_TOKENS", raising=False)
 
     monkeypatch.setattr(secrets_service, "SETTINGS", None, raising=False)
     monkeypatch.setattr(secrets_service, "CIPHER", None, raising=False)
@@ -145,7 +173,11 @@ def test_require_authorized_caller_returns_503_when_settings_unavailable(
     monkeypatch.setattr(secrets_service, "initialize_dependencies", fake_initialize)
 
     with pytest.raises(secrets_service.HTTPException) as excinfo:
-        asyncio.run(secrets_service.require_authorized_caller("Bearer token-1"))
+        asyncio.run(
+            secrets_service.require_authorized_caller(
+                "Bearer token-1", x_mfa_token="mfa-token-1"
+            )
+        )
 
     assert excinfo.value.status_code == secrets_service.status.HTTP_503_SERVICE_UNAVAILABLE
     assert call_count["value"] == 1
@@ -160,6 +192,7 @@ def test_require_authorized_caller_returns_503_when_kubernetes_unavailable(
     monkeypatch.setenv("SECRET_ENCRYPTION_KEY", encryption_key)
     monkeypatch.setenv("SECRETS_SERVICE_AUTH_TOKENS", "token-1")
     monkeypatch.setenv("KRAKEN_SECRETS_AUTH_TOKENS", "token-1:alpha")
+    monkeypatch.setenv("KRAKEN_SECRETS_MFA_TOKENS", "mfa-token-1")
 
     monkeypatch.setattr(secrets_service, "SETTINGS", None, raising=False)
     monkeypatch.setattr(secrets_service, "CIPHER", None, raising=False)
@@ -190,7 +223,11 @@ def test_require_authorized_caller_returns_503_when_kubernetes_unavailable(
     )
 
     with pytest.raises(secrets_service.HTTPException) as excinfo:
-        asyncio.run(secrets_service.require_authorized_caller("Bearer token-1"))
+        asyncio.run(
+            secrets_service.require_authorized_caller(
+                "Bearer token-1", x_mfa_token="mfa-token-1"
+            )
+        )
 
     assert excinfo.value.status_code == secrets_service.status.HTTP_503_SERVICE_UNAVAILABLE
     assert call_count["value"] == 1

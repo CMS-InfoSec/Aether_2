@@ -21,6 +21,7 @@ try:  # pragma: no cover - prefer the real cryptography implementation
 except ImportError:  # pragma: no cover - lightweight environments
     AESGCM = None  # type: ignore[assignment]
 from fastapi import Depends, FastAPI, HTTPException, Header, Query, Request, status
+from fastapi.params import Header as HeaderInfo
 from fastapi.responses import JSONResponse
 from kubernetes import client, config
 from kubernetes.client import ApiException
@@ -105,6 +106,10 @@ class Settings(BaseModel):
         ..., alias="SECRETS_SERVICE_AUTH_TOKENS"
     )
 
+    authorized_mfa_tokens: Tuple[str, ...] = Field(
+        ..., alias="KRAKEN_SECRETS_MFA_TOKENS"
+    )
+
 
     class Config:
         allow_population_by_field_name = True
@@ -137,6 +142,20 @@ class Settings(BaseModel):
 
         if not tokens:
             raise ValueError("at least one authorized token must be configured")
+
+        return tuple(tokens)
+
+    @validator("authorized_mfa_tokens", pre=True, allow_reuse=True)
+    def _split_mfa_tokens(cls, value: Any) -> Tuple[str, ...]:  # type: ignore[override]
+        if isinstance(value, str):
+            tokens = [item.strip() for item in value.split(",") if item.strip()]
+        elif isinstance(value, (list, tuple, set)):
+            tokens = [str(item).strip() for item in value if str(item).strip()]
+        else:
+            raise ValueError("authorized MFA tokens must be provided as a string or sequence")
+
+        if not tokens:
+            raise ValueError("at least one authorized MFA token must be configured")
 
         return tuple(tokens)
 
@@ -180,6 +199,17 @@ def load_settings() -> Settings:
         )
         os.environ.setdefault("SECRETS_SERVICE_AUTH_TOKENS", tokens)
 
+    mfa_tokens = os.getenv("KRAKEN_SECRETS_MFA_TOKENS")
+    if not mfa_tokens:
+        if not allow_insecure:
+            raise RuntimeError("KRAKEN_SECRETS_MFA_TOKENS environment variable must be set")
+
+        mfa_tokens = _DEFAULT_TEST_TOKEN
+        LOGGER.warning(
+            "KRAKEN_SECRETS_MFA_TOKENS missing; using insecure default token for local testing",
+        )
+        os.environ.setdefault("KRAKEN_SECRETS_MFA_TOKENS", mfa_tokens)
+
     raw_labels = os.getenv("KRAKEN_SECRETS_AUTH_TOKENS")
     if raw_labels:
         token_labels = _parse_authorized_token_labels(raw_labels)
@@ -196,6 +226,7 @@ def load_settings() -> Settings:
         SECRET_ENCRYPTION_KEY=secret_key,
         SECRETS_SERVICE_AUTH_TOKENS=tokens,
         authorized_token_labels=token_labels,
+        KRAKEN_SECRETS_MFA_TOKENS=mfa_tokens,
     )
 
 
@@ -570,17 +601,31 @@ def _extract_bearer_token(header_value: Optional[str]) -> Optional[str]:
 
 async def require_authorized_caller(
     authorization: Optional[str] = Header(default=None),
+    x_mfa_token: Optional[str] = Header(default=None, alias="X-MFA-Token"),
 ) -> str:
+    if isinstance(x_mfa_token, HeaderInfo):
+        x_mfa_token = None
     token = _extract_bearer_token(authorization)
     if token is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing or invalid authorization token",
         )
+    mfa_token = (x_mfa_token or "").strip()
+    if not mfa_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid MFA context token",
+        )
     if SETTINGS is None:
         await initialize_dependencies()
 
     settings = _require_settings()
+    if mfa_token not in settings.authorized_mfa_tokens:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="MFA context token is not recognized",
+        )
     actor = settings.authorized_token_labels.get(token)
     if actor is None or token not in settings.authorized_token_ids:
         raise HTTPException(

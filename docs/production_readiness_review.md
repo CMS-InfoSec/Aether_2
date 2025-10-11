@@ -4,7 +4,7 @@
 | --- | --- | --- |
 | Architecture & Deployment | ✅ Hardened | Hardened Kubernetes manifests with explicit probes, enforced persistent storage for Feast/Redis, and re-verified TLS and safety toggles. |
 | Reliability & Observability | ✅ Ready | Exercised SLO dashboards, confirmed alert routing to on-call rotation, and refreshed runbooks with current remediation links. |
-| Security & Compliance | ✅ Ready | Removed plaintext credentials from manifests, rendered secrets from Vault at runtime, and enforced non-root ingestion images. |
+| Security & Compliance | ✅ Ready | Removed plaintext credentials from manifests, rendered secrets from Vault at runtime, enforced non-root ingestion images, and Kraken Secrets API enforces MFA context header; bearer-only auth disabled. |
 | Testing & Release Engineering | ✅ Ready | Pytest suite executed with dependency lock refreshed and CI pipeline validated through green smoke run. |
 
 ### Architecture & Deployment fixes
@@ -61,7 +61,7 @@
 
 | Architecture & Deployment | ❌ | FastAPI deployments reference `fastapi-credentials`/`fastapi-secrets` secrets that are not defined, so pods will crash on startup. |
 | Reliability & Observability | ❌ | Prometheus alerts depend on `kill_switch_response_seconds`, but the kill-switch service never emits that metric, leaving the SLO blind. |
-| Security & Compliance | ❌ | Kraken secrets API authorizes solely on bearer tokens and ignores the MFA context expected by clients. |
+| Security & Compliance | ✅ Ready | Kraken Secrets API enforces MFA context header; bearer-only auth disabled. |
 | Testing & Release Engineering | ❌ | The CI requirements set omits `pytest-asyncio`, causing async test suites marked with `@pytest.mark.asyncio` to error in minimal installs. |
 | Data Integrity & Backup | ❌ | Disaster-recovery tooling logs every action but never provisions the target table, so the very first snapshot/restore aborts with an undefined-table error. |
 | API & Integration Consistency | ⚠️ | Binance and Coinbase adapters are stubs that raise `NotImplementedError`, blocking multi-exchange routing until completed. |
@@ -73,7 +73,7 @@
 
 - Missing Kubernetes secret manifests (`fastapi-credentials`, `fastapi-secrets`) referenced by FastAPI deployments cause configuration load failures during pod startup.
 - Kill-switch observability gap: the alert rules expect `kill_switch_response_seconds`, yet the kill-switch service never records or exports that metric.
-- Kraken secrets API bypasses MFA context headers, relying solely on bearer tokens contrary to frontend expectations and security design.
+- Kraken Secrets API enforces MFA context headers, rejecting bearer-only calls per security design.
 - `requirements-ci.txt` excludes `pytest-asyncio`, so async tests fail in minimal CI environments where only the CI requirements are installed.
 - Disaster recovery playbook writes to a `dr_log` table without ever creating it, preventing the first snapshot/restore from completing.
 - Exchange adapters for Binance and Coinbase raise `NotImplementedError`, leaving those integrations non-functional.

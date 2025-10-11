@@ -103,6 +103,7 @@ def test_audit_chain_across_services(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("SECRET_ENCRYPTION_KEY", encryption_key)
     monkeypatch.setenv("SECRETS_SERVICE_AUTH_TOKENS", "integration-token")
     monkeypatch.setenv("KRAKEN_SECRETS_AUTH_TOKENS", "integration-token:ops.brigade")
+    monkeypatch.setenv("KRAKEN_SECRETS_MFA_TOKENS", "integration-mfa")
 
     conn_mock, cursor_mock = _make_connection_mock()
     monkeypatch.setattr(audit_logger, "psycopg", MagicMock(connect=MagicMock(return_value=conn_mock)))
