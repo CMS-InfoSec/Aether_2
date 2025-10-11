@@ -8,8 +8,8 @@
 | Testing & Release Engineering | ❌ Needs Fix | Required dependencies (pytest, pytest-asyncio, aiohttp, cryptography, prometheus_client) are pinned, but the test suite aborts during import because `ADMIN_ALLOWLIST` is read before the defaults from `conftest.py` apply. 【F:requirements-ci.txt†L1-L12】【F:services/common/security.py†L71-L136】【F:conftest.py†L24-L36】【3aaabe†L1-L19】 |
 | Data Integrity & Backup | ✅ Ready | dr_log table auto-created; backup/restore now completes successfully. 【F:dr_playbook.py†L442-L556】【F:tests/ops/test_dr_playbook.py†L181-L276】 |
 | API & Integration Consistency | ✅ Ready | Exchange adapters expose spot operations with multi-exchange gating and FastAPI services register `/metrics` endpoints via shared middleware. 【F:exchange_adapter.py†L592-L696】【F:metrics.py†L891-L920】 |
-| ML & Simulation Logic | ✅ Ready | Simulation defaults remain disabled for production and the sim-mode API enforces admin allowlists while publishing events and audit logs. 【F:config/system.yaml†L19-L34】【F:sim_mode.py†L1-L120】 |
-| Account Isolation & Governance | ✅ Ready | Admin and Director allowlists loaded from secrets; hard-coded defaults removed. 【F:deploy/helm/aether-platform/templates/backend-deployments.yaml†L84-L104】【F:services/common/security.py†L71-L136】【F:shared/runtime_checks.py†L101-L128】 |
+| ML & Simulation Logic | ✅ Ready | Exposure forecaster and supervised trainer implemented and integrated into AI loop. 【F:ml/exposure_forecaster.py†L1-L207】【F:ml/supervised_trainer.py†L1-L123】【F:exposure_forecast.py†L200-L344】 |
+| Account Isolation & Governance | ❌ Needs Fix | Services crash without the `platform-account-allowlists` secret that carries admin/director scopes, and the repository provides no ExternalSecret or sealed secret for it. 【F:deploy/helm/aether-platform/values.yaml†L41-L66】【b22d38†L1-L4】 |
 | UI Integration & Frontend Connectivity | ✅ Ready | Secrets Service routes for status and audit feeds exist, matching Builder.io Fusion UI expectations. 【F:secrets_service.py†L864-L992】 |
 
 ## Architecture & Deployment

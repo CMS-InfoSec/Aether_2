@@ -38,6 +38,7 @@ ensure_common_helpers()
 from services.common.config import get_timescale_session
 from services.common.security import require_admin_account
 
+from ml.exposure_forecaster import ExposureModelManager, TrainingSummary
 from ml.models.supervised import (
     MissingDependencyError,
     SklearnPipelineTrainer,
@@ -205,6 +206,8 @@ class _ExposureMLPipeline:
         self._last_trained: datetime | None = None
         self._residual_std: float = 0.0
         self._training_samples: int = 0
+        self._model_manager: ExposureModelManager | None = None
+        self._last_summary: TrainingSummary | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -254,14 +257,13 @@ class _ExposureMLPipeline:
         return now - self._last_trained >= self._retrain_cadence
 
     def _train(self, dataset: SupervisedDataset, now: datetime) -> bool:
-        try:
-            trainer = self._trainer_factory()
-        except Exception:  # pragma: no cover - defensive guard
-            LOGGER.debug("Trainer factory failed; skipping exposure retrain", exc_info=True)
+        manager = self._ensure_model_manager()
+        if manager is None:
+            LOGGER.debug("Exposure model manager unavailable; skipping ML retrain")
             return False
 
         try:
-            trainer.fit(dataset)
+            summary = manager.train(dataset, trained_at=now)
         except MissingDependencyError:
             LOGGER.debug("Missing dependencies for ML exposure pipeline", exc_info=True)
             return False
@@ -269,41 +271,49 @@ class _ExposureMLPipeline:
             LOGGER.debug("Exposure ML trainer failed", exc_info=True)
             return False
 
-        self._trainer = trainer
+        self._trainer = manager.trainer
         self._last_trained = now
-        self._training_samples = len(dataset.labels)
-
+        self._training_samples = summary.samples
+        residual_std = summary.metrics.get("residual_std", 0.0)
         try:
-            import numpy as np  # type: ignore
-        except Exception:  # pragma: no cover - numpy optional
+            self._residual_std = float(residual_std)
+        except (TypeError, ValueError):  # pragma: no cover - defensive guard
             self._residual_std = 0.0
-        else:
-            try:
-                predictions = trainer.predict(dataset.features)
-                residuals = predictions - dataset.labels.to_numpy()
-                if len(residuals) > 1:
-                    self._residual_std = float(np.std(residuals, ddof=1))
-                else:
-                    self._residual_std = 0.0
-            except Exception:  # pragma: no cover - defensive logging
-                LOGGER.debug("Unable to compute exposure residual standard deviation", exc_info=True)
-                self._residual_std = 0.0
+        self._last_summary = summary
 
         return True
 
     def _predict(
         self, latest_features: "pd.DataFrame", horizon_days: int
     ) -> ForecastResult | None:
-        if self._trainer is None:
+        try:
+            manager = self._ensure_model_manager()
+        except Exception:  # pragma: no cover - defensive guard
+            LOGGER.debug("Exposure model manager unavailable during prediction", exc_info=True)
+            return None
+
+        if manager is None:
             return None
 
         try:
-            prediction = float(self._trainer.predict(latest_features)[0])
+            predictions = manager.predict(latest_features)
         except Exception:  # pragma: no cover - defensive logging
             LOGGER.debug("Exposure ML prediction failed", exc_info=True)
             return None
 
-        value = max(Decimal(str(prediction)), ZERO)
+        try:
+            first_prediction = predictions[0]
+        except Exception:  # pragma: no cover - defensive logging
+            LOGGER.debug("Exposure ML prediction result was empty", exc_info=True)
+            return None
+
+        try:
+            prediction_value = float(first_prediction)
+        except Exception:  # pragma: no cover - defensive logging
+            LOGGER.debug("Exposure ML prediction result could not be coerced to float", exc_info=True)
+            return None
+
+        value = max(Decimal(str(prediction_value)), ZERO)
 
         margin = ZERO
         if self._residual_std > 0.0 and self._training_samples > 1:
@@ -439,6 +449,18 @@ class _ExposureMLPipeline:
             return None
 
         return SupervisedDataset(features=features, labels=labels)
+
+    def _ensure_model_manager(self) -> ExposureModelManager | None:
+        if self._model_manager is not None:
+            return self._model_manager
+        try:
+            self._model_manager = ExposureModelManager(
+                self._account_id, trainer_factory=self._trainer_factory
+            )
+        except Exception:  # pragma: no cover - optional dependency guard
+            LOGGER.debug("Failed to initialise exposure model manager", exc_info=True)
+            self._model_manager = None
+        return self._model_manager
 
     def _query_timescale(self, query: str, params: Mapping[str, Any]) -> List[Dict[str, Any]]:
         if _SQL_MODULE is None:
