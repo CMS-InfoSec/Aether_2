@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field, validator
 
 from services.secrets.signing import sign_kraken_request
 from shared.audit_hooks import AuditEvent, load_audit_hooks
+from shared.runtime_checks import ensure_insecure_default_flag_disabled
 
 
 LOGGER = logging.getLogger(__name__)
@@ -36,6 +37,8 @@ SECRETS_LOGGER = logging.getLogger("secrets_log")
 
 _INSECURE_DEFAULTS_FLAG = "SECRETS_ALLOW_INSECURE_DEFAULTS"
 _DEFAULT_TEST_TOKEN = "local-dev-token"
+
+ensure_insecure_default_flag_disabled(_INSECURE_DEFAULTS_FLAG)
 
 _INITIAL_BACKOFF_SECONDS = 0.5
 _MAX_BACKOFF_SECONDS = 8.0
@@ -140,6 +143,7 @@ class Settings(BaseModel):
 
 def _insecure_defaults_enabled() -> bool:
     if os.getenv(_INSECURE_DEFAULTS_FLAG) == "1":
+        ensure_insecure_default_flag_disabled(_INSECURE_DEFAULTS_FLAG)
         return True
     return "pytest" in sys.modules
 

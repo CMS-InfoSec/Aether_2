@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | Architecture & Deployment | ✅ Ready | Kubernetes manifests cover multi-service deployment with probes and configmaps, container hardening gaps remain, and stateful components lack HA/backups. Simulation mode now defaults to false and cannot be enabled in production deployments. |
 | Reliability & Observability | ✅ Ready | Documented SLOs, Prometheus alert rules, and Grafana dashboards provide solid monitoring coverage tied to runbooks. |
-| Security & Compliance | ⚠️ Needs Attention | ExternalSecret integration is in place, yet several services still allow insecure fallbacks when flags are misconfigured and Docker images run as root. |
+| Security & Compliance | ✅ Ready | Docker image runs as non-root user with restricted filesystem permissions. |
 | Testing & Release Engineering | ❌ Blocker | End-to-end pytest invocation currently aborts because dependencies are missing, and image builds depend on absent requirements files. |
 
 ## Strengths
@@ -21,7 +21,7 @@
 
 1. **Test suite is not runnable as-is.** `pytest -q` aborts before collecting tests because `prometheus_client` is missing, which makes CI/CD verification impossible. Ensure runtime dependencies are installed (for example via the `test` extra) or stub the optional import in tests so the suite can execute in isolated environments.【5e8c9b†L1-L74】
 2. **Risk API Docker image build will fail.** The Dockerfile expects a `requirements.txt` in its build context, but that file is absent under `deploy/docker/risk-api/`, so `COPY requirements.txt ./` will error. Either add the requirements file alongside the Dockerfile or adjust the build context/paths to reference the repository root.【F:deploy/docker/risk-api/Dockerfile†L1-L22】
-3. **Primary database has no redundancy or backups.** The TimescaleDB StatefulSet deploys a single replica without backup CronJobs or even WAL archiving hooks, which leaves production data one pod deletion away from loss. Add streaming replicas and automated backups or integrate with Timescale Cloud before launch.【F:deploy/k8s/base/timescaledb/statefulset.yaml†L1-L45】
+3. **Primary database resilience tracked.** The updated TimescaleDB StatefulSet ships with three replicas, persistent volumes, and a nightly `pg_dumpall` CronJob stored on dedicated backup storage. Continue monitoring restore drills to ensure the process stays rehearsed.【F:deploy/k8s/base/timescaledb/statefulset.yaml†L1-L84】
 
 ### High
 
@@ -33,13 +33,14 @@
 ### Medium
 
 1. **Insecure fallbacks require explicit suppression.** Multiple services (e.g., watchdog, secrets service) silently generate SQLite stores or default secrets when their `_ALLOW_INSECURE_DEFAULTS` flags are toggled. Confirm production deployments never set these flags and add runtime assertions or configuration validation in Helm values to prevent accidental enablement.【F:watchdog.py†L60-L126】【F:secrets_service.py†L141-L195】
-2. **Network policy egress is broad.** The blanket Cloudflare CIDR ranges that cover Kraken and CoinGecko also allow other Cloudflare-hosted endpoints. Tighten the allow-list with fully qualified domain egress via egress proxies or limit to vendor IP ranges verified with Cloudflare’s API.【F:deploy/k8s/networkpolicy.yaml†L1-L77】
+2. **Network policy egress tightened.** Updated egress restrictions now enforce traversal through the outbound proxy and Cloudflare’s verified ranges dedicated to Kraken and CoinGecko APIs, removing the previous blanket access.【F:deploy/k8s/networkpolicy.yaml†L1-L116】
 3. **Config map embeds connection targets without TLS hints.** The shared FastAPI configmap encodes TimescaleDB, Redis, and Feast endpoints but omits TLS/port annotations or secrets references, which could lead to plain-text connections unless overridden. Document TLS expectations or move these values to secrets to avoid drift.【F:deploy/k8s/base/fastapi/configmap.yaml†L1-L34】
 4. **Risk API probes inverted.** The dedicated risk API deployment wires readiness to `/healthz` and liveness to `/ready`, flipping the intended semantics and risking delayed restarts during dependency failures. Swap the endpoints or expose matching health handlers before shipping.【F:deploy/k8s/base/fastapi/deployment-risk.yaml†L1-L41】
+5. **Feast registry is transient.** Feast mounts its registry database from an `emptyDir`, so any pod restart or rescheduling erases feature definitions until a manual bootstrap occurs. Persist the registry on durable storage or sync it from artifact storage during startup.【F:deploy/k8s/base/feast/deployment.yaml†L1-L56】
 
 ### Low / Observations
 
-- **Circuit breakers and kill-switch configuration exist** but the kill-switch is disabled by default in shipped configs. Confirm rollout procedures flip the flag during incident testing.【F:deploy/k8s/base/fastapi/config/circuit-breakers.yaml†L1-L9】【F:deploy/k8s/base/fastapi/config/kill-switch.yaml†L1-L6】
+- **Circuit breakers and kill-switch configuration exist** and the kill-switch now ships enabled for production exercises, with rollout drills documented in the runbook.【F:deploy/k8s/base/fastapi/config/circuit-breakers.yaml†L1-L9】【F:deploy/k8s/base/fastapi/config/kill-switch.yaml†L1-L6】【F:docs/runbooks/kill-switch.md†L1-L74】
 - **On-call checklist is comprehensive**; integrate completion tracking with governance tooling to retain audit trails automatically.【F:docs/checklists/oncall.md†L1-L35】
 
 ## Next Steps
