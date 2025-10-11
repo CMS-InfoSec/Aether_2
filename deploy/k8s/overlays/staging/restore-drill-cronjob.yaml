@@ -1,0 +1,64 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: timescaledb-restore-drill
+  labels:
+    app.kubernetes.io/name: timescaledb
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: disaster-recovery
+spec:
+  schedule: "0 4 1 * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: restore-drill
+              image: ghcr.io/aether/ops-runtime:latest
+              imagePullPolicy: IfNotPresent
+              command: ["python", "-m", "ops.backup.restore_drill"]
+              env:
+                - name: PGHOST
+                  value: timescaledb-staging
+                - name: PGPORT
+                  value: "5432"
+                - name: PGUSER
+                  valueFrom:
+                    secretKeyRef:
+                      name: timescaledb-credentials
+                      key: username
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: timescaledb-credentials
+                      key: password
+                - name: RESTORE_TARGET_DATABASE
+                  value: marketdata_restore_drill
+                - name: RESTORE_ADMIN_DB
+                  value: postgres
+                - name: BACKUP_ARCHIVE_DIR
+                  value: /backups
+                - name: SLACK_WEBHOOK_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: oncall-slack-webhook
+                      key: url
+              volumeMounts:
+                - name: timescaledb-backup
+                  mountPath: /backups
+              resources:
+                requests:
+                  cpu: 200m
+                  memory: 256Mi
+                limits:
+                  cpu: 1
+                  memory: 1Gi
+          volumes:
+            - name: timescaledb-backup
+              persistentVolumeClaim:
+                claimName: timescaledb-backup
