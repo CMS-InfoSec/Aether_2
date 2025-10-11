@@ -300,9 +300,6 @@ def configure_observability(service_name: str) -> None:
     _configure_tracing_from_env(service_name)
 
 
-_REGISTRY = CollectorRegistry()
-
-
 class AccountSegment(str, Enum):
     """Bounded aggregation buckets for account level metrics."""
 

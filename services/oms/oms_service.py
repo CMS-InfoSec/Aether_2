@@ -48,6 +48,7 @@ from services.oms.kraken_ws import (
 from services.oms.routing import LatencyRouter
 from services.oms.rate_limit_guard import rate_limit_guard
 from services.oms.warm_start import WarmStartCoordinator
+from shared.audit import AuditLogStore, TimescaleAuditLogger
 
 try:  # pragma: no cover - stablecoin monitor may not be available in light environments
     from services.risk.stablecoin_monitor import (
@@ -210,6 +211,20 @@ from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 
 logger = logging.getLogger(__name__)
+
+
+_OMS_AUDIT_LOGGERS: Dict[str, TimescaleAuditLogger] = {}
+_DEFAULT_OMS_AUDIT_ACCOUNT = "aether-audit"
+
+
+def _get_oms_audit_logger(account_id: str) -> TimescaleAuditLogger:
+    normalized = (account_id or "").strip() or _DEFAULT_OMS_AUDIT_ACCOUNT
+    logger_instance = _OMS_AUDIT_LOGGERS.get(normalized)
+    if logger_instance is None:
+        store = AuditLogStore(account_id=normalized)
+        logger_instance = TimescaleAuditLogger(store)
+        _OMS_AUDIT_LOGGERS[normalized] = logger_instance
+    return logger_instance
 
 
 app = FastAPI(title="Kraken OMS Async Service")
@@ -2861,6 +2876,29 @@ async def place_order(
             except Exception:  # pragma: no cover - defensive guard for stubbed clients
                 pass
         result = await account.place_order(payload)
+
+    audit_logger = _get_oms_audit_logger(payload.account_id)
+    before_snapshot = payload.model_dump(mode="json")
+    after_snapshot = result.model_dump(mode="json")
+    try:
+        audit_logger.record(
+            action="oms.order.placed",
+            actor_id=account_id,
+            before=before_snapshot,
+            after=after_snapshot,
+            correlation_id=payload.client_id,
+            account_id=payload.account_id,
+        )
+    except Exception:  # pragma: no cover - audit logging must not break order placement
+        logger.exception(
+            "Failed to record audit log for order placement",
+            extra={
+                "account_id": payload.account_id,
+                "client_id": payload.client_id,
+                "actor": account_id,
+            },
+        )
+
     return result
 
 
@@ -2876,6 +2914,27 @@ async def cancel_order(
     account = await manager.get_account(payload.account_id)
     with bind_metric_context(account_id=payload.account_id):
         result = await account.cancel_order(payload)
+    audit_logger = _get_oms_audit_logger(payload.account_id)
+    before_snapshot = payload.model_dump(mode="json")
+    after_snapshot = result.model_dump(mode="json")
+    try:
+        audit_logger.record(
+            action="oms.order.cancelled",
+            actor_id=account_id,
+            before=before_snapshot,
+            after=after_snapshot,
+            correlation_id=payload.client_id,
+            account_id=payload.account_id,
+        )
+    except Exception:  # pragma: no cover - audit logging must not disrupt cancellations
+        logger.exception(
+            "Failed to record audit log for order cancellation",
+            extra={
+                "account_id": payload.account_id,
+                "client_id": payload.client_id,
+                "actor": account_id,
+            },
+        )
     return result
 
 

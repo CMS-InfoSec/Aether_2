@@ -29,16 +29,31 @@ from collections.abc import Iterable as IterableABC
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
-from typing import Any, Awaitable, Callable, Iterable, List, Mapping, Optional, Protocol, Sequence
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence
 
 from services.common.adapters import TimescaleAdapter
 from services.common.precision import _parse_asset_pairs
 from services.oms.kraken_rest import KrakenRESTClient, KrakenRESTError
 from shared import hedge_logging
+from shared.audit import AuditLogStore, TimescaleAuditLogger
 from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 
 logger = logging.getLogger(__name__)
+
+
+_HEDGE_AUDIT_LOGGERS: Dict[str, TimescaleAuditLogger] = {}
+_DEFAULT_HEDGE_AUDIT_ACCOUNT = "aether-audit"
+
+
+def _get_hedge_audit_logger(account_id: str) -> TimescaleAuditLogger:
+    normalized = (account_id or "").strip() or _DEFAULT_HEDGE_AUDIT_ACCOUNT
+    logger_instance = _HEDGE_AUDIT_LOGGERS.get(normalized)
+    if logger_instance is None:
+        store = AuditLogStore(account_id=normalized)
+        logger_instance = TimescaleAuditLogger(store)
+        _HEDGE_AUDIT_LOGGERS[normalized] = logger_instance
+    return logger_instance
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +368,32 @@ class LoggingOMSClient:
         self.timescale.record_event(
             event_type="hedge.order", payload={"order": order.to_payload()}
         )
+        audit_logger = _get_hedge_audit_logger(order.account_id)
+        before_snapshot = {"order": order.to_payload()}
+        after_snapshot = {
+            "order_id": order.client_order_id,
+            "symbol": order.symbol,
+            "side": order.side,
+            "status": "submitted",
+        }
+        try:
+            audit_logger.record(
+                action="hedge.order.submitted",
+                actor_id=self.account_id,
+                before=before_snapshot,
+                after=after_snapshot,
+                correlation_id=order.client_order_id,
+                account_id=order.account_id,
+            )
+        except Exception:  # pragma: no cover - audit logging must not stop hedges
+            logger.exception(
+                "Failed to record audit log for hedge order",
+                extra={
+                    "account_id": order.account_id,
+                    "client_order_id": order.client_order_id,
+                    "symbol": order.symbol,
+                },
+            )
 
 
 # ---------------------------------------------------------------------------
