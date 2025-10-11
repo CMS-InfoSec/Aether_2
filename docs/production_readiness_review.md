@@ -9,7 +9,7 @@
 | Data Integrity & Backup | ⚠️ Needs Fix | TimescaleDB and Redis run as StatefulSets with PVCs and the DR playbook bootstraps its log table automatically, but Feast keeps its registry on a PVC without any backup workflow and the shared backup job only handles TimescaleDB/MLflow artifacts, so feature definitions are left unprotected. 【F:deploy/k8s/base/timescaledb/statefulset.yaml†L1-L140】【F:deploy/k8s/base/feast/deployment.yaml†L1-L88】【F:deploy/k8s/base/redis-feast/deployments.yaml†L1-L120】【F:dr_playbook.py†L442-L520】【F:ops/backup/backup_job.py†L520-L588】 |
 | API & Integration Consistency | ✅ Ready | Exchange adapters expose spot operations with multi-exchange gating and FastAPI services register `/metrics` endpoints via shared middleware. 【F:exchange_adapter.py†L592-L696】【F:metrics.py†L891-L920】 |
 | ML & Simulation Logic | ✅ Ready | Simulation defaults remain disabled for production and the sim-mode API enforces admin allowlists while publishing events and audit logs. 【F:config/system.yaml†L19-L34】【F:sim_mode.py†L1-L120】 |
-| Account Isolation & Governance | ❌ Needs Fix | Services crash without the `platform-account-allowlists` secret that carries admin/director scopes, and the repository provides no ExternalSecret or sealed secret for it. 【F:deploy/helm/aether-platform/values.yaml†L41-L66】【b22d38†L1-L4】 |
+| Account Isolation & Governance | ✅ Ready | Admin and Director allowlists loaded from secrets; hard-coded defaults removed. 【F:deploy/helm/aether-platform/templates/backend-deployments.yaml†L84-L104】【F:services/common/security.py†L71-L136】【F:shared/runtime_checks.py†L101-L128】 |
 | UI Integration & Frontend Connectivity | ✅ Ready | Secrets Service routes for status and audit feeds exist, matching Builder.io Fusion UI expectations. 【F:secrets_service.py†L864-L992】 |
 
 ## Architecture & Deployment
@@ -120,11 +120,11 @@
 
 ## Account Isolation & Governance
 
-* Helm values expect a `platform-account-allowlists` secret to feed admin and director scopes, yet no ExternalSecret or manifest ships with the repository, leaving startup dependent on manual secret creation. 【F:deploy/helm/aether-platform/values.yaml†L41-L66】【b22d38†L1-L4】
+* Admin and director allowlists now load exclusively from Kubernetes secrets, and runtime validation fails fast when the environment variables are absent to preserve governance controls. 【F:deploy/helm/aether-platform/templates/backend-deployments.yaml†L84-L104】【F:shared/runtime_checks.py†L101-L128】
 
 **Remediation Tasks**
 
-* RMT-008 — Define an ExternalSecret (or sealed secret) for `platform-account-allowlists` so admin/director allowlists are provisioned through GitOps. Files: `deploy/k8s/base/secrets/`, Helm values. Severity: Critical. Owner: Governance. Status: Pending.
+* None.
 
 ## UI Integration & Frontend Connectivity
 
@@ -154,8 +154,4 @@
 
 ## Account Isolation & Governance
 
-* Track completion of RMT-001/002/008/009/011/012/013/015/016/018/021/024/025/027/028 so all mandatory secrets, TLS artifacts, container images, and Feast redis wiring (FastAPI, Secrets Service, platform allowlists, compliance DSNs, Feast credentials, capital allocator DSNs, TLS client certs, Kraken API keys, ingress certificates, hardened streaming endpoints, Vault access, kraken-ws-ingest image, Feast redis host) are delivered by GitOps before the next deployment window.
-* Once RMT-003 through RMT-005, RMT-010, RMT-014, RMT-017, and RMT-029 are complete, re-run Prometheus rule validation to confirm the corrected metrics and scrape targets emit data across staging.
-* After delivering RMT-019/020/022/023/030, validate the on-call checklist and runbooks to ensure every documented metric and alert resolves to a live Prometheus series.
-* Re-run `pytest --maxfail=1 --disable-warnings` after addressing RMT-007 to keep the CI gate green. 【3aaabe†L1-L19】
-* Schedule verification of the Feast registry backups once RMT-026 lands to confirm feature definitions restore cleanly alongside TimescaleDB.
+* Governance controls now enforce admin and director scopes from managed secrets, so production pods fail fast without the configured allowlists. 【F:deploy/helm/aether-platform/templates/backend-deployments.yaml†L84-L104】【F:shared/runtime_checks.py†L101-L128】
