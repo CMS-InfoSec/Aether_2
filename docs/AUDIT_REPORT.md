@@ -2,6 +2,14 @@
 
 The repository requires coordinated fixes across persistence, services, and tests before the system can be considered production-ready. The following backlog converts the audit findings into actionable work items, grouped by subsystem. Each task includes the failure signal that exposes the bug, the component to inspect, and the suggested remediation steps.
 
+## Platform Capability Snapshot
+
+- **Order management & simulation** – `SimBroker` enforces spot-only order flow, persists simulated executions, and mirrors Kafka/Timescale side effects so CI can exercise the OMS without live exchange access.【F:services/oms/sim_broker.py†L86-L160】
+- **Risk & hedging controls** – The exit-rule engine guarantees stop-loss, take-profit, and trailing orders while the hedge service blends volatility and drawdown signals, persists operator overrides, and raises kill-switch recommendations.【F:services/risk/exit_rules.py†L42-L179】【F:services/hedge/hedge_service.py†L467-L620】
+- **Data ingestion & model training** – Feature jobs compute rolling microstructure statistics with deterministic SQLite fallbacks, and the supervised trainers support LightGBM, XGBoost, and PyTorch sequence models for adaptive strategies.【F:data/ingest/feature_jobs.py†L90-L213】【F:ml/models/supervised.py†L70-L399】
+- **Governance & observability** – Immutable audit logging, correlation IDs, and Prometheus-compatible metrics are available to every service, keeping sensitive changes and health data attributable even in dependency-light environments.【F:shared/audit.py†L1-L178】【F:metrics.py†L1-L152】
+- **Deployment & security posture** – Helm templates enforce TLS-only ingress with hardened headers, aligning platform deployments with the production security baseline.【F:deploy/helm/aether-platform/templates/backend-ingresses.yaml†L1-L58】
+
 ## 1. Test Harness & Environment
 
 | Priority | Task | Status | Notes |
@@ -76,5 +84,14 @@ The repository requires coordinated fixes across persistence, services, and test
 2. **Tackle P0 tasks by domain**—persistence, OMS, accounts—before moving to P1 items.
 3. After each fix, **add or update tests** to cover the restored functionality.
 4. Keep the task board updated as remediations land to ensure visibility across teams.
+
+## Outstanding Fixes and Follow-Ups
+
+- **Non-Kraken exchange adapters remain placeholders.** Binance and Coinbase integrations still raise `NotImplementedError`, so multi-exchange rollouts cannot proceed until real REST/WebSocket bindings ship.【F:exchange_adapter.py†L588-L664】
+- **Metrics exporter still depends on the Prometheus stub.** The lightweight `start_http_server` merely logs a warning; production deployments must restore the official client to expose scrape endpoints again.【F:metrics.py†L137-L152】
+- **Load-testing harness relies on insecure-default stubs.** The bundled `locust` module only works when insecure defaults are enabled and exits in production, so the genuine Locust/Gevent stack must be reinstated before capacity testing.【F:locust/__init__.py†L18-L135】
+- **Scientific stack needs the real NumPy/pandas toolchain.** Core ML and backtesting modules still gate their functionality behind dependency checks, leaving training and simulation unavailable until those libraries are installed.【F:ml/models/supervised.py†L46-L102】【F:backtest_engine.py†L18-L70】
+- **Kafka connectivity is replaced by a no-op shim.** The vendored `aiokafka` package records payloads in-memory and never reaches an actual Kafka broker, preventing live ingestion and OMS fan-out until the real client library is restored.【F:aiokafka/__init__.py†L13-L58】
+- **Human-in-the-loop approvals lose durability without SQLAlchemy.** When the ORM dependency is missing the HITL queue falls back to a process-local dictionary, so director decisions disappear across restarts and multiple replicas cannot coordinate until the persistent backend is reinstated.【F:hitl_service.py†L293-L355】
 
 This task board should replace the previous narrative audit and serve as the single source of truth for outstanding engineering work.

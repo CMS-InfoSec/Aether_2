@@ -127,14 +127,24 @@ Aether_2 is an autonomous AI-driven trading platform designed to operate exclusi
 
 | Component | Technology |
 |-----------|------------|
-| Backend | FastAPI (Python 3.11+). |
-| Database | PostgreSQL / TimescaleDB. |
-| Cache | Redis (optional). |
-| ML Framework | PyCaret / scikit-learn. |
-| Frontend | Builder.io Fusion (React). |
-| Deployment | Linode Kubernetes (Helm / Kustomize). |
-| External APIs | Kraken (Spot only), CoinGecko. |
-| Monitoring | Prometheus + Grafana / Linode Metrics. |
+| Backend | FastAPI services with Starlette middleware (Python 3.11+).【F:app.py†L9-L110】 |
+| Database | PostgreSQL / TimescaleDB surfaced through SQLAlchemy and psycopg helpers.【F:services/common/config.py†L158-L231】 |
+| Cache & Sessions | Redis-backed session store with in-memory fallbacks for tests.【F:common/utils/redis.py†L29-L190】 |
+| Streaming & Messaging | Kafka/NATS adapters for OMS and ingestion pipelines.【F:services/oms/sim_broker.py†L90-L160】 |
+| Feature Store | Feast repository with deterministic SQLite fallback for insecure defaults.【F:data/ingest/feature_jobs.py†L90-L213】 |
+| Machine Learning | LightGBM, XGBoost, and PyTorch trainers with MLflow logging hooks.【F:ml/models/supervised.py†L116-L399】 |
+| Frontend | Builder.io Fusion React components for dashboards and controls.【F:frontend/components/Dashboard.tsx†L1-L200】 |
+| Deployment | Helm charts targeting Linode Kubernetes with enforced TLS ingress policies.【F:deploy/helm/aether-platform/templates/backend-ingresses.yaml†L1-L58】 |
+| External APIs | Kraken spot REST/WebSocket adapters and CoinGecko data loaders.【F:exchange_adapter.py†L495-L664】【F:data/ingest/coingecko_job.py†L86-L186】 |
+| Monitoring & Tracing | Prometheus-compatible metrics plus OTLP tracing exporters.【F:metrics.py†L1-L152】 |
+
+### 4.1 Implemented Capabilities
+
+- **Order orchestration & simulation** – SimBroker validates spot symbols, records simulated fills, and mirrors Kafka/Timescale persistence so strategy and OMS flows can be exercised without exchange credentials.【F:services/oms/sim_broker.py†L86-L160】
+- **Risk controls & hedging** – ExitRuleEngine enforces mandatory brackets while HedgeService blends volatility, drawdown, and operator overrides to compute USD hedge targets and kill-switch recommendations.【F:services/risk/exit_rules.py†L42-L179】【F:services/hedge/hedge_service.py†L467-L620】
+- **Data ingestion & feature engineering** – Feature job workers compute rolling VWAP, spreads, and order-book imbalance, persisting to Feast or SQLite depending on environment flags.【F:data/ingest/feature_jobs.py†L90-L213】
+- **Governance & observability** – AuditLogStore provides immutable action trails and the metrics module exposes Prometheus/OTLP instrumentation for every service router.【F:shared/audit.py†L1-L178】【F:metrics.py†L1-L152】
+- **Operator experience** – The React dashboard surfaces risk forecasts, safe-mode state, and audit trails for director accounts.【F:frontend/components/Dashboard.tsx†L1-L200】
 
 ## 5. Success Criteria
 
@@ -167,6 +177,8 @@ The specification above describes the target end state, but the current reposito
 * **Automated testing is failing catastrophically.** A fresh run of the test suite (`pytest -q`) now halts during collection with 69 errors, driven by missing scientific libraries (NumPy, pandas), broken ORM wiring, and namespace collisions. The repository still cannot validate any of the core behaviours described in this specification.
   - ✅ Remediation: Interpreter startup now preloads the real `ml` package, extends its namespace so pytest mirrors cannot shadow the canonical modules, and guards the `services.auth` exports through the shared bootstrap. The ML policy shims ship an explicit `__init__` wrapper so `ml.policy.fallback_policy` resolves deterministically, keeping the end-to-end collection flow from erroring when the suite imports policy, training, or JWT helpers.【F:sitecustomize.py†L1-L132】【F:ml/__init__.py†L1-L118】【F:ml/policy/__init__.py†L1-L86】【F:shared/common_bootstrap.py†L35-L49】【F:tests/ml/policy/test_fallback_policy.py†L1-L43】【F:tests/services/test_auth_jwt.py†L1-L80】
 
+* **Non-Kraken exchange adapters remain placeholders.** Binance and Coinbase adapters still raise `NotImplementedError`, leaving cross-exchange expansion blocked until concrete REST/WebSocket implementations are delivered.【F:exchange_adapter.py†L588-L664】
+
   ```text
   $ pytest -q
   E   ModuleNotFoundError: No module named 'numpy'
@@ -184,6 +196,10 @@ The specification above describes the target end state, but the current reposito
 * ✅ **Audit backlog triaged with explicit statuses.** The remediation task board now records completed fixes for OMS adapters, simulation safety, CoinGecko ingest, and Kraken reconnect handling while flagging the remaining hedging, governance, and deployment follow-ups as pending work.【F:docs/AUDIT_REPORT.md†L1-L180】
 * **Core dependencies are missing from the runtime environment.** Security tests crash immediately because `starlette.requests` cannot be imported, signalling that Starlette is absent even though FastAPI components rely on it for request objects and middleware bindings. The secrets service middleware also imports `starlette.types` at module load, so the entire secrets API fails before startup until the dependency is restored.【a87cd4†L1-L13】【F:services/secrets/middleware.py†L1-L58】【a2c64c†L1-L16】
   - ✅ Remediation: the secrets middleware now ships with a tiny fallback `Headers` implementation and local ASGI type aliases when Starlette is unavailable, allowing the service to import without the external dependency while preserving header normalisation semantics.【F:services/secrets/middleware.py†L1-L64】
+* **Load-testing and observability tooling rely on stubs.** The bundled Locust shim only runs when insecure defaults are enabled and Prometheus' `start_http_server` logs a warning instead of exposing metrics, so production still needs the genuine packages restored for capacity testing and telemetry scraping.【F:locust/__init__.py†L18-L135】【F:metrics.py†L137-L152】
+* **Kafka producers/consumers never reach real brokers.** The in-repo `aiokafka` shim just records messages in memory, so Kraken ingest, OMS fan-out, and analytics pipelines cannot publish or consume market data until the genuine Kafka client is reintroduced.【F:aiokafka/__init__.py†L13-L58】
+* **Human-in-the-loop approvals lack durable storage.** Without SQLAlchemy the HITL service silently switches to an in-memory queue, meaning manual trade decisions disappear across process restarts and replicas until the persistent backend is restored.【F:hitl_service.py†L293-L355】
+* **Scientific stack still hard-fails without NumPy/pandas.** Supervised trainers and the backtest engine raise explicit dependency errors, leaving retraining, attribution, and stress scenarios unavailable until the scientific Python toolchain is reinstalled.【F:ml/models/supervised.py†L46-L102】【F:backtest_engine.py†L18-L70】
 * **Sequencer serialization is incompatible with the shipped Pydantic version.** `TradingSequencer.process_intent` still calls `BaseModel.model_dump(mode="json")`, but under Pydantic v2 that signature rejects the `mode` keyword, so every intent processing path fails before any trade orchestration can occur.【F:services/core/sequencer.py†L220-L270】【3839a3†L1-L44】
   - ✅ Remediation: the sequencer now routes all serialisation through a compatibility helper that prefers `model_dump(mode="json")` when available and falls back to `model_dump()`/`dict()`, restoring intent processing across both Pydantic v1 and v2 runtimes.【F:services/core/sequencer.py†L21-L38】【F:services/core/sequencer.py†L262-L383】
 * **Signal graph analytics cannot boot without NetworkX.** The signal graph service imports `networkx` directly, yet the dependency is absent from the runtime image, causing every signal graph request (and its associated security checks) to fail with `ModuleNotFoundError` and leaving feature attribution auditing offline.【F:signal_graph.py†L22-L66】【9d7e30†L1-L13】
