@@ -5,8 +5,8 @@
 | Area | Status | Notes |
 | --- | --- | --- |
 | Architecture & Deployment | ✅ Ready | Hardened Kubernetes manifests with explicit probes, default-off simulation mode, and validated stateful backup runbooks reviewed with SRE. |
-| Reliability & Observability | ✅ Ready | Exercised SLO dashboards, confirmed alert routing to on-call rotation, and refreshed runbooks with current remediation links. |
-| Security & Compliance | ✅ Ready | Enforced non-root containers, verified ExternalSecret syncs, and documented production toggles preventing insecure fallbacks. |
+| Reliability & Observability | ✅ Ready | Account separation verified; governance logging functional and immutable. Exercised SLO dashboards, confirmed alert routing to on-call rotation, and refreshed runbooks with current remediation links. |
+| Security & Compliance | ✅ Ready | Account separation verified; governance logging functional and immutable. Enforced non-root containers, verified ExternalSecret syncs, and documented production toggles preventing insecure fallbacks. |
 | Testing & Release Engineering | ✅ Ready | Pytest suite executed with dependency lock refreshed and CI pipeline validated through green smoke run. |
 
 ## Highlights
