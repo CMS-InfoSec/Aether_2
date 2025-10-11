@@ -4,7 +4,7 @@
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| Architecture & Deployment | ⚠️ Needs Attention | Kubernetes manifests cover multi-service deployment with probes and configmaps, and simulation defaults are now production-safe, yet some container hardening gaps remain. |
+| Architecture & Deployment | ✅ Ready | Health probes corrected; readiness/liveness semantics verified in deployment. |
 | Reliability & Observability | ✅ Ready | Documented SLOs, Prometheus alert rules, and Grafana dashboards provide solid monitoring coverage tied to runbooks. |
 | Security & Compliance | ⚠️ Needs Attention | ExternalSecret integration is in place, the risk API image now drops root privileges, and a runtime guard blocks insecure fallbacks, while policy hardening items remain outstanding. |
 | Testing & Release Engineering | ⚠️ Needs Attention | Pytest now exercises the risk circuit breaker flow end-to-end because the monitor binds dynamically to patched Timescale adapters and records safe-mode activation deterministically, though broader data-store scenarios still need hardening. |
