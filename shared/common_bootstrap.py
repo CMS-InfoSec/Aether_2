@@ -8,6 +8,8 @@ from pathlib import Path
 from types import ModuleType
 from typing import Callable, Dict, Mapping, Tuple
 
+from shared.runtime_checks import assert_insecure_defaults_disabled
+
 try:  # pragma: no cover - defensive import when sitecustomize missing
     from sitecustomize import (
         _ensure_auth_namespace,
@@ -346,6 +348,9 @@ def ensure_common_helpers() -> None:
         _ENSURING_COMMON_HELPERS = True
 
     try:
+        if not reentrant_call:
+            assert_insecure_defaults_disabled()
+
         loaded: Dict[str, ModuleType] = {}
         for name in _COMMON_MODULES:
             loaded[name] = _reload_with_overrides(name)
