@@ -345,6 +345,17 @@ class _TimescaleConnectionState:
     schema: str
 
 
+@dataclass(frozen=True)
+class _ContinuousAggregateDefinition:
+    name: str
+    source: str
+    query: str
+    refresh_start_offset: str = "30 days"
+    refresh_end_offset: str = "1 hour"
+    refresh_schedule_interval: str = "15 minutes"
+    retention_period: str | None = None
+
+
 class PublishError(RuntimeError):
     """Raised when a publish attempt fails for every configured transport."""
 
@@ -447,6 +458,26 @@ class _TimescaleStore:
         "events",
         "telemetry",
     )
+    _DEFAULT_RETENTION_DAYS: ClassVar[int] = 30
+    _CONTINUOUS_AGGREGATES: ClassVar[Tuple[_ContinuousAggregateDefinition, ...]] = (
+        _ContinuousAggregateDefinition(
+            name="events_hourly",
+            source="events",
+            query="""
+                CREATE MATERIALIZED VIEW {view}
+                    WITH (timescaledb.continuous) AS
+                SELECT
+                    time_bucket('1 hour', recorded_at) AS bucket,
+                    event_type,
+                    count(*) AS event_count
+                FROM {source}
+                GROUP BY bucket, event_type
+                WITH NO DATA;
+            """
+            .strip(),
+            retention_period="180 days",
+        ),
+    )
 
     def __init__(
         self,
@@ -528,6 +559,97 @@ class _TimescaleStore:
                         )
                     except Exception:  # pragma: no cover - tolerate missing extension
                         logger.debug("create_hypertable call failed", exc_info=True)
+                self._ensure_continuous_aggregates(cursor, state)
+                self._ensure_retention_policies(cursor, state)
+
+    def _ensure_continuous_aggregates(
+        self, cursor: "psycopg.Cursor[Any]", state: _TimescaleConnectionState
+    ) -> None:  # pragma: no cover - requires psycopg
+        for definition in self._CONTINUOUS_AGGREGATES:
+            view_name = f"{state.schema}.{definition.name}"
+            try:
+                cursor.execute("SELECT to_regclass(%s)", (view_name,))
+                existing = cursor.fetchone()
+            except Exception:
+                logger.debug(
+                    "Unable to inspect existing continuous aggregate %s", view_name, exc_info=True
+                )
+                continue
+            if not existing or existing[0] is None:
+                try:
+                    cursor.execute(
+                        definition.query.format(
+                            view=f'"{state.schema}"."{definition.name}"',
+                            source=f'"{state.schema}"."{definition.source}"',
+                        )
+                    )
+                except Exception:
+                    logger.debug(
+                        "Unable to create continuous aggregate %s", view_name, exc_info=True
+                    )
+                    continue
+            try:
+                cursor.execute(
+                    """
+                    SELECT add_continuous_aggregate_policy(
+                        %s::regclass,
+                        start_offset => %s::interval,
+                        end_offset => %s::interval,
+                        schedule_interval => %s::interval,
+                        if_not_exists => TRUE
+                    );
+                    """,
+                    (
+                        view_name,
+                        definition.refresh_start_offset,
+                        definition.refresh_end_offset,
+                        definition.refresh_schedule_interval,
+                    ),
+                )
+            except Exception:
+                logger.debug(
+                    "Unable to register continuous aggregate policy for %s",
+                    view_name,
+                    exc_info=True,
+                )
+            if definition.retention_period:
+                try:
+                    cursor.execute(
+                        """
+                        SELECT add_retention_policy(
+                            %s::regclass,
+                            %s::interval,
+                            if_not_exists => TRUE
+                        );
+                        """,
+                        (view_name, definition.retention_period),
+                    )
+                except Exception:
+                    logger.debug(
+                        "Unable to register retention policy for %s", view_name, exc_info=True
+                    )
+
+    def _ensure_retention_policies(
+        self, cursor: "psycopg.Cursor[Any]", state: _TimescaleConnectionState
+    ) -> None:  # pragma: no cover - requires psycopg
+        retention_interval = f"{self._DEFAULT_RETENTION_DAYS} days"
+        for name in self._HYPER_TABLES:
+            table_name = f"{state.schema}.{name}"
+            try:
+                cursor.execute(
+                    """
+                    SELECT add_retention_policy(
+                        %s::regclass,
+                        %s::interval,
+                        if_not_exists => TRUE
+                    );
+                    """,
+                    (table_name, retention_interval),
+                )
+            except Exception:
+                logger.debug(
+                    "Unable to register retention policy for %s", table_name, exc_info=True
+                )
 
     def _with_retry(
         self,
