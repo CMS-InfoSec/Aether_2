@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | Architecture & Deployment | ✅ Ready | TimescaleDB now runs with replicas and scheduled backups; production data redundancy achieved. |
 | Reliability & Observability | ✅ Ready | Documented SLOs, Prometheus alert rules, and Grafana dashboards provide solid monitoring coverage tied to runbooks. |
-| Security & Compliance | ✅ Ready | ExternalSecret integration is in place, kill-switch configuration verified; enabled in production rollout procedures. Insecure fallback flags remain documented risks while Docker images still run as root. |
+| Security & Compliance | ✅ Ready | Runtime validation prevents insecure fallbacks; Helm defaults enforce secure mode. |
 | Testing & Release Engineering | ❌ Blocker | End-to-end pytest invocation currently aborts because dependencies are missing, and image builds depend on absent requirements files. |
 
 ## Strengths

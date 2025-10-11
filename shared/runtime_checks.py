@@ -14,6 +14,22 @@ from typing import Iterable
 
 
 _GLOBAL_ALLOW_FLAG = "AETHER_ALLOW_INSECURE_DEFAULTS"
+_PRODUCTION_ENV_KEYS = (
+    "AETHER_ENVIRONMENT",
+    "AETHER_ENV",
+    "ENVIRONMENT",
+    "DEPLOY_ENV",
+    "DEPLOYMENT_ENVIRONMENT",
+    "APP_ENV",
+)
+_PRODUCTION_VALUES = {"prod", "production", "live"}
+_PRODUCTION_NAMESPACE_ENV_KEYS = (
+    "AETHER_K8S_NAMESPACE",
+    "KUBERNETES_NAMESPACE",
+    "POD_NAMESPACE",
+    "NAMESPACE",
+)
+_TRUTHY = {"1", "true", "yes", "on"}
 
 
 def _is_test_environment() -> bool:
@@ -22,6 +38,42 @@ def _is_test_environment() -> bool:
     if "pytest" in sys.modules:
         return True
     return os.getenv(_GLOBAL_ALLOW_FLAG) == "1"
+
+
+def is_production_environment() -> bool:
+    """Return ``True`` when the process identifies itself as production."""
+
+    for key in _PRODUCTION_ENV_KEYS:
+        value = os.getenv(key)
+        if value and value.strip().lower() in _PRODUCTION_VALUES:
+            return True
+
+    for key in _PRODUCTION_NAMESPACE_ENV_KEYS:
+        namespace = os.getenv(key)
+        if namespace and namespace.strip().lower().endswith("prod"):
+            return True
+
+    return False
+
+
+def ensure_insecure_default_flag_disabled(flag_name: str) -> None:
+    """Raise when ``flag_name`` enables insecure defaults in production."""
+
+    if _is_test_environment():
+        return
+
+    if not is_production_environment():
+        return
+
+    value = os.getenv(flag_name)
+    if value is None:
+        return
+
+    if value.strip().lower() in _TRUTHY:
+        raise RuntimeError(
+            f"{flag_name} is enabled but production deployments must use secure defaults. "
+            "Unset the flag or override the environment classification to continue."
+        )
 
 
 def assert_insecure_defaults_disabled(
