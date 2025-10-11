@@ -74,6 +74,7 @@
 ## Security & Compliance
 
 * All runtime network egress is restricted to the Kraken and CoinGecko ranges or the egress proxy, and Docker images drop root privileges. 【F:deploy/k8s/networkpolicy.yaml†L1-L112】【F:deploy/docker/risk-api/Dockerfile†L1-L26】
+* TLS certs validated and auto-renewal configured. 【F:deploy/k8s/base/secrets/tls-certificates.yaml†L1-L72】【F:deploy/k8s/base/secrets/cert-manager-renewal-cronjob.yaml†L1-L23】
 * The Secrets Service encryption key still depends on a manual workflow; the runbook is current but automating it would eliminate configuration drift. 【F:docs/runbooks/secrets-service-key-rotation.md†L27-L92】
 * Exchange credentials (`kraken-keys-company`, `kraken-keys-director-1`, `kraken-keys-director-2`) are consumed by OMS, policy, universe, risk, fees, and secrets services, yet no ExternalSecret manifests exist for them, so operators must craft Kubernetes secrets manually outside GitOps. 【F:deploy/k8s/base/aether-services/deployment-oms.yaml†L92-L124】【F:deploy/k8s/base/aether-services/deployment-policy.yaml†L78-L110】【F:deploy/k8s/base/secrets/external-secrets.yaml†L1-L204】
 * The Kafka and Zookeeper manifests explicitly enable plaintext listeners and anonymous logins, conflicting with the TLS-only expectations in `fastapi-config`. 【F:deploy/k8s/base/kafka-nats/stack.yaml†L24-L182】【F:deploy/k8s/base/fastapi/configmap.yaml†L12-L49】
