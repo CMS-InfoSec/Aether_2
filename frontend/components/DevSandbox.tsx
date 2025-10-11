@@ -6,6 +6,7 @@ import React, {
   useRef,
   useState,
 } from "react";
+import { withErrorBoundary } from "./withErrorBoundary";
 import { formatLondonTime } from "./timezone";
 import { useAuthClaims } from "./useAuthClaims";
 
@@ -1161,4 +1162,6 @@ const DevSandbox: React.FC = () => {
   );
 };
 
-export default DevSandbox;
+export default withErrorBoundary(DevSandbox, {
+  componentName: "Developer Sandbox",
+});

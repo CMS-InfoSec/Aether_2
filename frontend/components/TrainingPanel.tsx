@@ -5,6 +5,7 @@ import React, {
   useMemo,
   useState,
 } from "react";
+import { withErrorBoundary } from "./withErrorBoundary";
 import { formatLondonTime } from "./timezone";
 import { useAuthClaims } from "./useAuthClaims";
 
@@ -679,4 +680,6 @@ const TrainingPanel: React.FC = () => {
   );
 };
 
-export default TrainingPanel;
+export default withErrorBoundary(TrainingPanel, {
+  componentName: "Training Panel",
+});

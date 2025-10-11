@@ -5,13 +5,21 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import threading
 from dataclasses import dataclass
 from importlib import import_module
+from pathlib import Path
 from types import ModuleType
 from typing import Any, Dict, Iterable, List, Mapping, Protocol, Sequence, Tuple, TYPE_CHECKING, cast
 
 from services.common.schemas import ActionTemplate, BookSnapshot, ConfidenceMetrics
 from shared.spot import require_spot_symbol
+
+try:  # pragma: no cover - drift detection is optional in lightweight deployments
+    from ml.monitoring.live_monitor import FeatureDriftDetector
+except Exception:  # pragma: no cover - degrade gracefully when dependencies missing
+    FeatureDriftDetector = None  # type: ignore[assignment]
 class _PyFuncModel(Protocol):
     metadata: Any
 
@@ -79,6 +87,10 @@ MlflowClient: type[MlflowClientProtocol] | None = cast(
 ModelSignature: type[ModelSignatureLike] | None = cast(
     type[ModelSignatureLike] | None, MlflowModelSignature
 )
+
+_DRIFT_BASELINE_DIR = Path(os.getenv("DRIFT_BASELINE_DIR", "artifacts/drift"))
+_DRIFT_MONITORS: Dict[str, Any] = {}
+_DRIFT_LOCK = threading.Lock()
 
 logger = logging.getLogger(__name__)
 
@@ -492,6 +504,44 @@ def _model_name(account_id: str, symbol: str, variant: str | None = None) -> str
     return f"policy-intent::{account_id}::{canonical_symbol}{suffix}".lower()
 
 
+def _drift_monitor_key(model_key: str) -> str:
+    return model_key.replace("/", "_").replace("::", "__")
+
+
+def _load_drift_monitor(
+    model_key: str, feature_names: Sequence[str]
+) -> FeatureDriftDetector | None:
+    detector_cls = FeatureDriftDetector
+    if detector_cls is None:  # pragma: no cover - drift detector optional
+        return None
+
+    safe_key = _drift_monitor_key(model_key)
+    with _DRIFT_LOCK:
+        cached = _DRIFT_MONITORS.get(safe_key)
+        if isinstance(cached, detector_cls):  # type: ignore[arg-type]
+            return cached
+
+        candidates = [
+            _DRIFT_BASELINE_DIR / f"{safe_key}.json",
+            _DRIFT_BASELINE_DIR / f"{safe_key}_baseline.json",
+            _DRIFT_BASELINE_DIR / "training_baseline.json",
+        ]
+
+        for path in candidates:
+            if not path.exists():
+                continue
+            try:
+                monitor = detector_cls.from_json(path, feature_names=feature_names)
+            except Exception as exc:  # pragma: no cover - baseline may be malformed
+                logger.debug("Unable to load drift baseline from %s: %s", path, exc)
+                continue
+            _DRIFT_MONITORS[safe_key] = monitor
+            return monitor
+
+        logger.debug("No drift baseline available for model %s", model_key)
+        return None
+
+
 def _initialise_registry() -> PolicyModelRegistry:
     client: MlflowClientProtocol | None = None
     factory = MlflowClient
@@ -551,6 +601,23 @@ def predict_intent(
 
         raw_response = cached_model.model.predict(feature_frame, params=params)
         payload = _normalise_model_output(raw_response)
+
+        drift_monitor = _load_drift_monitor(model_key, cached_model.feature_names)
+        if drift_monitor is not None:
+            evaluation = drift_monitor.observe(
+                validated_features,
+                feature_names=cached_model.feature_names,
+            )
+            if evaluation is not None:
+                drift_payload = evaluation.to_dict()
+                payload_metadata = payload.get("metadata")
+                if not isinstance(payload_metadata, Mapping):
+                    payload_metadata = {}
+                merged_metadata = dict(payload_metadata)
+                merged_metadata["drift"] = drift_payload
+                payload["metadata"] = merged_metadata
+                metadata = dict(metadata or {})
+                metadata["drift"] = drift_payload
 
         return _intent_from_payload(payload, metadata)
 

@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { withErrorBoundary } from "./withErrorBoundary";
 import { formatLondonTime } from "./timezone";
 
 type AuditLogEntry = {
@@ -534,4 +535,6 @@ const AuditViewer: React.FC = () => {
   );
 };
 
-export default AuditViewer;
+export default withErrorBoundary(AuditViewer, {
+  componentName: "Audit Viewer",
+});

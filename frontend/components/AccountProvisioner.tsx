@@ -1,4 +1,5 @@
 import React, { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { withErrorBoundary } from "./withErrorBoundary";
 import { formatLondonTime } from "./timezone";
 import { useAuthClaims } from "./useAuthClaims";
 
@@ -194,7 +195,7 @@ const AccountProvisioner: React.FC = () => {
       const headers: Record<string, string> = {
         "Content-Type": "application/json",
         Accept: "application/json",
-        "X-MFA-Context": mfaContext,
+        "X-MFA-Token": mfaContext,
       };
       if (accessToken) {
         headers.Authorization = `Bearer ${accessToken}`;
@@ -456,4 +457,6 @@ const AccountProvisioner: React.FC = () => {
   );
 };
 
-export default AccountProvisioner;
+export default withErrorBoundary(AccountProvisioner, {
+  componentName: "Account Provisioner",
+});

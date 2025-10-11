@@ -15,7 +15,7 @@ from shared.k8s import KrakenSecretStore
 
 client = TestClient(app)
 
-MFA_HEADER = {"X-MFA-Context": "verified"}
+MFA_HEADER = {"X-MFA-Token": "verified"}
 
 
 def setup_function() -> None:
@@ -75,8 +75,8 @@ def test_upsert_secret_requires_mfa() -> None:
         headers={"X-Account-ID": "company"},
     )
 
-    assert response.status_code == 422
-    assert response.json()["detail"][0]["loc"][-1] == "X-MFA-Context"
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Missing MFA verification token."
 
 
 def test_status_requires_authorized_account(monkeypatch: pytest.MonkeyPatch) -> None:

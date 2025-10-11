@@ -20,6 +20,19 @@ import sys
 import os
 from pathlib import Path
 
+_TEST_ALLOWLIST_DEFAULTS = {
+    "ADMIN_ALLOWLIST": "company,director-1,director-2",
+    "DIRECTOR_ALLOWLIST": "director-1,director-2",
+}
+
+
+def _seed_test_allowlists() -> None:
+    """Mirror production secrets for test execution."""
+
+    for variable, default in _TEST_ALLOWLIST_DEFAULTS.items():
+        if not os.environ.get(variable):
+            os.environ[variable] = default
+
 
 def _ensure_repo_root_on_path() -> None:
     """Add the repository root to ``sys.path`` if it is missing."""
@@ -30,7 +43,11 @@ def _ensure_repo_root_on_path() -> None:
         sys.path.insert(0, repo_str)
 
 
-os.environ.setdefault("ADMIN_ALLOWLIST", "company,director-1,director-2")
-os.environ.setdefault("DIRECTOR_ALLOWLIST", "director-1,director-2")
+
+def pytest_configure(config):  # type: ignore[override]
+    """Populate required environment variables for the test harness."""
+
+    _seed_test_allowlists()
 
 _ensure_repo_root_on_path()
+_seed_test_allowlists()

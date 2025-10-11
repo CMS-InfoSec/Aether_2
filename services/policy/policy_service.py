@@ -956,9 +956,15 @@ def decide_policy_intent(
         pass
 
     drift = 0.0
-    raw = account_state.get("drift_score", 0.0)
+    raw = account_state.get("drift_score")
+    if raw is None:
+        metadata_payload = intent_payload.get("metadata") if isinstance(intent_payload, Mapping) else None
+        if isinstance(metadata_payload, Mapping):
+            drift_metadata = metadata_payload.get("drift")
+            if isinstance(drift_metadata, Mapping):
+                raw = drift_metadata.get("max_severity")
     try:
-        drift = float(raw)
+        drift = float(raw) if raw is not None else 0.0
     except (TypeError, ValueError):
         drift = 0.0
     metrics_ctx = metric_context(account_id=request.account_id, symbol=request.symbol)

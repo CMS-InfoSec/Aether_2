@@ -109,11 +109,11 @@ def assert_account_allowlists_configured() -> None:
     if _is_test_environment():
         return
 
-    missing = [
-        variable
-        for variable in _REQUIRED_ALLOWLIST_ENV
-        if not (os.getenv(variable) or "")
-    ]
+    missing = []
+    for variable in _REQUIRED_ALLOWLIST_ENV:
+        value = os.getenv(variable)
+        if value is None or not value.strip():
+            missing.append(variable)
 
     if missing:
         formatted = ", ".join(sorted(missing))

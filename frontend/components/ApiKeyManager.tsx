@@ -1,4 +1,5 @@
 import React, { FormEvent, useCallback, useEffect, useState } from "react";
+import { withErrorBoundary } from "./withErrorBoundary";
 import { formatLondonTime } from "./timezone";
 import { useAuthClaims } from "./useAuthClaims";
 
@@ -63,7 +64,7 @@ const ApiKeyManager: React.FC = () => {
           method: "GET",
           headers: {
             Accept: "application/json",
-            "X-MFA-Context": mfaContext,
+            "X-MFA-Token": mfaContext,
             ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
           },
           signal,
@@ -117,7 +118,7 @@ const ApiKeyManager: React.FC = () => {
           method: "GET",
           headers: {
             Accept: "application/json",
-            "X-MFA-Context": mfaContext,
+            "X-MFA-Token": mfaContext,
             ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
           },
           signal,
@@ -226,7 +227,7 @@ const ApiKeyManager: React.FC = () => {
         headers: {
           "Content-Type": "application/json",
           Accept: "application/json",
-          "X-MFA-Context": mfaContext,
+          "X-MFA-Token": mfaContext,
           ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
         },
         body: JSON.stringify(payload),
@@ -436,4 +437,6 @@ const ApiKeyManager: React.FC = () => {
   );
 };
 
-export default ApiKeyManager;
+export default withErrorBoundary(ApiKeyManager, {
+  componentName: "API Key Manager",
+});

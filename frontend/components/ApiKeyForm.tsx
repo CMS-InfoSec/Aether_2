@@ -1,4 +1,5 @@
 import React, { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { withErrorBoundary } from "./withErrorBoundary";
 import { formatLondonTime } from "./timezone";
 import { useAuthClaims } from "./useAuthClaims";
 
@@ -82,7 +83,7 @@ const ApiKeyForm: React.FC = () => {
             headers: {
               Accept: "application/json",
               "X-Account-ID": accountId,
-              "X-MFA-Context": mfaContext,
+              "X-MFA-Token": mfaContext,
               ...(accessToken
                 ? { Authorization: `Bearer ${accessToken}` }
                 : {}),
@@ -191,7 +192,7 @@ const ApiKeyForm: React.FC = () => {
           "Content-Type": "application/json",
           Accept: "application/json",
           "X-Account-ID": accountId,
-          "X-MFA-Context": mfaContext,
+          "X-MFA-Token": mfaContext,
           ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
         },
         body: JSON.stringify(payload),
@@ -381,4 +382,4 @@ const ApiKeyForm: React.FC = () => {
   );
 };
 
-export default ApiKeyForm;
+export default withErrorBoundary(ApiKeyForm, { componentName: "API Key Form" });

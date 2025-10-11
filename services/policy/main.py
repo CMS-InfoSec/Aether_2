@@ -302,6 +302,10 @@ def decide_policy(
 
     drift_value = 0.0
     drift_source = online_features.get("drift_score") if isinstance(online_features, dict) else None
+    if drift_source is None and isinstance(intent.metadata, Mapping):
+        drift_metadata = intent.metadata.get("drift")
+        if isinstance(drift_metadata, Mapping):
+            drift_source = drift_metadata.get("max_severity")
     if drift_source is None and isinstance(request.state, PolicyState):
         drift_source = getattr(request.state, "conviction", None)
     if drift_source is not None:
