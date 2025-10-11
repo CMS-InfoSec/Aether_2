@@ -18,11 +18,13 @@ try:  # pragma: no cover - optional dependency
         Float,
         Integer,
         String,
+        Table,
         Text,
         create_engine,
         select,
     )
     from sqlalchemy.engine import Engine
+    from sqlalchemy.exc import NoReferencedTableError
     from sqlalchemy.orm import Session, declarative_base, sessionmaker
 except Exception:  # pragma: no cover - executed when SQLAlchemy is unavailable
     Engine = object  # type: ignore[assignment]
@@ -32,7 +34,7 @@ else:  # pragma: no cover - exercised in environments with SQLAlchemy installed
     SQLALCHEMY_AVAILABLE = getattr(Column, "__module__", "").startswith("sqlalchemy")
 
 from services.common.security import require_admin_account
-from shared.account_scope import account_id_column
+from shared.account_scope import account_id_column, ensure_accounts_table
 
 
 logger = logging.getLogger(__name__)
@@ -41,6 +43,7 @@ audit_logger = logging.getLogger("risk.esg")
 
 if SQLALCHEMY_AVAILABLE:
     Base = declarative_base()
+    ensure_accounts_table(Base.metadata)
 
     class ESGAsset(Base):
         """ORM representation of ESG attributes for tradeable assets."""
@@ -115,14 +118,35 @@ if SQLALCHEMY_AVAILABLE:
         options["connect_args"] = connect_args
         return options
 
+    def _ensure_sqlite_accounts_shadow_table(engine: Engine) -> None:
+        """Provide a minimal ``accounts`` table for lightweight SQLite test runs."""
+
+        if engine.dialect.name != "sqlite":
+            return
+
+        shadow = Base.metadata.tables.get("accounts")
+        if shadow is None:
+            shadow = Table(
+                "accounts",
+                Base.metadata,
+                Column("account_id", String, primary_key=True),
+                extend_existing=True,
+                info={"aether_shadow": True},
+            )
+
+        Base.metadata.create_all(bind=engine, tables=[shadow], checkfirst=True)
+
     def _run_migrations(engine: Engine) -> None:
         """Ensure ESG tables exist in the configured database."""
 
-        Base.metadata.create_all(
-            bind=engine,
-            tables=[ESGAsset.__table__, ESGRejection.__table__],
-            checkfirst=True,
-        )
+        tables = [ESGAsset.__table__, ESGRejection.__table__]
+        try:
+            Base.metadata.create_all(bind=engine, tables=tables, checkfirst=True)
+            return
+        except NoReferencedTableError:
+            _ensure_sqlite_accounts_shadow_table(engine)
+
+        Base.metadata.create_all(bind=engine, tables=tables, checkfirst=True)
 
     _DB_URL = _database_url()
     ENGINE: Engine = create_engine(_DB_URL, **_engine_options(_DB_URL))
