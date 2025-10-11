@@ -58,6 +58,16 @@ spec:
               value: "6379"
             - name: FEAST_REGISTRY_PATH
               value: /data/registry.db
+            - name: FEAST_OFFLINE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: feast-offline-store
+                  key: username
+            - name: FEAST_OFFLINE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: feast-offline-store
+                  key: password
           volumeMounts:
             - name: feast-rendered-config
               mountPath: /etc/feast
@@ -69,6 +79,17 @@ spec:
               path: /health
               port: http
             initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
           resources:
             requests:
               cpu: 200m
@@ -76,6 +97,12 @@ spec:
             limits:
               cpu: 500m
               memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
       volumes:
         - name: feast-config-template
           configMap:
@@ -83,4 +110,19 @@ spec:
         - name: feast-rendered-config
           emptyDir: {}
         - name: feast-registry
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: feast-registry
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: feast-registry
+  labels:
+    app.kubernetes.io/name: feast-online
+    app.kubernetes.io/component: feature-store
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi

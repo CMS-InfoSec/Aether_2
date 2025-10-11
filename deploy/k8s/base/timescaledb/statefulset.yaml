@@ -36,6 +36,26 @@ spec:
           ports:
             - containerPort: 5432
               name: postgres
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - "pg_isready -U \"${POSTGRES_USER}\" -d \"${POSTGRES_DB}\" -h 127.0.0.1"
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - "pg_isready -U \"${POSTGRES_USER}\" -d \"${POSTGRES_DB}\" -h 127.0.0.1"
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
           resources:
             requests:
               cpu: 500m
@@ -125,6 +145,13 @@ spec:
               volumeMounts:
                 - name: backup-storage
                   mountPath: /backups
+              resources:
+                requests:
+                  cpu: 200m
+                  memory: 256Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
           volumes:
             - name: backup-storage
               persistentVolumeClaim:
