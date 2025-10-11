@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import io
+import json
 import os
+import shutil
 import tarfile
 from pathlib import Path
 
@@ -179,3 +181,96 @@ def test_log_dr_action_bootstraps_log_table(
     assert calls[1][1] == (config.actor, "snapshot:start")
     assert calls[2][0].startswith("INSERT INTO \"dr_log\"")
     assert calls[2][1] == (config.actor, "snapshot:complete")
+
+
+def test_snapshot_cluster_records_actions(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    bundle_path = tmp_path / "bundle.tar.gz"
+    bundle_path.write_bytes(b"bundle")
+
+    config = DisasterRecoveryConfig(
+        timescale_dsn="postgresql://localhost/postgres",
+        redis_url="redis://localhost:6379/0",
+        mlflow_artifact_uri="s3://dummy/artifacts",
+        object_store_bucket="dummy",
+        work_dir=tmp_path,
+    )
+
+    actions: list[str] = []
+    monkeypatch.setattr(dr_playbook, "_log_dr_action", lambda cfg, action: actions.append(action))
+    monkeypatch.setattr(dr_playbook, "create_snapshot_bundle", lambda cfg: bundle_path)
+    monkeypatch.setattr(dr_playbook, "push_snapshot", lambda bundle, cfg: f"{cfg.object_store_prefix}/{bundle.name}")
+
+    key = dr_playbook.snapshot_cluster(config)
+
+    assert key == f"{config.object_store_prefix}/{bundle_path.name}"
+    assert actions == [
+        "snapshot:start",
+        f"snapshot:complete:{config.object_store_prefix}/{bundle_path.name}",
+    ]
+
+
+def test_restore_cluster_happy_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    bundle_root = tmp_path / "bundle_root"
+    bundle_root.mkdir()
+    manifest = {
+        "timescale_dump": "timescale.dump",
+        "redis_snapshot": "redis.rdb",
+        "mlflow_archive": "mlflow.tar.gz",
+    }
+    for name in manifest.values():
+        (bundle_root / name).write_text(f"payload:{name}")
+    (bundle_root / "manifest.json").write_text(json.dumps(manifest))
+
+    bundle_path = tmp_path / "bundle.tar.gz"
+    with tarfile.open(bundle_path, "w:gz") as tar:
+        for name in ["manifest.json", *manifest.values()]:
+            tar.add(bundle_root / name, arcname=name)
+
+    class DummyClient:
+        def download_file(self, bucket: str, key: str, dest: str) -> None:
+            shutil.copyfile(bundle_path, dest)
+
+    monkeypatch.setattr(dr_playbook, "_build_object_store_client", lambda cfg: DummyClient())
+
+    actions: list[str] = []
+    monkeypatch.setattr(dr_playbook, "_log_dr_action", lambda cfg, action: actions.append(action))
+
+    calls: list[tuple[str, Path]] = []
+
+    def _capture_timescale(config: DisasterRecoveryConfig, dump: Path, *, drop_existing: bool = True) -> None:
+        calls.append(("timescale", dump))
+
+    def _capture_redis(config: DisasterRecoveryConfig, snapshot: Path) -> None:
+        calls.append(("redis", snapshot))
+
+    def _capture_mlflow(config: DisasterRecoveryConfig, archive: Path) -> None:
+        calls.append(("mlflow", archive))
+
+    monkeypatch.setattr(dr_playbook, "_restore_timescaledb", _capture_timescale)
+    monkeypatch.setattr(dr_playbook, "_restore_redis_state", _capture_redis)
+    monkeypatch.setattr(dr_playbook, "_restore_mlflow_artifacts", _capture_mlflow)
+
+    config = DisasterRecoveryConfig(
+        timescale_dsn="postgresql://localhost/postgres",
+        redis_url="redis://localhost:6379/0",
+        mlflow_artifact_uri="s3://dummy/artifacts",
+        object_store_bucket="dummy",
+        work_dir=tmp_path,
+    )
+
+    dr_playbook.restore_cluster("snapshot-key.tar.gz", config)
+
+    expected_key = f"{config.object_store_prefix}/snapshot-key.tar.gz"
+    assert actions == [
+        f"restore:start:{expected_key}",
+        f"restore:complete:{expected_key}",
+    ]
+
+    expected_names = {
+        "timescale": manifest["timescale_dump"],
+        "redis": manifest["redis_snapshot"],
+        "mlflow": manifest["mlflow_archive"],
+    }
+    assert {kind for kind, _ in calls} == set(expected_names)
+    for kind, path in calls:
+        assert path.name == expected_names[kind]

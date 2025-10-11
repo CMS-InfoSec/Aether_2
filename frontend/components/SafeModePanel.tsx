@@ -1,4 +1,5 @@
 import React, { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { withErrorBoundary } from "./withErrorBoundary";
 import { formatLondonTime } from "./timezone";
 import { useAuthClaims } from "./useAuthClaims";
 
@@ -955,4 +956,6 @@ const SafeModePanel: React.FC = () => {
   );
 };
 
-export default SafeModePanel;
+export default withErrorBoundary(SafeModePanel, {
+  componentName: "Safe Mode Panel",
+});

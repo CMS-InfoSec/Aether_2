@@ -1,10 +1,5 @@
-import React, {
-  FormEvent,
-  useCallback,
-  useEffect,
-  useMemo,
-  useState,
-} from "react";
+import React, { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { withErrorBoundary } from "./withErrorBoundary";
 import { formatLondonTime } from "./timezone";
 import { useAuthClaims } from "./useAuthClaims";
 
@@ -1049,4 +1044,6 @@ const DirectorControls: React.FC = () => {
   );
 };
 
-export default DirectorControls;
+export default withErrorBoundary(DirectorControls, {
+  componentName: "Director Controls",
+});

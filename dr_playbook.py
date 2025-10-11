@@ -450,12 +450,12 @@ def _log_dr_action(config: DisasterRecoveryConfig, action: str) -> None:
         "INSERT INTO {table} (actor, action, ts) VALUES (%s, %s, NOW())"
     ).format(table=sql.Identifier(config.log_table))
     with psycopg.connect(config.timescale_dsn, autocommit=True) as conn:  # type: ignore[arg-type]
-        _ensure_log_table_exists(conn, config.log_table)
         with conn.cursor() as cur:
+            _ensure_log_table_exists(cur, config.log_table)
             cur.execute(insert_query, (config.actor, action))
 
 
-def _ensure_log_table_exists(conn: Any, table_name: str) -> None:
+def _ensure_log_table_exists(cur: Any, table_name: str) -> None:
     """Ensure the disaster recovery log table exists."""
 
     if table_name in _LOG_TABLE_BOOTSTRAPPED:
@@ -472,8 +472,7 @@ def _ensure_log_table_exists(conn: Any, table_name: str) -> None:
         """
     ).format(table=sql.Identifier(table_name))
 
-    with conn.cursor() as cur:
-        cur.execute(create_query)
+    cur.execute(create_query)
 
     _LOG_TABLE_BOOTSTRAPPED.add(table_name)
 

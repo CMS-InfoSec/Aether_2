@@ -27,10 +27,21 @@ jobs:
       - name: Authenticate to GHCR for Kaniko
         env:
           GHCR_USER: ${{ github.actor }}
-          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          mask_secret() {
+            if [ -z "$1" ]; then
+              return
+            fi
+            printf '%s' "$1" | while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              echo "::add-mask::$line"
+            done
+          }
+          mask_secret "$GHCR_TOKEN"
           mkdir -p /kaniko/.docker
           AUTH_TOKEN=$(printf '%s' "${GHCR_USER}:${GHCR_TOKEN}" | base64 | tr -d '\n')
+          mask_secret "$AUTH_TOKEN"
           cat <<EOF >/kaniko/.docker/config.json
           {
             "auths": {
@@ -90,6 +101,9 @@ jobs:
         env:
           CR_PAT: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          if [ -n "$CR_PAT" ]; then
+            echo "::add-mask::$CR_PAT"
+          fi
           echo "${CR_PAT}" | buildah login --username ${{ github.actor }} --password-stdin ghcr.io
           buildah push ${REGISTRY}/kraken-ws-ingest:${{ github.sha }}
           buildah push ${REGISTRY}/risk-api:${{ github.sha }}
