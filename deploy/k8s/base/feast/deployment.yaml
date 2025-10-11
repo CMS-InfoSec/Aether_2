@@ -15,6 +15,34 @@ spec:
       labels:
         app.kubernetes.io/name: feast-online
     spec:
+      initContainers:
+        - name: render-feast-config
+          image: python:3.11-slim
+          command:
+            - python
+            - -c
+            - |
+              import os
+              from pathlib import Path
+
+              template = Path("/templates/feature_store.yaml").read_text()
+              password = os.environ["FEAST_OFFLINE_PASSWORD"]
+              rendered = template.replace("${FEAST_OFFLINE_PASSWORD}", password)
+              output = Path("/etc/feast/feature_store.yaml")
+              output.parent.mkdir(parents=True, exist_ok=True)
+              output.write_text(rendered)
+          env:
+            - name: FEAST_OFFLINE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: feast-offline-store
+                  key: password
+          volumeMounts:
+            - name: feast-config-template
+              mountPath: /templates
+              readOnly: true
+            - name: feast-rendered-config
+              mountPath: /etc/feast
       containers:
         - name: feast
           image: feastdev/feast-serving:1.0.0
@@ -41,7 +69,7 @@ spec:
                   name: feast-offline-store
                   key: password
           volumeMounts:
-            - name: feast-config
+            - name: feast-rendered-config
               mountPath: /etc/feast
               readOnly: true
             - name: feast-registry
@@ -76,9 +104,11 @@ spec:
                 - ALL
             readOnlyRootFilesystem: true
       volumes:
-        - name: feast-config
+        - name: feast-config-template
           configMap:
             name: feast-config
+        - name: feast-rendered-config
+          emptyDir: {}
         - name: feast-registry
           persistentVolumeClaim:
             claimName: feast-registry
