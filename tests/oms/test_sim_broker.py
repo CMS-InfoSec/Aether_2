@@ -12,6 +12,7 @@ from services.oms.sim_broker import SimBroker
 def _stub_timescale_adapter(monkeypatch: pytest.MonkeyPatch) -> type[TimescaleAdapter]:
     class _StubTimescaleAdapter:
         _fills: list[dict[str, object]] = []
+        _acks: list[dict[str, object]] = []
 
         def __init__(self, *, account_id: str) -> None:  # type: ignore[no-untyped-def]
             self.account_id = account_id
@@ -19,12 +20,19 @@ def _stub_timescale_adapter(monkeypatch: pytest.MonkeyPatch) -> type[TimescaleAd
         @classmethod
         def reset(cls) -> None:
             cls._fills = []
+            cls._acks = []
 
         def record_fill(self, payload: dict[str, object]) -> None:
             type(self)._fills.append(dict(payload))
 
+        def record_ack(self, payload: dict[str, object]) -> None:
+            type(self)._acks.append(dict(payload))
+
         def events(self) -> dict[str, list[dict[str, object]]]:
-            return {"fills": list(type(self)._fills)}
+            return {
+                "fills": list(type(self)._fills),
+                "acks": list(type(self)._acks),
+            }
 
     monkeypatch.setattr("services.oms.sim_broker.TimescaleAdapter", _StubTimescaleAdapter)
     monkeypatch.setattr("tests.oms.test_sim_broker.TimescaleAdapter", _StubTimescaleAdapter)
@@ -66,6 +74,8 @@ def test_market_order_immediate_fill(_stub_timescale_adapter: type[TimescaleAdap
 
     fills = broker._timescale.events()["fills"]
     assert fills[-1]["simulated"] is True
+    acks = broker._timescale.events()["acks"]
+    assert acks[-1]["simulated"] is True
 
 
 def test_limit_order_partial_fill(_stub_timescale_adapter: type[TimescaleAdapter]) -> None:
@@ -155,4 +165,47 @@ def test_place_order_rejects_non_spot_symbol(
             quantity=1.0,
             order_type="market",
             market_data={"last_price": 100.0},
+        )
+
+
+def test_stop_loss_take_profit_enforced(
+    _stub_timescale_adapter: type[TimescaleAdapter],
+) -> None:
+    broker = SimBroker("ACC-DEFAULT", timescale_factory=_stub_timescale_adapter)
+
+    result = broker.place_order(
+        client_order_id="with-brackets",
+        symbol="BTC-USD",
+        side="buy",
+        quantity=Decimal("0.5"),
+        order_type="market",
+        market_data={"last_price": 100.0, "high": 125.0, "low": 90.0},
+        stop_loss=Decimal("95"),
+        take_profit=Decimal("115"),
+    )
+
+    assert result["stop_loss"] == pytest.approx(95.0)
+    assert result["take_profit"] == pytest.approx(115.0)
+    assert result["stop_loss_triggered"] is True
+    assert result["take_profit_triggered"] is True
+
+    acks = broker._timescale.events()["acks"]
+    assert acks[-1]["stop_loss_triggered"] is True
+    assert acks[-1]["take_profit_triggered"] is True
+
+
+def test_invalid_stop_loss_configuration_rejected(
+    _stub_timescale_adapter: type[TimescaleAdapter],
+) -> None:
+    broker = SimBroker("ACC-DEFAULT", timescale_factory=_stub_timescale_adapter)
+
+    with pytest.raises(ValueError):
+        broker.place_order(
+            client_order_id="bad-stop",
+            symbol="BTC-USD",
+            side="buy",
+            quantity=1.0,
+            order_type="market",
+            market_data={"last_price": 100.0},
+            stop_loss=Decimal("120"),
         )
