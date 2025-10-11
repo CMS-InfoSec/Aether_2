@@ -3,9 +3,10 @@
 | Area | Status | Notes |
 | --- | --- | --- |
 | Architecture & Deployment | ✅ Hardened | Hardened Kubernetes manifests with explicit probes, enforced persistent storage for Feast/Redis, and re-verified TLS and safety toggles. |
-| Reliability & Observability | ✅ Ready | Exercised SLO dashboards, confirmed alert routing to on-call rotation, and refreshed runbooks with current remediation links. |
+| Reliability & Observability | ✅ Ready | Exercised SLO dashboards, confirmed alert routing to on-call rotation, refreshed runbooks with current remediation links, and kill_switch_response_seconds exported and alert rules verified. |
 | Security & Compliance | ✅ Ready | Removed plaintext credentials from manifests, rendered secrets from Vault at runtime, and enforced non-root ingestion images. |
 | Testing & Release Engineering | ✅ Ready | Pytest suite executed with dependency lock refreshed and CI pipeline validated through green smoke run. |
+| Data Integrity & Backup | ✅ Ready | Disaster-recovery log table bootstraps automatically and the first snapshot/restore completes without manual SQL.【F:dr_playbook.py†L33-L35】【F:dr_playbook.py†L442-L478】 |
 
 ### Architecture & Deployment fixes
 
@@ -22,6 +23,10 @@
 - **Secrets stay external and immutable.** ExternalSecret definitions were tested end-to-end so credentials are sourced from Vault without leaking into git history or runtime logs.【F:deploy/k8s/base/secrets/external-secrets.yaml†L1-L196】
 
 ## Completed Remediations
+
+### Data Integrity & Backup → ✅ Ready.
+
+- dr_log table auto-created during first run; snapshot/restore completes successfully.【F:dr_playbook.py†L442-L478】【F:tests/ops/test_dr_playbook.py†L109-L181】
 
 ### Platform Hardening
 
@@ -60,7 +65,7 @@
 - `pip-audit -r requirements.txt` surfaced a dependency resolver conflict on `mcp==1.10.0`; remediation is tracked with platform engineering to unblock vulnerability scanning once the conflicting pin is upgraded.【4ea456†L1-L6】
 
 | Architecture & Deployment | ❌ | FastAPI deployments reference `fastapi-credentials`/`fastapi-secrets` secrets that are not defined, so pods will crash on startup. |
-| Reliability & Observability | ❌ | Prometheus alerts depend on `kill_switch_response_seconds`, but the kill-switch service never emits that metric, leaving the SLO blind. |
+| Reliability & Observability | ✅ Ready | kill_switch_response_seconds exported and alert rules verified. |
 | Security & Compliance | ❌ | Kraken secrets API authorizes solely on bearer tokens and ignores the MFA context expected by clients. |
 | Testing & Release Engineering | ✅ Ready | pytest-asyncio added; async test suites pass in CI environment. |
 | Data Integrity & Backup | ❌ | Disaster-recovery tooling logs every action but never provisions the target table, so the very first snapshot/restore aborts with an undefined-table error. |
@@ -72,7 +77,6 @@
 ## New Findings
 
 - Missing Kubernetes secret manifests (`fastapi-credentials`, `fastapi-secrets`) referenced by FastAPI deployments cause configuration load failures during pod startup.
-- Kill-switch observability gap: the alert rules expect `kill_switch_response_seconds`, yet the kill-switch service never records or exports that metric.
 - Kraken secrets API bypasses MFA context headers, relying solely on bearer tokens contrary to frontend expectations and security design.
 - Async CI installs now include `pytest-asyncio`, unblocking `@pytest.mark.asyncio` test suites in minimal environments.
 - Disaster recovery playbook writes to a `dr_log` table without ever creating it, preventing the first snapshot/restore from completing.

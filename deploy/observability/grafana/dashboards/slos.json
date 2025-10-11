@@ -125,8 +125,8 @@
       "title": "Kill Switch Response",
       "targets": [
         {
-          "expr": "max_over_time(kill_switch_response_seconds[5m])",
-          "legendFormat": "response"
+          "expr": "histogram_quantile(0.99, sum(rate(kill_switch_response_seconds_bucket[5m])) by (le, status))",
+          "legendFormat": "{{status}}"
         }
       ],
       "fieldConfig": {

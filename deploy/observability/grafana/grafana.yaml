@@ -220,8 +220,8 @@ data:
           },
           "targets": [
             {
-              "expr": "max_over_time(kill_switch_response_seconds[5m])",
-              "legendFormat": "Kill Switch"
+              "expr": "histogram_quantile(0.99, sum(rate(kill_switch_response_seconds_bucket[5m])) by (le, status))",
+              "legendFormat": "{{status}}"
             }
           ],
           "title": "Kill-Switch Response (≤60 s)",
