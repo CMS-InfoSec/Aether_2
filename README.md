@@ -71,7 +71,58 @@ Many services provide deterministic fallbacks for environments without the full
 dependency stack. Set ``AETHER_ALLOW_INSECURE_DEFAULTS=1`` (or the service-specific
 flag documented in ``shared/insecure_defaults.py``) during development to enable
 local JSON/SQLite storage while production deployments continue to require
-managed dependencies.
+managed dependencies.【F:shared/runtime_checks.py†L69-L105】
+
+## Configuration
+
+- **Runtime configuration** lives under ``config/``. ``config/system.yaml``
+  captures platform-wide toggles (for example simulation guards and stablecoin
+  monitoring thresholds) while ``config/defaults.yaml`` and ``config/costs.yaml``
+  provide reference values consumed by the services.【F:config/system.yaml†L1-L40】【F:config/defaults.yaml†L1-L80】
+- **Service-specific settings** rely on environment variables sourced from
+  ExternalSecrets. Critical DSNs include ``TIMESCALE_DSN`` for shared
+  persistence and component-specific overrides such as ``RISK_DATABASE_URL``,
+  ``CAPITAL_ALLOCATOR_DB_URL``, and ``UNIVERSE_DATABASE_URL`` defined by the
+  Kubernetes manifests.【F:deploy/k8s/base/aether-services/deployment-risk.yaml†L37-L78】【F:deploy/k8s/base/aether-services/deployment-capital-allocator.yaml†L37-L66】【F:deploy/k8s/base/aether-services/deployment-universe.yaml†L37-L68】
+- **Secret management**: Production credentials are delivered through projected
+  secrets referenced in the deployments (for example Kraken trading keys and the
+  ExternalSecret-synced Postgres DSNs). Rotate keys following the runbooks in
+  ``docs/runbooks/`` and avoid committing secrets to git.
+- **Configuration references**: ``docs/config/`` contains service-level
+  explanations of the configuration knobs (fees, OMS network policy, scaling
+  controller, and more) for operators to review before changes are applied.【F:docs/config/fees_service.md†L1-L80】【F:docs/config/scaling_controller.md†L1-L120】
+
+## Deployment
+
+The repository ships Kubernetes manifests for every component under
+``deploy/k8s``. Each base defines shared infrastructure (TimescaleDB, Kafka,
+NATS, Redis/Feast) and Aether services, while overlays adjust replicas and
+environmental annotations for ``staging`` and ``production`` clusters.【F:deploy/k8s/base/kustomization.yaml†L1-L20】【F:deploy/k8s/overlays/production/kustomization.yaml†L1-L31】
+
+1. **Render the desired overlay** using Kustomize:
+
+   ```bash
+   kustomize build deploy/k8s/overlays/staging | kubectl apply -f -
+   ```
+
+   Replace ``staging`` with ``production`` when promoting to the live trading
+   environment. GitOps users should point their controllers at the overlay
+   directory instead of applying manifests manually.
+
+2. **Provision observability** by applying the stack in
+   ``deploy/observability/`` (Prometheus, Alertmanager, Loki/Tempo, Grafana).
+   Dashboards and alerting rules are committed in this repository so clusters
+   stay in sync with the documented SLOs.【F:deploy/observability/prometheus/prometheus.yaml†L1-L120】【F:deploy/observability/grafana/grafana.yaml†L1-L120】
+
+3. **Bootstrap market data pipelines**: the Kraken WebSocket ingestor and the
+   scheduled Argo workflows in ``ops/workflows/`` (for example the Kraken stream
+   workflow) are part of the base manifests. Ensure Kafka/NATS are reachable
+   before enabling dependent services such as the order gateway and strategy
+   orchestrator.【F:deploy/k8s/base/kraken-ws-ingest/deployment.yaml†L1-L44】【F:ops/workflows/kraken_stream_workflow.yaml†L1-L48】
+
+4. **Validate readiness** by checking the liveness/readiness probes exposed on
+   each service (``/healthz`` and ``/readyz``) and confirm Prometheus is
+   scraping the ``/metrics`` endpoints configured in the deployments.
 
 ## Component Overview
 

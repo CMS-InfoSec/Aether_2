@@ -1,6 +1,4 @@
-# Production Readiness Review
-
-## Summary
+# Production Readiness Review (Updated)
 
 | Area | Status | Notes |
 | --- | --- | --- |
