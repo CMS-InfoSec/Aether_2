@@ -8,12 +8,23 @@ from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, ClassVar, Deque, Dict, Iterable, List, Mapping, MutableMapping, Optional
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Deque,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    MutableMapping,
+    Optional,
+)
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
-from services.common.adapters import TimescaleAdapter
+from services.common import adapters as adapters_module
 from services.common.schemas import RiskValidationRequest
 from services.common.security import require_admin_account
 from shared.audit import (
@@ -26,6 +37,10 @@ from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+if TYPE_CHECKING:
+    from services.common.adapters import TimescaleAdapter
 
 
 DEFAULT_LOOKBACK_SECONDS = 60
@@ -150,11 +165,13 @@ class CircuitBreakerConfigStore:
         self,
         account_id: str,
         *,
-        timescale: TimescaleAdapter | None = None,
+        timescale: "TimescaleAdapter | None" = None,
         auditor: SensitiveActionRecorder | None = None,
     ) -> None:
         self.account_id = account_id
-        self._timescale = timescale or TimescaleAdapter(account_id=account_id)
+        self._timescale = timescale or adapters_module.TimescaleAdapter(
+            account_id=account_id
+        )
         self._auditor = auditor or SensitiveActionRecorder(self._audit_logger)
 
     def _load_bucket(self) -> tuple[Dict[str, Any], MutableMapping[str, Dict[str, object]]]:
@@ -259,12 +276,14 @@ class CircuitBreakerMonitor:
         self,
         account_id: str,
         *,
-        timescale: TimescaleAdapter | None = None,
+        timescale: "TimescaleAdapter | None" = None,
         config_store: CircuitBreakerConfigStore | None = None,
         lookback_seconds: int = DEFAULT_LOOKBACK_SECONDS,
     ) -> None:
         self.account_id = account_id
-        self._timescale = timescale or TimescaleAdapter(account_id=account_id)
+        self._timescale = timescale or adapters_module.TimescaleAdapter(
+            account_id=account_id
+        )
         self._lookback = timedelta(seconds=max(int(lookback_seconds), 1))
         self._quotes: Dict[str, _QuoteWindow] = {}
         self._blocked: Dict[str, _CircuitBreakerRecord] = {}
@@ -272,7 +291,7 @@ class CircuitBreakerMonitor:
             account_id, timescale=self._timescale
         )
 
-    def bind_timescale(self, timescale: TimescaleAdapter) -> None:
+    def bind_timescale(self, timescale: "TimescaleAdapter") -> None:
         self._timescale = timescale
         self._config = CircuitBreakerConfigStore(
             self.account_id, timescale=timescale
@@ -392,14 +411,6 @@ class CircuitBreakerMonitor:
             previous = self._blocked.get(symbol)
             triggered_at = previous.triggered_at if previous else _utcnow()
             safe_mode_engaged = previous.safe_mode_engaged if previous else False
-            self._blocked[symbol] = _CircuitBreakerRecord(
-                symbol=symbol,
-                reason=reason_text,
-                spread_bps=quote.spread_bps,
-                volatility=quote.volatility,
-                triggered_at=triggered_at,
-                safe_mode_engaged=safe_mode_engaged or thresholds.trigger_safe_mode,
-            )
             if previous is None:
                 self._timescale.record_event(
                     "circuit_breaker.engaged",
@@ -410,19 +421,28 @@ class CircuitBreakerMonitor:
                         "volatility": quote.volatility,
                     },
                 )
-                if thresholds.trigger_safe_mode and not safe_mode_engaged:
-                    try:
-                        self._timescale.set_safe_mode(
-                            engaged=True,
-                            reason=f"Circuit breaker engaged for {symbol}",
-                            actor="circuit-breaker",
-                        )
-                    except Exception:  # pragma: no cover - defensive fallback
-                        LOGGER.exception(
-                            "Failed to trigger safe mode for account %s symbol %s",
-                            self.account_id,
-                            symbol,
-                        )
+            if thresholds.trigger_safe_mode and not safe_mode_engaged:
+                try:
+                    self._timescale.set_safe_mode(
+                        engaged=True,
+                        reason=f"Circuit breaker engaged for {symbol}",
+                        actor="circuit-breaker",
+                    )
+                    safe_mode_engaged = True
+                except Exception:  # pragma: no cover - defensive fallback
+                    LOGGER.exception(
+                        "Failed to trigger safe mode for account %s symbol %s",
+                        self.account_id,
+                        symbol,
+                    )
+            self._blocked[symbol] = _CircuitBreakerRecord(
+                symbol=symbol,
+                reason=reason_text,
+                spread_bps=quote.spread_bps,
+                volatility=quote.volatility,
+                triggered_at=triggered_at,
+                safe_mode_engaged=safe_mode_engaged,
+            )
         elif symbol in self._blocked:
             record = self._blocked.pop(symbol)
             self._timescale.record_event(
@@ -500,7 +520,7 @@ _MONITORS: Dict[str, CircuitBreakerMonitor] = {}
 def get_circuit_breaker(
     account_id: str,
     *,
-    timescale: TimescaleAdapter | None = None,
+    timescale: "TimescaleAdapter | None" = None,
 ) -> CircuitBreakerMonitor:
     monitor = _MONITORS.get(account_id)
     if monitor is None:

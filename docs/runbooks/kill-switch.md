@@ -32,6 +32,21 @@ The kill-switch disables external trading integration and isolates the risk plat
    ```
 3. Validate Prometheus `MarketDataStale` alert clears within 10 minutes.
 
+## Incident simulation toggle procedure
+
+Use this workflow during quarterly incident simulations to exercise the production kill-switch without disrupting active trading:
+
+1. **Announce the drill.** Notify #ops-trading and #risk at least 10 minutes in advance, identifying the incident commander and the exact simulation window.
+2. **Stage the rollout.**
+   ```bash
+   kubectl apply -n aether-prod -f deploy/k8s/base/fastapi/config/kill-switch.yaml
+   kubectl rollout status deploy/risk-api-prod -n aether-prod
+   ```
+   Confirm the ConfigMap reflects `killSwitch.enabled: true` before the window opens.
+3. **Toggle the switch.** During the scheduled window, execute the activation and rollback commands in [Activation steps](#activation-steps) and [Rollback steps](#rollback-steps), pausing five minutes between each transition to capture observability metrics.
+4. **Verify observability.** Capture Grafana panels for kill-switch latency, ArgoCD sync status, and OMS order flow during both activation and rollback.
+5. **Document completion.** Record timestamps, command output, and metric screenshots in the simulation ticket for audit review.
+
 ## Audit requirements
 - Record activation and rollback timestamps in the incident tracker.
 - Attach Loki logs proving outbound traffic was halted.
