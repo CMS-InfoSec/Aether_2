@@ -58,7 +58,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push image
         id: publish
@@ -100,7 +100,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Scan image for vulnerabilities
         uses: anchore/grype-action@v0
@@ -108,12 +108,12 @@ jobs:
           image: ${{ needs.build-image.outputs.image_ref }}@${{ needs.build-image.outputs.image_digest }}
           fail-on-severity: critical
           registry-username: ${{ github.actor }}
-          registry-password: ${{ secrets.GHCR_TOKEN }}
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Generate SBOM
         env:
           SYFT_REGISTRY_AUTH_USERNAME: ${{ github.actor }}
-          SYFT_REGISTRY_AUTH_PASSWORD: ${{ secrets.GHCR_TOKEN }}
+          SYFT_REGISTRY_AUTH_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         run: |
           syft "${{ needs.build-image.outputs.image_ref }}@${{ needs.build-image.outputs.image_digest }}" -o json > sbom.json
 
@@ -136,7 +136,18 @@ jobs:
             echo "COSIGN_PASSWORD secret must be provided" >&2
             exit 1
           fi
-          echo "$COSIGN_PRIVATE_KEY" > cosign.key
+          mask_secret() {
+            if [ -z "$1" ]; then
+              return
+            fi
+            printf '%s' "$1" | while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              echo "::add-mask::$line"
+            done
+          }
+          mask_secret "$COSIGN_PRIVATE_KEY"
+          mask_secret "$COSIGN_PASSWORD"
+          printf '%s' "$COSIGN_PRIVATE_KEY" > cosign.key
           trap 'rm -f cosign.key' EXIT
           cosign sign --key cosign.key "${{ needs.build-image.outputs.image_ref }}@${{ needs.build-image.outputs.image_digest}}"
 
