@@ -79,6 +79,16 @@ except ModuleNotFoundError:  # pragma: no cover - redis helpers optional in test
         del args, kwargs
         raise RuntimeError("Redis helpers are unavailable in this environment")
 
+try:
+    from common.utils.redis import create_redis_from_url
+except ModuleNotFoundError:  # pragma: no cover - redis helpers optional in tests
+    def create_redis_from_url(*args: object, **kwargs: object):  # type: ignore[override]
+        del args, kwargs
+        raise RuntimeError("Redis helpers are unavailable in this environment")
+
+
+_ARGON2_IMPORT_ERROR: Exception | None = None
+_USING_ARGON2_FALLBACK = False
 
 _ARGON2_IMPORT_ERROR: Exception | None = None
 _USING_ARGON2_FALLBACK = False
