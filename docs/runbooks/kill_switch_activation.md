@@ -20,7 +20,7 @@ Describe the controlled process for activating and deactivating the trading kill
 ## Activation Steps
 1. **Announce intent**: Inform #ops-trading and #risk immediately, noting timestamp and reason for kill-switch request.
 2. **Activate switch**: Run `python -m services.oms.tools kill-switch --activate` from the secure bastion. Ensure confirmation message indicates success.
-3. **Verify halt**: Check `kill_switch_state` metric equals `1` and OMS rejects new orders within 30 seconds.
+3. **Verify halt**: Query the kill-switch `/metrics` endpoint (e.g., `curl https://kill-switch.$ENV.svc.cluster.local/metrics`) and confirm `kill_switch_state{account_id="<account>"}` equals `1`. OMS must reject new orders within 30 seconds.
 4. **Suspend automation**: Pause any workflows submitting orders, e.g., `argo suspend market-making`.
 
 ## Deactivation Steps
@@ -30,7 +30,7 @@ Describe the controlled process for activating and deactivating the trading kill
 4. **Post-restore validation**: Ensure OMS latency meets the 150 ms SLO and kill-switch response metric resets below the 60-second target documented in `../slo.md`.
 
 ## Recovery Validation
-- `kill_switch_state` returns to `0` once trading resumes.
+- `kill_switch_state{account_id="<account>"}` returns to `0` once trading resumes.
 - No unexpected order submissions occurred during the halt window.
 - Prometheus alert resets and acknowledges the response time within budget.
 

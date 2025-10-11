@@ -53,7 +53,7 @@ spec:
               name: http
           env:
             - name: FEAST_REDIS_HOST
-              value: redis
+              value: redis-master
             - name: FEAST_REDIS_PORT
               value: "6379"
             - name: FEAST_REGISTRY_PATH
