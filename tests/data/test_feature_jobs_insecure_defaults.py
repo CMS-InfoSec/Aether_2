@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import sys
 from pathlib import Path
-
-from data.ingest import feature_jobs as feature_jobs_module
 
 
 def test_feature_jobs_insecure_defaults_local_fallback(tmp_path, monkeypatch):
@@ -13,7 +12,9 @@ def test_feature_jobs_insecure_defaults_local_fallback(tmp_path, monkeypatch):
     monkeypatch.setenv("AETHER_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.delenv("DATABASE_URL", raising=False)
 
-    module = importlib.reload(feature_jobs_module)
+    sys.modules.pop("data.ingest.feature_jobs", None)
+    module = importlib.import_module("data.ingest.feature_jobs")
+    module = importlib.reload(module)
     monkeypatch.setattr(module, "AIOKafkaConsumer", None)
     monkeypatch.setattr(module, "FeatureStore", None)
     monkeypatch.setattr(module, "pd", None)

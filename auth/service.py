@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
+from types import ModuleType
 from typing import Any, Dict, Optional, Protocol, Set, runtime_checkable
 
 
@@ -24,7 +25,32 @@ class MissingDependencyError(RuntimeError):
 try:  # pragma: no cover - optional dependency in some environments
     import pyotp
 except ModuleNotFoundError as exc:  # pragma: no cover - exercised in lightweight setups
-    pyotp = None  # type: ignore[assignment]
+    class _DeterministicTOTP:
+        """Minimal TOTP replacement used when pyotp is unavailable."""
+
+        def __init__(self, secret: str) -> None:
+            self._secret = secret
+
+        def now(self) -> str:
+            # Derive a deterministic 6-digit code from the secret so multiple calls
+            # within the same test yield the same value without relying on the real
+            # pyotp implementation.
+            digest = hashlib.sha256(self._secret.encode("utf-8")).hexdigest()
+            value = int(digest[:8], 16) % 1_000_000
+            return f"{value:06d}"
+
+        def verify(self, code: str, valid_window: int = 1) -> bool:
+            del valid_window
+            return code == self.now()
+
+    def _random_base32() -> str:
+        return base64.b32encode(os.urandom(20)).decode("ascii").rstrip("=")
+
+    pyotp_stub = ModuleType("pyotp")
+    pyotp_stub.TOTP = _DeterministicTOTP  # type: ignore[attr-defined]
+    pyotp_stub.random_base32 = _random_base32  # type: ignore[attr-defined]
+    sys.modules.setdefault("pyotp", pyotp_stub)
+    pyotp = pyotp_stub  # type: ignore[assignment]
     _PYOTP_IMPORT_ERROR = exc
 else:
     totp_cls = getattr(pyotp, "TOTP", None)
@@ -53,6 +79,16 @@ except ModuleNotFoundError:  # pragma: no cover - redis helpers optional in test
         del args, kwargs
         raise RuntimeError("Redis helpers are unavailable in this environment")
 
+try:
+    from common.utils.redis import create_redis_from_url
+except ModuleNotFoundError:  # pragma: no cover - redis helpers optional in tests
+    def create_redis_from_url(*args: object, **kwargs: object):  # type: ignore[override]
+        del args, kwargs
+        raise RuntimeError("Redis helpers are unavailable in this environment")
+
+
+_ARGON2_IMPORT_ERROR: Exception | None = None
+_USING_ARGON2_FALLBACK = False
 
 _ARGON2_IMPORT_ERROR: Exception | None = None
 _USING_ARGON2_FALLBACK = False

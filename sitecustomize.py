@@ -75,6 +75,28 @@ def _ensure_ml_namespace() -> None:
         spec.submodule_search_locations = locations  # type: ignore[attr-defined]
 
 
+def _ensure_auth_namespace() -> None:
+    """Attach the project auth package to pytest stubs missing search paths."""
+
+    auth_module = sys.modules.get("auth")
+    if auth_module is None:
+        return
+
+    auth_path = str(_PROJECT_ROOT / "auth")
+    locations = list(getattr(auth_module, "__path__", []) or [])
+    if auth_path not in locations:
+        locations.append(auth_path)
+        auth_module.__path__ = locations  # type: ignore[attr-defined]
+
+    spec: ModuleSpec | None = getattr(auth_module, "__spec__", None)
+    if spec is None:
+        spec = ModuleSpec("auth", loader=None)
+        spec.submodule_search_locations = locations  # type: ignore[attr-defined]
+        auth_module.__spec__ = spec
+    else:
+        spec.submodule_search_locations = locations  # type: ignore[attr-defined]
+
+
 def _install_secrets_shim() -> None:
     """Ensure ``import secrets`` resolves to the in-repo compatibility shim."""
 
@@ -163,6 +185,7 @@ _preload_ml_package()
 _ensure_services_namespace()
 _ensure_common_namespace()
 _ensure_ml_namespace()
+_ensure_auth_namespace()
 _ensure_fastapi_testclient()
 
 try:  # pragma: no cover - shared bootstrap may be unavailable in some contexts

@@ -92,7 +92,7 @@ _STATE_DIR_ENV = "COINGECKO_STATE_DIR"
 
 
 def _allow_insecure_defaults() -> bool:
-    return "pytest" in sys.modules or os.getenv(_INSECURE_DEFAULTS_FLAG) == "1"
+    return os.getenv(_INSECURE_DEFAULTS_FLAG) == "1"
 
 
 def _allow_sqlite_fallback() -> bool:
@@ -162,13 +162,15 @@ def _resolve_database_url() -> str:
     return database_url
 
 
-try:
-    DATABASE_URL = _resolve_database_url()
-except RuntimeError as exc:  # pragma: no cover - exercised in insecure default environments
-    DATABASE_URL = None
-    _DATABASE_URL_ERROR = exc
+_DATABASE_URL_ERROR: RuntimeError | None = None
+if _allow_insecure_defaults():
+    try:
+        DATABASE_URL = _resolve_database_url()
+    except RuntimeError as exc:  # pragma: no cover - exercised in insecure default environments
+        DATABASE_URL = None
+        _DATABASE_URL_ERROR = exc
 else:
-    _DATABASE_URL_ERROR = None
+    DATABASE_URL = _resolve_database_url()
 WHITELIST_TOPIC = os.getenv("WHITELIST_TOPIC", "universe.whitelist")
 NATS_SERVERS = os.getenv("NATS_SERVERS", "nats://localhost:4222").split(",")
 

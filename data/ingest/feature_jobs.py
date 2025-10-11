@@ -81,7 +81,7 @@ def _state_root() -> Path:
 
 
 def _insecure_defaults_enabled() -> bool:
-    return os.getenv(_INSECURE_DEFAULTS_FLAG) == "1" or "pytest" in sys.modules
+    return os.getenv(_INSECURE_DEFAULTS_FLAG) == "1"
 
 
 def _resolve_database_url() -> str:
@@ -353,6 +353,8 @@ class FeatureWriter:
             and microstructure_table is not None
             and late_events_table is not None
             and hasattr(engine, "begin")
+            and not isinstance(engine, _InMemoryEngine)
+            and not _insecure_defaults_enabled()
         )
         if self._offline_supported:
             metadata.create_all(

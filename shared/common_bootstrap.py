@@ -9,10 +9,15 @@ from types import ModuleType
 from typing import Callable, Dict, Mapping, Tuple
 
 try:  # pragma: no cover - defensive import when sitecustomize missing
-    from sitecustomize import _ensure_common_namespace, _ensure_services_namespace
+    from sitecustomize import (
+        _ensure_auth_namespace,
+        _ensure_common_namespace,
+        _ensure_services_namespace,
+    )
 except Exception:  # pragma: no cover - sitecustomize not executed
     _ensure_services_namespace = None  # type: ignore[assignment]
     _ensure_common_namespace = None  # type: ignore[assignment]
+    _ensure_auth_namespace = None  # type: ignore[assignment]
 
 # Modules that routinely receive pytest stubs.  We ensure the real implementations
 # are loaded while preserving any overrides that tests intentionally provide.
@@ -366,6 +371,8 @@ def ensure_common_helpers() -> None:
             _ensure_services_namespace()
         if _ensure_common_namespace is not None:
             _ensure_common_namespace()
+        if _ensure_auth_namespace is not None:
+            _ensure_auth_namespace()
 
         _install_module_guard()
         if not reentrant_call:

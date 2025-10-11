@@ -102,7 +102,7 @@ _POLL_INTERVAL_SECONDS = float(os.getenv("KRAKEN_WS_POLL_INTERVAL_SECONDS", "5")
 def _insecure_defaults_enabled() -> bool:
     """Return whether insecure defaults are explicitly enabled for local runs."""
 
-    return "pytest" in sys.modules or os.getenv(_INSECURE_DEFAULTS_FLAG) == "1"
+    return os.getenv(_INSECURE_DEFAULTS_FLAG) == "1"
 
 
 def _state_root() -> Path:
@@ -150,7 +150,7 @@ def _resolve_database_url() -> str | None:
             "Kraken ingest requires DATABASE_URL to be set to a PostgreSQL/Timescale DSN."
         )
 
-    allow_sqlite = "pytest" in sys.modules or os.getenv(_SQLITE_FALLBACK_FLAG) == "1"
+    allow_sqlite = os.getenv(_SQLITE_FALLBACK_FLAG) == "1"
     database_url = normalize_sqlalchemy_dsn(
         raw_url,
         allow_sqlite=allow_sqlite,
