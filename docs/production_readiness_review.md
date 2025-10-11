@@ -4,10 +4,10 @@
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| Architecture & Deployment | ⚠️ Needs Attention | Kubernetes manifests cover multi-service deployment with probes and configmaps, and simulation defaults are now production-safe, yet some container hardening gaps remain. |
+| Architecture & Deployment | ⚠️ Needs Attention | Kubernetes manifests cover multi-service deployment with probes and configmaps, but defaults still enable simulation mode, some container hardening gaps remain, and stateful components lack HA/backups. |
 | Reliability & Observability | ✅ Ready | Documented SLOs, Prometheus alert rules, and Grafana dashboards provide solid monitoring coverage tied to runbooks. |
-| Security & Compliance | ⚠️ Needs Attention | ExternalSecret integration is in place, the risk API image now drops root privileges, and a runtime guard blocks insecure fallbacks, while policy hardening items remain outstanding. |
-| Testing & Release Engineering | ❌ Blocker | Pytest no longer aborts due to missing dependencies, and image builds include a requirements manifest, yet the suite still fails later on data-store setup. |
+| Security & Compliance | ⚠️ Needs Attention | ExternalSecret integration is in place, yet several services still allow insecure fallbacks when flags are misconfigured and Docker images run as root. |
+| Testing & Release Engineering | ❌ Blocker | End-to-end pytest invocation currently aborts because dependencies are missing, and image builds depend on absent requirements files. |
 
 ## Strengths
 
@@ -19,20 +19,23 @@
 
 ### Critical
 
-1. **Test suite is not runnable as-is.** ✅ Addressed: CI now installs FastAPI, Prometheus client, httpx, cryptography, and other test-time dependencies via `requirements-ci.txt`, allowing pytest to progress past collection. Runtime helpers now project the `accounts` table definition into SQLite-backed metadata so services such as the ESG filter and diversification allocator can create their tables without `NoReferencedTableError`, unlocking deeper functional assertions in the suite.【F:requirements-ci.txt†L1-L9】【F:shared/account_scope.py†L1-L124】【F:esg_filter.py†L1-L210】【F:services/risk/diversification_allocator.py†L240-L310】【F:services/anomaly/execution_anomaly.py†L1-L260】【3b74e9†L1-L31】【1be583†L1-L80】
-2. **Risk API Docker image build will fail.** ✅ Addressed: The Dockerfile now ships with a colocated `requirements.txt`, installs from it, and cleans up build artefacts to keep layers slim.【F:deploy/docker/risk-api/Dockerfile†L1-L25】【F:deploy/docker/risk-api/requirements.txt†L1-L15】
+1. **Test suite is not runnable as-is.** `pytest -q` aborts before collecting tests because `prometheus_client` is missing, which makes CI/CD verification impossible. Ensure runtime dependencies are installed (for example via the `test` extra) or stub the optional import in tests so the suite can execute in isolated environments.【5e8c9b†L1-L74】
+2. **Risk API Docker image build will fail.** The Dockerfile expects a `requirements.txt` in its build context, but that file is absent under `deploy/docker/risk-api/`, so `COPY requirements.txt ./` will error. Either add the requirements file alongside the Dockerfile or adjust the build context/paths to reference the repository root.【F:deploy/docker/risk-api/Dockerfile†L1-L22】
+3. **Primary database has no redundancy or backups.** The TimescaleDB StatefulSet deploys a single replica without backup CronJobs or even WAL archiving hooks, which leaves production data one pod deletion away from loss. Add streaming replicas and automated backups or integrate with Timescale Cloud before launch.【F:deploy/k8s/base/timescaledb/statefulset.yaml†L1-L45】
 
 ### High
 
-1. **Simulation mode is enabled by default.** ✅ Addressed: `simulation.enabled` now defaults to `false` so production rollouts do not need to override the flag to avoid simulated order paths.【F:config/system.yaml†L1-L28】
-2. **Docker images run as root.** ✅ Addressed: The risk API Dockerfile provisions an `app` user, adjusts ownership, and runs the service as non-root for defence in depth.【F:deploy/docker/risk-api/Dockerfile†L6-L25】
-3. **Dual PostgreSQL drivers inflate attack surface.** ✅ Addressed: The dependency set now standardises on `psycopg[binary]` and drops the duplicate `psycopg2-binary` package.【F:pyproject.toml†L12-L46】
+1. **Simulation mode is enabled by default.** Production system configuration keeps `simulation.enabled: true`, which risks routing live orders through simulated paths unless explicitly overridden. Flip the default to `false` or enforce environment overrides in deployment manifests.【F:config/system.yaml†L1-L49】
+2. **Docker images run as root.** The risk API Dockerfile never drops privileges, exposing the container to escalation if the service is compromised. Introduce a non-root user and minimal filesystem permissions.【F:deploy/docker/risk-api/Dockerfile†L1-L22】
+3. **Redis cache is ephemeral.** The Redis deployment runs with a single replica and no persistent volume claims, so any restart wipes feature caches and session state. Provision Redis with persistence (or managed Redis) and high-availability to avoid cascading incidents.【F:deploy/k8s/base/redis/deployment.yaml†L1-L38】
+4. **Dual PostgreSQL drivers inflate attack surface.** Both `psycopg[binary]` and `psycopg2-binary` ship in the base dependency set, growing image size and expanding the patching surface. Standardise on a single driver (`psycopg` v3) for production images.【F:pyproject.toml†L5-L53】
 
 ### Medium
 
-1. **Insecure fallbacks require explicit suppression.** ✅ Addressed: A global runtime guard now raises if any `_ALLOW_INSECURE_DEFAULTS` toggle is set when the common service bootstrap executes, preventing production pods from silently downgrading to local stores while keeping pytest overrides functional.【F:shared/runtime_checks.py†L1-L63】【F:shared/common_bootstrap.py†L1-L120】
+1. **Insecure fallbacks require explicit suppression.** Multiple services (e.g., watchdog, secrets service) silently generate SQLite stores or default secrets when their `_ALLOW_INSECURE_DEFAULTS` flags are toggled. Confirm production deployments never set these flags and add runtime assertions or configuration validation in Helm values to prevent accidental enablement.【F:watchdog.py†L60-L126】【F:secrets_service.py†L141-L195】
 2. **Network policy egress is broad.** The blanket Cloudflare CIDR ranges that cover Kraken and CoinGecko also allow other Cloudflare-hosted endpoints. Tighten the allow-list with fully qualified domain egress via egress proxies or limit to vendor IP ranges verified with Cloudflare’s API.【F:deploy/k8s/networkpolicy.yaml†L1-L77】
 3. **Config map embeds connection targets without TLS hints.** The shared FastAPI configmap encodes TimescaleDB, Redis, and Feast endpoints but omits TLS/port annotations or secrets references, which could lead to plain-text connections unless overridden. Document TLS expectations or move these values to secrets to avoid drift.【F:deploy/k8s/base/fastapi/configmap.yaml†L1-L34】
+4. **Risk API probes inverted.** The dedicated risk API deployment wires readiness to `/healthz` and liveness to `/ready`, flipping the intended semantics and risking delayed restarts during dependency failures. Swap the endpoints or expose matching health handlers before shipping.【F:deploy/k8s/base/fastapi/deployment-risk.yaml†L1-L41】
 
 ### Low / Observations
 
