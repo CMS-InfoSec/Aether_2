@@ -29,7 +29,11 @@ from pydantic import BaseModel
 
 from services.common.adapters import RedisFeastAdapter, TimescaleAdapter
 from services.common.security import require_admin_account
-from shared.account_scope import SQLALCHEMY_AVAILABLE as _ACCOUNT_SCOPE_AVAILABLE, account_id_column
+from shared.account_scope import (
+    SQLALCHEMY_AVAILABLE as _ACCOUNT_SCOPE_AVAILABLE,
+    account_id_column,
+    ensure_accounts_table,
+)
 
 try:  # pragma: no cover - SQLAlchemy is optional in insecure-default environments
     from sqlalchemy import Column, DateTime, Float, Integer, MetaData, String, create_engine
@@ -258,6 +262,7 @@ SessionLocal = _create_session_factory()
 
 metadata_obj = MetaData()
 Base = declarative_base(metadata=metadata_obj)
+ensure_accounts_table(Base.metadata)
 
 
 class DiversificationTargetRecord(Base):
