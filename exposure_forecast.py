@@ -38,6 +38,12 @@ ensure_common_helpers()
 from services.common.config import get_timescale_session
 from services.common.security import require_admin_account
 
+from ml.models.supervised import (
+    SklearnPipelineTrainer,
+    SupervisedDataset,
+    SupervisedTrainer,
+)
+
 
 PNL_CURVE_QUERY = """
 SELECT
@@ -79,6 +85,23 @@ WITH latest_positions AS (
 )
 SELECT market, quantity, entry_price
 FROM latest_positions
+"""
+
+
+OHLCV_FEATURE_QUERY = """
+SELECT
+    market,
+    bucket_start,
+    open,
+    high,
+    low,
+    close,
+    volume
+FROM ohlcv_bars
+WHERE market = ANY(%(markets)s)
+  AND bucket_start >= %(start)s
+  AND bucket_start < %(end)s
+ORDER BY bucket_start
 """
 
 
@@ -160,6 +183,320 @@ class ForecastResult:
             ],
             "horizon_days": self.horizon_days,
         }
+
+
+class _ExposureMLPipeline:
+    """Materialises features from TimescaleDB and predicts exposure via regression."""
+
+    def __init__(
+        self,
+        account_id: str,
+        retrain_cadence: timedelta,
+        lookback_days: int,
+        trainer_factory: Callable[[], SupervisedTrainer],
+    ) -> None:
+        self._account_id = account_id
+        self._retrain_cadence = retrain_cadence
+        self._lookback_window = timedelta(days=lookback_days)
+        self._trainer_factory = trainer_factory
+        self._factory_tag = id(trainer_factory)
+        self._trainer: SupervisedTrainer | None = None
+        self._last_trained: datetime | None = None
+        self._residual_std: float = 0.0
+        self._training_samples: int = 0
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def forecast(
+        self,
+        *,
+        nav_rows: Sequence[Mapping[str, Any]],
+        positions_rows: Sequence[Mapping[str, Any]],
+        now: datetime,
+        horizon_days: int,
+    ) -> ForecastResult | None:
+        if not nav_rows or not positions_rows:
+            return None
+
+        try:  # Optional dependency guard for environments lacking pandas
+            import pandas as pd  # type: ignore
+        except Exception:  # pragma: no cover - optional dependency
+            LOGGER.debug("pandas unavailable; skipping ML exposure forecast")
+            return None
+
+        features_frame = self._load_feature_frame(positions_rows, now)
+        if features_frame is None:
+            return None
+
+        dataset = self._prepare_dataset(nav_rows, positions_rows, features_frame, pd)
+        if dataset is None or dataset.features.empty:
+            return None
+
+        latest_features = dataset.features.iloc[[-1]]
+        if self._trainer is None or self._needs_retrain(now):
+            if not self._train(dataset, now):
+                return None
+
+        return self._predict(latest_features, horizon_days)
+
+    @property
+    def factory_tag(self) -> int:
+        return self._factory_tag
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _needs_retrain(self, now: datetime) -> bool:
+        if self._last_trained is None:
+            return True
+        return now - self._last_trained >= self._retrain_cadence
+
+    def _train(self, dataset: SupervisedDataset, now: datetime) -> bool:
+        try:
+            trainer = self._trainer_factory()
+        except Exception:  # pragma: no cover - defensive guard
+            LOGGER.debug("Trainer factory failed; skipping exposure retrain", exc_info=True)
+            return False
+
+        try:
+            trainer.fit(dataset)
+        except MissingDependencyError:
+            LOGGER.debug("Missing dependencies for ML exposure pipeline", exc_info=True)
+            return False
+        except Exception:  # pragma: no cover - defensive logging
+            LOGGER.debug("Exposure ML trainer failed", exc_info=True)
+            return False
+
+        self._trainer = trainer
+        self._last_trained = now
+        self._training_samples = len(dataset.labels)
+
+        try:
+            import numpy as np  # type: ignore
+        except Exception:  # pragma: no cover - numpy optional
+            self._residual_std = 0.0
+        else:
+            try:
+                predictions = trainer.predict(dataset.features)
+                residuals = predictions - dataset.labels.to_numpy()
+                if len(residuals) > 1:
+                    self._residual_std = float(np.std(residuals, ddof=1))
+                else:
+                    self._residual_std = 0.0
+            except Exception:  # pragma: no cover - defensive logging
+                LOGGER.debug("Unable to compute exposure residual standard deviation", exc_info=True)
+                self._residual_std = 0.0
+
+        return True
+
+    def _predict(
+        self, latest_features: "pd.DataFrame", horizon_days: int
+    ) -> ForecastResult | None:
+        if self._trainer is None:
+            return None
+
+        try:
+            prediction = float(self._trainer.predict(latest_features)[0])
+        except Exception:  # pragma: no cover - defensive logging
+            LOGGER.debug("Exposure ML prediction failed", exc_info=True)
+            return None
+
+        value = max(Decimal(str(prediction)), ZERO)
+
+        margin = ZERO
+        if self._residual_std > 0.0 and self._training_samples > 1:
+            margin = CONFIDENCE_Z_SCORE * Decimal(str(self._residual_std))
+        elif value > ZERO:
+            margin = value * Decimal("0.1")
+
+        lower = max(value - margin, ZERO)
+        upper = value + margin
+        return ForecastResult(value=value, lower=lower, upper=upper, horizon_days=horizon_days)
+
+    def _load_feature_frame(
+        self, positions_rows: Sequence[Mapping[str, Any]], now: datetime
+    ) -> "pd.DataFrame" | None:
+        try:
+            import pandas as pd  # type: ignore
+        except Exception:  # pragma: no cover - optional dependency
+            return None
+
+        markets = sorted(
+            {
+                str(row.get("market", "")).upper()
+                for row in positions_rows
+                if isinstance(row.get("market"), str)
+            }
+        )
+        markets = [market for market in markets if market]
+        if not markets:
+            return None
+
+        start = now - self._lookback_window
+        params = {"markets": markets, "start": start, "end": now}
+        try:
+            rows = self._query_timescale(OHLCV_FEATURE_QUERY, params)
+        except Exception:  # pragma: no cover - defensive guard
+            LOGGER.debug("Failed to query OHLCV features for exposure forecast", exc_info=True)
+            return None
+
+        if not rows:
+            return None
+
+        frame = pd.DataFrame(rows)
+        frame["bucket_start"] = pd.to_datetime(frame["bucket_start"], utc=True, errors="coerce")
+        frame = frame.dropna(subset=["bucket_start"])
+        if frame.empty:
+            return None
+
+        for column in ("open", "high", "low", "close", "volume"):
+            frame[column] = frame[column].apply(lambda value: float(_as_decimal(value or ZERO)))
+
+        frame = frame.sort_values(["market", "bucket_start"]).reset_index(drop=True)
+        frame["return"] = frame.groupby("market")["close"].pct_change().fillna(0.0)
+        return frame
+
+    def _prepare_dataset(
+        self,
+        nav_rows: Sequence[Mapping[str, Any]],
+        positions_rows: Sequence[Mapping[str, Any]],
+        feature_frame: "pd.DataFrame",
+        pd: Any,
+    ) -> SupervisedDataset | None:
+        nav_frame = pd.DataFrame(nav_rows)
+        if nav_frame.empty:
+            return None
+
+        nav_frame["as_of"] = nav_frame["as_of"].apply(_parse_datetime)
+        nav_frame = nav_frame.dropna(subset=["as_of", "nav"])
+        if nav_frame.empty:
+            return None
+
+        nav_frame["nav"] = nav_frame["nav"].apply(lambda value: float(_as_decimal(value or ZERO)))
+        nav_frame = nav_frame.sort_values("as_of").reset_index(drop=True)
+        nav_frame["nav_return"] = nav_frame["nav"].pct_change().fillna(0.0)
+        nav_frame["nav_ema"] = nav_frame["nav"].ewm(span=5, adjust=False).mean().fillna(method="bfill")
+
+        exposures_total = ZERO
+        for row in positions_rows:
+            quantity = _as_decimal(row.get("quantity", ZERO) or ZERO)
+            entry_price = _as_decimal(row.get("entry_price", ZERO) or ZERO)
+            exposures_total += abs(quantity * entry_price)
+
+        nav_latest = nav_frame["nav"].iloc[-1] if not nav_frame.empty else 0.0
+        leverage_ratio = float(exposures_total) / nav_latest if nav_latest > 0 else 1.0
+        nav_frame["exposure_target"] = nav_frame["nav"] * leverage_ratio
+
+        grouped = feature_frame.groupby("bucket_start").agg(
+            close_mean=("close", "mean"),
+            close_std=("close", "std"),
+            volume_sum=("volume", "sum"),
+            volume_mean=("volume", "mean"),
+            return_mean=("return", "mean"),
+            return_std=("return", "std"),
+            high_max=("high", "max"),
+            low_min=("low", "min"),
+        )
+        grouped["high_low_spread"] = grouped["high_max"] - grouped["low_min"]
+        grouped["market_count"] = feature_frame.groupby("bucket_start")["market"].nunique()
+        grouped = grouped.fillna(0.0)
+
+        merged = pd.merge_asof(
+            nav_frame,
+            grouped.sort_index().reset_index(),
+            left_on="as_of",
+            right_on="bucket_start",
+            direction="backward",
+            tolerance=pd.Timedelta("1H"),
+        )
+
+        merged = merged.dropna(subset=["close_mean", "volume_sum", "return_mean"])
+        if merged.empty:
+            return None
+
+        feature_columns = [
+            "close_mean",
+            "close_std",
+            "volume_sum",
+            "volume_mean",
+            "return_mean",
+            "return_std",
+            "high_low_spread",
+            "market_count",
+            "nav",
+            "nav_return",
+            "nav_ema",
+        ]
+
+        features = merged[feature_columns].fillna(method="ffill").fillna(0.0)
+        labels = merged["exposure_target"].astype(float)
+        valid_mask = labels.notna()
+        features = features[valid_mask]
+        labels = labels[valid_mask]
+        if features.empty:
+            return None
+
+        return SupervisedDataset(features=features, labels=labels)
+
+    def _query_timescale(self, query: str, params: Mapping[str, Any]) -> List[Dict[str, Any]]:
+        if _SQL_MODULE is None:
+            raise RuntimeError("Timescale SQL helpers unavailable")
+
+        session = get_timescale_session(self._account_id)
+        connection: Any | None = None
+        cursor: Any | None = None
+        rows: Sequence[Mapping[str, Any]] | None = None
+        try:
+            if psycopg is not None:
+                assert psycopg_dict_row is not None  # nosec - guarded by import
+                connection = psycopg.connect(session.dsn)
+                connection.autocommit = True
+                cursor = connection.cursor(row_factory=psycopg_dict_row)
+            elif psycopg2 is not None:
+                connection = psycopg2.connect(session.dsn)
+                connection.autocommit = True
+                cursor = connection.cursor(cursor_factory=RealDictCursor)
+            else:  # pragma: no cover - guarded by _SQL_MODULE check
+                raise RuntimeError("psycopg or psycopg2 is required for exposure ML queries")
+
+            if session.account_schema:
+                statement = _SQL_MODULE.SQL("SET search_path TO {}, public").format(
+                    _SQL_MODULE.Identifier(session.account_schema)
+                )
+                cursor.execute(statement)
+
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+        finally:
+            if cursor is not None:
+                cursor.close()
+            if connection is not None:
+                connection.close()
+
+        return [dict(row) for row in rows or []]
+
+
+_ML_PIPELINE_CACHE: Dict[Tuple[str, int, int], _ExposureMLPipeline] = {}
+
+
+def get_exposure_ml_pipeline(
+    account_id: str,
+    *,
+    retrain_cadence: timedelta | None = None,
+    lookback_days: int = 90,
+    trainer_factory: Callable[[], SupervisedTrainer] | None = None,
+) -> _ExposureMLPipeline:
+    """Return a cached ML exposure pipeline for ``account_id``."""
+
+    cadence = retrain_cadence or timedelta(minutes=60)
+    factory = trainer_factory or SklearnPipelineTrainer
+    key = (account_id, int(cadence.total_seconds()), lookback_days)
+    pipeline = _ML_PIPELINE_CACHE.get(key)
+    if pipeline is None or pipeline.factory_tag != id(factory):
+        pipeline = _ExposureMLPipeline(account_id, cadence, lookback_days, factory)
+        _ML_PIPELINE_CACHE[key] = pipeline
+    return pipeline
 
 
 class _BaseExposureStore:
@@ -388,6 +725,8 @@ class ExposureForecaster:
         account_id: str,
         window_days: int = 90,
         store_factory: Callable[[str], _BaseExposureStore] | None = None,
+        ml_retrain_minutes: int = 60,
+        ml_trainer_factory: Callable[[], SupervisedTrainer] | None = None,
     ) -> None:
         self._account_id = account_id
         self._window_days = window_days
@@ -406,6 +745,21 @@ class ExposureForecaster:
                 exc,
             )
             self._store = _InMemoryExposureStore(account_id)
+
+        self._ml_pipeline: _ExposureMLPipeline | None = None
+        self._ml_trainer_factory = ml_trainer_factory or SklearnPipelineTrainer
+        try:
+            self._ml_pipeline = get_exposure_ml_pipeline(
+                account_id,
+                retrain_cadence=timedelta(minutes=ml_retrain_minutes),
+                lookback_days=window_days,
+                trainer_factory=self._ml_trainer_factory,
+            )
+        except Exception:  # pragma: no cover - optional dependency
+            LOGGER.debug(
+                "ML exposure pipeline unavailable for account %s", account_id, exc_info=True
+            )
+            self._ml_pipeline = None
 
     def forecast(self) -> Dict[str, Any]:
         """Generate the NAV, fee, and margin forecasts for the account."""
@@ -436,7 +790,27 @@ class ExposureForecaster:
 
         nav_forecast = self._forecast_nav_volatility(nav_rows)
         fee_forecast = self._forecast_fee_spend(fees_rows)
-        margin_forecast = self._forecast_margin_usage(positions_rows, nav_forecast)
+
+        ml_forecast: ForecastResult | None = None
+        if self._ml_pipeline is not None:
+            try:
+                ml_forecast = self._ml_pipeline.forecast(
+                    nav_rows=nav_rows,
+                    positions_rows=positions_rows,
+                    now=now,
+                    horizon_days=nav_forecast.horizon_days,
+                )
+            except Exception:  # pragma: no cover - best effort integration
+                LOGGER.debug(
+                    "Failed to compute ML-based exposure forecast for %s",
+                    self._account_id,
+                    exc_info=True,
+                )
+                ml_forecast = None
+
+        margin_forecast = self._forecast_margin_usage(
+            positions_rows, nav_forecast, ml_forecast
+        )
 
         try:  # pragma: no cover - metrics module optional during unit tests
             from metrics import record_account_drawdown, record_account_exposure
@@ -553,8 +927,9 @@ class ExposureForecaster:
         self,
         rows: Sequence[Mapping[str, Any]],
         nav_volatility: ForecastResult,
+        ml_exposure: ForecastResult | None = None,
     ) -> ForecastResult:
-        if not rows:
+        if not rows and ml_exposure is None:
             return ForecastResult(value=ZERO, lower=ZERO, upper=ZERO, horizon_days=7)
 
         exposure = ZERO
@@ -563,17 +938,37 @@ class ExposureForecaster:
             entry_price = _as_decimal(row.get("entry_price", ZERO) or ZERO)
             exposure += abs(quantity * entry_price)
 
-        horizon_days = nav_volatility.horizon_days
-        projected_usage = exposure * (Decimal(1) + nav_volatility.value)
+        base_value = exposure
+        base_lower = exposure
+        base_upper = exposure
+        if ml_exposure is not None:
+            base_value = max(ml_exposure.value, ZERO)
+            base_lower = max(ml_exposure.lower, ZERO)
+            base_upper = max(ml_exposure.upper, ZERO)
 
-        lower_usage = exposure * (Decimal(1) + nav_volatility.lower)
-        upper_usage = exposure * (Decimal(1) + nav_volatility.upper)
+        nav_candidates = [
+            Decimal(1) + nav_volatility.value,
+            Decimal(1) + nav_volatility.lower,
+            Decimal(1) + nav_volatility.upper,
+        ]
+
+        projected_usage = base_value * nav_candidates[0]
+        scaled_candidates = [
+            base_lower * nav_candidates[1],
+            base_lower * nav_candidates[2],
+            base_upper * nav_candidates[1],
+            base_upper * nav_candidates[2],
+        ]
+
+        scaled_candidates.append(projected_usage)
+        lower_usage = max(min(scaled_candidates), ZERO)
+        upper_usage = max(scaled_candidates)
 
         return ForecastResult(
             value=projected_usage,
-            lower=min(lower_usage, upper_usage),
-            upper=max(lower_usage, upper_usage),
-            horizon_days=horizon_days,
+            lower=lower_usage,
+            upper=upper_usage,
+            horizon_days=nav_volatility.horizon_days,
         )
 
     @staticmethod

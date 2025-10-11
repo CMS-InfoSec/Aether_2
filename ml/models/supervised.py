@@ -35,6 +35,17 @@ else:  # pragma: no cover - trivial happy path
     _PANDAS_ERROR = None
 
 
+_JOBLIB_MODULE: Any | None
+_JOBLIB_ERROR: Exception | None
+try:  # pragma: no cover - exercised only when joblib is unavailable
+    import joblib as _JOBLIB_MODULE  # type: ignore[assignment]
+except Exception as exc:  # pragma: no cover - optional dependency
+    _JOBLIB_MODULE = None
+    _JOBLIB_ERROR = exc
+else:  # pragma: no cover - trivial happy path
+    _JOBLIB_ERROR = None
+
+
 if TYPE_CHECKING:  # pragma: no cover - type-checking only
     import numpy as np  # type: ignore
     import pandas as pd  # type: ignore
@@ -60,6 +71,33 @@ def _require_pandas() -> None:
         raise MissingDependencyError(
             "pandas is required for supervised training operations"
         ) from _PANDAS_ERROR
+
+
+def _require_joblib() -> Any:
+    """Return the joblib module or raise an informative error."""
+
+    if _JOBLIB_MODULE is None:
+        raise MissingDependencyError(
+            "joblib is required to persist sklearn-trained pipelines"
+        ) from _JOBLIB_ERROR
+    return _JOBLIB_MODULE
+
+
+def _import_sklearn_components() -> Tuple[Any, Any, Any, Any, Any]:
+    """Import scikit-learn building blocks on demand."""
+
+    try:
+        from sklearn.base import clone  # type: ignore
+        from sklearn.ensemble import RandomForestRegressor  # type: ignore
+        from sklearn.impute import SimpleImputer  # type: ignore
+        from sklearn.pipeline import Pipeline  # type: ignore
+        from sklearn.preprocessing import StandardScaler  # type: ignore
+    except Exception as exc:  # pragma: no cover - scikit-learn optional
+        raise MissingDependencyError(
+            "scikit-learn is required for SklearnPipelineTrainer"
+        ) from exc
+
+    return clone, Pipeline, RandomForestRegressor, SimpleImputer, StandardScaler
 
 
 from ml.experiment_tracking.mlflow_utils import MLFlowExperiment
@@ -189,6 +227,79 @@ class XGBoostTrainer(SupervisedTrainer):
         path.parent.mkdir(parents=True, exist_ok=True)
         self._model.save_model(str(path))
         LOGGER.info("Saved XGBoost model to %s", path)
+        if self.experiment:
+            self.experiment.log_artifact(path)
+
+
+@dataclass
+class SklearnPipelineTrainer(SupervisedTrainer):
+    """Scikit-learn regression pipeline with sensible preprocessing defaults."""
+
+    params: Dict[str, Any] = field(default_factory=dict)
+    random_state: Optional[int] = None
+    pipeline: Any | None = None
+    _model: Any = None
+
+    name: str = "sklearn"
+
+    def _build_pipeline(self) -> Any:
+        clone, Pipeline, RandomForestRegressor, SimpleImputer, StandardScaler = (
+            _import_sklearn_components()
+        )
+        if self.pipeline is not None:
+            return clone(self.pipeline)
+        estimator = RandomForestRegressor(
+            n_estimators=300,
+            random_state=self.random_state,
+        )
+        return Pipeline(
+            steps=[
+                ("imputer", SimpleImputer(strategy="median")),
+                (
+                    "scaler",
+                    StandardScaler(),
+                ),
+                ("model", estimator),
+            ]
+        )
+
+    def fit(self, dataset: SupervisedDataset, **kwargs: Any) -> Any:  # type: ignore[override]
+        _require_pandas()
+        _require_numpy()
+        pipeline = self._build_pipeline()
+        if self.random_state is not None:
+            model = getattr(pipeline, "named_steps", {}).get("model")
+            if model is not None and hasattr(model, "set_params"):
+                model.set_params(random_state=self.random_state)
+
+        all_params = {**self.params, **kwargs}
+        if all_params:
+            pipeline.set_params(**all_params)
+            self.log_params(all_params)
+
+        pipeline.fit(dataset.features, dataset.labels)
+        self._model = pipeline
+        LOGGER.info(
+            "Trained sklearn pipeline with %d samples and %d features",
+            len(dataset.labels),
+            dataset.features.shape[1],
+        )
+        return pipeline
+
+    def predict(self, features: pd.DataFrame) -> np.ndarray:  # type: ignore[override]
+        if self._model is None:
+            raise RuntimeError("Model has not been trained yet")
+        _require_pandas()
+        _require_numpy()
+        return self._model.predict(features)
+
+    def save(self, path: Path) -> None:  # type: ignore[override]
+        if self._model is None:
+            raise RuntimeError("Model has not been trained yet")
+        joblib = _require_joblib()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(self._model, path)
+        LOGGER.info("Saved sklearn pipeline to %s", path)
         if self.experiment:
             self.experiment.log_artifact(path)
 
@@ -436,6 +547,7 @@ class TransformerTrainer(SupervisedTrainer):
 TRAINER_REGISTRY: Dict[str, type[SupervisedTrainer]] = {
     LightGBMTrainer.name: LightGBMTrainer,
     XGBoostTrainer.name: XGBoostTrainer,
+    SklearnPipelineTrainer.name: SklearnPipelineTrainer,
     TemporalConvNetTrainer.name: TemporalConvNetTrainer,
     TransformerTrainer.name: TransformerTrainer,
 }
