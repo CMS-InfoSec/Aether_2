@@ -17,6 +17,10 @@ spec:
         app: config-service
         app.kubernetes.io/name: config-service
         app.kubernetes.io/component: api
+      annotations:
+        prometheus.io/path: /metrics
+        prometheus.io/port: "http"
+        prometheus.io/scrape: "true"
     spec:
       securityContext:
         runAsNonRoot: true
@@ -42,14 +46,14 @@ spec:
               value: require
           readinessProbe:
             httpGet:
-              path: /config/current
+              path: /healthz
               port: http
             initialDelaySeconds: 10
             periodSeconds: 10
             failureThreshold: 3
           livenessProbe:
             httpGet:
-              path: /config/current
+              path: /healthz
               port: http
             initialDelaySeconds: 20
             periodSeconds: 20

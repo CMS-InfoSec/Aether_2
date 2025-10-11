@@ -1,8 +1,30 @@
 {{- $global := .Values.global -}}
 {{- $ui := .Values.ui -}}
+{{- $promGlobal := $global.prometheus | default (dict) -}}
+{{- $promDefaultEnabled := ternary $promGlobal.enabled true (hasKey $promGlobal "enabled") -}}
+{{- $promDefaultPath := $promGlobal.path | default "/metrics" -}}
+{{- $promDefaultPort := $promGlobal.port | default "http" -}}
+{{- $promDefaultScheme := $promGlobal.scheme | default "http" -}}
 {{- if $ui.enabled }}
 {{- $name := default "aether-2-ui" $ui.nameOverride -}}
 {{- $labels := dict "name" $name "Release" $.Release -}}
+{{- $hasKraken := and $global.krakenSecrets.enabled $ui.usesKrakenSecrets -}}
+{{- $krakenAccounts := $global.krakenSecrets.accounts | default (list) -}}
+{{- $svcProm := $ui.prometheus | default (dict) -}}
+{{- $promEnabled := ternary $svcProm.enabled $promDefaultEnabled (hasKey $svcProm "enabled") -}}
+{{- $promPath := $svcProm.path | default $promDefaultPath -}}
+{{- $promPort := $svcProm.port | default $promDefaultPort -}}
+{{- $promScheme := $svcProm.scheme | default $promDefaultScheme -}}
+{{- $annotations := dict -}}
+{{- if $hasKraken }}
+{{- $_ := set $annotations $global.krakenSecrets.annotationKey (default "" $global.krakenSecrets.checksum) -}}
+{{- end }}
+{{- if and $promEnabled (ne $promEnabled false) }}
+{{- $_ := set $annotations "prometheus.io/scrape" "true" -}}
+{{- $_ := set $annotations "prometheus.io/path" $promPath -}}
+{{- $_ := set $annotations "prometheus.io/port" (printf "%v" $promPort) -}}
+{{- $_ := set $annotations "prometheus.io/scheme" $promScheme -}}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -20,9 +42,11 @@ spec:
       labels:
         {{- include "aether-platform.selectorLabels" (dict "name" $name) | nindent 8 }}
         {{- include "aether-platform.labels" $labels | nindent 8 }}
-      {{- if and $global.krakenSecrets.enabled $ui.usesKrakenSecrets }}
+      {{- if gt (len $annotations) 0 }}
       annotations:
-        {{ $global.krakenSecrets.annotationKey }}: {{ $global.krakenSecrets.checksum | quote }}
+        {{- range $key, $value := $annotations }}
+        {{ $key }}: {{ $value | quote }}
+        {{- end }}
       {{- end }}
     spec:
       securityContext:
@@ -34,7 +58,6 @@ spec:
           ports:
             - containerPort: {{ $ui.containerPort | default 8080 }}
               name: http
-          {{- $hasKraken := and $global.krakenSecrets.enabled $ui.usesKrakenSecrets }}
           {{- $extraEnv := $ui.env | default (list) -}}
           {{- $envEnabled := or $hasKraken (gt (len $extraEnv) 0) -}}
           {{- if $envEnabled }}
@@ -42,12 +65,10 @@ spec:
             {{- if $hasKraken }}
             - name: KRAKEN_SECRETS_BASE
               value: {{ $global.krakenSecrets.basePath | quote }}
-            - name: AETHER_COMPANY_KRAKEN_SECRET_PATH
-              value: {{ printf "%s/company/credentials.json" $global.krakenSecrets.basePath | quote }}
-            - name: AETHER_DIRECTOR_1_KRAKEN_SECRET_PATH
-              value: {{ printf "%s/director-1/credentials.json" $global.krakenSecrets.basePath | quote }}
-            - name: AETHER_DIRECTOR_2_KRAKEN_SECRET_PATH
-              value: {{ printf "%s/director-2/credentials.json" $global.krakenSecrets.basePath | quote }}
+            {{- range $account := $krakenAccounts }}
+            - name: {{ $account.envVar }}
+              value: {{ printf "%s/%s/credentials.json" $global.krakenSecrets.basePath $account.mountSubPath | quote }}
+            {{- end }}
             {{- end }}
             {{- range $extraEnv }}
             {{- toYaml . | nindent 12 }}
@@ -84,24 +105,15 @@ spec:
           projected:
             defaultMode: 0440
             sources:
+              {{- range $account := $krakenAccounts }}
+              {{- $optional := ternary $account.optional true (hasKey $account "optional") -}}
               - secret:
-                  name: {{ $global.krakenSecrets.secretRefs.company }}
+                  name: {{ $account.secretName }}
                   items:
                     - key: credentials.json
-                      path: company/credentials.json
-                  optional: true
-              - secret:
-                  name: {{ $global.krakenSecrets.secretRefs.director1 }}
-                  items:
-                    - key: credentials.json
-                      path: director-1/credentials.json
-                  optional: true
-              - secret:
-                  name: {{ $global.krakenSecrets.secretRefs.director2 }}
-                  items:
-                    - key: credentials.json
-                      path: director-2/credentials.json
-                  optional: true
+                      path: {{ printf "%s/credentials.json" $account.mountSubPath }}
+                  optional: {{ $optional }}
+              {{- end }}
         {{- end }}
         {{- range $ui.extraVolumes }}
         {{- toYaml . | nindent 8 }}

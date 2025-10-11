@@ -17,6 +17,10 @@ spec:
         app: auth-service
         app.kubernetes.io/name: auth-service
         app.kubernetes.io/component: api
+      annotations:
+        prometheus.io/path: /metrics
+        prometheus.io/port: "http"
+        prometheus.io/scrape: "true"
     spec:
       serviceAccountName: api-services
       containers:
