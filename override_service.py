@@ -17,6 +17,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from shared.account_scope import account_id_column
 from shared.audit_hooks import AuditEvent, load_audit_hooks
 from shared.postgres import normalize_sqlalchemy_dsn
 
@@ -126,7 +127,7 @@ class OverrideLogEntry(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     intent_id = Column(String, nullable=False, index=True)
-    account_id = Column(String, nullable=False, index=True)
+    account_id = account_id_column(index=True)
     actor = Column(String, nullable=False)
     decision = Column(String, nullable=False)
     reason = Column(Text, nullable=False)

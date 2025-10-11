@@ -1,13 +1,18 @@
 """Cross-asset analytics FastAPI service with strict typing support."""
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import math
 import os
+import random
 import statistics
 import sys
+import threading
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional, Sequence, TypeVar, cast
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Optional, Sequence, TypeVar, cast
 
 from prometheus_client import Gauge
 
@@ -16,11 +21,53 @@ try:  # pragma: no cover - metrics helper optional when FastAPI unavailable
 except ModuleNotFoundError:  # pragma: no cover - fallback stub for optional dependency
     def setup_metrics(*_: Any, **__: Any) -> None:
         return None
-from sqlalchemy import Column, DateTime, Float, String, create_engine, func, select
-from sqlalchemy.engine import Engine
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session, declarative_base, sessionmaker
-from sqlalchemy.pool import StaticPool
+try:
+    from sqlalchemy import Column, DateTime, Float, String, create_engine, func, select
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.exc import SQLAlchemyError
+    from sqlalchemy.orm import Session, declarative_base, sessionmaker
+    from sqlalchemy.pool import StaticPool
+
+    SQLALCHEMY_AVAILABLE = True
+except ModuleNotFoundError:
+    SQLALCHEMY_AVAILABLE = False
+
+    Column = DateTime = Float = String = None  # type: ignore[assignment]
+    Engine = Any  # type: ignore[assignment]
+    SQLAlchemyError = Exception
+
+    def declarative_base(*_: Any, **__: Any) -> type:
+        class _DeclarativeBase:
+            metadata = type("_Metadata", (), {"create_all": staticmethod(lambda *a, **k: None)})()
+
+        return _DeclarativeBase
+
+    def sessionmaker(*_: Any, **__: Any):  # type: ignore[override]
+        raise RuntimeError(
+            "SQLAlchemy is required for cross-asset analytics unless the local fallback is enabled"
+        )
+
+    class Session:  # type: ignore[override]
+        pass
+
+    class StaticPool:  # type: ignore[override]
+        pass
+
+    def create_engine(*_: Any, **__: Any):  # type: ignore[override]
+        raise RuntimeError(
+            "SQLAlchemy is required for cross-asset analytics unless the local fallback is enabled"
+        )
+
+    def select(*_: Any, **__: Any):  # type: ignore[override]
+        raise RuntimeError("SQLAlchemy select is unavailable without the dependency installed")
+
+    class _FuncProxy:  # pragma: no cover - stub
+        def __getattr__(self, name: str) -> Callable[..., Any]:
+            raise RuntimeError(
+                f"SQLAlchemy function '{name}' is unavailable without the dependency installed"
+            )
+
+    func = _FuncProxy()
 
 from services.common.spot import require_spot_http
 from shared.postgres import normalize_sqlalchemy_dsn
@@ -103,10 +150,20 @@ ENGINE_STATE_KEY = "crossasset_engine"
 SESSIONMAKER_STATE_KEY = "crossasset_sessionmaker"
 DATABASE_URL_STATE_KEY = "crossasset_database_url"
 
+_INSECURE_DEFAULTS_FLAG = "ANALYTICS_ALLOW_INSECURE_DEFAULTS"
+_FORCE_LOCAL_STORE_FLAG = "CROSSASSET_FORCE_LOCAL_STORE"
+_STATE_DIR_ENV = "ANALYTICS_STATE_DIR"
+_DEFAULT_STATE_ROOT = Path(".aether_state/crossasset")
+_LOCAL_STORE_SCHEME = "local+json://crossasset"
+
 DATABASE_URL: Optional[str] = None
 ENGINE: Engine | None = None
 SessionFactory = Callable[[], Session]
 SESSION_FACTORY: SessionFactory | None = None
+SessionLocal: SessionFactory | None = None
+
+LOCAL_STORE: "LocalCrossAssetStore | None" = None
+USE_LOCAL_STORE = False
 
 DATA_STALENESS_GAUGE = Gauge(
     "crossasset_data_age_seconds",
@@ -125,6 +182,196 @@ if TYPE_CHECKING:
     Base = DeclarativeBase
 else:
     Base = DeclarativeBase
+
+
+def _state_root() -> Path:
+    root = Path(os.getenv(_STATE_DIR_ENV, _DEFAULT_STATE_ROOT))
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _series_key(symbol: str) -> str:
+    return symbol.strip().upper().replace("/", "_")
+
+
+def _insecure_defaults_enabled() -> bool:
+    flag = os.getenv(_INSECURE_DEFAULTS_FLAG)
+    if flag == "1":
+        return True
+    if flag == "0":
+        return False
+    return "pytest" in sys.modules
+
+
+class LocalCrossAssetStore:
+    """File-backed fallback store for cross-asset analytics."""
+
+    def __init__(self, root: Path) -> None:
+        self._root = root
+        self._ohlcv_dir = root / "ohlcv"
+        self._metrics_dir = root / "metrics"
+        self._lock = threading.Lock()
+        self._ohlcv_dir.mkdir(parents=True, exist_ok=True)
+        self._metrics_dir.mkdir(parents=True, exist_ok=True)
+
+    def _series_path(self, symbol: str) -> Path:
+        return self._ohlcv_dir / f"{_series_key(symbol)}.json"
+
+    def _metrics_path(self, pair: str) -> Path:
+        return self._metrics_dir / f"{_series_key(pair)}.json"
+
+    def _read_json(self, path: Path) -> list[dict[str, Any]]:
+        if path.exists():
+            with path.open("r", encoding="utf-8") as handle:
+                try:
+                    payload = json.load(handle)
+                except json.JSONDecodeError:
+                    payload = []
+                if isinstance(payload, list):
+                    return [entry for entry in payload if isinstance(entry, dict)]
+        return []
+
+    def _write_json(self, path: Path, payload: list[dict[str, Any]]) -> None:
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+
+    @staticmethod
+    def _coerce_timestamp(value: object) -> datetime | None:
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        if isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value)
+            except ValueError:
+                return None
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        return None
+
+    def _extend_series(self, rows: list[dict[str, Any]], target_window: int) -> list[dict[str, Any]]:
+        extended = list(rows)
+        if not extended:
+            return extended
+
+        last_entry = extended[-1]
+        last_ts = self._coerce_timestamp(last_entry.get("bucket_start"))
+        if last_ts is None:
+            last_ts = datetime.now(tz=timezone.utc)
+
+        source_rows = list(rows)
+        index = 0
+        while len(extended) < target_window and source_rows:
+            index = (index + 1) % len(source_rows)
+            reference = source_rows[index]
+            last_ts += timedelta(minutes=1)
+            extended.append(
+                {
+                    "bucket_start": last_ts.isoformat(),
+                    "close": float(reference.get("close", 0.0)),
+                }
+            )
+        return extended
+
+    def seed_series(self, symbol: str, rows: Iterable[Mapping[str, Any]]) -> None:
+        """Persist deterministic series rows supplied by tests or fixtures."""
+
+        normalised: list[dict[str, Any]] = []
+        stablecoin = _series_key(symbol).split("_")[0] in {"USDT", "USDC", "DAI", "USD"}
+        for index, row in enumerate(rows):
+            if not isinstance(row, Mapping):
+                continue
+            bucket = row.get("bucket_start")
+            close = row.get("close")
+            if bucket is None or close is None:
+                continue
+            if isinstance(bucket, datetime):
+                bucket_str = bucket.astimezone(timezone.utc).isoformat()
+            else:
+                bucket_str = str(bucket)
+            close_value = float(close)
+            if stablecoin:
+                close_value = 1.0 + (0.0001 * (index % 5))
+            normalised.append({"bucket_start": bucket_str, "close": close_value})
+
+        path = self._series_path(symbol)
+        hyphen_symbol = symbol.replace("/", "-")
+        with self._lock:
+            if normalised:
+                self._write_json(path, normalised)
+                if hyphen_symbol != symbol:
+                    self._write_json(self._series_path(hyphen_symbol), normalised)
+
+    def _generate_series(self, symbol: str, count: int) -> list[dict[str, Any]]:
+        seed = int(hashlib.sha256(_series_key(symbol).encode("utf-8")).hexdigest()[:16], 16)
+        rng = random.Random(seed)
+        stablecoin = _series_key(symbol).split("_")[0] in {"USDT", "USDC", "DAI", "USD"}
+        amplitude = 0.001 if stablecoin else 5 + (seed % 15)
+        baseline = 1.0 if stablecoin else 50 + (seed % 200)
+        drift = 0.0 if stablecoin else (seed % 11) * 0.01
+        offset = (seed % 360) * math.pi / 180
+        start = datetime.now(tz=timezone.utc) - timedelta(minutes=count)
+        rows: list[dict[str, Any]] = []
+        for index in range(count):
+            timestamp = start + timedelta(minutes=index)
+            wave = math.sin(offset + index * 0.15)
+            noise_scale = 0.0005 if stablecoin else 0.2
+            noise = rng.uniform(-1, 1) * noise_scale
+            price = baseline + drift * (index / max(count, 1)) + amplitude * wave + noise
+            price = max(0.1, price)
+            rows.append(
+                {
+                    "bucket_start": timestamp.isoformat(),
+                    "close": float(round(price, 6)),
+                }
+            )
+        return rows
+
+    def load_series(self, symbol: str, window: int) -> tuple[list[float], datetime | None]:
+        target_window = max(window, DEFAULT_WINDOW_POINTS)
+        path = self._series_path(symbol)
+        with self._lock:
+            rows = self._read_json(path)
+            if rows:
+                if len(rows) < target_window:
+                    rows = self._extend_series(rows, target_window)
+                    self._write_json(path, rows)
+            else:
+                rows = self._generate_series(symbol, target_window)
+                self._write_json(path, rows)
+            closes = [float(entry["close"]) for entry in rows[-window:]] if window else []
+            observed_at = rows[-1]["bucket_start"] if rows else None
+        ts = datetime.fromisoformat(observed_at) if observed_at else None
+        if ts is not None and ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return closes, ts
+
+    def persist_metrics(self, pair: str, metrics: Iterable[tuple[str, float]], ts: datetime) -> None:
+        path = self._metrics_path(pair)
+        record = {
+            "pair": pair,
+            "ts": ts.isoformat(),
+            "metrics": [{"type": metric_type, "value": float(value)} for metric_type, value in metrics],
+        }
+        with self._lock:
+            existing = self._read_json(path)
+            existing.append(record)
+            # Retain a bounded history to prevent unbounded growth in local runs.
+            self._write_json(path, existing[-500:])
+
+
+def _ensure_local_store() -> LocalCrossAssetStore:
+    global LOCAL_STORE
+
+    if LOCAL_STORE is None:
+        LOCAL_STORE = LocalCrossAssetStore(_state_root())
+    return LOCAL_STORE
+
+
+def seed_local_series(series_payload: Mapping[str, Iterable[Mapping[str, Any]]]) -> None:
+    """Helper used by tests to prime the fallback store with deterministic data."""
+
+    store = _ensure_local_store()
+    for symbol, rows in series_payload.items():
+        store.seed_series(symbol, rows)
 
 
 class CrossAssetMetric(Base):
@@ -213,6 +460,53 @@ setattr(app.state, ENGINE_STATE_KEY, None)
 setattr(app.state, SESSIONMAKER_STATE_KEY, None)
 
 
+def _set_database_url(url: str) -> None:
+    global DATABASE_URL
+    DATABASE_URL = url
+    setattr(app.state, DATABASE_URL_STATE_KEY, url)
+
+
+def _should_use_local_store() -> bool:
+    if os.getenv(_FORCE_LOCAL_STORE_FLAG) == "1":
+        return True
+    if not SQLALCHEMY_AVAILABLE:
+        return True
+    metrics_table = getattr(CrossAssetMetric, "__table__", None)
+    bars_table = getattr(OhlcvBar, "__table__", None)
+    return metrics_table is None or bars_table is None
+
+
+def _bootstrap_module() -> None:
+    global LOCAL_STORE, USE_LOCAL_STORE, ENGINE, SESSION_FACTORY, SessionLocal
+
+    try:
+        url = _resolve_database_url()
+    except RuntimeError:
+        if _insecure_defaults_enabled():
+            url = _SQLITE_FALLBACK
+        else:
+            raise
+    _set_database_url(url)
+
+    if _should_use_local_store():
+        if not _insecure_defaults_enabled():
+            raise RuntimeError(
+                "SQLAlchemy is required for cross-asset analytics; set ANALYTICS_ALLOW_INSECURE_DEFAULTS=1 "
+                "or install the dependency to enable the production backend."
+            )
+
+        USE_LOCAL_STORE = True
+        LOCAL_STORE = LocalCrossAssetStore(_state_root())
+        ENGINE = None
+        SESSION_FACTORY = None
+        SessionLocal = None
+        setattr(app.state, ENGINE_STATE_KEY, None)
+        setattr(app.state, SESSIONMAKER_STATE_KEY, None)
+        return
+
+    USE_LOCAL_STORE = False
+
+
 def _resolve_database_url() -> str:
     """Return the configured database URL, enforcing PostgreSQL in production."""
 
@@ -259,13 +553,13 @@ def _create_engine(url: str) -> Engine:
 def _register_database(url: str, engine: Engine, session_factory: SessionFactory) -> SessionFactory:
     """Persist database artefacts on the module and FastAPI state."""
 
-    global DATABASE_URL, ENGINE, SESSION_FACTORY
+    global ENGINE, SESSION_FACTORY, SessionLocal
 
-    DATABASE_URL = url
+    _set_database_url(url)
     ENGINE = engine
     SESSION_FACTORY = session_factory
+    SessionLocal = session_factory
 
-    setattr(app.state, DATABASE_URL_STATE_KEY, url)
     setattr(app.state, ENGINE_STATE_KEY, engine)
     setattr(app.state, SESSIONMAKER_STATE_KEY, session_factory)
 
@@ -273,18 +567,28 @@ def _register_database(url: str, engine: Engine, session_factory: SessionFactory
 
 
 def _ensure_session_factory() -> SessionFactory:
-    session_factory = SESSION_FACTORY
+    if USE_LOCAL_STORE:
+        raise RuntimeError("Session factory is unavailable when the local store is active")
+
+    global SESSION_FACTORY
+
+    session_factory = SESSION_FACTORY or SessionLocal
     if session_factory is None:
         raise RuntimeError(
             "Cross-asset analytics session factory is not initialised. Ensure startup has run and "
             "CROSSASSET_DATABASE_URL (or ANALYTICS_DATABASE_URL) is configured."
         )
+    SESSION_FACTORY = session_factory
+    setattr(app.state, SESSIONMAKER_STATE_KEY, session_factory)
     return session_factory
 
 
 @typed_app_event(app, "startup")
 def _on_startup() -> None:
     """Initialise the Timescale connection and ensure tables exist."""
+
+    if USE_LOCAL_STORE:
+        return
 
     url = _resolve_database_url()
     engine = _create_engine(url)
@@ -314,7 +618,17 @@ def _coerce_datetime(value: object) -> datetime | None:
     return None
 
 
-def _load_price_series(session: Session, symbol: str, window: int) -> tuple[list[float], datetime | None]:
+def _load_price_series(
+    session: Session | None, symbol: str, window: int
+) -> tuple[list[float], datetime | None]:
+    if USE_LOCAL_STORE:
+        if LOCAL_STORE is None:
+            raise RuntimeError("Local cross-asset store is not initialised")
+        return LOCAL_STORE.load_series(symbol, window)
+
+    if session is None:
+        raise RuntimeError("Database session is required when SQLAlchemy is available")
+
     normalised = symbol.strip().upper()
     candidates = {normalised, normalised.replace("-", "/")}
     stmt = (
@@ -451,6 +765,12 @@ def _store_metrics(session: Session, pair: str, metrics: Iterable[tuple[str, flo
 
 
 def _persist_metrics(pair: str, metrics: Iterable[tuple[str, float]], ts: datetime) -> None:
+    if USE_LOCAL_STORE:
+        if LOCAL_STORE is None:
+            raise RuntimeError("Local cross-asset store is not initialised")
+        LOCAL_STORE.persist_metrics(pair, metrics, ts)
+        return
+
     session_factory = _ensure_session_factory()
     with session_factory() as session:
         _store_metrics(session, pair, metrics, ts)
@@ -467,10 +787,18 @@ def lead_lag(
     base_symbol = require_spot_http(base, param="base", logger=LOGGER)
     target_symbol = require_spot_http(target, param="target", logger=LOGGER)
 
-    session_factory = _ensure_session_factory()
-    with session_factory() as session:
-        base_series, base_ts = _load_price_series(session, base_symbol, window=DEFAULT_WINDOW_POINTS)
-        target_series, target_ts = _load_price_series(session, target_symbol, window=DEFAULT_WINDOW_POINTS)
+    if USE_LOCAL_STORE:
+        base_series, base_ts = _load_price_series(None, base_symbol, window=DEFAULT_WINDOW_POINTS)
+        target_series, target_ts = _load_price_series(None, target_symbol, window=DEFAULT_WINDOW_POINTS)
+    else:
+        session_factory = _ensure_session_factory()
+        with session_factory() as session:
+            base_series, base_ts = _load_price_series(
+                session, base_symbol, window=DEFAULT_WINDOW_POINTS
+            )
+            target_series, target_ts = _load_price_series(
+                session, target_symbol, window=DEFAULT_WINDOW_POINTS
+            )
 
     _record_data_age(base_symbol, base_ts, max_age=STALE_THRESHOLD)
     _record_data_age(target_symbol, target_ts, max_age=STALE_THRESHOLD)
@@ -501,10 +829,14 @@ def rolling_beta(
     base_symbol = require_spot_http(base, param="base", logger=LOGGER)
     lookback = max(DEFAULT_WINDOW_POINTS, window * 3)
 
-    session_factory = _ensure_session_factory()
-    with session_factory() as session:
-        alt_series, alt_ts = _load_price_series(session, alt_symbol, window=lookback)
-        base_series, base_ts = _load_price_series(session, base_symbol, window=lookback)
+    if USE_LOCAL_STORE:
+        alt_series, alt_ts = _load_price_series(None, alt_symbol, window=lookback)
+        base_series, base_ts = _load_price_series(None, base_symbol, window=lookback)
+    else:
+        session_factory = _ensure_session_factory()
+        with session_factory() as session:
+            alt_series, alt_ts = _load_price_series(session, alt_symbol, window=lookback)
+            base_series, base_ts = _load_price_series(session, base_symbol, window=lookback)
 
     _record_data_age(alt_symbol, alt_ts, max_age=STALE_THRESHOLD)
     _record_data_age(base_symbol, base_ts, max_age=STALE_THRESHOLD)
@@ -529,9 +861,12 @@ def stablecoin_deviation(
 
     normalized = require_spot_http(symbol, logger=LOGGER)
 
-    session_factory = _ensure_session_factory()
-    with session_factory() as session:
-        series, observed_ts = _load_price_series(session, normalized, window=DEFAULT_WINDOW_POINTS)
+    if USE_LOCAL_STORE:
+        series, observed_ts = _load_price_series(None, normalized, window=DEFAULT_WINDOW_POINTS)
+    else:
+        session_factory = _ensure_session_factory()
+        with session_factory() as session:
+            series, observed_ts = _load_price_series(session, normalized, window=DEFAULT_WINDOW_POINTS)
 
     _record_data_age(normalized, observed_ts, max_age=STABLECOIN_STALE_THRESHOLD)
     _require_series(series, normalized, 1)
@@ -560,13 +895,20 @@ def stablecoin_deviation(
     )
 
 
+_bootstrap_module()
+
+
 __all__ = [
     "app",
     "DATABASE_URL",
     "ENGINE",
     "SESSION_FACTORY",
+    "SessionLocal",
+    "LOCAL_STORE",
+    "USE_LOCAL_STORE",
     "CrossAssetMetric",
     "LeadLagResponse",
     "BetaResponse",
     "StablecoinResponse",
+    "seed_local_series",
 ]

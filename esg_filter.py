@@ -32,6 +32,7 @@ else:  # pragma: no cover - exercised in environments with SQLAlchemy installed
     SQLALCHEMY_AVAILABLE = getattr(Column, "__module__", "").startswith("sqlalchemy")
 
 from services.common.security import require_admin_account
+from shared.account_scope import account_id_column
 
 
 logger = logging.getLogger(__name__)
@@ -60,7 +61,7 @@ if SQLALCHEMY_AVAILABLE:
         __tablename__ = "esg_rejections"
 
         id = Column(Integer, primary_key=True, autoincrement=True)
-        account_id = Column(String, nullable=False)
+        account_id = account_id_column()
         symbol = Column(String, nullable=False)
         flag = Column(String, nullable=True)
         score = Column(Float, nullable=True)
