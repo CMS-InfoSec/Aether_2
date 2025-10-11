@@ -911,6 +911,8 @@ backendServices:
           secretKeyRef:
             name: secrets-service-config
             key: SECRET_ENCRYPTION_KEY
+      - name: SECRETS_ALLOW_INSECURE_DEFAULTS
+        value: "0"
     usesKrakenSecrets: true
     extraVolumeMounts: []
     extraVolumes: []
