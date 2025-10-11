@@ -10,10 +10,15 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 from typing import Iterable
+
+from yaml import safe_load
 
 
 _GLOBAL_ALLOW_FLAG = "AETHER_ALLOW_INSECURE_DEFAULTS"
+_SYSTEM_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "system.yaml"
+_ENV_FLAG = "ENV"
 
 
 def _is_test_environment() -> bool:
@@ -59,4 +64,49 @@ def assert_insecure_defaults_disabled(
         f"{formatted}. Unset them or set {_GLOBAL_ALLOW_FLAG}=1 to explicitly "
         "acknowledge the risk in non-production environments."
     )
+
+
+def _load_system_config() -> dict[str, object]:
+    """Return the parsed ``system.yaml`` configuration."""
+
+    try:
+        with _SYSTEM_CONFIG_PATH.open("r", encoding="utf-8") as handle:
+            loaded = safe_load(handle) or {}
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:  # pragma: no cover - defensive guard
+        raise RuntimeError(f"Failed to load {_SYSTEM_CONFIG_PATH}") from exc
+
+    if isinstance(loaded, dict):
+        return loaded
+
+    raise RuntimeError(
+        f"{_SYSTEM_CONFIG_PATH} must contain a top-level mapping, received {type(loaded)!r}."
+    )
+
+
+def assert_simulation_disabled_in_production() -> None:
+    """Prevent enabling global simulation mode when ``ENV=production``."""
+
+    environment = (os.getenv(_ENV_FLAG) or "").strip().lower()
+    if environment != "production":
+        return
+
+    simulation_config = _load_system_config().get("simulation", {})
+    if isinstance(simulation_config, dict):
+        enabled = bool(simulation_config.get("enabled"))
+    else:
+        enabled = bool(simulation_config)
+
+    if enabled:
+        raise RuntimeError(
+            "Simulation mode is enabled in system.yaml, but production deployments "
+            "require it to remain disabled."
+        )
+
+
+__all__ = [
+    "assert_insecure_defaults_disabled",
+    "assert_simulation_disabled_in_production",
+]
 

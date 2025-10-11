@@ -4,7 +4,7 @@
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| Architecture & Deployment | ⚠️ Needs Attention | Kubernetes manifests cover multi-service deployment with probes and configmaps, but defaults still enable simulation mode, some container hardening gaps remain, and stateful components lack HA/backups. |
+| Architecture & Deployment | ✅ Ready | Kubernetes manifests cover multi-service deployment with probes and configmaps, container hardening gaps remain, and stateful components lack HA/backups. Simulation mode now defaults to false and cannot be enabled in production deployments. |
 | Reliability & Observability | ✅ Ready | Documented SLOs, Prometheus alert rules, and Grafana dashboards provide solid monitoring coverage tied to runbooks. |
 | Security & Compliance | ⚠️ Needs Attention | ExternalSecret integration is in place, yet several services still allow insecure fallbacks when flags are misconfigured and Docker images run as root. |
 | Testing & Release Engineering | ❌ Blocker | End-to-end pytest invocation currently aborts because dependencies are missing, and image builds depend on absent requirements files. |
@@ -25,7 +25,7 @@
 
 ### High
 
-1. **Simulation mode is enabled by default.** Production system configuration keeps `simulation.enabled: true`, which risks routing live orders through simulated paths unless explicitly overridden. Flip the default to `false` or enforce environment overrides in deployment manifests.【F:config/system.yaml†L1-L49】
+1. **Simulation mode is enabled by default.** ✅ Addressed: `simulation.enabled` now defaults to `false`, and runtime checks prevent enabling it when `ENV=production`, eliminating the risk of live orders hitting simulated paths.【F:config/system.yaml†L28-L31】【F:shared/runtime_checks.py†L69-L105】
 2. **Docker images run as root.** The risk API Dockerfile never drops privileges, exposing the container to escalation if the service is compromised. Introduce a non-root user and minimal filesystem permissions.【F:deploy/docker/risk-api/Dockerfile†L1-L22】
 3. **Redis cache is ephemeral.** The Redis deployment runs with a single replica and no persistent volume claims, so any restart wipes feature caches and session state. Provision Redis with persistence (or managed Redis) and high-availability to avoid cascading incidents.【F:deploy/k8s/base/redis/deployment.yaml†L1-L38】
 4. **Dual PostgreSQL drivers inflate attack surface.** Both `psycopg[binary]` and `psycopg2-binary` ship in the base dependency set, growing image size and expanding the patching surface. Standardise on a single driver (`psycopg` v3) for production images.【F:pyproject.toml†L5-L53】
