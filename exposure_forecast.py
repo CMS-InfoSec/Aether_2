@@ -11,14 +11,25 @@ from typing import Any, Callable, ClassVar, Dict, List, Mapping, Optional, Seque
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-try:  # pragma: no cover - psycopg2 is optional in some environments
+try:  # pragma: no cover - prefer psycopg (v3) when available
+    import psycopg
+    from psycopg import sql as psycopg_sql
+    from psycopg.rows import dict_row as psycopg_dict_row
+except Exception:  # pragma: no cover - runtime may only ship psycopg2
+    psycopg = None  # type: ignore[assignment]
+    psycopg_sql = None  # type: ignore[assignment]
+    psycopg_dict_row = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - retain psycopg2 compatibility
     import psycopg2
-    from psycopg2 import sql
+    from psycopg2 import sql as psycopg2_sql
     from psycopg2.extras import RealDictCursor
 except Exception:  # pragma: no cover - fallback when psycopg2 is unavailable
     psycopg2 = None  # type: ignore[assignment]
-    sql = None  # type: ignore[assignment]
+    psycopg2_sql = None  # type: ignore[assignment]
     RealDictCursor = Any  # type: ignore[assignment]
+
+_SQL_MODULE = psycopg_sql or psycopg2_sql
 
 from shared.common_bootstrap import ensure_common_helpers
 
@@ -168,31 +179,51 @@ class _BaseExposureStore:
 
 
 class _PsycopgExposureStore(_BaseExposureStore):
-    """Timescale-backed exposure store using psycopg2 connections."""
+    """Timescale-backed exposure store using psycopg-compatible connections."""
 
     def __init__(self, account_id: str) -> None:
-        if psycopg2 is None or sql is None:
-            raise RuntimeError("psycopg2 is not available; cannot use the database-backed exposure store")
+        if _SQL_MODULE is None or (psycopg is None and psycopg2 is None):
+            raise RuntimeError(
+                "psycopg or psycopg2 is not available; cannot use the database-backed exposure store"
+            )
         super().__init__(account_id)
         self._session = get_timescale_session(account_id)
 
     def _query(self, query: str, params: Mapping[str, Any]) -> List[Dict[str, Any]]:
-        if psycopg2 is None or sql is None:
-            raise RuntimeError("psycopg2 is not available; cannot execute Timescale queries")
+        if _SQL_MODULE is None:
+            raise RuntimeError(
+                "psycopg or psycopg2 is not available; cannot execute Timescale queries"
+            )
 
-        connection = psycopg2.connect(self._session.dsn)
+        connection: Any | None = None
+        cursor: Any | None = None
         try:
-            connection.autocommit = True
-            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
-                if self._session.account_schema:
-                    statement = sql.SQL("SET search_path TO {}, public").format(
-                        sql.Identifier(self._session.account_schema)
-                    )
-                    cursor.execute(statement)
-                cursor.execute(query, params)
-                rows = cursor.fetchall()
+            if psycopg is not None:
+                assert psycopg_dict_row is not None  # nosec - guarded by import
+                connection = psycopg.connect(self._session.dsn)
+                connection.autocommit = True
+                cursor = connection.cursor(row_factory=psycopg_dict_row)
+            elif psycopg2 is not None:
+                connection = psycopg2.connect(self._session.dsn)
+                connection.autocommit = True
+                cursor = connection.cursor(cursor_factory=RealDictCursor)
+            else:  # pragma: no cover - guarded by _SQL_MODULE check
+                raise RuntimeError(
+                    "psycopg or psycopg2 is not available; cannot execute Timescale queries"
+                )
+
+            if self._session.account_schema:
+                statement = _SQL_MODULE.SQL("SET search_path TO {}, public").format(
+                    _SQL_MODULE.Identifier(self._session.account_schema)
+                )
+                cursor.execute(statement)
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
         finally:
-            connection.close()
+            if cursor is not None:
+                cursor.close()
+            if connection is not None:
+                connection.close()
 
         return [dict(row) for row in rows]
 
@@ -389,12 +420,47 @@ class ExposureForecaster:
                 detail="No NAV history available for account",
             )
 
+        peak_nav = ZERO
+        max_drawdown = ZERO
+        for row in nav_rows:
+            nav_value = _as_decimal(row.get("nav", ZERO) or ZERO)
+            if nav_value > peak_nav:
+                peak_nav = nav_value
+            if peak_nav > ZERO:
+                drawdown = (peak_nav - nav_value) / peak_nav
+                if drawdown > max_drawdown:
+                    max_drawdown = drawdown
+
         fees_rows = self._store.fetch_fee_history(start, now)
         positions_rows = self._store.fetch_positions()
 
         nav_forecast = self._forecast_nav_volatility(nav_rows)
         fee_forecast = self._forecast_fee_spend(fees_rows)
         margin_forecast = self._forecast_margin_usage(positions_rows, nav_forecast)
+
+        try:  # pragma: no cover - metrics module optional during unit tests
+            from metrics import record_account_drawdown, record_account_exposure
+
+            record_account_drawdown(
+                self._account_id,
+                drawdown_pct=float(max_drawdown),
+                service="risk",
+            )
+            for position in positions_rows:
+                symbol = str(position.get("market") or "")
+                quantity = _as_decimal(position.get("quantity", ZERO) or ZERO)
+                entry_price = _as_decimal(position.get("entry_price", ZERO) or ZERO)
+                exposure_value = abs(quantity * entry_price)
+                record_account_exposure(
+                    self._account_id,
+                    symbol=symbol,
+                    exposure_usd=float(exposure_value),
+                    service="risk",
+                )
+        except Exception:  # pragma: no cover - metrics emission is best effort
+            LOGGER.debug(
+                "Failed to record exposure metrics for account %s", self._account_id, exc_info=True
+            )
 
         return {
             "account_id": self._account_id,

@@ -340,12 +340,15 @@ class MetricContext:
     """Bounded labels derived from request context for metric emission."""
 
     service: Optional[str] = None
+    account_id: str = "unknown"
     account_segment: AccountSegment = AccountSegment.UNKNOWN
     symbol_tier: SymbolTier = SymbolTier.UNKNOWN
     transport: TransportType = TransportType.UNKNOWN
 
     def for_service(self, service: Optional[str]) -> "MetricContext":
-        return replace(self, service=_service_value(service) if service else self.service)
+        if not service:
+            return self
+        return replace(self, service=_service_value(service))
 
 
 _REQUEST_CONTEXT: ContextVar[MetricContext] = ContextVar(
@@ -369,7 +372,7 @@ _trades_rejected_total = Counter(
 _trade_rejections_total = Counter(
     "trade_rejections_total",
     "Total number of trades rejected by risk evaluation.",
-    ["service", "account_segment", "symbol_tier"],
+    ["service", "account_id", "account_segment", "symbol_tier"],
     registry=_REGISTRY,
 )
 
@@ -468,21 +471,56 @@ _scaling_evaluations_total = Counter(
 _policy_abstention_rate = Gauge(
     "policy_abstention_rate",
     "Observed abstention rate from policy decisions.",
-    ["service", "account_segment", "symbol_tier"],
+    ["service", "account_id", "account_segment", "symbol_tier"],
     registry=_REGISTRY,
 )
 
 _policy_drift_score = Gauge(
     "policy_drift_score",
     "Policy drift score per account and symbol.",
-    ["service", "account_segment", "symbol_tier"],
+    ["service", "account_id", "account_segment", "symbol_tier"],
     registry=_REGISTRY,
 )
 
 _fees_nav_pct = Gauge(
     "fees_nav_pct",
     "Percentage of fees to net asset value for risk evaluation.",
-    ["service", "account_segment", "symbol_tier"],
+    ["service", "account_id", "account_segment", "symbol_tier"],
+    registry=_REGISTRY,
+)
+
+_account_daily_realized_pnl = Gauge(
+    "account_daily_realized_pnl_usd",
+    "Daily realized profit and loss per account in USD.",
+    ["service", "account_id"],
+    registry=_REGISTRY,
+)
+
+_account_daily_unrealized_pnl = Gauge(
+    "account_daily_unrealized_pnl_usd",
+    "Daily unrealized profit and loss per account in USD.",
+    ["service", "account_id"],
+    registry=_REGISTRY,
+)
+
+_account_daily_net_pnl = Gauge(
+    "account_daily_net_pnl_usd",
+    "Net daily profit and loss per account in USD after fees.",
+    ["service", "account_id"],
+    registry=_REGISTRY,
+)
+
+_account_drawdown_pct = Gauge(
+    "account_drawdown_pct",
+    "Latest observed drawdown for the account expressed as a percentage.",
+    ["service", "account_id"],
+    registry=_REGISTRY,
+)
+
+_account_exposure_usd = Gauge(
+    "account_exposure_usd",
+    "Open exposure per account and symbol in USD.",
+    ["service", "account_id", "symbol", "symbol_tier"],
     registry=_REGISTRY,
 )
 
@@ -539,6 +577,11 @@ _METRICS: Dict[str, Counter | Gauge | Histogram] = {
     "policy_abstention_rate": _policy_abstention_rate,
     "policy_drift_score": _policy_drift_score,
     "fees_nav_pct": _fees_nav_pct,
+    "account_daily_realized_pnl_usd": _account_daily_realized_pnl,
+    "account_daily_unrealized_pnl_usd": _account_daily_unrealized_pnl,
+    "account_daily_net_pnl_usd": _account_daily_net_pnl,
+    "account_drawdown_pct": _account_drawdown_pct,
+    "account_exposure_usd": _account_exposure_usd,
     "policy_inference_latency": _policy_inference_latency,
     "risk_validation_latency": _risk_validation_latency,
     "oms_submit_latency": _oms_submit_latency,
@@ -554,6 +597,13 @@ _METRICS: Dict[str, Counter | Gauge | Histogram] = {
 _INITIALISED = False
 _SERVICE_NAME = "service"
 _REQUEST_ID: ContextVar[Optional[str]] = ContextVar("request_id", default=None)
+
+
+def _account_value(account_id: Optional[str] = None) -> str:
+    if account_id is None:
+        return "unknown"
+    value = str(account_id).strip()
+    return value or "unknown"
 
 
 def _derive_account_segment(account_id: Optional[str]) -> AccountSegment:
@@ -630,6 +680,9 @@ def _resolve_metric_context(
     base = context or _REQUEST_CONTEXT.get()
 
     resolved_service = _service_value(service or base.service)
+    resolved_account_id = (
+        _account_value(account_id) if account_id is not None else base.account_id
+    )
     resolved_account_segment = account_segment or (
         _derive_account_segment(account_id) if account_id else base.account_segment
     )
@@ -640,6 +693,7 @@ def _resolve_metric_context(
 
     return MetricContext(
         service=resolved_service,
+        account_id=resolved_account_id,
         account_segment=resolved_account_segment,
         symbol_tier=resolved_symbol_tier,
         transport=resolved_transport,
@@ -649,6 +703,7 @@ def _resolve_metric_context(
 def _account_symbol_labels(ctx: MetricContext) -> Dict[str, str]:
     return {
         "service": _service_value(ctx.service),
+        "account_id": ctx.account_id,
         "account_segment": ctx.account_segment.value,
         "symbol_tier": ctx.symbol_tier.value,
     }
@@ -669,6 +724,13 @@ def _normalised(value: Optional[str], default: str) -> str:
     if value and value.strip():
         return value.strip()
     return default
+
+
+def _coerce_float(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
 
 
 class RequestTracingMiddleware(BaseHTTPMiddleware):
@@ -717,68 +779,71 @@ def init_metrics(service_name: str = "service") -> Dict[str, Counter | Gauge | H
         _INITIALISED = True
 
     # Prime the core series so they appear immediately for the service.
-    _trades_submitted_total.labels(service=_service_value())
-    _trades_rejected_total.labels(service=_service_value(), reason="unknown")
-    _trade_rejections_total.labels(
-        service=_service_value(),
-        account_segment=AccountSegment.UNKNOWN.value,
-        symbol_tier=SymbolTier.UNKNOWN.value,
-    )
+    base_service = _service_value()
+    base_account_id = _account_value()
+    base_account_labels = {
+        "service": base_service,
+        "account_id": base_account_id,
+        "account_segment": AccountSegment.UNKNOWN.value,
+        "symbol_tier": SymbolTier.UNKNOWN.value,
+    }
+
+    _trades_submitted_total.labels(service=base_service)
+    _trades_rejected_total.labels(service=base_service, reason="unknown")
+    _trade_rejections_total.labels(**base_account_labels)
     _rejected_intents_total.labels(
-        service=_service_value(), stage="unknown", reason="unknown"
+        service=base_service, stage="unknown", reason="unknown"
     )
-    _safe_mode_triggers_total.labels(service=_service_value(), reason="unknown")
+    _safe_mode_triggers_total.labels(service=base_service, reason="unknown")
     _oms_errors_total.labels(
-        service=_service_value(),
+        service=base_service,
         account_segment=AccountSegment.UNKNOWN.value,
         symbol_tier=SymbolTier.UNKNOWN.value,
         transport=TransportType.UNKNOWN.value,
     )
-    _oms_auth_failures_total.labels(
-        service=_service_value(), reason="unknown"
-    )
+    _oms_auth_failures_total.labels(service=base_service, reason="unknown")
     _oms_child_orders_total.labels(
-        service=_service_value(),
+        service=base_service,
         account_segment=AccountSegment.UNKNOWN.value,
         symbol_tier=SymbolTier.UNKNOWN.value,
         transport=TransportType.UNKNOWN.value,
     )
     _oms_latency_ms.labels(
-        service=_service_value(),
+        service=base_service,
         account_segment=AccountSegment.UNKNOWN.value,
         symbol_tier=SymbolTier.UNKNOWN.value,
         transport=TransportType.UNKNOWN.value,
     )
-    _pipeline_latency_ms.labels(service=_service_value())
-    _policy_abstention_rate.labels(
-        service=_service_value(),
-        account_segment=AccountSegment.UNKNOWN.value,
-        symbol_tier=SymbolTier.UNKNOWN.value,
-    )
-    _policy_drift_score.labels(
-        service=_service_value(),
-        account_segment=AccountSegment.UNKNOWN.value,
-        symbol_tier=SymbolTier.UNKNOWN.value,
-    )
-    _fees_nav_pct.labels(
-        service=_service_value(),
-        account_segment=AccountSegment.UNKNOWN.value,
-        symbol_tier=SymbolTier.UNKNOWN.value,
-    )
-    _policy_inference_latency.labels(service=_service_value())
-    _risk_validation_latency.labels(service=_service_value())
+    _pipeline_latency_ms.labels(service=base_service)
+    _policy_abstention_rate.labels(**base_account_labels)
+    _policy_drift_score.labels(**base_account_labels)
+    _fees_nav_pct.labels(**base_account_labels)
+    _policy_inference_latency.labels(service=base_service)
+    _risk_validation_latency.labels(service=base_service)
     _oms_submit_latency.labels(
-        service=_service_value(), transport=TransportType.UNKNOWN.value
+        service=base_service, transport=TransportType.UNKNOWN.value
     )
-    _late_events_total.labels(service=_service_value(), stream="unknown")
-    _reorder_buffer_depth.labels(service=_service_value(), stream="unknown").set(0)
-    _scaling_oms_replicas.labels(service=_service_value()).set(0)
-    _scaling_gpu_nodes.labels(service=_service_value()).set(0)
-    _scaling_pending_training_jobs.labels(service=_service_value()).set(0)
-    evaluation_metric = _scaling_evaluation_duration_seconds.labels(service=_service_value())
+    _late_events_total.labels(service=base_service, stream="unknown")
+    _reorder_buffer_depth.labels(service=base_service, stream="unknown").set(0)
+    _scaling_oms_replicas.labels(service=base_service).set(0)
+    _scaling_gpu_nodes.labels(service=base_service).set(0)
+    _scaling_pending_training_jobs.labels(service=base_service).set(0)
+    evaluation_metric = _scaling_evaluation_duration_seconds.labels(service=base_service)
     if hasattr(evaluation_metric, "observe"):
         evaluation_metric.observe(0)
-    _scaling_evaluations_total.labels(service=_service_value())
+    _scaling_evaluations_total.labels(service=base_service)
+
+    simple_account_labels = {"service": base_service, "account_id": base_account_id}
+    _account_daily_realized_pnl.labels(**simple_account_labels).set(0.0)
+    _account_daily_unrealized_pnl.labels(**simple_account_labels).set(0.0)
+    _account_daily_net_pnl.labels(**simple_account_labels).set(0.0)
+    _account_drawdown_pct.labels(**simple_account_labels).set(0.0)
+    _account_exposure_usd.labels(
+        service=base_service,
+        account_id=base_account_id,
+        symbol="unknown",
+        symbol_tier=SymbolTier.UNKNOWN.value,
+    ).set(0.0)
 
     return _METRICS
 
@@ -1198,6 +1263,55 @@ def record_fees_nav_pct(
     _fees_nav_pct.labels(**_account_symbol_labels(ctx)).set(value)
 
 
+def record_account_daily_pnl(
+    account_id: str,
+    *,
+    realized: object,
+    unrealized: object,
+    fees: object = 0.0,
+    service: Optional[str] = None,
+) -> None:
+    ctx = _resolve_metric_context(service=service, account_id=account_id)
+    labels = {"service": _service_value(ctx.service), "account_id": ctx.account_id}
+    realized_value = _coerce_float(realized)
+    unrealized_value = _coerce_float(unrealized)
+    fees_value = _coerce_float(fees)
+    _account_daily_realized_pnl.labels(**labels).set(realized_value)
+    _account_daily_unrealized_pnl.labels(**labels).set(unrealized_value)
+    _account_daily_net_pnl.labels(**labels).set(
+        realized_value + unrealized_value - fees_value
+    )
+
+
+def record_account_drawdown(
+    account_id: str,
+    drawdown_pct: object,
+    *,
+    service: Optional[str] = None,
+) -> None:
+    ctx = _resolve_metric_context(service=service, account_id=account_id)
+    labels = {"service": _service_value(ctx.service), "account_id": ctx.account_id}
+    value = max(_coerce_float(drawdown_pct), 0.0)
+    _account_drawdown_pct.labels(**labels).set(value)
+
+
+def record_account_exposure(
+    account_id: str,
+    symbol: str,
+    exposure_usd: object,
+    *,
+    service: Optional[str] = None,
+) -> None:
+    ctx = _resolve_metric_context(service=service, account_id=account_id, symbol=symbol)
+    labels = {
+        "service": _service_value(ctx.service),
+        "account_id": ctx.account_id,
+        "symbol": _normalised(symbol, "unknown"),
+        "symbol_tier": ctx.symbol_tier.value,
+    }
+    _account_exposure_usd.labels(**labels).set(_coerce_float(exposure_usd))
+
+
 def record_scaling_state(
     *,
     oms_replicas: int,
@@ -1240,6 +1354,7 @@ def traced_span(name: str, **attributes: object) -> Generator[Optional[Span], No
             span.set_attribute("request.id", request_id)
         span.set_attribute("service.name", _SERVICE_NAME)
         ctx = current_metric_context()
+        span.set_attribute("metric.account_id", ctx.account_id)
         span.set_attribute("metric.account_segment", ctx.account_segment.value)
         span.set_attribute("metric.symbol_tier", ctx.symbol_tier.value)
         span.set_attribute("metric.transport", ctx.transport.value)
@@ -1277,6 +1392,9 @@ __all__ = [
     "record_abstention_rate",
     "record_drift_score",
     "record_fees_nav_pct",
+    "record_account_daily_pnl",
+    "record_account_drawdown",
+    "record_account_exposure",
     "record_scaling_state",
     "observe_scaling_evaluation",
     "get_request_id",
