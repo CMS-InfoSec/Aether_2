@@ -310,7 +310,57 @@ def _ensure_httpx_module() -> None:
         module = ModuleType("httpx")
 
         class _HTTPXError(Exception):
+            """Base httpx exception used by the fallback shim."""
+
             pass
+
+        class _HTTPXRequestError(_HTTPXError):
+            """Mirror of httpx.RequestError for compatibility."""
+
+            def __init__(self, message: str = "", request: object | None = None):
+                super().__init__(message)
+                self.request = request
+
+        class _HTTPXHTTPStatusError(_HTTPXError):
+            """Mirror of httpx.HTTPStatusError for compatibility."""
+
+            def __init__(
+                self,
+                message: str = "",
+                request: object | None = None,
+                response: object | None = None,
+            ) -> None:
+                super().__init__(message)
+                self.request = request
+                self.response = response
+
+        class _HTTPXTimeoutException(_HTTPXRequestError):
+            """Mirror of httpx.TimeoutException for compatibility."""
+
+            pass
+
+        class _HTTPXTimeout:
+            """Minimal Timeout implementation storing timeout parameters."""
+
+            def __init__(
+                self,
+                timeout: float | None = None,
+                *,
+                connect: float | None = None,
+                read: float | None = None,
+                write: float | None = None,
+                pool: float | None = None,
+            ) -> None:
+                # httpx.Timeout accepts either a single float or individual keyword
+                # arguments. For the shim we just keep the original values to allow
+                # downstream code to inspect them if needed.
+                if timeout is not None:
+                    self.connect = self.read = self.write = self.pool = timeout
+                else:
+                    self.connect = connect
+                    self.read = read
+                    self.write = write
+                    self.pool = pool
 
         class _HTTPXResponse(SimpleNamespace):
             def __init__(self, status_code: int = 200, json_data: object | None = None):
@@ -339,6 +389,10 @@ def _ensure_httpx_module() -> None:
         module.Request = _HTTPXRequest  # type: ignore[attr-defined]
         module.Response = _HTTPXResponse  # type: ignore[attr-defined]
         module.HTTPError = _HTTPXError  # type: ignore[attr-defined]
+        module.RequestError = _HTTPXRequestError  # type: ignore[attr-defined]
+        module.HTTPStatusError = _HTTPXHTTPStatusError  # type: ignore[attr-defined]
+        module.TimeoutException = _HTTPXTimeoutException  # type: ignore[attr-defined]
+        module.Timeout = _HTTPXTimeout  # type: ignore[attr-defined]
         module.__file__ = "<httpx-stub>"
         sys.modules["httpx"] = module
 
