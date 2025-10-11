@@ -1,5 +1,5 @@
 killSwitch:
-  enabled: false
+  enabled: true
   rolloutWindowSeconds: 60
   allowedStages:
     - canary

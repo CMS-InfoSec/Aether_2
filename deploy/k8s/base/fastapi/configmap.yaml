@@ -10,20 +10,42 @@ metadata:
 data:
   settings.yaml: |
     kafka:
-      brokers:
-        - kafka:9092
+      brokersSecret:
+        name: kafka-tls
+        key: bootstrap_servers
+      tls:
+        enabled: true
+        caSecret: kafka-tls
     nats:
-      url: nats://nats:4222
+      urlSecret:
+        name: nats-tls
+        key: url
+      tls:
+        enabled: true
+        caSecret: nats-tls
     timescaledb:
-      host: timescaledb
+      hostSecret:
+        name: timescaledb-tls
+        key: host
+      port: 5433
       database: marketdata
       user: risk_engine
+      tls: true
+      clientCertSecret: timescaledb-client-cert
     redis:
-      host: redis
-      port: 6379
+      hostSecret:
+        name: redis-tls
+        key: host
+      port: 6380
+      tls: true
+      caSecret: redis-tls
     feature_store:
-      host: feast-online
-      port: 6566
+      hostSecret:
+        name: feast-online-tls
+        key: host
+      port: 6567
+      tls: true
+      clientCertSecret: feast-online-client-cert
     risk_thresholds:
       liquidation_ratio: 0.25
       drawdown_limit: 0.18
