@@ -13,7 +13,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Any, Callable, Dict, Iterable, Mapping
+from typing import Any, Callable, Dict, Iterable, Iterator, Mapping
 from urllib.parse import parse_qsl, urlparse, urlunparse
 
 import pytest

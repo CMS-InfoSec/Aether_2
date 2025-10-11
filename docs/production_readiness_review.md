@@ -49,6 +49,7 @@
 
 - Realigned health probe endpoints for FastAPI services so readiness and liveness checks reflect actual dependency health signals.【F:deploy/k8s/base/fastapi/deployment-risk.yaml†L1-L41】
 - Ensured pytest dependencies are bundled with the repository lockfiles and validated via CI smoke jobs, keeping the test suite runnable in isolation.【F:pyproject.toml†L13-L41】
+- Test suite uses isolated secrets; verified safe for CI.【F:.env.test†L1-L11】【F:tests/conftest.py†L41-L95】【F:tests/security/test_env_isolation.py†L1-L69】
 - Documented persistence expectations for Feast and Redis, including bootstrapping routines that restore the registry and caches after node restarts.【F:deploy/k8s/base/feast/deployment.yaml†L1-L56】【F:deploy/k8s/base/redis/deployment.yaml†L1-L38】
 - Binance and Coinbase adapters implemented and tested for spot-data compatibility.【F:exchange_adapter.py†L585-L701】【F:tests/unit/test_exchange_adapter.py†L213-L260】
 
