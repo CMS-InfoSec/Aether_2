@@ -13,10 +13,96 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Any, Callable, Dict, Iterable, Mapping
+from typing import Any, Callable, Dict, Iterable, Iterator, Mapping
 from urllib.parse import parse_qsl, urlparse, urlunparse
 
 import pytest
+
+
+class _InMemoryDatabase:
+    """Lightweight stand-in for services expecting a SQLAlchemy-style engine."""
+
+    def __init__(self, url: str) -> None:
+        self.url = url
+
+    def connect(self) -> "_InMemoryDatabase":  # pragma: no cover - compatibility shim
+        return self
+
+    # The real SQLAlchemy engine offers context-manager semantics; expose minimal
+    # implementations so call sites relying on ``with engine.connect():`` remain
+    # functional during unit tests.
+    def __enter__(self) -> "_InMemoryDatabase":  # pragma: no cover - compatibility shim
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:  # pragma: no cover - compatibility shim
+        return None
+
+
+class _InMemoryRedis:
+    """Simple in-memory Redis replacement used across the suite."""
+
+    def __init__(self) -> None:
+        self._values: Dict[str, bytes] = {}
+
+    def set(self, key: str, value: str | bytes) -> None:
+        if isinstance(value, str):
+            value = value.encode("utf-8")
+        self._values[key] = value
+
+    def setex(self, key: str, ttl_seconds: int, value: str | bytes) -> None:
+        del ttl_seconds
+        self.set(key, value)
+
+    def get(self, key: str) -> bytes | None:
+        return self._values.get(key)
+
+    def delete(self, key: str) -> None:
+        self._values.pop(key, None)
+
+    def flushall(self) -> None:
+        self._values.clear()
+
+
+class _RecordingKrakenClient:
+    """Capture Kraken WebSocket interactions for assertions."""
+
+    def __init__(self, account_id: str = "test-account", **kwargs: Any) -> None:
+        del kwargs
+        self.account_id = account_id
+        self.requests: list[dict[str, Any]] = []
+
+    def add_order(self, payload: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
+        self.requests.append({"payload": payload, "timeout": timeout})
+        return {"status": "ok", "txid": "TESTTX", "transport": "websocket"}
+
+    def open_orders(self) -> dict[str, Any]:
+        return {"open": []}
+
+    def own_trades(self, txid: str | None = None) -> dict[str, Any]:
+        return {"trades": []}
+
+    def close(self) -> None:  # pragma: no cover - compatibility shim
+        return None
+
+
+_DEFAULT_MASTER_KEY = base64.b64encode(b"\x00" * 32).decode("ascii")
+os.environ.setdefault("SECRET_ENCRYPTION_KEY", _DEFAULT_MASTER_KEY)
+os.environ.setdefault("LOCAL_KMS_MASTER_KEY", _DEFAULT_MASTER_KEY)
+
+os.environ.setdefault("AUTH_JWT_SECRET", "unit-test-secret")
+os.environ.setdefault("AUTH_DATABASE_URL", "sqlite:////tmp/aether-auth-test.db")
+os.environ.setdefault(
+    "DATABASE_URL",
+    "timescale://test:test@localhost:5432/aether_test",
+)
+
+os.environ.setdefault("AZURE_AD_CLIENT_ID", "unit-test-client")
+os.environ.setdefault("AZURE_AD_CLIENT_SECRET", "unit-test-client-secret")
+
+os.environ.setdefault("SESSION_REDIS_URL", "memory://oms-test")
+
+os.environ.setdefault("TIMESCALE_DSN", "postgresql://localhost:5432/aether_test")
+
 
 try:
     from shared.common_bootstrap import ensure_common_helpers
@@ -55,27 +141,6 @@ else:
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-
-
-_DEFAULT_MASTER_KEY = base64.b64encode(b"\x00" * 32).decode("ascii")
-os.environ.setdefault("SECRET_ENCRYPTION_KEY", _DEFAULT_MASTER_KEY)
-os.environ.setdefault("LOCAL_KMS_MASTER_KEY", _DEFAULT_MASTER_KEY)
-
-os.environ.setdefault("AUTH_JWT_SECRET", "unit-test-secret")
-os.environ.setdefault("AUTH_DATABASE_URL", "sqlite:////tmp/aether-auth-test.db")
-os.environ.setdefault(
-    "DATABASE_URL",
-    "timescale://test:test@localhost:5432/aether_test",
-)
-
-os.environ.setdefault("AZURE_AD_CLIENT_ID", "unit-test-client")
-os.environ.setdefault("AZURE_AD_CLIENT_SECRET", "unit-test-client-secret")
-
-os.environ.setdefault("SESSION_REDIS_URL", "memory://oms-test")
-
-os.environ.setdefault("TIMESCALE_DSN", "postgresql://localhost:5432/aether_test")
-
-
 
 
 pytest_plugins = [
@@ -230,6 +295,32 @@ def _configure_session_backend(monkeypatch: pytest.MonkeyPatch) -> None:
         yield
     finally:
         backend.flushall()
+
+
+@pytest.fixture()
+def database(tmp_path: Path) -> _InMemoryDatabase:
+    """Return an isolated in-memory database engine for tests."""
+
+    db_path = tmp_path / "aether-tests.db"
+    return _InMemoryDatabase(f"sqlite:///{db_path}")
+
+
+@pytest.fixture()
+def redis_client() -> Iterable[_InMemoryRedis]:
+    """Provide a shared Redis stub with automatic cleanup."""
+
+    backend = _InMemoryRedis()
+    try:
+        yield backend
+    finally:
+        backend.flushall()
+
+
+@pytest.fixture()
+def kraken_client() -> _RecordingKrakenClient:
+    """Return a recording Kraken client stub for behavioural tests."""
+
+    return _RecordingKrakenClient()
 
 
 from importlib.machinery import ModuleSpec

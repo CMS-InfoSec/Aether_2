@@ -68,6 +68,21 @@ def load_dependency(
         module = importlib.import_module(module_name)
         return module
     except ModuleNotFoundError as exc:  # pragma: no cover - exercised via tests
+        base_name = module_name.split(".")[0]
+        if base_name == "fastapi":
+            sys.path = original_path
+            for name, existing in removed_modules:
+                sys.modules[name] = existing
+            for index in range(1, len(parts) + 1):
+                sys.modules.pop(".".join(parts[:index]), None)
+            import services.common.fastapi_stub  # type: ignore[import-not-found]
+            module = sys.modules.get(module_name)
+            if module is None:
+                module = sys.modules.get("fastapi")
+            if module is None:
+                raise
+            return module
+
         hint = install_hint or f"`pip install {package}`"
         message = (
             f"The '{package}' dependency is required to import '{module_name}'. "

@@ -21,3 +21,14 @@ build/
 **/.pytest_cache
 **/.mypy_cache
 **/.ruff_cache
+
+# Prevent Docker test/CI images from receiving sensitive credentials.
+config/production/
+deploy/credentials/
+secrets/production/
+vault/
+certs/
+**/*.pem
+**/*.key
+**/*.crt
+**/*.p12

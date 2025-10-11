@@ -5,7 +5,7 @@ import importlib
 import importlib.util
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Callable, Dict, Mapping, Tuple
 
 from shared.runtime_checks import (
@@ -170,7 +170,16 @@ def _ensure_fastapi_stub() -> None:
 
     def _reload() -> ModuleType:
         sys.modules.pop("fastapi", None)
-        return importlib.import_module("fastapi")
+        try:
+            return importlib.import_module("fastapi")
+        except ModuleNotFoundError:
+            import services.common.fastapi_stub  # type: ignore[import-not-found]
+            module = sys.modules.get("fastapi")
+            if isinstance(module, ModuleType):
+                return module
+            module = ModuleType("fastapi")
+            sys.modules["fastapi"] = module
+            return module
 
     module = sys.modules.get("fastapi")
     if not isinstance(module, ModuleType) or getattr(module, "__file__", None) is None:
@@ -189,7 +198,8 @@ def _ensure_fastapi_stub() -> None:
         return submodule
 
     # Core exports frequently accessed directly from ``fastapi``.
-    for name in ("FastAPI", "APIRouter", "HTTPException", "Request", "Depends"):
+    stub_exports = getattr(stub, "__all__", ("FastAPI", "APIRouter", "HTTPException", "Request", "Depends"))
+    for name in stub_exports:
         if getattr(module, name, None) is None:
             setattr(module, name, getattr(stub, name))
 
@@ -294,7 +304,43 @@ def _ensure_httpx_module() -> None:
         }
 
     sys.modules.pop("httpx", None)
-    module = importlib.import_module("httpx")
+    try:
+        module = importlib.import_module("httpx")
+    except ModuleNotFoundError:
+        module = ModuleType("httpx")
+
+        class _HTTPXError(Exception):
+            pass
+
+        class _HTTPXResponse(SimpleNamespace):
+            def __init__(self, status_code: int = 200, json_data: object | None = None):
+                super().__init__(status_code=status_code, _json=json_data)
+
+            def json(self) -> object:
+                return getattr(self, "_json", {})
+
+        class _HTTPXRequest(SimpleNamespace):
+            pass
+
+        class _HTTPXAsyncClient:
+            async def __aenter__(self) -> "_HTTPXAsyncClient":
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            async def get(self, *args: object, **kwargs: object) -> _HTTPXResponse:
+                return _HTTPXResponse()
+
+            async def post(self, *args: object, **kwargs: object) -> _HTTPXResponse:
+                return _HTTPXResponse()
+
+        module.AsyncClient = _HTTPXAsyncClient  # type: ignore[attr-defined]
+        module.Request = _HTTPXRequest  # type: ignore[attr-defined]
+        module.Response = _HTTPXResponse  # type: ignore[attr-defined]
+        module.HTTPError = _HTTPXError  # type: ignore[attr-defined]
+        module.__file__ = "<httpx-stub>"
+        sys.modules["httpx"] = module
 
     for key, value in overrides.items():
         setattr(module, key, value)

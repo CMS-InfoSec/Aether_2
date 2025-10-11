@@ -1351,7 +1351,10 @@ def _run_async(factory: Callable[[], Any]) -> Any:
 def _install_fastapi_module() -> None:
     if importlib is None or sys is None:  # pragma: no cover - safeguard for exotic platforms
         return
-    spec = importlib.util.find_spec("fastapi")
+    try:
+        spec = importlib.util.find_spec("fastapi")
+    except ValueError:
+        spec = None
     if spec is not None:
         return
 

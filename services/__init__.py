@@ -94,7 +94,9 @@ def _register_test_mirrors() -> None:
         try:
             sys.modules[alias] = module
             spec.loader.exec_module(module)
-        except Exception:  # pragma: no cover - optional deps may be absent
+        except BaseException as exc:  # pragma: no cover - optional deps may be absent
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
             sys.modules.pop(alias, None)
             continue
 

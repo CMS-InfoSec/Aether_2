@@ -8,7 +8,7 @@ WORKDIR /app
 
 # Install system dependencies (if any future dependencies require compilation)
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y build-essential \
+    && apt-get install --no-install-recommends -y build-essential libssl-dev openssl \
     && addgroup --system appuser \
     && adduser --system --ingroup appuser appuser \
     && rm -rf /var/lib/apt/lists/*
