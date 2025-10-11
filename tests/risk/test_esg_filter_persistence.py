@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from uuid import uuid4
 
 import sys
 
@@ -38,8 +39,8 @@ def test_esg_assets_persist_across_restarts(tmp_path: Path, monkeypatch: pytest.
 
 def test_esg_rejections_visible_to_new_instances(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     db_name = "esg_consistency.db"
-    account_a = "acct-a"
-    account_b = "acct-b"
+    account_a = str(uuid4())
+    account_b = str(uuid4())
     symbol = "btc-usd"
 
     with esg_filter_instance(tmp_path, monkeypatch, db_filename=db_name) as module_a:
@@ -48,7 +49,7 @@ def test_esg_rejections_visible_to_new_instances(tmp_path: Path, monkeypatch: py
         with module_a.SessionLocal() as session:
             records = session.execute(select(module_a.ESGRejection)).scalars().all()
             assert len(records) == 1
-            assert records[0].account_id == account_a
+            assert str(records[0].account_id) == account_a
             assert records[0].symbol == "BTC-USD"
 
     module_b = reload_esg_filter(tmp_path, monkeypatch, db_filename=db_name)
@@ -60,7 +61,7 @@ def test_esg_rejections_visible_to_new_instances(tmp_path: Path, monkeypatch: py
         with module_b.SessionLocal() as session:
             records = session.execute(select(module_b.ESGRejection)).scalars().all()
             assert len(records) == 2
-            assert {record.account_id for record in records} == {account_a, account_b}
+            assert {str(record.account_id) for record in records} == {account_a, account_b}
             assert {record.symbol for record in records} == {"BTC-USD"}
     finally:
         module_b.ENGINE.dispose()
