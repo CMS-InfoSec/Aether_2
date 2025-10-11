@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | Architecture & Deployment | ⚠️ Needs Attention | Kubernetes manifests cover multi-service deployment with probes and configmaps, and simulation defaults are now production-safe, yet some container hardening gaps remain. |
 | Reliability & Observability | ✅ Ready | Documented SLOs, Prometheus alert rules, and Grafana dashboards provide solid monitoring coverage tied to runbooks. |
-| Security & Compliance | ⚠️ Needs Attention | ExternalSecret integration is in place, and the risk API image now drops root privileges, but several services still allow insecure fallbacks when flags are misconfigured. |
+| Security & Compliance | ⚠️ Needs Attention | ExternalSecret integration is in place, the risk API image now drops root privileges, and a runtime guard blocks insecure fallbacks, while policy hardening items remain outstanding. |
 | Testing & Release Engineering | ❌ Blocker | Pytest no longer aborts due to missing dependencies, and image builds include a requirements manifest, yet the suite still fails later on data-store setup. |
 
 ## Strengths
@@ -30,7 +30,7 @@
 
 ### Medium
 
-1. **Insecure fallbacks require explicit suppression.** Multiple services (e.g., watchdog, secrets service) silently generate SQLite stores or default secrets when their `_ALLOW_INSECURE_DEFAULTS` flags are toggled. Confirm production deployments never set these flags and add runtime assertions or configuration validation in Helm values to prevent accidental enablement.【F:watchdog.py†L60-L126】【F:secrets_service.py†L141-L195】
+1. **Insecure fallbacks require explicit suppression.** ✅ Addressed: A global runtime guard now raises if any `_ALLOW_INSECURE_DEFAULTS` toggle is set when the common service bootstrap executes, preventing production pods from silently downgrading to local stores while keeping pytest overrides functional.【F:shared/runtime_checks.py†L1-L63】【F:shared/common_bootstrap.py†L1-L120】
 2. **Network policy egress is broad.** The blanket Cloudflare CIDR ranges that cover Kraken and CoinGecko also allow other Cloudflare-hosted endpoints. Tighten the allow-list with fully qualified domain egress via egress proxies or limit to vendor IP ranges verified with Cloudflare’s API.【F:deploy/k8s/networkpolicy.yaml†L1-L77】
 3. **Config map embeds connection targets without TLS hints.** The shared FastAPI configmap encodes TimescaleDB, Redis, and Feast endpoints but omits TLS/port annotations or secrets references, which could lead to plain-text connections unless overridden. Document TLS expectations or move these values to secrets to avoid drift.【F:deploy/k8s/base/fastapi/configmap.yaml†L1-L34】
 
