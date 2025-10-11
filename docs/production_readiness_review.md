@@ -3,9 +3,9 @@
 | Area | Status | Notes |
 | --- | --- | --- |
 | Architecture & Deployment | ✅ Ready | Hardened Kubernetes manifests with explicit probes, default-off simulation mode, and validated stateful backup runbooks reviewed with SRE. |
-| Reliability & Observability | ✅ Ready | Account separation verified; governance logging functional and immutable. Exercised SLO dashboards, confirmed alert routing to on-call rotation, and refreshed runbooks with current remediation links. |
-| Security & Compliance | ✅ Ready | Account separation verified; governance logging functional and immutable. Enforced non-root containers, verified ExternalSecret syncs, and documented production toggles preventing insecure fallbacks. |
-| Testing & Release Engineering | ✅ Ready | Pytest suite executed with dependency lock refreshed and CI pipeline validated through green smoke run. |
+| Reliability & Observability | ✅ Ready | Exercised SLO dashboards, confirmed alert routing to on-call rotation, and refreshed runbooks with current remediation links. |
+| Security & Compliance | ✅ Ready | Enforced non-root containers, verified ExternalSecret syncs, and documented production toggles preventing insecure fallbacks. |
+| Testing & Release Engineering | ❌ Needs Attention | Pytest currently fails (39 failures across auth, ingest, fees, and account flows due to missing dependencies, configuration gaps, and stub conflicts), coverage only ~31% from a partial run, and CI build (lint-test) blocked on failing test stage. |
 
 ## Highlights
 
