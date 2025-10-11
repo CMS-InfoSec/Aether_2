@@ -19,6 +19,9 @@ spec:
         app.kubernetes.io/component: api
       annotations:
         checksum/kraken-secrets: "$(KRAKEN_SECRET_HASH)"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "http"
+        prometheus.io/scrape: "true"
     spec:
       securityContext:
         runAsNonRoot: true
@@ -57,7 +60,7 @@ spec:
                   key: sslmode
           readinessProbe:
             httpGet:
-              path: /metrics
+              path: /healthz
               port: http
             initialDelaySeconds: 20
             periodSeconds: 10
@@ -65,7 +68,7 @@ spec:
             failureThreshold: 3
           livenessProbe:
             httpGet:
-              path: /metrics
+              path: /healthz
               port: http
             initialDelaySeconds: 30
             periodSeconds: 20

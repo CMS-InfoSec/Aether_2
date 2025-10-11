@@ -25,6 +25,19 @@ global:
       company: kraken-keys-company
       director1: kraken-keys-director-1
       director2: kraken-keys-director-2
+    accounts:
+      - name: company
+        envVar: AETHER_COMPANY_KRAKEN_SECRET_PATH
+        mountSubPath: company
+        secretName: kraken-keys-company
+      - name: director-1
+        envVar: AETHER_DIRECTOR_1_KRAKEN_SECRET_PATH
+        mountSubPath: director-1
+        secretName: kraken-keys-director-1
+      - name: director-2
+        envVar: AETHER_DIRECTOR_2_KRAKEN_SECRET_PATH
+        mountSubPath: director-2
+        secretName: kraken-keys-director-2
   podSecurityContext:
     runAsNonRoot: true
     runAsUser: 1000
@@ -49,7 +62,7 @@ global:
   probes:
     liveness:
       httpGet:
-        path: /metrics
+        path: /healthz
         port: http
       initialDelaySeconds: 30
       periodSeconds: 20
@@ -57,12 +70,17 @@ global:
       failureThreshold: 3
     readiness:
       httpGet:
-        path: /metrics
+        path: /healthz
         port: http
       initialDelaySeconds: 20
       periodSeconds: 10
       timeoutSeconds: 5
       failureThreshold: 3
+  prometheus:
+    enabled: true
+    path: /metrics
+    port: http
+    scheme: http
   networkPolicy:
     enabled: true
     allowFromIngress:

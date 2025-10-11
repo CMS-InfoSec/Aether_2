@@ -18,6 +18,10 @@ spec:
         app: strategy-orchestrator
         app.kubernetes.io/name: strategy-orchestrator
         app.kubernetes.io/component: api
+      annotations:
+        prometheus.io/path: /metrics
+        prometheus.io/port: "http"
+        prometheus.io/scrape: "true"
     spec:
       securityContext:
         runAsNonRoot: true
@@ -47,14 +51,14 @@ spec:
                   optional: true
           readinessProbe:
             httpGet:
-              path: /strategy/status
+              path: /healthz
               port: http
             initialDelaySeconds: 10
             periodSeconds: 10
             failureThreshold: 3
           livenessProbe:
             httpGet:
-              path: /strategy/status
+              path: /healthz
               port: http
             initialDelaySeconds: 30
             periodSeconds: 20
