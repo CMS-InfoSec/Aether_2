@@ -10,6 +10,7 @@ it suitable for usage in Argo Workflows where the container entrypoint is
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 import hashlib
 import io
 import json
@@ -22,6 +23,8 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Tuple
+
+from ml.insecure_defaults import insecure_defaults_enabled
 
 try:  # pragma: no cover - SQLAlchemy is optional in lightweight environments.
     from sqlalchemy import text
@@ -53,12 +56,36 @@ class MissingDependencyError(RuntimeError):
     """Raised when optional ML training dependencies are unavailable."""
 
 
+class _NumpyFallback:
+    inf = float("inf")
+    nan = float("nan")
+
+    class _ErrState:
+        def __enter__(self) -> None:  # pragma: no cover - trivial
+            return None
+
+        def __exit__(self, exc_type, exc, tb) -> bool:  # pragma: no cover - trivial
+            return False
+
+    def errstate(self, **kwargs: Any) -> "_NumpyFallback._ErrState":
+        return self._ErrState()
+
+    @staticmethod
+    def concatenate(arrays: Sequence[Sequence[Any]]) -> List[Any]:
+        result: List[Any] = []
+        for array in arrays:
+            result.extend(list(array))
+        return result
+
+
 @lru_cache(maxsize=1)
 def _require_numpy():
     try:
         import numpy as numpy_module  # type: ignore import-not-found
     except ModuleNotFoundError as exc:  # pragma: no cover - exercised via tests
-        raise MissingDependencyError("numpy is required for the ML training workflow") from exc
+        if not insecure_defaults_enabled():
+            raise MissingDependencyError("numpy is required for the ML training workflow") from exc
+        numpy_module = _NumpyFallback()
     return numpy_module
 
 
@@ -305,9 +332,20 @@ def _format_timestamp(value: "pd.Timestamp") -> Optional[str]:
 
     if pandas.isna(value):
         return None
-    if value.tzinfo is None:
-        value = value.tz_localize(timezone.utc)
-    return value.to_pydatetime().isoformat()
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.isoformat()
+    tzinfo = getattr(value, "tzinfo", None)
+    if tzinfo is None:
+        try:
+            value = value.tz_localize(timezone.utc)
+        except AttributeError:  # pragma: no cover - fallback for shim objects
+            return None
+    try:
+        return value.to_pydatetime().isoformat()
+    except AttributeError:  # pragma: no cover - shim already returns datetime
+        return str(value)
 
 
 def _build_registration_tags(
@@ -400,21 +438,42 @@ def _prepare_supervised_frame(
     if config.label_horizon <= 0:
         raise ValueError("label_horizon must be positive")
 
-    numpy = _require_numpy()
+    pandas = _require_pandas()
     working = frame.copy()
     working.sort_values([config.entity_column, config.timestamp_column], inplace=True)
 
-    grouped = working.groupby(config.entity_column, group_keys=False)
-    future = grouped[config.label_column].shift(-config.label_horizon)
-    base = working[config.label_column]
+    grouped_rows: Dict[Any, List[Dict[str, Any]]] = defaultdict(list)
+    for row in working.to_dict("records"):
+        grouped_rows[row.get(config.entity_column)].append(row)
 
-    with numpy.errstate(divide="ignore", invalid="ignore"):
-        returns = (future - base) / base
+    result_rows: List[Dict[str, Any]] = []
+    for rows in grouped_rows.values():
+        rows.sort(key=lambda row: row.get(config.timestamp_column))
+        for index, row in enumerate(rows):
+            future_index = index + config.label_horizon
+            if future_index >= len(rows):
+                continue
+            base_value = rows[index].get(config.label_column)
+            future_value = rows[future_index].get(config.label_column)
+            if base_value in (None, 0):
+                continue
+            try:
+                return_value = (future_value - base_value) / base_value
+            except Exception:  # pragma: no cover - defensive guard for bad data
+                continue
+            if math.isinf(return_value) or math.isnan(return_value):
+                continue
+            enriched = dict(row)
+            enriched[_TARGET_COLUMN] = return_value
+            result_rows.append(enriched)
 
-    working[_TARGET_COLUMN] = returns
-    working = working.replace([numpy.inf, -numpy.inf], numpy.nan)
-    working = working.dropna(subset=[_TARGET_COLUMN])
-    return working
+    if not result_rows:
+        return pandas.DataFrame(columns=list(working.columns) + [_TARGET_COLUMN])
+
+    columns = list(working.columns)
+    if _TARGET_COLUMN not in columns:
+        columns.append(_TARGET_COLUMN)
+    return pandas.DataFrame(result_rows, columns=columns)
 
 
 def _apply_outlier_handling(
@@ -434,13 +493,26 @@ def _apply_outlier_handling(
     if pandas.isna(lower) or pandas.isna(upper):
         return frame
 
+    records = frame.to_dict("records")
     if method == "clip":
-        clipped = frame.copy()
-        clipped[column] = clipped[column].clip(lower, upper)
-        return clipped
+        adjusted: List[Dict[str, Any]] = []
+        for row in records:
+            new_row = dict(row)
+            value = new_row.get(column)
+            if not pandas.isna(value):
+                if value < lower:
+                    new_row[column] = lower
+                elif value > upper:
+                    new_row[column] = upper
+            adjusted.append(new_row)
+        return pandas.DataFrame(adjusted, columns=frame.columns)
 
-    mask = frame[column].between(lower, upper)
-    return frame.loc[mask].copy()
+    filtered = [
+        row
+        for row in records
+        if not pandas.isna(row.get(column)) and lower <= row.get(column) <= upper
+    ]
+    return pandas.DataFrame(filtered, columns=frame.columns)
 
 
 def _chronological_split(
@@ -453,12 +525,14 @@ def _chronological_split(
     if frame.empty:
         raise ValueError("Cannot split an empty frame")
 
+    pandas = _require_pandas()
     ordered = frame.sort_values(timestamp_column)
-    unique_timestamps = ordered[timestamp_column].drop_duplicates().to_numpy()
-    if unique_timestamps.size < 3:
+    ordered_records = ordered.to_dict("records")
+    unique_timestamps = sorted({row[timestamp_column] for row in ordered_records})
+    n_timestamps = len(unique_timestamps)
+    if n_timestamps < 3:
         raise ValueError("At least three unique timestamps are required for splitting")
 
-    n_timestamps = unique_timestamps.size
     train_boundary = max(1, int(round(n_timestamps * split.train_fraction)))
     val_boundary = max(
         train_boundary + 1,
@@ -472,13 +546,21 @@ def _chronological_split(
     train_end = unique_timestamps[train_boundary - 1]
     val_end = unique_timestamps[val_boundary - 1]
 
-    train_mask = ordered[timestamp_column] <= train_end
-    val_mask = (ordered[timestamp_column] > train_end) & (ordered[timestamp_column] <= val_end)
-    test_mask = ordered[timestamp_column] > val_end
+    train_rows: List[Dict[str, Any]] = []
+    val_rows: List[Dict[str, Any]] = []
+    test_rows: List[Dict[str, Any]] = []
+    for row in ordered_records:
+        timestamp = row[timestamp_column]
+        if timestamp <= train_end:
+            train_rows.append(dict(row))
+        elif timestamp <= val_end:
+            val_rows.append(dict(row))
+        else:
+            test_rows.append(dict(row))
 
-    train_frame = ordered.loc[train_mask].copy()
-    val_frame = ordered.loc[val_mask].copy()
-    test_frame = ordered.loc[test_mask].copy()
+    train_frame = pandas.DataFrame(train_rows, columns=ordered.columns)
+    val_frame = pandas.DataFrame(val_rows, columns=ordered.columns)
+    test_frame = pandas.DataFrame(test_rows, columns=ordered.columns)
 
     if val_frame.empty or test_frame.empty:
         raise ValueError("Validation and test splits must be non-empty")
@@ -784,7 +866,7 @@ def _normalise_local_artifact_base_path(base_path: str | os.PathLike[str]) -> Pa
             if not resolved_ancestor.exists():
                 raise ValueError("Artifact base path symlink targets must exist")
             if not resolved_ancestor.is_dir():
-                raise ValueError("Artifact base path symlink targets must resolve to directories")
+                raise ValueError("Artifact base path symlink targets must resolve to a directory")
             try:
                 resolved_candidate.relative_to(resolved_ancestor)
             except ValueError:

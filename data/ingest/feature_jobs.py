@@ -11,6 +11,7 @@ import os
 import sys
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple
 
 
@@ -69,6 +70,18 @@ from services.ingest import EventOrderingBuffer, OrderedEvent
 LOGGER = logging.getLogger(__name__)
 
 _SQLITE_FALLBACK_FLAG = "FEATURE_JOBS_ALLOW_SQLITE_FOR_TESTS"
+_INSECURE_DEFAULTS_FLAG = "FEATURE_JOBS_ALLOW_INSECURE_DEFAULTS"
+_STATE_DIR_ENV = "AETHER_STATE_DIR"
+
+
+def _state_root() -> Path:
+    root = Path(os.getenv(_STATE_DIR_ENV, ".aether_state")) / "feature_jobs"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _insecure_defaults_enabled() -> bool:
+    return os.getenv(_INSECURE_DEFAULTS_FLAG) == "1"
 
 
 def _resolve_database_url() -> str:
@@ -76,6 +89,12 @@ def _resolve_database_url() -> str:
 
     raw_url = os.getenv("DATABASE_URL", "")
     if not raw_url.strip():
+        if _insecure_defaults_enabled():
+            state_path = _state_root() / "feature_jobs.sqlite"
+            LOGGER.warning(
+                "DATABASE_URL missing; using insecure local sqlite fallback at %s", state_path
+            )
+            return f"sqlite+pysqlite:///{state_path}"
         raise RuntimeError(
             "Feature jobs ingestion requires DATABASE_URL to be set to a PostgreSQL/Timescale DSN."
         )
@@ -322,16 +341,20 @@ class FeatureWriter:
         engine: Engine,
         store: FeatureStore | None,
         feature_view: str,
+        state_dir: Optional[Path] = None,
     ) -> None:
         self.engine = engine
         self.store = store
         self.feature_view = feature_view
+        self._state_dir = state_dir
         self._memory_storage: _InMemoryFeatureStorage | None = None
         self._offline_supported = bool(
             _SQLALCHEMY_AVAILABLE
             and microstructure_table is not None
             and late_events_table is not None
             and hasattr(engine, "begin")
+            and not isinstance(engine, _InMemoryEngine)
+            and not _insecure_defaults_enabled()
         )
         if self._offline_supported:
             metadata.create_all(
@@ -377,6 +400,7 @@ class FeatureWriter:
                 created_at=created_at,
                 features=features,
             )
+            self._persist_memory_snapshot()
             return
         stmt = pg_insert(microstructure_table).values(
             symbol=symbol,
@@ -438,6 +462,7 @@ class FeatureWriter:
                 arrival_ts=event.arrival_ts,
                 payload=serialised,
             )
+            self._persist_late_events_snapshot()
             return
         stmt = pg_insert(late_events_table).values(
             stream=stream,
@@ -453,6 +478,24 @@ class FeatureWriter:
     @property
     def memory_storage(self) -> _InMemoryFeatureStorage | None:
         return self._memory_storage
+
+    def _persist_memory_snapshot(self) -> None:
+        if not (_insecure_defaults_enabled() and self._state_dir and self._memory_storage):
+            return
+        snapshot = {
+            "features": self._memory_storage.list_features(),
+        }
+        path = self._state_dir / "offline_features.json"
+        path.write_text(json.dumps(snapshot, default=_json_default, indent=2), encoding="utf-8")
+
+    def _persist_late_events_snapshot(self) -> None:
+        if not (_insecure_defaults_enabled() and self._state_dir and self._memory_storage):
+            return
+        payload = {
+            "late_events": self._memory_storage.list_late_events(),
+        }
+        path = self._state_dir / "late_events.json"
+        path.write_text(json.dumps(payload, default=_json_default, indent=2), encoding="utf-8")
 
 
 class MarketFeatureJob:
@@ -477,6 +520,8 @@ class MarketFeatureJob:
         self.window = dt.timedelta(seconds=window_seconds)
         self.book_levels = book_levels
         self.state: MutableMapping[str, FeatureState] = {}
+        self._state_dir = _state_root()
+        self._events_path = self._state_dir / "events.jsonl"
         self.engine = engine or create_engine(DATABASE_URL)
         self.max_lateness_ms = max_lateness_ms
         self.store = (
@@ -488,6 +533,7 @@ class MarketFeatureJob:
             engine=self.engine,
             store=self.store,
             feature_view=self.feature_view,
+            state_dir=self._state_dir,
         )
         # Normalise the engine reference in case the writer swapped to an in-memory
         # backend because SQLAlchemy was unavailable.
@@ -518,6 +564,72 @@ class MarketFeatureJob:
 
     def _timestamp_from_payload(self, payload: Mapping[str, Any]) -> dt.datetime:
         return self._parse_timestamp(payload.get("event_ts") or payload.get("timestamp"))
+
+    def _process_local_events(self) -> None:
+        events = self._load_local_events()
+        for payload in events:
+            stream = str(payload.get("stream") or payload.get("type") or "md.trades")
+            event_ts = self._timestamp_from_payload(payload)
+            ordered = OrderedEvent(
+                stream=stream,
+                payload=payload,
+                event_ts=event_ts,
+                arrival_ts=event_ts,
+                key=str(payload.get("symbol", "")).upper() or None,
+                lateness_ms=0,
+                is_late=False,
+            )
+            if stream == "md.book" or payload.get("type") == "book":
+                self.process_book(ordered)
+            else:
+                self.process_trade(ordered)
+        self._flush_ordering_buffers()
+
+    def _load_local_events(self) -> List[Mapping[str, Any]]:
+        events: List[Mapping[str, Any]] = []
+        if self._events_path.exists():
+            for line in self._events_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    LOGGER.warning("Skipping malformed local event line")
+        if events:
+            return events
+        events = self._generate_synthetic_events()
+        self._persist_local_events(events)
+        return events
+
+    def _persist_local_events(self, events: Iterable[Mapping[str, Any]]) -> None:
+        lines = [json.dumps(event, default=_json_default) for event in events]
+        self._events_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+    def _generate_synthetic_events(self) -> List[Mapping[str, Any]]:
+        now = dt.datetime.now(tz=dt.timezone.utc)
+        events: List[Mapping[str, Any]] = []
+        price = 20_000.0
+        for offset in range(10):
+            ts = now - dt.timedelta(minutes=10 - offset)
+            price += 25.0
+            trade = {
+                "stream": "md.trades",
+                "type": "trade",
+                "symbol": "BTC/USD",
+                "price": price,
+                "quantity": 0.1 + offset * 0.01,
+                "event_ts": ts.isoformat(),
+            }
+            book = {
+                "stream": "md.book",
+                "type": "book",
+                "symbol": "BTC/USD",
+                "bids": [[price - 30.0, 1.0 + offset * 0.05]],
+                "asks": [[price + 30.0, 0.9 + offset * 0.05]],
+                "event_ts": ts.isoformat(),
+            }
+            events.extend([trade, book])
+        return events
 
     def process_trade(self, event: OrderedEvent) -> None:
         payload = event.payload
@@ -571,7 +683,14 @@ class MarketFeatureJob:
 
     async def run(self) -> None:
         if AIOKafkaConsumer is None:
-            raise RuntimeError("aiokafka is required to run the streaming feature job")
+            if not _insecure_defaults_enabled():
+                raise RuntimeError("aiokafka is required to run the streaming feature job")
+            LOGGER.warning(
+                "aiokafka missing; replaying local feature events from %s",
+                self._events_path,
+            )
+            self._process_local_events()
+            return
         consumer = AIOKafkaConsumer(
             "md.trades",
             "md.book",

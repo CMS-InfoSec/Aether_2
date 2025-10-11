@@ -14,8 +14,9 @@ HedgeMetricsRequest = _MODULE.HedgeMetricsRequest
 HedgeService = _MODULE.HedgeService
 
 
-def test_health_status_reports_override_and_history() -> None:
-    service = HedgeService()
+def test_health_status_reports_override_and_history(tmp_path) -> None:
+    store = _MODULE.HedgeOverrideStateStore(history_limit=10, state_path=tmp_path / "state.json")
+    service = _MODULE.HedgeService(history_limit=10, state_store=store)
     metrics = HedgeMetricsRequest(volatility=1.2, drawdown=0.3, stablecoin_price=1.0)
 
     decision = service.evaluate(metrics)
@@ -27,6 +28,9 @@ def test_health_status_reports_override_and_history() -> None:
     assert status["last_decision_at"] is not None
     assert status["last_target_pct"] == decision.target_pct
     assert status["last_guard_triggered"] == decision.diagnostics.guard_triggered
+    assert status["kill_switch_recommended"] is False
+    assert status["kill_switch_engaged"] is False
+    assert "kill_switch_reason" not in status
 
     service.set_override(55.0, reason="manual risk adjustment")
     override_status = service.health_status()

@@ -43,7 +43,7 @@ except Exception:  # pragma: no cover - executed when SQLAlchemy missing entirel
 else:
     _SQLALCHEMY_AVAILABLE = bool(getattr(_sa, "__version__", None))
 
-if _SQLALCHEMY_AVAILABLE:
+if _SQLALCHEMY_AVAILABLE and _ACCOUNT_SCOPE_AVAILABLE:
     from sqlalchemy import Column, DateTime, MetaData, Numeric, String, create_engine, text
     from sqlalchemy.engine import Engine
     from sqlalchemy.exc import SQLAlchemyError
@@ -84,6 +84,7 @@ from services.common.spot import require_spot_http
 from shared.audit_hooks import AuditEvent, load_audit_hooks
 from shared.postgres import normalize_sqlalchemy_dsn
 from shared.spot import is_spot_symbol, normalize_spot_symbol
+from shared.account_scope import SQLALCHEMY_AVAILABLE as _ACCOUNT_SCOPE_AVAILABLE, account_id_column
 
 
 LOGGER = logging.getLogger(__name__)
@@ -288,9 +289,7 @@ else:
 
         stub_select = getattr(_sa, "select", None)
         if callable(stub_select):  # pragma: no cover - runtime patching
-            stub_select.__code__ = _select.__code__
-            stub_select.__defaults__ = _select.__defaults__
-            stub_select.__kwdefaults__ = _select.__kwdefaults__
+            setattr(_sa, "select", _select)
 
 
 def SessionLocal() -> Any:
@@ -307,7 +306,7 @@ if _SQLALCHEMY_AVAILABLE:
 
         __tablename__ = "tca_results"
 
-        account_id = Column(String, primary_key=True)
+        account_id = account_id_column(primary_key=True)
         trade_id = Column(String, primary_key=True)
         slippage_bps = Column(Numeric(24, 12), nullable=False)
         fees_usd = Column(Numeric(24, 12), nullable=True)
@@ -319,7 +318,7 @@ if _SQLALCHEMY_AVAILABLE:
 
         __tablename__ = "tca_reports"
 
-        account_id = Column(String, primary_key=True)
+        account_id = account_id_column(primary_key=True)
         symbol = Column(String, primary_key=True)
         ts = Column(
             DateTime(timezone=True), primary_key=True, default=lambda: datetime.now(UTC)
