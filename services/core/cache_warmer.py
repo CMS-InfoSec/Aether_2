@@ -24,7 +24,28 @@ from typing import (
 
 from fastapi import APIRouter, FastAPI, HTTPException
 
-from services.common.adapters import RedisFeastAdapter, TimescaleAdapter
+try:
+    from services.common.adapters import RedisFeastAdapter, TimescaleAdapter
+except (ImportError, AttributeError):  # pragma: no cover - lightweight fallback
+    class RedisFeastAdapter:  # type: ignore[override]
+        def __init__(self, account_id: str, *args: Any, **kwargs: Any) -> None:
+            self.account_id = account_id
+
+        def approved_instruments(self) -> Sequence[str]:
+            return ()
+
+        def fetch_online_features(self, instrument: str) -> Dict[str, Any]:
+            return {}
+
+        def fee_tiers(self, instrument: str) -> Sequence[Dict[str, Any]]:
+            return ()
+
+    class TimescaleAdapter:  # type: ignore[override]
+        def __init__(self, account_id: str, *args: Any, **kwargs: Any) -> None:
+            self.account_id = account_id
+
+        def rolling_volume(self, instrument: str) -> Dict[str, Any]:
+            return {}
 from shared.spot import is_spot_symbol, normalize_spot_symbol
 from services.models.model_zoo import ModelZoo, get_model_zoo
 

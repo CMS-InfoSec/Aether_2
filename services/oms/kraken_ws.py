@@ -8,6 +8,7 @@ import random
 import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional
 from uuid import uuid4
 
@@ -17,7 +18,10 @@ try:  # pragma: no cover - optional dependency used in production
     from websockets import WebSocketClientProtocol
     from websockets.exceptions import WebSocketException
 except ImportError:  # pragma: no cover - exercised in unit-only environments
-    websockets = None  # type: ignore[assignment]
+    async def _missing_connect(*_: Any, **__: Any) -> None:
+        raise RuntimeError("websockets is required for Kraken websocket operations")
+
+    websockets = SimpleNamespace(connect=_missing_connect)  # type: ignore[assignment]
 
     class WebSocketClientProtocol:  # type: ignore[override]
         async def send(self, *_: Any, **__: Any) -> None:
@@ -176,6 +180,7 @@ class KrakenWSClient:
         self._last_private_heartbeat: Optional[float] = None
         self._ws_token: Optional[str] = None
         self._ws_token_expiry: Optional[float] = None
+        self._request_id_override: Optional[str] = None
 
     async def _default_transport(
         self, url: str, *, headers: Optional[Dict[str, str]] = None
@@ -192,14 +197,23 @@ class KrakenWSClient:
 
         self._rest_client = rest_client
 
+    def set_request_id(self, request_id: Optional[str]) -> None:
+        """Record the request identifier for the next websocket connection."""
+
+        self._request_id_override = request_id
+
     async def ensure_connected(self) -> None:
+        request_id = get_request_id()
+        if request_id:
+            self._request_id_override = request_id
         async with self._lock:
             if self._transport and not self._transport.closed:
                 return
             await self._connect_locked()
 
     async def _connect_locked(self) -> None:
-        request_id = get_request_id() or str(uuid4())
+        request_id = self._request_id_override or get_request_id() or str(uuid4())
+        self._request_id_override = None
         headers = {"X-Request-ID": request_id}
         while True:
             try:

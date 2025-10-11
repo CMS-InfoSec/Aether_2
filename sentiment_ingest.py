@@ -399,7 +399,14 @@ def _try_parse_iso8601(value: str) -> dt.datetime:
 
 if SQLALCHEMY_AVAILABLE:
     _METADATA = MetaData()
-    _SENTIMENT_ID_TYPE = BigInteger().with_variant(Integer, "sqlite")
+    if BigInteger is None or Integer is None:  # pragma: no cover - defensive when stubs incomplete
+        _SENTIMENT_ID_TYPE = Integer()
+    else:
+        candidate = BigInteger()
+        if hasattr(candidate, "with_variant"):
+            _SENTIMENT_ID_TYPE = candidate.with_variant(Integer, "sqlite")
+        else:  # pragma: no cover - fall back when SQLAlchemy stub omits with_variant
+            _SENTIMENT_ID_TYPE = Integer()
     _SENTIMENT_TABLE = Table(
         "sentiment_scores",
         _METADATA,

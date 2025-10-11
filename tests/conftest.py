@@ -13,15 +13,43 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Iterable, Mapping
 from urllib.parse import parse_qsl, urlparse, urlunparse
 
 import pytest
 
 try:
+    from shared.common_bootstrap import ensure_common_helpers
+except Exception:  # pragma: no cover - shared helpers may be unavailable in some suites
+    ensure_common_helpers = None  # type: ignore[assignment]
+else:
+    ensure_common_helpers()
+
+try:
     from services.oms import order_ack_cache as _order_ack_cache
 except Exception:  # pragma: no cover - services module may be unavailable in some suites
     _order_ack_cache = None  # type: ignore[assignment]
+
+try:
+    from services.common.adapters import KafkaNATSAdapter
+except Exception:  # pragma: no cover - adapters may be unavailable in lightweight suites
+    KafkaNATSAdapter = None  # type: ignore[assignment]
+else:
+    if not hasattr(KafkaNATSAdapter, "reset"):
+
+        @classmethod
+        def _reset_adapter(cls, account_id: str | None = None) -> None:
+            buffer = getattr(cls, "_fallback_buffer", {})
+            published = getattr(cls, "_published_events", {})
+            if account_id is None:
+                buffer.clear()
+                published.clear()
+            else:
+                normalized = str(account_id)
+                buffer.pop(normalized, None)
+                published.pop(normalized, None)
+
+        setattr(KafkaNATSAdapter, "reset", _reset_adapter)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +63,10 @@ os.environ.setdefault("LOCAL_KMS_MASTER_KEY", _DEFAULT_MASTER_KEY)
 
 os.environ.setdefault("AUTH_JWT_SECRET", "unit-test-secret")
 os.environ.setdefault("AUTH_DATABASE_URL", "sqlite:////tmp/aether-auth-test.db")
+os.environ.setdefault(
+    "DATABASE_URL",
+    "timescale://test:test@localhost:5432/aether_test",
+)
 
 os.environ.setdefault("AZURE_AD_CLIENT_ID", "unit-test-client")
 os.environ.setdefault("AZURE_AD_CLIENT_SECRET", "unit-test-client-secret")
@@ -214,7 +246,8 @@ def _install_sqlalchemy_stub() -> None:
     sa.__path__ = []  # type: ignore[attr-defined]
 
     class _Column:
-        def __init__(self, *args: object, **kwargs: object) -> None:
+        def __init__(self, name: object, *args: object, **kwargs: object) -> None:
+            self.name = str(name) if isinstance(name, str) else name
             self.args = args
             self.kwargs = kwargs
 
@@ -235,27 +268,75 @@ def _install_sqlalchemy_stub() -> None:
         def create_all(self, *args: object, **kwargs: object) -> None:  # pragma: no cover - noop
             return None
 
+        def drop_all(self, *args: object, **kwargs: object) -> None:  # pragma: no cover - noop
+            return None
+
+    class _ExcludedAccessor:
+        def __getattr__(self, name: str) -> str:
+            return f"excluded.{name}"
+
     class Table:
         def __init__(self, name: str, metadata: MetaData, *columns: object, **kwargs: object) -> None:
             self.name = name
             self.columns = columns
             self.kwargs = kwargs
             metadata.tables[name] = self
+            namespace = SimpleNamespace()
+            for column in columns:
+                column_name = getattr(column, "name", None)
+                if isinstance(column_name, str):
+                    setattr(namespace, column_name, column)
+            self._column_namespace = namespace
 
         def insert(self, *args: object, **kwargs: object) -> "_Insert":
             return _Insert(self)
 
+        @property
+        def c(self) -> SimpleNamespace:
+            return self._column_namespace
+
     class _Insert:
         def __init__(self, table: Table) -> None:
             self.table = table
-            self._values: dict[str, object] | None = None
+            self._values: dict[str, object] = {}
+            self._index_elements: tuple[object, ...] = ()
+            self._update_values: dict[str, object] = {}
+            self.excluded = _ExcludedAccessor()
 
         def values(self, *args: object, **kwargs: object) -> "_Insert":
-            self._values = kwargs if kwargs else (args[0] if args else None)
+            payload: dict[str, object]
+            if args and isinstance(args[0], dict):
+                payload = dict(args[0])
+            else:
+                payload = dict(kwargs)
+            self._values = payload
             return self
 
-        def on_conflict_do_update(self, *args: object, **kwargs: object) -> "_Insert":
+        def on_conflict_do_update(
+            self,
+            *,
+            index_elements: Iterable[object] = (),
+            set_: Mapping[str, object] | None = None,
+            **_: object,
+        ) -> "_Insert":
+            self._index_elements = tuple(index_elements)
+            if set_ is not None:
+                self._update_values = dict(set_)
             return self
+
+        def __str__(self) -> str:  # pragma: no cover - exercised indirectly in SQL capture tests
+            columns = ", ".join(f'"{name}"' for name in self._values.keys())
+            conflict = ", ".join(
+                f'"{getattr(element, "name", element)}"' for element in self._index_elements
+            )
+            return (
+                f"INSERT INTO {self.table.name} ({columns}) VALUES (...)"
+                + (
+                    f" ON CONFLICT ({conflict}) DO UPDATE"
+                    if conflict
+                    else ""
+                )
+            )
 
         def returning(self, *args: object, **kwargs: object) -> "_Insert":
             return self
@@ -278,6 +359,9 @@ def _install_sqlalchemy_stub() -> None:
             return self
 
         def where(self, *args: object, **kwargs: object) -> "_SelectStatement":
+            return self
+
+        def select_from(self, *args: object, **kwargs: object) -> "_SelectStatement":
             return self
 
         def group_by(self, *args: object, **kwargs: object) -> "_SelectStatement":
@@ -376,7 +460,13 @@ def _install_sqlalchemy_stub() -> None:
 
     orm = ModuleType("sqlalchemy.orm")
     orm.__spec__ = ModuleSpec("sqlalchemy.orm", loader=None)
-    
+    orm.Mapped = Any  # type: ignore[attr-defined]
+
+    def _mapped_column(*args: object, **kwargs: object) -> _Column:
+        return _Column(*(args or (None,)), **kwargs)
+
+    orm.mapped_column = _mapped_column  # type: ignore[attr-defined]
+
     class Session:
         def __init__(self, bind: object | None = None) -> None:
             self.bind = bind
@@ -413,6 +503,7 @@ def _install_sqlalchemy_stub() -> None:
                         values = []
                     return SimpleNamespace(
                         scalars=lambda: _scalar_result(values),
+                        scalar_one=lambda: values[0] if values else None,
                         scalar_one_or_none=lambda: values[0] if values else None,
                     )
 
@@ -420,13 +511,28 @@ def _install_sqlalchemy_stub() -> None:
                     values = list(memory_runs)
                     return SimpleNamespace(
                         scalars=lambda: _scalar_result(values),
+                        scalar_one=lambda: values[0] if values else None,
                         scalar_one_or_none=lambda: values[0] if values else None,
                     )
 
-            return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: []))
+            return SimpleNamespace(
+                scalars=lambda: SimpleNamespace(all=lambda: []),
+                scalar_one=lambda: None,
+                scalar_one_or_none=lambda: None,
+            )
 
         def get(self, *args: object, **kwargs: object) -> None:
             return None
+
+        def merge(self, instance: object, *args: object, **kwargs: object) -> object:
+            """Record merged instances for inspection in lightweight fallbacks."""
+
+            merged = getattr(self, "_merged_instances", None)
+            if merged is None:
+                merged = []
+                setattr(self, "_merged_instances", merged)
+            merged.append(instance)
+            return instance
 
         def add(self, *args: object, **kwargs: object) -> None:  # pragma: no cover - noop stub
             return None
@@ -462,6 +568,7 @@ def _install_sqlalchemy_stub() -> None:
             return Session(bind=bind)
 
         _factory.bind = bind  # type: ignore[attr-defined]
+        _factory.close_all = lambda: None  # type: ignore[attr-defined]
         return _factory
 
     orm.Session = Session
@@ -479,7 +586,7 @@ def _install_sqlalchemy_stub() -> None:
             return cls
 
     class DeclarativeBase(metaclass=_BaseMeta):
-        metadata = SimpleNamespace(create_all=lambda *a, **k: None)
+        metadata = MetaData()
 
         def __init__(self, **kwargs: object) -> None:
             for key, value in kwargs.items():
@@ -494,11 +601,13 @@ def _install_sqlalchemy_stub() -> None:
     orm.declarative_base = declarative_base
     orm.DeclarativeBase = DeclarativeBase
     orm.registry = _registry
+    orm.relationship = lambda *a, **k: None  # type: ignore[attr-defined]
     sys.modules["sqlalchemy.orm"] = orm
 
     engine = ModuleType("sqlalchemy.engine")
     engine.__spec__ = ModuleSpec("sqlalchemy.engine", loader=None)
     engine.Engine = SimpleNamespace
+    engine.create_engine = _create_engine
 
     class _URL(SimpleNamespace):
         def __init__(self, raw_url: str) -> None:
@@ -524,6 +633,33 @@ def _install_sqlalchemy_stub() -> None:
 
     def _make_url(raw_url: str) -> _URL:
         return _URL(raw_url)
+
+    def _create_mock_engine(url: str, executor):
+        url_obj = _make_url(url)
+
+        class _MockConnection(SimpleNamespace):
+            def execute(self, statement, *multiparams, **params):  # type: ignore[override]
+                if not multiparams:
+                    payload = getattr(statement, "_values", {})
+                    multiparams = (payload,) if payload else ()
+                executor(statement, *multiparams, **params)
+                return SimpleNamespace(rowcount=1)
+
+        class _MockTransaction:
+            def __enter__(self):  # type: ignore[override]
+                return _MockConnection()
+
+            def __exit__(self, exc_type, exc, tb):  # type: ignore[override]
+                return None
+
+        return SimpleNamespace(
+            url=url_obj,
+            begin=lambda: _MockTransaction(),
+            connect=lambda: _MockConnection(),
+            dispose=lambda: None,
+        )
+
+    engine.create_mock_engine = _create_mock_engine
 
     engine_url = ModuleType("sqlalchemy.engine.url")
     engine_url.__spec__ = ModuleSpec("sqlalchemy.engine.url", loader=None)

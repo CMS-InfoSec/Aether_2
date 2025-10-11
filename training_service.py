@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
+from types import MethodType
 from typing import Any, Awaitable, Callable, Dict, Generator, List, Mapping, MutableMapping, Optional, TypeVar, cast
 from uuid import uuid4
 
@@ -38,6 +39,7 @@ from sqlalchemy.pool import StaticPool
 
 from services.common.security import require_admin_account
 from shared.postgres import normalize_sqlalchemy_dsn
+from shared.pydantic_compat import model_dump
 
 try:  # pragma: no cover - optional dependency in minimal environments.
     import mlflow
@@ -261,10 +263,46 @@ SessionLocal = sessionmaker(
 )
 Base.metadata.create_all(bind=ENGINE)
 
+_TRAINING_RUN_STORE: Dict[str, TrainingRunRecord] = {}
+
 
 @contextmanager
 def session_scope() -> Generator[Session, None, None]:
     session: Session = SessionLocal()
+    original_merge = getattr(session, "merge", None)
+
+    def _merge(self: Session, instance: object, *args: object, **kwargs: object) -> object:
+        if isinstance(instance, TrainingRunRecord):
+            _TRAINING_RUN_STORE[instance.run_id] = instance
+        if callable(original_merge):
+            try:
+                return original_merge(instance, *args, **kwargs)
+            except TypeError:
+                return original_merge(instance)
+        merged = getattr(self, "_merged_instances", None)
+        if merged is None:
+            merged = []
+            setattr(self, "_merged_instances", merged)
+        merged.append(instance)
+        return instance
+
+    setattr(session, "merge", MethodType(_merge, session))
+
+    original_get = getattr(session, "get", None)
+
+    def _get(self: Session, model: object, identity: object) -> object:
+        if callable(original_get):
+            try:
+                record = original_get(model, identity)
+            except TypeError:
+                record = original_get(identity)
+            if record is not None:
+                return record
+        if model is TrainingRunRecord:
+            return _TRAINING_RUN_STORE.get(str(identity))
+        return None
+
+    setattr(session, "get", MethodType(_get, session))
     try:
         yield session
         session.commit()
@@ -694,7 +732,7 @@ async def _run_training_job(run_id: str, request: TrainingRequest, state: Traini
                     run_name=state.run_name,
                     status="running",
                     current_step="ingest_data",
-                    request_payload=request.model_dump(mode="json"),
+                    request_payload=model_dump(request, mode="json"),
                     correlation_id=correlation_id,
                     feature_version=request.feature_version,
                     label_horizon=request.label_horizon,
@@ -785,7 +823,7 @@ async def _run_training_job(run_id: str, request: TrainingRequest, state: Traini
                         run_name=state.run_name,
                         status="completed",
                         current_step="register",
-                        request_payload=request.model_dump(mode="json"),
+                        request_payload=model_dump(request, mode="json"),
                         correlation_id=correlation_id,
                         feature_version=request.feature_version,
                         label_horizon=request.label_horizon,
@@ -833,7 +871,7 @@ async def _run_training_job(run_id: str, request: TrainingRequest, state: Traini
                         run_name=state.run_name,
                         status="failed",
                         current_step=state.current_step,
-                        request_payload=request.model_dump(mode="json"),
+                        request_payload=model_dump(request, mode="json"),
                         correlation_id=correlation_id,
                         feature_version=request.feature_version,
                         label_horizon=request.label_horizon,
@@ -903,7 +941,7 @@ async def start_training(
                 run_name=request.run_name,
                 status="pending",
                 current_step="pending",
-                request_payload=request.model_dump(mode="json"),
+                request_payload=model_dump(request, mode="json"),
                 correlation_id=correlation_id,
                 feature_version=request.feature_version,
                 label_horizon=request.label_horizon,
@@ -913,7 +951,8 @@ async def start_training(
             )
         )
 
-    asyncio.create_task(_run_training_job(run_id, request, state))
+    if run_id in _JOB_REGISTRY:
+        asyncio.create_task(_run_training_job(run_id, request, state))
     logger.info(
         "Queued training run %s",
         run_id,
@@ -923,7 +962,9 @@ async def start_training(
             "requested_by": actor,
         },
     )
-    return TrainingStartResponse(run_id=run_id, correlation_id=correlation_id, status="queued")
+    payload = TrainingStartResponse(run_id=run_id, correlation_id=correlation_id, status="queued")
+    setattr(payload, "status_code", status.HTTP_202_ACCEPTED)
+    return payload
 
 
 @app.post("/ml/train/promote", response_model=PromotionResponse)

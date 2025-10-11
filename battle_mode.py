@@ -10,6 +10,7 @@ from typing import Callable, ContextManager, Dict, Optional
 from sqlalchemy import Column, DateTime, String, select
 from sqlalchemy.orm import Session, declarative_base
 
+from shared.account_scope import account_id_column
 
 BattleModeBase = declarative_base()
 
@@ -19,7 +20,7 @@ class BattleModeLog(BattleModeBase):
 
     __tablename__ = "battle_mode_log"
 
-    account_id = Column(String, primary_key=True)
+    account_id = account_id_column(primary_key=True)
     entered_at = Column(DateTime(timezone=True), primary_key=True)
     exited_at = Column(DateTime(timezone=True), nullable=True)
     reason = Column(String, nullable=False, default="")

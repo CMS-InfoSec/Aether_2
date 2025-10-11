@@ -4,9 +4,25 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
+from types import SimpleNamespace
 
-from sqlalchemy import DateTime, Integer, Numeric, String
-from sqlalchemy.orm import Mapped, declarative_base, mapped_column
+import sqlalchemy
+try:  # pragma: no cover - lightweight stubs may omit orm package
+    from sqlalchemy import orm as sa_orm
+except Exception:  # pragma: no cover - provide minimal fallback for import-time stubs
+    sa_orm = SimpleNamespace(  # type: ignore[assignment]
+        declarative_base=lambda: type(
+            "Base",
+            (),
+            {
+                "metadata": SimpleNamespace(
+                    create_all=lambda bind=None: None, drop_all=lambda bind=None: None
+                )
+            },
+        ),
+        Mapped=Any,
+        mapped_column=lambda *args, **kwargs: None,
+    )
 
 if TYPE_CHECKING:
     from sqlalchemy.sql.schema import Table
@@ -20,8 +36,16 @@ if TYPE_CHECKING:
         metadata: Any  # pragma: no cover - attribute provided by SQLAlchemy
         registry: Any  # pragma: no cover - attribute provided by SQLAlchemy
 else:  # pragma: no cover - runtime declarative base when SQLAlchemy is available
-    Base = declarative_base()
+    Base = sa_orm.declarative_base()
     Base.__doc__ = "Typed declarative base for the fees service models."
+
+
+DateTime = getattr(sqlalchemy, "DateTime")
+Numeric = getattr(sqlalchemy, "Numeric")
+String = getattr(sqlalchemy, "String")
+Integer = getattr(sqlalchemy, "Integer", getattr(sqlalchemy, "BigInteger", Numeric))
+Mapped = getattr(sa_orm, "Mapped", Any)
+mapped_column = getattr(sa_orm, "mapped_column", lambda *args, **kwargs: None)
 
 
 class FeeTier(Base):
