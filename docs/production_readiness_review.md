@@ -9,7 +9,7 @@
 | Data Integrity & Backup | ⚠️ Needs Fix | TimescaleDB and Redis run as StatefulSets with PVCs and the DR playbook bootstraps its log table automatically, but Feast keeps its registry on a PVC without any backup workflow and the shared backup job only handles TimescaleDB/MLflow artifacts, so feature definitions are left unprotected. 【F:deploy/k8s/base/timescaledb/statefulset.yaml†L1-L140】【F:deploy/k8s/base/feast/deployment.yaml†L1-L88】【F:deploy/k8s/base/redis-feast/deployments.yaml†L1-L120】【F:dr_playbook.py†L442-L520】【F:ops/backup/backup_job.py†L520-L588】 |
 | API & Integration Consistency | ✅ Ready | Exchange adapters expose spot operations with multi-exchange gating and FastAPI services register `/metrics` endpoints via shared middleware. 【F:exchange_adapter.py†L592-L696】【F:metrics.py†L891-L920】 |
 | ML & Simulation Logic | ✅ Ready | Model registry and drift detection active; retraining triggers automated. 【F:training_service.py†L603-L657】【F:services/policy/model_server.py†L580-L625】【F:ml/monitoring/live_monitor.py†L1-L172】 |
-| Account Isolation & Governance | ❌ Needs Fix | Services crash without the `platform-account-allowlists` secret that carries admin/director scopes, and the repository provides no ExternalSecret or sealed secret for it. 【F:deploy/helm/aether-platform/values.yaml†L41-L66】【b22d38†L1-L4】 |
+| Account Isolation & Governance | ✅ Ready | Vault now renders the `platform-account-allowlists` secret through a committed ExternalSecret, so admin and director allowlists load from GitOps-managed credentials during rollout. 【F:deploy/k8s/base/secrets/platform-account-allowlists-external-secret.yaml†L1-L20】【F:deploy/helm/aether-platform/templates/backend-deployments.yaml†L84-L104】 |
 | UI Integration & Frontend Connectivity | ✅ Ready | Secrets API endpoints implemented; UI key manager operational. 【F:services/builder/routes.py†L625-L737】 |
 
 ## Architecture & Deployment
@@ -38,6 +38,7 @@
 
 - Secrets, TLS certificates, and database credentials have been codified via ExternalSecrets and sealed secrets for risk, OMS, policy, compliance, capital allocator, and supporting services, with the shared `aether-vault` ClusterSecretStore committed to source control. 【F:deploy/k8s/base/secrets/external-secrets.yaml†L1-L248】【F:deploy/k8s/base/secrets/clustersecretstore.yaml†L1-L17】
 - Secrets Service encryption keys and Kraken API credentials reconcile from Vault through committed ExternalSecrets, eliminating the hand-applied secrets that previously blocked GitOps parity. 【F:deploy/k8s/base/secrets/secrets-service-config-external-secret.yaml†L1-L16】【F:deploy/k8s/base/secrets/kraken-keys-external-secrets.yaml†L1-L44】【F:docs/runbooks/secrets-service-key-rotation.md†L1-L112】
+- Admin and director allowlists now reconcile from Vault via the committed `platform-account-allowlists` ExternalSecret, removing the manual secret gap that previously crashed platform services on rollout. 【F:deploy/k8s/base/secrets/platform-account-allowlists-external-secret.yaml†L1-L20】【F:deploy/helm/aether-platform/templates/backend-deployments.yaml†L84-L104】
 - Prometheus configuration now follows the standard `prometheus.io/scrape` annotations and references live service discovery labels, so annotated APIs (risk, policy, secrets, etc.) flow into the platform Prometheus instance.
 - Kill-switch service now exports a `kill_switch_state` gauge and the activation runbook references the live metric for verification. 【F:metrics.py†L533-L605】【F:services/common/adapters.py†L1863-L1890】【F:kill_switch.py†L1-L214】【F:docs/runbooks/kill_switch_activation.md†L1-L34】
 - Backup jobs cover Feast registry artifacts alongside TimescaleDB dumps, with runbooks updated to document verification steps.
@@ -119,7 +120,7 @@
 
 ## Account Isolation & Governance
 
-* Admin and director allowlists now load exclusively from Kubernetes secrets, and runtime validation fails fast when the environment variables are absent to preserve governance controls. 【F:deploy/helm/aether-platform/templates/backend-deployments.yaml†L84-L104】【F:shared/runtime_checks.py†L101-L128】
+* Admin and director allowlists now load exclusively from the Vault-managed `platform-account-allowlists` secret, and runtime validation fails fast when the environment variables are absent to preserve governance controls. 【F:deploy/k8s/base/secrets/platform-account-allowlists-external-secret.yaml†L1-L20】【F:deploy/helm/aether-platform/templates/backend-deployments.yaml†L84-L104】【F:shared/runtime_checks.py†L101-L128】
 
 **Remediation Tasks**
 
@@ -154,4 +155,4 @@
 
 ## Account Isolation & Governance
 
-* Governance controls now enforce admin and director scopes from managed secrets, so production pods fail fast without the configured allowlists. 【F:deploy/helm/aether-platform/templates/backend-deployments.yaml†L84-L104】【F:shared/runtime_checks.py†L101-L128】
+* Governance controls now enforce admin and director scopes from Vault-managed secrets, so production pods fail fast without the configured allowlists. 【F:deploy/k8s/base/secrets/platform-account-allowlists-external-secret.yaml†L1-L20】【F:deploy/helm/aether-platform/templates/backend-deployments.yaml†L84-L104】【F:shared/runtime_checks.py†L101-L128】
