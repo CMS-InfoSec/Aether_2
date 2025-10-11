@@ -60,6 +60,7 @@ The repository requires coordinated fixes across persistence, services, and test
 | --- | --- | --- | --- |
 | P0 | Fix `/reports/pnl/daily_pct` aggregation | ✅ Completed | The daily return endpoint now falls back to a local NAV store when Timescale tables or psycopg are unavailable, keeping `/reports/pnl/daily_pct` online under insecure defaults while still preferring the database path in production.【F:services/reports/report_service.py†L60-L231】【F:services/reports/report_service.py†L666-L768】【F:tests/reports/test_daily_return_insecure_defaults.py†L1-L38】 |
 | P1 | Wire Prometheus / OpenTelemetry exporters | ✅ Completed | `metrics.configure_observability` starts the embedded Prometheus exporter and configures OTLP tracing whenever the relevant environment variables are set, keeping scrape and trace targets aligned across services.【F:metrics.py†L1-L352】【F:metrics.py†L828-L851】 |
+| P0 | Restore Prometheus scrape endpoint without third-party client | ✅ Completed | The vendored Prometheus shim now starts a background HTTP server and serves generated metrics so `/metrics` endpoints remain available even when the upstream library is missing, preserving observability in dependency-light environments.【F:prometheus_client/__init__.py†L366-L404】 |
 | P1 | Ensure Timescale continuous aggregates refreshed | ✅ Completed | `ops/refresh_continuous_aggregates.py` refreshes materialised views via psycopg when available and logs manual follow-ups when running against lightweight environments.【F:ops/refresh_continuous_aggregates.py†L1-L102】 |
 
 ## 7. Deployment & Ops
