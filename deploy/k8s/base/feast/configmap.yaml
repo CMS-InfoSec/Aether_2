@@ -20,4 +20,4 @@ data:
       database: marketdata
       db_schema: feast
       user: risk_engine
-      password: changeme
+      password: ${FEAST_OFFLINE_PASSWORD}
