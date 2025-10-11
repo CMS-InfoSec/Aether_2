@@ -96,6 +96,7 @@
 ## Data Integrity & Backup
 
 * TimescaleDB and Redis run as StatefulSets with PVC-backed storage, and TimescaleDB includes a nightly `pg_dump` CronJob. 【F:deploy/k8s/base/timescaledb/statefulset.yaml†L1-L140】【F:deploy/k8s/base/redis/deployment.yaml†L1-L40】
+* Automated DR drills added; restore verified quarterly. 【F:deploy/k8s/overlays/staging/restore-drill-cronjob.yaml†L1-L58】【F:ops/backup/restore_drill.py†L1-L223】
 * `_log_dr_action` now creates the `dr_log` table on demand, and unit tests cover that bootstrap path. 【F:dr_playbook.py†L442-L479】【F:tests/ops/test_dr_playbook.py†L157-L181】
 * `ops/backup/backup_job.py` supplies AES-GCM backup/restore logic for TimescaleDB dumps and MLflow artifacts, but Feast only ships Deployments plus PVCs—no CronJob or export pipeline protects the registry database or Redis feature store from loss. 【F:ops/backup/backup_job.py†L520-L588】【F:deploy/k8s/base/feast/deployment.yaml†L1-L88】【F:deploy/k8s/base/redis-feast/deployments.yaml†L1-L120】
 

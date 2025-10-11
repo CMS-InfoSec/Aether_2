@@ -4,6 +4,8 @@ nameSuffix: -staging
 namespace: aether-staging
 resources:
   - ../../base
+  - restore-drill-cronjob.yaml
+  - restore-drill-secret.yaml
 
 patches:
   - target:
