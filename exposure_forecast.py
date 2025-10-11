@@ -39,6 +39,7 @@ from services.common.config import get_timescale_session
 from services.common.security import require_admin_account
 
 from ml.models.supervised import (
+    MissingDependencyError,
     SklearnPipelineTrainer,
     SupervisedDataset,
     SupervisedTrainer,
