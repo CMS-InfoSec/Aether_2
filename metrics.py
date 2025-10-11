@@ -86,6 +86,7 @@ except ImportError:  # pragma: no cover - provide a no-op metrics backend
             labelnames: Optional[Iterable[str]] = None,
             *,
             registry: CollectorRegistry | None = None,
+            **_: Any,
         ) -> None:
             self._name = name
             self._documentation = documentation
