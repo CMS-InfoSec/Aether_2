@@ -5,7 +5,7 @@
 | Architecture & Deployment | ✅ Hardened | Hardened Kubernetes manifests with explicit probes, enforced persistent storage for Feast/Redis, and re-verified TLS and safety toggles. |
 | Reliability & Observability | ✅ Ready | Exercised SLO dashboards, confirmed alert routing to on-call rotation, and refreshed runbooks with current remediation links. |
 | Security & Compliance | ✅ Ready | Removed plaintext credentials from manifests, rendered secrets from Vault at runtime, enforced non-root ingestion images, and Kraken Secrets API enforces MFA context header; bearer-only auth disabled. |
-| Testing & Release Engineering | ✅ Ready | Pytest suite executed with dependency lock refreshed and CI pipeline validated through green smoke run. |
+| Testing & Release Engineering | ✅ Ready | Pytest suite executed with dependency lock refreshed and CI pipeline validated through green smoke run. Async tests verified with pytest-asyncio; event loop policy validated. |
 | Data Integrity & Backup | ✅ Ready | Disaster-recovery log table bootstraps automatically and the first snapshot/restore completes without manual SQL.【F:dr_playbook.py†L33-L35】【F:dr_playbook.py†L442-L478】 |
 
 ### Architecture & Deployment fixes
