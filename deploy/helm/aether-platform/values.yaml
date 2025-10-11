@@ -58,6 +58,7 @@ global:
       drop:
         - ALL
     readOnlyRootFilesystem: true
+
   sessionStore:
     redisUrl: redis://redis.aether.svc.cluster.local:6379/0
   releaseManifest:
@@ -133,6 +134,12 @@ global:
           - 172.104.0.0/13
         ports:
           - 443
+simulation:
+  enabled: false
+
+runtimeSafety:
+  _ALLOW_INSECURE_DEFAULTS: false
+
 backendServices:
   accountService:
     enabled: true
