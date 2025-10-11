@@ -27,6 +27,8 @@ from pydantic import BaseModel, Field
 
 from shared.common_bootstrap import ensure_common_helpers
 
+from exposure_forecast import ForecastResult, PNL_CURVE_QUERY, get_exposure_ml_pipeline
+
 ensure_common_helpers()
 
 from services.common.config import get_timescale_session
@@ -47,6 +49,7 @@ except Exception:  # pragma: no cover - executed when psycopg is unavailable
 LOGGER = logging.getLogger(__name__)
 
 LOOKBACK_DAYS = int(os.getenv("SCENARIO_LOOKBACK_DAYS", "90"))
+EXPOSURE_RETRAIN_MINUTES = int(os.getenv("SCENARIO_EXPOSURE_RETRAIN_MINUTES", "60"))
 
 _ENSURED_SCHEMAS: Set[str] = set()
 _ENSURE_LOCK = threading.Lock()
@@ -266,6 +269,18 @@ def _fetch_price_history(conn: psycopg.Connection, markets: Iterable[str]) -> li
     return history
 
 
+def _fetch_nav_history(conn: psycopg.Connection, account_id: str) -> list[Dict[str, Any]]:
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=LOOKBACK_DAYS)
+    with conn.cursor() as cur:
+        cur.execute(
+            PNL_CURVE_QUERY,
+            {"account_id": account_id, "start": start, "end": now},
+        )
+        rows = cur.fetchall()
+    return [_row_to_mapping(row, ["as_of", "nav"]) for row in rows]
+
+
 def _canonical_spot_markets(markets: Iterable[object]) -> list[str]:
     return filter_spot_symbols(markets, logger=LOGGER)
 
@@ -333,6 +348,24 @@ def _portfolio_exposures(
             continue
         exposures[market] = quantity * float(prices[market])
     return exposures
+
+
+def _apply_ml_forecast_to_exposures(
+    exposures: Mapping[str, float], forecast: ForecastResult | None
+) -> Dict[str, float]:
+    if forecast is None:
+        return dict(exposures)
+
+    predicted_total = float(forecast.value)
+    if predicted_total <= 0:
+        return dict(exposures)
+
+    total_abs = sum(abs(value) for value in exposures.values())
+    if total_abs <= 0:
+        return dict(exposures)
+
+    scale = predicted_total / total_abs
+    return {market: value * scale for market, value in exposures.items()}
 
 
 def _compute_returns(price_history: Sequence[Mapping[str, Any]]) -> list[Dict[str, Any]]:
@@ -499,6 +532,30 @@ def run_scenario(
             price_history = _fetch_price_history(conn, markets)
             prices = _latest_prices(price_history)
             exposures = _portfolio_exposures(positions, prices)
+            nav_history = _fetch_nav_history(conn, actor_account)
+
+            ml_forecast: ForecastResult | None = None
+            try:
+                pipeline = get_exposure_ml_pipeline(
+                    actor_account,
+                    retrain_cadence=timedelta(minutes=EXPOSURE_RETRAIN_MINUTES),
+                    lookback_days=LOOKBACK_DAYS,
+                )
+                ml_forecast = pipeline.forecast(
+                    nav_rows=nav_history,
+                    positions_rows=positions,
+                    now=datetime.now(timezone.utc),
+                    horizon_days=7,
+                )
+            except Exception:  # pragma: no cover - optional pipeline
+                LOGGER.debug(
+                    "Scenario ML exposure forecast unavailable for %s",
+                    actor_account,
+                    exc_info=True,
+                )
+                ml_forecast = None
+
+            exposures = _apply_ml_forecast_to_exposures(exposures, ml_forecast)
             returns = _compute_returns(price_history)
             pnl_values = _scenario_pnl_series(
                 returns,

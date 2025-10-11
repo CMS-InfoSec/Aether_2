@@ -65,7 +65,7 @@
 | Testing & Release Engineering | ❌ | The CI requirements set omits `pytest-asyncio`, causing async test suites marked with `@pytest.mark.asyncio` to error in minimal installs. |
 | Data Integrity & Backup | ❌ | Disaster-recovery tooling logs every action but never provisions the target table, so the very first snapshot/restore aborts with an undefined-table error. |
 | API & Integration Consistency | ⚠️ | Binance and Coinbase adapters are stubs that raise `NotImplementedError`, blocking multi-exchange routing until completed. |
-| ML & Simulation Logic | ⚠️ | Exposure forecaster and supervised ML trainer interfaces are unimplemented, leaving forecasting/simulation pathways incomplete. |
+| ML & Simulation Logic | ✅ | Exposure forecasting regression pipeline retrains on cadence and feeds both live and simulation loops. |
 | Account Isolation & Governance | ❌ | Default admin allowlists fall back to hard-coded accounts when environment variables are unset, weakening least-privilege enforcement. |
 | UI Integration & Frontend Connectivity | ❌ | The React API key manager calls `/secrets/status`/`/secrets/audit`, but the backend exposes only `/secrets/kraken/*`, so the UI cannot load or rotate credentials. |
 
@@ -77,7 +77,7 @@
 - `requirements-ci.txt` excludes `pytest-asyncio`, so async tests fail in minimal CI environments where only the CI requirements are installed.
 - Disaster recovery playbook writes to a `dr_log` table without ever creating it, preventing the first snapshot/restore from completing.
 - Exchange adapters for Binance and Coinbase raise `NotImplementedError`, leaving those integrations non-functional.
-- Exposure forecasting and supervised ML trainer abstractions remain abstract-only, blocking downstream simulation workflows.
+- Exposure forecasting and supervised training implemented and integrated into live/sim loop.
 - Admin/Director allowlists silently default to baked-in identities (`company`, `director-1`, `director-2`) when env overrides are missing, undermining account isolation.
 - Secrets manager frontend routes do not match backend endpoints, so credential status/audit calls fail and rotation actions cannot complete from the UI.
 
