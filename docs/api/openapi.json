@@ -1,0 +1,245 @@
+{
+  "info": {
+    "title": "Aether Admin Platform",
+    "version": "stub"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "//alerts/prioritized": {
+      "get": {
+        "operationId": "prioritized_alerts_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          }
+        }
+      }
+    },
+    "/alerts/active": {
+      "get": {
+        "operationId": "get_active_alerts_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          }
+        }
+      }
+    },
+    "/alerts/policies": {
+      "get": {
+        "operationId": "get_alert_policies_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          }
+        }
+      }
+    },
+    "/auth/login": {
+      "post": {
+        "operationId": "login_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          }
+        }
+      }
+    },
+    "/compliance/export": {
+      "get": {
+        "operationId": "export_compliance_pack_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          }
+        }
+      }
+    },
+    "/healthz": {
+      "get": {
+        "operationId": "healthz_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          }
+        }
+      }
+    },
+    "/hedge/diagnostics": {
+      "get": {
+        "operationId": "get_last_diagnostics_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          }
+        }
+      }
+    },
+    "/hedge/evaluate": {
+      "post": {
+        "operationId": "evaluate_hedge_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          }
+        }
+      }
+    },
+    "/hedge/history": {
+      "get": {
+        "operationId": "get_history_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          }
+        }
+      }
+    },
+    "/hedge/override": {
+      "delete": {
+        "operationId": "clear_override_delete",
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          }
+        }
+      },
+      "get": {
+        "operationId": "get_override_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          }
+        }
+      },
+      "post": {
+        "operationId": "set_override_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          }
+        }
+      }
+    },
+    "/infra/scaling/status": {
+      "get": {
+        "operationId": "scaling_status_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          }
+        }
+      }
+    },
+    "/knowledge/export/latest": {
+      "get": {
+        "operationId": "latest_pack_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          }
+        }
+      }
+    },
+    "/logging/export/status": {
+      "get": {
+        "operationId": "export_status_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          }
+        }
+      }
+    },
+    "/logs/export": {
+      "get": {
+        "operationId": "export_logs_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          }
+        }
+      }
+    },
+    "/meta/weights": {
+      "get": {
+        "operationId": "meta_weights_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "operationId": "metrics_endpoint_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          }
+        }
+      }
+    },
+    "/models/active": {
+      "get": {
+        "operationId": "active_models_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          }
+        }
+      }
+    },
+    "/models/list": {
+      "get": {
+        "operationId": "list_models_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          }
+        }
+      }
+    },
+    "/models/switch": {
+      "post": {
+        "operationId": "switch_model_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          }
+        }
+      }
+    },
+    "/reports/xai": {
+      "get": {
+        "operationId": "recent_xai_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          }
+        }
+      }
+    },
+    "/risk/forecast": {
+      "get": {
+        "operationId": "get_exposure_forecast_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          }
+        }
+      }
+    },
+    "/system/health": {
+      "get": {
+        "operationId": "get_system_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          }
+        }
+      }
+    }
+  }
+}

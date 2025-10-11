@@ -6,6 +6,8 @@ from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from enum import Enum
+import logging
+import os
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Dict, Generator, Iterable, Optional
 from uuid import uuid4
@@ -20,6 +22,7 @@ try:  # pragma: no cover - prometheus client may be unavailable in lightweight t
         Gauge,
         Histogram,
         generate_latest,
+        start_http_server,
     )
 except ImportError:  # pragma: no cover - provide a no-op metrics backend
     CONTENT_TYPE_LATEST = "text/plain; version=0.0.4"  # type: ignore[assignment]
@@ -142,6 +145,10 @@ except ImportError:  # pragma: no cover - provide a no-op metrics backend
 
     def generate_latest(*args: Any, **kwargs: Any) -> bytes:  # type: ignore[override]
         return b""
+
+    def start_http_server(*args: Any, **kwargs: Any) -> None:  # type: ignore[override]
+        logger = logging.getLogger(__name__)
+        logger.warning("prometheus_client.start_http_server unavailable; exporter disabled")
 try:  # pragma: no cover - optional dependency in lightweight test environments
     from starlette.middleware.base import BaseHTTPMiddleware
 except ImportError:  # pragma: no cover - exercised in unit-only environments
@@ -159,6 +166,138 @@ except Exception:  # pragma: no cover - fall back to no-op tracing
     trace = None  # type: ignore
     Span = object  # type: ignore
     SpanKind = None  # type: ignore
+
+
+logger = logging.getLogger(__name__)
+
+_REGISTRY = CollectorRegistry()
+
+_PROMETHEUS_EXPORTER_STARTED = False
+_TRACING_CONFIGURED = False
+_TRACING_SERVICE_NAME: Optional[str] = None
+
+
+def _configure_prometheus_exporter_from_env() -> None:
+    """Start a Prometheus scrape endpoint when configured via environment variables."""
+
+    global _PROMETHEUS_EXPORTER_STARTED
+    if _PROMETHEUS_EXPORTER_STARTED:
+        return
+
+    port_env = os.getenv("PROMETHEUS_EXPORTER_PORT")
+    if not port_env:
+        return
+
+    try:
+        port = int(port_env)
+    except ValueError:
+        logger.warning(
+            "Invalid PROMETHEUS_EXPORTER_PORT value '%s'; expected an integer", port_env
+        )
+        return
+
+    addr = os.getenv("PROMETHEUS_EXPORTER_ADDR", "0.0.0.0")
+    try:
+        start_http_server(port, addr=addr, registry=_REGISTRY)
+    except Exception as exc:  # pragma: no cover - depends on prometheus client implementation
+        logger.warning(
+            "Failed to start Prometheus exporter on %s:%s: %s", addr, port, exc
+        )
+        return
+
+    _PROMETHEUS_EXPORTER_STARTED = True
+    logger.info("Prometheus exporter listening on %s:%s", addr, port)
+
+
+def _parse_otlp_headers(raw: Optional[str]) -> Dict[str, str]:
+    if not raw:
+        return {}
+    headers: Dict[str, str] = {}
+    for item in raw.split(","):
+        key, _, value = item.partition("=")
+        if not key or not _:
+            continue
+        headers[key.strip()] = value.strip()
+    return headers
+
+
+def _configure_tracing_from_env(service_name: str, *, endpoint: Optional[str] = None) -> None:
+    """Wire an OTLP exporter when OpenTelemetry is installed and configured."""
+
+    global _TRACING_CONFIGURED, _TRACING_SERVICE_NAME
+    if _TRACING_CONFIGURED:
+        return
+
+    endpoint = endpoint or os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+    if not endpoint:
+        return
+
+    if trace is None:
+        logger.warning(
+            "OpenTelemetry API unavailable; skipping OTLP tracing exporter for %s",
+            service_name,
+        )
+        return
+
+    try:  # pragma: no cover - depends on optional OpenTelemetry SDK
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    except Exception as exc:  # pragma: no cover - optional dependency may be missing
+        logger.warning(
+            "OpenTelemetry SDK unavailable; skipping OTLP exporter for %s: %s",
+            service_name,
+            exc,
+        )
+        return
+
+    headers = _parse_otlp_headers(os.getenv("OTEL_EXPORTER_OTLP_HEADERS"))
+    insecure = os.getenv("OTEL_EXPORTER_OTLP_INSECURE") == "1"
+    certificate = os.getenv("OTEL_EXPORTER_OTLP_CERTIFICATE")
+    timeout_env = os.getenv("OTEL_EXPORTER_OTLP_TIMEOUT")
+    exporter_kwargs: Dict[str, Any] = {"endpoint": endpoint}
+    if headers:
+        exporter_kwargs["headers"] = headers
+    if insecure:
+        exporter_kwargs["insecure"] = True
+    if certificate:
+        exporter_kwargs["certificates"] = certificate
+    if timeout_env:
+        try:
+            exporter_kwargs["timeout"] = float(timeout_env)
+        except ValueError:
+            logger.warning(
+                "Invalid OTEL_EXPORTER_OTLP_TIMEOUT value '%s'; ignoring", timeout_env
+            )
+
+    try:
+        exporter = OTLPSpanExporter(**exporter_kwargs)
+    except Exception as exc:  # pragma: no cover - depends on exporter implementation
+        logger.warning(
+            "Failed to initialise OTLP exporter for %s: %s", service_name, exc
+        )
+        return
+
+    resource = Resource.create({"service.name": service_name})
+    provider = TracerProvider(resource=resource)
+    provider.add_span_processor(BatchSpanProcessor(exporter))
+    try:
+        trace.set_tracer_provider(provider)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Failed to register tracer provider for %s: %s", service_name, exc)
+        return
+
+    _TRACING_CONFIGURED = True
+    _TRACING_SERVICE_NAME = service_name
+    logger.info("Configured OTLP tracing exporter for %s", service_name)
+
+
+def configure_observability(service_name: str) -> None:
+    """Configure Prometheus and OpenTelemetry exporters based on environment settings."""
+
+    _configure_prometheus_exporter_from_env()
+    _configure_tracing_from_env(service_name)
 
 
 _REGISTRY = CollectorRegistry()
@@ -690,6 +829,7 @@ def setup_metrics(app: FastAPI, service_name: str = "service") -> None:
     """Attach Prometheus /metrics endpoint and tracing middleware."""
 
     init_metrics(service_name)
+    configure_observability(_SERVICE_NAME)
 
     if not any(
         getattr(middleware, "cls", None) is RequestTracingMiddleware

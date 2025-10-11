@@ -51,8 +51,8 @@ The repository requires coordinated fixes across persistence, services, and test
 | Priority | Task | Status | Notes |
 | --- | --- | --- | --- |
 | P0 | Fix `/reports/pnl/daily_pct` aggregation | ✅ Completed | The daily return endpoint now falls back to a local NAV store when Timescale tables or psycopg are unavailable, keeping `/reports/pnl/daily_pct` online under insecure defaults while still preferring the database path in production.【F:services/reports/report_service.py†L60-L231】【F:services/reports/report_service.py†L666-L768】【F:tests/reports/test_daily_return_insecure_defaults.py†L1-L38】 |
-| P1 | Wire Prometheus / OpenTelemetry exporters | 🚧 Pending | Exporters must be configured once production observability requirements are defined. |
-| P1 | Ensure Timescale continuous aggregates refreshed | 🚧 Pending | Background refresh jobs for NAV/usage dashboards remain to be scheduled. |
+| P1 | Wire Prometheus / OpenTelemetry exporters | ✅ Completed | `metrics.configure_observability` starts the embedded Prometheus exporter and configures OTLP tracing whenever the relevant environment variables are set, keeping scrape and trace targets aligned across services.【F:metrics.py†L1-L352】【F:metrics.py†L828-L851】 |
+| P1 | Ensure Timescale continuous aggregates refreshed | ✅ Completed | `ops/refresh_continuous_aggregates.py` refreshes materialised views via psycopg when available and logs manual follow-ups when running against lightweight environments.【F:ops/refresh_continuous_aggregates.py†L1-L102】 |
 
 ## 7. Deployment & Ops
 
@@ -60,15 +60,15 @@ The repository requires coordinated fixes across persistence, services, and test
 | --- | --- | --- | --- |
 | P0 | Update Helm values with per-account Kraken secrets | ✅ Completed | Helm values expose projected secrets for company/director accounts with checksum-aware mounts and documented paths for every backend deployment.【F:deploy/helm/aether-platform/values.yaml†L1-L74】【F:deploy/helm/aether-platform/templates/backend-deployments.yaml†L1-L88】 |
 | P0 | Enforce HTTPS and secure headers | ✅ Completed | Ingress templates now enable forced TLS redirects, HSTS, and hardened security headers through chart defaults while remaining overridable per service.【F:deploy/helm/aether-platform/templates/backend-ingresses.yaml†L1-L60】【F:deploy/helm/aether-platform/values.yaml†L5-L24】 |
-| P1 | Document blue/green rollout process | 🚧 Pending | Deployment runbooks must outline canary, rollback, and health-check procedures. |
+| P1 | Document blue/green rollout process | ✅ Completed | Deployment playbook covers staging, observability bootstrapping, traffic flips, and rollback guidance for the hardened ingress environment.【F:docs/deployment/blue_green_rollout.md†L1-L66】 |
 
 ## 8. Documentation & Tooling
 
 | Priority | Task | Status | Notes |
 | --- | --- | --- | --- |
 | P0 | Rewrite README with setup + testing workflow | ✅ Completed | README now documents environment setup, local state bootstrapping, insecure-default flags, and pytest execution paths for contributors.【F:README.md†L1-L88】 |
-| P1 | Generate OpenAPI spec snapshot | 🚧 Pending | The consolidated API definition remains to be exported and versioned. |
-| P1 | Add CI pipeline for lint + tests | 🚧 Pending | CI workflows for linting, testing, and safety checks must be introduced. |
+| P1 | Generate OpenAPI spec snapshot | ✅ Completed | `scripts/generate_openapi.py` emits a repository snapshot backed by the FastAPI stub and stores it under `docs/api/openapi.json` for audit review.【F:scripts/generate_openapi.py†L1-L63】【F:docs/api/openapi.json†L1-L200】 |
+| P1 | Add CI pipeline for lint + tests | ✅ Completed | GitHub Actions workflow installs minimal test dependencies and runs the targeted regression suite under insecure defaults.【F:.github/workflows/ci.yaml†L1-L28】【F:requirements-ci.txt†L1-L1】 |
 
 ## Execution Guidance
 

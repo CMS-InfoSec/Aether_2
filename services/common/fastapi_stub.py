@@ -546,6 +546,30 @@ class FastAPI:
             full_path = _join_path(combined_prefix, path)
             self._register_route(full_path, endpoint, methods)
 
+    def openapi(self) -> Dict[str, Any]:  # pragma: no cover - exercised via tooling
+        """Generate a minimal OpenAPI structure for tooling that expects FastAPI."""
+
+        paths: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        for route in self.routes:
+            path_item = paths.setdefault(route.path, {})
+            for method in route.methods:
+                operation_id = getattr(route.endpoint, "__name__", "handler")
+                path_item[method.lower()] = {
+                    "operationId": f"{operation_id}_{method.lower()}",
+                    "responses": {
+                        "200": {"description": "Successful Response"}
+                    },
+                }
+
+        return {
+            "openapi": "3.1.0",
+            "info": {
+                "title": self.title or "FastAPI",
+                "version": "stub",
+            },
+            "paths": paths,
+        }
+
     def add_middleware(self, middleware_cls: Any, **kwargs: Any) -> None:
         self.user_middleware.append(SimpleNamespace(cls=middleware_cls, kwargs=kwargs))
 
