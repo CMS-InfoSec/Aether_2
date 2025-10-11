@@ -22,6 +22,7 @@
 1. **Test suite is not runnable as-is.** `pytest -q` aborts before collecting tests because `prometheus_client` is missing, which makes CI/CD verification impossible. Ensure runtime dependencies are installed (for example via the `test` extra) or stub the optional import in tests so the suite can execute in isolated environments.【5e8c9b†L1-L74】
 2. **Risk API Docker image build will fail.** The Dockerfile expects a `requirements.txt` in its build context, but that file is absent under `deploy/docker/risk-api/`, so `COPY requirements.txt ./` will error. Either add the requirements file alongside the Dockerfile or adjust the build context/paths to reference the repository root.【F:deploy/docker/risk-api/Dockerfile†L1-L22】
 3. **Primary database has no redundancy or backups.** The TimescaleDB StatefulSet deploys a single replica without backup CronJobs or even WAL archiving hooks, which leaves production data one pod deletion away from loss. Add streaming replicas and automated backups or integrate with Timescale Cloud before launch.【F:deploy/k8s/base/timescaledb/statefulset.yaml†L1-L45】
+4. **Kafka broker is a single point of failure.** The Kafka StatefulSet provisions only one replica, so any node drain or pod eviction halts ingestion and sequenced trade distribution. Introduce a multi-broker cluster or managed Kafka with replication and rack-awareness before go-live.【F:deploy/k8s/base/kafka/statefulset.yaml†L1-L52】
 
 ### High
 
@@ -29,6 +30,7 @@
 2. **Docker images run as root.** The risk API Dockerfile never drops privileges, exposing the container to escalation if the service is compromised. Introduce a non-root user and minimal filesystem permissions.【F:deploy/docker/risk-api/Dockerfile†L1-L22】
 3. **Redis cache is ephemeral.** The Redis deployment runs with a single replica and no persistent volume claims, so any restart wipes feature caches and session state. Provision Redis with persistence (or managed Redis) and high-availability to avoid cascading incidents.【F:deploy/k8s/base/redis/deployment.yaml†L1-L38】
 4. **Dual PostgreSQL drivers inflate attack surface.** Both `psycopg[binary]` and `psycopg2-binary` ship in the base dependency set, growing image size and expanding the patching surface. Standardise on a single driver (`psycopg` v3) for production images.【F:pyproject.toml†L5-L53】
+5. **NATS JetStream data is non-durable.** The NATS deployment enables JetStream but only backs it with an `emptyDir` volume on a single replica, so pod restarts purge persistence layers for replayable events. Move to a StatefulSet with persistent volumes and clustering or adopt a managed NATS deployment.【F:deploy/k8s/base/nats/deployment.yaml†L1-L47】
 
 ### Medium
 
@@ -36,6 +38,7 @@
 2. **Network policy egress is broad.** The blanket Cloudflare CIDR ranges that cover Kraken and CoinGecko also allow other Cloudflare-hosted endpoints. Tighten the allow-list with fully qualified domain egress via egress proxies or limit to vendor IP ranges verified with Cloudflare’s API.【F:deploy/k8s/networkpolicy.yaml†L1-L77】
 3. **Config map embeds connection targets without TLS hints.** The shared FastAPI configmap encodes TimescaleDB, Redis, and Feast endpoints but omits TLS/port annotations or secrets references, which could lead to plain-text connections unless overridden. Document TLS expectations or move these values to secrets to avoid drift.【F:deploy/k8s/base/fastapi/configmap.yaml†L1-L34】
 4. **Risk API probes inverted.** The dedicated risk API deployment wires readiness to `/healthz` and liveness to `/ready`, flipping the intended semantics and risking delayed restarts during dependency failures. Swap the endpoints or expose matching health handlers before shipping.【F:deploy/k8s/base/fastapi/deployment-risk.yaml†L1-L41】
+5. **Feast registry is transient.** Feast mounts its registry database from an `emptyDir`, so any pod restart or rescheduling erases feature definitions until a manual bootstrap occurs. Persist the registry on durable storage or sync it from artifact storage during startup.【F:deploy/k8s/base/feast/deployment.yaml†L1-L56】
 
 ### Low / Observations
 
