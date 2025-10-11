@@ -43,6 +43,7 @@ __all__ = [
     "ADMIN_ACCOUNTS",
     "DIRECTOR_ACCOUNTS",
     "AuthenticatedPrincipal",
+    "AllowlistConfigurationError",
     "Session",
     "SessionStoreProtocol",
     "reload_admin_accounts",
@@ -55,6 +56,16 @@ __all__ = [
     "require_mfa_context",
     "require_dual_director_confirmation",
 ]
+
+
+class AllowlistConfigurationError(RuntimeError):
+    """Raised when administrator or director allowlists are not configured."""
+
+    def __init__(self, message: str, *, variable: str | None = None) -> None:
+        if variable is not None:
+            message = f"{variable}: {message}"
+        super().__init__(message)
+        self.variable = variable
 
 _ADMIN_ENV_VARIABLE = "ADMIN_ALLOWLIST"
 _DIRECTOR_ENV_VARIABLE = "DIRECTOR_ALLOWLIST"
@@ -71,9 +82,9 @@ def _normalize_account_id(value: str) -> str:
 def _parse_allowlist(variable: str) -> set[str]:
     raw = os.environ.get(variable)
     if raw is None or not raw.strip():
-        raise RuntimeError(
-            f"{variable} is required but was not provided. Configure the environment "
-            "variable with a comma-separated list of account identifiers."
+        raise AllowlistConfigurationError(
+            "is required but was not provided. Configure the environment variable with a comma-separated list of account identifiers.",
+            variable=variable,
         )
     values = {
         _sanitize_account_id(part)
@@ -81,10 +92,25 @@ def _parse_allowlist(variable: str) -> set[str]:
         if _sanitize_account_id(part)
     }
     if not values:
-        raise RuntimeError(
-            f"{variable} must contain at least one non-empty account identifier."
+        raise AllowlistConfigurationError(
+            "must contain at least one non-empty account identifier.",
+            variable=variable,
         )
     return values
+
+
+def _normalize_accounts(source: Iterable[str], *, variable: str) -> set[str]:
+    accounts = {
+        _sanitize_account_id(account)
+        for account in source
+        if _sanitize_account_id(account)
+    }
+    if not accounts:
+        raise AllowlistConfigurationError(
+            "must contain at least one non-empty account identifier.",
+            variable=variable,
+        )
+    return accounts
 
 
 def _load_admin_accounts_from_env() -> set[str]:
@@ -99,46 +125,111 @@ def reload_admin_accounts(
     source: Optional[Iterable[str]] = None,
     *,
     director_source: Optional[Iterable[str]] = None,
+    strict: bool = True,
 ) -> set[str]:
     """Refresh administrator accounts from the configured source."""
 
-    if source is None:
-        accounts = _load_admin_accounts_from_env()
-    else:
-        accounts = {
-            _sanitize_account_id(account)
-            for account in source
-            if _sanitize_account_id(account)
-        }
-        if not accounts:
-            raise RuntimeError(
-                "ADMIN_ALLOWLIST must contain at least one account identifier."
-            )
+    admin_error: AllowlistConfigurationError | None = None
+    director_error: AllowlistConfigurationError | None = None
 
-    ADMIN_ACCOUNTS.clear()
-    ADMIN_ACCOUNTS.update(accounts)
+    if source is None:
+        try:
+            accounts = _load_admin_accounts_from_env()
+        except AllowlistConfigurationError as exc:
+            if strict:
+                raise
+            admin_error = exc
+            accounts = set()
+        else:
+            admin_error = None
+    else:
+        try:
+            accounts = _normalize_accounts(source, variable=_ADMIN_ENV_VARIABLE)
+        except AllowlistConfigurationError as exc:
+            if strict:
+                raise
+            admin_error = exc
+            accounts = set()
+        else:
+            admin_error = None
 
     if director_source is None:
-        directors = _load_director_accounts_from_env()
+        try:
+            directors = _load_director_accounts_from_env()
+        except AllowlistConfigurationError as exc:
+            if strict:
+                raise
+            director_error = exc
+            directors = set()
+        else:
+            director_error = None
     else:
-        directors = {
-            _sanitize_account_id(account)
-            for account in director_source
-            if _sanitize_account_id(account)
-        }
-        if not directors:
-            raise RuntimeError(
-                "DIRECTOR_ALLOWLIST must contain at least one account identifier."
+        try:
+            directors = _normalize_accounts(
+                director_source,
+                variable=_DIRECTOR_ENV_VARIABLE,
             )
+        except AllowlistConfigurationError as exc:
+            if strict:
+                raise
+            director_error = exc
+            directors = set()
+        else:
+            director_error = None
 
-    DIRECTOR_ACCOUNTS.clear()
-    DIRECTOR_ACCOUNTS.update(directors)
+    _reset_allowlists(accounts, directors)
+    _update_configuration_errors(
+        admin_error=admin_error,
+        director_error=director_error,
+    )
     return set(ADMIN_ACCOUNTS)
 
 
 ADMIN_ACCOUNTS: set[str] = set()
 DIRECTOR_ACCOUNTS: set[str] = set()
-reload_admin_accounts()
+_ADMIN_CONFIGURATION_ERROR: AllowlistConfigurationError | None = None
+_DIRECTOR_CONFIGURATION_ERROR: AllowlistConfigurationError | None = None
+
+def _update_configuration_errors(
+    *,
+    admin_error: AllowlistConfigurationError | None = None,
+    director_error: AllowlistConfigurationError | None = None,
+) -> None:
+    global _ADMIN_CONFIGURATION_ERROR, _DIRECTOR_CONFIGURATION_ERROR
+    _ADMIN_CONFIGURATION_ERROR = admin_error
+    _DIRECTOR_CONFIGURATION_ERROR = director_error
+
+
+def _reset_allowlists(admin_accounts: set[str], director_accounts: set[str]) -> None:
+    ADMIN_ACCOUNTS.clear()
+    ADMIN_ACCOUNTS.update(admin_accounts)
+    DIRECTOR_ACCOUNTS.clear()
+    DIRECTOR_ACCOUNTS.update(director_accounts)
+
+
+def _ensure_allowlists_configured() -> None:
+    if not ADMIN_ACCOUNTS:
+        error = _ADMIN_CONFIGURATION_ERROR or AllowlistConfigurationError(
+            "administrator allowlist has not been configured.",
+            variable=_ADMIN_ENV_VARIABLE,
+        )
+        raise error
+    if not DIRECTOR_ACCOUNTS:
+        error = _DIRECTOR_CONFIGURATION_ERROR or AllowlistConfigurationError(
+            "director allowlist has not been configured.",
+            variable=_DIRECTOR_ENV_VARIABLE,
+        )
+        raise error
+
+
+def _initialise_allowlists() -> None:
+    try:
+        reload_admin_accounts(strict=False)
+    except AllowlistConfigurationError as exc:  # pragma: no cover - defensive guard
+        _update_configuration_errors(admin_error=exc)
+
+
+_initialise_allowlists()
 
 
 def get_admin_accounts(*, normalized: bool = False) -> set[str]:
@@ -270,6 +361,14 @@ def require_admin_account(
             detail="Account header does not match authenticated session.",
         )
 
+    try:
+        _ensure_allowlists_configured()
+    except AllowlistConfigurationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        ) from exc
+
     if principal.normalized_account not in get_admin_accounts(normalized=True):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -351,6 +450,15 @@ def require_mfa_context(
         )
 
     principal = require_authenticated_principal(request, authorization)
+
+    try:
+        _ensure_allowlists_configured()
+    except AllowlistConfigurationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        ) from exc
+
     if principal.normalized_account not in get_admin_accounts(normalized=True):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -415,6 +523,14 @@ def require_dual_director_confirmation(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Two distinct director approvals are required.",
         )
+
+    try:
+        _ensure_allowlists_configured()
+    except AllowlistConfigurationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        ) from exc
 
     valid_directors = get_director_accounts(normalized=True)
     for account in accounts:

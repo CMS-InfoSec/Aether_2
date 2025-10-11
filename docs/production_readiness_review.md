@@ -101,11 +101,11 @@
 
 * `requirements-ci.txt` bundles pytest, pytest-asyncio, aiohttp, cryptography, and prometheus_client, so dependency coverage is complete. 【F:requirements-ci.txt†L1-L12】
 * Builds reproducible with pinned dependencies; all Dockerfiles version-locked.
-* `pytest --maxfail=1 --disable-warnings` aborts because importing `services.common.adapters` raises a `RuntimeError` before `conftest.py` seeds the allowlist environment variables. 【F:services/common/security.py†L71-L136】【F:conftest.py†L24-L36】【3aaabe†L1-L19】
+* `services.common.security.reload_admin_accounts(strict=False)` now seeds empty allowlists during import so pytest can load modules before `conftest.py` injects the Vault defaults, and the FastAPI guards surface missing configuration as 500-level errors instead of crashing imports. 【F:services/common/security.py†L82-L213】【F:services/common/security.py†L248-L357】【F:tests/security/test_admin_configuration.py†L74-L99】【F:conftest.py†L1-L44】
 
 **Remediation Tasks**
 
-* RMT-007 — Delay the ADMIN/DIRECTOR allowlist enforcement until runtime (or seed defaults earlier) so pytest can import modules without hard-failing. Files: `services/common/security.py`, test harness. Severity: High. Owner: Platform. Status: Pending.
+* RMT-007 — Delay the ADMIN/DIRECTOR allowlist enforcement until runtime (or seed defaults earlier) so pytest can import modules without hard-failing. Files: `services/common/security.py`, test harness. Severity: High. Owner: Platform. Status: Mitigated.
 
 ## Data Integrity & Backup
 
@@ -141,7 +141,7 @@
 
 **Remediation Tasks**
 
-* RMT-007 — Delay the ADMIN/DIRECTOR allowlist enforcement until runtime (or seed defaults earlier) so pytest can import modules without hard-failing. Files: `services/common/security.py`, test harness. Severity: High. Owner: Platform. Status: Pending.
+* RMT-007 — Delay the ADMIN/DIRECTOR allowlist enforcement until runtime (or seed defaults earlier) so pytest can import modules without hard-failing. Files: `services/common/security.py`, test harness. Severity: High. Owner: Platform. Status: Mitigated.
 
 ## Data Integrity & Backup
 
