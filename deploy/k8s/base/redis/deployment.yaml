@@ -19,7 +19,13 @@ spec:
       containers:
         - name: redis
           image: redis:7.2-alpine
-          args: ["--appendonly", "yes"]
+          args:
+            - "--appendonly"
+            - "yes"
+            - "--maxmemory"
+            - "450mb"
+            - "--maxmemory-policy"
+            - "allkeys-lru"
           ports:
             - containerPort: 6379
               name: redis
