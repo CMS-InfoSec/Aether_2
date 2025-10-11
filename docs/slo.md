@@ -8,8 +8,8 @@ This document defines the quantitative availability and responsiveness expectati
 | --- | --- | --- | --- |
 | Policy Latency | 95th percentile policy evaluation latency (`histogram_quantile(0.95, policy_latency_ms_bucket)`) | ≤ 200 ms over rolling 5 minutes | `policy_latency_p95_slo_breach` fires when > 200 ms for 2/3 evaluations |
 | Risk Latency | 95th percentile risk validation latency (`histogram_quantile(0.95, risk_latency_ms_bucket)`) | ≤ 200 ms over rolling 5 minutes | `risk_latency_p95_slo_breach` fires when > 200 ms for 2/3 evaluations |
-| OMS Latency | 95th percentile OMS submission latency (`histogram_quantile(0.95, oms_latency_ms_bucket)`) | ≤ 500 ms over rolling 5 minutes | `oms_latency_p95_slo_breach` fires when > 500 ms for 2/3 evaluations |
-| WebSocket Ingest Latency | 99th percentile delta propagation latency (`ws_delivery_latency_seconds{quantile="0.99"}`) | ≤ 0.300 s over rolling 5 minutes | `ws_latency_slo_breach` fires when > 0.250 s for 3/5 evaluations |
+| OMS Latency | 95th percentile OMS submission latency (`histogram_quantile(0.95, oms_latency_ms_bucket)`) with a p99 early-warning rule | ≤ 500 ms p95 over rolling 5 minutes (`p99` early warning at 150 ms) | `oms_latency_p95_slo_breach` fires when > 500 ms for 2/3 evaluations; `oms_latency_slo_breach` warns when p99 > 150 ms for 10 minutes |
+| WebSocket Ingest Latency | 99th percentile delta propagation latency (`histogram_quantile(0.99, ws_delivery_latency_seconds_bucket)`) | ≤ 0.300 s over rolling 5 minutes | `ws_latency_slo_breach` fires when > 0.250 s for 3/5 evaluations |
 | Kill-Switch Response | Time from activation command to OMS halt (`kill_switch_response_seconds`) | ≤ 60 s per activation | `kill_switch_slo_warning` fires when > 45 s for a single evaluation |
 | Model Canary Promotion | Completion time of canary to production promotion (`model_canary_promotion_duration_minutes`) | ≤ 45 minutes for 95% of promotions in 30-day window | `model_canary_promotion_slow` fires when 3 consecutive promotions exceed 30 minutes |
 
@@ -26,9 +26,9 @@ This document defines the quantitative availability and responsiveness expectati
 - **Runbooks**: Follow [`docs/runbooks/risk_latency.md`](runbooks/risk_latency.md).
 
 ## OMS Latency
-- **Measurement**: Histogram `oms_latency_ms` records submission latency to external venues, keyed by `symbol_tier` and `account_segment`.
-- **Target**: Hold the rolling 5-minute p95 ≤ 500 ms to absorb market spikes without missing fills.
-- **Alerting**: `oms_latency_p95_slo_breach` fires when the rolling p95 is above 500 ms for two of the last three evaluations.
+- **Measurement**: Histogram `oms_latency_ms` records submission latency to external venues, keyed by `symbol_tier` and `account_segment`. A companion histogram `oms_order_latency_seconds` tracks p99 latency for an early-warning circuit.
+- **Target**: Hold the rolling 5-minute p95 ≤ 500 ms to absorb market spikes without missing fills. The p99 alert raises awareness when latency exceeds 150 ms so responders can intervene before the SLO is breached.
+- **Alerting**: `oms_latency_p95_slo_breach` fires when the rolling p95 is above 500 ms for two of the last three evaluations. `oms_latency_slo_breach` fires when p99 latency stays above 150 ms for 10 minutes.
 - **Runbooks**: See [`docs/runbooks/oms_latency.md`](runbooks/oms_latency.md) and [`docs/runbooks/kill_switch_activation.md`](runbooks/kill_switch_activation.md) for remediation guidance.
 
 ## WebSocket Ingest Latency
@@ -51,4 +51,4 @@ This document defines the quantitative availability and responsiveness expectati
 
 ## Implementation Notes
 - Prometheus alerting rules in [`ops/monitoring/prometheus-rules.yaml`](../ops/monitoring/prometheus-rules.yaml) and [`deploy/observability/prometheus/prometheus.yaml`](../deploy/observability/prometheus/prometheus.yaml) annotate each alert with the relevant SLO target.
-- Grafana dashboards provisioned in [`deploy/observability/grafana/grafana.yaml`](../deploy/observability/grafana/grafana.yaml) include dedicated panels with threshold markers that align to these targets.
+- Grafana dashboards provisioned in [`deploy/observability/grafana/dashboards/slos.json`](../deploy/observability/grafana/dashboards/slos.json) surface policy, risk, OMS (p95 and p99), WebSocket, kill-switch, and canary metrics with colour-coded thresholds that mirror this document.【F:deploy/observability/grafana/dashboards/slos.json†L1-L172】

@@ -1,15 +1,172 @@
 {
   "title": "Trading SLOs",
+  "tags": ["slos", "aether"],
+  "timezone": "browser",
   "panels": [
     {
       "type": "timeseries",
-      "title": "Availability",
+      "title": "Policy Latency p95",
+      "description": "histogram_quantile(0.95, sum(rate(policy_latency_ms_bucket[5m])) by (le, symbol_tier, account_segment))",
       "targets": [
         {
-          "expr": "trading:latency:availability",
-          "legendFormat": "Availability"
+          "expr": "histogram_quantile(0.95, sum(rate(policy_latency_ms_bucket[5m])) by (le, symbol_tier, account_segment))",
+          "legendFormat": "{{symbol_tier}}/{{account_segment}}"
         }
-      ]
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 200 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Risk Latency p95",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(risk_latency_ms_bucket[5m])) by (le, symbol_tier, account_segment))",
+          "legendFormat": "{{symbol_tier}}/{{account_segment}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 200 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "OMS Latency p95",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(oms_latency_ms_bucket[5m])) by (le, symbol_tier, account_segment))",
+          "legendFormat": "{{symbol_tier}}/{{account_segment}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 350 },
+              { "color": "red", "value": 500 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "OMS Latency p99 (Early Warning)",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(oms_order_latency_seconds_bucket[5m])) by (le)) * 1000",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 150 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "WebSocket Delivery p99",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(ws_delivery_latency_seconds_bucket[5m])) by (le)) * 1000",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 250 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Kill Switch Response",
+      "targets": [
+        {
+          "expr": "max_over_time(kill_switch_response_seconds[5m])",
+          "legendFormat": "response"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 45 },
+              { "color": "red", "value": 60 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Model Canary Promotion Duration",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(model_canary_promotion_duration_minutes_bucket[30m])) by (le))",
+          "legendFormat": "p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "min",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 30 },
+              { "color": "red", "value": 45 }
+            ]
+          }
+        },
+        "overrides": []
+      }
     }
   ]
 }
