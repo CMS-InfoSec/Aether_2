@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 
 _FLAG = "ML_ALLOW_INSECURE_DEFAULTS"
@@ -12,16 +11,9 @@ _DEFAULT_STATE_DIR = Path(".aether_state/ml")
 
 
 def insecure_defaults_enabled() -> bool:
-    """Return ``True`` when insecure fallbacks are explicitly permitted."""
+    """Return ``True`` only when insecure fallbacks are explicitly permitted."""
 
-    flag = os.getenv(_FLAG)
-    if flag == "1":
-        return True
-    if flag == "0":
-        return False
-    # Pytest environments are treated as insecure by default so local tests can
-    # exercise the compatibility shims without additional configuration.
-    return "pytest" in sys.modules
+    return os.getenv(_FLAG) == "1"
 
 
 def state_root() -> Path:
