@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import inspect
 import json
 import logging
@@ -11,8 +12,6 @@ import os
 from datetime import datetime, timezone
 from functools import wraps
 from typing import Any, Callable, Iterable, Mapping, MutableMapping, Optional, Sequence, Tuple, TypeVar
-
-import hmac
 
 from fastapi import HTTPException, Request
 

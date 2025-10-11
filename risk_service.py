@@ -24,7 +24,18 @@ import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 
 from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, model_validator
-from sqlalchemy import Column, DateTime, Float, Integer, Numeric, String, create_engine, select
+from sqlalchemy import (
+    Column,
+    DateTime,
+    Float,
+    Integer,
+    Numeric,
+    String,
+    create_engine,
+    select,
+)
+from sqlalchemy import MetaData, Table
+from sqlalchemy import inspect
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from statistics import mean
@@ -49,7 +60,7 @@ from services.common.compliance import (
 )
 from services.common.security import require_admin_account
 from services.common.spot import require_spot_http
-from battle_mode import BattleModeController, create_battle_mode_tables
+from battle_mode import BattleModeBase, BattleModeController, create_battle_mode_tables
 from shared.health import setup_health_checks
 
 from cost_throttler import CostThrottler
@@ -438,7 +449,37 @@ def _seed_default_limits(session: Session) -> None:
 
 
 def _bootstrap_storage() -> None:
+    if ENGINE.dialect.name == "sqlite" and "accounts" not in Base.metadata.tables:
+        Table(
+            "accounts",
+            Base.metadata,
+            Column("account_id", String, primary_key=True),
+            Column("name", String, nullable=True),
+            extend_existing=True,
+        )
+
+    if ENGINE.dialect.name == "sqlite" and "accounts" not in BattleModeBase.metadata.tables:
+        Table(
+            "accounts",
+            BattleModeBase.metadata,
+            Column("account_id", String, primary_key=True),
+            extend_existing=True,
+        )
+
     Base.metadata.create_all(bind=ENGINE)
+
+    if ENGINE.dialect.name == "sqlite":
+        with ENGINE.begin() as connection:
+            inspector = inspect(connection)
+            if "accounts" not in inspector.get_table_names():
+                stub_metadata = MetaData()
+                Table(
+                    "accounts",
+                    stub_metadata,
+                    Column("account_id", String, primary_key=True),
+                    Column("name", String, nullable=True),
+                )
+                stub_metadata.create_all(bind=connection)
 
     create_battle_mode_tables(ENGINE)
 

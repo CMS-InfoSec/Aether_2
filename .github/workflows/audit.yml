@@ -1,0 +1,39 @@
+name: Nightly Production Readiness Audits
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  run-audits:
+    name: Execute production readiness audits
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f pyproject.toml ]; then pip install '.[dev,test]'; fi
+          python -m pip install pip-audit
+
+      - name: Run audits and update documentation
+        env:
+          GIT_AUTHOR_NAME: Codex Audit Bot
+          GIT_AUTHOR_EMAIL: codex-audit-bot@example.com
+        run: |
+          python ./.codex/audit_and_update.py
