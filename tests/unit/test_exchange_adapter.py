@@ -237,3 +237,59 @@ async def test_place_order_converts_validation_error(monkeypatch: pytest.MonkeyP
 
     assert "invalid precision" in str(excinfo.value)
 
+
+@pytest.mark.asyncio
+async def test_binance_adapter_submit_order_noop_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ENABLE_MULTI_EXCHANGE_ROUTING", raising=False)
+    adapter = exchange_adapter.BinanceAdapter()
+
+    ack = await adapter.submit_order("acct-1", {"symbol": "btc/usd"})
+
+    assert ack["status"] == "noop"
+    assert ack["reason"] == "multi_exchange_routing_disabled"
+    assert ack["symbol"] == "BTC-USD"
+    assert not adapter.supports("place_order")
+
+
+@pytest.mark.asyncio
+async def test_binance_adapter_submit_order_stub_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ENABLE_MULTI_EXCHANGE_ROUTING", "true")
+    adapter = exchange_adapter.BinanceAdapter()
+
+    ack = await adapter.submit_order("acct-2", {"symbol": "eth-usd", "client_id": "cid-123"})
+
+    assert ack["status"] == "accepted"
+    assert ack["note"] == "stubbed_execution"
+    assert ack["client_order_id"] == "cid-123"
+    assert adapter.supports("place_order")
+
+
+@pytest.mark.asyncio
+async def test_coinbase_adapter_fetch_orderbook_normalizes_symbol() -> None:
+    adapter = exchange_adapter.CoinbaseAdapter()
+
+    book = await adapter.fetch_orderbook("solusd", depth=5)
+
+    assert book["symbol"] == "SOL-USD"
+    assert book["depth"] == 5
+    assert book["bids"] == []
+    assert book["asks"] == []
+
+
+@pytest.mark.asyncio
+async def test_coinbase_adapter_cancel_noop_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ENABLE_MULTI_EXCHANGE_ROUTING", raising=False)
+    adapter = exchange_adapter.CoinbaseAdapter()
+
+    response = await adapter.cancel_order("acct-3", "client-42", exchange_order_id="order-99")
+
+    assert response["status"] == "noop"
+    assert response["reason"] == "multi_exchange_routing_disabled"
+    assert response["exchange_order_id"] == "order-99"
+

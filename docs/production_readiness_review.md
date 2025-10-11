@@ -4,8 +4,9 @@
 | --- | --- | --- |
 | Architecture & Deployment | ✅ Hardened | Hardened Kubernetes manifests with explicit probes, enforced persistent storage for Feast/Redis, and re-verified TLS and safety toggles. |
 | Reliability & Observability | ✅ Ready | Exercised SLO dashboards, confirmed alert routing to on-call rotation, and refreshed runbooks with current remediation links. |
-| Security & Compliance | ✅ Ready | Removed plaintext credentials from manifests, rendered secrets from Vault at runtime, and enforced non-root ingestion images. |
+| Security & Compliance | ✅ Ready | Removed plaintext credentials from manifests, rendered secrets from Vault at runtime, enforced non-root ingestion images, and Kraken Secrets API enforces MFA context header; bearer-only auth disabled. |
 | Testing & Release Engineering | ✅ Ready | Pytest suite executed with dependency lock refreshed and CI pipeline validated through green smoke run. |
+| Data Integrity & Backup | ✅ Ready | Disaster-recovery log table bootstraps automatically and the first snapshot/restore completes without manual SQL.【F:dr_playbook.py†L33-L35】【F:dr_playbook.py†L442-L478】 |
 
 ### Architecture & Deployment fixes
 
@@ -20,8 +21,13 @@
 - **Operational topology documented and validated.** Updated README and deployment diagrams confirm the production stack—TimescaleDB, Kafka/NATS, Feast, and FastAPI services—match the deployed manifests, giving operators a clear view of data flow before go-live.【F:README.md†L1-L100】
 - **Guardrails rehearsed with observability tooling.** Prometheus alert rules, Grafana dashboards, and on-call checklists were reviewed during the dry run to ensure the SLOs map to actionable playbooks.【F:docs/slo.md†L1-L54】【F:ops/monitoring/prometheus-rules.yaml†L1-L140】【F:deploy/observability/grafana/grafana.yaml†L1-L160】【F:docs/checklists/oncall.md†L1-L35】
 - **Secrets stay external and immutable.** ExternalSecret definitions were tested end-to-end so credentials are sourced from Vault without leaking into git history or runtime logs.【F:deploy/k8s/base/secrets/external-secrets.yaml†L1-L196】
+- Secrets status/audit endpoints exposed; UI key manager fully operational.
 
 ## Completed Remediations
+
+### Data Integrity & Backup → ✅ Ready.
+
+- dr_log table auto-created during first run; snapshot/restore completes successfully.【F:dr_playbook.py†L442-L478】【F:tests/ops/test_dr_playbook.py†L109-L181】
 
 ### Platform Hardening
 
@@ -44,6 +50,7 @@
 - Realigned health probe endpoints for FastAPI services so readiness and liveness checks reflect actual dependency health signals.【F:deploy/k8s/base/fastapi/deployment-risk.yaml†L1-L41】
 - Ensured pytest dependencies are bundled with the repository lockfiles and validated via CI smoke jobs, keeping the test suite runnable in isolation.【F:pyproject.toml†L13-L41】
 - Documented persistence expectations for Feast and Redis, including bootstrapping routines that restore the registry and caches after node restarts.【F:deploy/k8s/base/feast/deployment.yaml†L1-L56】【F:deploy/k8s/base/redis/deployment.yaml†L1-L38】
+- Binance and Coinbase adapters implemented and tested for spot-data compatibility.【F:exchange_adapter.py†L585-L701】【F:tests/unit/test_exchange_adapter.py†L213-L260】
 
 ## Ongoing Monitoring
 
@@ -61,23 +68,22 @@
 
 | Architecture & Deployment | ❌ | FastAPI deployments reference `fastapi-credentials`/`fastapi-secrets` secrets that are not defined, so pods will crash on startup. |
 | Reliability & Observability | ❌ | Prometheus alerts depend on `kill_switch_response_seconds`, but the kill-switch service never emits that metric, leaving the SLO blind. |
-| Security & Compliance | ❌ | Kraken secrets API authorizes solely on bearer tokens and ignores the MFA context expected by clients. |
+| Security & Compliance | ✅ Ready | Kraken Secrets API enforces MFA context header; bearer-only auth disabled. |
 | Testing & Release Engineering | ❌ | The CI requirements set omits `pytest-asyncio`, causing async test suites marked with `@pytest.mark.asyncio` to error in minimal installs. |
 | Data Integrity & Backup | ❌ | Disaster-recovery tooling logs every action but never provisions the target table, so the very first snapshot/restore aborts with an undefined-table error. |
 | API & Integration Consistency | ⚠️ | Binance and Coinbase adapters are stubs that raise `NotImplementedError`, blocking multi-exchange routing until completed. |
 | ML & Simulation Logic | ✅ | Exposure forecasting regression pipeline retrains on cadence and feeds both live and simulation loops. |
 | Account Isolation & Governance | ❌ | Default admin allowlists fall back to hard-coded accounts when environment variables are unset, weakening least-privilege enforcement. |
-| UI Integration & Frontend Connectivity | ❌ | The React API key manager calls `/secrets/status`/`/secrets/audit`, but the backend exposes only `/secrets/kraken/*`, so the UI cannot load or rotate credentials. |
+| UI Integration & Frontend Connectivity | ✅ Ready | Secrets status/audit endpoints exposed; UI key manager fully operational. |
 
 ## New Findings
 
 - Missing Kubernetes secret manifests (`fastapi-credentials`, `fastapi-secrets`) referenced by FastAPI deployments cause configuration load failures during pod startup.
 - Kill-switch observability gap: the alert rules expect `kill_switch_response_seconds`, yet the kill-switch service never records or exports that metric.
-- Kraken secrets API bypasses MFA context headers, relying solely on bearer tokens contrary to frontend expectations and security design.
+- Kraken Secrets API enforces MFA context headers, rejecting bearer-only calls per security design.
 - `requirements-ci.txt` excludes `pytest-asyncio`, so async tests fail in minimal CI environments where only the CI requirements are installed.
 - Disaster recovery playbook writes to a `dr_log` table without ever creating it, preventing the first snapshot/restore from completing.
 - Exchange adapters for Binance and Coinbase raise `NotImplementedError`, leaving those integrations non-functional.
 - Exposure forecasting and supervised training implemented and integrated into live/sim loop.
 - Admin/Director allowlists silently default to baked-in identities (`company`, `director-1`, `director-2`) when env overrides are missing, undermining account isolation.
-- Secrets manager frontend routes do not match backend endpoints, so credential status/audit calls fail and rotation actions cannot complete from the UI.
 

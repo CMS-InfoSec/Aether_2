@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import dr_playbook
 from dr_playbook import DisasterRecoveryConfig, _restore_mlflow_artifacts
 
 
@@ -103,3 +104,78 @@ def test_from_env_rejects_file_work_dir(
 
     with pytest.raises(ValueError, match="DR_WORK_DIR must reference a directory"):
         DisasterRecoveryConfig.from_env()
+
+
+def test_log_dr_action_bootstraps_log_table(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[tuple[str, tuple[str, str] | None]] = []
+
+    class DummyCursor:
+        def __enter__(self) -> "DummyCursor":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[override]
+            return None
+
+        def execute(self, query, params=None) -> None:
+            calls.append((str(query), params))
+
+    class DummyConnection:
+        def __enter__(self) -> "DummyConnection":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[override]
+            return None
+
+        def cursor(self) -> DummyCursor:
+            return DummyCursor()
+
+    def fake_connect(*args, **kwargs):  # type: ignore[no-untyped-def]
+        return DummyConnection()
+
+    class _Identifier:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def __str__(self) -> str:
+            return f'"{self.name}"'
+
+    class _SQL:
+        def __init__(self, template: str) -> None:
+            self.template = template
+
+        def format(self, **kwargs: object) -> "_SQL":
+            rendered = self.template
+            for key, value in kwargs.items():
+                rendered = rendered.replace("{" + key + "}", str(value))
+            return _SQL(rendered)
+
+        def __str__(self) -> str:
+            return self.template
+
+    monkeypatch.setattr(dr_playbook, "psycopg", type("PsycoStub", (), {"connect": staticmethod(fake_connect)}))
+    monkeypatch.setattr(
+        dr_playbook,
+        "sql",
+        type("SqlStub", (), {"SQL": staticmethod(lambda template: _SQL(template)), "Identifier": staticmethod(_Identifier)}),
+    )
+    monkeypatch.setattr(dr_playbook, "_LOG_TABLE_BOOTSTRAPPED", set())
+
+    config = DisasterRecoveryConfig(
+        timescale_dsn="postgresql://localhost/postgres",
+        redis_url="redis://localhost:6379/0",
+        mlflow_artifact_uri="s3://dummy/artifacts",
+        object_store_bucket="dummy",
+        mlflow_restore_path=tmp_path,
+    )
+
+    dr_playbook._log_dr_action(config, "snapshot:start")
+    dr_playbook._log_dr_action(config, "snapshot:complete")
+
+    assert "CREATE TABLE IF NOT EXISTS \"dr_log\"" in calls[0][0]
+    assert calls[0][1] is None
+    assert calls[1][0].startswith("INSERT INTO \"dr_log\"")
+    assert calls[1][1] == (config.actor, "snapshot:start")
+    assert calls[2][0].startswith("INSERT INTO \"dr_log\"")
+    assert calls[2][1] == (config.actor, "snapshot:complete")
