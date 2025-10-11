@@ -10,8 +10,8 @@ WORKDIR /app
 RUN apt-get update \
     && apt-get install --no-install-recommends -y build-essential libpq-dev \
     && rm -rf /var/lib/apt/lists/* \
-    && addgroup --system app \
-    && adduser --system --ingroup app app
+    && addgroup --system appuser \
+    && adduser --system --ingroup appuser appuser
 
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir --upgrade pip \
@@ -19,9 +19,9 @@ RUN pip install --no-cache-dir --upgrade pip \
     && rm /tmp/requirements.txt
 
 COPY . .
-RUN chown -R app:app /app
+RUN chown -R appuser:appuser /app
 
-USER app
+USER appuser
 
 EXPOSE 8000
 
