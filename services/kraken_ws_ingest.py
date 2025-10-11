@@ -13,8 +13,9 @@ import os
 import signal
 import sys
 import time
+from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Deque, DefaultDict, Dict, Iterable, List, Optional
 
 import websockets
 
@@ -38,6 +39,8 @@ except ModuleNotFoundError:  # pragma: no cover - fallback stub for tests withou
         async def send_and_wait(self, *args, **kwargs) -> None:  # pragma: no cover - test stub
             raise RuntimeError("aiokafka is required to run Kraken ingestion")
 
+from prometheus_client import Counter, Gauge, Histogram, start_http_server
+
 from shared.spot import is_spot_symbol, normalize_spot_symbol
 
 
@@ -47,6 +50,35 @@ DEFAULT_BOOK_TOPIC = "md.book"
 HEARTBEAT_TIMEOUT_SECONDS = 30.0
 HEARTBEAT_CHECK_INTERVAL_SECONDS = 5.0
 RECONNECT_DELAY_SECONDS = 5.0
+DEFAULT_METRICS_PORT = 9000
+SEQUENCE_WINDOW_SIZE = 200
+
+
+MESSAGES_TOTAL = Counter(
+    "kraken_ws_messages_total",
+    "Number of Kraken WebSocket messages normalised",
+    labelnames=("type", "pair"),
+)
+KAFKA_PUBLISH_DURATION_SECONDS = Histogram(
+    "kraken_ws_kafka_publish_duration_seconds",
+    "Duration spent publishing normalised payloads to Kafka",
+    labelnames=("topic",),
+    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0),
+)
+KAFKA_PUBLISH_ERRORS_TOTAL = Counter(
+    "kraken_ws_kafka_publish_errors_total",
+    "Number of errors raised while publishing to Kafka",
+    labelnames=("topic",),
+)
+HEARTBEAT_AGE_SECONDS = Gauge(
+    "kraken_ws_heartbeat_age_seconds",
+    "Seconds elapsed since the last Kraken heartbeat event",
+)
+WS_SEQUENCE_GAP_RATIO = Gauge(
+    "ws_sequence_gap_ratio",
+    "Ratio of out-of-order WebSocket updates observed in the recent sliding window",
+    labelnames=("pair",),
+)
 
 
 class HeartbeatTimeout(RuntimeError):
@@ -105,6 +137,10 @@ class KrakenIngestor:
         self._last_heartbeat_ts = time.monotonic()
         self._active_ws: Optional[websockets.WebSocketClientProtocol] = None
         self._active_tasks: set[asyncio.Task[Any]] = set()
+        self._last_event_ts: Dict[str, float] = {}
+        self._gap_windows: DefaultDict[str, Deque[bool]] = defaultdict(
+            lambda: deque(maxlen=SEQUENCE_WINDOW_SIZE)
+        )
 
     async def run(self) -> None:
         """Entrypoint for the ingestion loop with reconnection handling."""
@@ -305,6 +341,7 @@ class KrakenIngestor:
                 "size": size,
                 "type": "trade",
             }
+            self._record_event_metrics("trade", pair, timestamp)
             await self._send_to_kafka(self._config.trade_topic, normalized)
 
     async def _handle_book_message(
@@ -349,20 +386,26 @@ class KrakenIngestor:
                 "size": size,
                 "type": "book",
             }
+            self._record_event_metrics("book", pair, timestamp)
             await self._send_to_kafka(self._config.book_topic, normalized)
 
     async def _send_to_kafka(self, topic: str, payload: Dict[str, Any]) -> None:
         assert self._producer is not None
         try:
+            start = time.perf_counter()
             await self._producer.send_and_wait(topic, payload)
+            duration = time.perf_counter() - start
+            KAFKA_PUBLISH_DURATION_SECONDS.labels(topic=topic).observe(duration)
         except KafkaError as exc:
             logging.error("Kafka send failed for topic %s: %s", topic, exc)
+            KAFKA_PUBLISH_ERRORS_TOTAL.labels(topic=topic).inc()
             raise
 
     async def _heartbeat_guard(self, ws: websockets.WebSocketClientProtocol) -> None:
         while True:
             await asyncio.sleep(self._config.heartbeat_check_interval)
             elapsed = time.monotonic() - self._last_heartbeat_ts
+            HEARTBEAT_AGE_SECONDS.set(elapsed)
             if elapsed > self._config.heartbeat_timeout:
                 logging.warning(
                     "No heartbeat received for %.1f seconds (timeout %.1f)",
@@ -383,6 +426,19 @@ class KrakenIngestor:
                 elif channel_name is None:
                     channel_name = item
         return channel_name, pair
+
+    def _record_event_metrics(self, event_type: str, pair: str, timestamp: float) -> None:
+        MESSAGES_TOTAL.labels(type=event_type, pair=pair).inc()
+
+        last_ts = self._last_event_ts.get(pair)
+        gap_detected = bool(last_ts is not None and timestamp <= last_ts)
+        self._last_event_ts[pair] = max(timestamp, last_ts or timestamp)
+
+        window = self._gap_windows[pair]
+        window.append(gap_detected)
+        if window:
+            ratio = sum(window) / len(window)
+            WS_SEQUENCE_GAP_RATIO.labels(pair=pair).set(ratio)
 
 
 def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
@@ -418,6 +474,12 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         "--log-level",
         default=os.getenv("LOG_LEVEL", "INFO"),
         help="Logging level (default: INFO or LOG_LEVEL env value)",
+    )
+    parser.add_argument(
+        "--metrics-port",
+        type=int,
+        default=int(os.getenv("METRICS_PORT", DEFAULT_METRICS_PORT)),
+        help="Port to expose Prometheus metrics on (default: 9000)",
     )
     return parser.parse_args(argv)
 
@@ -455,6 +517,9 @@ async def async_main(argv: Optional[Iterable[str]] = None) -> None:
         book_topic=args.book_topic,
         book_depth=args.book_depth,
     )
+
+    start_http_server(args.metrics_port)
+    logging.info("Prometheus metrics server started on port %d", args.metrics_port)
 
     ingestor = KrakenIngestor(config)
     install_signal_handlers(ingestor)
