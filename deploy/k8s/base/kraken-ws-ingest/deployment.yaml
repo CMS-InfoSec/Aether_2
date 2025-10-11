@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
         - name: kraken-ws-ingest
-          image: ghcr.io/your-org/kraken-ws-ingest:latest
+          image: ghcr.io/aether/kraken-ws-ingest:latest
           imagePullPolicy: IfNotPresent
           args:
             - "--pairs"
@@ -27,9 +27,16 @@ spec:
             - "md.trades"
             - "--book-topic"
             - "md.book"
+            - "--metrics-port"
+            - "$(METRICS_PORT)"
           env:
             - name: LOG_LEVEL
               value: INFO
+            - name: METRICS_PORT
+              value: "9000"
+          ports:
+            - name: metrics
+              containerPort: 9000
           resources:
             requests:
               cpu: 100m
