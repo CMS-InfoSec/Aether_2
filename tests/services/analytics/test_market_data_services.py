@@ -54,7 +54,10 @@ _load_module("services.analytics.market_data_store", "services/analytics/market_
 crossasset_service = _load_module("services.analytics.crossasset_service", "services/analytics/crossasset_service.py")
 
 
-from prometheus_client import REGISTRY
+try:  # pragma: no cover - prefer the real Prometheus client when available
+    from prometheus_client import REGISTRY
+except ModuleNotFoundError:  # pragma: no cover - fallback to local metrics shim
+    from metrics import _REGISTRY as REGISTRY  # type: ignore[attr-defined]
 
 
 def _reload_signal_service():

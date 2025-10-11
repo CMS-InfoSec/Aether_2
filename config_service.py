@@ -67,8 +67,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 try:  # pragma: no cover - support alternative namespace packages
-from services.common.security import require_admin_account
-from shared.audit import AuditLogStore, TimescaleAuditLogger
+    from services.common.security import require_admin_account
+    from shared.audit import AuditLogStore, TimescaleAuditLogger
 except ModuleNotFoundError:  # pragma: no cover - fallback when installed under package namespace
     try:
         from aether.services.common.security import require_admin_account

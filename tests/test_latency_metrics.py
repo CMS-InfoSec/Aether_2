@@ -1,6 +1,9 @@
 import logging
 
-from prometheus_client import CollectorRegistry
+try:  # pragma: no cover - prefer the real Prometheus client when available
+    from prometheus_client import CollectorRegistry
+except ModuleNotFoundError:  # pragma: no cover - fallback to local metrics shim
+    from metrics import CollectorRegistry  # type: ignore[attr-defined]
 
 from ops.observability.latency_metrics import LatencyMetrics, LatencySnapshot
 

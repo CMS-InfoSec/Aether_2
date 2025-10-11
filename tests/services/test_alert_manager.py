@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import pytest
 
-prometheus_client = pytest.importorskip("prometheus_client")
+try:  # pragma: no cover - prefer the real Prometheus client when available
+    from prometheus_client import CollectorRegistry
+except ModuleNotFoundError:  # pragma: no cover - fallback to local metrics shim
+    from metrics import CollectorRegistry  # type: ignore[attr-defined]
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -19,9 +22,6 @@ from services.alert_manager import (
     get_alert_metrics,
     setup_alerting,
 )
-
-
-CollectorRegistry = prometheus_client.CollectorRegistry
 
 
 class RecordingAlertManager(AlertManager):

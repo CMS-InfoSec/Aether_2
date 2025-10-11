@@ -4,19 +4,32 @@ from __future__ import annotations
 
 import importlib
 import sys
+from types import SimpleNamespace
 
 import pytest
 
 
 def _reset_prometheus_registry(monkeypatch: pytest.MonkeyPatch) -> None:
-    import prometheus_client
-    from prometheus_client import metrics as metrics_module
-    from prometheus_client import registry as registry_module
+    try:  # pragma: no cover - favour the real dependency when available
+        import prometheus_client as prometheus_client_mod
+        from prometheus_client import metrics as metrics_module
+        from prometheus_client import registry as registry_module
+    except ModuleNotFoundError:  # pragma: no cover - fallback to local metrics shim
+        import metrics as metrics_module  # type: ignore[import-not-found]
+
+        registry_module = SimpleNamespace(
+            CollectorRegistry=metrics_module.CollectorRegistry,
+            REGISTRY=metrics_module._REGISTRY,
+        )
+        prometheus_client_mod = SimpleNamespace(
+            REGISTRY=metrics_module._REGISTRY,
+            Gauge=metrics_module.Gauge,
+        )
 
     fresh_registry = registry_module.CollectorRegistry()
     monkeypatch.setattr(registry_module, "REGISTRY", fresh_registry)
     monkeypatch.setattr(metrics_module, "REGISTRY", fresh_registry, raising=False)
-    monkeypatch.setattr(prometheus_client, "REGISTRY", fresh_registry, raising=False)
+    monkeypatch.setattr(prometheus_client_mod, "REGISTRY", fresh_registry, raising=False)
 
     class _GaugeStub:
         def __init__(self, *args: object, **kwargs: object) -> None:  # pragma: no cover - trivial
@@ -28,7 +41,7 @@ def _reset_prometheus_registry(monkeypatch: pytest.MonkeyPatch) -> None:
         def set(self, value: object) -> None:  # pragma: no cover - trivial
             return None
 
-    monkeypatch.setattr(prometheus_client, "Gauge", _GaugeStub)
+    monkeypatch.setattr(prometheus_client_mod, "Gauge", _GaugeStub)
 
 
 MODULE = "services.analytics.crossasset_service"

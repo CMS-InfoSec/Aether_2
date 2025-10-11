@@ -13,7 +13,17 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 from fastapi import FastAPI
-from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, REGISTRY
+
+try:  # pragma: no cover - prefer the real Prometheus client when available
+    from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, REGISTRY
+except ModuleNotFoundError:  # pragma: no cover - fall back to in-repo metrics shims
+    from metrics import (  # type: ignore[attr-defined]
+        CollectorRegistry,
+        Counter,
+        Gauge,
+        Histogram,
+        _REGISTRY as REGISTRY,
+    )
 
 logger = logging.getLogger(__name__)
 
