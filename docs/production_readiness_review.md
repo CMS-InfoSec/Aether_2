@@ -6,6 +6,7 @@
 | Reliability & Observability | ✅ Ready | Exercised SLO dashboards, confirmed alert routing to on-call rotation, and refreshed runbooks with current remediation links. |
 | Security & Compliance | ✅ Ready | Removed plaintext credentials from manifests, rendered secrets from Vault at runtime, enforced non-root ingestion images, and Kraken Secrets API enforces MFA context header; bearer-only auth disabled. |
 | Testing & Release Engineering | ✅ Ready | Pytest suite executed with dependency lock refreshed and CI pipeline validated through green smoke run. |
+| Data Integrity & Backup | ✅ Ready | Disaster-recovery log table bootstraps automatically and the first snapshot/restore completes without manual SQL.【F:dr_playbook.py†L33-L35】【F:dr_playbook.py†L442-L478】 |
 
 ### Architecture & Deployment fixes
 
@@ -22,6 +23,10 @@
 - **Secrets stay external and immutable.** ExternalSecret definitions were tested end-to-end so credentials are sourced from Vault without leaking into git history or runtime logs.【F:deploy/k8s/base/secrets/external-secrets.yaml†L1-L196】
 
 ## Completed Remediations
+
+### Data Integrity & Backup → ✅ Ready.
+
+- dr_log table auto-created during first run; snapshot/restore completes successfully.【F:dr_playbook.py†L442-L478】【F:tests/ops/test_dr_playbook.py†L109-L181】
 
 ### Platform Hardening
 
