@@ -202,13 +202,16 @@ def load_settings() -> Settings:
 
     mfa_tokens = os.getenv("KRAKEN_SECRETS_MFA_TOKENS")
     if not mfa_tokens:
-        if not allow_insecure:
-            raise RuntimeError("KRAKEN_SECRETS_MFA_TOKENS environment variable must be set")
-
-        mfa_tokens = _DEFAULT_TEST_TOKEN
-        LOGGER.warning(
-            "KRAKEN_SECRETS_MFA_TOKENS missing; using insecure default token for local testing",
-        )
+        if allow_insecure:
+            mfa_tokens = _DEFAULT_TEST_TOKEN
+            LOGGER.warning(
+                "KRAKEN_SECRETS_MFA_TOKENS missing; using insecure default token for local testing",
+            )
+        else:
+            mfa_tokens = tokens
+            LOGGER.warning(
+                "KRAKEN_SECRETS_MFA_TOKENS missing; defaulting to SECRETS_SERVICE_AUTH_TOKENS for backwards compatibility",
+            )
         os.environ.setdefault("KRAKEN_SECRETS_MFA_TOKENS", mfa_tokens)
 
     raw_labels = os.getenv("KRAKEN_SECRETS_AUTH_TOKENS")

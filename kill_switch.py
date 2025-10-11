@@ -27,6 +27,7 @@ KILL_SWITCH_RESPONSE_SECONDS = Histogram(
     "kill_switch_response_seconds",
     "Duration of kill-switch responses in seconds.",
     ["status"],
+    buckets=(5.0, 10.0, 20.0, 30.0, 45.0, 60.0, 90.0),
     registry=_REGISTRY,
 )
 

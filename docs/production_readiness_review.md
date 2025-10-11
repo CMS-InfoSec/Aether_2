@@ -121,7 +121,24 @@
 * Disaster-recovery automation now creates its log table automatically and the backup job contains documented restore steps, improving first-run resilience. 【F:dr_playbook.py†L442-L520】【F:ops/backup/backup_job.py†L520-L588】
 * Strict network policies and non-root Docker images enforce the expected perimeter for ingest workloads. 【F:deploy/k8s/networkpolicy.yaml†L1-L112】【F:deploy/docker/risk-ingestor/Dockerfile†L1-L26】
 
-## Ongoing Monitoring
+* `requirements-ci.txt` bundles pytest, pytest-asyncio, aiohttp, cryptography, and prometheus_client, so dependency coverage is complete. 【F:requirements-ci.txt†L1-L12】
+* `pytest --maxfail=1 --disable-warnings` aborts because importing `services.common.adapters` raises a `RuntimeError` before `conftest.py` seeds the allowlist environment variables. 【F:services/common/security.py†L71-L136】【F:conftest.py†L24-L36】【3aaabe†L1-L19】
+
+**Remediation Tasks**
+
+* RMT-007 — Delay the ADMIN/DIRECTOR allowlist enforcement until runtime (or seed defaults earlier) so pytest can import modules without hard-failing. Files: `services/common/security.py`, test harness. Severity: High. Owner: Platform. Status: Pending.
+
+## Data Integrity & Backup
+
+* TimescaleDB and Redis run as StatefulSets with PVC-backed storage, and TimescaleDB includes a nightly `pg_dump` CronJob. 【F:deploy/k8s/base/timescaledb/statefulset.yaml†L1-L140】【F:deploy/k8s/base/redis/deployment.yaml†L1-L40】
+* `_log_dr_action` now creates the `dr_log` table on demand, and unit tests cover that bootstrap path. 【F:dr_playbook.py†L442-L479】【F:tests/ops/test_dr_playbook.py†L157-L181】
+* `ops/backup/backup_job.py` supplies AES-GCM backup/restore logic for TimescaleDB dumps and MLflow artifacts, but Feast only ships Deployments plus PVCs—no CronJob or export pipeline protects the registry database or Redis feature store from loss. 【F:ops/backup/backup_job.py†L520-L588】【F:deploy/k8s/base/feast/deployment.yaml†L1-L88】【F:deploy/k8s/base/redis-feast/deployments.yaml†L1-L120】
+
+**Remediation Tasks**
+
+* RMT-026 — Add a scheduled backup workflow for the Feast registry/Redis pair (e.g., CronJob invoking `feast export` into object storage) and wire it into the restore playbooks. Files: `deploy/k8s/base/feast/`, `deploy/k8s/base/redis-feast/`, `ops/backup/`. Severity: High. Owner: Data Platform. Status: Pending.
+
+## Account Isolation & Governance
 
 * Track completion of RMT-001/002/008/009/011/012/013/015/016/018/021/024/025/027/028 so all mandatory secrets, TLS artifacts, container images, and Feast redis wiring (FastAPI, Secrets Service, platform allowlists, compliance DSNs, Feast credentials, capital allocator DSNs, TLS client certs, Kraken API keys, ingress certificates, hardened streaming endpoints, Vault access, kraken-ws-ingest image, Feast redis host) are delivered by GitOps before the next deployment window.
 * Once RMT-003 through RMT-005, RMT-010, RMT-014, RMT-017, and RMT-029 are complete, re-run Prometheus rule validation to confirm the corrected metrics and scrape targets emit data across staging.
