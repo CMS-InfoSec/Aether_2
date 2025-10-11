@@ -1,4 +1,5 @@
 import React, { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { withErrorBoundary } from "./withErrorBoundary";
 import { formatLondonTime } from "./timezone";
 import { useAuthClaims } from "./useAuthClaims";
 
@@ -381,4 +382,4 @@ const ApiKeyForm: React.FC = () => {
   );
 };
 
-export default ApiKeyForm;
+export default withErrorBoundary(ApiKeyForm, { componentName: "API Key Form" });

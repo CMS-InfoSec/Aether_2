@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
+import { withErrorBoundary } from "./withErrorBoundary";
 import { useAuthClaims } from "./useAuthClaims";
 
 interface PortfolioData {
@@ -288,4 +289,6 @@ const PortfolioView: React.FC = () => {
   );
 };
 
-export default PortfolioView;
+export default withErrorBoundary(PortfolioView, {
+  componentName: "Portfolio View",
+});
