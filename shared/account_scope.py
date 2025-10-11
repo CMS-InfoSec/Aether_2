@@ -29,12 +29,12 @@ import importlib
 SQLALCHEMY_AVAILABLE = True
 
 try:  # pragma: no cover - exercised when SQLAlchemy is installed
-    from sqlalchemy import Column, ForeignKey
+    from sqlalchemy import Column, ForeignKey, String, Table
     from sqlalchemy.dialects.postgresql import UUID as PGUUID
     from sqlalchemy.types import CHAR, TypeDecorator
 except Exception:  # pragma: no cover - executed in dependency-light environments
     SQLALCHEMY_AVAILABLE = False
-    Column = ForeignKey = PGUUID = CHAR = None  # type: ignore[assignment]
+    Column = ForeignKey = PGUUID = CHAR = String = Table = None  # type: ignore[assignment]
     TypeDecorator = object  # type: ignore[assignment]
 
 
@@ -55,6 +55,40 @@ def _resolve_sqlalchemy_artifacts() -> Tuple[Any, Any] | None:
         return None
     return column, foreign_key
 
+
+def ensure_accounts_table(metadata: Any) -> None:
+    """Ensure ``metadata`` contains an ``accounts`` table definition."""
+
+    if not SQLALCHEMY_AVAILABLE or Column is None or metadata is None:
+        return
+
+    if hasattr(metadata, "tables") and "accounts" in metadata.tables:
+        return
+
+    try:  # pragma: no cover - depends on optional service availability
+        from services.account_service import Account as _AccountModel
+
+        table = getattr(_AccountModel, "__table__", None)
+        if table is not None:
+            to_metadata = getattr(table, "to_metadata", None)
+            if callable(to_metadata):
+                to_metadata(metadata, name=table.name, schema=getattr(table, "schema", None))
+                return
+            if hasattr(table, "tometadata"):
+                table.tometadata(metadata, name=table.name, schema=getattr(table, "schema", None))
+                return
+    except Exception:
+        pass
+
+    if String is None or Table is None:
+        return
+    Table(
+        "accounts",
+        metadata,
+        Column("account_id", String, primary_key=True),
+        extend_existing=True,
+        info={"aether_shadow": True},
+    )
 
 def _attach_foreign_keys(column: Any, fk: Any) -> None:
     """Ensure the column exposes a ``foreign_keys`` collection."""
