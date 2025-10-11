@@ -31,6 +31,7 @@ _COMMON_MODULES = (
     "services.auth.jwt_tokens",
     "services.analytics",
     "services.oms",
+    "shared",
 )
 
 # Guard re-entrant ``ensure_common_helpers`` calls triggered from module level

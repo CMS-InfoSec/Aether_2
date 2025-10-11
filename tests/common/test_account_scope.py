@@ -3,9 +3,17 @@ from __future__ import annotations
 from uuid import UUID, uuid4
 
 from sqlalchemy import Column, Integer, create_engine
+import pytest
+
 from sqlalchemy.orm import Session, declarative_base
 
-from shared.account_scope import AccountId, account_id_column
+from shared.account_scope import AccountId, SQLALCHEMY_AVAILABLE, account_id_column
+
+
+pytestmark = pytest.mark.skipif(
+    not SQLALCHEMY_AVAILABLE,
+    reason="SQLAlchemy is required to exercise account-scoped persistence",
+)
 
 
 Base = declarative_base()
