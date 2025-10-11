@@ -17,14 +17,14 @@ data:
         metrics_path: /metrics
         static_configs:
           - targets:
-              - risk-api.aether-prod.svc.cluster.local
-              - risk-api.aether-staging.svc.cluster.local
+              - risk-api-prod.aether-prod.svc.cluster.local
+              - risk-api-staging.aether-staging.svc.cluster.local
       - job_name: marketdata-ingestor
         metrics_path: /metrics
         static_configs:
           - targets:
-              - marketdata-ingestor.aether-prod.svc.cluster.local
-              - marketdata-ingestor.aether-staging.svc.cluster.local
+              - marketdata-ingestor-prod.aether-prod.svc.cluster.local
+              - marketdata-ingestor-staging.aether-staging.svc.cluster.local
       - job_name: node-exporter
         kubernetes_sd_configs:
           - role: node

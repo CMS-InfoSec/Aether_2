@@ -1871,6 +1871,20 @@ class TimescaleAdapter:
         config["kill_switch"] = bool(engaged)
         self._persist_risk_config(config)
 
+        try:
+            from metrics import record_kill_switch_state  # type: ignore
+        except Exception:  # pragma: no cover - metrics backend optional
+            record_kill_switch_state = None
+
+        if record_kill_switch_state is not None:
+            try:
+                record_kill_switch_state(self.account_id, engaged)
+            except Exception:  # pragma: no cover - defensive guard for optional deps
+                logger.debug(
+                    "Kill switch metric unavailable; skipping update",
+                    exc_info=logger.isEnabledFor(logging.DEBUG),
+                )
+
         event_payload: Dict[str, Any] = {"state": "engaged" if engaged else "released"}
         if reason:
             event_payload["reason"] = reason
