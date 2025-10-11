@@ -63,6 +63,10 @@ os.environ.setdefault("LOCAL_KMS_MASTER_KEY", _DEFAULT_MASTER_KEY)
 
 os.environ.setdefault("AUTH_JWT_SECRET", "unit-test-secret")
 os.environ.setdefault("AUTH_DATABASE_URL", "sqlite:////tmp/aether-auth-test.db")
+os.environ.setdefault(
+    "DATABASE_URL",
+    "timescale://test:test@localhost:5432/aether_test",
+)
 
 os.environ.setdefault("AZURE_AD_CLIENT_ID", "unit-test-client")
 os.environ.setdefault("AZURE_AD_CLIENT_SECRET", "unit-test-client-secret")

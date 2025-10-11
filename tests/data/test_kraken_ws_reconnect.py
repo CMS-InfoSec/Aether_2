@@ -98,6 +98,7 @@ async def test_consume_reconnects_after_disconnect(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(kraken_ws, "aiohttp", fake_aiohttp)
     monkeypatch.setattr(kraken_ws, "DATABASE_URL", None)
+    monkeypatch.setenv("KRAKEN_WS_ALLOW_INSECURE_DEFAULTS", "1")
     monkeypatch.setattr(kraken_ws, "_require_sqlalchemy", lambda: None)
 
     persisted = []

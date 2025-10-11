@@ -136,15 +136,12 @@ def _require_sqlalchemy() -> None:
         raise MissingDependencyError("SQLAlchemy is required for Kraken ingest") from _SQLALCHEMY_IMPORT_ERROR
 
 
-def _resolve_database_url() -> str | None:
-    """Return the configured Timescale/PostgreSQL DSN used for persistence."""
+def _load_database_url() -> str | None:
+    """Best-effort database URL resolver used during module import."""
 
     raw_url = os.getenv("DATABASE_URL", "").strip()
     if not raw_url:
         if _insecure_defaults_enabled():
-            LOGGER.warning(
-                "DATABASE_URL is not configured; Kraken ingest will persist JSON snapshots locally",
-            )
             return None
         raise RuntimeError(
             "Kraken ingest requires DATABASE_URL to be set to a PostgreSQL/Timescale DSN."
@@ -166,7 +163,29 @@ def _resolve_database_url() -> str | None:
     return database_url
 
 
-DATABASE_URL = _resolve_database_url()
+DATABASE_URL = _load_database_url()
+_WARNED_MISSING_DATABASE_URL = False
+
+
+def _database_url_or_fallback() -> str | None:
+    """Return the configured DSN or raise when insecure defaults are disabled."""
+
+    global _WARNED_MISSING_DATABASE_URL
+
+    if DATABASE_URL:
+        return DATABASE_URL
+
+    if _insecure_defaults_enabled():
+        if not _WARNED_MISSING_DATABASE_URL:
+            LOGGER.warning(
+                "DATABASE_URL is not configured; Kraken ingest will persist JSON snapshots locally",
+            )
+            _WARNED_MISSING_DATABASE_URL = True
+        return None
+
+    raise RuntimeError(
+        "Kraken ingest requires DATABASE_URL to be set to a PostgreSQL/Timescale DSN."
+    )
 NATS_SERVERS = os.getenv("NATS_SERVERS", "nats://localhost:4222").split(",")
 NATS_SUBJECT = os.getenv("NATS_SUBJECT", "marketdata.kraken.orderbook")
 
@@ -508,13 +527,10 @@ async def _stream_websocket(
 async def consume(pairs: Sequence[str], *, max_cycles: int | None = None) -> None:
     _require_sqlalchemy()
     engine: Engine | None = None
-    if (
-        DATABASE_URL
-        and _SQLALCHEMY_AVAILABLE
-        and metadata is not None
-        and orderbook_events_table is not None
-    ):
-        engine = create_engine(DATABASE_URL, future=True)
+    if _SQLALCHEMY_AVAILABLE and metadata is not None and orderbook_events_table is not None:
+        database_url = _database_url_or_fallback()
+        if database_url is not None:
+            engine = create_engine(database_url, future=True)
     producer = kafka_producer()
 
     if aiohttp is None and _insecure_defaults_enabled():
