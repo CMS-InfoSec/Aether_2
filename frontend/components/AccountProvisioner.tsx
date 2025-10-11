@@ -194,7 +194,7 @@ const AccountProvisioner: React.FC = () => {
       const headers: Record<string, string> = {
         "Content-Type": "application/json",
         Accept: "application/json",
-        "X-MFA-Context": mfaContext,
+        "X-MFA-Token": mfaContext,
       };
       if (accessToken) {
         headers.Authorization = `Bearer ${accessToken}`;

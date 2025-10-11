@@ -211,7 +211,7 @@ def test_rotate_secret_triggers_oms_reload(monkeypatch: pytest.MonkeyPatch, capl
                         "api_key": new_key,
                         "api_secret": new_secret,
                     },
-                    headers={"X-Account-ID": account_id, "X-MFA-Context": "verified"},
+                    headers={"X-Account-ID": account_id, "X-MFA-Token": "verified"},
                 )
 
         assert response.status_code == 200

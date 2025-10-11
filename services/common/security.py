@@ -333,8 +333,22 @@ async def ensure_admin_access(
 def require_mfa_context(
     request: Request,
     authorization: Optional[str] = Header(None, alias="Authorization"),
+    x_mfa_token: Optional[str] = Header(None, alias="X-MFA-Token"),
 ) -> str:
     """Ensure the caller has completed MFA challenges via a verified session."""
+
+    token = (x_mfa_token or "").strip()
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing MFA verification token.",
+        )
+
+    if token.lower() != "verified":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="MFA token is invalid or incomplete.",
+        )
 
     principal = require_authenticated_principal(request, authorization)
     if principal.normalized_account not in get_admin_accounts(normalized=True):

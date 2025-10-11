@@ -15,7 +15,7 @@ from shared.k8s import KrakenSecretStore
 
 client = TestClient(app)
 
-MFA_HEADER = {"X-MFA-Context": "verified"}
+MFA_HEADER = {"X-MFA-Token": "verified"}
 
 
 @pytest.fixture(autouse=True)

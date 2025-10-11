@@ -82,7 +82,7 @@ const ApiKeyForm: React.FC = () => {
             headers: {
               Accept: "application/json",
               "X-Account-ID": accountId,
-              "X-MFA-Context": mfaContext,
+              "X-MFA-Token": mfaContext,
               ...(accessToken
                 ? { Authorization: `Bearer ${accessToken}` }
                 : {}),
@@ -191,7 +191,7 @@ const ApiKeyForm: React.FC = () => {
           "Content-Type": "application/json",
           Accept: "application/json",
           "X-Account-ID": accountId,
-          "X-MFA-Context": mfaContext,
+          "X-MFA-Token": mfaContext,
           ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
         },
         body: JSON.stringify(payload),

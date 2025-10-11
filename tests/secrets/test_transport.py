@@ -41,7 +41,7 @@ def test_forwarded_proto_allows_secure_requests(client: TestClient) -> None:
         },
         headers={
             "X-Account-ID": "company",
-            "X-MFA-Context": "verified",
+            "X-MFA-Token": "verified",
             "X-Forwarded-Proto": "https",
         },
     )
@@ -66,7 +66,7 @@ def test_forwarded_proto_rejected_for_untrusted_clients(
         },
         headers={
             "X-Account-ID": "company",
-            "X-MFA-Context": "verified",
+            "X-MFA-Token": "verified",
             "X-Forwarded-Proto": "https",
         },
     )

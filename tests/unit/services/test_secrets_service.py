@@ -76,7 +76,7 @@ def test_rotate_secret_enforces_account_match(secrets_client: TestClient) -> Non
         "api_key": "abcdef",
         "api_secret": "abcdefghijkl",
     }
-    response = secrets_client.post("/secrets/kraken", json=payload, headers={"X-Account-ID": "company", "X-MFA-Context": "verified"})
+    response = secrets_client.post("/secrets/kraken", json=payload, headers={"X-Account-ID": "company", "X-MFA-Token": "verified"})
     assert response.status_code == 403
 
 
@@ -89,7 +89,7 @@ def test_rotate_secret_updates_kubernetes(secrets_client: TestClient, fake_audit
     response = secrets_client.post(
         "/secrets/kraken",
         json=payload,
-        headers={"X-Account-ID": "company", "X-MFA-Context": "verified"},
+        headers={"X-Account-ID": "company", "X-MFA-Token": "verified"},
     )
     assert response.status_code == 204
 
@@ -102,7 +102,7 @@ def test_secret_status_returns_metadata(secrets_client: TestClient) -> None:
     response = secrets_client.get(
         "/secrets/kraken/status",
         params={"account_id": "company"},
-        headers={"X-Account-ID": "company", "X-MFA-Context": "verified"},
+        headers={"X-Account-ID": "company", "X-MFA-Token": "verified"},
     )
     assert response.status_code == 200
     body = response.json()
