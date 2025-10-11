@@ -1,19 +1,16 @@
-"""Compatibility wrapper exposing :mod:`fastapi.testclient` from the local stub."""
+"""Compatibility loader for :mod:`fastapi.testclient`.
+
+The real FastAPI package now ships with the repository.  This module proxies the
+import to the upstream implementation while providing a clear error if the
+optional dependency has not been installed.
+"""
 
 from __future__ import annotations
 
-from . import _ensure_stub
+from shared.dependency_loader import load_dependency
 
-_stub = _ensure_stub()
-try:
-    TestClient = getattr(_stub, "TestClient")
-except AttributeError:  # pragma: no cover - defensive fallback for stub races
-    try:
-        from services.common.fastapi_stub import TestClient as _fallback
-    except Exception as exc:  # pragma: no cover - surface a descriptive import error
-        raise ImportError("FastAPI TestClient is unavailable") from exc
-    else:
-        TestClient = _fallback
+_real_testclient = load_dependency(
+    "fastapi.testclient", install_hint="pip install fastapi"
+)
 
-__all__ = ["TestClient"]
-
+globals().update(vars(_real_testclient))
