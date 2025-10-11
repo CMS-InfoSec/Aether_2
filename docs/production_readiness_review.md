@@ -2,8 +2,8 @@
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| Architecture & Deployment | ❌ Needs Fix | FastAPI workloads reference `fastapi-secrets` keys that are not rendered, the Secrets Service encryption key is managed out-of-band, and risk-service depends on an undefined `compliance-service-database` secret, so pods fail until operators hand-create missing inputs. 【F:deploy/k8s/base/fastapi/deployments.yaml†L27-L114】【F:deploy/k8s/base/secrets/external-secrets.yaml†L1-L204】【F:deploy/k8s/base/aether-services/secret-secrets-service-config.yaml†L1-L6】【F:deploy/k8s/base/aether-services/deployment-risk.yaml†L41-L72】 |
-| Reliability & Observability | ❌ Needs Fix | Prometheus rules target metric names that no service exports (OMS/policy/risk/WS histograms, order-gateway counters, model canary histogram), leaving SLOs unsatisfied despite the kill-switch exporter being wired correctly. 【F:deploy/observability/prometheus/prometheus.yaml†L55-L152】【F:metrics.py†L525-L586】【F:kill_switch.py†L26-L175】【6f6b28†L1-L2】【4ecd18†L1-L2】【a8ce36†L1-L2】 |
+| Architecture & Deployment | ❌ Needs Fix | FastAPI workloads reference `fastapi-secrets` keys that are not rendered, the Secrets Service encryption key is managed out-of-band, risk-service depends on an undefined `compliance-service-database` secret, and the runtime expects TLS secrets (`kafka-tls`, `timescaledb-client-cert`, `aether-risk-tls`, etc.) that have no manifests, so pods fail until operators hand-create missing inputs. 【F:deploy/k8s/base/fastapi/deployments.yaml†L27-L114】【F:deploy/k8s/base/secrets/external-secrets.yaml†L1-L204】【F:deploy/k8s/base/aether-services/secret-secrets-service-config.yaml†L1-L6】【F:deploy/k8s/base/aether-services/deployment-risk.yaml†L41-L72】【F:deploy/k8s/base/fastapi/configmap.yaml†L12-L49】【F:deploy/k8s/base/ingress/ingress.yaml†L27-L41】 |
+| Reliability & Observability | ❌ Needs Fix | Prometheus rules target metric names that no service exports (OMS/policy/risk/WS histograms, order-gateway counters, model canary histogram), and the Kraken ingest Deployment never exposes `/metrics`, leaving SLOs unsatisfied despite the kill-switch exporter being wired correctly. 【F:deploy/observability/prometheus/prometheus.yaml†L55-L152】【F:metrics.py†L525-L586】【F:kill_switch.py†L26-L175】【F:deploy/k8s/base/kraken-ws-ingest/deployment.yaml†L1-L40】【F:services/kraken_ws_ingest.py†L1-L160】【6f6b28†L1-L2】【4ecd18†L1-L2】【a8ce36†L1-L2】 |
 | Security & Compliance | ❌ Needs Fix | Network policies and Dockerfiles are hardened, but the Secrets Service key and every Kraken API credential (`kraken-keys-*`) remain manual, so critical secrets drift outside GitOps. 【F:deploy/k8s/networkpolicy.yaml†L1-L112】【F:deploy/docker/risk-api/Dockerfile†L1-L26】【F:deploy/k8s/base/aether-services/secret-secrets-service-config.yaml†L1-L6】【F:deploy/k8s/base/aether-services/deployment-oms.yaml†L92-L124】【F:docs/runbooks/secrets-service-key-rotation.md†L1-L102】 |
 | Testing & Release Engineering | ❌ Needs Fix | Required dependencies (pytest, pytest-asyncio, aiohttp, cryptography, prometheus_client) are pinned, but the test suite aborts during import because `ADMIN_ALLOWLIST` is read before the defaults from `conftest.py` apply. 【F:requirements-ci.txt†L1-L12】【F:services/common/security.py†L71-L136】【F:conftest.py†L24-L36】【3aaabe†L1-L19】 |
 | Data Integrity & Backup | ✅ Ready | TimescaleDB and Redis run as StatefulSets with PVCs, the DR playbook bootstraps its log table automatically, and the backup job ships restore routines for TimescaleDB and MLflow artifacts. 【F:deploy/k8s/base/timescaledb/statefulset.yaml†L1-L112】【F:deploy/k8s/base/redis/deployment.yaml†L1-L40】【F:dr_playbook.py†L442-L520】【F:tests/ops/test_dr_playbook.py†L157-L181】【F:ops/backup/backup_job.py†L520-L620】 |
@@ -17,18 +17,23 @@
 * `fastapi-secrets` only exposes JWT/API credentials. The FastAPI deployments pull `REDIS_URL`/`NATS_URL` keys from that secret, so the pods fail configuration resolution until those keys are added. 【F:deploy/k8s/base/fastapi/deployments.yaml†L27-L114】【F:deploy/k8s/base/secrets/external-secrets.yaml†L179-L204】
 * The Secrets Service requires a `secrets-service-config` secret containing `SECRET_ENCRYPTION_KEY`, but the base manifest intentionally omits it. Operators currently follow the rotation runbook to apply it manually, leaving no GitOps trace. 【F:deploy/k8s/base/aether-services/secret-secrets-service-config.yaml†L1-L6】【F:docs/runbooks/secrets-service-key-rotation.md†L27-L92】
 * Risk Service also needs `COMPLIANCE_DATABASE_URL` and `COMPLIANCE_DB_SSLMODE`, yet no ExternalSecret or sealed secret ships those values (`compliance-service-database` is undeclared), so the deployment dereferences a secret that Git never provisions. 【F:deploy/k8s/base/aether-services/deployment-risk.yaml†L41-L72】【F:deploy/k8s/base/secrets/external-secrets.yaml†L1-L204】
+* TLS configuration in `fastapi-config` references Kubernetes secrets for Kafka, NATS, TimescaleDB, Redis, and Feast client certificates (`kafka-tls`, `timescaledb-client-cert`, etc.), but the repository does not define any manifests for them. 【F:deploy/k8s/base/fastapi/configmap.yaml†L12-L49】
+* The ingress for risk-service requires the `aether-risk-tls` secret, yet no ExternalSecret or certificate definition is present. 【F:deploy/k8s/base/ingress/ingress.yaml†L27-L41】
 
 **Remediation Tasks**
 
 * RMT-001 — Populate `REDIS_URL` and `NATS_URL` entries in the `fastapi-secrets` ExternalSecret so API pods receive all required connection strings. Files: `deploy/k8s/base/secrets/external-secrets.yaml`. Severity: Critical. Owner: Platform. Status: Pending.
 * RMT-002 — Manage the Secrets Service encryption key through an ExternalSecret or sealed secret committed to GitOps overlays instead of manual applies. Files: `deploy/k8s/base/aether-services/secret-secrets-service-config.yaml`, overlays. Severity: Critical. Owner: Security Platform. Status: Pending.
 * RMT-009 — Provide a GitOps-managed secret (`compliance-service-database`) for the Risk Service to source compliance DSNs/SSL flags. Files: `deploy/k8s/base/secrets/`, Vault config. Severity: Critical. Owner: Compliance Platform. Status: Pending.
+* RMT-012 — Define ExternalSecrets (or cert-manager resources) for Kafka/NATS/Timescale/Redis/Feast TLS client secrets referenced by `fastapi-config` so API pods can establish encrypted connections. Files: `deploy/k8s/base/fastapi/configmap.yaml`, `deploy/k8s/base/secrets/`. Severity: Critical. Owner: Platform. Status: Pending.
+* RMT-013 — Create a GitOps-managed TLS certificate (`aether-risk-tls`) for the risk ingress instead of relying on a manually provisioned secret. Files: `deploy/k8s/base/ingress/ingress.yaml`, `deploy/k8s/base/secrets/`. Severity: High. Owner: Platform. Status: Pending.
 
 ## Reliability & Observability
 
 * The Prometheus rule set queries histograms and counters named `oms_order_latency_seconds`, `policy_latency_ms`, `risk_latency_ms`, and `ws_delivery_latency_seconds`. The instrumentation library exports differently named histograms (`oms_submit_latency`, `policy_inference_latency`, `risk_validation_latency`) and has no WebSocket delivery metric or order-gateway counters, so every alert stays silent. 【F:deploy/observability/prometheus/prometheus.yaml†L55-L152】【F:metrics.py†L525-L586】【4ecd18†L1-L2】【a8ce36†L1-L2】
 * The `model_canary_promotion_duration_minutes_*` histogram referenced in alerts and dashboards is never emitted anywhere in the repository. 【F:deploy/observability/prometheus/prometheus.yaml†L138-L152】【6f6b28†L1-L2】
 * The kill-switch service still exports `kill_switch_response_seconds`, so that SLO path remains valid once the alert queries are corrected. 【F:kill_switch.py†L26-L175】
+* `kraken-ws-ingest` is deployed without a HTTP listener or Prometheus exporter, so it never services `/metrics` scrapes. 【F:deploy/k8s/base/kraken-ws-ingest/deployment.yaml†L1-L40】【F:services/kraken_ws_ingest.py†L1-L160】
 
 **Remediation Tasks**
 
@@ -36,6 +41,7 @@
 * RMT-004 — Implement `model_canary_promotion_duration_minutes` (or adjust alerts to the emitted metric) so canary SLOs observe real data. Files: ML canary pipeline, `deploy/observability/prometheus/prometheus.yaml`. Severity: High. Owner: ML Ops. Status: Pending.
 * RMT-005 — Add order-gateway exported counters (`*_orders_total`, `*_fee_spend_usd`, etc.) or prune the unused Prometheus rules to eliminate blind alerts. Files: Order Gateway service, Prometheus rules. Severity: High. Owner: OMS Team. Status: Pending.
 * RMT-010 — Emit `ws_delivery_latency_seconds` (or update alerts/dashboards to the actual ingest metric) so WebSocket latency SLOs observe live data. Files: Kraken ingest services, `metrics.py`, Prometheus rules. Severity: High. Owner: Data Platform. Status: Pending.
+* RMT-014 — Expose Prometheus metrics from `kraken-ws-ingest` (e.g., via `prometheus_client` HTTP server) so observability stacks can scrape ingestion health. Files: `services/kraken_ws_ingest.py`, `deploy/k8s/base/kraken-ws-ingest/deployment.yaml`. Severity: Medium. Owner: Data Platform. Status: Pending.
 
 ## Security & Compliance
 
@@ -83,6 +89,6 @@
 
 ## Ongoing Monitoring
 
-* Track completion of RMT-001/002/008/009/011 so all mandatory secrets (FastAPI, Secrets Service, platform allowlists, compliance DSNs, Kraken API keys) are delivered by GitOps before the next deployment window.
-* Once RMT-003 through RMT-005 and RMT-010 are complete, re-run Prometheus rule validation to confirm the corrected metrics emit data across staging.
+* Track completion of RMT-001/002/008/009/011/012/013 so all mandatory secrets (FastAPI, Secrets Service, platform allowlists, compliance DSNs, TLS client certs, Kraken API keys, ingress certificates) are delivered by GitOps before the next deployment window.
+* Once RMT-003 through RMT-005, RMT-010, and RMT-014 are complete, re-run Prometheus rule validation to confirm the corrected metrics emit data across staging.
 * Re-run `pytest --maxfail=1 --disable-warnings` after addressing RMT-007 to keep the CI gate green. 【3aaabe†L1-L19】
