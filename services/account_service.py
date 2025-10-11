@@ -19,6 +19,9 @@ from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Path as FastAPIPath, status
 
+if FastAPIPath is Path:  # pragma: no cover - fallback for stub environments
+    from services.common.fastapi_stub import Path as FastAPIPath  # type: ignore[assignment]
+
 from metrics import setup_metrics
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import (
@@ -168,8 +171,14 @@ class CurrentUser:
     role: str
     account_ids: set[UUID]
 
+    def _normalized_role(self) -> str:
+        return self.role.strip().lower()
+
+    def has_management_rights(self) -> bool:
+        return self._normalized_role() in {Role.ADMIN, Role.DIRECTOR}
+
     def can_access(self, account_id: UUID) -> bool:
-        if self.role == Role.ADMIN:
+        if self._normalized_role() == Role.ADMIN:
             return True
         return account_id in self.account_ids
 
@@ -208,7 +217,7 @@ def get_current_user(
     except Exception as exc:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid user") from exc
 
-    role_value = role or Role.DIRECTOR
+    role_value = (role or Role.DIRECTOR).strip().lower()
     allowed = _parse_uuid_list(account_ids)
     return CurrentUser(user_id=user_uuid, role=role_value, account_ids=allowed)
 
@@ -459,8 +468,11 @@ def create_account(
     session: Session = Depends(get_session),
     user: CurrentUser = Depends(get_current_user),
 ) -> AccountCreateResponse:
-    if user.role != Role.ADMIN:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only admins can create accounts")
+    if not user.has_management_rights():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admin or director roles can create accounts",
+        )
 
     account = Account(
         account_id=uuid4(),
@@ -584,8 +596,11 @@ def delete_account(
     session: Session = Depends(get_session),
     user: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
-    if user.role != Role.ADMIN:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only admins can delete accounts")
+    if not user.has_management_rights():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admin or director roles can delete accounts",
+        )
     account = session.get(Account, payload.account_id)
     if account is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Account not found")
