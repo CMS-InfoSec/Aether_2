@@ -121,7 +121,11 @@ spec:
             runbook: docs/runbooks/websocket_desync.md
             slo_reference: docs/slo.md#websocket-ingest-latency
         - alert: kill_switch_slo_warning
-          expr: max_over_time(kill_switch_response_seconds[5m]) > 45
+          expr: |
+            histogram_quantile(
+              0.99,
+              sum(rate(kill_switch_response_seconds_bucket[5m])) by (le)
+            ) > 45
           for: 1m
           labels:
             severity: critical
@@ -163,7 +167,7 @@ data:
       relabel_configs:
         - source_labels: [__meta_kubernetes_pod_label_app]
           action: keep
-          regex: order-gateway|pricing-service
+          regex: order-gateway|pricing-service|kill-switch
         - source_labels: [__meta_kubernetes_pod_container_port_name]
           action: keep
           regex: http

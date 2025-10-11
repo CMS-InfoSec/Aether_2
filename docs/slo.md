@@ -10,7 +10,7 @@ This document defines the quantitative availability and responsiveness expectati
 | Risk Latency | 95th percentile risk validation latency (`histogram_quantile(0.95, risk_latency_ms_bucket)`) | ≤ 200 ms over rolling 5 minutes | `risk_latency_p95_slo_breach` fires when > 200 ms for 2/3 evaluations |
 | OMS Latency | 95th percentile OMS submission latency (`histogram_quantile(0.95, oms_latency_ms_bucket)`) with a p99 early-warning rule | ≤ 500 ms p95 over rolling 5 minutes (`p99` early warning at 150 ms) | `oms_latency_p95_slo_breach` fires when > 500 ms for 2/3 evaluations; `oms_latency_slo_breach` warns when p99 > 150 ms for 10 minutes |
 | WebSocket Ingest Latency | 99th percentile delta propagation latency (`histogram_quantile(0.99, ws_delivery_latency_seconds_bucket)`) | ≤ 0.300 s over rolling 5 minutes | `ws_latency_slo_breach` fires when > 0.250 s for 3/5 evaluations |
-| Kill-Switch Response | Time from activation command to OMS halt (`kill_switch_response_seconds`) | ≤ 60 s per activation | `kill_switch_slo_warning` fires when > 45 s for a single evaluation |
+| Kill-Switch Response | 99th percentile kill-switch activation latency (`histogram_quantile(0.99, kill_switch_response_seconds_bucket)`) | ≤ 60 s per activation | `kill_switch_slo_warning` fires when p99 > 45 s across a 5-minute window |
 | Model Canary Promotion | Completion time of canary to production promotion (`model_canary_promotion_duration_minutes`) | ≤ 45 minutes for 95% of promotions in 30-day window | `model_canary_promotion_slow` fires when 3 consecutive promotions exceed 30 minutes |
 
 ## Policy Latency
@@ -38,7 +38,7 @@ This document defines the quantitative availability and responsiveness expectati
 - **Runbooks**: Use [`docs/runbooks/websocket_desync.md`](runbooks/websocket_desync.md) for mitigation steps.
 
 ## Kill-Switch Response
-- **Measurement**: `kill_switch_response_seconds` gauges elapsed time between command invocation and confirmation that OMS rejects new orders.
+- **Measurement**: Histogram `kill_switch_response_seconds` tracks elapsed time between command invocation and confirmation that OMS rejects new orders, keyed by activation outcome (`status`).
 - **Target**: Achieve ≤ 60 s response to contain catastrophic exposure.
 - **Alerting**: Prometheus alert `kill_switch_slo_warning` fires if any activation exceeds 45 s so responders can investigate before the SLO budget is consumed.
 - **Runbooks**: Refer to [`docs/runbooks/kill_switch_activation.md`](runbooks/kill_switch_activation.md).

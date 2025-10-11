@@ -37,7 +37,11 @@ spec:
     - name: risk-controls.slo
       rules:
         - alert: kill_switch_slo_warning
-          expr: max_over_time(kill_switch_response_seconds[5m]) > 45
+          expr: |
+            histogram_quantile(
+              0.99,
+              sum(rate(kill_switch_response_seconds_bucket[5m])) by (le)
+            ) > 45
           for: 1m
           labels:
             severity: critical
