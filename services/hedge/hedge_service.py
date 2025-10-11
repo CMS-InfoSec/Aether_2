@@ -29,6 +29,7 @@ from typing import (
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from services.common.security import require_admin_account
+from shared.audit_hooks import AuditEvent, AuditHooks, load_audit_hooks
 
 ValidatorFn = TypeVar("ValidatorFn", bound=Callable[..., Any])
 
@@ -81,6 +82,9 @@ else:  # pragma: no cover - runtime import with graceful fallback
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+TelemetrySink = Callable[["HedgeDecision", "HedgeMetricsRequest"], None]
 
 
 def _parse_datetime(value: object) -> Optional[datetime]:
@@ -484,6 +488,8 @@ class HedgeService:
         drawdown_kill_threshold: float = 0.5,
         drawdown_recovery_threshold: float = 0.25,
         kill_switch_handler: Optional[KillSwitchHandler] = None,
+        telemetry_sink: Optional[TelemetrySink] = None,
+        audit_hooks: Optional[AuditHooks] = None,
     ) -> None:
         self._state_store = state_store or HedgeOverrideStateStore(history_limit=history_limit)
         persisted_override, persisted_history = self._state_store.load()
@@ -492,6 +498,9 @@ class HedgeService:
         self._history: Deque[HedgeHistoryRecord] = deque(persisted_history, maxlen=history_limit)
         self._last_diagnostics: Optional[HedgeDiagnostics] = (
             self._history[0].diagnostics if self._history else None
+        )
+        self._last_governance_snapshot: Optional[Dict[str, object]] = (
+            self._snapshot_from_history(self._history[0]) if self._history else None
         )
         self._stablecoin_peg = stablecoin_peg
         self._stablecoin_threshold = stablecoin_threshold
@@ -510,6 +519,8 @@ class HedgeService:
         )
         self._kill_switch_handler = kill_switch_handler
         self._kill_switch_engaged = False
+        self._telemetry_sink = telemetry_sink or self._default_telemetry_sink
+        self._audit_hooks = audit_hooks
 
     def evaluate(self, metrics: HedgeMetricsRequest) -> HedgeDecision:
         """Compute hedge target, applying overrides and safeguards."""
@@ -518,12 +529,13 @@ class HedgeService:
         self._last_diagnostics = diagnostics
 
         if diagnostics.kill_switch_recommended:
-            if self._kill_switch_handler and not self._kill_switch_engaged:
+            newly_engaged = not self._kill_switch_engaged
+            self._kill_switch_engaged = True
+            if self._kill_switch_handler and newly_engaged:
                 try:
                     self._kill_switch_handler(metrics, diagnostics)
                 except Exception as exc:  # pragma: no cover - defensive logging path
                     LOGGER.warning("Kill switch handler failed: %s", exc)
-                self._kill_switch_engaged = True
         else:
             if metrics.drawdown <= self._drawdown_recovery_threshold:
                 self._kill_switch_engaged = False
@@ -558,6 +570,8 @@ class HedgeService:
                 override=override,
             )
         )
+        self._emit_telemetry(decision, metrics)
+        self._record_governance_decision(decision, metrics)
         return decision
 
     def set_override(self, target_pct: float, reason: str) -> HedgeOverride:
@@ -654,6 +668,39 @@ class HedgeService:
             drawdown_signal,
             0.55 * normalized_volatility + 0.45 * drawdown_signal,
         )
+        previous = self._last_diagnostics
+        if previous is not None:
+            drawdown_delta = metrics.drawdown - previous.drawdown
+            volatility_delta = metrics.volatility - previous.volatility
+            if drawdown_delta > 0.0:
+                combined_risk = min(
+                    combined_risk
+                    + min(drawdown_delta / max(self._drawdown_reference, 0.01), 0.2),
+                    1.0,
+                )
+            elif drawdown_delta < 0.0:
+                combined_risk = max(
+                    combined_risk
+                    - min(abs(drawdown_delta) / max(self._drawdown_reference, 0.01) * 0.1, 0.15),
+                    0.0,
+                )
+
+            if volatility_delta > 0.0:
+                combined_risk = min(
+                    combined_risk
+                    + min(volatility_delta / max(self._volatility_reference, 0.1), 0.15),
+                    1.0,
+                )
+            elif volatility_delta < 0.0:
+                combined_risk = max(
+                    combined_risk
+                    - min(
+                        abs(volatility_delta) / max(self._volatility_reference, 0.1) * 0.05,
+                        0.1,
+                    ),
+                    0.0,
+                )
+
         if metrics.drawdown >= self._drawdown_warning_threshold:
             combined_risk = min(combined_risk + 0.1, 1.0)
 
@@ -709,12 +756,135 @@ class HedgeService:
     def _append_history(self, record: HedgeHistoryRecord) -> None:
         self._history.appendleft(record)
         self._persist_state()
+        self._last_governance_snapshot = self._snapshot_from_history(record)
 
     def _persist_state(self) -> None:
         try:
             self._state_store.persist(self._override, self._history)
         except Exception as exc:  # pragma: no cover - defensive guard
             LOGGER.warning("Failed to persist hedge override snapshot: %s", exc)
+
+    def _default_telemetry_sink(
+        self, decision: "HedgeDecision", metrics: "HedgeMetricsRequest"
+    ) -> None:
+        payload = {
+            "mode": decision.mode,
+            "target_pct": decision.target_pct,
+            "reason": decision.reason,
+            "volatility": decision.diagnostics.volatility,
+            "drawdown": decision.diagnostics.drawdown,
+            "guard_triggered": decision.diagnostics.guard_triggered,
+            "kill_switch_recommended": decision.diagnostics.kill_switch_recommended,
+            "kill_switch_engaged": self._kill_switch_engaged,
+            "account_id": metrics.account_id,
+        }
+        LOGGER.info("hedge.decision", extra={"hedge": payload})
+
+    def _emit_telemetry(
+        self, decision: "HedgeDecision", metrics: "HedgeMetricsRequest"
+    ) -> None:
+        try:
+            self._telemetry_sink(decision, metrics)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            LOGGER.warning("Failed to emit hedge telemetry: %s", exc)
+
+    def _ensure_audit_hooks(self) -> Optional[AuditHooks]:
+        if self._audit_hooks is None:
+            try:
+                self._audit_hooks = load_audit_hooks()
+            except Exception as exc:  # pragma: no cover - defensive guard
+                LOGGER.warning("Failed to load audit hooks: %s", exc)
+                return None
+        return self._audit_hooks
+
+    def _record_governance_decision(
+        self, decision: "HedgeDecision", metrics: "HedgeMetricsRequest"
+    ) -> None:
+        hooks = self._ensure_audit_hooks()
+        if hooks is None:
+            return
+
+        account = metrics.account_id or "global"
+        entity = self._governance_entity(account)
+        before_snapshot = dict(self._last_governance_snapshot or {})
+        after_snapshot = self._build_governance_snapshot(decision)
+
+        context = {
+            "account_id": account,
+            "volatility": decision.diagnostics.volatility,
+            "drawdown": decision.diagnostics.drawdown,
+            "stablecoin": decision.diagnostics.stablecoin_price,
+            "kill_switch_engaged": self._kill_switch_engaged,
+        }
+
+        event = AuditEvent(
+            actor="system",
+            action=f"hedge.decision.{decision.mode}",
+            entity=entity,
+            before=before_snapshot,
+            after=after_snapshot,
+            context=context,
+        )
+        event.log_with_fallback(
+            hooks,
+            LOGGER,
+            failure_message="Failed to record hedge governance decision",
+            disabled_message="Audit logging disabled; skipping hedge decision event",
+        )
+        self._last_governance_snapshot = after_snapshot
+
+    def _snapshot_from_history(self, record: HedgeHistoryRecord) -> Dict[str, object]:
+        diagnostics = record.diagnostics
+        payload: Dict[str, object] = {
+            "mode": record.mode,
+            "target_pct": record.target_pct,
+            "timestamp": record.timestamp.isoformat(),
+        }
+        if record.reason:
+            payload["reason"] = record.reason
+        if diagnostics:
+            payload.update(
+                {
+                    "volatility": diagnostics.volatility,
+                    "drawdown": diagnostics.drawdown,
+                    "guard_triggered": diagnostics.guard_triggered,
+                    "kill_switch_recommended": diagnostics.kill_switch_recommended,
+                    "kill_switch_reason": diagnostics.kill_switch_reason,
+                }
+            )
+            if diagnostics.guard_reason:
+                payload["guard_reason"] = diagnostics.guard_reason
+        if record.override:
+            payload["override"] = record.override.to_json_dict()
+        return payload
+
+    def _build_governance_snapshot(self, decision: "HedgeDecision") -> Dict[str, object]:
+        diagnostics = decision.diagnostics
+        snapshot: Dict[str, object] = {
+            "mode": decision.mode,
+            "target_pct": decision.target_pct,
+            "timestamp": decision.timestamp.isoformat(),
+            "guard_triggered": diagnostics.guard_triggered,
+            "kill_switch_recommended": diagnostics.kill_switch_recommended,
+            "kill_switch_engaged": self._kill_switch_engaged,
+        }
+        if decision.reason:
+            snapshot["reason"] = decision.reason
+        snapshot["volatility"] = diagnostics.volatility
+        snapshot["drawdown"] = diagnostics.drawdown
+        snapshot["stablecoin_price"] = diagnostics.stablecoin_price
+        if diagnostics.guard_reason:
+            snapshot["guard_reason"] = diagnostics.guard_reason
+        if diagnostics.kill_switch_reason:
+            snapshot["kill_switch_reason"] = diagnostics.kill_switch_reason
+        if decision.override:
+            snapshot["override"] = decision.override.to_json_dict()
+        return snapshot
+
+    @staticmethod
+    def _governance_entity(account_id: str) -> str:
+        normalized = (account_id or "").strip().lower()
+        return f"hedge:{normalized or 'global'}"
 
     @staticmethod
     def _clamp(value: float, lower: float, upper: float) -> float:

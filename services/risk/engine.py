@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from compliance_filter import COMPLIANCE_REASON, compliance_filter
 from esg_filter import ESG_REASON, esg_filter
@@ -11,6 +12,10 @@ from services.common.adapters import RedisFeastAdapter, TimescaleAdapter
 from services.common.schemas import RiskValidationRequest, RiskValidationResponse
 from shared.exits import compute_exit_targets
 from services.risk.circuit_breakers import CircuitBreakerDecision, get_circuit_breaker
+from shared.spot import normalize_spot_symbol
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -20,6 +25,7 @@ class RiskEngine:
     account_id: str
     timescale: TimescaleAdapter | None = None
     universe_source: RedisFeastAdapter | None = None
+    balance_loader: Callable[[str], Tuple[Mapping[str, float], Optional[float]]] | None = None
 
     def __post_init__(self) -> None:
         if self.timescale is None:
@@ -32,6 +38,8 @@ class RiskEngine:
         self._circuit_breaker = get_circuit_breaker(
             self.account_id, timescale=self.timescale
         )
+        if self.balance_loader is None:
+            self.balance_loader = self._default_balance_loader
 
     def validate(self, request: RiskValidationRequest) -> RiskValidationResponse:
         if self.timescale is None:
@@ -47,6 +55,8 @@ class RiskEngine:
             "loss_to_date": request.portfolio_state.loss_to_date,
             "fee_to_date": request.portfolio_state.fee_to_date,
         }
+
+        self._apply_live_balances(request, context)
 
         decision_payload = request.intent.policy_decision
         decision_request = decision_payload.request
@@ -65,6 +75,18 @@ class RiskEngine:
             take_profit_bps=take_profit_bps,
             stop_loss_bps=stop_loss_bps,
         )
+
+        adjusted_stop_loss = self._apply_stop_loss_cash_guard(
+            side=decision_request.side,
+            price=decision_request.price,
+            quantity=decision_request.quantity,
+            instrument=decision_request.instrument,
+            stop_loss=exit_stop_loss,
+            available_cash=request.portfolio_state.available_cash,
+        )
+        if adjusted_stop_loss != exit_stop_loss:
+            context["stop_loss_adjusted_for_cash"] = True
+            exit_stop_loss = adjusted_stop_loss
 
         if self._config.get("kill_switch", False):
             reason = "Risk kill switch engaged for account"
@@ -118,6 +140,136 @@ class RiskEngine:
             take_profit=exit_take_profit,
             stop_loss=exit_stop_loss,
         )
+
+    # ------------------------------------------------------------------
+    # Live balance helpers
+    # ------------------------------------------------------------------
+    def _default_balance_loader(
+        self, account_id: str
+    ) -> Tuple[Mapping[str, float], Optional[float]]:
+        if self.timescale is None:
+            return {}, None
+        exposures: Mapping[str, float]
+        try:
+            exposures = self.timescale.open_positions()
+        except Exception as exc:  # pragma: no cover - defensive guard
+            LOGGER.warning("Failed to load live exposures for %s: %s", account_id, exc)
+            exposures = {}
+
+        available_cash: Optional[float] = None
+        cash_attr = getattr(self.timescale, "available_cash", None)
+        if callable(cash_attr):  # pragma: no cover - exercised via integration tests
+            try:
+                available_cash = cash_attr()
+            except Exception as exc:  # pragma: no cover - defensive guard
+                LOGGER.warning("Failed to fetch available cash for %s: %s", account_id, exc)
+        elif isinstance(cash_attr, (int, float)):
+            available_cash = float(cash_attr)
+
+        return exposures, available_cash
+
+    def _apply_live_balances(
+        self,
+        request: RiskValidationRequest,
+        context: Dict[str, Any],
+    ) -> None:
+        if self.balance_loader is None:
+            return
+        try:
+            exposures, available_cash = self.balance_loader(self.account_id)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            LOGGER.warning("Balance loader failed for %s: %s", self.account_id, exc)
+            exposures, available_cash = {}, None
+
+        normalized_exposures: Dict[str, float] = {}
+        for symbol, notional in exposures.items():
+            normalized_symbol = normalize_spot_symbol(symbol) or str(symbol)
+            try:
+                normalized_exposures[normalized_symbol] = abs(float(notional))
+            except (TypeError, ValueError):  # pragma: no cover - defensive guard
+                continue
+
+        if normalized_exposures:
+            request.portfolio_state.instrument_exposure.update(normalized_exposures)
+            context["live_exposures"] = dict(normalized_exposures)
+
+        if available_cash is not None:
+            try:
+                request.portfolio_state.available_cash = max(float(available_cash), 0.0)
+            except (TypeError, ValueError):  # pragma: no cover - defensive guard
+                request.portfolio_state.available_cash = None
+            else:
+                context["live_available_cash"] = request.portfolio_state.available_cash
+
+        instrument = request.instrument or request.intent.policy_decision.request.instrument
+        normalized_instrument = normalize_spot_symbol(instrument) or str(instrument)
+        current_exposure = float(
+            abs(
+                request.portfolio_state.instrument_exposure.get(normalized_instrument, 0.0)
+            )
+        )
+        gross_notional = abs(
+            float(
+                request.gross_notional
+                if request.gross_notional is not None
+                else request.intent.metrics.gross_notional or 0.0
+            )
+        )
+        request.net_exposure = current_exposure + gross_notional
+        context["live_instrument_exposure"] = current_exposure
+
+    def _apply_stop_loss_cash_guard(
+        self,
+        *,
+        side: str,
+        price: float,
+        quantity: float,
+        instrument: Optional[str],
+        stop_loss: Optional[float],
+        available_cash: Optional[float],
+    ) -> Optional[float]:
+        if stop_loss is None or available_cash is None:
+            return stop_loss
+
+        side_normalized = (side or "").upper()
+        try:
+            price_value = float(price)
+            quantity_value = float(quantity)
+        except (TypeError, ValueError):  # pragma: no cover - defensive guard
+            return stop_loss
+
+        if quantity_value <= 0 or price_value <= 0:
+            return stop_loss
+
+        available = max(float(available_cash), 0.0)
+        if available <= 0:
+            return stop_loss
+
+        if side_normalized == "BUY":
+            potential_loss_per_unit = max(price_value - stop_loss, 0.0)
+        else:
+            potential_loss_per_unit = max(stop_loss - price_value, 0.0)
+
+        potential_loss = potential_loss_per_unit * quantity_value
+        if potential_loss <= available or potential_loss_per_unit <= 0:
+            return stop_loss
+
+        max_loss_per_unit = available / quantity_value
+        if side_normalized == "BUY":
+            adjusted_stop = max(price_value - max_loss_per_unit, 0.0)
+        else:
+            adjusted_stop = price_value + max_loss_per_unit
+
+        LOGGER.info(
+            "Adjusted stop loss to respect live cash balance",
+            extra={
+                "instrument": instrument,
+                "original_stop": stop_loss,
+                "adjusted_stop": adjusted_stop,
+                "available_cash": available,
+            },
+        )
+        return round(adjusted_stop, 8)
 
     # ------------------------------------------------------------------
     # Validation helpers
