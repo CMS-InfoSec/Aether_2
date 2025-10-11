@@ -13,7 +13,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Any, Callable, Dict, Iterable, Mapping
+from typing import Any, Callable, Dict, Iterable, Iterator, Mapping
 from urllib.parse import parse_qsl, urlparse, urlunparse
 
 import pytest
@@ -58,22 +58,65 @@ if str(ROOT) not in sys.path:
 
 
 _DEFAULT_MASTER_KEY = base64.b64encode(b"\x00" * 32).decode("ascii")
-os.environ.setdefault("SECRET_ENCRYPTION_KEY", _DEFAULT_MASTER_KEY)
-os.environ.setdefault("LOCAL_KMS_MASTER_KEY", _DEFAULT_MASTER_KEY)
 
-os.environ.setdefault("AUTH_JWT_SECRET", "unit-test-secret")
-os.environ.setdefault("AUTH_DATABASE_URL", "sqlite:////tmp/aether-auth-test.db")
-os.environ.setdefault(
-    "DATABASE_URL",
-    "timescale://test:test@localhost:5432/aether_test",
+_SAFE_ENV_DEFAULTS: Dict[str, str] = {
+    "SECRET_ENCRYPTION_KEY": _DEFAULT_MASTER_KEY,
+    "LOCAL_KMS_MASTER_KEY": _DEFAULT_MASTER_KEY,
+    "AUTH_JWT_SECRET": "unit-test-secret",
+    "AUTH_DATABASE_URL": "sqlite:////tmp/aether-auth-test.db",
+    "DATABASE_URL": "timescale://test:test@localhost:5432/aether_test",
+    "AZURE_AD_CLIENT_ID": "unit-test-client",
+    "AZURE_AD_CLIENT_SECRET": "unit-test-client-secret",
+    "SESSION_REDIS_URL": "memory://oms-test",
+    "TIMESCALE_DSN": "postgresql://localhost:5432/aether_test",
+}
+
+for _env_name, _placeholder in _SAFE_ENV_DEFAULTS.items():
+    os.environ.setdefault(_env_name, _placeholder)
+
+_PLACEHOLDER_MARKERS = (
+    "test",
+    "unit",
+    "fake",
+    "dummy",
+    "placeholder",
+    "localhost",
+    "memory://",
+    "sqlite://",
+    "timescale://test",
+    "postgresql://localhost",
 )
 
-os.environ.setdefault("AZURE_AD_CLIENT_ID", "unit-test-client")
-os.environ.setdefault("AZURE_AD_CLIENT_SECRET", "unit-test-client-secret")
 
-os.environ.setdefault("SESSION_REDIS_URL", "memory://oms-test")
+def _looks_like_placeholder(value: str, expected: str) -> bool:
+    if value == expected:
+        return True
+    normalized = value.strip().lower()
+    return any(marker in normalized for marker in _PLACEHOLDER_MARKERS)
 
-os.environ.setdefault("TIMESCALE_DSN", "postgresql://localhost:5432/aether_test")
+
+@pytest.fixture(scope="session", autouse=True)
+def _enforce_isolated_test_environment() -> Iterator[None]:
+    """Prevent tests from booting when production credentials leak into CI."""
+
+    if os.environ.get("ALLOW_NON_PLACEHOLDER_TEST_ENV") == "1":
+        yield
+        return
+
+    violations = {
+        name: os.environ[name]
+        for name, expected in _SAFE_ENV_DEFAULTS.items()
+        if name in os.environ and not _looks_like_placeholder(os.environ[name], expected)
+    }
+
+    if violations:
+        formatted = ", ".join(sorted(violations))
+        raise RuntimeError(
+            "Refusing to run pytest with potential production credentials set: "
+            f"{formatted}. Set ALLOW_NON_PLACEHOLDER_TEST_ENV=1 to override explicitly."
+        )
+
+    yield
 
 
 
