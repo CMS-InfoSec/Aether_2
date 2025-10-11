@@ -42,12 +42,12 @@ from shared.audit import AuditLogStore, TimescaleAuditLogger
 from shared.postgres import normalize_sqlalchemy_dsn
 from shared.pydantic_compat import model_dump
 
+from ml.experiment_tracking.model_registry import register_model as registry_register_model
+
 try:  # pragma: no cover - optional dependency in minimal environments.
     import mlflow
-    from mlflow.exceptions import MlflowException
 except Exception:  # pragma: no cover - gracefully degrade when MLflow absent.
     mlflow = None  # type: ignore
-    MlflowException = Exception  # type: ignore
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -613,7 +613,6 @@ def _register_model(
         logger.warning("MLflow registry model name not configured; skipping registration")
         return None
 
-    client = mlflow.tracking.MlflowClient()
     # Ensure a minimal artifact exists under "model" for registration.
     model_dir = artifact_dir / "model"
     model_dir.mkdir(parents=True, exist_ok=True)
@@ -633,45 +632,29 @@ def _register_model(
     except Exception as exc:  # pragma: no cover - degrade gracefully
         logger.warning("Failed to attach model artifacts prior to registration: %s", exc)
 
-    model_uri = f"runs:/{mlflow_run_id}/model"
     try:
-        result = mlflow.register_model(model_uri, MLFLOW_REGISTRY_MODEL_NAME)
-    except MlflowException as exc:
-        logger.error("MLflow registration failed: %s", exc, extra={"correlation_id": correlation_id})
-        return None
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.error("Unexpected MLflow error: %s", exc, extra={"correlation_id": correlation_id})
-        return None
-
-    try:
-        client.set_model_version_tag(
+        registered = registry_register_model(
+            run_id=mlflow_run_id,
             name=MLFLOW_REGISTRY_MODEL_NAME,
-            version=result.version,
-            key="feature_version",
-            value=request.feature_version,
+            stage="staging",
+            tags={
+                "feature_version": request.feature_version,
+                "label_horizon": request.label_horizon,
+            },
         )
-        client.set_model_version_tag(
-            name=MLFLOW_REGISTRY_MODEL_NAME,
-            version=result.version,
-            key="label_horizon",
-            value=request.label_horizon,
-        )
-        client.transition_model_version_stage(
-            name=MLFLOW_REGISTRY_MODEL_NAME,
-            version=result.version,
-            stage="Staging",
-            archive_existing_versions=False,
-        )
-        logger.info(
-            "Registered MLflow model version %s for run %s",
-            result.version,
-            mlflow_run_id,
+    except (ImportError, RuntimeError, ValueError) as exc:
+        logger.error(
+            "Model registry integration failed: %s",
+            exc,
             extra={"correlation_id": correlation_id},
         )
-        return result.version
-    except Exception as exc:  # pragma: no cover - degrade gracefully
-        logger.error("Failed to tag/transition model version: %s", exc, extra={"correlation_id": correlation_id})
-        return str(result.version)
+        return None
+
+    version_value = getattr(registered, "version", None)
+    logger.info(
+        "Registered model version %s for run %s", version_value, mlflow_run_id, extra={"correlation_id": correlation_id}
+    )
+    return str(version_value) if version_value is not None else None
 
 
 T = TypeVar("T")
