@@ -30,6 +30,11 @@ LOGGER = logging.getLogger("dr_playbook")
 from common.utils.tar import safe_extract_tar
 
 
+# Cache of log tables that were already created in this process to avoid
+# issuing ``CREATE TABLE IF NOT EXISTS`` on every write.
+_LOG_TABLE_BOOTSTRAPPED: set[str] = set()
+
+
 try:  # pragma: no cover - optional dependency exercised in integration tests
     import psycopg
     from psycopg import sql
@@ -441,12 +446,36 @@ def _log_dr_action(config: DisasterRecoveryConfig, action: str) -> None:
         ) from _PSYCOPG_IMPORT_ERROR
 
     LOGGER.debug("Recording DR action '%s' for actor '%s'", action, config.actor)
-    query = sql.SQL(
+    insert_query = sql.SQL(
         "INSERT INTO {table} (actor, action, ts) VALUES (%s, %s, NOW())"
     ).format(table=sql.Identifier(config.log_table))
     with psycopg.connect(config.timescale_dsn, autocommit=True) as conn:  # type: ignore[arg-type]
+        _ensure_log_table_exists(conn, config.log_table)
         with conn.cursor() as cur:
-            cur.execute(query, (config.actor, action))
+            cur.execute(insert_query, (config.actor, action))
+
+
+def _ensure_log_table_exists(conn: Any, table_name: str) -> None:
+    """Ensure the disaster recovery log table exists."""
+
+    if table_name in _LOG_TABLE_BOOTSTRAPPED:
+        return
+
+    create_query = sql.SQL(
+        """
+        CREATE TABLE IF NOT EXISTS {table} (
+            id BIGSERIAL PRIMARY KEY,
+            actor TEXT NOT NULL,
+            action TEXT NOT NULL,
+            ts TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """
+    ).format(table=sql.Identifier(table_name))
+
+    with conn.cursor() as cur:
+        cur.execute(create_query)
+
+    _LOG_TABLE_BOOTSTRAPPED.add(table_name)
 
 
 def restore_cluster(
