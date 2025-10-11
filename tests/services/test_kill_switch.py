@@ -3,10 +3,16 @@ from copy import deepcopy
 from datetime import datetime
 from typing import Any, Dict, List, Tuple
 
+import os
+
+os.environ.setdefault("ADMIN_ALLOWLIST", "company")
+os.environ.setdefault("DIRECTOR_ALLOWLIST", "company")
+
 import pytest
 from fastapi.testclient import TestClient
 
 from kill_switch import KillSwitchReason, app
+from metrics import record_kill_switch_state
 from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
 
 
@@ -51,6 +57,7 @@ class _FakeTimescaleAdapter:
             event_payload["actor"] = actor
         events = self._events.setdefault(self.account_id, [])
         events.append({"type": "kill_switch_engaged" if engaged else "kill_switch_released", **event_payload})
+        record_kill_switch_state(self.account_id, engaged)
 
     def load_risk_config(self) -> Dict[str, Any]:
         return deepcopy(self._config())
@@ -199,6 +206,38 @@ def test_trigger_kill_switch_publishes_event_and_sets_state(monkeypatch: pytest.
     parsed_body = json.loads(body.decode("utf-8"))
     assert parsed_body["account_id"] == "alpha"
     assert "X-Signature" in headers
+
+
+def test_metrics_endpoint_exposes_kill_switch_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = TestClient(app)
+
+    _configure_env(monkeypatch)
+    record_kill_switch_state("omega", False)
+
+    def _fake_post(url: str, **kwargs: Any) -> _DummyResponse:
+        if url == "https://sendgrid.test/mail/send":
+            return _DummyResponse(status_code=202)
+        if url == "https://twilio.test/messages":
+            return _DummyResponse(status_code=201)
+        if url == "https://hooks.internal/kill-switch":
+            return _DummyResponse(status_code=200)
+        raise AssertionError(f"Unexpected URL {url}")
+
+    monkeypatch.setattr("kill_alerts.requests.post", _fake_post)
+
+    response = client.post(
+        "/risk/kill",
+        params={"account_id": "Omega", "reason_code": KillSwitchReason.LATENCY_STALL.value},
+        headers={"X-Account-ID": "company"},
+    )
+
+    assert response.status_code == 200
+
+    metrics_response = client.get("/metrics")
+    assert metrics_response.status_code == 200
+    payload = metrics_response.text
+    assert "kill_switch_state{account_id=\"omega\"}" in payload
+    assert "kill_switch_state{account_id=\"omega\"} 1" in payload
 
 
 def test_list_kill_events_endpoint_returns_recent_events(monkeypatch: pytest.MonkeyPatch) -> None:
