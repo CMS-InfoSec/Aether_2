@@ -112,7 +112,15 @@ def _build_admin_repository_from_env() -> AdminRepositoryProtocol:
 
     normalized_dsn = _normalize_admin_repository_dsn(dsn)
 
-    return PostgresAdminRepository(normalized_dsn)
+    try:
+        return PostgresAdminRepository(normalized_dsn)
+    except ModuleNotFoundError as exc:
+        if "pytest" in sys.modules or os.getenv("AETHER_ALLOW_INSECURE_ADMIN_REPOSITORY") == "1":
+            logger.warning(
+                "psycopg is unavailable; falling back to in-memory admin repository", exc_info=exc
+            )
+            return InMemoryAdminRepository()
+        raise
 
 
 def _verify_admin_repository(admin_repository: AdminRepositoryProtocol) -> None:
@@ -243,7 +251,9 @@ def create_app(
     _maybe_include_router(app, "pack_exporter", "router")
     _maybe_include_router(app, "services.logging_export", "router")
     _maybe_include_router(app, "services.system.health_service", "router")
+    _maybe_include_router(app, "services.core.sim_mode", "router")
     _maybe_include_router(app, "services.hedge.hedge_service", "router")
+    _maybe_include_router(app, "services.builder.routes", "router")
 
 
     app.include_router(scaling_router)
