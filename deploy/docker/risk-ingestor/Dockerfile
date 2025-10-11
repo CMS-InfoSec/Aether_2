@@ -8,7 +8,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y build-essential libpq-dev \
+    && apt-get install --no-install-recommends -y build-essential libpq-dev libssl-dev openssl \
     && addgroup --system appuser \
     && adduser --system --ingroup appuser appuser \
     && rm -rf /var/lib/apt/lists/*
