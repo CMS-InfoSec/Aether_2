@@ -560,6 +560,13 @@ _reorder_buffer_depth = Gauge(
     registry=_REGISTRY,
 )
 
+_kill_switch_state = Gauge(
+    "kill_switch_state",
+    "Binary indicator of whether the kill switch is engaged for an account.",
+    ["account_id"],
+    registry=_REGISTRY,
+)
+
 _METRICS: Dict[str, Counter | Gauge | Histogram] = {
     "trades_submitted_total": _trades_submitted_total,
     "trades_rejected_total": _trades_rejected_total,
@@ -590,6 +597,7 @@ _METRICS: Dict[str, Counter | Gauge | Histogram] = {
     "scaling_pending_training_jobs": _scaling_pending_training_jobs,
     "scaling_evaluation_duration_seconds": _scaling_evaluation_duration_seconds,
     "scaling_evaluations_total": _scaling_evaluations_total,
+    "kill_switch_state": _kill_switch_state,
 }
 
 _INITIALISED = False
@@ -602,6 +610,11 @@ def _account_value(account_id: Optional[str] = None) -> str:
         return "unknown"
     value = str(account_id).strip()
     return value or "unknown"
+
+
+def _normalized_account_label(account_id: Optional[str] = None) -> str:
+    value = _account_value(account_id)
+    return value.lower()
 
 
 def _derive_account_segment(account_id: Optional[str]) -> AccountSegment:
@@ -843,6 +856,8 @@ def init_metrics(service_name: str = "service") -> Dict[str, Counter | Gauge | H
         symbol_tier=SymbolTier.UNKNOWN.value,
     ).set(0.0)
 
+    _kill_switch_state.labels(account_id=base_account_id).set(0.0)
+
     return _METRICS
 
 
@@ -865,6 +880,16 @@ def metric_context(
         symbol_tier=symbol_tier,
         transport=transport,
     )
+
+
+def record_kill_switch_state(account_id: str, engaged: bool) -> None:
+    """Record the engagement state of the kill switch for an account."""
+
+    try:
+        value = 1.0 if engaged else 0.0
+        _kill_switch_state.labels(account_id=_normalized_account_label(account_id)).set(value)
+    except Exception:  # pragma: no cover - prometheus optional in some environments
+        logger.debug("Kill switch metric unavailable; skipping update")
 
 
 @contextmanager

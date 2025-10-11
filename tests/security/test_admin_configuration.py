@@ -96,6 +96,27 @@ def test_missing_director_allowlist_is_rejected(monkeypatch) -> None:
     security.reload_admin_accounts()
 
 
+def test_require_admin_account_fails_when_allowlists_missing(monkeypatch) -> None:
+    monkeypatch.delenv("ADMIN_ALLOWLIST", raising=False)
+    monkeypatch.delenv("DIRECTOR_ALLOWLIST", raising=False)
+
+    # Ensure lazy reload succeeds even when the environment is not configured.
+    security.reload_admin_accounts(strict=False)
+
+    store = InMemorySessionStore()
+    session = store.create("company")
+    request = _build_request(store)
+
+    with pytest.raises(fastapi.HTTPException) as excinfo:
+        security.require_admin_account(request, authorization=f"Bearer {session.token}")
+
+    assert excinfo.value.status_code == fastapi.status.HTTP_500_INTERNAL_SERVER_ERROR
+
+    monkeypatch.setenv("ADMIN_ALLOWLIST", "company,director-1,director-2")
+    monkeypatch.setenv("DIRECTOR_ALLOWLIST", "director-1,director-2")
+    security.reload_admin_accounts()
+
+
 def test_director_allowlist_can_be_configured_independently(configure_admin_accounts) -> None:
     configure_admin_accounts(
         "company,director-1",
