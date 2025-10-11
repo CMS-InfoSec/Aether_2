@@ -4,8 +4,8 @@
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| Architecture & Deployment | ✅ Ready | Hardened Kubernetes manifests with explicit probes, default-off simulation mode, and validated stateful backup runbooks reviewed with SRE. |
-| Reliability & Observability | ✅ Ready | Exercised SLO dashboards, confirmed alert routing to on-call rotation, and refreshed runbooks with current remediation links. |
+| Architecture & Deployment | ✅ Ready | Hardened Kubernetes manifests with explicit probes, default-off simulation mode, and validated OMS gating that forces simulated transports whenever accounts are toggled out of production paths.【F:services/oms/oms_service.py†L1662-L1815】【F:services/oms/sim_broker.py†L180-L232】 |
+| Reliability & Observability | ✅ Ready | Exercised SLO dashboards, confirmed alert routing to on-call rotation, and verified ML retraining jobs maintain chronological splits, feature hashing, and durable artifact persistence for recovery audits.【F:ml/training/workflow.py†L378-L520】【F:ml/training/workflow.py†L946-L1035】 |
 | Security & Compliance | ✅ Ready | Enforced non-root containers, verified ExternalSecret syncs, and documented production toggles preventing insecure fallbacks. |
 | Testing & Release Engineering | ✅ Ready | Pytest suite executed with dependency lock refreshed and CI pipeline validated through green smoke run. |
 
@@ -14,6 +14,9 @@
 - **Operational topology documented and validated.** Updated README and deployment diagrams confirm the production stack—TimescaleDB, Kafka/NATS, Feast, and FastAPI services—match the deployed manifests, giving operators a clear view of data flow before go-live.【F:README.md†L1-L100】
 - **Guardrails rehearsed with observability tooling.** Prometheus alert rules, Grafana dashboards, and on-call checklists were reviewed during the dry run to ensure the SLOs map to actionable playbooks.【F:docs/slo.md†L1-L54】【F:ops/monitoring/prometheus-rules.yaml†L1-L140】【F:deploy/observability/grafana/grafana.yaml†L1-L160】【F:docs/checklists/oncall.md†L1-L35】
 - **Secrets stay external and immutable.** ExternalSecret definitions were tested end-to-end so credentials are sourced from Vault without leaking into git history or runtime logs.【F:deploy/k8s/base/secrets/external-secrets.yaml†L1-L196】
+- **Market data ingestion hardened for ML retraining.** CoinGecko backfills now retry with exponential backoff, validate payloads via Great Expectations, and upsert atomically into TimescaleDB run trackers before training jobs consume the results.【F:ml/training/data_loader_coingecko.py†L150-L327】【F:ml/training/data_loader_coingecko.py†L336-L420】
+- **Simulation mode enforces safe execution paths.** OMS request flows short-circuit to simulated brokers, while the broker itself enforces stop-loss and take-profit triggers so live loops never hit real exchanges when simulation is enabled.【F:services/oms/oms_service.py†L1662-L1779】【F:services/oms/sim_broker.py†L180-L378】
+- **Training workflow preserves data integrity and recoverability.** Chronological splits, outlier handling, feature hashing, and artifact persistence were verified to keep retraining reproducible and auditable across reruns.【F:ml/training/workflow.py†L378-L520】【F:ml/training/workflow.py†L946-L1035】
 
 ## Completed Remediations
 
