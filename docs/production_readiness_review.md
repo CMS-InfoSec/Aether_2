@@ -19,7 +19,7 @@
 
 ### Critical
 
-1. **Test suite is not runnable as-is.** ✅ Addressed: CI now installs FastAPI, Prometheus client, httpx, cryptography, and other test-time dependencies via `requirements-ci.txt`, allowing pytest to progress past collection. Continue triaging the remaining database bootstrap failures surfaced once dependency resolution succeeded.【F:requirements-ci.txt†L1-L9】【f59009†L1-L20】【c05720†L1-L120】【53b751†L119-L160】
+1. **Test suite is not runnable as-is.** ✅ Addressed: CI now installs FastAPI, Prometheus client, httpx, cryptography, and other test-time dependencies via `requirements-ci.txt`, allowing pytest to progress past collection. Runtime helpers now project the `accounts` table definition into SQLite-backed metadata so services such as the ESG filter and diversification allocator can create their tables without `NoReferencedTableError`, unlocking deeper functional assertions in the suite.【F:requirements-ci.txt†L1-L9】【F:shared/account_scope.py†L1-L124】【F:esg_filter.py†L1-L210】【F:services/risk/diversification_allocator.py†L240-L310】【F:services/anomaly/execution_anomaly.py†L1-L260】【3b74e9†L1-L31】【1be583†L1-L80】
 2. **Risk API Docker image build will fail.** ✅ Addressed: The Dockerfile now ships with a colocated `requirements.txt`, installs from it, and cleans up build artefacts to keep layers slim.【F:deploy/docker/risk-api/Dockerfile†L1-L25】【F:deploy/docker/risk-api/requirements.txt†L1-L15】
 
 ### High

@@ -63,7 +63,11 @@ if _SQLALCHEMY_AVAILABLE and not hasattr(Session, "__enter__"):
 from metrics import setup_metrics
 from services.common.security import require_admin_account
 from shared.postgres import normalize_sqlalchemy_dsn
-from shared.account_scope import SQLALCHEMY_AVAILABLE as _ACCOUNT_SCOPE_AVAILABLE, account_id_column
+from shared.account_scope import (
+    SQLALCHEMY_AVAILABLE as _ACCOUNT_SCOPE_AVAILABLE,
+    account_id_column,
+    ensure_accounts_table,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -150,6 +154,7 @@ if _SQLALCHEMY_AVAILABLE and _ACCOUNT_SCOPE_AVAILABLE:
         bind=ENGINE, autoflush=False, expire_on_commit=False, future=True
     )
     Base = declarative_base()
+    ensure_accounts_table(Base.metadata)
 else:
     class _InMemoryEngine:
         def __init__(self, url: str) -> None:
@@ -242,6 +247,7 @@ else:
         return _InMemorySession(_get_store(DATABASE_URL))
 
     Base = declarative_base()
+    ensure_accounts_table(Base.metadata)
 
 
 if _SQLALCHEMY_AVAILABLE:
