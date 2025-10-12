@@ -94,7 +94,7 @@
 * RMT-023 — Implement the `ws_sequence_gap_ratio` metric (or update the WebSocket desync runbook) so the alerting flow references observable data. Files: WebSocket ingest/exporter, `docs/runbooks/websocket_desync.md`. Severity: Medium. Owner: Data Platform. Status: Mitigated.
 * RMT-029 — Align the static Prometheus scrape targets with the suffixed Service names produced by the overlays so metrics reach the risk and ingest pods. Files: `deploy/observability/prometheus/configmap.yaml`, overlay patches. Severity: High. Owner: Observability. Status: Mitigated.
 * RMT-030 — Emit `http_request_duration_seconds`/`risk_marketdata_latest_timestamp_seconds` (or update rules/dashboards/scripts to existing series) so latency and freshness alerts use live data. Files: `metrics.py`, `deploy/observability/prometheus/configmap.yaml`, `docs/runbooks/scripts/daily_report.py`. Severity: High. Owner: Observability. Status: Mitigated.
-* RMT-056 — Environment parity smoke tests implemented. Files: `.github/workflows/post-deploy-smoke.yml`. Severity: Medium. Owner: Platform Ops. Status: Mitigated.
+* RMT-057 — Compliance metadata tagging enabled in CI artifacts. Files: `.github/workflows/ci.yaml`, `.github/workflows/build-images.yaml`, `.github/workflows/main-pipeline.yml`. Severity: Low. Owner: Release Engineering. Status: Complete.
 
 ## Security & Compliance
 

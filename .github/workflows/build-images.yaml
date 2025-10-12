@@ -50,6 +50,28 @@ jobs:
           tags: |
             ghcr.io/aether/risk-ingestor:${{ github.sha }}
 
+      - name: Generate build metadata manifest
+        run: |
+          cat <<EOF > build-manifest.json
+          {
+            "commit_sha": "${{ github.sha }}",
+            "build_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "change_request_id": "${CHANGE_REQUEST_ID}",
+            "compliance_labels": [
+              "ISO27001",
+              "GDPR"
+            ]
+          }
+          EOF
+        env:
+          CHANGE_REQUEST_ID: ${{ github.event.pull_request.number || github.run_id }}
+
+      - name: Upload build metadata manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-manifest-${{ github.job }}
+          path: build-manifest.json
+
   buildah-sbom:
     runs-on: ubuntu-latest
     needs: kaniko-build
@@ -78,3 +100,25 @@ jobs:
           path: |
             sbom-risk-api.json
             sbom-risk-ingestor.json
+
+      - name: Generate build metadata manifest
+        run: |
+          cat <<EOF > build-manifest.json
+          {
+            "commit_sha": "${{ github.sha }}",
+            "build_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "change_request_id": "${CHANGE_REQUEST_ID}",
+            "compliance_labels": [
+              "ISO27001",
+              "GDPR"
+            ]
+          }
+          EOF
+        env:
+          CHANGE_REQUEST_ID: ${{ github.event.pull_request.number || github.run_id }}
+
+      - name: Upload build metadata manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-manifest-${{ github.job }}
+          path: build-manifest.json
