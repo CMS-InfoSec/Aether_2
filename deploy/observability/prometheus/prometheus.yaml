@@ -96,6 +96,38 @@ spec:
       rules:
         - record: trading:latency:availability
           expr: 1 - (sum(rate(order_gateway_request_errors_total[5m])) / sum(rate(order_gateway_requests_total[5m])))
+        - alert: policy_latency_p95_slo_breach
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum(rate(policy_latency_ms_bucket[5m])) by (le, symbol_tier, account_segment)
+            ) > 200
+          for: 10m
+          labels:
+            severity: warning
+            slo_target: "p95<=200ms"
+          annotations:
+            summary: >-
+              Policy evaluation latency p95 above 200 ms for {{ $labels.symbol_tier }}/{{ $labels.account_segment }}
+            description: Investigate policy engine load, feature availability, and downstream dependency health.
+            runbook: docs/runbooks/policy_latency.md
+            slo_reference: docs/slo.md#policy-latency
+        - alert: risk_latency_p95_slo_breach
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum(rate(risk_latency_ms_bucket[5m])) by (le, symbol_tier, account_segment)
+            ) > 200
+          for: 10m
+          labels:
+            severity: warning
+            slo_target: "p95<=200ms"
+          annotations:
+            summary: >-
+              Risk validation latency p95 above 200 ms for {{ $labels.symbol_tier }}/{{ $labels.account_segment }}
+            description: Inspect risk model queues, dependency latency, and exchange data completeness.
+            runbook: docs/runbooks/risk_latency.md
+            slo_reference: docs/slo.md#risk-latency
         - alert: oms_latency_slo_breach
           expr: |
             histogram_quantile(0.99, sum(rate(oms_order_latency_seconds_bucket[5m])) by (le)) > 0.12
