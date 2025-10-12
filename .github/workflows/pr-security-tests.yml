@@ -29,6 +29,17 @@ jobs:
           pip install ".[test]"
           pip install bandit ruff mypy pytest-cov
 
+      - name: Install Gitleaks
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/gitleaks/gitleaks/master/install.sh \
+            | sh -s -- -b "$(pwd)/bin"
+          echo "$(pwd)/bin" >> "$GITHUB_PATH"
+
+      - name: Run Gitleaks secret scan
+        id: gitleaks
+        run: gitleaks detect --source . --no-git --redact --exit-code 1
+        continue-on-error: true
+
       - name: Run Bandit
         id: bandit
         run: bandit -r .
@@ -113,6 +124,7 @@ PY
         id: prepare_comment
         if: always()
         run: |
+          gitleaks_outcome="${{ steps.gitleaks.outcome }}"
           bandit_outcome="${{ steps.bandit.outcome }}"
           ruff_outcome="${{ steps.ruff.outcome }}"
           mypy_outcome="${{ steps.mypy.outcome }}"
@@ -126,6 +138,7 @@ PY
             fi
           }
 
+          gitleaks_status=$(to_status "$gitleaks_outcome")
           bandit_status=$(to_status "$bandit_outcome")
           ruff_status=$(to_status "$ruff_outcome")
           mypy_status=$(to_status "$mypy_outcome")
@@ -143,6 +156,7 @@ PY
 
 | Check | Result |
 | --- | --- |
+| Gitleaks | GITLEAKS_STATUS |
 | Bandit | BANDIT_STATUS |
 | Ruff | RUFF_STATUS |
 | MyPy | MYPY_STATUS |
@@ -153,6 +167,7 @@ PY
 - Critical: CRITICAL_VULNS
 COMMENT
 
+          sed -i "s/GITLEAKS_STATUS/$gitleaks_status/" pr-comment.md
           sed -i "s/BANDIT_STATUS/$bandit_status/" pr-comment.md
           sed -i "s/RUFF_STATUS/$ruff_status/" pr-comment.md
           sed -i "s/MYPY_STATUS/$mypy_status/" pr-comment.md
@@ -191,6 +206,10 @@ COMMENT
           status=0
           if [ "${{ steps.bandit.outcome }}" != "success" ]; then
             echo "Bandit failed"
+            status=1
+          fi
+          if [ "${{ steps.gitleaks.outcome }}" != "success" ]; then
+            echo "Gitleaks found potential secrets"
             status=1
           fi
           if [ "${{ steps.ruff.outcome }}" != "success" ]; then

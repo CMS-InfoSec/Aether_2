@@ -99,7 +99,7 @@
 
 **Remediation Tasks**
 
-* None — area marked Ready.
+* RMT-060 — Automated secret scanning active in CI. Files: `.github/workflows/pr-security-tests.yml`. Severity: Medium. Owner: Platform Security. Status: Mitigated.
 
 ## Testing & Release Engineering
 
