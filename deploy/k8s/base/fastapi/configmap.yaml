@@ -10,42 +10,28 @@ metadata:
 data:
   settings.yaml: |
     kafka:
-      brokersSecret:
-        name: kafka-tls
-        key: bootstrap_servers
+      brokers:
+        - bootstrap.kafka.aether.svc.cluster.local:9092
       tls:
-        enabled: true
-        caSecret: kafka-tls
+        enabled: false
     nats:
-      urlSecret:
-        name: nats-tls
-        key: url
+      url: nats://nats.aether.svc.cluster.local:4222
       tls:
-        enabled: true
-        caSecret: nats-tls
+        enabled: false
     timescaledb:
-      hostSecret:
-        name: timescaledb-tls
-        key: host
-      port: 5433
+      host: timescaledb.aether.svc.cluster.local
+      port: 5432
       database: marketdata
       user: risk_engine
-      tls: true
-      clientCertSecret: timescaledb-client-cert
+      tls: false
     redis:
-      hostSecret:
-        name: redis-tls
-        key: host
-      port: 6380
-      tls: true
-      caSecret: redis-tls
+      host: redis.aether.svc.cluster.local
+      port: 6379
+      tls: false
     feature_store:
-      hostSecret:
-        name: feast-online-tls
-        key: host
-      port: 6567
-      tls: true
-      clientCertSecret: feast-online-client-cert
+      host: feast-online.aether.svc.cluster.local
+      port: 6566
+      tls: false
     risk_thresholds:
       liquidation_ratio: 0.25
       drawdown_limit: 0.18

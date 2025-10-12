@@ -8,6 +8,8 @@ from dataclasses import dataclass, replace
 from enum import Enum
 import logging
 import os
+from datetime import datetime, timezone
+from time import perf_counter
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Dict, Generator, Iterable, Optional
 from uuid import uuid4
@@ -416,6 +418,48 @@ _oms_stale_feed_total = Counter(
     registry=_REGISTRY,
 )
 
+_order_gateway_requests_total = Counter(
+    "order_gateway_requests_total",
+    "Total order placement requests processed by the OMS gateway.",
+    ["service", "account_id"],
+    registry=_REGISTRY,
+)
+
+_order_gateway_request_errors_total = Counter(
+    "order_gateway_request_errors_total",
+    "Number of OMS order placement requests that resulted in an error.",
+    ["service", "account_id", "reason"],
+    registry=_REGISTRY,
+)
+
+_order_gateway_orders_total = Counter(
+    "order_gateway_orders_total",
+    "Number of orders successfully handed to the exchange gateway.",
+    ["service", "account_id", "account_segment", "symbol_tier", "side"],
+    registry=_REGISTRY,
+)
+
+_order_gateway_filled_notional_usd = Counter(
+    "order_gateway_filled_notional_usd",
+    "USD notional filled by the OMS gateway.",
+    ["service", "account_id", "account_segment", "symbol_tier", "side", "liquidity"],
+    registry=_REGISTRY,
+)
+
+_order_gateway_fee_spend_usd = Counter(
+    "order_gateway_fee_spend_usd",
+    "USD fees attributed to OMS gateway fills.",
+    ["service", "account_id", "account_segment", "symbol_tier", "side", "liquidity", "source"],
+    registry=_REGISTRY,
+)
+
+_order_gateway_circuit_breaker_engaged = Gauge(
+    "order_gateway_circuit_breaker_engaged",
+    "Binary indicator that the OMS gateway circuit breaker is engaged for a symbol.",
+    ["service", "account_id", "symbol"],
+    registry=_REGISTRY,
+)
+
 _oms_latency_ms = Gauge(
     "oms_latency_ms",
     "Current latency of OMS interactions in milliseconds.",
@@ -530,6 +574,14 @@ _policy_inference_latency = Histogram(
     buckets=(5, 10, 25, 50, 100, 250, 500, 1000, float("inf")),
 )
 
+_policy_latency_ms = Histogram(
+    "policy_latency_ms",
+    "Latency distribution for policy decisions in milliseconds.",
+    ["service", "account_segment", "symbol_tier"],
+    registry=_REGISTRY,
+    buckets=(5, 10, 25, 50, 100, 250, 500, 1000, float("inf")),
+)
+
 _risk_validation_latency = Histogram(
     "risk_validation_latency",
     "Latency distribution for risk validation in milliseconds.",
@@ -538,12 +590,61 @@ _risk_validation_latency = Histogram(
     buckets=(5, 10, 25, 50, 100, 250, 500, 1000, float("inf")),
 )
 
+_risk_latency_ms = Histogram(
+    "risk_latency_ms",
+    "Latency distribution for risk evaluations in milliseconds.",
+    ["service", "account_segment", "symbol_tier"],
+    registry=_REGISTRY,
+    buckets=(5, 10, 25, 50, 100, 250, 500, 1000, float("inf")),
+)
+
+_http_request_duration_seconds = Histogram(
+    "http_request_duration_seconds",
+    "HTTP request latency distribution in seconds.",
+    ["service", "method", "status_code"],
+    registry=_REGISTRY,
+    buckets=(
+        0.005,
+        0.01,
+        0.025,
+        0.05,
+        0.1,
+        0.25,
+        0.5,
+        1.0,
+        2.5,
+        5.0,
+        10.0,
+        float("inf"),
+    ),
+)
+
 _oms_submit_latency = Histogram(
     "oms_submit_latency",
     "Latency distribution for submitting intents to the OMS in milliseconds.",
     ["service", "transport"],
     registry=_REGISTRY,
     buckets=(5, 10, 25, 50, 100, 250, 500, 1000, float("inf")),
+)
+
+_oms_order_latency_seconds = Histogram(
+    "oms_order_latency_seconds",
+    "Latency distribution for OMS order acknowledgements in seconds.",
+    ["service", "account_segment", "symbol_tier", "transport"],
+    registry=_REGISTRY,
+    buckets=(
+        0.005,
+        0.01,
+        0.025,
+        0.05,
+        0.1,
+        0.25,
+        0.5,
+        1.0,
+        2.5,
+        5.0,
+        float("inf"),
+    ),
 )
 
 _late_events_total = Counter(
@@ -567,6 +668,13 @@ _kill_switch_state = Gauge(
     registry=_REGISTRY,
 )
 
+_risk_marketdata_latest_timestamp_seconds = Gauge(
+    "risk_marketdata_latest_timestamp_seconds",
+    "Unix timestamp of the most recent market data event processed by the service.",
+    ["service"],
+    registry=_REGISTRY,
+)
+
 _METRICS: Dict[str, Counter | Gauge | Histogram] = {
     "trades_submitted_total": _trades_submitted_total,
     "trades_rejected_total": _trades_rejected_total,
@@ -577,6 +685,12 @@ _METRICS: Dict[str, Counter | Gauge | Histogram] = {
     "oms_auth_failures_total": _oms_auth_failures_total,
     "oms_child_orders_total": _oms_child_orders_total,
     "oms_stale_feed_total": _oms_stale_feed_total,
+    "order_gateway_requests_total": _order_gateway_requests_total,
+    "order_gateway_request_errors_total": _order_gateway_request_errors_total,
+    "order_gateway_orders_total": _order_gateway_orders_total,
+    "order_gateway_filled_notional_usd": _order_gateway_filled_notional_usd,
+    "order_gateway_fee_spend_usd": _order_gateway_fee_spend_usd,
+    "order_gateway_circuit_breaker_engaged": _order_gateway_circuit_breaker_engaged,
     "oms_latency_ms": _oms_latency_ms,
     "pipeline_latency_ms": _pipeline_latency_ms,
     "policy_abstention_rate": _policy_abstention_rate,
@@ -588,8 +702,12 @@ _METRICS: Dict[str, Counter | Gauge | Histogram] = {
     "account_drawdown_pct": _account_drawdown_pct,
     "account_exposure_usd": _account_exposure_usd,
     "policy_inference_latency": _policy_inference_latency,
+    "policy_latency_ms": _policy_latency_ms,
     "risk_validation_latency": _risk_validation_latency,
+    "risk_latency_ms": _risk_latency_ms,
+    "http_request_duration_seconds": _http_request_duration_seconds,
     "oms_submit_latency": _oms_submit_latency,
+    "oms_order_latency_seconds": _oms_order_latency_seconds,
     "late_events_total": _late_events_total,
     "reorder_buffer_depth": _reorder_buffer_depth,
     "scaling_oms_replicas": _scaling_oms_replicas,
@@ -598,6 +716,7 @@ _METRICS: Dict[str, Counter | Gauge | Histogram] = {
     "scaling_evaluation_duration_seconds": _scaling_evaluation_duration_seconds,
     "scaling_evaluations_total": _scaling_evaluations_total,
     "kill_switch_state": _kill_switch_state,
+    "risk_marketdata_latest_timestamp_seconds": _risk_marketdata_latest_timestamp_seconds,
 }
 
 _INITIALISED = False
@@ -726,6 +845,19 @@ def _transport_labels(ctx: MetricContext) -> Dict[str, str]:
     return labels
 
 
+def _latency_histogram_labels(
+    ctx: MetricContext, *, include_transport: bool = False
+) -> Dict[str, str]:
+    labels: Dict[str, str] = {
+        "service": _service_value(ctx.service),
+        "account_segment": ctx.account_segment.value,
+        "symbol_tier": ctx.symbol_tier.value,
+    }
+    if include_transport:
+        labels["transport"] = ctx.transport.value
+    return labels
+
+
 def _service_value(service: Optional[str] = None) -> str:
     value = service or _SERVICE_NAME or "service"
     return value
@@ -744,6 +876,21 @@ def _coerce_float(value: object, default: float = 0.0) -> float:
         return default
 
 
+def _record_http_request_duration(
+    service_name: str, method: str, status_code: str, duration_seconds: float
+) -> None:
+    """Record the duration of an HTTP request for the service histogram."""
+
+    try:
+        _http_request_duration_seconds.labels(
+            service=_service_value(service_name),
+            method=_normalised(method.upper(), "UNKNOWN"),
+            status_code=_normalised(status_code, "unknown"),
+        ).observe(max(duration_seconds, 0.0))
+    except Exception:  # pragma: no cover - prometheus optional in some environments
+        logger.debug("HTTP request duration metric unavailable; skipping update")
+
+
 class RequestTracingMiddleware(BaseHTTPMiddleware):
     """Starlette middleware that wires request IDs and tracing spans."""
 
@@ -756,6 +903,9 @@ class RequestTracingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         request_id = request.headers.get("x-request-id") or str(uuid4())
         token = _REQUEST_ID.set(request_id)
+        response: Optional[Response] = None
+        status_code: Optional[int] = None
+        start = perf_counter()
 
         span_cm = (
             self._tracer.start_as_current_span(
@@ -765,20 +915,41 @@ class RequestTracingMiddleware(BaseHTTPMiddleware):
             else nullcontext(None)
         )
 
-        with span_cm as span:  # type: ignore[assignment]
-            if span:
-                span.set_attribute("service.name", self._service_name)
-                span.set_attribute("request.id", request_id)
-                span.set_attribute("http.method", request.method)
-                span.set_attribute("http.url", str(request.url))
+        try:
+            with span_cm as span:  # type: ignore[assignment]
+                if span:
+                    span.set_attribute("service.name", self._service_name)
+                    span.set_attribute("request.id", request_id)
+                    span.set_attribute("http.method", request.method)
+                    span.set_attribute("http.url", str(request.url))
 
-            response = await call_next(request)
-            if span:
-                span.set_attribute("http.status_code", response.status_code)
-
-        _REQUEST_ID.reset(token)
-        response.headers["x-request-id"] = request_id
-        return response
+                response = await call_next(request)
+                status_code = response.status_code
+                if span:
+                    span.set_attribute("http.status_code", status_code)
+            return response
+        except Exception as exc:
+            status_code = status_code or 500
+            if self._tracer:
+                try:
+                    span = trace.get_current_span()
+                    if span:
+                        span.set_attribute("http.status_code", status_code)
+                        span.record_exception(exc)  # type: ignore[attr-defined]
+                except Exception:  # pragma: no cover - defensive guard
+                    logger.debug("Failed to annotate tracing span for exception", exc_info=True)
+            raise
+        finally:
+            duration = perf_counter() - start
+            _record_http_request_duration(
+                self._service_name,
+                request.method,
+                str(status_code or 500),
+                duration,
+            )
+            if response is not None:
+                response.headers["x-request-id"] = request_id
+            _REQUEST_ID.reset(token)
 
 
 def init_metrics(service_name: str = "service") -> Dict[str, Counter | Gauge | Histogram]:
@@ -831,6 +1002,9 @@ def init_metrics(service_name: str = "service") -> Dict[str, Counter | Gauge | H
     _fees_nav_pct.labels(**base_account_labels)
     _policy_inference_latency.labels(service=base_service)
     _risk_validation_latency.labels(service=base_service)
+    _http_request_duration_seconds.labels(
+        service=base_service, method="GET", status_code="200"
+    )
     _oms_submit_latency.labels(
         service=base_service, transport=TransportType.UNKNOWN.value
     )
@@ -857,6 +1031,7 @@ def init_metrics(service_name: str = "service") -> Dict[str, Counter | Gauge | H
     ).set(0.0)
 
     _kill_switch_state.labels(account_id=base_account_id).set(0.0)
+    _risk_marketdata_latest_timestamp_seconds.labels(service=base_service).set(0.0)
 
     return _METRICS
 
@@ -890,6 +1065,33 @@ def record_kill_switch_state(account_id: str, engaged: bool) -> None:
         _kill_switch_state.labels(account_id=_normalized_account_label(account_id)).set(value)
     except Exception:  # pragma: no cover - prometheus optional in some environments
         logger.debug("Kill switch metric unavailable; skipping update")
+
+
+def record_marketdata_latest_timestamp(
+    timestamp: datetime | float | int,
+    *,
+    service: Optional[str] = None,
+) -> None:
+    """Record the Unix timestamp of the freshest observed market data point."""
+
+    try:
+        if isinstance(timestamp, datetime):
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            epoch = timestamp.astimezone(timezone.utc).timestamp()
+        else:
+            epoch = float(timestamp)
+    except Exception:
+        logger.debug("Unable to normalise market data timestamp", exc_info=True)
+        return
+
+    try:
+        ctx = _resolve_metric_context(service=service)
+        _risk_marketdata_latest_timestamp_seconds.labels(
+            service=_service_value(ctx.service)
+        ).set(epoch)
+    except Exception:  # pragma: no cover - prometheus optional in some environments
+        logger.debug("Market data freshness metric unavailable; skipping update")
 
 
 @contextmanager
@@ -1097,6 +1299,110 @@ def increment_oms_stale_feed(
     ).inc()
 
 
+def increment_order_gateway_requests_total(
+    account: str,
+    *,
+    context: Optional[MetricContext] = None,
+    service: Optional[str] = None,
+) -> None:
+    ctx = _resolve_metric_context(context=context, service=service, account_id=account)
+    _order_gateway_requests_total.labels(
+        service=_service_value(ctx.service), account_id=ctx.account_id
+    ).inc()
+
+
+def increment_order_gateway_request_errors_total(
+    account: str,
+    *,
+    reason: str,
+    context: Optional[MetricContext] = None,
+    service: Optional[str] = None,
+) -> None:
+    ctx = _resolve_metric_context(context=context, service=service, account_id=account)
+    _order_gateway_request_errors_total.labels(
+        service=_service_value(ctx.service),
+        account_id=ctx.account_id,
+        reason=_normalised(reason, "unknown"),
+    ).inc()
+
+
+def increment_order_gateway_orders_total(
+    account: str,
+    symbol: str,
+    side: str,
+    *,
+    context: Optional[MetricContext] = None,
+    service: Optional[str] = None,
+) -> None:
+    ctx = _resolve_metric_context(
+        context=context, service=service, account_id=account, symbol=symbol
+    )
+    labels = _account_symbol_labels(ctx)
+    labels["side"] = _normalised(side, "unknown")
+    _order_gateway_orders_total.labels(**labels).inc()
+
+
+def observe_order_gateway_filled_notional_usd(
+    account: str,
+    symbol: str,
+    side: str,
+    *,
+    liquidity: str,
+    notional_usd: object,
+    context: Optional[MetricContext] = None,
+    service: Optional[str] = None,
+) -> None:
+    ctx = _resolve_metric_context(
+        context=context, service=service, account_id=account, symbol=symbol
+    )
+    labels = _account_symbol_labels(ctx)
+    labels["side"] = _normalised(side, "unknown")
+    labels["liquidity"] = _normalised(liquidity, "unknown")
+    _order_gateway_filled_notional_usd.labels(**labels).inc(
+        max(_coerce_float(notional_usd, 0.0), 0.0)
+    )
+
+
+def observe_order_gateway_fee_spend_usd(
+    account: str,
+    symbol: str,
+    side: str,
+    *,
+    liquidity: str,
+    fee_usd: object,
+    source: str,
+    context: Optional[MetricContext] = None,
+    service: Optional[str] = None,
+) -> None:
+    ctx = _resolve_metric_context(
+        context=context, service=service, account_id=account, symbol=symbol
+    )
+    labels = _account_symbol_labels(ctx)
+    labels["side"] = _normalised(side, "unknown")
+    labels["liquidity"] = _normalised(liquidity, "unknown")
+    labels["source"] = _normalised(source, "unknown")
+    _order_gateway_fee_spend_usd.labels(**labels).inc(
+        max(_coerce_float(fee_usd, 0.0), 0.0)
+    )
+
+
+def record_order_gateway_circuit_breaker_state(
+    account: str,
+    symbol: str,
+    *,
+    engaged: bool,
+    context: Optional[MetricContext] = None,
+    service: Optional[str] = None,
+) -> None:
+    ctx = _resolve_metric_context(context=context, service=service, account_id=account)
+    labels = {
+        "service": _service_value(ctx.service),
+        "account_id": ctx.account_id,
+        "symbol": _normalised(symbol, "unknown"),
+    }
+    _order_gateway_circuit_breaker_engaged.labels(**labels).set(1.0 if engaged else 0.0)
+
+
 def set_oms_latency(
     latency_ms: float,
     *,
@@ -1173,9 +1479,11 @@ def observe_policy_inference_latency(
     service: Optional[str] = None,
 ) -> None:
     ctx = _resolve_metric_context(service=service)
-    _policy_inference_latency.labels(service=_service_value(ctx.service)).observe(
-        latency_ms
-    )
+    service_value = _service_value(ctx.service)
+    _policy_inference_latency.labels(service=service_value).observe(latency_ms)
+    _policy_latency_ms.labels(
+        **_latency_histogram_labels(ctx)
+    ).observe(latency_ms)
 
 
 def observe_risk_validation_latency(
@@ -1184,9 +1492,11 @@ def observe_risk_validation_latency(
     service: Optional[str] = None,
 ) -> None:
     ctx = _resolve_metric_context(service=service)
-    _risk_validation_latency.labels(service=_service_value(ctx.service)).observe(
-        latency_ms
-    )
+    service_value = _service_value(ctx.service)
+    _risk_validation_latency.labels(service=service_value).observe(latency_ms)
+    _risk_latency_ms.labels(
+        **_latency_histogram_labels(ctx)
+    ).observe(latency_ms)
 
 
 def observe_oms_submit_latency(
@@ -1199,9 +1509,13 @@ def observe_oms_submit_latency(
     ctx = _resolve_metric_context(
         context=context, service=service, transport=transport
     )
+    service_value = _service_value(ctx.service)
     _oms_submit_latency.labels(
-        service=_service_value(ctx.service), transport=ctx.transport.value
+        service=service_value, transport=ctx.transport.value
     ).observe(latency_ms)
+    _oms_order_latency_seconds.labels(
+        **_latency_histogram_labels(ctx, include_transport=True)
+    ).observe(latency_ms / 1000.0)
 
 
 def record_oms_submit_ack(
@@ -1406,6 +1720,12 @@ __all__ = [
     "increment_oms_auth_failures",
     "increment_oms_child_orders_total",
     "increment_oms_stale_feed",
+    "increment_order_gateway_requests_total",
+    "increment_order_gateway_request_errors_total",
+    "increment_order_gateway_orders_total",
+    "observe_order_gateway_filled_notional_usd",
+    "observe_order_gateway_fee_spend_usd",
+    "record_order_gateway_circuit_breaker_state",
     "set_oms_latency",
     "record_oms_latency",
     "set_pipeline_latency",
@@ -1418,6 +1738,7 @@ __all__ = [
     "record_account_daily_pnl",
     "record_account_drawdown",
     "record_account_exposure",
+    "record_marketdata_latest_timestamp",
     "record_scaling_state",
     "observe_scaling_evaluation",
     "get_request_id",
