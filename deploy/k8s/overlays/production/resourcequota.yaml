@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: aether-compute-quota
+spec:
+  hard:
+    limits.cpu: "80"
+    limits.memory: 320Gi
+    requests.cpu: "40"
+    requests.memory: 160Gi
+    pods: "400"
+    persistentvolumeclaims: "30"
+    requests.storage: 2Ti
+    services: "60"
+    services.loadbalancers: "5"
+    configmaps: "400"
+    secrets: "800"
+    count/jobs.batch: "100"
+    count/cronjobs.batch: "40"
