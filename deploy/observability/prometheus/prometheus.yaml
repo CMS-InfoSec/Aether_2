@@ -150,6 +150,26 @@ spec:
             description: Inspect canary validation and feature pipelines.
             runbook: docs/runbooks/model_rollback.md
             slo_reference: docs/slo.md#model-canary-promotion
+    - name: infra.scaling
+      rules:
+        - alert: scaling_controller_evaluations_stalled
+          expr: increase(scaling_evaluations_total[15m]) < 1
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: Scaling controller has not completed an evaluation in the last 15 minutes
+            runbook: docs/runbooks/scaling_controller.md
+        - alert: scaling_gpu_pool_idle
+          expr: |
+            max_over_time(scaling_gpu_nodes[30m]) > 0
+            and max_over_time(scaling_pending_training_jobs[30m]) < 1
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: GPU node pool provisioned without pending jobs for 30 minutes
+            runbook: docs/runbooks/scaling_controller.md
 ---
 apiVersion: v1
 kind: ConfigMap
