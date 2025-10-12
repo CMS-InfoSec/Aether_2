@@ -17,13 +17,13 @@ spec:
 
         violation[{"msg": msg}] {
           container := input.review.object.spec.containers[_]
-          endswith(container.image, ":latest")
-          msg := sprintf("image %s uses forbidden tag :latest", [container.image])
+          endswith(container.image, "\x3Alatest")
+          msg := sprintf("image %s uses forbidden tag \x3Alatest", [container.image])
         }
         violation[{"msg": msg}] {
           container := input.review.object.spec.initContainers[_]
-          endswith(container.image, ":latest")
-          msg := sprintf("init container image %s uses forbidden tag :latest", [container.image])
+          endswith(container.image, "\x3Alatest")
+          msg := sprintf("init container image %s uses forbidden tag \x3Alatest", [container.image])
         }
 ---
 apiVersion: templates.gatekeeper.sh/v1

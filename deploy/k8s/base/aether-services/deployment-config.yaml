@@ -31,7 +31,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: config-service
-          image: ghcr.io/aether/config-service:latest
+          image: ghcr.io/aether/config-service@sha256:77cfbd5f9952b796192c4cfc99db95d3f17fdeb7560ca9d395a4ea80c9812115
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8000

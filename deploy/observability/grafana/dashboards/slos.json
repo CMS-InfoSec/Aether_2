@@ -5,12 +5,12 @@
   "panels": [
     {
       "type": "timeseries",
-      "title": "Policy Latency p95",
-      "description": "histogram_quantile(0.95, sum(rate(policy_latency_ms_bucket[5m])) by (le, symbol_tier, account_segment))",
+      "title": "Policy API Latency p95",
+      "description": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{service=\"policy-service\", status_code=~\"2..\"}[5m])) by (le, method)) * 1000",
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum(rate(policy_latency_ms_bucket[5m])) by (le, symbol_tier, account_segment))",
-          "legendFormat": "{{symbol_tier}}/{{account_segment}}"
+          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{service=\"policy-service\", status_code=~\"2..\"}[5m])) by (le, method)) * 1000",
+          "legendFormat": "{{method}}"
         }
       ],
       "fieldConfig": {
@@ -29,11 +29,11 @@
     },
     {
       "type": "timeseries",
-      "title": "Risk Latency p95",
+      "title": "Risk API Latency p95",
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum(rate(risk_latency_ms_bucket[5m])) by (le, symbol_tier, account_segment))",
-          "legendFormat": "{{symbol_tier}}/{{account_segment}}"
+          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{service=\"risk-service\", status_code=~\"2..\"}[5m])) by (le, method)) * 1000",
+          "legendFormat": "{{method}}"
         }
       ],
       "fieldConfig": {
@@ -55,8 +55,8 @@
       "title": "OMS Latency p95",
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum(rate(oms_latency_ms_bucket[5m])) by (le, symbol_tier, account_segment))",
-          "legendFormat": "{{symbol_tier}}/{{account_segment}}"
+          "expr": "histogram_quantile(0.95, sum(rate(oms_order_latency_seconds_bucket[5m])) by (le, account_segment, symbol_tier, transport)) * 1000",
+          "legendFormat": "{{symbol_tier}}/{{account_segment}}/{{transport}}"
         }
       ],
       "fieldConfig": {
@@ -68,6 +68,30 @@
               { "color": "green", "value": null },
               { "color": "orange", "value": 350 },
               { "color": "red", "value": 500 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Market Data Freshness",
+      "targets": [
+        {
+          "expr": "time() - max(risk_marketdata_latest_timestamp_seconds)",
+          "legendFormat": "Freshness"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 60 },
+              { "color": "red", "value": 120 }
             ]
           }
         },

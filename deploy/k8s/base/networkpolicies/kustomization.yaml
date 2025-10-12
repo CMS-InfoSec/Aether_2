@@ -2,3 +2,5 @@ resources:
   - egress-marketdata.yaml
   - ingress-risk.yaml
   - restrictive-egress-ingress.yaml
+  - namespace-cert-manager.yaml
+  - namespace-external-secrets.yaml

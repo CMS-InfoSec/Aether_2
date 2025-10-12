@@ -56,6 +56,20 @@ data:
         Line_Format       json
         Log_Level         info
         Workers           2
+
+    [OUTPUT]
+        Name              http
+        Match             kube.*
+        Host              ${SIEM_HOST}
+        Port              ${SIEM_PORT}
+        URI               ${SIEM_ENDPOINT}
+        Format            json
+        Header            Authorization Bearer ${SIEM_TOKEN}
+        Header            X-Retention-Days ${SIEM_RETENTION_DAYS}
+        tls               On
+        tls.verify        On
+        Retry_Limit       False
+        Workers           2
   parsers.conf: |
     [PARSER]
         Name   cri
