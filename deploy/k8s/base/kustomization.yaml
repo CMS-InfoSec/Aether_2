@@ -23,6 +23,8 @@ resources:
   - ingress
   - networkpolicies
   - aether-services
+  - rbac/serviceaccounts.yaml
+  - rbac/roles.yaml
 commonLabels:
   app.kubernetes.io/part-of: aether-risk
 
