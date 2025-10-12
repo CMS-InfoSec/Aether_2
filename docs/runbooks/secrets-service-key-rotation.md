@@ -89,6 +89,11 @@ Provide a standardized procedure for rotating the AES encryption key that protec
 - Notify stakeholders via #security-ops and #platform-alerts channels.
 - Conduct a post-incident review to determine root cause before attempting rotation again.
 
-## Automation Opportunities
-- Integrate this runbook into the CI pipeline so that a merged PR automatically updates the clusters via Argo CD sync.
-- Schedule quarterly reminders in the Security team calendar to ensure the key rotation cadence is maintained.
+## Automation
+- A scheduled GitHub Actions workflow (`.github/workflows/secrets-service-key-rotation.yml`) runs at 04:00 UTC on the first day
+  of every month. It generates a fresh 32-byte AES key, writes the value to Vault using the Secrets Service AppRole, and
+  annotates the `secrets-service-config` `ExternalSecret` so the external-secrets operator reconciles the update.
+- The workflow restarts the Secrets Service Deployment in staging and production to apply the rotated key. Production rotation
+  is gated behind the `production` environment for manual approval and auditing.
+- On-demand rotations remain available through `workflow_dispatch`, which invokes the same steps without waiting for the
+  monthly trigger.
