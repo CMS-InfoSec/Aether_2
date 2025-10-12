@@ -99,7 +99,7 @@
 
 **Remediation Tasks**
 
-* None — area marked Ready.
+* RMT-050 — Automated monthly secrets rotation pipeline implemented. Files: `.github/workflows/secrets-service-key-rotation.yml`, `docs/runbooks/secrets-service-key-rotation.md`. Severity: Medium. Owner: Security Platform. Status: Mitigated.
 
 ## Testing & Release Engineering
 
