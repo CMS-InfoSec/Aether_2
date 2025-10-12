@@ -90,6 +90,7 @@
 * RMT-023 — Implement the `ws_sequence_gap_ratio` metric (or update the WebSocket desync runbook) so the alerting flow references observable data. Files: WebSocket ingest/exporter, `docs/runbooks/websocket_desync.md`. Severity: Medium. Owner: Data Platform. Status: Mitigated.
 * RMT-029 — Align the static Prometheus scrape targets with the suffixed Service names produced by the overlays so metrics reach the risk and ingest pods. Files: `deploy/observability/prometheus/configmap.yaml`, overlay patches. Severity: High. Owner: Observability. Status: Mitigated.
 * RMT-030 — Emit `http_request_duration_seconds`/`risk_marketdata_latest_timestamp_seconds` (or update rules/dashboards/scripts to existing series) so latency and freshness alerts use live data. Files: `metrics.py`, `deploy/observability/prometheus/configmap.yaml`, `docs/runbooks/scripts/daily_report.py`. Severity: High. Owner: Observability. Status: Mitigated.
+* RMT-051 — Centralized audit log export configured. Files: `deploy/observability/logging/fluent-bit-configmap.yaml`, `deploy/observability/logging/fluent-bit-daemonset.yaml`, `deploy/observability/logging/fluent-bit-siem-externalsecret.yaml`. Severity: High. Owner: Observability. Status: Mitigated.
 
 ## Security & Compliance
 
