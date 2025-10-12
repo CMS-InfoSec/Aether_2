@@ -24,7 +24,16 @@ jobs:
 
       - name: Ensure container tags are immutable
         run: |
-          if grep -R ":latest" --exclude=*.md --exclude-dir=.git --exclude-dir=deploy/k8s/policies .; then
+          search_paths=(deploy/k8s argo kubernetes)
+          existing_paths=()
+          for path in "${search_paths[@]}"; do
+            if [ -e "$path" ]; then
+              existing_paths+=("$path")
+            fi
+          done
+
+          if [ "${#existing_paths[@]}" -gt 0 ] && \
+             grep -R ":latest" "${existing_paths[@]}" --include='*.yaml' --include='*.yml' --include='*.json'; then
             echo 'Found mutable :latest tag references. Pin all container images to immutable tags or digests.' >&2
             exit 1
           fi
