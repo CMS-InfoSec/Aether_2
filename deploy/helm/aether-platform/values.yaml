@@ -1075,7 +1075,13 @@ ui:
     host: ui.aether.example.com
     tlsSecret: aether-2-ui-tls
     annotations: {}
-  resources: {}
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 300m
+      memory: 512Mi
   usesKrakenSecrets: false
   extraVolumeMounts: []
   extraVolumes: []
