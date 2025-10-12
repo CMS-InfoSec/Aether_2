@@ -12,7 +12,7 @@ spec:
           kinds:
             - Pod
       validate:
-        message: "Images must not use the :latest tag"
+        message: "Images must not use the 'latest' tag"
         foreach:
           - list: "request.object.spec.containers[]"
             deny:

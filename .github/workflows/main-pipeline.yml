@@ -59,6 +59,28 @@ jobs:
           path: coverage.xml
           if-no-files-found: error
 
+      - name: Generate build metadata manifest
+        run: |
+          cat <<EOF > build-manifest.json
+          {
+            "commit_sha": "${{ github.sha }}",
+            "build_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "change_request_id": "${CHANGE_REQUEST_ID}",
+            "compliance_labels": [
+              "ISO27001",
+              "GDPR"
+            ]
+          }
+          EOF
+        env:
+          CHANGE_REQUEST_ID: ${{ github.event.pull_request.number || github.run_id }}
+
+      - name: Upload build metadata manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-manifest-${{ github.job }}
+          path: build-manifest.json
+
   sast-scan:
     name: Static Application Security Scan
     runs-on: ubuntu-latest
@@ -75,6 +97,28 @@ jobs:
           security-checks: vuln,secret,config
           exit-code: '1'
           format: table
+
+      - name: Generate build metadata manifest
+        run: |
+          cat <<EOF > build-manifest.json
+          {
+            "commit_sha": "${{ github.sha }}",
+            "build_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "change_request_id": "${CHANGE_REQUEST_ID}",
+            "compliance_labels": [
+              "ISO27001",
+              "GDPR"
+            ]
+          }
+          EOF
+        env:
+          CHANGE_REQUEST_ID: ${{ github.event.pull_request.number || github.run_id }}
+
+      - name: Upload build metadata manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-manifest-${{ github.job }}
+          path: build-manifest.json
 
   build-and-release:
     name: Build, Sign, and Publish Images
@@ -162,6 +206,28 @@ jobs:
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
         run: cosign attest --key env://COSIGN_PRIVATE_KEY --predicate "sbom-${{ matrix.build.name }}.spdx.json" --type spdx "${{ steps.image_meta.outputs.sha_tag }}"
 
+      - name: Generate build metadata manifest
+        run: |
+          cat <<EOF > build-manifest.json
+          {
+            "commit_sha": "${{ github.sha }}",
+            "build_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "change_request_id": "${CHANGE_REQUEST_ID}",
+            "compliance_labels": [
+              "ISO27001",
+              "GDPR"
+            ]
+          }
+          EOF
+        env:
+          CHANGE_REQUEST_ID: ${{ github.event.pull_request.number || github.run_id }}
+
+      - name: Upload build metadata manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-manifest-${{ github.job }}
+          path: build-manifest.json
+
   argocd-sync:
     name: Trigger ArgoCD Sync
     runs-on: ubuntu-latest
@@ -189,3 +255,25 @@ jobs:
           argocd app wait aether-risk-staging --health --timeout 600
           argocd app sync aether-risk-prod
           argocd app wait aether-risk-prod --health --timeout 600
+
+      - name: Generate build metadata manifest
+        run: |
+          cat <<EOF > build-manifest.json
+          {
+            "commit_sha": "${{ github.sha }}",
+            "build_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "change_request_id": "${CHANGE_REQUEST_ID}",
+            "compliance_labels": [
+              "ISO27001",
+              "GDPR"
+            ]
+          }
+          EOF
+        env:
+          CHANGE_REQUEST_ID: ${{ github.event.pull_request.number || github.run_id }}
+
+      - name: Upload build metadata manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-manifest-${{ github.job }}
+          path: build-manifest.json

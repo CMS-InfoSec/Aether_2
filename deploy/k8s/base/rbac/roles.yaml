@@ -1,0 +1,132 @@
+apiVersion: v1
+kind: List
+items:
+  - apiVersion: rbac.authorization.k8s.io/v1
+    kind: Role
+    metadata:
+      name: gitops-controller
+    rules:
+      - apiGroups: [""]
+        resources:
+          - configmaps
+          - secrets
+          - services
+          - serviceaccounts
+          - persistentvolumeclaims
+          - pods
+          - pods/log
+        verbs: ["get", "list", "watch"]
+      - apiGroups: [""]
+        resources:
+          - configmaps
+          - secrets
+          - services
+          - persistentvolumeclaims
+        verbs: ["create", "update", "patch", "delete"]
+      - apiGroups: ["apps"]
+        resources:
+          - deployments
+          - statefulsets
+          - daemonsets
+          - replicasets
+        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+      - apiGroups: ["batch"]
+        resources:
+          - jobs
+          - cronjobs
+        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+      - apiGroups: ["networking.k8s.io"]
+        resources:
+          - ingresses
+          - networkpolicies
+        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+      - apiGroups: ["policy"]
+        resources:
+          - poddisruptionbudgets
+        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        resources:
+          - roles
+          - rolebindings
+        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiVersion: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    metadata:
+      name: gitops-controller
+    roleRef:
+      apiGroup: rbac.authorization.k8s.io
+      kind: Role
+      name: gitops-controller
+    subjects:
+      - kind: ServiceAccount
+        name: gitops-controller
+  - apiVersion: rbac.authorization.k8s.io/v1
+    kind: Role
+    metadata:
+      name: external-secrets-operator
+    rules:
+      - apiGroups: ["external-secrets.io"]
+        resources:
+          - externalsecrets
+        verbs: ["get", "list", "watch", "update", "patch"]
+      - apiGroups: ["external-secrets.io"]
+        resources:
+          - externalsecrets/status
+          - externalsecrets/finalizers
+        verbs: ["get", "update", "patch"]
+      - apiGroups: [""]
+        resources:
+          - secrets
+        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+      - apiGroups: ["events.k8s.io"]
+        resources:
+          - events
+        verbs: ["create", "patch", "update"]
+  - apiVersion: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    metadata:
+      name: external-secrets-operator
+    roleRef:
+      apiGroup: rbac.authorization.k8s.io
+      kind: Role
+      name: external-secrets-operator
+    subjects:
+      - kind: ServiceAccount
+        name: external-secrets-operator
+  - apiVersion: rbac.authorization.k8s.io/v1
+    kind: Role
+    metadata:
+      name: cicd-bot
+    rules:
+      - apiGroups: [""]
+        resources:
+          - configmaps
+          - secrets
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["apps"]
+        resources:
+          - deployments
+          - statefulsets
+          - daemonsets
+          - replicasets
+        verbs: ["get", "list", "watch", "update", "patch"]
+      - apiGroups: ["batch"]
+        resources:
+          - jobs
+          - cronjobs
+        verbs: ["get", "list", "watch", "create", "update", "patch"]
+      - apiGroups: ["autoscaling"]
+        resources:
+          - horizontalpodautoscalers
+        verbs: ["get", "list", "watch", "update", "patch"]
+  - apiVersion: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    metadata:
+      name: cicd-bot
+    roleRef:
+      apiGroup: rbac.authorization.k8s.io
+      kind: Role
+      name: cicd-bot
+    subjects:
+      - kind: ServiceAccount
+        name: cicd-bot
