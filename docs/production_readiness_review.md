@@ -94,7 +94,7 @@
 * RMT-023 — Implement the `ws_sequence_gap_ratio` metric (or update the WebSocket desync runbook) so the alerting flow references observable data. Files: WebSocket ingest/exporter, `docs/runbooks/websocket_desync.md`. Severity: Medium. Owner: Data Platform. Status: Mitigated.
 * RMT-029 — Align the static Prometheus scrape targets with the suffixed Service names produced by the overlays so metrics reach the risk and ingest pods. Files: `deploy/observability/prometheus/configmap.yaml`, overlay patches. Severity: High. Owner: Observability. Status: Mitigated.
 * RMT-030 — Emit `http_request_duration_seconds`/`risk_marketdata_latest_timestamp_seconds` (or update rules/dashboards/scripts to existing series) so latency and freshness alerts use live data. Files: `metrics.py`, `deploy/observability/prometheus/configmap.yaml`, `docs/runbooks/scripts/daily_report.py`. Severity: High. Owner: Observability. Status: Mitigated.
-* RMT-046 — Pin every container image to an immutable tag or digest to prevent drift between environments. Files: `deploy/k8s/base/aether-services/`, `deploy/k8s/dr_policy.yaml`, `deploy/k8s/overlays/staging/restore-drill-cronjob.yaml`, `argo/*.yaml`, `.github/workflows/ci.yaml`, `docs/production_readiness_review.md`. Severity: High. Owner: Platform. Status: Mitigated.
+* RMT-049 — PodSecurity Baseline enforced. Files: `deploy/k8s/overlays/production/namespace.yaml`, `deploy/k8s/overlays/staging/namespace.yaml`, `deploy/observability/namespace.yaml`, `deploy/k8s/argocd/namespace.yaml`, `deploy/k8s/base/kustomization.yaml`. Severity: High. Owner: Platform Ops. Status: Mitigated.
 
 ## Security & Compliance
 
