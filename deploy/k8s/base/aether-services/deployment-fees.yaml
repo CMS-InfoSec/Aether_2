@@ -32,7 +32,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: fees-service
-          image: ghcr.io/aether/fees-service:latest
+          image: ghcr.io/aether/fees-service@sha256:998f85d4d281e13d46227de3dca535312bc5080a97423c7e0640ace414411959
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8000
@@ -59,7 +59,7 @@ spec:
                   optional: true
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /metrics
               port: http
             initialDelaySeconds: 20
             periodSeconds: 10

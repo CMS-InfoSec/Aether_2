@@ -32,7 +32,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: risk-service
-          image: ghcr.io/aether/risk-service:latest
+          image: ghcr.io/aether/risk-service@sha256:9c9a9a0eaca65d24b7ad9159347ebe6b3d21abf21889d9cf0250026bb5623cb6
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8000
@@ -92,7 +92,7 @@ spec:
                   optional: true
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /metrics
               port: http
             initialDelaySeconds: 20
             periodSeconds: 10

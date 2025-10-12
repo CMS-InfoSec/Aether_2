@@ -25,7 +25,7 @@ spec:
       serviceAccountName: api-services
       containers:
         - name: auth-service
-          image: ghcr.io/aether/auth-service:latest
+          image: ghcr.io/aether/auth-service@sha256:fb8ae37a4942cf16345f68677456b72539702722df3ae19005bdb5755ae4fb68
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8000
@@ -48,7 +48,7 @@ spec:
               value: redis://redis.aether.svc.cluster.local:6379/0
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /metrics
               port: http
             initialDelaySeconds: 10
             periodSeconds: 5

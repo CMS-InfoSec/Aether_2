@@ -31,7 +31,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: capital-allocator
-          image: ghcr.io/aether/capital-allocator:latest
+          image: ghcr.io/aether/capital-allocator@sha256:896b577f309c62491127e14e3b9b14c8364ccaf1e470a058fcf4451ea6ac0381
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8000
@@ -50,7 +50,7 @@ spec:
                   optional: true
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /metrics
               port: http
             initialDelaySeconds: 20
             periodSeconds: 10
