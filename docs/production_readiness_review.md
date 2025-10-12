@@ -65,7 +65,7 @@
 * RMT-027 — Define certificates/ExternalSecrets for each ingress TLS secret (`auth|fees|oms|policy|risk|secrets|universe` `*-service-tls`) so cert-manager can provision HTTPS for every service. Files: `deploy/k8s/base/aether-services/ingress-*.yaml`, secrets overlays. Severity: High. Owner: Platform. Status: Pending.
 * RMT-052 — CI image vulnerability scanning active. Files: `.github/workflows/ci.yaml`, `docs/runbooks/security_ci.md`. Severity: High. Owner: Security Platform. Status: Mitigated.
 * RMT-028 — Point Feast serving at the dedicated Feast Redis service (e.g., `redis-master`) or remove the unused `redis-feast` stack so online feature reads hit the correct backend. Files: `deploy/k8s/base/feast/configmap.yaml`, `deploy/k8s/base/feast/deployment.yaml`, `deploy/k8s/base/redis-feast/deployments.yaml`. Severity: High. Owner: Data Platform. Status: Mitigated.
-* RMT-040 — Automated restore validation job added so weekly drills replay TimescaleDB backups and assert `dr_log` counts without manual intervention. Files: `deploy/k8s/overlays/staging/restore-drill-cronjob.yaml`, `ops/backup/restore_drill.py`. Severity: Medium. Owner: Data Platform. Status: Mitigated.
+* RMT-047 — Enforce resource requests and limits for every Deployment and StatefulSet so cluster schedulers honor capacity guardrails. Files: `deploy/helm/aether-platform/values.yaml`, `deploy/helm/aether-platform/templates/ui.yaml`, Kubernetes deployment manifests. Severity: Medium. Owner: Platform. Status: Mitigated.
 
 ## Reliability & Observability
 
