@@ -14,6 +14,10 @@ spec:
         app: kafka
     spec:
       serviceAccountName: streaming-services
+      volumes:
+        - name: kafka-tls
+          secret:
+            secretName: kafka-tls
       containers:
         - name: kafka
           image: bitnami/kafka:3.7.0
@@ -23,8 +27,36 @@ spec:
           env:
             - name: KAFKA_CFG_ZOOKEEPER_CONNECT
               value: zookeeper:2181
-            - name: ALLOW_PLAINTEXT_LISTENER
-              value: "yes"
+            - name: KAFKA_CFG_LISTENERS
+              value: SSL://:9092
+            - name: KAFKA_CFG_ADVERTISED_LISTENERS
+              value: SSL://kafka:9092
+            - name: KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP
+              value: SSL:SSL
+            - name: KAFKA_CFG_INTER_BROKER_LISTENER_NAME
+              value: SSL
+            - name: KAFKA_TLS_TYPE
+              value: PEM
+            - name: KAFKA_TLS_CERTIFICATE_FILE
+              value: /opt/bitnami/kafka/config/tls/tls.crt
+            - name: KAFKA_TLS_KEY_FILE
+              value: /opt/bitnami/kafka/config/tls/tls.key
+            - name: KAFKA_TLS_CA_CERT_FILE
+              value: /opt/bitnami/kafka/config/tls/ca.crt
+            - name: KAFKA_TLS_CLIENT_AUTH
+              value: none
+            - name: KAFKA_ZOOKEEPER_PROTOCOL
+              value: SASL
+            - name: KAFKA_ZOOKEEPER_USER
+              valueFrom:
+                secretKeyRef:
+                  name: zookeeper-credentials
+                  key: kafka_user
+            - name: KAFKA_ZOOKEEPER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: zookeeper-credentials
+                  key: kafka_password
           resources:
             requests:
               cpu: 500m
@@ -49,6 +81,9 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /bitnami/kafka
+            - name: kafka-tls
+              mountPath: /opt/bitnami/kafka/config/tls
+              readOnly: true
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -178,8 +213,28 @@ spec:
           ports:
             - containerPort: 2181
           env:
-            - name: ALLOW_ANONYMOUS_LOGIN
+            - name: ZOO_ENABLE_AUTH
               value: "yes"
+            - name: ZOO_CLIENT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: zookeeper-credentials
+                  key: client_user
+            - name: ZOO_CLIENT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: zookeeper-credentials
+                  key: client_password
+            - name: ZOO_SERVER_USERS
+              valueFrom:
+                secretKeyRef:
+                  name: zookeeper-credentials
+                  key: server_users
+            - name: ZOO_SERVER_PASSWORDS
+              valueFrom:
+                secretKeyRef:
+                  name: zookeeper-credentials
+                  key: server_passwords
           resources:
             requests:
               cpu: 200m

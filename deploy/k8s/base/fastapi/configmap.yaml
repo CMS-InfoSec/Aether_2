@@ -13,7 +13,8 @@ data:
       brokers:
         - bootstrap.kafka.aether.svc.cluster.local:9092
       tls:
-        enabled: false
+        enabled: true
+        ca_file: /etc/aether/tls/kafka/ca.crt
     nats:
       url: nats://nats.aether.svc.cluster.local:4222
       tls:
