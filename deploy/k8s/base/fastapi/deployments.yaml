@@ -72,10 +72,16 @@ spec:
           volumeMounts:
             - name: config
               mountPath: /etc/aether
+            - name: kafka-tls
+              mountPath: /etc/aether/tls/kafka
+              readOnly: true
       volumes:
         - name: config
           configMap:
             name: fastapi-config
+        - name: kafka-tls
+          secret:
+            secretName: kafka-tls
 ---
 apiVersion: v1
 kind: Service
@@ -161,10 +167,16 @@ spec:
           volumeMounts:
             - name: config
               mountPath: /etc/aether
+            - name: kafka-tls
+              mountPath: /etc/aether/tls/kafka
+              readOnly: true
       volumes:
         - name: config
           configMap:
             name: fastapi-config
+        - name: kafka-tls
+          secret:
+            secretName: kafka-tls
 ---
 apiVersion: v1
 kind: Service
