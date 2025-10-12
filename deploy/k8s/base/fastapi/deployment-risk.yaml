@@ -38,6 +38,9 @@ spec:
             - name: config
               mountPath: /etc/aether
               readOnly: true
+            - name: kafka-tls
+              mountPath: /etc/aether/tls/kafka
+              readOnly: true
           resources:
             requests:
               cpu: 300m
@@ -54,3 +57,6 @@ spec:
         - name: config
           configMap:
             name: fastapi-config
+        - name: kafka-tls
+          secret:
+            secretName: kafka-tls

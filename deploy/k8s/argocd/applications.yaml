@@ -17,45 +17,48 @@ spec:
       kind: "*"
 ---
 apiVersion: argoproj.io/v1alpha1
-kind: Application
+kind: ApplicationSet
 metadata:
-  name: aether-risk-staging
+  name: aether-risk-environments
   namespace: argocd
 spec:
-  project: aether-risk
-  source:
-    repoURL: https://github.com/aether/aether-risk.git
-    targetRevision: main
-    path: deploy/k8s/overlays/staging
-  destination:
-    namespace: aether-staging
-    server: https://kubernetes.default.svc
-  syncPolicy:
-    automated:
-      prune: true
-      selfHeal: true
-    syncOptions:
-      - CreateNamespace=true
-      - ServerSideApply=true
----
-apiVersion: argoproj.io/v1alpha1
-kind: Application
-metadata:
-  name: aether-risk-prod
-  namespace: argocd
-spec:
-  project: aether-risk
-  source:
-    repoURL: https://github.com/aether/aether-risk.git
-    targetRevision: main
-    path: deploy/k8s/overlays/production
-  destination:
-    namespace: aether-prod
-    server: https://kubernetes.default.svc
-  syncPolicy:
-    automated:
-      prune: true
-      selfHeal: true
-    syncOptions:
-      - CreateNamespace=true
-      - ApplyOutOfSyncOnly=true
+  generators:
+    - list:
+        elements:
+          - env: staging
+            namespace: aether-staging
+            path: deploy/k8s/overlays/staging
+          - env: production
+            namespace: aether-prod
+            path: deploy/k8s/overlays/production
+  template:
+    metadata:
+      name: aether-risk-{{env}}
+      labels:
+        aether.io/gitops: "true"
+        environment: {{env}}
+    spec:
+      project: aether-risk
+      source:
+        repoURL: https://github.com/aether/aether-risk.git
+        targetRevision: main
+        path: {{path}}
+      destination:
+        namespace: {{namespace}}
+        server: https://kubernetes.default.svc
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+{{- if eq env "staging" }}
+          - ServerSideApply=true
+{{- else if eq env "production" }}
+          - ApplyOutOfSyncOnly=true
+{{- end }}
+      info:
+        - name: Environment
+          value: {{env}}
+        - name: GitOps Managed
+          value: Managed by Argo CD ApplicationSet

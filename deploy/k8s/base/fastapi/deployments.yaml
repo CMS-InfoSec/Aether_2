@@ -81,6 +81,9 @@ spec:
         - name: config
           configMap:
             name: fastapi-config
+        - name: kafka-tls
+          secret:
+            secretName: kafka-tls
 ---
 apiVersion: v1
 kind: Service
@@ -175,6 +178,9 @@ spec:
         - name: config
           configMap:
             name: fastapi-config
+        - name: kafka-tls
+          secret:
+            secretName: kafka-tls
 ---
 apiVersion: v1
 kind: Service
