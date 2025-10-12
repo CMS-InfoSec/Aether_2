@@ -13,9 +13,17 @@ data:
       brokers:
         - bootstrap.kafka.aether.svc.cluster.local:9092
       tls:
-        enabled: false
+        enabled: true
+        caFile: /etc/aether/tls/kafka/ca.crt
+      sasl:
+        mechanism: scram-sha-512
+        usernameSecretKey: KAFKA_USERNAME
+        passwordSecretKey: KAFKA_PASSWORD
     nats:
       url: nats://nats.aether.svc.cluster.local:4222
+      authentication:
+        usernameSecretKey: NATS_USERNAME
+        passwordSecretKey: NATS_PASSWORD
       tls:
         enabled: false
     timescaledb:
