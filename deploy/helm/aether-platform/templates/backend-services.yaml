@@ -18,5 +18,5 @@ spec:
       targetPort: {{ $svc.service.targetPort | default "http" }}
   type: ClusterIP
 ---
-{{- end }}
-{{- end }}
+{{ end }}
+{{ end }}

@@ -14,12 +14,16 @@ spec:
         app: kafka
     spec:
       serviceAccountName: streaming-services
+      volumes:
+        - name: kafka-tls
+          secret:
+            secretName: kafka-tls
       containers:
         - name: kafka
           image: bitnami/kafka:3.7.0
           ports:
-            - containerPort: 9092
-              name: client
+            - containerPort: 9093
+              name: client-tls
           env:
             - name: KAFKA_CFG_ZOOKEEPER_CONNECT
               value: zookeeper:2181
@@ -66,14 +70,14 @@ spec:
               memory: 4Gi
           readinessProbe:
             tcpSocket:
-              port: client
+              port: client-tls
             initialDelaySeconds: 20
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 6
           livenessProbe:
             tcpSocket:
-              port: client
+              port: client-tls
             initialDelaySeconds: 60
             periodSeconds: 20
             timeoutSeconds: 5
@@ -81,12 +85,26 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /bitnami/kafka
+            - name: kafka-tls
+              mountPath: /opt/bitnami/kafka/config/tls
+              readOnly: true
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
               drop:
                 - ALL
             readOnlyRootFilesystem: true
+      volumes:
+        - name: kafka-tls
+          secret:
+            secretName: kafka-tls
+            items:
+              - key: tls.crt
+                path: kafka.keystore.pem
+              - key: tls.key
+                path: kafka.keystore.key
+              - key: ca.crt
+                path: kafka.truststore.pem
   volumeClaimTemplates:
     - metadata:
         name: data
@@ -106,9 +124,9 @@ spec:
   selector:
     app: kafka
   ports:
-    - name: client
-      port: 9092
-      targetPort: 9092
+    - name: client-tls
+      port: 9093
+      targetPort: 9093
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -183,9 +201,22 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: nats-tls
+              mountPath: /etc/nats/tls
+              readOnly: true
       volumes:
         - name: data
           emptyDir: {}
+        - name: nats-tls
+          secret:
+            secretName: nats-tls
+            items:
+              - key: tls.crt
+                path: server.crt
+              - key: tls.key
+                path: server.key
+              - key: ca.crt
+                path: ca.crt
 ---
 apiVersion: v1
 kind: Service
@@ -225,8 +256,28 @@ spec:
           ports:
             - containerPort: 2181
           env:
-            - name: ALLOW_ANONYMOUS_LOGIN
+            - name: ZOO_ENABLE_AUTH
               value: "yes"
+            - name: ZOO_CLIENT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: zookeeper-credentials
+                  key: client_user
+            - name: ZOO_CLIENT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: zookeeper-credentials
+                  key: client_password
+            - name: ZOO_SERVER_USERS
+              valueFrom:
+                secretKeyRef:
+                  name: zookeeper-credentials
+                  key: server_users
+            - name: ZOO_SERVER_PASSWORDS
+              valueFrom:
+                secretKeyRef:
+                  name: zookeeper-credentials
+                  key: server_passwords
           resources:
             requests:
               cpu: 200m
