@@ -93,7 +93,7 @@
 * RMT-023 — Implement the `ws_sequence_gap_ratio` metric (or update the WebSocket desync runbook) so the alerting flow references observable data. Files: WebSocket ingest/exporter, `docs/runbooks/websocket_desync.md`. Severity: Medium. Owner: Data Platform. Status: Mitigated.
 * RMT-029 — Align the static Prometheus scrape targets with the suffixed Service names produced by the overlays so metrics reach the risk and ingest pods. Files: `deploy/observability/prometheus/configmap.yaml`, overlay patches. Severity: High. Owner: Observability. Status: Mitigated.
 * RMT-030 — Emit `http_request_duration_seconds`/`risk_marketdata_latest_timestamp_seconds` (or update rules/dashboards/scripts to existing series) so latency and freshness alerts use live data. Files: `metrics.py`, `deploy/observability/prometheus/configmap.yaml`, `docs/runbooks/scripts/daily_report.py`. Severity: High. Owner: Observability. Status: Mitigated.
-* RMT-039 — ExternalSecret reconciliation validated in CI/CD. Files: `.github/workflows/ci.yaml`, `scripts/verify_externalsecrets_ready.sh`, `docs/runbooks/secrets-validation.md`. Severity: High. Owner: Platform Ops. Status: Mitigated.
+* RMT-044 — Namespace NetworkPolicy coverage completed. Namespaces `aether-prod`, `aether-staging`, `cert-manager`, and `external-secrets` now ship baseline deny-all policies with explicit allowances for ingress controller, DNS, Vault, ACME, and API server flows. Files: `deploy/k8s/base/networkpolicies/restrictive-egress-ingress.yaml`, `deploy/k8s/base/networkpolicies/namespace-cert-manager.yaml`, `deploy/k8s/base/networkpolicies/namespace-external-secrets.yaml`. Severity: High. Owner: Platform Security. Status: Mitigated.
 
 ## Security & Compliance
 
