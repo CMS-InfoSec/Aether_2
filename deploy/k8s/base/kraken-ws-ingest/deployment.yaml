@@ -16,13 +16,17 @@ spec:
     spec:
       containers:
         - name: kraken-ws-ingest
-          image: ghcr.io/aether/kraken-ws-ingest:latest
+          image: ghcr.io/aether/kraken-ws-ingest@sha256:b960cd80f58627d0c59d3e18873a2855b29e0898d4ddeebf7186290729edfa6e
           imagePullPolicy: IfNotPresent
           args:
             - "--pairs"
             - "XBT/USD,ETH/USD"
             - "--kafka-bootstrap"
             - "kafka:9092"
+            - "--kafka-security-protocol"
+            - "SSL"
+            - "--kafka-ca-path"
+            - "/etc/aether/tls/kafka/ca.crt"
             - "--trade-topic"
             - "md.trades"
             - "--book-topic"
@@ -60,3 +64,11 @@ spec:
                 - "pgrep -f kraken_ws_ingest || exit 1"
             initialDelaySeconds: 10
             periodSeconds: 30
+          volumeMounts:
+            - name: kafka-tls
+              mountPath: /etc/aether/tls/kafka
+              readOnly: true
+      volumes:
+        - name: kafka-tls
+          secret:
+            secretName: kafka-tls

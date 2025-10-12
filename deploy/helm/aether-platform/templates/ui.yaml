@@ -70,14 +70,14 @@ spec:
               value: {{ printf "%s/%s/credentials.json" $global.krakenSecrets.basePath $account.mountSubPath | quote }}
             {{- end }}
             {{- end }}
-            {{- range $extraEnv }}
+          {{- with $extraEnv }}
             {{- toYaml . | nindent 12 }}
-            {{- end }}
           {{- end }}
-          {{- $readiness := $global.probes.readiness -}}
+        {{- end }}
+          {{ $readiness := $global.probes.readiness }}
           readinessProbe:
             {{- toYaml $readiness | nindent 12 }}
-          {{- $liveness := $global.probes.liveness -}}
+          {{ $liveness := $global.probes.liveness }}
           livenessProbe:
             {{- toYaml $liveness | nindent 12 }}
           {{- with $ui.resources }}
@@ -85,7 +85,23 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           securityContext:
-            {{- toYaml $global.containerSecurityContext | nindent 12 }}
+            allowPrivilegeEscalation: {{ $global.containerSecurityContext.allowPrivilegeEscalation }}
+            readOnlyRootFilesystem: {{ $global.containerSecurityContext.readOnlyRootFilesystem }}
+            {{- with $global.containerSecurityContext.capabilities }}
+            capabilities:
+              {{- with .drop }}
+              drop:
+                {{- range . }}
+                - {{ . }}
+                {{- end }}
+              {{- end }}
+              {{- with omit . "drop" }}
+              {{- toYaml . | nindent 14 }}
+              {{- end }}
+            {{- end }}
+            {{- with omit $global.containerSecurityContext "allowPrivilegeEscalation" "readOnlyRootFilesystem" "capabilities" }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           volumeMounts:
             - name: tmp
               mountPath: /tmp
@@ -93,10 +109,10 @@ spec:
             - name: kraken-credentials
               mountPath: {{ $global.krakenSecrets.basePath | quote }}
               readOnly: true
-            {{- end }}
-            {{- range $ui.extraVolumeMounts }}
-            {{- toYaml . | nindent 12 }}
-            {{- end }}
+            {{ end }}
+            {{- range $vm := $ui.extraVolumeMounts }}
+            {{- toYaml (list $vm) | nindent 12 }}
+            {{ end }}
       volumes:
         - name: tmp
           emptyDir: {}
@@ -105,19 +121,19 @@ spec:
           projected:
             defaultMode: 0440
             sources:
-              {{- range $account := $krakenAccounts }}
-              {{- $optional := ternary $account.optional true (hasKey $account "optional") -}}
+              {{ range $account := $krakenAccounts }}
+              {{ $optional := ternary $account.optional true (hasKey $account "optional") }}
               - secret:
                   name: {{ $account.secretName }}
                   items:
                     - key: credentials.json
                       path: {{ printf "%s/credentials.json" $account.mountSubPath }}
                   optional: {{ $optional }}
-              {{- end }}
-        {{- end }}
-        {{- range $ui.extraVolumes }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
+              {{ end }}
+        {{ end }}
+        {{- range $vol := $ui.extraVolumes }}
+        {{- toYaml (list $vol) | nindent 8 }}
+        {{ end }}
 ---
 apiVersion: v1
 kind: Service

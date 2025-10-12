@@ -22,7 +22,7 @@ spec:
     spec:
       containers:
         - name: oms-service
-          image: ghcr.io/aether/oms-service:latest
+          image: ghcr.io/aether/oms-service@sha256:257a808c4abc954e0b4c364b7b0950dd33d5a3565aa6d85bf8d032c16fa722be
           ports:
             - containerPort: 8000
               name: http
@@ -79,7 +79,7 @@ spec:
     spec:
       containers:
         - name: risk-service
-          image: ghcr.io/aether/risk-service:latest
+          image: ghcr.io/aether/risk-service@sha256:9c9a9a0eaca65d24b7ad9159347ebe6b3d21abf21889d9cf0250026bb5623cb6
           ports:
             - containerPort: 8000
               name: http
@@ -133,7 +133,7 @@ spec:
     spec:
       containers:
         - name: policy-service
-          image: ghcr.io/aether/policy-service:latest
+          image: ghcr.io/aether/policy-service@sha256:516da008a68cf816b0aa082d52d620a161a038815a9bc8eca88df9c650bde41c
           ports:
             - containerPort: 8000
               name: http
@@ -207,7 +207,7 @@ spec:
             - name: data
               mountPath: /var/lib/postgresql/data
         - name: wal-streamer
-          image: ghcr.io/aether/timescaledb-wal-shipper:latest
+          image: ghcr.io/aether/timescaledb-wal-shipper@sha256:4977e381c6e82ca44f896b88e674145d1e20b3f7f4386a48f9a9dfe17be6ebde
           imagePullPolicy: IfNotPresent
           env:
             - name: WAL_ARCHIVE_S3_BUCKET
