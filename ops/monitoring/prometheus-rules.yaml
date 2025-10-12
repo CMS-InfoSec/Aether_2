@@ -50,6 +50,17 @@ spec:
             summary: Kill-switch response time exceeded 45s threshold
             runbook: docs/runbooks/kill_switch_activation.md
             slo_reference: docs/slo.md#kill-switch-response
+        - alert: kill_switch_engaged
+          expr: |
+            max by (account_id) (kill_switch_state) > 0
+          for: 2m
+          labels:
+            severity: critical
+            pager_channel: aether-oncall
+          annotations:
+            summary: Kill-switch engaged for {{ $labels.account_id }}
+            description: The trading kill-switch has remained engaged for more than two minutes for {{ $labels.account_id }}.
+            runbook: docs/runbooks/kill_switch_activation.md
     - name: model-canary.slo
       rules:
         - alert: model_canary_promotion_slow

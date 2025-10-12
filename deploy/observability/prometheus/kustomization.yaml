@@ -2,5 +2,4 @@ resources:
   - configmap.yaml
   - deployment.yaml
   - service.yaml
-  - prometheus.yaml
   - servicemonitors.yaml

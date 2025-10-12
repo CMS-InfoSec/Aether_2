@@ -1,97 +1,91 @@
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: auth-service
+  name: risk-service
+  namespace: observability
   labels:
     release: aether
+    app.kubernetes.io/name: risk-service
+    app.kubernetes.io/component: api
 spec:
   selector:
     matchLabels:
-      app: auth-service
+      app: risk-service
+  namespaceSelector:
+    matchNames:
+      - aether-staging
+      - aether-prod
   endpoints:
     - port: http
+      path: /metrics
       interval: 30s
----
-apiVersion: monitoring.coreos.com/v1
-kind: ServiceMonitor
-metadata:
-  name: fees-service
-  labels:
-    release: aether
-spec:
-  selector:
-    matchLabels:
-      app: fees-service
-  endpoints:
-    - port: http
-      interval: 30s
----
-apiVersion: monitoring.coreos.com/v1
-kind: ServiceMonitor
-metadata:
-  name: oms-service
-  labels:
-    release: aether
-spec:
-  selector:
-    matchLabels:
-      app: oms-service
-  endpoints:
-    - port: http
-      interval: 30s
+      honorLabels: true
 ---
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
   name: policy-service
+  namespace: observability
   labels:
     release: aether
+    app.kubernetes.io/name: policy-service
+    app.kubernetes.io/component: api
 spec:
   selector:
     matchLabels:
       app: policy-service
+  namespaceSelector:
+    matchNames:
+      - aether-staging
+      - aether-prod
   endpoints:
     - port: http
+      path: /metrics
       interval: 30s
----
-apiVersion: monitoring.coreos.com/v1
-kind: ServiceMonitor
-metadata:
-  name: risk-service
-  labels:
-    release: aether
-spec:
-  selector:
-    matchLabels:
-      app: risk-service
-  endpoints:
-    - port: http
-      interval: 30s
+      honorLabels: true
 ---
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
   name: secrets-service
+  namespace: observability
   labels:
     release: aether
+    app.kubernetes.io/name: secrets-service
+    app.kubernetes.io/component: api
 spec:
   selector:
     matchLabels:
       app: secrets-service
+  namespaceSelector:
+    matchNames:
+      - aether-staging
+      - aether-prod
   endpoints:
     - port: http
+      path: /metrics
       interval: 30s
+      honorLabels: true
 ---
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
   name: universe-service
+  namespace: observability
   labels:
     release: aether
+    app.kubernetes.io/name: universe-service
+    app.kubernetes.io/component: api
 spec:
   selector:
     matchLabels:
       app: universe-service
+  namespaceSelector:
+    matchNames:
+      - aether-staging
+      - aether-prod
   endpoints:
     - port: http
+      path: /metrics
       interval: 30s
+      honorLabels: true
