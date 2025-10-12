@@ -5,6 +5,7 @@ namespace: aether-prod
 nameSuffix: -prod
 resources:
   - ../../base
+  - resourcequota.yaml
 patches:
   - target:
       kind: Deployment
