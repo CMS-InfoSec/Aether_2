@@ -1,0 +1,145 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: feast-backup
+  labels:
+    app.kubernetes.io/name: feast-backup
+    app.kubernetes.io/component: feature-store
+spec:
+  schedule: "15 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          initContainers:
+            - name: render-feast-config
+              image: python:3.11-slim
+              command:
+                - python
+                - -c
+                - |
+                  import os
+                  from pathlib import Path
+
+                  template = Path("/templates/feature_store.yaml").read_text()
+                  password = os.environ["FEAST_OFFLINE_PASSWORD"]
+                  rendered = template.replace("${FEAST_OFFLINE_PASSWORD}", password)
+                  output = Path("/etc/feast/feature_store.yaml")
+                  output.parent.mkdir(parents=True, exist_ok=True)
+                  output.write_text(rendered)
+              env:
+                - name: FEAST_OFFLINE_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: feast-offline-store
+                      key: password
+              volumeMounts:
+                - name: feast-config-template
+                  mountPath: /templates
+                  readOnly: true
+                - name: feast-rendered-config
+                  mountPath: /etc/feast
+          containers:
+            - name: backup
+              image: ghcr.io/aether/ops-runtime:latest
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -euo pipefail
+                  apt-get update >/tmp/apt-install.log
+                  apt-get install -y --no-install-recommends redis-tools >>/tmp/apt-install.log
+                  rm -rf /var/lib/apt/lists/*
+                  pip install --no-cache-dir feast==0.40.1 boto3 cryptography >/tmp/pip-install.log
+                  python -m ops.backup.feast_backup backup
+              env:
+                - name: FEAST_FEATURE_STORE_PATH
+                  value: /etc/feast/feature_store.yaml
+                - name: FEAST_REPO_PATH
+                  value: /etc/feast
+                - name: FEAST_REDIS_HOST
+                  value: redis-master
+                - name: FEAST_REDIS_PORT
+                  value: "6379"
+                - name: FEAST_OFFLINE_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: feast-offline-store
+                      key: username
+                - name: FEAST_OFFLINE_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: feast-offline-store
+                      key: password
+                - name: LINODE_BUCKET
+                  valueFrom:
+                    secretKeyRef:
+                      name: feast-backup-object-storage
+                      key: bucket
+                - name: LINODE_PREFIX
+                  valueFrom:
+                    secretKeyRef:
+                      name: feast-backup-object-storage
+                      key: prefix
+                      optional: true
+                - name: LINODE_REGION
+                  valueFrom:
+                    secretKeyRef:
+                      name: feast-backup-object-storage
+                      key: region
+                      optional: true
+                - name: LINODE_ENDPOINT
+                  valueFrom:
+                    secretKeyRef:
+                      name: feast-backup-object-storage
+                      key: endpoint
+                      optional: true
+                - name: LINODE_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: feast-backup-object-storage
+                      key: access_key
+                - name: LINODE_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: feast-backup-object-storage
+                      key: secret_key
+                - name: LINODE_SSE_ALGO
+                  valueFrom:
+                    secretKeyRef:
+                      name: feast-backup-object-storage
+                      key: sse_algorithm
+                      optional: true
+                - name: LINODE_SSE_KMS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: feast-backup-object-storage
+                      key: kms_key_id
+                      optional: true
+                - name: BACKUP_RETENTION_DAYS
+                  valueFrom:
+                    secretKeyRef:
+                      name: feast-backup-object-storage
+                      key: retention_days
+                      optional: true
+                - name: BACKUP_ENCRYPTION_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: feast-backup-object-storage
+                      key: encryption_key
+              volumeMounts:
+                - name: feast-rendered-config
+                  mountPath: /etc/feast
+                  readOnly: true
+          volumes:
+            - name: feast-config-template
+              configMap:
+                name: feast-config
+            - name: feast-rendered-config
+              emptyDir: {}
