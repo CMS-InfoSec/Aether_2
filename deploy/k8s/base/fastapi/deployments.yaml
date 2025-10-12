@@ -65,7 +65,7 @@ spec:
             periodSeconds: 10
           readinessProbe:
             httpGet:
-              path: /readyz
+              path: /metrics
               port: http
             initialDelaySeconds: 10
             periodSeconds: 5
@@ -155,7 +155,7 @@ spec:
             initialDelaySeconds: 15
           readinessProbe:
             httpGet:
-              path: /readyz
+              path: /metrics
               port: http
             periodSeconds: 5
           volumeMounts:

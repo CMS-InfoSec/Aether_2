@@ -26,7 +26,7 @@ spec:
               value: /etc/aether/settings.yaml
           readinessProbe:
             httpGet:
-              path: /ready
+              path: /metrics
               port: http
             initialDelaySeconds: 5
           livenessProbe:

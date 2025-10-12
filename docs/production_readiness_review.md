@@ -63,6 +63,7 @@
 * RMT-025 — Update the `kraken-ws-ingest` Deployment to reference the published `ghcr.io/aether/kraken-ws-ingest` image (and tag) so Argo CD deploys the production build. Files: `deploy/k8s/base/kraken-ws-ingest/deployment.yaml`, image publish workflow. Severity: High. Owner: Data Platform. Status: Mitigated.
 * RMT-027 — Define certificates/ExternalSecrets for each ingress TLS secret (`auth|fees|oms|policy|risk|secrets|universe` `*-service-tls`) so cert-manager can provision HTTPS for every service. Files: `deploy/k8s/base/aether-services/ingress-*.yaml`, secrets overlays. Severity: High. Owner: Platform. Status: Pending.
 * RMT-028 — Point Feast serving at the dedicated Feast Redis service (e.g., `redis-master`) or remove the unused `redis-feast` stack so online feature reads hit the correct backend. Files: `deploy/k8s/base/feast/configmap.yaml`, `deploy/k8s/base/feast/deployment.yaml`, `deploy/k8s/base/redis-feast/deployments.yaml`. Severity: High. Owner: Data Platform. Status: Mitigated.
+* RMT-048 — Liveness and readiness probes standardized across FastAPI workloads. Files: `deploy/k8s/base/fastapi/deployment-ingestor.yaml`, `deploy/k8s/base/aether-services/deployment-risk.yaml`. Severity: Medium. Owner: Platform. Status: Mitigated.
 
 ## Reliability & Observability
 
