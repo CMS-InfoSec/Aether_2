@@ -18,13 +18,13 @@ spec:
             deny:
               conditions:
                 any:
-                  - key: "{{ contains(@.image, '\\x3Alatest') }}"
+                  - key: "{{ contains(@.image, ':latest') }}"
                     operator: Equals
                     value: true
           - list: "request.object.spec.initContainers[]"
             deny:
               conditions:
                 any:
-                  - key: "{{ contains(@.image, '\\x3Alatest') }}"
+                  - key: "{{ contains(@.image, ':latest') }}"
                     operator: Equals
                     value: true
