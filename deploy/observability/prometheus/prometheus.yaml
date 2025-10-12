@@ -191,6 +191,7 @@ spec:
             severity: critical
           annotations:
             summary: Scaling controller has not completed an evaluation in the last 15 minutes
+            description: Review controller logs and queued jobs to restore automation.
             runbook: docs/runbooks/scaling_controller.md
         - alert: scaling_gpu_pool_idle
           expr: |
@@ -201,6 +202,7 @@ spec:
             severity: warning
           annotations:
             summary: GPU node pool provisioned without pending jobs for 30 minutes
+            description: Scale the pool down or investigate stuck queue submissions.
             runbook: docs/runbooks/scaling_controller.md
 ---
 apiVersion: v1

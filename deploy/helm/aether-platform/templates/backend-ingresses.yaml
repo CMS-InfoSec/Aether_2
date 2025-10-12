@@ -57,5 +57,5 @@ spec:
                 port:
                   number: {{ $svc.service.port | default 80 }}
 ---
-{{- end }}
+{{ end }}
 {{- end }}

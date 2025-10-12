@@ -22,6 +22,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install --no-cache-dir '.[dev,test]'
 
+      - name: Validate Kubernetes overlays
+        run: |
+          kubectl apply --dry-run=client -k deploy/k8s/overlays/production
+          kubectl apply --dry-run=client -k deploy/k8s/overlays/staging
+
       - name: Lint for unused imports and insecure defaults
         run: |
           ruff check . --select F401,F402,F403,F404,F405,F406,F407,F601,F602 --exclude tests
@@ -43,6 +48,15 @@ jobs:
       - name: Build risk API Docker image
         run: |
           docker build -t risk-api:ci -f deploy/docker/risk-api/Dockerfile .
+
+      - name: Scan risk API image with Trivy
+        uses: aquasecurity/trivy-action@0.21.0
+        with:
+          image-ref: risk-api:ci
+          severity: CRITICAL,HIGH
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
 
       - name: Run /healthz check
         run: |
