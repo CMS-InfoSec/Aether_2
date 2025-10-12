@@ -5,7 +5,7 @@ metadata:
   name: aether-risk
   annotations:
     kubernetes.io/ingress.class: nginx
-    cert-manager.io/cluster-issuer: letsencrypt-production
+    cert-manager.io/issuer: aether-risk-issuer
     nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
     nginx.ingress.kubernetes.io/rewrite-target: /$1
     # Ensure upstream services see the original TLS scheme via X-Forwarded-Proto.

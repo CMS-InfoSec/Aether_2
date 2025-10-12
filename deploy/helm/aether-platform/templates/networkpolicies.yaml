@@ -52,7 +52,7 @@ spec:
         {{- end }}
     {{- end }}
 ---
-{{- end }}
+{{ end }}
 {{- end }}
 {{- if .Values.ui.enabled }}
 {{- $ui := .Values.ui -}}
@@ -106,5 +106,5 @@ spec:
         {{- end }}
     {{- end }}
 ---
-{{- end }}
+{{ end }}
 {{- end }}
