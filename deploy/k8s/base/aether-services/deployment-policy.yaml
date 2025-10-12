@@ -32,7 +32,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: policy-service
-          image: ghcr.io/aether/policy-service:latest
+          image: ghcr.io/aether/policy-service@sha256:516da008a68cf816b0aa082d52d620a161a038815a9bc8eca88df9c650bde41c
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8000

@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
         - name: kraken-ws-ingest
-          image: ghcr.io/aether/kraken-ws-ingest:latest
+          image: ghcr.io/aether/kraken-ws-ingest@sha256:b960cd80f58627d0c59d3e18873a2855b29e0898d4ddeebf7186290729edfa6e
           imagePullPolicy: IfNotPresent
           args:
             - "--pairs"

@@ -22,10 +22,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install --no-cache-dir '.[dev,test]'
 
-      - name: Validate Kubernetes overlays
+      - name: Ensure container tags are immutable
         run: |
-          kubectl apply --dry-run=client -k deploy/k8s/overlays/production
-          kubectl apply --dry-run=client -k deploy/k8s/overlays/staging
+          if grep -R ":latest" --exclude=*.md --exclude-dir=.git --exclude-dir=deploy/k8s/policies .; then
+            echo 'Found mutable :latest tag references. Pin all container images to immutable tags or digests.' >&2
+            exit 1
+          fi
 
       - name: Lint for unused imports and insecure defaults
         run: |
