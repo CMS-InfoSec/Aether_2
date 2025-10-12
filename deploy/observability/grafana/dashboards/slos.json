@@ -79,8 +79,8 @@
       "title": "Market Data Freshness",
       "targets": [
         {
-          "expr": "time() - max(risk_marketdata_latest_timestamp_seconds)",
-          "legendFormat": "Freshness"
+          "expr": "time() - max(risk_marketdata_latest_timestamp_seconds) by (service)",
+          "legendFormat": "{{service}}"
         }
       ],
       "fieldConfig": {
