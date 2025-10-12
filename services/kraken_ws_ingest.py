@@ -80,6 +80,30 @@ WS_SEQUENCE_GAP_RATIO = Gauge(
     labelnames=("pair",),
 )
 
+WS_DELIVERY_LATENCY_SECONDS = Histogram(
+    "ws_delivery_latency_seconds",
+    "Latency between Kraken event timestamps and ingestion processing in seconds",
+    labelnames=("pair",),
+    buckets=(
+        0.01,
+        0.025,
+        0.05,
+        0.1,
+        0.25,
+        0.5,
+        1.0,
+        2.5,
+        5.0,
+        float("inf"),
+    ),
+)
+
+RISK_MARKETDATA_LATEST_TIMESTAMP_SECONDS = Gauge(
+    "risk_marketdata_latest_timestamp_seconds",
+    "Unix timestamp of the most recent normalized market data event emitted by the ingestor.",
+    labelnames=("service",),
+)
+
 
 class HeartbeatTimeout(RuntimeError):
     """Raised when Kraken heartbeats stop flowing."""
@@ -439,6 +463,20 @@ class KrakenIngestor:
         if window:
             ratio = sum(window) / len(window)
             WS_SEQUENCE_GAP_RATIO.labels(pair=pair).set(ratio)
+
+        if timestamp:
+            try:
+                latency = max(time.time() - float(timestamp), 0.0)
+                WS_DELIVERY_LATENCY_SECONDS.labels(pair=pair).observe(latency)
+            except Exception:  # pragma: no cover - defensive guard for optional metrics
+                logging.debug("Failed to record WebSocket delivery latency", exc_info=True)
+
+        try:
+            RISK_MARKETDATA_LATEST_TIMESTAMP_SECONDS.labels(
+                service="marketdata-ingestor"
+            ).set(timestamp)
+        except Exception:  # pragma: no cover - defensive guard for optional metrics
+            logging.debug("Failed to record market data freshness metric", exc_info=True)
 
 
 def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
