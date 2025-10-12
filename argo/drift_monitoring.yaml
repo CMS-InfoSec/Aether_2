@@ -23,7 +23,7 @@ spec:
               template: alert
       - name: fetch-data
         container:
-          image: ghcr.io/aether/ml-runtime:latest
+          image: ghcr.io/aether/ml-runtime@sha256:b907adb85315dd9d690dd0638823d0a8f9ff23020a01efc7a50bf9188bcf5068
           command: ["python", "-m", "ml.monitoring.fetch_production_snapshot"]
           envFrom:
             - configMapRef:
@@ -32,7 +32,7 @@ spec:
                 name: observability-credentials
       - name: compute-drift
         script:
-          image: ghcr.io/aether/ml-runtime:latest
+          image: ghcr.io/aether/ml-runtime@sha256:b907adb85315dd9d690dd0638823d0a8f9ff23020a01efc7a50bf9188bcf5068
           command: [python]
           source: |
             import json
@@ -60,7 +60,7 @@ spec:
             - name: drift_report
               path: /reports/drift_report.json
         container:
-          image: ghcr.io/aether/observability-cli:latest
+          image: ghcr.io/aether/observability-cli@sha256:df58330ae3bb97111925705298e8c1a0ed5b42a9fac4b62f8d4a08a8cb2acf2d
           command: ["obsctl", "alerts", "send", "--channel", "ml-ops", "--file", "/reports/drift_report.json"]
           envFrom:
             - secretRef:

@@ -3,6 +3,7 @@ kind: Kustomization
 nameSuffix: -staging
 namespace: aether-staging
 resources:
+  - namespace.yaml
   - ../../base
   - restore-drill-cronjob.yaml
   - restore-drill-secret.yaml
