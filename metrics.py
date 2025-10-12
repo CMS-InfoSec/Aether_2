@@ -532,10 +532,26 @@ _policy_inference_latency = Histogram(
     buckets=(5, 10, 25, 50, 100, 250, 500, 1000, float("inf")),
 )
 
+_policy_latency_ms = Histogram(
+    "policy_latency_ms",
+    "Latency distribution for policy decisions in milliseconds.",
+    ["service", "account_segment", "symbol_tier"],
+    registry=_REGISTRY,
+    buckets=(5, 10, 25, 50, 100, 250, 500, 1000, float("inf")),
+)
+
 _risk_validation_latency = Histogram(
     "risk_validation_latency",
     "Latency distribution for risk validation in milliseconds.",
     ["service"],
+    registry=_REGISTRY,
+    buckets=(5, 10, 25, 50, 100, 250, 500, 1000, float("inf")),
+)
+
+_risk_latency_ms = Histogram(
+    "risk_latency_ms",
+    "Latency distribution for risk evaluations in milliseconds.",
+    ["service", "account_segment", "symbol_tier"],
     registry=_REGISTRY,
     buckets=(5, 10, 25, 50, 100, 250, 500, 1000, float("inf")),
 )
@@ -567,6 +583,26 @@ _oms_submit_latency = Histogram(
     ["service", "transport"],
     registry=_REGISTRY,
     buckets=(5, 10, 25, 50, 100, 250, 500, 1000, float("inf")),
+)
+
+_oms_order_latency_seconds = Histogram(
+    "oms_order_latency_seconds",
+    "Latency distribution for OMS order acknowledgements in seconds.",
+    ["service", "account_segment", "symbol_tier", "transport"],
+    registry=_REGISTRY,
+    buckets=(
+        0.005,
+        0.01,
+        0.025,
+        0.05,
+        0.1,
+        0.25,
+        0.5,
+        1.0,
+        2.5,
+        5.0,
+        float("inf"),
+    ),
 )
 
 _late_events_total = Counter(
@@ -618,9 +654,12 @@ _METRICS: Dict[str, Counter | Gauge | Histogram] = {
     "account_drawdown_pct": _account_drawdown_pct,
     "account_exposure_usd": _account_exposure_usd,
     "policy_inference_latency": _policy_inference_latency,
+    "policy_latency_ms": _policy_latency_ms,
     "risk_validation_latency": _risk_validation_latency,
+    "risk_latency_ms": _risk_latency_ms,
     "http_request_duration_seconds": _http_request_duration_seconds,
     "oms_submit_latency": _oms_submit_latency,
+    "oms_order_latency_seconds": _oms_order_latency_seconds,
     "late_events_total": _late_events_total,
     "reorder_buffer_depth": _reorder_buffer_depth,
     "scaling_oms_replicas": _scaling_oms_replicas,
@@ -755,6 +794,19 @@ def _account_symbol_labels(ctx: MetricContext) -> Dict[str, str]:
 def _transport_labels(ctx: MetricContext) -> Dict[str, str]:
     labels = _account_symbol_labels(ctx)
     labels["transport"] = ctx.transport.value
+    return labels
+
+
+def _latency_histogram_labels(
+    ctx: MetricContext, *, include_transport: bool = False
+) -> Dict[str, str]:
+    labels: Dict[str, str] = {
+        "service": _service_value(ctx.service),
+        "account_segment": ctx.account_segment.value,
+        "symbol_tier": ctx.symbol_tier.value,
+    }
+    if include_transport:
+        labels["transport"] = ctx.transport.value
     return labels
 
 
@@ -1275,9 +1327,11 @@ def observe_policy_inference_latency(
     service: Optional[str] = None,
 ) -> None:
     ctx = _resolve_metric_context(service=service)
-    _policy_inference_latency.labels(service=_service_value(ctx.service)).observe(
-        latency_ms
-    )
+    service_value = _service_value(ctx.service)
+    _policy_inference_latency.labels(service=service_value).observe(latency_ms)
+    _policy_latency_ms.labels(
+        **_latency_histogram_labels(ctx)
+    ).observe(latency_ms)
 
 
 def observe_risk_validation_latency(
@@ -1286,9 +1340,11 @@ def observe_risk_validation_latency(
     service: Optional[str] = None,
 ) -> None:
     ctx = _resolve_metric_context(service=service)
-    _risk_validation_latency.labels(service=_service_value(ctx.service)).observe(
-        latency_ms
-    )
+    service_value = _service_value(ctx.service)
+    _risk_validation_latency.labels(service=service_value).observe(latency_ms)
+    _risk_latency_ms.labels(
+        **_latency_histogram_labels(ctx)
+    ).observe(latency_ms)
 
 
 def observe_oms_submit_latency(
@@ -1301,9 +1357,13 @@ def observe_oms_submit_latency(
     ctx = _resolve_metric_context(
         context=context, service=service, transport=transport
     )
+    service_value = _service_value(ctx.service)
     _oms_submit_latency.labels(
-        service=_service_value(ctx.service), transport=ctx.transport.value
+        service=service_value, transport=ctx.transport.value
     ).observe(latency_ms)
+    _oms_order_latency_seconds.labels(
+        **_latency_histogram_labels(ctx, include_transport=True)
+    ).observe(latency_ms / 1000.0)
 
 
 def record_oms_submit_ack(
