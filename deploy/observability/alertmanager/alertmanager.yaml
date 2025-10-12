@@ -23,8 +23,18 @@ data:
       group_wait: 30s
       group_interval: 5m
       repeat_interval: 3h
+      routes:
+        - match:
+            pager_channel: aether-oncall
+          receiver: aether-oncall
     receivers:
       - name: default
+        slack_configs:
+          - channel: '#aether-alerts'
+            api_url_file: /etc/alertmanager/secrets/prometheus-slack/webhook-url
+            title: '{{ template "aether.title" . }}'
+            text: '{{ template "aether.body" . }}'
+      - name: aether-oncall
         slack_configs:
           - channel: '#aether-alerts'
             api_url_file: /etc/alertmanager/secrets/prometheus-slack/webhook-url

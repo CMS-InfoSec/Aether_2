@@ -10,6 +10,7 @@ resources:
   - fastapi
   - secrets/clustersecretstore.yaml
   - secrets/clusterissuer.yaml
+  - secrets/aether-risk-tls.yaml
   - secrets/tls-certificates.yaml
   - secrets/cert-manager-renewal-cronjob.yaml
   - secrets/external-secrets.yaml
@@ -22,6 +23,8 @@ resources:
   - ingress
   - networkpolicies
   - aether-services
+  - rbac/serviceaccounts.yaml
+  - rbac/roles.yaml
 commonLabels:
   app.kubernetes.io/part-of: aether-risk
 
