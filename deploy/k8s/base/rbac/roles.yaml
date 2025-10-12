@@ -69,6 +69,11 @@ items:
         resources:
           - externalsecrets
         verbs: ["get", "list", "watch", "update", "patch"]
+      - apiGroups: ["external-secrets.io"]
+        resources:
+          - externalsecrets/status
+          - externalsecrets/finalizers
+        verbs: ["get", "update", "patch"]
       - apiGroups: [""]
         resources:
           - secrets
