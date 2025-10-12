@@ -58,3 +58,25 @@ jobs:
           docker logs risk-api-ci || true
           docker stop risk-api-ci || true
           exit 1
+
+      - name: Generate build metadata manifest
+        run: |
+          cat <<EOF > build-manifest.json
+          {
+            "commit_sha": "${{ github.sha }}",
+            "build_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "change_request_id": "${CHANGE_REQUEST_ID}",
+            "compliance_labels": [
+              "ISO27001",
+              "GDPR"
+            ]
+          }
+          EOF
+        env:
+          CHANGE_REQUEST_ID: ${{ github.event.pull_request.number || github.run_id }}
+
+      - name: Upload build metadata manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-manifest-${{ github.job }}
+          path: build-manifest.json
