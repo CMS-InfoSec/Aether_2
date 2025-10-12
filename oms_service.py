@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 
 from fastapi import FastAPI, HTTPException, Query, status
@@ -19,8 +19,16 @@ from pydantic import BaseModel, Field, field_validator
 
 from common.schemas.contracts import FillEvent
 from metrics import (
+    bind_metric_context,
     increment_oms_error_count,
+    increment_order_gateway_orders_total,
+    increment_order_gateway_request_errors_total,
+    increment_order_gateway_requests_total,
+    metric_context,
+    observe_order_gateway_fee_spend_usd,
+    observe_order_gateway_filled_notional_usd,
     record_oms_latency,
+    record_order_gateway_circuit_breaker_state,
     setup_metrics,
     traced_span,
 )
@@ -51,6 +59,8 @@ logger = logging.getLogger(__name__)
 
 
 SHUTDOWN_TIMEOUT = float(os.getenv("OMS_SHUTDOWN_TIMEOUT", os.getenv("SERVICE_SHUTDOWN_TIMEOUT", "75.0")))
+
+_ACTIVE_CIRCUIT_BREAKERS: Dict[str, Set[str]] = {}
 
 app = FastAPI(title="Kraken OMS Service")
 setup_metrics(app, service_name="oms-service")
@@ -124,9 +134,25 @@ def oms_log(order_id: Optional[str], account_id: str, status: str, ts: datetime 
     logger.info("oms_log", extra={"order_id": order_id, "account_id": account_id, "status": status, "ts": timestamp.isoformat()})
 
 
-def _enforce_stablecoin_guard() -> None:
+def _enforce_stablecoin_guard(account_id: Optional[str]) -> None:
     monitor = get_global_monitor()
     statuses = monitor.active_depegs()
+    account_label = (account_id or "global").strip() or "global"
+    active_symbols = {
+        str(getattr(status, "symbol", "")).strip()
+        for status in statuses
+        if getattr(status, "symbol", None)
+    }
+
+    for symbol, accounts in list(_ACTIVE_CIRCUIT_BREAKERS.items()):
+        if account_label in accounts and symbol not in active_symbols:
+            record_order_gateway_circuit_breaker_state(
+                account_label, symbol, engaged=False
+            )
+            accounts.discard(account_label)
+            if not accounts:
+                _ACTIVE_CIRCUIT_BREAKERS.pop(symbol, None)
+
     if not statuses:
         return
 
@@ -146,6 +172,14 @@ def _enforce_stablecoin_guard() -> None:
             ],
         },
     )
+    for status_entry in statuses:
+        symbol = str(getattr(status_entry, "symbol", "")).strip()
+        if not symbol:
+            continue
+        record_order_gateway_circuit_breaker_state(
+            account_label, symbol, engaged=True
+        )
+        _ACTIVE_CIRCUIT_BREAKERS.setdefault(symbol, set()).add(account_label)
     raise HTTPException(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         detail=detail,
@@ -883,6 +917,33 @@ class KrakenSession:
             else Decimal("0")
         )
         discrepancy_bps = actual_fee_bps - estimated_fee_bps
+        metric_ctx = metric_context(
+            account_id=self.account_id,
+            symbol=context.symbol,
+            transport=state.transport,
+        )
+        if notional > 0:
+            observe_order_gateway_filled_notional_usd(
+                self.account_id,
+                context.symbol,
+                context.side,
+                liquidity=liquidity,
+                notional_usd=notional,
+                context=metric_ctx,
+            )
+        fee_source = "actual" if actual_fee_usd > 0 else "estimated"
+        fee_value = actual_fee_usd if actual_fee_usd > 0 else estimated_fee_usd
+        if fee_value > 0:
+            observe_order_gateway_fee_spend_usd(
+                self.account_id,
+                context.symbol,
+                context.side,
+                liquidity=liquidity,
+                fee_usd=fee_value,
+                source=fee_source,
+                context=metric_ctx,
+            )
+
         logger.info(
             "oms_fee_reconciliation",
             extra={
@@ -935,56 +996,108 @@ class OMSService:
                 await session.close()
 
     async def place_order(self, request: PlaceOrderRequest) -> PlaceOrderResponse:
-        _enforce_stablecoin_guard()
-        session = await self._session(request.account_id)
-        metadata = await session.get_metadata()
-        snapped = self._snap_order_fields(request, metadata)
-        payload = self._build_payload(request, snapped)
-        context = OrderContext(
-            account_id=request.account_id,
-            symbol=request.symbol,
-            side=request.side,
-            qty=snapped.qty,
-            client_id=request.client_id,
-            post_only=request.post_only,
-            reduce_only=request.reduce_only,
-            tif=request.tif,
-            price=snapped.limit_px,
-            expected_fee_bps=request.expected_fee_bps or Decimal("0"),
-            expected_slippage_bps=request.expected_slippage_bps or Decimal("0"),
+        base_metric_ctx = metric_context(
+            account_id=request.account_id, symbol=request.symbol
         )
-        async def execute() -> PlaceOrderResponse:
-            with traced_span(
-                "oms.place_order",
+        with bind_metric_context(account_id=request.account_id, symbol=request.symbol):
+            increment_order_gateway_requests_total(
+                request.account_id, context=base_metric_ctx
+            )
+            try:
+                _enforce_stablecoin_guard(request.account_id)
+            except HTTPException:
+                increment_order_gateway_request_errors_total(
+                    request.account_id,
+                    reason="circuit_breaker",
+                    context=base_metric_ctx,
+                )
+                raise
+
+            session = await self._session(request.account_id)
+            metadata = await session.get_metadata()
+            snapped = self._snap_order_fields(request, metadata)
+            payload = self._build_payload(request, snapped)
+            context = OrderContext(
                 account_id=request.account_id,
                 symbol=request.symbol,
+                side=request.side,
+                qty=snapped.qty,
                 client_id=request.client_id,
-            ):
-                ack, transport = await session.place_order(payload, context)
-            exchange_id = ack.exchange_order_id or session.resolve_order_id(request.client_id) or request.client_id
-            response = PlaceOrderResponse(
-                order_id=exchange_id,
-                status=ack.status or "pending",
-                filled_qty=ack.filled_qty,
-                avg_price=ack.avg_price,
-                errors=ack.errors,
-                transport=transport,
-                reused=False,
+                post_only=request.post_only,
+                reduce_only=request.reduce_only,
+                tif=request.tif,
+                price=snapped.limit_px,
+                expected_fee_bps=request.expected_fee_bps or Decimal("0"),
+                expected_slippage_bps=request.expected_slippage_bps or Decimal("0"),
             )
-            return response
 
-        try:
-            result, reused = await self._idempotency.get_or_create(
-                request.account_id, request.client_id, execute
-            )
-        except Exception:
-            increment_oms_error_count(request.account_id, request.symbol, "websocket")
-            raise
-        if reused:
-            result.reused = True
+            async def execute() -> PlaceOrderResponse:
+                with traced_span(
+                    "oms.place_order",
+                    account_id=request.account_id,
+                    symbol=request.symbol,
+                    client_id=request.client_id,
+                ):
+                    ack, transport = await session.place_order(payload, context)
+                order_metric_ctx = metric_context(
+                    account_id=request.account_id,
+                    symbol=request.symbol,
+                    transport=transport,
+                )
+                status_value = (ack.status or "").lower()
+                if ack.errors or status_value in {"error", "rejected", "failed"}:
+                    increment_order_gateway_request_errors_total(
+                        request.account_id,
+                        reason="exchange_error",
+                        context=order_metric_ctx,
+                    )
+                else:
+                    increment_order_gateway_orders_total(
+                        request.account_id,
+                        request.symbol,
+                        request.side,
+                        context=order_metric_ctx,
+                    )
+                exchange_id = (
+                    ack.exchange_order_id
+                    or session.resolve_order_id(request.client_id)
+                    or request.client_id
+                )
+                response = PlaceOrderResponse(
+                    order_id=exchange_id,
+                    status=ack.status or "pending",
+                    filled_qty=ack.filled_qty,
+                    avg_price=ack.avg_price,
+                    errors=ack.errors,
+                    transport=transport,
+                    reused=False,
+                )
+                return response
+
+            try:
+                result, reused = await self._idempotency.get_or_create(
+                    request.account_id, request.client_id, execute
+                )
+            except HTTPException as exc:
+                increment_order_gateway_request_errors_total(
+                    request.account_id,
+                    reason=f"http_{exc.status_code}",
+                    context=base_metric_ctx,
+                )
+                raise
+            except Exception as exc:
+                increment_order_gateway_request_errors_total(
+                    request.account_id,
+                    reason=exc.__class__.__name__,
+                    context=base_metric_ctx,
+                )
+                increment_oms_error_count(request.account_id, request.symbol, "websocket")
+                raise
+            if reused:
+                result.reused = True
+                return result
+            await self._idempotency.store(request.account_id, request.client_id, result)
             return result
-        await self._idempotency.store(request.account_id, request.client_id, result)
-        return result
 
     async def cancel_order(self, request: CancelOrderRequest) -> CancelOrderResponse:
         session = await self._session(request.account_id)

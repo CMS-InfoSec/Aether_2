@@ -418,6 +418,48 @@ _oms_stale_feed_total = Counter(
     registry=_REGISTRY,
 )
 
+_order_gateway_requests_total = Counter(
+    "order_gateway_requests_total",
+    "Total order placement requests processed by the OMS gateway.",
+    ["service", "account_id"],
+    registry=_REGISTRY,
+)
+
+_order_gateway_request_errors_total = Counter(
+    "order_gateway_request_errors_total",
+    "Number of OMS order placement requests that resulted in an error.",
+    ["service", "account_id", "reason"],
+    registry=_REGISTRY,
+)
+
+_order_gateway_orders_total = Counter(
+    "order_gateway_orders_total",
+    "Number of orders successfully handed to the exchange gateway.",
+    ["service", "account_id", "account_segment", "symbol_tier", "side"],
+    registry=_REGISTRY,
+)
+
+_order_gateway_filled_notional_usd = Counter(
+    "order_gateway_filled_notional_usd",
+    "USD notional filled by the OMS gateway.",
+    ["service", "account_id", "account_segment", "symbol_tier", "side", "liquidity"],
+    registry=_REGISTRY,
+)
+
+_order_gateway_fee_spend_usd = Counter(
+    "order_gateway_fee_spend_usd",
+    "USD fees attributed to OMS gateway fills.",
+    ["service", "account_id", "account_segment", "symbol_tier", "side", "liquidity", "source"],
+    registry=_REGISTRY,
+)
+
+_order_gateway_circuit_breaker_engaged = Gauge(
+    "order_gateway_circuit_breaker_engaged",
+    "Binary indicator that the OMS gateway circuit breaker is engaged for a symbol.",
+    ["service", "account_id", "symbol"],
+    registry=_REGISTRY,
+)
+
 _oms_latency_ms = Gauge(
     "oms_latency_ms",
     "Current latency of OMS interactions in milliseconds.",
@@ -643,6 +685,12 @@ _METRICS: Dict[str, Counter | Gauge | Histogram] = {
     "oms_auth_failures_total": _oms_auth_failures_total,
     "oms_child_orders_total": _oms_child_orders_total,
     "oms_stale_feed_total": _oms_stale_feed_total,
+    "order_gateway_requests_total": _order_gateway_requests_total,
+    "order_gateway_request_errors_total": _order_gateway_request_errors_total,
+    "order_gateway_orders_total": _order_gateway_orders_total,
+    "order_gateway_filled_notional_usd": _order_gateway_filled_notional_usd,
+    "order_gateway_fee_spend_usd": _order_gateway_fee_spend_usd,
+    "order_gateway_circuit_breaker_engaged": _order_gateway_circuit_breaker_engaged,
     "oms_latency_ms": _oms_latency_ms,
     "pipeline_latency_ms": _pipeline_latency_ms,
     "policy_abstention_rate": _policy_abstention_rate,
@@ -1251,6 +1299,110 @@ def increment_oms_stale_feed(
     ).inc()
 
 
+def increment_order_gateway_requests_total(
+    account: str,
+    *,
+    context: Optional[MetricContext] = None,
+    service: Optional[str] = None,
+) -> None:
+    ctx = _resolve_metric_context(context=context, service=service, account_id=account)
+    _order_gateway_requests_total.labels(
+        service=_service_value(ctx.service), account_id=ctx.account_id
+    ).inc()
+
+
+def increment_order_gateway_request_errors_total(
+    account: str,
+    *,
+    reason: str,
+    context: Optional[MetricContext] = None,
+    service: Optional[str] = None,
+) -> None:
+    ctx = _resolve_metric_context(context=context, service=service, account_id=account)
+    _order_gateway_request_errors_total.labels(
+        service=_service_value(ctx.service),
+        account_id=ctx.account_id,
+        reason=_normalised(reason, "unknown"),
+    ).inc()
+
+
+def increment_order_gateway_orders_total(
+    account: str,
+    symbol: str,
+    side: str,
+    *,
+    context: Optional[MetricContext] = None,
+    service: Optional[str] = None,
+) -> None:
+    ctx = _resolve_metric_context(
+        context=context, service=service, account_id=account, symbol=symbol
+    )
+    labels = _account_symbol_labels(ctx)
+    labels["side"] = _normalised(side, "unknown")
+    _order_gateway_orders_total.labels(**labels).inc()
+
+
+def observe_order_gateway_filled_notional_usd(
+    account: str,
+    symbol: str,
+    side: str,
+    *,
+    liquidity: str,
+    notional_usd: object,
+    context: Optional[MetricContext] = None,
+    service: Optional[str] = None,
+) -> None:
+    ctx = _resolve_metric_context(
+        context=context, service=service, account_id=account, symbol=symbol
+    )
+    labels = _account_symbol_labels(ctx)
+    labels["side"] = _normalised(side, "unknown")
+    labels["liquidity"] = _normalised(liquidity, "unknown")
+    _order_gateway_filled_notional_usd.labels(**labels).inc(
+        max(_coerce_float(notional_usd, 0.0), 0.0)
+    )
+
+
+def observe_order_gateway_fee_spend_usd(
+    account: str,
+    symbol: str,
+    side: str,
+    *,
+    liquidity: str,
+    fee_usd: object,
+    source: str,
+    context: Optional[MetricContext] = None,
+    service: Optional[str] = None,
+) -> None:
+    ctx = _resolve_metric_context(
+        context=context, service=service, account_id=account, symbol=symbol
+    )
+    labels = _account_symbol_labels(ctx)
+    labels["side"] = _normalised(side, "unknown")
+    labels["liquidity"] = _normalised(liquidity, "unknown")
+    labels["source"] = _normalised(source, "unknown")
+    _order_gateway_fee_spend_usd.labels(**labels).inc(
+        max(_coerce_float(fee_usd, 0.0), 0.0)
+    )
+
+
+def record_order_gateway_circuit_breaker_state(
+    account: str,
+    symbol: str,
+    *,
+    engaged: bool,
+    context: Optional[MetricContext] = None,
+    service: Optional[str] = None,
+) -> None:
+    ctx = _resolve_metric_context(context=context, service=service, account_id=account)
+    labels = {
+        "service": _service_value(ctx.service),
+        "account_id": ctx.account_id,
+        "symbol": _normalised(symbol, "unknown"),
+    }
+    _order_gateway_circuit_breaker_engaged.labels(**labels).set(1.0 if engaged else 0.0)
+
+
 def set_oms_latency(
     latency_ms: float,
     *,
@@ -1568,6 +1720,12 @@ __all__ = [
     "increment_oms_auth_failures",
     "increment_oms_child_orders_total",
     "increment_oms_stale_feed",
+    "increment_order_gateway_requests_total",
+    "increment_order_gateway_request_errors_total",
+    "increment_order_gateway_orders_total",
+    "observe_order_gateway_filled_notional_usd",
+    "observe_order_gateway_fee_spend_usd",
+    "record_order_gateway_circuit_breaker_state",
     "set_oms_latency",
     "record_oms_latency",
     "set_pipeline_latency",
