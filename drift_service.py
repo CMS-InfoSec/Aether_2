@@ -34,7 +34,13 @@ except Exception:  # pragma: no cover - dependency might be unavailable in tests
 
 from fastapi import Depends, FastAPI, HTTPException, Response, status
 from pydantic import BaseModel, Field
-from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, Gauge, generate_latest
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    CollectorRegistry,
+    Gauge,
+    Histogram,
+    generate_latest,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - imported for static type checking only.
     from psycopg2.extensions import connection as TimescaleConnection
@@ -147,6 +153,12 @@ DRIFT_FLAGS_TOTAL = Gauge(
     "Number of features that breached drift thresholds in the latest run.",
     registry=REGISTRY,
 )
+MODEL_CANARY_PROMOTION_DURATION_MINUTES = Histogram(
+    "model_canary_promotion_duration_minutes",
+    "Wall-clock time between canary deployment and promotion measured in minutes.",
+    registry=REGISTRY,
+    buckets=(1, 5, 10, 15, 20, 30, 45, 60, 90, 120, float("inf")),
+)
 
 PSI_THRESHOLD = 0.2
 ROLLBACK_THRESHOLD = 0.2
@@ -156,6 +168,9 @@ PROMOTION_STABILITY_DELTA = float(os.getenv("CANARY_PROMOTION_STABILITY_DELTA", 
 MAX_ALERTS_RETURNED = 100
 
 _daily_task: asyncio.Task[None] | None = None
+_canary_deploy_cache: Dict[str, datetime] = {}
+_CANARY_DEPLOY_CACHE_TTL = timedelta(hours=6)
+_DEFAULT_CANARY_CACHE_KEY = "__latest__"
 
 app = FastAPI(title="Drift Monitoring Service", version="1.0.0")
 
@@ -556,6 +571,111 @@ def _load_latest_results(
     return checked_at, metrics
 
 
+def _extract_canary_version(details: Dict[str, Any] | None) -> str | None:
+    """Return the canary version embedded in alert details when supplied."""
+
+    if not isinstance(details, dict):
+        return None
+
+    for key in ("canary_version", "version", "model_version"):
+        value = details.get(key)
+        if value is None:
+            continue
+        try:
+            return str(int(value))
+        except (TypeError, ValueError):
+            return str(value)
+    return None
+
+
+def _prune_cached_deployments(now: datetime) -> None:
+    """Expire stale cached deployment timestamps."""
+
+    cutoff = now - _CANARY_DEPLOY_CACHE_TTL
+    for version, started_at in list(_canary_deploy_cache.items()):
+        if started_at < cutoff:
+            _canary_deploy_cache.pop(version, None)
+
+
+def _lookup_deploy_start(
+    conn: TimescaleConnection,
+    version: str | None,
+    promoted_at: datetime,
+) -> datetime | None:
+    """Fetch the deployment timestamp from Timescale when not cached locally."""
+
+    try:
+        with conn.cursor() as cursor:
+            if version is not None:
+                cursor.execute(
+                    """
+                    SELECT triggered_at
+                    FROM drift_alerts
+                    WHERE action = %s
+                      AND triggered_at <= %s
+                      AND details ->> 'canary_version' = %s
+                    ORDER BY triggered_at DESC
+                    LIMIT 1
+                    """,
+                    ("canary_deployed", promoted_at, version),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT triggered_at
+                    FROM drift_alerts
+                    WHERE action = %s
+                      AND triggered_at <= %s
+                    ORDER BY triggered_at DESC
+                    LIMIT 1
+                    """,
+                    ("canary_deployed", promoted_at),
+                )
+            row = cursor.fetchone()
+    except Exception:  # pragma: no cover - defensive for optional dependency.
+        LOGGER.warning("Failed to query canary deployment timestamp", exc_info=True)
+        return None
+
+    if not row:
+        return None
+
+    started_at = row[0]
+    return started_at if isinstance(started_at, datetime) else None
+
+
+def _observe_canary_promotion_metrics(
+    conn: TimescaleConnection,
+    action: str,
+    triggered_at: datetime,
+    details: Dict[str, Any] | None,
+) -> None:
+    """Update promotion histograms so SLOs observe real durations."""
+
+    if action not in {"canary_deployed", "canary_promoted"}:
+        return
+
+    _prune_cached_deployments(triggered_at)
+
+    version = _extract_canary_version(details)
+    cache_key = version if version is not None else _DEFAULT_CANARY_CACHE_KEY
+
+    if action == "canary_deployed":
+        _canary_deploy_cache[cache_key] = triggered_at
+        return
+
+    started_at = _canary_deploy_cache.pop(cache_key, None)
+    if started_at is None:
+        started_at = _lookup_deploy_start(conn, version, triggered_at)
+    if started_at is None:
+        return
+
+    duration = (triggered_at - started_at).total_seconds() / 60.0
+    if duration < 0:
+        return
+
+    MODEL_CANARY_PROMOTION_DURATION_MINUTES.observe(duration)
+
+
 def _record_alert(
     conn: TimescaleConnection,
     *,
@@ -595,6 +715,11 @@ def _record_alert(
                 payload,
             ),
         )
+
+    try:
+        _observe_canary_promotion_metrics(conn, action, triggered_at, details)
+    except Exception:  # pragma: no cover - defensive guard.
+        LOGGER.exception("Failed to update canary promotion metrics")
 
 
 def _fetch_recent_alerts(
