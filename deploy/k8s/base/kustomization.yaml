@@ -18,8 +18,10 @@ resources:
   - secrets/fastapi-secrets-external-secret.yaml
   - secrets/secrets-service-config-external-secret.yaml
   - secrets/kraken-keys-external-secrets.yaml
+  - secrets/vault-health-monitor-external-secret.yaml
   - secrets/platform-account-allowlists-external-secret.yaml
   - secrets/fastapi-tls-external-secrets.yaml
+  - secrets/vault-health-monitor-cronjob.yaml
   - ingress
   - networkpolicies
   - aether-services
