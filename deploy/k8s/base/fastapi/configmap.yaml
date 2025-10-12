@@ -11,13 +11,13 @@ data:
   settings.yaml: |
     kafka:
       brokers:
-        - bootstrap.kafka.aether.svc.cluster.local:9092
+        - bootstrap.kafka.aether.svc.cluster.local:9093
       tls:
-        enabled: false
+        enabled: true
     nats:
       url: nats://nats.aether.svc.cluster.local:4222
       tls:
-        enabled: false
+        enabled: true
     timescaledb:
       host: timescaledb.aether.svc.cluster.local
       port: 5432
