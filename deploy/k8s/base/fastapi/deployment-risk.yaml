@@ -56,7 +56,7 @@ spec:
                   key: NATS_PASSWORD
           readinessProbe:
             httpGet:
-              path: /ready
+              path: /metrics
               port: http
             initialDelaySeconds: 5
           livenessProbe:

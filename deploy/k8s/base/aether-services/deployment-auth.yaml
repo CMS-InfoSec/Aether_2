@@ -48,7 +48,7 @@ spec:
               value: redis://redis.aether.svc.cluster.local:6379/0
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /metrics
               port: http
             initialDelaySeconds: 10
             periodSeconds: 5

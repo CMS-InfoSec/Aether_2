@@ -92,7 +92,7 @@ spec:
                   optional: true
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /metrics
               port: http
             initialDelaySeconds: 20
             periodSeconds: 10
