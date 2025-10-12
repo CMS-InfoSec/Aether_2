@@ -1,13 +1,13 @@
 apiVersion: batch/v1
 kind: CronJob
 metadata:
-  name: timescaledb-restore-drill
+  name: restore-drill
   labels:
     app.kubernetes.io/name: timescaledb
     app.kubernetes.io/component: database
     app.kubernetes.io/part-of: disaster-recovery
 spec:
-  schedule: "0 4 1 * *"
+  schedule: "0 4 * * 1"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 3
@@ -19,9 +19,9 @@ spec:
           restartPolicy: Never
           containers:
             - name: restore-drill
-              image: ghcr.io/aether/ops-runtime:latest
+              image: ghcr.io/aether/ops-runtime@sha256:9ef612a979dd5bd56c1f821e628be9612debc569f2a2063325ea49a69f78bf8f
               imagePullPolicy: IfNotPresent
-              command: ["python", "-m", "ops.backup.restore_drill"]
+              command: ["python", "ops/backup/restore_drill.py"]
               env:
                 - name: PGHOST
                   value: timescaledb-staging
@@ -43,6 +43,8 @@ spec:
                   value: postgres
                 - name: BACKUP_ARCHIVE_DIR
                   value: /backups
+                - name: RESTORE_VALIDATION_QUERY
+                  value: "SELECT count(*) FROM dr_log"
                 - name: SLACK_WEBHOOK_URL
                   valueFrom:
                     secretKeyRef:

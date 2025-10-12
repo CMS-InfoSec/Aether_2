@@ -24,9 +24,39 @@ spec:
           env:
             - name: SETTINGS_FILE
               value: /etc/aether/settings.yaml
+            - name: AETHER_DEFAULT_KAFKA_BOOTSTRAP
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: KAFKA_BOOTSTRAP
+            - name: AETHER_DEFAULT_NATS_SERVERS
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: NATS_URL
+            - name: AETHER_DEFAULT_KAFKA_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: KAFKA_USERNAME
+            - name: AETHER_DEFAULT_KAFKA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: KAFKA_PASSWORD
+            - name: AETHER_DEFAULT_NATS_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: NATS_USERNAME
+            - name: AETHER_DEFAULT_NATS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: NATS_PASSWORD
           readinessProbe:
             httpGet:
-              path: /ready
+              path: /metrics
               port: http
             initialDelaySeconds: 5
           livenessProbe:
@@ -38,6 +68,9 @@ spec:
             - name: config
               mountPath: /etc/aether
               readOnly: true
+            - name: kafka-tls
+              mountPath: /etc/aether/tls/kafka
+              readOnly: true
           resources:
             requests:
               cpu: 300m
@@ -45,7 +78,15 @@ spec:
             limits:
               cpu: 800m
               memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
       volumes:
         - name: config
           configMap:
             name: fastapi-config
+        - name: kafka-tls
+          secret:
+            secretName: kafka-tls

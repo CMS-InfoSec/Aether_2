@@ -41,6 +41,11 @@ spec:
               port: redis
             initialDelaySeconds: 10
             periodSeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           readinessProbe:
             tcpSocket:
               port: redis
