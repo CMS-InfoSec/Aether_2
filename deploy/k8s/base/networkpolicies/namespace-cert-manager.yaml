@@ -16,6 +16,12 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: kube-system
+        # Managed control planes originate traffic from host-network IPs outside the cluster.
+        # Allow all addresses by default so overlays can down-scope to the platform CIDRs.
+        - ipBlock:
+            cidr: 0.0.0.0/0
+        - ipBlock:
+            cidr: ::/0
       ports:
         - protocol: TCP
           port: 9443
@@ -44,6 +50,11 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: kube-system
+        # Permit calls to the Kubernetes API server endpoints even when they are not pod-backed.
+        - ipBlock:
+            cidr: 0.0.0.0/0
+        - ipBlock:
+            cidr: ::/0
       ports:
         - protocol: TCP
           port: 443
