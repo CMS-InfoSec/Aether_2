@@ -49,6 +49,15 @@ jobs:
         run: |
           docker build -t risk-api:ci -f deploy/docker/risk-api/Dockerfile .
 
+      - name: Scan risk API image with Trivy
+        uses: aquasecurity/trivy-action@0.21.0
+        with:
+          image-ref: risk-api:ci
+          severity: CRITICAL,HIGH
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+
       - name: Run /healthz check
         run: |
           docker run -d --rm -p 8000:8000 --name risk-api-ci risk-api:ci

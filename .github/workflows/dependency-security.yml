@@ -1,0 +1,66 @@
+name: Weekly dependency security updates
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  pip-audit-fix:
+    name: Apply pip-audit patches
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install pip-audit
+        run: python -m pip install pip-audit
+
+      - name: Run pip-audit with automatic fixes
+        run: |
+          set -o pipefail
+          exit_code=0
+          pip-audit \
+            --progress-spinner off \
+            --config pip-audit.toml \
+            --fix \
+            --requirement requirements.txt \
+            --requirement requirements-ci.txt || exit_code=$?
+
+          if [ "$exit_code" -gt 1 ]; then
+            exit "$exit_code"
+          fi
+
+          if [ "$exit_code" -eq 1 ]; then
+            echo "pip-audit reported vulnerabilities that require manual remediation."
+          fi
+
+      - name: Create dependency update pull request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: apply pip-audit dependency patches"
+          branch: chore/pip-audit-fixes
+          delete-branch: true
+          title: "chore: apply pip-audit dependency patches"
+          body: |
+            ## Summary
+            - Apply security patches suggested by pip-audit
+            - Update dependency lock files to address known vulnerabilities
+            
+            ## Details
+            This automated PR is generated weekly. It uses pip-audit with automatic
+            fixes to patch known vulnerabilities in pinned dependencies and commits
+            the resulting changes.

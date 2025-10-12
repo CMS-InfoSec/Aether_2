@@ -29,6 +29,20 @@ spec:
         - name: fluent-bit
           image: fluent/fluent-bit:2.2.0
           imagePullPolicy: IfNotPresent
+          env:
+            - name: SIEM_HOST
+              value: sentinel-siem
+            - name: SIEM_PORT
+              value: "443"
+            - name: SIEM_ENDPOINT
+              value: /ingest/v1/logs
+            - name: SIEM_RETENTION_DAYS
+              value: "90"
+            - name: SIEM_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: fluent-bit-siem
+                  key: token
           args:
             - --config=/fluent-bit/etc/fluent-bit.conf
           ports:
