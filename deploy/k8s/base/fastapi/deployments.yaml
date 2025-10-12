@@ -50,6 +50,36 @@ spec:
                 secretKeyRef:
                   name: fastapi-secrets
                   key: REDIS_URL
+            - name: AETHER_DEFAULT_KAFKA_BOOTSTRAP
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: KAFKA_BOOTSTRAP
+            - name: AETHER_DEFAULT_NATS_SERVERS
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: NATS_URL
+            - name: AETHER_DEFAULT_KAFKA_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: KAFKA_USERNAME
+            - name: AETHER_DEFAULT_KAFKA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: KAFKA_PASSWORD
+            - name: AETHER_DEFAULT_NATS_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: NATS_USERNAME
+            - name: AETHER_DEFAULT_NATS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: NATS_PASSWORD
           resources:
             requests:
               cpu: 250m
@@ -147,6 +177,36 @@ spec:
                 secretKeyRef:
                   name: fastapi-secrets
                   key: NATS_URL
+            - name: AETHER_DEFAULT_KAFKA_BOOTSTRAP
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: KAFKA_BOOTSTRAP
+            - name: AETHER_DEFAULT_NATS_SERVERS
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: NATS_URL
+            - name: AETHER_DEFAULT_KAFKA_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: KAFKA_USERNAME
+            - name: AETHER_DEFAULT_KAFKA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: KAFKA_PASSWORD
+            - name: AETHER_DEFAULT_NATS_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: NATS_USERNAME
+            - name: AETHER_DEFAULT_NATS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: NATS_PASSWORD
           resources:
             requests:
               cpu: 200m

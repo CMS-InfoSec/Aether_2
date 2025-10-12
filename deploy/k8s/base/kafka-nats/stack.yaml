@@ -27,36 +27,40 @@ spec:
           env:
             - name: KAFKA_CFG_ZOOKEEPER_CONNECT
               value: zookeeper:2181
-            - name: KAFKA_CFG_LISTENERS
-              value: SSL://:9092
-            - name: KAFKA_CFG_ADVERTISED_LISTENERS
-              value: SSL://kafka:9092
+            - name: ALLOW_PLAINTEXT_LISTENER
+              value: "no"
             - name: KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP
-              value: SSL:SSL
+              value: SASL_PLAINTEXT:SASL_PLAINTEXT
+            - name: KAFKA_CFG_LISTENERS
+              value: SASL_PLAINTEXT://:9092
+            - name: KAFKA_CFG_ADVERTISED_LISTENERS
+              value: SASL_PLAINTEXT://bootstrap.kafka.aether.svc.cluster.local:9092
             - name: KAFKA_CFG_INTER_BROKER_LISTENER_NAME
-              value: SSL
-            - name: KAFKA_TLS_TYPE
-              value: PEM
-            - name: KAFKA_TLS_CERTIFICATE_FILE
-              value: /opt/bitnami/kafka/config/tls/tls.crt
-            - name: KAFKA_TLS_KEY_FILE
-              value: /opt/bitnami/kafka/config/tls/tls.key
-            - name: KAFKA_TLS_CA_CERT_FILE
-              value: /opt/bitnami/kafka/config/tls/ca.crt
-            - name: KAFKA_TLS_CLIENT_AUTH
-              value: none
-            - name: KAFKA_ZOOKEEPER_PROTOCOL
-              value: SASL
-            - name: KAFKA_ZOOKEEPER_USER
+              value: SASL_PLAINTEXT
+            - name: KAFKA_CFG_SASL_ENABLED_MECHANISMS
+              value: SCRAM-SHA-512
+            - name: KAFKA_CFG_SASL_MECHANISM_INTER_BROKER_PROTOCOL
+              value: SCRAM-SHA-512
+            - name: KAFKA_CLIENT_USERS
               valueFrom:
                 secretKeyRef:
-                  name: zookeeper-credentials
-                  key: kafka_user
-            - name: KAFKA_ZOOKEEPER_PASSWORD
+                  name: kafka-sasl-credentials
+                  key: client-user
+            - name: KAFKA_CLIENT_PASSWORDS
               valueFrom:
                 secretKeyRef:
-                  name: zookeeper-credentials
-                  key: kafka_password
+                  name: kafka-sasl-credentials
+                  key: client-password
+            - name: KAFKA_INTER_BROKER_USER
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-sasl-credentials
+                  key: inter-broker-user
+            - name: KAFKA_INTER_BROKER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-sasl-credentials
+                  key: inter-broker-password
           resources:
             requests:
               cpu: 500m
@@ -143,13 +147,23 @@ spec:
         - name: nats
           image: nats:2.10.9-alpine
           args:
-            - -DV
-            - -js
-            - --tls
-            - --tlscert=/etc/nats/tls/server.crt
-            - --tlskey=/etc/nats/tls/server.key
-            - --tlsca=/etc/nats/tls/ca.crt
-            - --tlsverify
+          env:
+            - name: NATS_USER
+              valueFrom:
+                secretKeyRef:
+                  name: nats-auth-credentials
+                  key: username
+            - name: NATS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nats-auth-credentials
+                  key: password
+          command:
+            - /bin/sh
+            - -ec
+          args:
+            - >-
+              exec nats-server -DV -js --user "$NATS_USER" --pass "$NATS_PASSWORD"
           ports:
             - containerPort: 4222
               name: client
