@@ -37,7 +37,7 @@ spec:
                   value: "{{steps.train-model.outputs.parameters.run-id}}"
     - name: data-loader-coingecko
       container:
-        image: ghcr.io/aether/ml-runtime:latest
+        image: ghcr.io/aether/ml-runtime@sha256:b907adb85315dd9d690dd0638823d0a8f9ff23020a01efc7a50bf9188bcf5068
         command: ["python", "-m", "services.coingecko_ingest"]
         args:
           - "--symbols"
@@ -54,7 +54,7 @@ spec:
             path: /tmp/ingest.log
     - name: build-features
       container:
-        image: ghcr.io/aether/ml-runtime:latest
+        image: ghcr.io/aether/ml-runtime@sha256:b907adb85315dd9d690dd0638823d0a8f9ff23020a01efc7a50bf9188bcf5068
         command: ["python", "-m", "ml.features.materialize"]
         args:
           - "--version"
@@ -73,7 +73,7 @@ spec:
             path: /artifacts/feature_version.txt
     - name: train-model
       container:
-        image: ghcr.io/aether/ml-runtime:latest
+        image: ghcr.io/aether/ml-runtime@sha256:b907adb85315dd9d690dd0638823d0a8f9ff23020a01efc7a50bf9188bcf5068
         command: ["python", "-m", "ml.training.workflow"]
         args:
           - "--symbols"

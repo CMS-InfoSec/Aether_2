@@ -22,7 +22,7 @@ spec:
               template: register-model
       - name: load-data
         container:
-          image: ghcr.io/aether/ml-runtime:latest
+          image: ghcr.io/aether/ml-runtime@sha256:b907adb85315dd9d690dd0638823d0a8f9ff23020a01efc7a50bf9188bcf5068
           command: ["python", "-m", "ml.data.load_daily_snapshot"]
           env:
             - name: FEATURE_REPO_PATH
@@ -32,7 +32,7 @@ spec:
                   key: feast_repo
       - name: train-models
         container:
-          image: ghcr.io/aether/ml-runtime:latest
+          image: ghcr.io/aether/ml-runtime@sha256:b907adb85315dd9d690dd0638823d0a8f9ff23020a01efc7a50bf9188bcf5068
           command: ["python", "-m", "ml.training.train_all"]
           envFrom:
             - secretRef:
@@ -41,7 +41,7 @@ spec:
                 name: ml-config
       - name: register-model
         container:
-          image: ghcr.io/aether/ml-runtime:latest
+          image: ghcr.io/aether/ml-runtime@sha256:b907adb85315dd9d690dd0638823d0a8f9ff23020a01efc7a50bf9188bcf5068
           command: ["python", "-m", "ml.registry.register_latest", "--stage", "Staging"]
           envFrom:
             - secretRef:

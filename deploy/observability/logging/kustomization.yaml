@@ -4,3 +4,4 @@ resources:
   - fluent-bit-clusterrolebinding.yaml
   - fluent-bit-configmap.yaml
   - fluent-bit-daemonset.yaml
+  - fluent-bit-siem-externalsecret.yaml

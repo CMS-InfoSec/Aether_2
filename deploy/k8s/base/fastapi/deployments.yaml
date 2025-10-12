@@ -50,6 +50,36 @@ spec:
                 secretKeyRef:
                   name: fastapi-secrets
                   key: REDIS_URL
+            - name: AETHER_DEFAULT_KAFKA_BOOTSTRAP
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: KAFKA_BOOTSTRAP
+            - name: AETHER_DEFAULT_NATS_SERVERS
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: NATS_URL
+            - name: AETHER_DEFAULT_KAFKA_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: KAFKA_USERNAME
+            - name: AETHER_DEFAULT_KAFKA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: KAFKA_PASSWORD
+            - name: AETHER_DEFAULT_NATS_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: NATS_USERNAME
+            - name: AETHER_DEFAULT_NATS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: NATS_PASSWORD
           resources:
             requests:
               cpu: 250m
@@ -65,17 +95,25 @@ spec:
             periodSeconds: 10
           readinessProbe:
             httpGet:
-              path: /readyz
+              path: /metrics
               port: http
             initialDelaySeconds: 10
             periodSeconds: 5
           volumeMounts:
             - name: config
               mountPath: /etc/aether
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
       volumes:
         - name: config
           configMap:
             name: fastapi-config
+        - name: kafka-tls
+          secret:
+            secretName: kafka-tls
 ---
 apiVersion: v1
 kind: Service
@@ -141,6 +179,36 @@ spec:
                 secretKeyRef:
                   name: fastapi-secrets
                   key: NATS_URL
+            - name: AETHER_DEFAULT_KAFKA_BOOTSTRAP
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: KAFKA_BOOTSTRAP
+            - name: AETHER_DEFAULT_NATS_SERVERS
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: NATS_URL
+            - name: AETHER_DEFAULT_KAFKA_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: KAFKA_USERNAME
+            - name: AETHER_DEFAULT_KAFKA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: KAFKA_PASSWORD
+            - name: AETHER_DEFAULT_NATS_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: NATS_USERNAME
+            - name: AETHER_DEFAULT_NATS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: fastapi-secrets
+                  key: NATS_PASSWORD
           resources:
             requests:
               cpu: 200m
@@ -155,16 +223,24 @@ spec:
             initialDelaySeconds: 15
           readinessProbe:
             httpGet:
-              path: /readyz
+              path: /metrics
               port: http
             periodSeconds: 5
           volumeMounts:
             - name: config
               mountPath: /etc/aether
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
       volumes:
         - name: config
           configMap:
             name: fastapi-config
+        - name: kafka-tls
+          secret:
+            secretName: kafka-tls
 ---
 apiVersion: v1
 kind: Service

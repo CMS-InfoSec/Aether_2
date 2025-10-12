@@ -31,7 +31,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: strategy-orchestrator
-          image: ghcr.io/aether/strategy-orchestrator:latest
+          image: ghcr.io/aether/strategy-orchestrator@sha256:e4ff822c3a43e1c772e7204555e4ce0259dd64b9ee736132dfd0dc1288185a62
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8000
@@ -50,7 +50,7 @@ spec:
                   optional: true
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /metrics
               port: http
             initialDelaySeconds: 10
             periodSeconds: 10
