@@ -1,0 +1,14 @@
+name: Dependency Audit
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run pip-audit
+        run: pip install pip-audit && pip-audit --require-hashes || true

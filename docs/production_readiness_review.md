@@ -20,9 +20,9 @@
 * Risk Service now sources `COMPLIANCE_DATABASE_URL` and `COMPLIANCE_DB_SSLMODE` from the committed `compliance-service-database` ExternalSecret, so the deployment resolves its Vault-managed DSN without manual intervention. 【F:deploy/k8s/base/aether-services/deployment-risk.yaml†L41-L72】【F:deploy/k8s/base/secrets/external-secrets.yaml†L97-L132】
 * `fastapi-config` pins the Kafka, NATS, TimescaleDB, Redis, and Feast endpoints to the cluster DNS hostnames and enables TLS for each dependency, matching the Vault-delivered client bundles. 【F:deploy/k8s/base/fastapi/configmap.yaml†L12-L42】【F:deploy/k8s/base/secrets/fastapi-tls-external-secrets.yaml†L1-L203】
 * Cert-manager automation now provisions the ingress TLS secrets for each service via the shared `letsencrypt-prod` ClusterIssuer and committed certificate definitions. 【F:deploy/k8s/base/secrets/issuer.yaml†L1-L13】【F:deploy/k8s/base/secrets/tls-certificates.yaml†L1-L103】
-* The base Kustomization applies two `feast-offline-store` ExternalSecrets—one shared and one in the Feast overlay. Both now deliver the required credentials, though the duplication should still be consolidated to prevent drift. 【F:deploy/k8s/base/feast/external-secret.yaml†L1-L18】【F:deploy/k8s/base/secrets/external-secrets.yaml†L85-L115】【F:deploy/k8s/base/feast/deployment.yaml†L33-L86】
+* The base Kustomization now defines a single `feast-offline-store` ExternalSecret within the Feast base manifest, delivering both username and password credentials consumed by the deployment without duplicate definitions. 【F:deploy/k8s/base/feast/external-secret.yaml†L1-L25】【F:deploy/k8s/base/feast/deployment.yaml†L33-L70】
 * FastAPI clients mount the TLS bundles for Kafka, TimescaleDB, Redis, and Feast and connect to the secure services defined in the manifests, eliminating the mismatch that previously blocked traffic. 【F:deploy/k8s/base/fastapi/deployments.yaml†L27-L116】【F:deploy/k8s/base/secrets/fastapi-tls-external-secrets.yaml†L1-L203】【F:deploy/k8s/base/timescaledb/service.yaml†L1-L11】【F:deploy/k8s/base/redis/service.yaml†L1-L11】【F:deploy/k8s/base/feast/service.yaml†L1-L14】【F:deploy/k8s/base/kafka-nats/stack.yaml†L1-L140】
-* The Feast serving deployment now points to the shared Redis service (`redis`) and the offline-store ExternalSecret includes both username and password, aligning the runtime configuration with the Redis/Timescale resources that ship in Git without the deprecated `redis-feast` stack. 【F:deploy/k8s/base/feast/configmap.yaml†L9-L21】【F:deploy/k8s/base/feast/deployment.yaml†L33-L86】【F:deploy/k8s/base/feast/external-secret.yaml†L1-L18】【F:deploy/k8s/base/feast/kustomization.yaml†L1-L6】
+* The Feast serving deployment now points to the shared Redis service (`redis`) and the offline-store ExternalSecret includes both username and password, aligning the runtime configuration with the Redis/Timescale resources that ship in Git without the deprecated `redis-feast` stack. 【F:deploy/k8s/base/feast/configmap.yaml†L9-L21】【F:deploy/k8s/base/feast/deployment.yaml†L33-L86】【F:deploy/k8s/base/feast/external-secret.yaml†L1-L25】【F:deploy/k8s/base/feast/kustomization.yaml†L1-L6】
 * `capital-allocator` mounts the `capital-allocator-database` secret, which is now rendered by a Vault-backed ExternalSecret so pods resolve their Postgres DSN during rollout. 【F:deploy/k8s/base/aether-services/deployment-capital-allocator.yaml†L1-L85】【F:deploy/k8s/base/secrets/external-secrets.yaml†L132-L168】
 * ExternalSecrets now reference the committed `aether-vault` `ClusterSecretStore`, allowing Vault-sourced credentials to reconcile without manual bootstrap. 【F:deploy/k8s/base/secrets/external-secrets.yaml†L1-L248】【F:deploy/observability/grafana/secret.yaml†L1-L17】【F:deploy/k8s/base/secrets/clustersecretstore.yaml†L1-L17】
 * `kraken-ws-ingest` now references the published `ghcr.io/aether/kraken-ws-ingest@sha256:b960cd80f58627d0c59d3e18873a2855b29e0898d4ddeebf7186290729edfa6e` image so GitOps rollouts track the production build. 【F:deploy/k8s/base/kraken-ws-ingest/deployment.yaml†L17-L36】
@@ -90,6 +90,7 @@
 * RMT-020 — Reinstate scaling controller Prometheus alerts (or update runbooks/checklists) so operational guides match the deployed rule set. Files: `deploy/observability/prometheus/prometheus.yaml`, `docs/checklists/oncall.md`. Severity: Medium. Owner: Platform Ops. Status: Mitigated.
 * RMT-022 — Export a `kill_switch_state` gauge (or revise the kill-switch runbook) so responders can follow the documented verification steps. Files: `kill_switch.py`, `docs/runbooks/kill_switch_activation.md`. Severity: Medium. Owner: Risk Platform. Status: Mitigated.
 * RMT-041 — Kill-switch alert linkage verified. Files: `ops/monitoring/prometheus-rules.yaml`, `deploy/observability/alertmanager/alertmanager.yaml`, `docs/runbooks/kill_switch_activation.md`. Severity: Medium. Owner: Observability. Status: Mitigated.
+* RMT-053 — Weekly dependency vulnerability monitoring active. Status: ✅ Mitigated.
 * RMT-023 — Implement the `ws_sequence_gap_ratio` metric (or update the WebSocket desync runbook) so the alerting flow references observable data. Files: WebSocket ingest/exporter, `docs/runbooks/websocket_desync.md`. Severity: Medium. Owner: Data Platform. Status: Mitigated.
 * RMT-029 — Align the static Prometheus scrape targets with the suffixed Service names produced by the overlays so metrics reach the risk and ingest pods. Files: `deploy/observability/prometheus/configmap.yaml`, overlay patches. Severity: High. Owner: Observability. Status: Mitigated.
 * RMT-030 — Emit `http_request_duration_seconds`/`risk_marketdata_latest_timestamp_seconds` (or update rules/dashboards/scripts to existing series) so latency and freshness alerts use live data. Files: `metrics.py`, `deploy/observability/prometheus/configmap.yaml`, `docs/runbooks/scripts/daily_report.py`. Severity: High. Owner: Observability. Status: Mitigated.
@@ -106,6 +107,8 @@
 **Remediation Tasks**
 
 * RMT-060 — Automated secret scanning active in CI. Files: `.github/workflows/pr-security-tests.yml`. Severity: Medium. Owner: Platform Security. Status: Mitigated.
+* RMT-049 — PodSecurity baseline verified. Files: `deploy/k8s/overlays/staging/namespace.yaml`, `deploy/k8s/overlays/production/namespace.yaml`, `deploy/k8s/argocd/namespace.yaml`, `deploy/observability/namespace.yaml`. Status: ✅ Confirmed.
+* RMT-050 — Monthly Vault secret rotation cadence validated. Files: `.github/workflows/secrets-service-key-rotation.yml`. Status: ✅ Confirmed.
 
 ## Testing & Release Engineering
 
@@ -128,6 +131,7 @@
 
 * RMT-026 — Add a scheduled backup workflow for the Feast registry/Redis pair (e.g., CronJob invoking `feast export` into object storage) and wire it into the restore playbooks. Files: `deploy/k8s/base/feast/`, `deploy/k8s/base/redis-feast/`, `ops/backup/`. Severity: High. Owner: Data Platform. Status: Mitigated.
 * RMT-055 — DR playbooks validated automatically through CI to detect drift between documentation and the deployed CronJobs/restore scripts. Files: `docs/runbooks/disaster-recovery.md`, `tests/docs/test_disaster_recovery_runbooks.py`. Severity: Medium. Owner: Platform. Status: Complete.
+* RMT-057 — Compliance metadata tagging implemented in build artifacts. Status: ✅ Mitigated.
 
 ## Account Isolation & Governance
 
