@@ -5,6 +5,7 @@ namespace: aether-staging
 resources:
   - namespace.yaml
   - ../../base
+  - resourcequota.yaml
   - restore-drill-cronjob.yaml
   - restore-drill-secret.yaml
 
