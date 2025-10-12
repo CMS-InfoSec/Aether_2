@@ -126,7 +126,8 @@
 
 **Remediation Tasks**
 
-* RMT-026 — Add a scheduled backup workflow for the Feast registry/Redis pair (e.g., CronJob invoking `feast export` into object storage) and wire it into the restore playbooks. Files: `deploy/k8s/base/feast/`, `ops/backup/`. Severity: High. Owner: Data Platform. Status: Mitigated.
+* RMT-026 — Add a scheduled backup workflow for the Feast registry/Redis pair (e.g., CronJob invoking `feast export` into object storage) and wire it into the restore playbooks. Files: `deploy/k8s/base/feast/`, `deploy/k8s/base/redis-feast/`, `ops/backup/`. Severity: High. Owner: Data Platform. Status: Mitigated.
+* RMT-055 — DR playbooks validated automatically through CI to detect drift between documentation and the deployed CronJobs/restore scripts. Files: `docs/runbooks/disaster-recovery.md`, `tests/docs/test_disaster_recovery_runbooks.py`. Severity: Medium. Owner: Platform. Status: Complete.
 
 ## Account Isolation & Governance
 
