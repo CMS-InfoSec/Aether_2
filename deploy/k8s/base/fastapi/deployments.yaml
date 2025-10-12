@@ -72,6 +72,11 @@ spec:
           volumeMounts:
             - name: config
               mountPath: /etc/aether
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
       volumes:
         - name: config
           configMap:
@@ -161,6 +166,11 @@ spec:
           volumeMounts:
             - name: config
               mountPath: /etc/aether
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
       volumes:
         - name: config
           configMap:

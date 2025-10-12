@@ -45,6 +45,11 @@ spec:
             limits:
               cpu: 800m
               memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
       volumes:
         - name: config
           configMap:
