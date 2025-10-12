@@ -17,6 +17,7 @@ metadata:
     nginx.ingress.kubernetes.io/hsts-include-subdomains: "true"
     nginx.ingress.kubernetes.io/hsts-preload: "true"
 spec:
+  ingressClassName: nginx
   rules:
     - host: risk.aether.example.com
       http:
