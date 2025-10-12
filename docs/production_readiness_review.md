@@ -95,7 +95,7 @@
 * RMT-023 — Implement the `ws_sequence_gap_ratio` metric (or update the WebSocket desync runbook) so the alerting flow references observable data. Files: WebSocket ingest/exporter, `docs/runbooks/websocket_desync.md`. Severity: Medium. Owner: Data Platform. Status: Mitigated.
 * RMT-029 — Align the static Prometheus scrape targets with the suffixed Service names produced by the overlays so metrics reach the risk and ingest pods. Files: `deploy/observability/prometheus/configmap.yaml`, overlay patches. Severity: High. Owner: Observability. Status: Mitigated.
 * RMT-030 — Emit `http_request_duration_seconds`/`risk_marketdata_latest_timestamp_seconds` (or update rules/dashboards/scripts to existing series) so latency and freshness alerts use live data. Files: `metrics.py`, `deploy/observability/prometheus/configmap.yaml`, `docs/runbooks/scripts/daily_report.py`. Severity: High. Owner: Observability. Status: Mitigated.
-* RMT-054 — Automated GitOps drift detection active through the Argo CD ApplicationSet with Slack and webhook notifications for out-of-sync applications. Files: `deploy/k8s/argocd/applications.yaml`, `deploy/k8s/argocd/notifications.yaml`. Severity: Medium. Owner: Platform Ops. Status: Mitigated.
+* RMT-053 — Automated dependency security monitoring enabled. Files: `.github/workflows/dependency-security.yml`, `pip-audit.toml`. Severity: Medium. Owner: Platform Ops. Status: Mitigated.
 
 ## Security & Compliance
 
