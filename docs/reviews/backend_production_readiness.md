@@ -60,9 +60,9 @@
 - README and SLO documents provide new operator onboarding context, but consolidating production-specific prerequisites (required secrets, environment flags, database migrations) into a single "production checklist" would streamline go-live reviews.【F:README.md†L1-L64】【F:docs/checklists/oncall.md†L1-L160】
 
 ## Recommended Next Steps
-1. Implement `/readyz` endpoints with dependency checks for all FastAPI services and update Kubernetes readiness probes accordingly.
-2. Tighten container build and deployment pipelines to fail fast when psycopg/argon2 or other critical dependencies are missing; alert on fallback activation.
-3. Broaden static analysis (mypy, ruff) and enforce CI gates to cover core backend modules.
-4. Establish a dependency refresh cadence with automated security scanning to manage the extensive pinned requirements.
-5. Add automated verification that required ExternalSecret keys exist before promotion, preventing runtime secret drift.
-6. Document and automate recovery drills for Timescale, Kafka, and Redis aligned with existing disaster recovery guidance.
+1. **Ship dependency-aware readiness endpoints.** Add a `/readyz` router to every FastAPI service that exercises Postgres (read/write sentinel), Redis (ping), Kafka (metadata), and any optional providers. Update the Kubernetes readiness probes in `deploy/k8s/base/aether-services/*` to target the new endpoint with appropriate initial delays/timeouts, and add smoke tests that assert a `503` response when dependencies fail.
+2. **Harden container builds around critical wheels.** Extend the Docker build and deploy workflows to verify psycopg, argon2, and other security-sensitive wheels are installed (e.g., `python -c "import psycopg,argon2"`). Make the build fail on missing modules, and emit structured alerts if runtime fallback code paths activate so incidents are raised before production impact.
+3. **Expand and gate static analysis.** Broaden `mypy` modules to include `app.py`, `auth/`, `shared/`, and `metrics.py`, enable `ruff` across the backend package, and wire both tools into CI required checks alongside `pytest`. Block merges when lint/type regressions occur and publish coverage summaries in build artifacts.
+4. **Institute dependency refresh & scanning.** Schedule a monthly pip-compile refresh for `pyproject.lock`, execute vulnerability scans (e.g., Trivy, Dependabot, or Snyk) as part of the cadence, and track remediation SLAs in the operations checklist to keep the pinned set current and secure.
+5. **Validate ExternalSecret integrity pre-promotion.** Automate a CI/CD job that queries Vault/ExternalSecrets to confirm all keys referenced in `deploy/k8s/base/secrets/external-secrets.yaml` exist before promoting manifests, preventing drift-induced runtime failures.
+6. **Practice stateful service recovery.** Produce detailed recovery drills for Timescale, Kafka, and Redis—covering backup validation, restore runbooks, failover testing, and RTO/RPO verification—and automate at least quarterly tabletop or simulated exercises aligned with the disaster recovery guidance.
