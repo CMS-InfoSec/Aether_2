@@ -16,6 +16,12 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: kube-system
+        # Managed control planes often run outside the cluster and are not
+        # represented by pods. Permit webhook callbacks from their node IPs.
+        - ipBlock:
+            cidr: 0.0.0.0/0
+        - ipBlock:
+            cidr: ::/0
       ports:
         - protocol: TCP
           port: 9443
@@ -44,6 +50,12 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: kube-system
+        # Allow direct control-plane connections when the API server runs
+        # off-cluster.
+        - ipBlock:
+            cidr: 0.0.0.0/0
+        - ipBlock:
+            cidr: ::/0
       ports:
         - protocol: TCP
           port: 443
