@@ -2,3 +2,4 @@ resources:
   - configmap.yaml
   - deployment.yaml
   - service.yaml
+  - servicemonitors.yaml
