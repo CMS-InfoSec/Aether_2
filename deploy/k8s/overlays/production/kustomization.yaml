@@ -4,7 +4,9 @@ kind: Kustomization
 namespace: aether-prod
 nameSuffix: -prod
 resources:
+  - namespace.yaml
   - ../../base
+  - resourcequota.yaml
 patches:
   - target:
       kind: Deployment

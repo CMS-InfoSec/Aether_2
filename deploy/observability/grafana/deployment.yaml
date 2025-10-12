@@ -32,6 +32,8 @@ spec:
               mountPath: /var/lib/grafana/dashboards
             - name: provisioning
               mountPath: /etc/grafana/provisioning/dashboards
+            - name: datasources
+              mountPath: /etc/grafana/provisioning/datasources
           resources:
             requests:
               cpu: 200m
@@ -46,3 +48,6 @@ spec:
         - name: provisioning
           configMap:
             name: grafana-provisioning
+        - name: datasources
+          configMap:
+            name: grafana-datasources

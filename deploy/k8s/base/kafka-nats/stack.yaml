@@ -14,6 +14,10 @@ spec:
         app: kafka
     spec:
       serviceAccountName: streaming-services
+      volumes:
+        - name: kafka-tls
+          secret:
+            secretName: kafka-tls
       containers:
         - name: kafka
           image: bitnami/kafka:3.7.0
@@ -25,20 +29,38 @@ spec:
               value: zookeeper:2181
             - name: ALLOW_PLAINTEXT_LISTENER
               value: "no"
-            - name: KAFKA_CFG_LISTENERS
-              value: CLIENT://:9093
-            - name: KAFKA_CFG_ADVERTISED_LISTENERS
-              value: CLIENT://kafka:9093
-            - name: KAFKA_CFG_INTER_BROKER_LISTENER_NAME
-              value: CLIENT
             - name: KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP
-              value: CLIENT:SSL
-            - name: KAFKA_CFG_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM
-              value: ""
-            - name: KAFKA_TLS_TYPE
-              value: PEM
-            - name: KAFKA_TLS_CLIENT_AUTH
-              value: none
+              value: SASL_PLAINTEXT:SASL_PLAINTEXT
+            - name: KAFKA_CFG_LISTENERS
+              value: SASL_PLAINTEXT://:9092
+            - name: KAFKA_CFG_ADVERTISED_LISTENERS
+              value: SASL_PLAINTEXT://bootstrap.kafka.aether.svc.cluster.local:9092
+            - name: KAFKA_CFG_INTER_BROKER_LISTENER_NAME
+              value: SASL_PLAINTEXT
+            - name: KAFKA_CFG_SASL_ENABLED_MECHANISMS
+              value: SCRAM-SHA-512
+            - name: KAFKA_CFG_SASL_MECHANISM_INTER_BROKER_PROTOCOL
+              value: SCRAM-SHA-512
+            - name: KAFKA_CLIENT_USERS
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-sasl-credentials
+                  key: client-user
+            - name: KAFKA_CLIENT_PASSWORDS
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-sasl-credentials
+                  key: client-password
+            - name: KAFKA_INTER_BROKER_USER
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-sasl-credentials
+                  key: inter-broker-user
+            - name: KAFKA_INTER_BROKER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-sasl-credentials
+                  key: inter-broker-password
           resources:
             requests:
               cpu: 500m
@@ -64,7 +86,7 @@ spec:
             - name: data
               mountPath: /bitnami/kafka
             - name: kafka-tls
-              mountPath: /opt/bitnami/kafka/config/certs
+              mountPath: /opt/bitnami/kafka/config/tls
               readOnly: true
           securityContext:
             allowPrivilegeEscalation: false
@@ -125,13 +147,23 @@ spec:
         - name: nats
           image: nats:2.10.9-alpine
           args:
-            - -DV
-            - -js
-            - --tls
-            - --tlscert=/etc/nats/tls/server.crt
-            - --tlskey=/etc/nats/tls/server.key
-            - --tlsca=/etc/nats/tls/ca.crt
-            - --tlsverify
+          env:
+            - name: NATS_USER
+              valueFrom:
+                secretKeyRef:
+                  name: nats-auth-credentials
+                  key: username
+            - name: NATS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nats-auth-credentials
+                  key: password
+          command:
+            - /bin/sh
+            - -ec
+          args:
+            - >-
+              exec nats-server -DV -js --user "$NATS_USER" --pass "$NATS_PASSWORD"
           ports:
             - containerPort: 4222
               name: client
@@ -224,8 +256,28 @@ spec:
           ports:
             - containerPort: 2181
           env:
-            - name: ALLOW_ANONYMOUS_LOGIN
+            - name: ZOO_ENABLE_AUTH
               value: "yes"
+            - name: ZOO_CLIENT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: zookeeper-credentials
+                  key: client_user
+            - name: ZOO_CLIENT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: zookeeper-credentials
+                  key: client_password
+            - name: ZOO_SERVER_USERS
+              valueFrom:
+                secretKeyRef:
+                  name: zookeeper-credentials
+                  key: server_users
+            - name: ZOO_SERVER_PASSWORDS
+              valueFrom:
+                secretKeyRef:
+                  name: zookeeper-credentials
+                  key: server_passwords
           resources:
             requests:
               cpu: 200m

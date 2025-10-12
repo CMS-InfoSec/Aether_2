@@ -20,7 +20,7 @@ spec:
             template: promote-canary
     - name: deploy-canary
       container:
-        image: ghcr.io/aether/ml-runtime:latest
+        image: ghcr.io/aether/ml-runtime@sha256:b907adb85315dd9d690dd0638823d0a8f9ff23020a01efc7a50bf9188bcf5068
         command: ["python", "-m", "ml.deployment.deploy", "--strategy", "canary"]
         envFrom:
           - configMapRef:
@@ -29,7 +29,7 @@ spec:
               name: kubernetes-credentials
     - name: monitor-canary
       script:
-        image: ghcr.io/aether/ml-runtime:latest
+        image: ghcr.io/aether/ml-runtime@sha256:b907adb85315dd9d690dd0638823d0a8f9ff23020a01efc7a50bf9188bcf5068
         command: [python]
         source: |
           import json
@@ -55,7 +55,7 @@ spec:
             path: /tmp/report.json
     - name: promote-canary
       container:
-        image: ghcr.io/aether/ml-runtime:latest
+        image: ghcr.io/aether/ml-runtime@sha256:b907adb85315dd9d690dd0638823d0a8f9ff23020a01efc7a50bf9188bcf5068
         command: ["python", "-m", "ml.registry.promote", "--stage", "Production"]
         envFrom:
           - secretRef:

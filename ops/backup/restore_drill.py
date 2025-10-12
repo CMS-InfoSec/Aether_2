@@ -37,6 +37,11 @@ The job relies on the following environment variables:
 ``SLACK_WEBHOOK_URL`` (optional)
     Incoming webhook used to post the drill results.  When unset the script
     still performs the restore but only logs the outcome locally.
+
+``RESTORE_VALIDATION_QUERY`` (optional)
+    Additional SQL statement executed after the baseline restore checks.  When
+    provided the resulting row is included in the Slack notification/logs to
+    confirm downstream data integrity.
 """
 
 from __future__ import annotations
@@ -186,10 +191,16 @@ def _run_psql(sql_file: Path, env: dict[str, str], target_db: str) -> None:
     subprocess.run(command, check=True, env=env)
 
 
-def _validate_restore(conn_kwargs: dict[str, str], target_db: str) -> Tuple[int, int]:
+def _validate_restore(
+    conn_kwargs: dict[str, str],
+    target_db: str,
+    extra_query: str | None = None,
+) -> Tuple[int, int, tuple[str, object] | None]:
     """Run basic validation queries on ``target_db``.
 
-    Returns the number of user tables and backup log entries discovered.
+    Returns the number of user tables and backup log entries discovered. When
+    ``extra_query`` is provided, it is executed after the baseline checks and
+    the raw result tuple is returned for reporting.
     """
 
     LOGGER.info("Validating restored database %s", target_db)
@@ -209,12 +220,30 @@ def _validate_restore(conn_kwargs: dict[str, str], target_db: str) -> Tuple[int,
             cursor.execute("SELECT COUNT(*) FROM backup_log")
             backup_entries = int(cursor.fetchone()[0])
 
+            extra_result: tuple[str, object] | None = None
+            if extra_query:
+                cursor.execute(extra_query)
+                row = cursor.fetchone()
+                if row is None:
+                    raise RuntimeError(
+                        "Validation query returned no rows: {query}".format(
+                            query=extra_query
+                        )
+                    )
+                extra_result = (extra_query, row[0] if len(row) == 1 else row)
+
     LOGGER.info(
         "Validation succeeded with %s tables and %s backup_log rows",
         table_count,
         backup_entries,
     )
-    return table_count, backup_entries
+    if extra_result:
+        LOGGER.info(
+            "Additional validation query succeeded: %s => %s",
+            extra_result[0],
+            extra_result[1],
+        )
+    return table_count, backup_entries, extra_result
 
 
 def _send_slack_message(webhook: str | None, text: str, emoji: str) -> None:
@@ -263,12 +292,18 @@ def run_restore_drill() -> tuple[str, int, int]:
     sql_file = _decompress_archive(archive, sql_dir)
 
     tables = backups = 0
+    extra_result: tuple[str, object] | None = None
     created = False
     try:
         _create_database(conn_kwargs, admin_db, target_db)
         created = True
         _run_psql(sql_file, env, target_db)
-        tables, backups = _validate_restore(conn_kwargs, target_db)
+        validation_query = os.environ.get("RESTORE_VALIDATION_QUERY")
+        tables, backups, extra_result = _validate_restore(
+            conn_kwargs,
+            target_db,
+            validation_query,
+        )
     except Exception:
         if created and not keep_on_failure:
             try:
@@ -282,7 +317,7 @@ def run_restore_drill() -> tuple[str, int, int]:
         except Exception:  # pragma: no cover - cleanup best effort
             LOGGER.exception("Failed to drop database %s after restore", target_db)
 
-    return archive.name, tables, backups
+    return archive.name, tables, backups, extra_result
 
 
 def main() -> None:
@@ -290,7 +325,7 @@ def main() -> None:
     webhook = os.environ.get("SLACK_WEBHOOK_URL")
 
     try:
-        archive_name, table_count, backup_entries = run_restore_drill()
+        archive_name, table_count, backup_entries, extra_result = run_restore_drill()
     except Exception as exc:
         duration = (dt.datetime.utcnow() - started).total_seconds()
         message = (
@@ -306,6 +341,10 @@ def main() -> None:
         f" {archive_name}; {table_count} tables and {backup_entries}"
         f" backup_log rows verified in {duration:.0f}s."
     )
+    if extra_result:
+        message += (
+            " Validation query [{query}] returned {value}."
+        ).format(query=extra_result[0], value=extra_result[1])
     _send_slack_message(webhook, message, ":white_check_mark:")
 
 
