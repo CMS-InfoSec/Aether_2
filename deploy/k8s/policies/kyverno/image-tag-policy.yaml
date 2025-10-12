@@ -23,4 +23,4 @@ spec:
             template:
               spec:
                 containers:
-                  - image: "!*:latest"
+                  - image: "!*\x3Alatest"

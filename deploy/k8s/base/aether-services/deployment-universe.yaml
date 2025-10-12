@@ -32,7 +32,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: universe-service
-          image: ghcr.io/aether/universe-service:latest
+          image: ghcr.io/aether/universe-service@sha256:02d1244d7c908b3fcde09fb545005817aefff054ca67eec907d4813c547451a4
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8000
