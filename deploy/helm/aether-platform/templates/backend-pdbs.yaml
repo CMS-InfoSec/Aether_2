@@ -19,5 +19,5 @@ spec:
     matchLabels:
       {{- include "aether-platform.selectorLabels" (dict "name" $name) | nindent 6 }}
 ---
-{{- end }}
+{{ end }}
 {{- end }}
