@@ -105,6 +105,8 @@
 **Remediation Tasks**
 
 * RMT-060 — Automated secret scanning active in CI. Files: `.github/workflows/pr-security-tests.yml`. Severity: Medium. Owner: Platform Security. Status: Mitigated.
+* RMT-049 — PodSecurity baseline verified. Files: `deploy/k8s/overlays/staging/namespace.yaml`, `deploy/k8s/overlays/production/namespace.yaml`, `deploy/k8s/argocd/namespace.yaml`, `deploy/observability/namespace.yaml`. Status: ✅ Confirmed.
+* RMT-050 — Monthly Vault secret rotation cadence validated. Files: `.github/workflows/secrets-service-key-rotation.yml`. Status: ✅ Confirmed.
 
 ## Testing & Release Engineering
 
