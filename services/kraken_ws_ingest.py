@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import signal
+import ssl
 import sys
 import time
 from collections import defaultdict, deque
@@ -119,6 +120,8 @@ class KrakenConfig:
     reconnect_delay: float = RECONNECT_DELAY_SECONDS
     heartbeat_timeout: float = HEARTBEAT_TIMEOUT_SECONDS
     heartbeat_check_interval: float = HEARTBEAT_CHECK_INTERVAL_SECONDS
+    security_protocol: str = "PLAINTEXT"
+    ssl_ca_file: Optional[str] = None
 
     def __post_init__(self) -> None:
         """Normalise and validate Kraken trading pairs for USD spot-only usage."""
@@ -172,8 +175,17 @@ class KrakenIngestor:
             raise ValueError("At least one trading pair must be provided.")
 
         self._running = True
+        protocol = self._config.security_protocol.upper()
+        ssl_context: Optional[ssl.SSLContext] = None
+        if protocol in {"SSL", "SASL_SSL"}:
+            ssl_context = ssl.create_default_context()
+            if self._config.ssl_ca_file:
+                ssl_context.load_verify_locations(self._config.ssl_ca_file)
+
         self._producer = AIOKafkaProducer(
             bootstrap_servers=self._config.kafka_bootstrap_servers,
+            security_protocol=protocol,
+            ssl_context=ssl_context,
             value_serializer=lambda v: json.dumps(v).encode("utf-8"),
         )
 
@@ -493,6 +505,17 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Kafka bootstrap servers (e.g. localhost:9092)",
     )
     parser.add_argument(
+        "--kafka-security-protocol",
+        default=os.getenv("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT"),
+        choices=["PLAINTEXT", "SSL", "SASL_SSL", "SASL_PLAINTEXT"],
+        help="Security protocol to use when connecting to Kafka",
+    )
+    parser.add_argument(
+        "--kafka-ca-path",
+        default=os.getenv("KAFKA_CA_PATH"),
+        help="Path to a CA bundle for Kafka TLS verification",
+    )
+    parser.add_argument(
         "--trade-topic",
         default=DEFAULT_TRADE_TOPIC,
         help="Kafka topic for trade events",
@@ -554,6 +577,8 @@ async def async_main(argv: Optional[Iterable[str]] = None) -> None:
         trade_topic=args.trade_topic,
         book_topic=args.book_topic,
         book_depth=args.book_depth,
+        security_protocol=args.kafka_security_protocol,
+        ssl_ca_file=args.kafka_ca_path,
     )
 
     start_http_server(args.metrics_port)

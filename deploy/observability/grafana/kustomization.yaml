@@ -1,4 +1,5 @@
 resources:
+  - datasources.yaml
   - dashboards.yaml
   - provisioning.yaml
   - deployment.yaml
