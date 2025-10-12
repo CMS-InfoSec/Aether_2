@@ -10,6 +10,7 @@ resources:
   - fastapi
   - secrets/clustersecretstore.yaml
   - secrets/clusterissuer.yaml
+  - secrets/aether-risk-tls.yaml
   - secrets/tls-certificates.yaml
   - secrets/cert-manager-renewal-cronjob.yaml
   - secrets/external-secrets.yaml
@@ -17,11 +18,56 @@ resources:
   - secrets/fastapi-secrets-external-secret.yaml
   - secrets/secrets-service-config-external-secret.yaml
   - secrets/kraken-keys-external-secrets.yaml
+  - secrets/vault-health-monitor-external-secret.yaml
   - secrets/platform-account-allowlists-external-secret.yaml
   - secrets/fastapi-tls-external-secrets.yaml
+  - secrets/vault-health-monitor-cronjob.yaml
   - ingress
   - networkpolicies
   - aether-services
+  - rbac/serviceaccounts.yaml
+  - rbac/roles.yaml
 commonLabels:
   app.kubernetes.io/part-of: aether-risk
+patches:
+  - target:
+      kind: Deployment
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata: {}
+      spec:
+        template:
+          spec:
+            securityContext:
+              runAsNonRoot: true
+              seccompProfile:
+                type: RuntimeDefault
+  - target:
+      kind: StatefulSet
+    patch: |-
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata: {}
+      spec:
+        template:
+          spec:
+            securityContext:
+              runAsNonRoot: true
+              seccompProfile:
+                type: RuntimeDefault
+  - target:
+      kind: CronJob
+    patch: |-
+      apiVersion: batch/v1
+      kind: CronJob
+      metadata: {}
+      spec:
+        jobTemplate:
+          spec:
+            template:
+              spec:
+                securityContext:
+                  seccompProfile:
+                    type: RuntimeDefault
 

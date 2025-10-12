@@ -1,0 +1,34 @@
+name: Post-Deployment Smoke Tests
+
+on:
+  deployment_status:
+    types: [success]
+
+jobs:
+  smoke-tests:
+    if: github.event.deployment_status.state == 'success'
+    runs-on: ubuntu-latest
+    env:
+      TARGET_URL: ${{ github.event.deployment_status.environment_url }}
+    steps:
+      - name: Validate deployment URL
+        run: |
+          if [ -z "${TARGET_URL}" ]; then
+            echo "Deployment environment URL is missing from the deployment status payload."
+            exit 1
+          fi
+      - name: Run smoke tests
+        run: |
+          set -euo pipefail
+          base="${TARGET_URL%/}"
+          echo "Running smoke tests against ${base}"
+
+          curl --fail --silent --show-error "${base}/healthz" > /tmp/healthz
+          echo "✔ /healthz responded successfully"
+
+          curl --fail --silent --show-error "${base}/metrics" > /tmp/metrics
+          if ! grep -q . /tmp/metrics; then
+            echo "Metrics endpoint returned an empty response"
+            exit 1
+          fi
+          echo "✔ /metrics responded successfully"

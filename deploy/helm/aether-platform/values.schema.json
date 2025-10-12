@@ -1,58 +1,263 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://aether.example.com/helm/aether-platform/values.schema.json",
-  "title": "Aether Platform Helm Values",
-  "type": "object",
-  "additionalProperties": true,
-  "properties": {
-    "simulation": {
-      "type": "object",
-      "description": "Controls access to the simulation workloads. These must remain disabled in production clusters.",
-      "default": {
-        "enabled": false
-      },
-      "required": [
-        "enabled"
-      ],
-      "properties": {
-        "enabled": {
-          "type": "boolean",
-          "const": false,
-          "default": false,
-          "description": "Simulation traffic is disabled by default to prevent accidental activation in production."
-        }
-      },
-      "additionalProperties": true
-    },
-    "runtimeSafety": {
-      "type": "object",
-      "description": "Global runtime safety flags that harden the chart against insecure defaults.",
-      "default": {
-        "_ALLOW_INSECURE_DEFAULTS": false
-      },
-      "required": [
-        "_ALLOW_INSECURE_DEFAULTS"
-      ],
-      "properties": {
-        "_ALLOW_INSECURE_DEFAULTS": {
-          "description": "Ensures insecure default fallbacks remain disabled across all workloads.",
-          "anyOf": [
-            {
-              "type": "boolean",
-              "const": false
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "https://aether.example.com/helm/aether-platform/values.schema.json",
+    "title": "Aether Platform Helm Values",
+    "type": "object",
+    "additionalProperties": true,
+    "required": [
+        "global",
+        "backendServices",
+        "ui"
+    ],
+    "$defs": {
+        "image": {
+            "type": "object",
+            "description": "Container image settings must pin a repository and tag to avoid implicit upgrades.",
+            "required": [
+                "repository",
+                "tag"
+            ],
+            "properties": {
+                "repository": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "tag": {
+                    "type": "string",
+                    "minLength": 1
+                }
             },
-            {
-              "type": "string",
-              "enum": [
-                "0",
-                "false",
-                "False"
-              ]
-            }
-          ]
+            "additionalProperties": true
+        },
+        "resourceQuantities": {
+            "type": "object",
+            "required": [
+                "cpu",
+                "memory"
+            ],
+            "properties": {
+                "cpu": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "memory": {
+                    "type": "string",
+                    "minLength": 1
+                }
+            },
+            "additionalProperties": true
+        },
+        "resources": {
+            "type": "object",
+            "description": "CPU and memory requests/limits are required for every workload to guarantee scheduling and enforce quotas.",
+            "required": [
+                "requests",
+                "limits"
+            ],
+            "properties": {
+                "requests": {
+                    "$ref": "#/$defs/resourceQuantities"
+                },
+                "limits": {
+                    "$ref": "#/$defs/resourceQuantities"
+                }
+            },
+            "additionalProperties": false
+        },
+        "backendService": {
+            "type": "object",
+            "required": [
+                "enabled",
+                "image",
+                "resources"
+            ],
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "description": "Backend deployment toggles must be explicit so production rollouts cannot omit the gate.",
+                    "default": true
+                },
+                "image": {
+                    "$ref": "#/$defs/image"
+                },
+                "resources": {
+                    "$ref": "#/$defs/resources"
+                }
+            },
+            "additionalProperties": true
         }
-      },
-      "additionalProperties": true
+    },
+    "properties": {
+        "global": {
+            "type": "object",
+            "description": "Global defaults applied to every workload in the chart.",
+            "required": [
+                "imagePullPolicy",
+                "containerSecurityContext",
+                "podSecurityContext"
+            ],
+            "properties": {
+                "imagePullPolicy": {
+                    "type": "string",
+                    "enum": [
+                        "Always",
+                        "IfNotPresent",
+                        "Never"
+                    ]
+                },
+                "containerSecurityContext": {
+                    "type": "object",
+                    "description": "Container-level security controls must keep privilege escalation disabled and enforce a read-only root filesystem.",
+                    "required": [
+                        "allowPrivilegeEscalation",
+                        "capabilities",
+                        "readOnlyRootFilesystem"
+                    ],
+                    "properties": {
+                        "allowPrivilegeEscalation": {
+                            "type": "boolean",
+                            "const": false
+                        },
+                        "readOnlyRootFilesystem": {
+                            "type": "boolean",
+                            "const": true
+                        },
+                        "capabilities": {
+                            "type": "object",
+                            "required": [
+                                "drop"
+                            ],
+                            "properties": {
+                                "drop": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "string"
+                                    },
+                                    "contains": {
+                                        "const": "ALL"
+                                    },
+                                    "minItems": 1
+                                }
+                            },
+                            "additionalProperties": true
+                        }
+                    },
+                    "additionalProperties": true
+                },
+                "podSecurityContext": {
+                    "type": "object",
+                    "description": "Pod-level security context must enforce non-root execution and default seccomp profile.",
+                    "required": [
+                        "runAsNonRoot",
+                        "runAsUser",
+                        "runAsGroup",
+                        "fsGroup"
+                    ],
+                    "properties": {
+                        "runAsNonRoot": {
+                            "type": "boolean",
+                            "const": true
+                        },
+                        "runAsUser": {
+                            "type": "integer",
+                            "minimum": 1
+                        },
+                        "runAsGroup": {
+                            "type": "integer",
+                            "minimum": 1
+                        },
+                        "fsGroup": {
+                            "type": "integer",
+                            "minimum": 1
+                        }
+                    },
+                    "additionalProperties": true
+                }
+            },
+            "additionalProperties": true
+        },
+        "simulation": {
+            "type": "object",
+            "description": "Controls access to the simulation workloads. These must remain disabled in production clusters.",
+            "default": {
+                "enabled": false
+            },
+            "required": [
+                "enabled"
+            ],
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "const": false,
+                    "default": false,
+                    "description": "Simulation traffic is disabled by default to prevent accidental activation in production."
+                }
+            },
+            "additionalProperties": true
+        },
+        "runtimeSafety": {
+            "type": "object",
+            "description": "Global runtime safety flags that harden the chart against insecure defaults.",
+            "default": {
+                "_ALLOW_INSECURE_DEFAULTS": false
+            },
+            "required": [
+                "_ALLOW_INSECURE_DEFAULTS"
+            ],
+            "properties": {
+                "_ALLOW_INSECURE_DEFAULTS": {
+                    "description": "Ensures insecure default fallbacks remain disabled across all workloads.",
+                    "anyOf": [
+                        {
+                            "type": "boolean",
+                            "const": false
+                        },
+                        {
+                            "type": "string",
+                            "enum": [
+                                "0",
+                                "false",
+                                "False"
+                            ]
+                        }
+                    ]
+                }
+            },
+            "additionalProperties": true
+        },
+        "backendServices": {
+            "type": "object",
+            "description": "Collection of backend workloads deployed as part of the platform.",
+            "minProperties": 1,
+            "patternProperties": {
+                "^[A-Za-z0-9_-]+$": {
+                    "$ref": "#/$defs/backendService"
+                }
+            },
+            "additionalProperties": false
+        },
+        "ui": {
+            "type": "object",
+            "description": "Frontend workload configuration.",
+            "required": [
+                "enabled",
+                "image",
+                "resources"
+            ],
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "description": "UI deployment toggles must be explicit so production rollouts cannot omit the gate.",
+                    "default": true
+                },
+                "image": {
+                    "$ref": "#/$defs/image"
+                },
+                "resources": {
+                    "$ref": "#/$defs/resources"
+                }
+            },
+            "additionalProperties": true
+        }
     }
-  }
 }
