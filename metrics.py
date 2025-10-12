@@ -8,6 +8,8 @@ from dataclasses import dataclass, replace
 from enum import Enum
 import logging
 import os
+from datetime import datetime, timezone
+from time import perf_counter
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Dict, Generator, Iterable, Optional
 from uuid import uuid4
@@ -538,6 +540,27 @@ _risk_validation_latency = Histogram(
     buckets=(5, 10, 25, 50, 100, 250, 500, 1000, float("inf")),
 )
 
+_http_request_duration_seconds = Histogram(
+    "http_request_duration_seconds",
+    "HTTP request latency distribution in seconds.",
+    ["service", "method", "status_code"],
+    registry=_REGISTRY,
+    buckets=(
+        0.005,
+        0.01,
+        0.025,
+        0.05,
+        0.1,
+        0.25,
+        0.5,
+        1.0,
+        2.5,
+        5.0,
+        10.0,
+        float("inf"),
+    ),
+)
+
 _oms_submit_latency = Histogram(
     "oms_submit_latency",
     "Latency distribution for submitting intents to the OMS in milliseconds.",
@@ -567,6 +590,13 @@ _kill_switch_state = Gauge(
     registry=_REGISTRY,
 )
 
+_risk_marketdata_latest_timestamp_seconds = Gauge(
+    "risk_marketdata_latest_timestamp_seconds",
+    "Unix timestamp of the most recent market data event processed by the service.",
+    ["service"],
+    registry=_REGISTRY,
+)
+
 _METRICS: Dict[str, Counter | Gauge | Histogram] = {
     "trades_submitted_total": _trades_submitted_total,
     "trades_rejected_total": _trades_rejected_total,
@@ -589,6 +619,7 @@ _METRICS: Dict[str, Counter | Gauge | Histogram] = {
     "account_exposure_usd": _account_exposure_usd,
     "policy_inference_latency": _policy_inference_latency,
     "risk_validation_latency": _risk_validation_latency,
+    "http_request_duration_seconds": _http_request_duration_seconds,
     "oms_submit_latency": _oms_submit_latency,
     "late_events_total": _late_events_total,
     "reorder_buffer_depth": _reorder_buffer_depth,
@@ -598,6 +629,7 @@ _METRICS: Dict[str, Counter | Gauge | Histogram] = {
     "scaling_evaluation_duration_seconds": _scaling_evaluation_duration_seconds,
     "scaling_evaluations_total": _scaling_evaluations_total,
     "kill_switch_state": _kill_switch_state,
+    "risk_marketdata_latest_timestamp_seconds": _risk_marketdata_latest_timestamp_seconds,
 }
 
 _INITIALISED = False
@@ -744,6 +776,21 @@ def _coerce_float(value: object, default: float = 0.0) -> float:
         return default
 
 
+def _record_http_request_duration(
+    service_name: str, method: str, status_code: str, duration_seconds: float
+) -> None:
+    """Record the duration of an HTTP request for the service histogram."""
+
+    try:
+        _http_request_duration_seconds.labels(
+            service=_service_value(service_name),
+            method=_normalised(method.upper(), "UNKNOWN"),
+            status_code=_normalised(status_code, "unknown"),
+        ).observe(max(duration_seconds, 0.0))
+    except Exception:  # pragma: no cover - prometheus optional in some environments
+        logger.debug("HTTP request duration metric unavailable; skipping update")
+
+
 class RequestTracingMiddleware(BaseHTTPMiddleware):
     """Starlette middleware that wires request IDs and tracing spans."""
 
@@ -756,6 +803,9 @@ class RequestTracingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         request_id = request.headers.get("x-request-id") or str(uuid4())
         token = _REQUEST_ID.set(request_id)
+        response: Optional[Response] = None
+        status_code: Optional[int] = None
+        start = perf_counter()
 
         span_cm = (
             self._tracer.start_as_current_span(
@@ -765,20 +815,41 @@ class RequestTracingMiddleware(BaseHTTPMiddleware):
             else nullcontext(None)
         )
 
-        with span_cm as span:  # type: ignore[assignment]
-            if span:
-                span.set_attribute("service.name", self._service_name)
-                span.set_attribute("request.id", request_id)
-                span.set_attribute("http.method", request.method)
-                span.set_attribute("http.url", str(request.url))
+        try:
+            with span_cm as span:  # type: ignore[assignment]
+                if span:
+                    span.set_attribute("service.name", self._service_name)
+                    span.set_attribute("request.id", request_id)
+                    span.set_attribute("http.method", request.method)
+                    span.set_attribute("http.url", str(request.url))
 
-            response = await call_next(request)
-            if span:
-                span.set_attribute("http.status_code", response.status_code)
-
-        _REQUEST_ID.reset(token)
-        response.headers["x-request-id"] = request_id
-        return response
+                response = await call_next(request)
+                status_code = response.status_code
+                if span:
+                    span.set_attribute("http.status_code", status_code)
+            return response
+        except Exception as exc:
+            status_code = status_code or 500
+            if self._tracer:
+                try:
+                    span = trace.get_current_span()
+                    if span:
+                        span.set_attribute("http.status_code", status_code)
+                        span.record_exception(exc)  # type: ignore[attr-defined]
+                except Exception:  # pragma: no cover - defensive guard
+                    logger.debug("Failed to annotate tracing span for exception", exc_info=True)
+            raise
+        finally:
+            duration = perf_counter() - start
+            _record_http_request_duration(
+                self._service_name,
+                request.method,
+                str(status_code or 500),
+                duration,
+            )
+            if response is not None:
+                response.headers["x-request-id"] = request_id
+            _REQUEST_ID.reset(token)
 
 
 def init_metrics(service_name: str = "service") -> Dict[str, Counter | Gauge | Histogram]:
@@ -831,6 +902,9 @@ def init_metrics(service_name: str = "service") -> Dict[str, Counter | Gauge | H
     _fees_nav_pct.labels(**base_account_labels)
     _policy_inference_latency.labels(service=base_service)
     _risk_validation_latency.labels(service=base_service)
+    _http_request_duration_seconds.labels(
+        service=base_service, method="GET", status_code="200"
+    )
     _oms_submit_latency.labels(
         service=base_service, transport=TransportType.UNKNOWN.value
     )
@@ -857,6 +931,7 @@ def init_metrics(service_name: str = "service") -> Dict[str, Counter | Gauge | H
     ).set(0.0)
 
     _kill_switch_state.labels(account_id=base_account_id).set(0.0)
+    _risk_marketdata_latest_timestamp_seconds.labels(service=base_service).set(0.0)
 
     return _METRICS
 
@@ -890,6 +965,33 @@ def record_kill_switch_state(account_id: str, engaged: bool) -> None:
         _kill_switch_state.labels(account_id=_normalized_account_label(account_id)).set(value)
     except Exception:  # pragma: no cover - prometheus optional in some environments
         logger.debug("Kill switch metric unavailable; skipping update")
+
+
+def record_marketdata_latest_timestamp(
+    timestamp: datetime | float | int,
+    *,
+    service: Optional[str] = None,
+) -> None:
+    """Record the Unix timestamp of the freshest observed market data point."""
+
+    try:
+        if isinstance(timestamp, datetime):
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            epoch = timestamp.astimezone(timezone.utc).timestamp()
+        else:
+            epoch = float(timestamp)
+    except Exception:
+        logger.debug("Unable to normalise market data timestamp", exc_info=True)
+        return
+
+    try:
+        ctx = _resolve_metric_context(service=service)
+        _risk_marketdata_latest_timestamp_seconds.labels(
+            service=_service_value(ctx.service)
+        ).set(epoch)
+    except Exception:  # pragma: no cover - prometheus optional in some environments
+        logger.debug("Market data freshness metric unavailable; skipping update")
 
 
 @contextmanager
@@ -1418,6 +1520,7 @@ __all__ = [
     "record_account_daily_pnl",
     "record_account_drawdown",
     "record_account_exposure",
+    "record_marketdata_latest_timestamp",
     "record_scaling_state",
     "observe_scaling_evaluation",
     "get_request_id",
