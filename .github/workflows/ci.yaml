@@ -40,6 +40,9 @@ jobs:
         run: |
           pytest tests/test_compliance_pack.py -k "spot" --maxfail=1 --strict-markers --strict-config --runxfail
 
+      - name: Verify ExternalSecrets reconciliation
+        run: scripts/verify_externalsecrets_ready.sh
+
       - name: Build risk API Docker image
         run: |
           docker build -t risk-api:ci -f deploy/docker/risk-api/Dockerfile .
