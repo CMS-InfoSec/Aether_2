@@ -22,6 +22,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install --no-cache-dir '.[dev,test]'
 
+      - name: Ensure container tags are immutable
+        run: |
+          set -euo pipefail
+          search_paths=()
+          for path in argo deploy kubernetes; do
+            if [ -d "$path" ]; then
+              search_paths+=("$path")
+            fi
+          done
+
+          if [ "${#search_paths[@]}" -gt 0 ] && \ 
+             grep -R --exclude=*.md --exclude-dir=.git --exclude-dir=deploy/k8s/policies ':latest' "${search_paths[@]}"; then
+            echo 'Found mutable :latest tag references. Pin all container images to immutable tags or digests.' >&2
+            exit 1
+          fi
+
       - name: Lint for unused imports and insecure defaults
         run: |
           ruff check . --select F401,F402,F403,F404,F405,F406,F407,F601,F602 --exclude tests
@@ -40,9 +56,21 @@ jobs:
         run: |
           pytest tests/test_compliance_pack.py -k "spot" --maxfail=1 --strict-markers --strict-config --runxfail
 
+      - name: Verify ExternalSecrets reconciliation
+        run: scripts/verify_externalsecrets_ready.sh
+
       - name: Build risk API Docker image
         run: |
           docker build -t risk-api:ci -f deploy/docker/risk-api/Dockerfile .
+
+      - name: Scan risk API image with Trivy
+        uses: aquasecurity/trivy-action@0.21.0
+        with:
+          image-ref: risk-api:ci
+          severity: CRITICAL,HIGH
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
 
       - name: Run /healthz check
         run: |
@@ -58,3 +86,25 @@ jobs:
           docker logs risk-api-ci || true
           docker stop risk-api-ci || true
           exit 1
+
+      - name: Generate build metadata manifest
+        run: |
+          cat <<EOF > build-manifest.json
+          {
+            "commit_sha": "${{ github.sha }}",
+            "build_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "change_request_id": "${CHANGE_REQUEST_ID}",
+            "compliance_labels": [
+              "ISO27001",
+              "GDPR"
+            ]
+          }
+          EOF
+        env:
+          CHANGE_REQUEST_ID: ${{ github.event.pull_request.number || github.run_id }}
+
+      - name: Upload build metadata manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-manifest-${{ github.job }}
+          path: build-manifest.json

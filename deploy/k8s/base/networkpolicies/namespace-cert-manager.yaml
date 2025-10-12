@@ -11,7 +11,7 @@ spec:
     - Ingress
     - Egress
   ingress:
-    # Webhook callbacks initiated by the Kubernetes API server.
+    # Webhook callbacks initiated by the Kubernetes API server, including external control planes.
     - from:
         - namespaceSelector:
             matchLabels:
@@ -45,7 +45,7 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
-    # Allow communication with the Kubernetes API server.
+    # Allow communication with the Kubernetes API server, including hosted control planes.
     - to:
         - namespaceSelector:
             matchLabels:

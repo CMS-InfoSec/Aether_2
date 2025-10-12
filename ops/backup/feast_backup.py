@@ -70,7 +70,7 @@ class FeastBackupConfig:
             os.environ.get("FEAST_FEATURE_STORE_PATH", "/etc/feast/feature_store.yaml")
         )
         repo_path = Path(os.environ.get("FEAST_REPO_PATH", feature_store_path.parent))
-        redis_host = os.environ.get("FEAST_REDIS_HOST", "redis-master")
+        redis_host = os.environ.get("FEAST_REDIS_HOST", "redis")
         redis_port = int(os.environ.get("FEAST_REDIS_PORT", "6379"))
         redis_password = os.environ.get("FEAST_REDIS_PASSWORD")
 

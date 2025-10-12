@@ -37,3 +37,13 @@ jobs:
         run: kustomize build deploy/k8s/overlays/production
       - name: Validate observability stack
         run: kustomize build deploy/observability
+  helm-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v3
+        with:
+          version: v3.13.3
+      - name: Lint Helm charts
+        run: |
+          helm lint deploy/helm/aether-platform --strict
