@@ -22,8 +22,8 @@ spec:
         - name: kafka
           image: bitnami/kafka:3.7.0
           ports:
-            - containerPort: 9092
-              name: client
+            - containerPort: 9093
+              name: client-tls
           env:
             - name: KAFKA_CFG_ZOOKEEPER_CONNECT
               value: zookeeper:2181
@@ -66,14 +66,14 @@ spec:
               memory: 4Gi
           readinessProbe:
             tcpSocket:
-              port: client
+              port: client-tls
             initialDelaySeconds: 20
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 6
           livenessProbe:
             tcpSocket:
-              port: client
+              port: client-tls
             initialDelaySeconds: 60
             periodSeconds: 20
             timeoutSeconds: 5
@@ -90,6 +90,17 @@ spec:
               drop:
                 - ALL
             readOnlyRootFilesystem: true
+      volumes:
+        - name: kafka-tls
+          secret:
+            secretName: kafka-tls
+            items:
+              - key: tls.crt
+                path: kafka.keystore.pem
+              - key: tls.key
+                path: kafka.keystore.key
+              - key: ca.crt
+                path: kafka.truststore.pem
   volumeClaimTemplates:
     - metadata:
         name: data
@@ -109,9 +120,9 @@ spec:
   selector:
     app: kafka
   ports:
-    - name: client
-      port: 9092
-      targetPort: 9092
+    - name: client-tls
+      port: 9093
+      targetPort: 9093
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -134,6 +145,11 @@ spec:
           args:
             - -DV
             - -js
+            - --tls
+            - --tlscert=/etc/nats/tls/server.crt
+            - --tlskey=/etc/nats/tls/server.key
+            - --tlsca=/etc/nats/tls/ca.crt
+            - --tlsverify
           ports:
             - containerPort: 4222
               name: client
@@ -171,9 +187,22 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: nats-tls
+              mountPath: /etc/nats/tls
+              readOnly: true
       volumes:
         - name: data
           emptyDir: {}
+        - name: nats-tls
+          secret:
+            secretName: nats-tls
+            items:
+              - key: tls.crt
+                path: server.crt
+              - key: tls.key
+                path: server.key
+              - key: ca.crt
+                path: ca.crt
 ---
 apiVersion: v1
 kind: Service
