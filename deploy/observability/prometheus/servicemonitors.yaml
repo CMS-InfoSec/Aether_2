@@ -1,0 +1,97 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: auth-service
+  labels:
+    release: aether
+spec:
+  selector:
+    matchLabels:
+      app: auth-service
+  endpoints:
+    - port: http
+      interval: 30s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: fees-service
+  labels:
+    release: aether
+spec:
+  selector:
+    matchLabels:
+      app: fees-service
+  endpoints:
+    - port: http
+      interval: 30s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: oms-service
+  labels:
+    release: aether
+spec:
+  selector:
+    matchLabels:
+      app: oms-service
+  endpoints:
+    - port: http
+      interval: 30s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: policy-service
+  labels:
+    release: aether
+spec:
+  selector:
+    matchLabels:
+      app: policy-service
+  endpoints:
+    - port: http
+      interval: 30s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: risk-service
+  labels:
+    release: aether
+spec:
+  selector:
+    matchLabels:
+      app: risk-service
+  endpoints:
+    - port: http
+      interval: 30s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: secrets-service
+  labels:
+    release: aether
+spec:
+  selector:
+    matchLabels:
+      app: secrets-service
+  endpoints:
+    - port: http
+      interval: 30s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: universe-service
+  labels:
+    release: aether
+spec:
+  selector:
+    matchLabels:
+      app: universe-service
+  endpoints:
+    - port: http
+      interval: 30s
