@@ -7,6 +7,9 @@
 - Focused on controls that impact production resilience, security, observability, and day-two operations for the backend services.
 
 ## Executive Summary
+### Readiness Decision
+- **Status:** Not production ready. Blockers include the lack of a dependency-aware `/readyz` endpoint, permissive fallbacks that can bypass Postgres and Argon2 safeguards, and insufficient automated static analysis coverage to detect regressions before release.【F:deploy/k8s/base/aether-services/deployment-risk.yaml†L93-L108】【F:app.py†L120-L128】【F:auth/service.py†L455-L469】【F:pyproject.toml†L121-L153】
+
 ### Strengths
 - The application factory enforces strong startup contracts by verifying Postgres connectivity, Redis-backed sessions, scaling controller lifecycle, metrics, correlation IDs, and audit integrations before serving traffic.【F:app.py†L206-L299】
 - Runtime safety checks block insecure fallbacks and misconfiguration of account allowlists or simulation mode in production, reducing the chance that dev-mode toggles leak into live environments.【F:shared/runtime_checks.py†L49-L163】
