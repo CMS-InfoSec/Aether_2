@@ -11,13 +11,11 @@ spec:
     - Ingress
     - Egress
   ingress:
-    # Webhook callbacks initiated by the Kubernetes API server.
+    # Webhook callbacks initiated by the Kubernetes API server, including external control planes.
     - from:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: kube-system
-        # Managed control planes often run outside the cluster and are not
-        # represented by pods. Permit webhook callbacks from their node IPs.
         - ipBlock:
             cidr: 0.0.0.0/0
         - ipBlock:
@@ -45,13 +43,11 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
-    # Allow communication with the Kubernetes API server.
+    # Allow communication with the Kubernetes API server, including hosted control planes.
     - to:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: kube-system
-        # Allow direct control-plane connections when the API server runs
-        # off-cluster.
         - ipBlock:
             cidr: 0.0.0.0/0
         - ipBlock:
