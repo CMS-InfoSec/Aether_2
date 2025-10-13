@@ -11,7 +11,7 @@ import os
 from datetime import datetime, timezone
 from time import perf_counter
 from types import SimpleNamespace
-from typing import Any, Awaitable, Callable, Dict, Generator, Iterable, Iterator, Optional
+from typing import Any, Awaitable, Callable, Dict, Generator, Iterable, Iterator, List, Optional
 from uuid import uuid4
 
 from fastapi import FastAPI, Request, Response
@@ -51,11 +51,13 @@ except ImportError:  # pragma: no cover - provide a no-op metrics backend
             labelnames: Optional[Iterable[str]] = None,
             *,
             registry: "CollectorRegistry" | None = None,
+            metric_type: str | None = None,
             **_: Any,
         ) -> None:
             self._name = name
             self._documentation = documentation
             self._labelnames = tuple(labelnames or ())
+            self._metric_type = metric_type or "gauge"
             self._values: Dict[tuple[str, ...], float] = {}
             if registry is not None:
                 try:
@@ -98,7 +100,12 @@ except ImportError:  # pragma: no cover - provide a no-op metrics backend
                 )
                 for key, value in self._values.items()
             ]
-            yield SimpleNamespace(name=self._name, documentation=self._documentation, samples=samples)
+            yield SimpleNamespace(
+                name=self._name,
+                documentation=self._documentation,
+                samples=samples,
+                type=self._metric_type,
+            )
 
     class _FallbackCollectorRegistry:
         """Lightweight registry compatible with the Prometheus client interface."""
@@ -145,16 +152,38 @@ except ImportError:  # pragma: no cover - provide a no-op metrics backend
             return None
 
     def Counter(name: str, documentation: str, labelnames=(), **kwargs: Any) -> _Metric:
-        return _Metric(name, documentation, labelnames, **kwargs)
+        return _Metric(name, documentation, labelnames, metric_type="counter", **kwargs)
 
     def Gauge(name: str, documentation: str, labelnames=(), **kwargs: Any) -> _Metric:
-        return _Metric(name, documentation, labelnames, **kwargs)
+        return _Metric(name, documentation, labelnames, metric_type="gauge", **kwargs)
 
     def Histogram(name: str, documentation: str, labelnames=(), **kwargs: Any) -> _Metric:
-        return _Metric(name, documentation, labelnames, **kwargs)
+        return _Metric(name, documentation, labelnames, metric_type="histogram", **kwargs)
 
-    def generate_latest(*args: Any, **kwargs: Any) -> bytes:
-        return b""
+    def generate_latest(
+        registry: "CollectorRegistry" | None = None, *args: Any, **kwargs: Any
+    ) -> bytes:
+        registry_obj = registry or _REGISTRY
+        lines: List[str] = []
+        for family in registry_obj.collect():
+            metric_name = getattr(family, "name", "")
+            documentation = getattr(family, "documentation", "")
+            metric_type = getattr(family, "type", "gauge")
+            if metric_name:
+                if documentation:
+                    lines.append(f"# HELP {metric_name} {documentation}")
+                lines.append(f"# TYPE {metric_name} {metric_type}")
+            for sample in getattr(family, "samples", []):
+                labels = getattr(sample, "labels", {})
+                label_text = ""
+                if labels:
+                    encoded = ",".join(f'{key}="{value}"' for key, value in labels.items())
+                    label_text = f"{{{encoded}}}"
+                lines.append(f"{sample.name}{label_text} {getattr(sample, 'value', 0.0)}")
+        if not lines:
+            return b""
+        lines.append("")
+        return "\n".join(lines).encode("utf-8")
 
     def start_http_server(*args: Any, **kwargs: Any) -> None:
         logging.getLogger(__name__).warning(
