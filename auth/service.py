@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import sys
+from urllib.parse import quote, urlencode
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -43,6 +44,27 @@ except ModuleNotFoundError as exc:  # pragma: no cover - exercised in lightweigh
         def verify(self, code: str, valid_window: int = 1) -> bool:
             del valid_window
             return code == self.now()
+
+        def provisioning_uri(
+            self,
+            name: str,
+            issuer_name: str | None = None,
+            **parameters: object,
+        ) -> str:
+            """Return a deterministic otpauth provisioning URI compatible with authenticator apps."""
+
+            label = name
+            if issuer_name:
+                label = f"{issuer_name}:{name}"
+            label = quote(label)
+            query: dict[str, str] = {"secret": self._secret}
+            if issuer_name:
+                query["issuer"] = issuer_name
+            for key, value in parameters.items():
+                if value is None:
+                    continue
+                query[key] = str(value)
+            return f"otpauth://totp/{label}?{urlencode(query)}"
 
     def _random_base32() -> str:
         return base64.b32encode(os.urandom(20)).decode("ascii").rstrip("=")
