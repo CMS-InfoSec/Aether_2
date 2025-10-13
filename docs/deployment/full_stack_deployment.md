@@ -185,6 +185,9 @@ Key items to review:
 * `feast` Redis host, offline store secret, and backup bucket so the feature
   store and CronJob succeed immediately after install.
   【F:deploy/helm/aether-platform/values.yaml†L1604-L1641】
+* `bootstrap` images, actors, and secret references so the post-install jobs
+  can run configuration and database migrations without manual kubectl execs.
+  【F:deploy/helm/aether-platform/values.yaml†L313-L369】
 
 ## 7. Deploy the Platform Chart
 
@@ -206,25 +209,18 @@ Use Lens to watch the release: open the **Workloads ➜ Deployments** view for t
 `aether` namespace and verify all pods become Ready, then inspect the Helm tab to
 see the rendered values and manifest history.
 
-## 8. Run Database Migrations and Bootstraps
+## 8. Verify Bootstrap Jobs
 
-After the services are online, execute the configuration and account migrations
-exactly once so schema and seed data are present. Because the risk-service
-deployment already has the environment variables your Helm release injected,
-re-use that runtime to run the bootstrap commands:
+The chart now creates three Helm hook jobs – configuration bootstrap, account
+schema creation, and database migrations – immediately after each install or
+upgrade. Use Lens (**Workloads ➜ Jobs**) to confirm the `*-config-bootstrap`,
+`*-account-bootstrap`, and `*-data-migrations` jobs complete successfully.
 
-```bash
-kubectl exec deploy/risk-service -n aether -- \
-  python migrate.py apply config/bootstrap.yaml
-
-kubectl exec deploy/risk-service -n aether -- \
-  python -c "import account_migrations as m;\nfrom sqlalchemy import create_engine;\nengine = create_engine(\"$ADMIN_POSTGRES_DSN\");\nm.upgrade(engine)"
-```
-
-The commands match the bootstrap scripts used in non-Kubernetes environments and
-seed the shared configuration plus admin tables the APIs rely on.
-【F:migrate.py†L1-L117】【F:account_migrations.py†L1-L117】 Ensure the DSNs in the pod
-environment point at the TimescaleDB release you installed in Step 5.
+Each job runs with the service account, working directory, and secrets defined
+under the `bootstrap` values block, so override the defaults when you point at
+external databases or bespoke images.【F:deploy/helm/aether-platform/templates/bootstrap-jobs.yaml†L1-L203】【F:deploy/helm/aether-platform/values.yaml†L313-L369】
+If a job fails, update the relevant credentials or commands in `platform-values.yaml`
+and rerun `helm upgrade` – Helm will recreate the hook until it succeeds.
 
 ## 9. Validate in Lens
 

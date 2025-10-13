@@ -453,6 +453,243 @@
                 }
             ],
             "additionalProperties": true
+        },
+        "serviceAccountSet": {
+            "type": "object",
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "default": true
+                },
+                "names": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "minLength": 1
+                    }
+                }
+            },
+            "additionalProperties": false
+        },
+        "pipelineService": {
+            "type": "object",
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "default": false
+                },
+                "type": {
+                    "type": "string"
+                },
+                "ports": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": [
+                            "port",
+                            "targetPort"
+                        ],
+                        "properties": {
+                            "name": {
+                                "type": "string"
+                            },
+                            "port": {
+                                "type": "integer",
+                                "minimum": 1
+                            },
+                            "targetPort": {
+                                "type": [
+                                    "integer",
+                                    "string"
+                                ]
+                            }
+                        },
+                        "additionalProperties": true
+                    }
+                }
+            },
+            "additionalProperties": true
+        },
+        "pipelineDeployment": {
+            "type": "object",
+            "required": [
+                "image",
+                "resources"
+            ],
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "default": true
+                },
+                "image": {
+                    "$ref": "#/$defs/image"
+                },
+                "resources": {
+                    "$ref": "#/$defs/resources"
+                },
+                "service": {
+                    "$ref": "#/$defs/pipelineService"
+                }
+            },
+            "additionalProperties": true
+        },
+        "feastConfig": {
+            "type": "object",
+            "required": [
+                "enabled",
+                "image",
+                "resources",
+                "backup"
+            ],
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "default": false
+                },
+                "image": {
+                    "$ref": "#/$defs/image"
+                },
+                "resources": {
+                    "$ref": "#/$defs/resources"
+                },
+                "backup": {
+                    "type": "object",
+                    "required": [
+                        "image",
+                        "objectStoreSecret"
+                    ],
+                    "properties": {
+                        "image": {
+                            "$ref": "#/$defs/image"
+                        },
+                        "objectStoreSecret": {
+                            "type": "string",
+                            "minLength": 1
+                        }
+                    },
+                    "additionalProperties": true
+                }
+            },
+            "additionalProperties": true
+        },
+        "postgresConnection": {
+            "type": "object",
+            "description": "Connection attributes for managed PostgreSQL secrets.",
+            "required": [
+                "database",
+                "username",
+                "password"
+            ],
+            "properties": {
+                "host": {
+                    "type": "string",
+                    "description": "Override the hostname when using an external PostgreSQL instance."
+                },
+                "port": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Override the port when using a non-standard PostgreSQL listener."
+                },
+                "database": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "username": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "password": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "sslmode": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "parameters": {
+                    "type": "object",
+                    "description": "Additional query parameters appended to the generated DSN.",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                }
+            },
+            "additionalProperties": true
+        },
+        "managedSecret": {
+            "type": "object",
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "default": true
+                },
+                "type": {
+                    "type": "string",
+                    "enum": [
+                        "postgresDsn",
+                        "opaque"
+                    ],
+                    "default": "opaque"
+                },
+                "dsnKey": {
+                    "type": "string",
+                    "description": "Key used to store the generated DSN when type is postgresDsn.",
+                    "default": "dsn"
+                },
+                "sslmodeKey": {
+                    "type": "string",
+                    "description": "Key used to store the SSL mode alongside generated DSNs.",
+                    "default": "sslmode"
+                },
+                "connection": {
+                    "$ref": "#/$defs/postgresConnection"
+                },
+                "data": {
+                    "type": "object",
+                    "description": "Literal key/value pairs for opaque secrets.",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                },
+                "additionalData": {
+                    "type": "object",
+                    "description": "Additional key/value pairs appended to generated DSN secrets.",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                }
+            },
+            "allOf": [
+                {
+                    "if": {
+                        "properties": {
+                            "type": {
+                                "const": "postgresDsn"
+                            }
+                        }
+                    },
+                    "then": {
+                        "required": [
+                            "connection"
+                        ]
+                    }
+                },
+                {
+                    "if": {
+                        "properties": {
+                            "type": {
+                                "const": "opaque"
+                            }
+                        }
+                    },
+                    "then": {
+                        "required": [
+                            "data"
+                        ]
+                    }
+                }
+            ],
+            "additionalProperties": true
         }
     },
     "properties": {
@@ -754,6 +991,273 @@
                 }
             },
             "additionalProperties": false
+        },
+        "bootstrap": {
+            "type": "object",
+            "description": "Post-install bootstrap jobs that seed configuration and run database migrations automatically.",
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "default": true
+                },
+                "actor": {
+                    "type": "string",
+                    "description": "Actor recorded in migration history when bootstrap jobs apply configuration.",
+                    "default": "helm"
+                },
+                "image": {
+                    "$ref": "#/$defs/image"
+                },
+                "workingDir": {
+                    "type": "string"
+                },
+                "serviceAccountName": {
+                    "type": "string"
+                },
+                "backoffLimit": {
+                    "type": "integer",
+                    "minimum": 0
+                },
+                "ttlSecondsAfterFinished": {
+                    "type": "integer",
+                    "minimum": 0
+                },
+                "resources": {
+                    "$ref": "#/$defs/resources"
+                },
+                "config": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean",
+                            "default": true
+                        },
+                        "jobName": {
+                            "type": "string"
+                        },
+                        "configMapName": {
+                            "type": "string"
+                        },
+                        "mountPath": {
+                            "type": "string"
+                        },
+                        "fileName": {
+                            "type": "string"
+                        },
+                        "databaseSecret": {
+                            "type": "object",
+                            "properties": {
+                                "name": {
+                                    "type": "string"
+                                },
+                                "dsnKey": {
+                                    "type": "string"
+                                },
+                                "sslmodeKey": {
+                                    "type": "string"
+                                }
+                            },
+                            "additionalProperties": false
+                        },
+                        "env": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": true
+                            }
+                        },
+                        "envFrom": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": true
+                            }
+                        },
+                        "inlineConfig": {
+                            "type": "string"
+                        },
+                        "image": {
+                            "$ref": "#/$defs/image"
+                        },
+                        "workingDir": {
+                            "type": "string"
+                        },
+                        "serviceAccountName": {
+                            "type": "string"
+                        },
+                        "backoffLimit": {
+                            "type": "integer",
+                            "minimum": 0
+                        },
+                        "ttlSecondsAfterFinished": {
+                            "type": "integer",
+                            "minimum": 0
+                        },
+                        "resources": {
+                            "$ref": "#/$defs/resources"
+                        },
+                        "jobAnnotations": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "additionalProperties": true
+                },
+                "accounts": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean",
+                            "default": true
+                        },
+                        "jobName": {
+                            "type": "string"
+                        },
+                        "databaseSecret": {
+                            "type": "object",
+                            "properties": {
+                                "name": {
+                                    "type": "string"
+                                },
+                                "dsnKey": {
+                                    "type": "string"
+                                }
+                            },
+                            "additionalProperties": false
+                        },
+                        "env": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": true
+                            }
+                        },
+                        "envFrom": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": true
+                            }
+                        },
+                        "python": {
+                            "type": "string"
+                        },
+                        "image": {
+                            "$ref": "#/$defs/image"
+                        },
+                        "workingDir": {
+                            "type": "string"
+                        },
+                        "serviceAccountName": {
+                            "type": "string"
+                        },
+                        "backoffLimit": {
+                            "type": "integer",
+                            "minimum": 0
+                        },
+                        "ttlSecondsAfterFinished": {
+                            "type": "integer",
+                            "minimum": 0
+                        },
+                        "resources": {
+                            "$ref": "#/$defs/resources"
+                        },
+                        "jobAnnotations": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "additionalProperties": true
+                },
+                "migrations": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean",
+                            "default": true
+                        },
+                        "jobName": {
+                            "type": "string"
+                        },
+                        "riskDatabaseSecret": {
+                            "type": "object",
+                            "properties": {
+                                "name": {
+                                    "type": "string"
+                                },
+                                "dsnKey": {
+                                    "type": "string"
+                                }
+                            },
+                            "additionalProperties": false
+                        },
+                        "releaseManifestSecret": {
+                            "type": "object",
+                            "properties": {
+                                "name": {
+                                    "type": "string"
+                                },
+                                "dsnKey": {
+                                    "type": "string"
+                                },
+                                "sslmodeKey": {
+                                    "type": "string"
+                                }
+                            },
+                            "additionalProperties": false
+                        },
+                        "env": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": true
+                            }
+                        },
+                        "envFrom": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": true
+                            }
+                        },
+                        "script": {
+                            "type": "string"
+                        },
+                        "image": {
+                            "$ref": "#/$defs/image"
+                        },
+                        "workingDir": {
+                            "type": "string"
+                        },
+                        "serviceAccountName": {
+                            "type": "string"
+                        },
+                        "backoffLimit": {
+                            "type": "integer",
+                            "minimum": 0
+                        },
+                        "ttlSecondsAfterFinished": {
+                            "type": "integer",
+                            "minimum": 0
+                        },
+                        "resources": {
+                            "$ref": "#/$defs/resources"
+                        },
+                        "jobAnnotations": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "additionalProperties": true
+                }
+            },
+            "additionalProperties": true
         },
         "serviceAccounts": {
             "$ref": "#/$defs/serviceAccountSet"

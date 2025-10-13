@@ -379,6 +379,88 @@ managedSecrets:
         secret_key: change-me-object-secret
         prefix: feast
         retention_days: "30"
+bootstrap:
+  enabled: true
+  actor: helm
+  image:
+    repository: ghcr.io/aether/risk-service
+    tag: latest
+  workingDir: /app
+  serviceAccountName: api-services
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  config:
+    enabled: true
+    jobName: config-bootstrap
+    configMapName: config-bootstrap
+    mountPath: /bootstrap
+    fileName: bootstrap.yaml
+    databaseSecret:
+      name: config-service-database
+      dsnKey: dsn
+      sslmodeKey: sslmode
+    env: []
+    envFrom: []
+    inlineConfig: |
+      account_id: global
+      actor: helm
+      entries:
+        trading:
+          max_positions: 10
+          max_notional_per_symbol: 250000
+        risk:
+          max_drawdown_pct: 0.2
+          max_var_pct: 0.05
+        training:
+          retrain_interval_days: 7
+          window_days: 90
+        hedge:
+          target_pct: 0.25
+          rebalance_frequency: daily
+  accounts:
+    enabled: true
+    jobName: account-bootstrap
+    databaseSecret:
+      name: account-service-database
+      dsnKey: dsn
+    env: []
+    envFrom: []
+    python: |
+      import os
+      from sqlalchemy import create_engine
+      import account_migrations as migrations
+
+      engine = create_engine(os.environ["ACCOUNTS_DATABASE_URL"])
+      migrations.upgrade(engine)
+  migrations:
+    enabled: true
+    jobName: data-migrations
+    riskDatabaseSecret:
+      name: risk-service-database
+      dsnKey: dsn
+    releaseManifestSecret:
+      name: release-manifest-database
+      dsnKey: dsn
+      sslmodeKey: sslmode
+    env: []
+    envFrom: []
+    script: |
+      export DATABASE_URL="$RISK_DATABASE_URL"
+      alembic -c data/migrations/alembic.ini upgrade head
+      alembic -c data/alembic/alembic.ini upgrade head
+      python - <<'PY'
+      import os
+      from release_manifest import run_release_manifest_migrations
+
+      run_release_manifest_migrations(os.environ["RELEASE_MANIFEST_DATABASE_URL"])
+      PY
 simulation:
   enabled: false
 
