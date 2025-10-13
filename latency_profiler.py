@@ -21,7 +21,7 @@ from typing import Deque, Dict, Iterable, Mapping, MutableMapping, Optional, Seq
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from prometheus_client import CollectorRegistry, Histogram, REGISTRY
+from metrics import CollectorRegistry, Histogram, _REGISTRY as _METRICS_REGISTRY
 from sqlalchemy import Column, DateTime, Float, MetaData, String, Table, create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
@@ -82,8 +82,8 @@ class LatencyProfiler:
         histogram_buckets: Sequence[float] = _DEFAULT_BUCKETS,
     ) -> None:
         self.service_name = service_name
-        self._registry = registry or REGISTRY
-        metric_kwargs = {"registry": self._registry} if registry is not None else {}
+        self._registry = registry or _METRICS_REGISTRY
+        metric_kwargs = {"registry": self._registry}
         self._histogram = Histogram(
             "latency_ms",
             "HTTP request latency in milliseconds.",

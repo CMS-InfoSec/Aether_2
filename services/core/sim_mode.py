@@ -11,9 +11,8 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, sta
 from shared.pydantic_compat import BaseModel, Field
 
 from common.schemas.contracts import SimModeEvent
-from services.common.adapters import KafkaNATSAdapter
 from services.common.security import get_admin_accounts, require_admin_account
-from shared.sim_mode import SimModeStatus, sim_mode_repository
+from shared.sim_mode import KafkaNATSAdapter, SimModeStatus, sim_mode_repository
 from shared.simulation import sim_mode_state
 from shared.audit_hooks import AuditEvent, load_audit_hooks
 
