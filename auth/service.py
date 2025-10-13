@@ -8,6 +8,7 @@ import hmac
 import json
 import logging
 import os
+import secrets
 import sys
 from urllib.parse import quote, urlencode
 
@@ -27,23 +28,46 @@ class MissingDependencyError(RuntimeError):
 
 _PYOTP_IMPORT_ERROR: Exception | None = None
 
+
+_BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+
+
+def _derive_code(secret: str, *, digits: int, interval: int) -> str:
+    payload = f"{secret}:{digits}:{interval}".encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()
+    window = 16 if digits > 8 else 8
+    value = int(digest[:window], 16) % (10**max(digits, 1))
+    return f"{value:0{digits}d}"
+
 try:  # pragma: no cover - optional dependency in some environments
     import pyotp
 except ModuleNotFoundError as exc:  # pragma: no cover - exercised in lightweight setups
     class _DeterministicTOTPStub:
         """Minimal TOTP replacement used when pyotp is unavailable."""
 
-        def __init__(self, secret: str) -> None:
+        def __init__(
+            self,
+            secret: str,
+            digits: int = 6,
+            interval: int = 30,
+            digest: Any | None = None,
+            name: str | None = None,
+            issuer: str | None = None,
+            **_kwargs: object,
+        ) -> None:
+            del digest
             self._secret = secret
+            self.digits = max(int(digits), 1)
+            self.interval = max(int(interval), 1)
+            self.name = name
+            self.issuer = issuer
 
         def now(self) -> str:
-            digest = hashlib.sha256(self._secret.encode("utf-8")).hexdigest()
-            value = int(digest[:8], 16) % 1_000_000
-            return f"{value:06d}"
+            return _derive_code(self._secret, digits=self.digits, interval=self.interval)
 
         def verify(self, code: str, valid_window: int = 1) -> bool:
             del valid_window
-            return code == self.now()
+            return str(code) == self.now()
 
         def provisioning_uri(
             self,
@@ -60,14 +84,23 @@ except ModuleNotFoundError as exc:  # pragma: no cover - exercised in lightweigh
             query: dict[str, str] = {"secret": self._secret}
             if issuer_name:
                 query["issuer"] = issuer_name
+            if "digits" not in parameters and self.digits != 6:
+                query["digits"] = str(self.digits)
+            if "period" not in parameters and self.interval != 30:
+                query["period"] = str(self.interval)
             for key, value in parameters.items():
                 if value is None:
                     continue
                 query[key] = str(value)
             return f"otpauth://totp/{label}?{urlencode(query)}"
 
-    def _random_base32() -> str:
-        return base64.b32encode(os.urandom(20)).decode("ascii").rstrip("=")
+    def _random_base32(length: int = 32, randomize: bool = False) -> str:
+        minimum = 16
+        if length < minimum:
+            raise ValueError("Secrets must be at least 16 characters long")
+        if randomize:
+            length = minimum + secrets.randbelow(length - minimum + 1)
+        return "".join(secrets.choice(_BASE32_ALPHABET) for _ in range(length))
 
     pyotp_stub = ModuleType("pyotp")
     pyotp_stub.TOTP = _DeterministicTOTPStub  # type: ignore[attr-defined]
@@ -83,14 +116,31 @@ else:
         class _DeterministicTOTPAdapter:
             """Adapter that enforces deterministic verification in stubbed environments."""
 
-            def __init__(self, secret: str) -> None:
+            def __init__(
+                self,
+                secret: str,
+                digits: int = 6,
+                interval: int = 30,
+                digest: Any | None = None,
+                name: str | None = None,
+                issuer: str | None = None,
+                **_kwargs: object,
+            ) -> None:
+                del digest
                 self._secret = secret
+                self.digits = max(int(digits), 1)
+                self.interval = max(int(interval), 1)
+                self.name = name
+                self.issuer = issuer
 
             def now(self) -> str:
-                return "123456"
+                return _derive_code(
+                    self._secret, digits=self.digits, interval=self.interval
+                )
 
             def verify(self, code: str, valid_window: int = 1) -> bool:
-                return code == self.now()
+                del valid_window
+                return str(code) == self.now()
 
             def provisioning_uri(
                 self,
@@ -107,6 +157,10 @@ else:
                 query: dict[str, str] = {"secret": self._secret}
                 if issuer_name:
                     query["issuer"] = issuer_name
+                if "digits" not in parameters and self.digits != 6:
+                    query["digits"] = str(self.digits)
+                if "period" not in parameters and self.interval != 30:
+                    query["period"] = str(self.interval)
                 for key, value in parameters.items():
                     if value is None:
                         continue
@@ -991,13 +1045,14 @@ def hash_password(password: str) -> str:
 
 
 def _require_pyotp():
-    module = sys.modules.get("pyotp", pyotp)
+    module = globals().get("pyotp")
+    if module is None:
+        module = sys.modules.get("pyotp")
     if module is None:  # pragma: no cover - executed when pyotp missing
         raise MissingDependencyError(
             "pyotp is required for multi-factor authentication"
         ) from _PYOTP_IMPORT_ERROR
-    if module is not pyotp:
-        globals()["pyotp"] = module
+    globals()["pyotp"] = module
     return module
 
 

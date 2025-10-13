@@ -36,6 +36,52 @@ def test_pyotp_stub_provisioning_uri(monkeypatch):
     )
 
 
+def test_pyotp_stub_accepts_digits_and_interval(monkeypatch):
+    """The stub TOTP implementation should honour digits and interval parameters."""
+
+    monkeypatch.delitem(sys.modules, "pyotp", raising=False)
+    for name in [
+        mod_name
+        for mod_name in list(sys.modules)
+        if mod_name == "auth.service" or mod_name.startswith("auth.service.")
+    ]:
+        monkeypatch.delitem(sys.modules, name, raising=False)
+
+    service_module = importlib.import_module("auth.service")
+
+    totp = service_module.pyotp.TOTP("SECRET123", digits=8, interval=45)
+
+    code = totp.now()
+
+    assert len(code) == 8
+    assert totp.verify(code)
+    assert not totp.verify("00000000")
+
+    uri = totp.provisioning_uri("user@example.com")
+    assert "digits=8" in uri
+    assert "period=45" in uri
+
+
+def test_pyotp_stub_random_base32_length(monkeypatch):
+    """The fallback random_base32 helper should mirror pyotp's signature."""
+
+    monkeypatch.delitem(sys.modules, "pyotp", raising=False)
+    for name in [
+        mod_name
+        for mod_name in list(sys.modules)
+        if mod_name == "auth.service" or mod_name.startswith("auth.service.")
+    ]:
+        monkeypatch.delitem(sys.modules, name, raising=False)
+
+    service_module = importlib.import_module("auth.service")
+
+    secret = service_module.pyotp.random_base32(length=24)
+    randomized = service_module.pyotp.random_base32(length=32, randomize=True)
+
+    assert len(secret) == 24
+    assert 16 <= len(randomized) <= 32
+
+
 def test_pyotp_adapter_provisioning_uri(monkeypatch):
     """Adapters installed when tests stub pyotp should expose provisioning URIs."""
 
