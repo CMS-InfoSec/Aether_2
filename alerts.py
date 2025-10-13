@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from typing import Dict, Optional
+from typing import Dict, Mapping, Optional
 
 import httpx
 
@@ -144,3 +144,53 @@ def push_drift_event(
         },
     )
     _post_alert(payload, alertmanager_url)
+
+
+def push_dependency_fallback(
+    component: str,
+    dependency: str,
+    fallback: str,
+    *,
+    severity: str = "critical",
+    environment: Optional[str] = None,
+    details: Optional[Mapping[str, str]] = None,
+    alertmanager_url: Optional[str] = None,
+) -> None:
+    """Emit an alert when a critical dependency is unavailable and a fallback activates."""
+
+    labels: Dict[str, str] = {
+        "severity": severity,
+        "component": component,
+        "dependency": dependency,
+        "fallback": fallback,
+    }
+    if environment:
+        labels["environment"] = environment
+
+    summary = f"{component} activated fallback for missing {dependency}"
+    description_parts = [
+        f"{component} is using {fallback} because the {dependency} dependency is unavailable.",
+    ]
+
+    annotations: Dict[str, str] = {"summary": summary}
+    if details:
+        normalized = {key: str(value) for key, value in details.items()}
+        detail_pairs = ", ".join(f"{key}={value}" for key, value in sorted(normalized.items()))
+        description_parts.append(f"Details: {detail_pairs}")
+        for key, value in normalized.items():
+            annotations[f"detail_{key}"] = value
+
+    annotations["description"] = " ".join(description_parts)
+
+    payload = _build_payload(
+        alertname="CriticalDependencyFallback",
+        labels=labels,
+        annotations=annotations,
+    )
+
+    try:
+        _post_alert(payload, alertmanager_url)
+    except AlertPushError:
+        raise
+    except Exception as exc:  # pragma: no cover - defensive guard
+        raise AlertPushError(f"Failed to push dependency fallback alert: {exc}") from exc

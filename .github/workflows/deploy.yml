@@ -84,6 +84,13 @@ jobs:
           echo "sha_tag=${IMAGE_ID}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
           echo "latest_tag=${IMAGE_ID}:latest" >> "$GITHUB_OUTPUT"
 
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Build and push image with Kaniko
         uses: int128/kaniko-action@v1
         with:
@@ -97,6 +104,34 @@ jobs:
           push: true
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify critical wheels in ${{ matrix.build.name }} image
+        run: |
+          docker pull ${{ steps.image_meta.outputs.sha_tag }}
+          docker run --rm ${{ steps.image_meta.outputs.sha_tag }} python - <<'PY'
+import importlib
+import json
+import sys
+
+modules = ["psycopg", "argon2", "cryptography"]
+missing: dict[str, str] = {}
+for name in modules:
+    try:
+        importlib.import_module(name)
+    except Exception as exc:
+        missing[name] = repr(exc)
+
+if missing:
+    payload = {
+        "event": "missing_critical_modules",
+        "modules": missing,
+        "component": "${{ matrix.build.name }}-image",
+    }
+    sys.stderr.write(json.dumps(payload) + "\n")
+    raise SystemExit(1)
+
+print("Verified critical Python modules:", ", ".join(modules))
+PY
 
       - name: Generate SBOM with Syft
         id: sbom

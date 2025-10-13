@@ -71,6 +71,7 @@ else:
     _PYOTP_IMPORT_ERROR = None
 
 from shared.correlation import get_correlation_id
+from shared.dependency_alerts import notify_dependency_fallback
 
 try:
     from common.utils.redis import create_redis_from_url
@@ -278,6 +279,13 @@ _LOGIN_SUCCESS_COUNTER: Counter
 if _USING_ARGON2_FALLBACK:
     logger.warning(
         "argon2-cffi dependency missing; using PBKDF2 fallback for administrator passwords"
+    )
+    notify_dependency_fallback(
+        component="auth-service",
+        dependency="argon2-cffi",
+        fallback="pbkdf2",
+        reason="argon2 import failed during startup",
+        metadata={"module": __name__},
     )
 
 
