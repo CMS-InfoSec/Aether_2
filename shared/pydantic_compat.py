@@ -147,6 +147,7 @@ __all__ = [
     "field_validator",
     "model_validator",
     "model_serializer",
+    "model_dump",
 ]
 
 

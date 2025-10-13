@@ -17,7 +17,9 @@ def _normalize_side(side: str) -> str:
     return normalized
 
 
-def _price_from_bps(price: float, side: str, bps: float, exit_type: str) -> Optional[float]:
+def _price_from_bps(
+    price: float, side: str, bps: Optional[float], exit_type: str
+) -> Optional[float]:
     if price <= 0 or bps is None or bps <= 0:
         return None
     normalized_side = _normalize_side(side)

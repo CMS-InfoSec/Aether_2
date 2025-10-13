@@ -19,6 +19,11 @@ Use this checklist during weekly reviews to verify operational readiness and doc
 - [ ] Confirm Argo workflows `ml-canary-deployment`, `secret-rotation`, and `kraken-ingest` have no suspended steps and latest runs succeeded.
 - [ ] Validate Vault secret rotation pipeline has access tokens expiring at least 7 days in the future.
 
+## Dependency Hygiene & Security
+- [ ] Verify `pyproject.lock` was regenerated via `pip-compile` within the past 30 days and committed to the main branch.
+- [ ] Review the latest Trivy, Dependabot, and Snyk scans; ensure findings have assigned remediation owners and SLAs captured in the operations log.
+- [ ] Escalate any remediation tasks breaching SLA to the security channel and track follow-up in the checklist sign-off.
+
 ## Communication
 - [ ] Review #ops-trading, #ops-realtime, and #security-ops channels for unresolved incident follow-ups.
 - [ ] Update the on-call schedule and escalation matrix if personnel changes occurred.

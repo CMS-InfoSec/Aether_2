@@ -86,7 +86,7 @@ class HttpSessionClient(SessionClientProtocol):
         endpoint_template: Optional[str] = None,
         timeout: Optional[float] = None,
     ) -> None:
-        resolved_base = (base_url or os.getenv("SESSION_SERVICE_URL", "")).strip()
+        resolved_base = (base_url or os.getenv("SESSION_SERVICE_URL", "") or "").strip()
         self._base_url = resolved_base.rstrip("/")
         self._endpoint = (endpoint_template or os.getenv("SESSION_SERVICE_ENDPOINT") or "/sessions/admin/{account_id}").strip()
         self._timeout = timeout if timeout is not None else float(os.getenv("SESSION_SERVICE_TIMEOUT", "2.0"))

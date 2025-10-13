@@ -333,6 +333,36 @@
                     "additionalProperties": true
                 }
             },
+            "allOf": [
+                {
+                    "if": {
+                        "properties": {
+                            "type": {
+                                "const": "postgresDsn"
+                            }
+                        }
+                    },
+                    "then": {
+                        "required": [
+                            "connection"
+                        ]
+                    }
+                },
+                {
+                    "if": {
+                        "properties": {
+                            "type": {
+                                "const": "opaque"
+                            }
+                        }
+                    },
+                    "then": {
+                        "required": [
+                            "data"
+                        ]
+                    }
+                }
+            ],
             "additionalProperties": true
         }
     },

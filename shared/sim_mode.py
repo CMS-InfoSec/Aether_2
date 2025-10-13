@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from functools import partial
 from threading import Lock
-from typing import Awaitable, Dict, Iterable, Iterator, Optional, Tuple
+from typing import Awaitable, Dict, Iterable, Iterator, Optional, Tuple, cast
 
 from sqlalchemy import (
     Boolean,
@@ -45,7 +45,7 @@ from common.schemas.contracts import FillEvent
 from services.common.adapters import KafkaNATSAdapter
 from shared.async_utils import dispatch_async
 from shared.postgres import normalize_sqlalchemy_dsn
-from shared.account_scope import SQLALCHEMY_AVAILABLE as _ACCOUNT_SCOPE_AVAILABLE, account_id_column
+from shared.account_scope import account_id_column
 
 
 LOGGER = logging.getLogger(__name__)
@@ -284,7 +284,7 @@ class SimModeRepository:
         result = session.execute(
             select(SimModeStateORM).where(SimModeStateORM.account_id == account_id)
         )
-        row = _scalar_one_or_none(result)
+        row = cast(Optional[SimModeStateORM], _scalar_one_or_none(result))
         if row is None:
             row = SimModeStateORM(account_id=account_id, active=False, reason=None, ts=_utcnow())
             session.add(row)
@@ -468,13 +468,16 @@ class SimBroker:
 
     def _persist_order(self, snapshot: SimulatedOrderSnapshot) -> None:
         with session_scope() as session:
-            row = _scalar_one_or_none(
-                session.execute(
-                    select(SimBrokerOrderORM).where(
-                        SimBrokerOrderORM.account_id == snapshot.account_id,
-                        SimBrokerOrderORM.client_id == snapshot.client_id,
+            row = cast(
+                Optional[SimBrokerOrderORM],
+                _scalar_one_or_none(
+                    session.execute(
+                        select(SimBrokerOrderORM).where(
+                            SimBrokerOrderORM.account_id == snapshot.account_id,
+                            SimBrokerOrderORM.client_id == snapshot.client_id,
+                        )
                     )
-                )
+                ),
             )
             if row is None:
                 row = SimBrokerOrderORM(
@@ -511,13 +514,16 @@ class SimBroker:
         if fill_qty <= 0:
             return
         with session_scope() as session:
-            row = _scalar_one_or_none(
-                session.execute(
-                    select(SimBrokerOrderORM).where(
-                        SimBrokerOrderORM.account_id == snapshot.account_id,
-                        SimBrokerOrderORM.client_id == snapshot.client_id,
+            row = cast(
+                Optional[SimBrokerOrderORM],
+                _scalar_one_or_none(
+                    session.execute(
+                        select(SimBrokerOrderORM).where(
+                            SimBrokerOrderORM.account_id == snapshot.account_id,
+                            SimBrokerOrderORM.client_id == snapshot.client_id,
+                        )
                     )
-                )
+                ),
             )
             order_id = row.id if row is not None else None
             session.add(
@@ -670,13 +676,16 @@ class SimBroker:
             if snapshot is not None:
                 return snapshot
         with session_scope() as session:
-            row = _scalar_one_or_none(
-                session.execute(
-                    select(SimBrokerOrderORM).where(
-                        SimBrokerOrderORM.account_id == account_id,
-                        SimBrokerOrderORM.client_id == client_id,
+            row = cast(
+                Optional[SimBrokerOrderORM],
+                _scalar_one_or_none(
+                    session.execute(
+                        select(SimBrokerOrderORM).where(
+                            SimBrokerOrderORM.account_id == account_id,
+                            SimBrokerOrderORM.client_id == client_id,
+                        )
                     )
-                )
+                ),
             )
             if row is None:
                 return None

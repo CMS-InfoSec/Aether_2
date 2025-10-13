@@ -75,7 +75,7 @@ def load_dependency(
                 sys.modules[name] = existing
             for index in range(1, len(parts) + 1):
                 sys.modules.pop(".".join(parts[:index]), None)
-            import services.common.fastapi_stub  # type: ignore[import-not-found]
+            import services.common.fastapi_stub  # type: ignore[import-not-found]  # noqa: F401
             module = sys.modules.get(module_name)
             if module is None:
                 module = sys.modules.get("fastapi")

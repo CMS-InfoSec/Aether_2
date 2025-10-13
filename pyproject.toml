@@ -82,6 +82,7 @@ dev = [
     "isort==6.1.0",
     "mypy==1.18.2",
     "ruff==0.13.3",
+    "coverage[toml]==7.6.10",
 ]
 
 [tool.setuptools]
@@ -121,10 +122,16 @@ markers = [
 [tool.ruff]
 target-version = "py311"
 line-length = 120
-include = [
-    "training_service.py",
-    "watchdog.py",
-    "tests/**/*.py",
+src = [
+    ".",
+]
+extend-exclude = [
+    "tests",
+    "docs",
+    "deploy",
+    "frontend",
+    "argo",
+    "pipelines",
 ]
 
 [tool.ruff.lint]
@@ -134,7 +141,14 @@ select = ["E402", "F401", "F402", "F811", "F841"]
 "tests/**" = ["E402"]
 
 [tool.mypy]
-files = ["training_service.py", "pg_session.py"]
+files = [
+    "app.py",
+    "auth",
+    "metrics.py",
+    "pg_session.py",
+    "shared",
+    "training_service.py",
+]
 exclude = [
     "data/migrations/env.py",
     "data/alembic/env.py",
@@ -150,4 +164,26 @@ exclude = [
 ]
 ignore_missing_imports = true
 follow_imports = "skip"
+
+[tool.coverage.run]
+branch = true
+source = [
+    "app",
+    "auth",
+    "metrics",
+    "pg_session",
+    "services",
+    "shared",
+    "aether",
+]
+omit = [
+    "tests/*",
+    "*/tests/*",
+    "deploy/*",
+    "frontend/*",
+    "docs/*",
+]
+
+[tool.coverage.report]
+skip_empty = true
 
