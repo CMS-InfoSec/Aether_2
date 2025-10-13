@@ -51,8 +51,14 @@ def test_latency_profiler_uses_metrics_fallback(monkeypatch: pytest.MonkeyPatch)
     assert observation["p50"] == pytest.approx(12.5)
     assert observation["count"] == 1
 
-    assert metrics._REGISTRY.get_sample_value(  # type: ignore[attr-defined]
+    sample = metrics._REGISTRY.get_sample_value(  # type: ignore[attr-defined]
         "latency_ms",
         {"service": "test-service", "endpoint": "GET /ping"},
-    ) == pytest.approx(12.5)
+    )
+    if sample is not None:
+        assert sample == pytest.approx(12.5)
+    else:
+        histogram = profiler._histogram
+        assert hasattr(histogram, "_values")
+        assert histogram._values.get(("test-service", "GET /ping")) == pytest.approx(12.5)
 

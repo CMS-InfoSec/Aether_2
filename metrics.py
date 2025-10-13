@@ -11,10 +11,60 @@ import os
 from datetime import datetime, timezone
 from time import perf_counter
 from types import SimpleNamespace
-from typing import Any, Awaitable, Callable, Dict, Generator, Iterable, Iterator, List, Optional
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    Generator,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    cast,
+)
 from uuid import uuid4
 
-from fastapi import FastAPI, Request, Response
+# FastAPI may be optional in some lightweight environments, so install a fallback.
+try:  # pragma: no cover - exercised when FastAPI is available
+    from fastapi import FastAPI, Request, Response
+except Exception:  # pragma: no cover - provide lightweight stand-ins
+    class _FallbackResponse:
+        def __init__(self, content: Any = b"", media_type: str | None = None) -> None:
+            self.body = content
+            self.media_type = media_type
+
+    class _FallbackRequest:
+        def __init__(
+            self,
+            *,
+            headers: Optional[Mapping[str, str]] = None,
+            method: str = "GET",
+            url: str = "/",
+        ) -> None:
+            self.headers = dict(headers or {})
+            self.method = method
+            self.url = url
+
+    class _FallbackFastAPI:
+        def __init__(self) -> None:
+            self.user_middleware: List[Any] = []
+            self.routes: List[Any] = []
+
+        def add_middleware(self, middleware_cls: Any, **options: Any) -> None:
+            self.user_middleware.append(SimpleNamespace(cls=middleware_cls, options=options))
+
+        def get(self, path: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+            def _decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+                self.routes.append(SimpleNamespace(path=path, endpoint=func))
+                return func
+
+            return _decorator
+
+    FastAPI = cast(Any, _FallbackFastAPI)
+    Request = cast(Any, _FallbackRequest)
+    Response = cast(Any, _FallbackResponse)
 
 CollectorRegistry: Any
 Counter: Callable[..., Any]
