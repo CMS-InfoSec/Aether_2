@@ -36,12 +36,16 @@ def _purge_modules(prefixes: Iterable[str]) -> None:
         "latency_profiler",
         "model_server",
         "training_service",
+        "config_service",
+        "config_sandbox",
         "pack_exporter",
         "taxlots",
         "override_service",
         "capital_optimizer",
         "alert_prioritizer",
         "alt_data",
+        "tca_service",
+        "sequencer",
         "services.ui.explain_service",
         "services.report_service",
         "ops.metrics.cost_monitor",
@@ -69,6 +73,10 @@ def test_core_services_import_without_fastapi(
     if module_name == "override_service":
         monkeypatch.setenv("OVERRIDE_ALLOW_SQLITE_FOR_TESTS", "1")
         monkeypatch.setenv("OVERRIDE_DATABASE_URL", "sqlite:///override.db")
+
+    if module_name == "config_sandbox":
+        monkeypatch.setenv("CONFIG_SANDBOX_ALLOW_SQLITE", "1")
+        monkeypatch.setenv("CONFIG_SANDBOX_DATABASE_URL", "sqlite:///sandbox.db")
 
     if module_name == "multiformat_export":
         _purge_modules(["services.common.adapters"])
