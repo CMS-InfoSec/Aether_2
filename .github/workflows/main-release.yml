@@ -62,7 +62,7 @@ jobs:
 
       - name: Build and push image
         id: publish
-        uses: int128/kaniko-action@v1
+        uses: int128/kaniko-action@v1.52.0
         with:
           push: true
           context: .

@@ -92,7 +92,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push image with Kaniko
-        uses: int128/kaniko-action@v1
+        uses: int128/kaniko-action@v1.52.0
         with:
           registry: ${{ env.REGISTRY }}
           image: ${{ steps.image_meta.outputs.image_id }}
