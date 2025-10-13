@@ -40,7 +40,7 @@ except ModuleNotFoundError:  # pragma: no cover - fallback stub for tests withou
         async def send_and_wait(self, *args, **kwargs) -> None:  # pragma: no cover - test stub
             raise RuntimeError("aiokafka is required to run Kraken ingestion")
 
-from prometheus_client import Counter, Gauge, Histogram, start_http_server
+from metrics import Counter, Gauge, Histogram, start_http_server
 
 from shared.spot import is_spot_symbol, normalize_spot_symbol
 
