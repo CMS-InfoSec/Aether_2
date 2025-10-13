@@ -20,17 +20,30 @@ jobs:
   kaniko:
     name: Kaniko Build
     runs-on: ubuntu-latest
-    if: ${{ hashFiles('deploy/docker/kraken-ws-ingest/Dockerfile') != '' && hashFiles('deploy/docker/risk-api/Dockerfile') != '' }}
+    outputs:
+      should_build: ${{ steps.guard.outputs.should_build }}
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check required Dockerfiles
+        id: guard
+        run: |
+          if [ -f deploy/docker/kraken-ws-ingest/Dockerfile ] && [ -f deploy/docker/risk-api/Dockerfile ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "Required Dockerfiles not found. Skipping Kaniko build stage."
+          fi
+
       - name: Log in to GHCR
+        if: steps.guard.outputs.should_build == 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build Kraken WS Ingest image
+        if: steps.guard.outputs.should_build == 'true'
         uses: int128/kaniko-action@v1.52.0
         with:
           context: .
@@ -42,6 +55,7 @@ jobs:
             --snapshotMode=time
             --single-snapshot
       - name: Build Risk API image
+        if: steps.guard.outputs.should_build == 'true'
         uses: int128/kaniko-action@v1.52.0
         with:
           context: .
@@ -56,7 +70,7 @@ jobs:
     name: Buildah Build
     runs-on: ubuntu-latest
     needs: kaniko
-    if: ${{ needs.kaniko.result == 'success' }}
+    if: ${{ needs.kaniko.outputs.should_build == 'true' }}
     steps:
       - uses: actions/checkout@v4
       - name: Install Buildah

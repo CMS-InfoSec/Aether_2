@@ -109,29 +109,29 @@ jobs:
         run: |
           docker pull ${{ steps.image_meta.outputs.sha_tag }}
           docker run --rm ${{ steps.image_meta.outputs.sha_tag }} python - <<'PY'
-import importlib
-import json
-import sys
+          import importlib
+          import json
+          import sys
 
-modules = ["psycopg", "argon2", "cryptography"]
-missing: dict[str, str] = {}
-for name in modules:
-    try:
-        importlib.import_module(name)
-    except Exception as exc:
-        missing[name] = repr(exc)
+          modules = ["psycopg", "argon2", "cryptography"]
+          missing: dict[str, str] = {}
+          for name in modules:
+              try:
+                  importlib.import_module(name)
+              except Exception as exc:
+                  missing[name] = repr(exc)
 
-if missing:
-    payload = {
-        "event": "missing_critical_modules",
-        "modules": missing,
-        "component": "${{ matrix.build.name }}-image",
-    }
-    sys.stderr.write(json.dumps(payload) + "\n")
-    raise SystemExit(1)
+          if missing:
+              payload = {
+                  "event": "missing_critical_modules",
+                  "modules": missing,
+                  "component": "${{ matrix.build.name }}-image",
+              }
+              sys.stderr.write(json.dumps(payload) + "\n")
+              raise SystemExit(1)
 
-print("Verified critical Python modules:", ", ".join(modules))
-PY
+          print("Verified critical Python modules:", ", ".join(modules))
+          PY
 
       - name: Generate SBOM with Syft
         id: sbom
@@ -151,7 +151,7 @@ PY
           path: sbom-${{ matrix.build.name }}.spdx.json
 
       - name: Scan image with Trivy
-        uses: aquasecurity/trivy-action@v0.33.1
+        uses: aquasecurity/trivy-action@0.33.1
         with:
           image-ref: ${{ steps.image_meta.outputs.sha_tag }}
           severity: CRITICAL,HIGH

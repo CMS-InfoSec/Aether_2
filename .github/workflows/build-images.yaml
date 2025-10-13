@@ -45,29 +45,29 @@ jobs:
         run: |
           docker pull ghcr.io/aether/risk-api:${{ github.sha }}
           docker run --rm ghcr.io/aether/risk-api:${{ github.sha }} python - <<'PY'
-import importlib
-import json
-import sys
+          import importlib
+          import json
+          import sys
 
-modules = ["psycopg", "argon2", "cryptography"]
-missing: dict[str, str] = {}
-for name in modules:
-    try:
-        importlib.import_module(name)
-    except Exception as exc:
-        missing[name] = repr(exc)
+          modules = ["psycopg", "argon2", "cryptography"]
+          missing: dict[str, str] = {}
+          for name in modules:
+              try:
+                  importlib.import_module(name)
+              except Exception as exc:
+                  missing[name] = repr(exc)
 
-if missing:
-    payload = {
-        "event": "missing_critical_modules",
-        "modules": missing,
-        "component": "risk-api-image",
-    }
-    sys.stderr.write(json.dumps(payload) + "\n")
-    raise SystemExit(1)
+          if missing:
+              payload = {
+                  "event": "missing_critical_modules",
+                  "modules": missing,
+                  "component": "risk-api-image",
+              }
+              sys.stderr.write(json.dumps(payload) + "\n")
+              raise SystemExit(1)
 
-print("Verified critical Python modules:", ", ".join(modules))
-PY
+          print("Verified critical Python modules:", ", ".join(modules))
+          PY
       - name: Build Ingestor Image
         uses: int128/kaniko-action@v1.52.0
         with:
@@ -80,29 +80,29 @@ PY
         run: |
           docker pull ghcr.io/aether/risk-ingestor:${{ github.sha }}
           docker run --rm ghcr.io/aether/risk-ingestor:${{ github.sha }} python - <<'PY'
-import importlib
-import json
-import sys
+          import importlib
+          import json
+          import sys
 
-modules = ["psycopg", "argon2", "cryptography"]
-missing: dict[str, str] = {}
-for name in modules:
-    try:
-        importlib.import_module(name)
-    except Exception as exc:
-        missing[name] = repr(exc)
+          modules = ["psycopg", "argon2", "cryptography"]
+          missing: dict[str, str] = {}
+          for name in modules:
+              try:
+                  importlib.import_module(name)
+              except Exception as exc:
+                  missing[name] = repr(exc)
 
-if missing:
-    payload = {
-        "event": "missing_critical_modules",
-        "modules": missing,
-        "component": "risk-ingestor-image",
-    }
-    sys.stderr.write(json.dumps(payload) + "\n")
-    raise SystemExit(1)
+          if missing:
+              payload = {
+                  "event": "missing_critical_modules",
+                  "modules": missing,
+                  "component": "risk-ingestor-image",
+              }
+              sys.stderr.write(json.dumps(payload) + "\n")
+              raise SystemExit(1)
 
-print("Verified critical Python modules:", ", ".join(modules))
-PY
+          print("Verified critical Python modules:", ", ".join(modules))
+          PY
 
       - name: Generate build metadata manifest
         run: |

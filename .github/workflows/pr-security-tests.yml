@@ -70,13 +70,14 @@ jobs:
         run: |
           if [ -f coverage.xml ]; then
             total=$(python - <<'PY'
-import xml.etree.ElementTree as ET
-from decimal import Decimal, ROUND_HALF_UP
-root = ET.parse("coverage.xml").getroot()
-rate = Decimal(root.get('line-rate', '0')) * Decimal(100)
-print(rate.quantize(Decimal('0.1'), rounding=ROUND_HALF_UP))
-PY
-)
+            import xml.etree.ElementTree as ET
+            from decimal import Decimal, ROUND_HALF_UP
+
+            root = ET.parse("coverage.xml").getroot()
+            rate = Decimal(root.get('line-rate', '0')) * Decimal(100)
+            print(rate.quantize(Decimal('0.1'), rounding=ROUND_HALF_UP))
+            PY
+            )
           else
             total="N/A"
           fi
@@ -100,7 +101,7 @@ PY
 
       - name: Run Trivy filesystem scan
         id: trivy_scan
-        uses: aquasecurity/trivy-action@v0.33.1
+        uses: aquasecurity/trivy-action@0.33.1
         with:
           scan-type: fs
           format: json
@@ -156,20 +157,20 @@ PY
           fi
 
           cat <<'COMMENT' > pr-comment.md
-### Automated Security & Test Summary
+          ### Automated Security & Test Summary
 
-| Check | Result |
-| --- | --- |
-| Gitleaks | GITLEAKS_STATUS |
-| Bandit | BANDIT_STATUS |
-| Ruff | RUFF_STATUS |
-| MyPy | MYPY_STATUS |
-| Pytest (coverage) | PYTEST_STATUS (Coverage: COVERAGE%) |
+          | Check | Result |
+          | --- | --- |
+          | Gitleaks | GITLEAKS_STATUS |
+          | Bandit | BANDIT_STATUS |
+          | Ruff | RUFF_STATUS |
+          | MyPy | MYPY_STATUS |
+          | Pytest (coverage) | PYTEST_STATUS (Coverage: COVERAGE%) |
 
-**Vulnerabilities**
-- Total: TOTAL_VULNS
-- Critical: CRITICAL_VULNS
-COMMENT
+          **Vulnerabilities**
+          - Total: TOTAL_VULNS
+          - Critical: CRITICAL_VULNS
+          COMMENT
 
           sed -i "s/GITLEAKS_STATUS/$gitleaks_status/" pr-comment.md
           sed -i "s/BANDIT_STATUS/$bandit_status/" pr-comment.md
