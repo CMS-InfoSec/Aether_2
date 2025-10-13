@@ -10,6 +10,9 @@ from typing import Any, Dict, Iterator, Optional
 
 try:  # pragma: no cover - MLflow is optional in tests.
     import mlflow
+    from shared.mlflow_safe import harden_mlflow
+
+    harden_mlflow(mlflow)
 except Exception:  # pragma: no cover - gracefully degrade when MLflow absent.
     mlflow = None  # type: ignore
 

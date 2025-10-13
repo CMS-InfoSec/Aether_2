@@ -79,7 +79,7 @@ PY
           echo "total=$total" >> "$GITHUB_OUTPUT"
 
       - name: Download Syft
-        uses: anchore/sbom-action/download-syft@v0.15.4
+        uses: anchore/sbom-action/download-syft@v0.16.0
         with:
           syft-version: v1.17.0
 
@@ -96,7 +96,7 @@ PY
 
       - name: Run Trivy filesystem scan
         id: trivy_scan
-        uses: aquasecurity/trivy-action@v0.20.0
+        uses: aquasecurity/trivy-action@0.33.1
         with:
           scan-type: fs
           format: json
