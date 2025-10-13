@@ -57,6 +57,15 @@ from shared.account_scope import account_id_column
 
 LOGGER = logging.getLogger(__name__)
 
+def _normalize_account_id(value: str | None) -> str:
+    """Mirror the normalisation performed by the production adapter."""
+
+    if value is None:
+        return "default"
+    candidate = value.strip()
+    return candidate or "default"
+
+
 if _KafkaNATSAdapter is None:
     class KafkaNATSAdapter:  # type: ignore[no-redef]
         """Fallback Kafka/NATS publisher used when the common adapters are unavailable."""
@@ -64,7 +73,7 @@ if _KafkaNATSAdapter is None:
         _event_store: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
 
         def __init__(self, account_id: str, **_: object) -> None:
-            self.account_id = account_id.strip() or "default"
+            self.account_id = _normalize_account_id(account_id)
 
         async def publish(self, topic: str, payload: Dict[str, Any]) -> None:
             enriched = attach_correlation(payload)
@@ -90,7 +99,8 @@ if _KafkaNATSAdapter is None:
             if account_id is None:
                 cls._event_store.clear()
             else:
-                cls._event_store.pop(account_id, None)
+                normalized = _normalize_account_id(account_id)
+                cls._event_store.pop(normalized, None)
 
         @classmethod
         async def flush_events(cls) -> Dict[str, int]:

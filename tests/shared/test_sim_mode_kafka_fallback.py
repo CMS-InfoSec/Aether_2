@@ -37,3 +37,20 @@ def test_in_memory_kafka_adapter_enriches_events(monkeypatch):
     assert adapter.history() == []
 
     sys.modules.pop("shared.sim_mode", None)
+
+
+def test_in_memory_kafka_reset_normalises_account_ids(monkeypatch):
+    dummy_module = ModuleType("services.common.adapters")
+    monkeypatch.setitem(sys.modules, "services.common.adapters", dummy_module)
+    sys.modules.pop("shared.sim_mode", None)
+
+    sim_mode = importlib.import_module("shared.sim_mode")
+
+    adapter = sim_mode.KafkaNATSAdapter(account_id="  acct-456  ")
+    asyncio.run(adapter.publish("topic", {"payload": "value"}))
+    assert adapter.history()
+
+    sim_mode.KafkaNATSAdapter.reset("  acct-456  ")
+    assert adapter.history() == []
+
+    sys.modules.pop("shared.sim_mode", None)
