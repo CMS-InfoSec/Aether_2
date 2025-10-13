@@ -1,0 +1,25 @@
+{{- $pipelines := .Values.dataPipelines | default (dict) -}}
+{{- if and ($pipelines.enabled | default true) ($pipelines.deployments) }}
+{{- range $pipelineName, $pipeline := $pipelines.deployments }}
+{{- if and ($pipeline.enabled | default true) ($pipeline.service.enabled | default false) }}
+{{- $name := default $pipelineName $pipeline.nameOverride -}}
+{{- $labels := dict "name" $name "Release" $.Release -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "aether-platform.labels" $labels | nindent 4 }}
+    app: {{ $name }}
+spec:
+  selector:
+    {{- include "aether-platform.selectorLabels" (dict "name" $name) | nindent 4 }}
+  {{- with $pipeline.service.type }}
+  type: {{ . }}
+  {{- end }}
+  ports:
+    {{- toYaml ($pipeline.service.ports | default (list)) | nindent 4 }}
+---
+{{- end }}
+{{- end }}
+{{- end }}

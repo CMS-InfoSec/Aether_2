@@ -1,0 +1,35 @@
+{{- $bootstrap := .Values.bootstrap | default (dict) -}}
+{{- if and ($bootstrap.enabled | default true) ($bootstrap.config.enabled | default false) }}
+{{- $cfg := $bootstrap.config -}}
+{{- $configMapName := $cfg.configMapName | default "config-bootstrap" -}}
+{{- $fullName := printf "%s-%s" $.Release.Name $configMapName | trunc 63 | trimSuffix "-" -}}
+{{- $labels := dict "name" $fullName "Release" $.Release -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullName }}
+  labels:
+    {{- include "aether-platform.labels" $labels | nindent 4 }}
+data:
+  {{ $cfg.fileName | default "bootstrap.yaml" }}: |
+    {{- $content := $cfg.inlineConfig | default "" -}}
+    {{- if $content }}
+    {{- $content | nindent 4 }}
+    {{- else }}
+    account_id: global
+    actor: helm
+    entries:
+      trading:
+        max_positions: 10
+        max_notional_per_symbol: 250000
+      risk:
+        max_drawdown_pct: 0.2
+        max_var_pct: 0.05
+      training:
+        retrain_interval_days: 7
+        window_days: 90
+      hedge:
+        target_pct: 0.25
+        rebalance_frequency: daily
+    {{- end }}
+{{- end }}

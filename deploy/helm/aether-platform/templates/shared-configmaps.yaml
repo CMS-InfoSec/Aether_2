@@ -1,0 +1,26 @@
+{{- $pipelines := .Values.dataPipelines | default (dict) -}}
+{{- $configs := $pipelines.sharedConfig | default (dict) -}}
+{{- if and ($pipelines.enabled | default true) $configs }}
+{{- range $cfgName, $cfg := $configs }}
+{{- if $cfg.enabled | default true }}
+{{- $name := default $cfgName $cfg.name -}}
+{{- $labels := dict "name" $name "Release" $.Release -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "aether-platform.labels" $labels | nindent 4 }}
+  {{- with $cfg.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+{{- range $key, $value := $cfg.data | default (dict) }}
+  {{ $key }}: |
+{{ $value | indent 4 }}
+{{- end }}
+---
+{{- end }}
+{{- end }}
+{{- end }}
