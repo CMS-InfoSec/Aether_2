@@ -24,63 +24,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Authenticate to GHCR for Kaniko
-        env:
-          GHCR_USER: ${{ github.actor }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          mask_secret() {
-            if [ -z "$1" ]; then
-              return
-            fi
-            printf '%s' "$1" | while IFS= read -r line; do
-              [ -z "$line" ] && continue
-              echo "::add-mask::$line"
-            done
-          }
-          mask_secret "$GHCR_TOKEN"
-          mkdir -p /kaniko/.docker
-          AUTH_TOKEN=$(printf '%s' "${GHCR_USER}:${GHCR_TOKEN}" | base64 | tr -d '\n')
-          mask_secret "$AUTH_TOKEN"
-          cat <<EOF >/kaniko/.docker/config.json
-          {
-            "auths": {
-              "ghcr.io": {
-                "auth": "${AUTH_TOKEN}"
-              }
-            }
-          }
-          EOF
-      - name: Build Order Gateway image
-
-        uses: addnab/docker-run-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
         with:
-          image: gcr.io/kaniko-project/executor:v1.18.0
-          options: >-
-            --rm
-            -v ${GITHUB_WORKSPACE}:/workspace
-            -v /kaniko/.docker:/kaniko/.docker
-          run: >-
-            /kaniko/executor
-            --context /workspace
-            --dockerfile /workspace/deploy/docker/kraken-ws-ingest/Dockerfile
-            --destination ${REGISTRY}/kraken-ws-ingest:${{ github.sha }}
-            --snapshotMode time
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build Kraken WS Ingest image
+        uses: int128/kaniko-action@v1.52.0
+        with:
+          context: .
+          file: deploy/docker/kraken-ws-ingest/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/kraken-ws-ingest:${{ github.sha }}
+          kaniko-args: |
+            --snapshotMode=time
             --single-snapshot
       - name: Build Risk API image
-        uses: addnab/docker-run-action@v3
+        uses: int128/kaniko-action@v1.52.0
         with:
-          image: gcr.io/kaniko-project/executor:v1.18.0
-          options: >-
-            --rm
-            -v ${GITHUB_WORKSPACE}:/workspace
-            -v /kaniko/.docker:/kaniko/.docker
-          run: >-
-            /kaniko/executor
-            --context /workspace
-            --dockerfile /workspace/deploy/docker/risk-api/Dockerfile
-            --destination ${REGISTRY}/risk-api:${{ github.sha }}
-            --snapshotMode time
+          context: .
+          file: deploy/docker/risk-api/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/risk-api:${{ github.sha }}
+          kaniko-args: |
+            --snapshotMode=time
             --single-snapshot
   buildah:
     name: Buildah Build
