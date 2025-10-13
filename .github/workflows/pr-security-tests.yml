@@ -30,9 +30,13 @@ jobs:
           pip install bandit ruff mypy pytest-cov
 
       - name: Install Gitleaks
+        env:
+          GITLEAKS_VERSION: v8.28.0
         run: |
-          curl -sSfL https://raw.githubusercontent.com/gitleaks/gitleaks/master/install.sh \
-            | sh -s -- -b "$(pwd)/bin"
+          set -euo pipefail
+          mkdir -p bin
+          curl -sSfL "https://raw.githubusercontent.com/gitleaks/gitleaks/${GITLEAKS_VERSION}/install.sh" \
+            | sh -s -- -b "$(pwd)/bin" "${GITLEAKS_VERSION}"
           echo "$(pwd)/bin" >> "$GITHUB_PATH"
 
       - name: Run Gitleaks secret scan
