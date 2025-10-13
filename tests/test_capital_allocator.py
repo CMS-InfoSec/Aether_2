@@ -212,6 +212,44 @@ def test_capital_allocator_rebalance_and_status(tmp_path, monkeypatch: pytest.Mo
     sys.modules.pop("capital_allocator", None)
 
 
+def test_readyz_reports_database_success(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _reload_allocator(monkeypatch, "sqlite:///:memory:")
+
+    with TestClient(module.app) as client:
+        response = client.get("/readyz")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "ok"
+    assert payload["checks"]["postgres_read"]["status"] == "ok"
+
+    module.ENGINE.dispose()
+    sys.modules.pop("capital_allocator", None)
+
+
+def test_readyz_returns_503_when_database_unavailable(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _reload_allocator(monkeypatch, "sqlite:///:memory:")
+
+    original_factory = getattr(module.app.state, "db_sessionmaker", None)
+    if hasattr(module.app.state, "db_sessionmaker"):
+        delattr(module.app.state, "db_sessionmaker")
+
+    try:
+        with TestClient(module.app) as client:
+            response = client.get("/readyz")
+    finally:
+        if original_factory is not None:
+            module.app.state.db_sessionmaker = original_factory
+
+    assert response.status_code == 503
+    payload = response.json()
+    assert payload["status"] == "error"
+    assert payload["checks"]["postgres_read"]["status"] == "error"
+
+    module.ENGINE.dispose()
+    sys.modules.pop("capital_allocator", None)
+
+
 def test_allocator_handles_large_navs_precision(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     db_url = "sqlite:///:memory:"
     module = _reload_allocator(monkeypatch, db_url)

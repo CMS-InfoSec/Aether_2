@@ -46,6 +46,9 @@ from ml.experiment_tracking.model_registry import register_model as registry_reg
 
 try:  # pragma: no cover - optional dependency in minimal environments.
     import mlflow
+    from shared.mlflow_safe import harden_mlflow
+
+    harden_mlflow(mlflow)
 except Exception:  # pragma: no cover - gracefully degrade when MLflow absent.
     mlflow = None  # type: ignore
 
