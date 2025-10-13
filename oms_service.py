@@ -32,7 +32,7 @@ from metrics import (
     setup_metrics,
     traced_span,
 )
-from services.common.adapters import KafkaNATSAdapter
+from shared.event_bus import KafkaNATSAdapter
 from services.oms.kraken_rest import KrakenRESTClient, KrakenRESTError
 from services.oms.kraken_ws import (
     KrakenWSClient,
