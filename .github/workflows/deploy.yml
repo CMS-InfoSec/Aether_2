@@ -151,7 +151,7 @@ PY
           path: sbom-${{ matrix.build.name }}.spdx.json
 
       - name: Scan image with Trivy
-        uses: aquasecurity/trivy-action@0.33.1
+        uses: aquasecurity/trivy-action@v0.33.1
         with:
           image-ref: ${{ steps.image_meta.outputs.sha_tag }}
           severity: CRITICAL,HIGH
