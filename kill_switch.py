@@ -11,8 +11,15 @@ from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional
 from shared.event_bus import KafkaNATSAdapter
 from services.common.security import require_admin_account
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
-from fastapi.responses import JSONResponse, Response
+try:  # pragma: no cover - prefer real FastAPI when available
+    from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import Depends, FastAPI, HTTPException, Query, Request, status
+
+try:  # pragma: no cover - prefer real FastAPI response types
+    from fastapi.responses import JSONResponse, Response
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import JSONResponse, Response
 
 from kill_alerts import NotificationDispatchError, dispatch_notifications
 from metrics import CONTENT_TYPE_LATEST, Histogram, _REGISTRY, generate_latest

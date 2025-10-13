@@ -5,7 +5,7 @@ from __future__ import annotations
 import inspect
 from collections import OrderedDict
 from types import SimpleNamespace
-from typing import Any, Awaitable, Callable, Mapping, cast
+from typing import Any, Awaitable, Callable, Iterator, Mapping, cast
 
 try:  # pragma: no cover - exercised when FastAPI is installed
     from fastapi import APIRouter
@@ -20,9 +20,16 @@ except Exception:  # pragma: no cover - provide lightweight stand-ins
             self.status_code = status_code
             self.body = json.dumps(content).encode("utf-8")
 
+    class _FallbackRoute(SimpleNamespace):
+        def __iter__(self) -> "Iterator[Any]":
+            yield self.path
+            yield self.methods
+            yield self.endpoint
+
     class _FallbackAPIRouter:
         def __init__(self) -> None:
-            self.routes: list[SimpleNamespace] = []
+            self.routes: list[_FallbackRoute] = []
+            self.prefix = ""
 
         def get(
             self,
@@ -32,7 +39,7 @@ except Exception:  # pragma: no cover - provide lightweight stand-ins
         ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
             def _decorator(func: Callable[..., Any]) -> Callable[..., Any]:
                 self.routes.append(
-                    SimpleNamespace(
+                    _FallbackRoute(
                         path=path,
                         endpoint=func,
                         methods=["GET"],

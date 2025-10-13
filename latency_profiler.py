@@ -19,8 +19,15 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Deque, Dict, Iterable, Mapping, MutableMapping, Optional, Sequence
 
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+try:  # pragma: no cover - prefer real FastAPI when available
+    from fastapi import FastAPI, Request
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import FastAPI, Request
+
+try:  # pragma: no cover - prefer real FastAPI responses
+    from fastapi.responses import JSONResponse
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import JSONResponse
 from metrics import CollectorRegistry, Histogram, _REGISTRY as _METRICS_REGISTRY
 from sqlalchemy import Column, DateTime, Float, MetaData, String, Table, create_engine
 from sqlalchemy.engine import Engine
