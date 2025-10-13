@@ -62,7 +62,7 @@ spec:
             - containerPort: {{ $svc.containerPort | default 8000 }}
               name: http
           {{- $extraEnv := $svc.env | default (list) -}}
-          {{- $sessionRedis := default "" $global.sessionStore.redisUrl -}}
+          {{- $sessionRedis := include "aether-platform.redisUrl" $ -}}
           {{- $releaseManifest := $global.releaseManifest | default (dict) -}}
           {{- $releaseManifestEnabled := and ($releaseManifest.enabled | default false) $releaseManifest.databaseSecretName -}}
           {{- $envEnabled := or $hasKraken (gt (len $extraEnv) 0) (ne $sessionRedis "") $releaseManifestEnabled -}}
