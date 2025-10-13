@@ -34,10 +34,24 @@ jobs:
           GITLEAKS_VERSION: v8.28.0
         run: |
           set -euo pipefail
-          mkdir -p bin
-          curl -sSfL "https://raw.githubusercontent.com/gitleaks/gitleaks/${GITLEAKS_VERSION}/install.sh" \
-            | sh -s -- -b "$(pwd)/bin" "${GITLEAKS_VERSION}"
-          echo "$(pwd)/bin" >> "$GITHUB_PATH"
+          archive="gitleaks_${GITLEAKS_VERSION#v}_linux_x64.tar.gz"
+          checksum_file="checksums.txt"
+          base_url="https://github.com/gitleaks/gitleaks/releases/download/${GITLEAKS_VERSION}"
+          curl -fsSLo "${archive}" "${base_url}/${archive}"
+          curl -fsSLo "${checksum_file}" "${base_url}/${checksum_file}"
+          expected_sum="$(grep " ${archive}$" "${checksum_file}" | awk '{print $1}')"
+          if [ -z "${expected_sum}" ]; then
+            echo "Unable to determine checksum for ${archive}" >&2
+            exit 1
+          fi
+          echo "${expected_sum}  ${archive}" | sha256sum --check --status
+          tar -xzf "${archive}" gitleaks
+          install_dir="$(pwd)/bin"
+          mkdir -p "${install_dir}"
+          install -m 0755 gitleaks "${install_dir}/gitleaks"
+          rm -f "${archive}" "${checksum_file}" gitleaks
+          echo "${install_dir}" >> "$GITHUB_PATH"
+          "${install_dir}/gitleaks" version
 
       - name: Run Gitleaks secret scan
         id: gitleaks

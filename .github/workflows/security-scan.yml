@@ -42,8 +42,8 @@ jobs:
         run: |
           set -euo pipefail
           archive="kube-score_${KUBE_SCORE_VERSION#v}_linux_amd64.tar.gz"
-          curl -sSL -o "${archive}" "https://github.com/zegl/kube-score/releases/download/${KUBE_SCORE_VERSION}/${archive}"
-          curl -sSL -o checksums.txt "https://github.com/zegl/kube-score/releases/download/${KUBE_SCORE_VERSION}/checksums.txt"
+          curl -fsSLo "${archive}" "https://github.com/zegl/kube-score/releases/download/${KUBE_SCORE_VERSION}/${archive}"
+          curl -fsSLo checksums.txt "https://github.com/zegl/kube-score/releases/download/${KUBE_SCORE_VERSION}/checksums.txt"
           expected_sum="$(grep " ${archive}$" checksums.txt | awk '{print $1}')"
           if [ -z "${expected_sum}" ]; then
             echo "Unable to find checksum for ${archive}" >&2
