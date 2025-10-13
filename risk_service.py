@@ -21,7 +21,10 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optio
 
 import httpx
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+try:  # pragma: no cover - prefer real FastAPI when available
+    from fastapi import Depends, FastAPI, HTTPException, Query, status
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import Depends, FastAPI, HTTPException, Query, status
 
 from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, model_validator
 from sqlalchemy import (

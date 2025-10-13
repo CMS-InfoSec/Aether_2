@@ -12,9 +12,8 @@ from pydantic import BaseModel, Field
 
 from common.schemas.contracts import SimModeEvent
 from metrics import setup_metrics
-from services.common.adapters import KafkaNATSAdapter
 from services.common.security import get_admin_accounts, require_admin_account
-from shared.sim_mode import SimModeStatus, sim_mode_repository
+from shared.sim_mode import KafkaNATSAdapter, SimModeStatus, sim_mode_repository
 from shared.audit_hooks import AuditEvent, load_audit_hooks
 from shared.health import setup_health_checks
 

@@ -34,7 +34,7 @@ except Exception:  # pragma: no cover - dependency might be unavailable in tests
 
 from fastapi import Depends, FastAPI, HTTPException, Response, status
 from pydantic import BaseModel, Field
-from prometheus_client import (
+from metrics import (
     CONTENT_TYPE_LATEST,
     CollectorRegistry,
     Gauge,
@@ -897,6 +897,9 @@ def _get_mlflow_client() -> tuple[Any | None, str | None, Dict[str, Any] | None]
     try:  # pragma: no cover - optional dependency path.
         import mlflow
         from mlflow.tracking import MlflowClient
+        from shared.mlflow_safe import harden_mlflow
+
+        harden_mlflow(mlflow)
     except Exception as exc:  # pragma: no cover - optional dependency path.
         LOGGER.warning("MLflow unavailable: %s", exc)
         return None, model_name, {"status": "skipped", "reason": "mlflow_unavailable"}
