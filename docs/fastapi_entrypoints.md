@@ -75,3 +75,14 @@ This document enumerates every FastAPI application defined in the repository, hi
 | `tca_service.py` | 672 | Postgres/SQLAlchemy | None | — |
 | `training_service.py` | 890 | Postgres/SQLAlchemy | None | — |
 | `watchdog.py` | 925 | Postgres/SQLAlchemy, Kafka/NATS | None | — |
+
+## `/readyz` rollout progress
+
+| Service module | Status |
+| --- | --- |
+| `advisor_service.py` | ✅ Adopted shared router |
+| `capital_allocator.py` | ✅ Adopted shared router |
+| `config_service.py` | ✅ Adopted shared router |
+| `services/fees/fee_service.py` | ✅ Adopted shared router |
+| `strategy_orchestrator.py` | ✅ Adopted shared router |
+| Remaining entries | ⏳ Pending |
