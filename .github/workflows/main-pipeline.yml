@@ -147,7 +147,7 @@ jobs:
           echo "latest_tag=${IMAGE_ID}:latest" >> "$GITHUB_OUTPUT"
 
       - name: Authenticate to GHCR
-        uses: redhat-actions/podman-login@v1
+        uses: redhat-actions/podman-login@v2
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
