@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from importlib import import_module
+import sys
 import logging
 from typing import Any, ClassVar, Dict, List
 
@@ -20,13 +22,69 @@ def _normalize_account_id(value: str | None) -> str:
     return candidate or "default"
 
 
-try:  # pragma: no cover - depends on optional services.common.adapters package
-    from services.common.adapters import KafkaNATSAdapter as _KafkaNATSAdapter
-except Exception as exc:  # pragma: no cover - exercised when dependency unavailable
-    _KafkaNATSAdapter = None  # type: ignore[assignment]
-    _KAFKA_IMPORT_ERROR = exc
-else:  # pragma: no cover - executed when dependency is available
-    _KAFKA_IMPORT_ERROR = None
+def _adapter_dependencies_ready() -> tuple[bool, BaseException | None]:
+    """Return ``True`` when runtime dependencies for the real adapter exist."""
+
+    try:
+        import httpx  # type: ignore
+    except Exception as exc:  # pragma: no cover - exercised when httpx missing
+        return False, exc
+
+    required = ("AsyncClient", "RequestError", "HTTPStatusError")
+    missing = [name for name in required if not hasattr(httpx, name)]
+    if missing:
+        return False, AttributeError(
+            f"httpx is missing required attributes: {', '.join(sorted(missing))}"
+        )
+
+    return True, None
+
+
+_adapters_module = sys.modules.get("services.common.adapters")
+_missing_adapter_stub = bool(
+    _adapters_module is not None
+    and not hasattr(_adapters_module, "KafkaNATSAdapter")
+)
+
+if _adapters_module is None:
+    try:  # pragma: no cover - depends on optional services.common.adapters package
+        _adapters_module = import_module("services.common.adapters")
+    except Exception as exc:  # pragma: no cover - exercised when dependency unavailable
+        _KafkaNATSAdapter = None  # type: ignore[assignment]
+        _KAFKA_IMPORT_ERROR = exc
+    else:  # pragma: no cover - executed when dependency is available
+        _KafkaNATSAdapter = getattr(_adapters_module, "KafkaNATSAdapter", None)
+        if _KafkaNATSAdapter is None or _missing_adapter_stub:
+            _KAFKA_IMPORT_ERROR = AttributeError(
+                "services.common.adapters lacks KafkaNATSAdapter"
+            )
+            _KafkaNATSAdapter = None  # type: ignore[assignment]
+        else:
+            ready, error = _adapter_dependencies_ready()
+            if ready:
+                _KAFKA_IMPORT_ERROR = None
+            else:
+                _KafkaNATSAdapter = None  # type: ignore[assignment]
+                _KAFKA_IMPORT_ERROR = error
+else:
+    if _missing_adapter_stub:
+        _KafkaNATSAdapter = None  # type: ignore[assignment]
+        _KAFKA_IMPORT_ERROR = AttributeError(
+            "services.common.adapters lacks KafkaNATSAdapter"
+        )
+    else:
+        _KafkaNATSAdapter = getattr(_adapters_module, "KafkaNATSAdapter", None)
+        if _KafkaNATSAdapter is None:
+            _KAFKA_IMPORT_ERROR = AttributeError(
+                "services.common.adapters lacks KafkaNATSAdapter"
+            )
+        else:
+            ready, error = _adapter_dependencies_ready()
+            if ready:
+                _KAFKA_IMPORT_ERROR = None
+            else:
+                _KafkaNATSAdapter = None  # type: ignore[assignment]
+                _KAFKA_IMPORT_ERROR = error
 
 
 if _KafkaNATSAdapter is None:
