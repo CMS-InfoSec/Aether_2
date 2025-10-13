@@ -90,7 +90,7 @@ jobs:
       packages: write
     steps:
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3.4.0
+        uses: sigstore/cosign-installer@v3.5.0
 
       - name: Install Syft
         uses: anchore/sbom-action/download-syft@v0.16.0
@@ -103,12 +103,11 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Scan image for vulnerabilities
-        uses: anchore/grype-action@v0
+        uses: anchore/scan-action@v7
         with:
           image: ${{ needs.build-image.outputs.image_ref }}@${{ needs.build-image.outputs.image_digest }}
-          fail-on-severity: critical
-          registry-username: ${{ github.actor }}
-          registry-password: ${{ secrets.GITHUB_TOKEN }}
+          severity-cutoff: critical
+          fail-build: true
 
       - name: Generate SBOM
         env:
