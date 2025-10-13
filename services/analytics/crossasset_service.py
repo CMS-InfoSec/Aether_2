@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Optional, Sequence, TypeVar, cast
 
-from prometheus_client import Gauge
+from metrics import Gauge
 
 try:  # pragma: no cover - metrics helper optional when FastAPI unavailable
     from metrics import setup_metrics
