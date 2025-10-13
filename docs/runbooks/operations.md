@@ -86,3 +86,8 @@ This runbook describes the day-2 operational workflows for the Aether risk platf
 - After ArgoCD/Helm syncs, verify `https://ui.aether.example.com` hits the
   expected backend ingress and that browser console/network traces remain free
   from CORS or authentication errors.
+
+## 8. Dependency refresh cadence
+- Schedule a monthly maintenance window to regenerate `pyproject.lock` via `pip-compile --resolver=backtracking pyproject.toml -o pyproject.lock` and open a review containing the updated lockfile.
+- Capture vulnerability scan outputs from Trivy (filesystem scan), Dependabot advisories, and Snyk projects as part of the same cadence. Flag any high or critical findings in the operations log with remediation SLAs.
+- Coordinate with the security liaison to ensure overdue remediation tasks are escalated in #security-ops and tracked to closure in the on-call checklist.
