@@ -85,6 +85,125 @@
                 }
             },
             "additionalProperties": true
+        },
+        "postgresConnection": {
+            "type": "object",
+            "description": "Connection attributes for managed PostgreSQL secrets.",
+            "required": [
+                "database",
+                "username",
+                "password"
+            ],
+            "properties": {
+                "host": {
+                    "type": "string",
+                    "description": "Override the hostname when using an external PostgreSQL instance."
+                },
+                "port": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Override the port when using a non-standard PostgreSQL listener."
+                },
+                "database": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "username": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "password": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "sslmode": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "parameters": {
+                    "type": "object",
+                    "description": "Additional query parameters appended to the generated DSN.",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                }
+            },
+            "additionalProperties": true
+        },
+        "managedSecret": {
+            "type": "object",
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "default": true
+                },
+                "type": {
+                    "type": "string",
+                    "enum": [
+                        "postgresDsn",
+                        "opaque"
+                    ],
+                    "default": "opaque"
+                },
+                "dsnKey": {
+                    "type": "string",
+                    "description": "Key used to store the generated DSN when type is postgresDsn.",
+                    "default": "dsn"
+                },
+                "sslmodeKey": {
+                    "type": "string",
+                    "description": "Key used to store the SSL mode alongside generated DSNs.",
+                    "default": "sslmode"
+                },
+                "connection": {
+                    "$ref": "#/$defs/postgresConnection"
+                },
+                "data": {
+                    "type": "object",
+                    "description": "Literal key/value pairs for opaque secrets.",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                },
+                "additionalData": {
+                    "type": "object",
+                    "description": "Additional key/value pairs appended to generated DSN secrets.",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                }
+            },
+            "allOf": [
+                {
+                    "if": {
+                        "properties": {
+                            "type": {
+                                "const": "postgresDsn"
+                            }
+                        }
+                    },
+                    "then": {
+                        "required": [
+                            "connection"
+                        ]
+                    }
+                },
+                {
+                    "if": {
+                        "properties": {
+                            "type": {
+                                "const": "opaque"
+                            }
+                        }
+                    },
+                    "then": {
+                        "required": [
+                            "data"
+                        ]
+                    }
+                }
+            ],
+            "additionalProperties": true
         }
     },
     "properties": {
@@ -172,6 +291,39 @@
                         }
                     },
                     "additionalProperties": true
+                },
+                "sessionStore": {
+                    "type": "object",
+                    "description": "Override the session Redis URL when not using the bundled dependency.",
+                    "properties": {
+                        "redisUrl": {
+                            "type": "string"
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "releaseManifest": {
+                    "type": "object",
+                    "description": "Configuration for the optional release manifest integration.",
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean",
+                            "default": true
+                        },
+                        "databaseSecretName": {
+                            "type": "string"
+                        },
+                        "databaseSecretKey": {
+                            "type": "string"
+                        },
+                        "sslmode": {
+                            "type": "string"
+                        },
+                        "appName": {
+                            "type": "string"
+                        }
+                    },
+                    "additionalProperties": true
                 }
             },
             "additionalProperties": true
@@ -224,6 +376,135 @@
                 }
             },
             "additionalProperties": true
+        },
+        "dependencies": {
+            "type": "object",
+            "description": "Configuration for bundled stateful dependencies that can be deployed alongside the platform.",
+            "properties": {
+                "postgresql": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean",
+                            "default": true
+                        },
+                        "fullnameOverride": {
+                            "type": "string"
+                        },
+                        "auth": {
+                            "type": "object",
+                            "description": "Superuser credentials used by the bundled PostgreSQL release.",
+                            "required": [
+                                "username",
+                                "password",
+                                "database"
+                            ],
+                            "properties": {
+                                "username": {
+                                    "type": "string",
+                                    "minLength": 1
+                                },
+                                "password": {
+                                    "type": "string",
+                                    "minLength": 1
+                                },
+                                "database": {
+                                    "type": "string",
+                                    "minLength": 1
+                                }
+                            },
+                            "additionalProperties": true
+                        },
+                        "primary": {
+                            "type": "object",
+                            "description": "Primary instance configuration overrides passed to the Bitnami PostgreSQL chart.",
+                            "properties": {
+                                "initdbScriptsConfigMap": {
+                                    "type": "string"
+                                }
+                            },
+                            "additionalProperties": true
+                        }
+                    },
+                    "additionalProperties": true
+                },
+                "redis": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean",
+                            "default": true
+                        },
+                        "fullnameOverride": {
+                            "type": "string"
+                        },
+                        "architecture": {
+                            "type": "string",
+                            "enum": [
+                                "standalone",
+                                "replication"
+                            ]
+                        },
+                        "auth": {
+                            "type": "object",
+                            "properties": {
+                                "enabled": {
+                                    "type": "boolean"
+                                },
+                                "password": {
+                                    "type": "string"
+                                }
+                            },
+                            "additionalProperties": true
+                        }
+                    },
+                    "additionalProperties": true
+                },
+                "kafka": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean",
+                            "default": true
+                        },
+                        "fullnameOverride": {
+                            "type": "string"
+                        }
+                    },
+                    "additionalProperties": true
+                },
+                "nats": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean",
+                            "default": true
+                        },
+                        "fullnameOverride": {
+                            "type": "string"
+                        }
+                    },
+                    "additionalProperties": true
+                }
+            },
+            "additionalProperties": true
+        },
+        "managedSecrets": {
+            "type": "object",
+            "description": "Declarative secrets generated by the chart for quick-start deployments.",
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "default": true
+                },
+                "secrets": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "$ref": "#/$defs/managedSecret"
+                    }
+                }
+            },
+            "additionalProperties": false
         },
         "backendServices": {
             "type": "object",

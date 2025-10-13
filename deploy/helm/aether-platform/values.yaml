@@ -17,7 +17,7 @@ global:
       X-Frame-Options: "DENY"
       X-XSS-Protection: "1; mode=block"
   krakenSecrets:
-    enabled: true
+    enabled: false
     basePath: /var/run/secrets/kraken
     annotationKey: checksum/kraken-secrets
     checksum: ""
@@ -40,11 +40,11 @@ global:
         secretName: kraken-keys-director-2
   accountAllowlists:
     admin:
-      secretName: platform-account-allowlists
-      secretKey: admins
+      secretName: ""
+      secretKey: ""
     director:
-      secretName: platform-account-allowlists
-      secretKey: directors
+      secretName: ""
+      secretKey: ""
   podSecurityContext:
     runAsNonRoot: true
     runAsUser: 1000
@@ -60,7 +60,7 @@ global:
     readOnlyRootFilesystem: true
 
   sessionStore:
-    redisUrl: redis://redis.aether.svc.cluster.local:6379/0
+    redisUrl: ""
   releaseManifest:
     enabled: true
     databaseSecretName: release-manifest-database
@@ -134,6 +134,181 @@ global:
           - 172.104.0.0/13
         ports:
           - 443
+
+dependencies:
+  postgresql:
+    enabled: true
+    fullnameOverride: aether-postgresql
+    auth:
+      username: aether_admin
+      password: aether-admin-password
+      database: aether_admin
+    primary:
+      initdbScriptsConfigMap: aether-postgresql-init
+      persistence:
+        enabled: true
+        size: 100Gi
+      resources:
+        requests:
+          cpu: 500m
+          memory: 2Gi
+        limits:
+          cpu: 2
+          memory: 4Gi
+  redis:
+    enabled: true
+    fullnameOverride: aether-redis
+    architecture: standalone
+    auth:
+      enabled: true
+      password: aether-redis-password
+    master:
+      persistence:
+        enabled: true
+        size: 10Gi
+      service:
+        ports:
+          redis: 6379
+  kafka:
+    enabled: true
+    fullnameOverride: aether-kafka
+    replicaCount: 3
+    persistence:
+      enabled: true
+      size: 50Gi
+    listeners:
+      client:
+        protocol: PLAINTEXT
+      external:
+        enabled: false
+    zookeeper:
+      replicaCount: 3
+      persistence:
+        enabled: true
+        size: 10Gi
+  nats:
+    enabled: true
+    fullnameOverride: aether-nats
+    auth:
+      enabled: false
+    replicaCount: 3
+
+managedSecrets:
+  enabled: true
+  secrets:
+    account-service-database:
+      type: postgresDsn
+      connection:
+        database: account_service
+        username: account_service
+        password: account-service-password
+        sslmode: require
+    account-service-secrets:
+      type: opaque
+      data:
+        encryptionKey: change-me-account-secret
+    advisor-service-database:
+      type: postgresDsn
+      connection:
+        database: advisor_service
+        username: advisor_service
+        password: advisor-service-password
+        sslmode: require
+    behavior-service-database:
+      type: postgresDsn
+      connection:
+        database: behavior_service
+        username: behavior_service
+        password: behavior-service-password
+        sslmode: require
+    benchmark-service-database:
+      type: postgresDsn
+      connection:
+        database: benchmark_service
+        username: benchmark_service
+        password: benchmark-service-password
+        sslmode: require
+    capital-flow-service-database:
+      type: postgresDsn
+      connection:
+        database: capital_flow_service
+        username: capital_flow_service
+        password: capital-flow-service-password
+        sslmode: require
+    fees-service-database:
+      type: postgresDsn
+      connection:
+        database: fees_service
+        username: fees_service
+        password: fees-service-password
+        sslmode: require
+    hitl-service-database:
+      type: postgresDsn
+      connection:
+        database: hitl_service
+        username: hitl_service
+        password: hitl-service-password
+        sslmode: require
+    override-service-database:
+      type: postgresDsn
+      connection:
+        database: override_service
+        username: override_service
+        password: override-service-password
+        sslmode: require
+    risk-service-database:
+      type: postgresDsn
+      connection:
+        database: risk_service
+        username: risk_service
+        password: risk-service-password
+        sslmode: require
+    seasonality-service-database:
+      type: postgresDsn
+      connection:
+        database: seasonality_service
+        username: seasonality_service
+        password: seasonality-service-password
+        sslmode: require
+    secrets-service-config:
+      type: opaque
+      data:
+        SECRET_ENCRYPTION_KEY: change-me-platform-secret
+    sim-mode-database:
+      type: postgresDsn
+      connection:
+        database: sim_mode
+        username: sim_mode
+        password: sim-mode-password
+        sslmode: require
+    training-service-database:
+      type: postgresDsn
+      connection:
+        database: training_service
+        username: training_service
+        password: training-service-password
+        sslmode: require
+    universe-service-database:
+      type: postgresDsn
+      connection:
+        database: universe_service
+        username: universe_service
+        password: universe-service-password
+        sslmode: require
+    volatility-service-database:
+      type: postgresDsn
+      connection:
+        database: volatility_service
+        username: volatility_service
+        password: volatility-service-password
+        sslmode: require
+    release-manifest-database:
+      type: postgresDsn
+      connection:
+        database: release_manifest
+        username: release_manifest
+        password: release-manifest-password
+        sslmode: require
 simulation:
   enabled: false
 
@@ -612,8 +787,6 @@ backendServices:
     replicaCount: 2
     containerPort: 8000
     env:
-      - name: SESSION_REDIS_URL
-        value: redis://redis:6379/0
       - name: SIM_MODE_DATABASE_URL
         valueFrom:
           secretKeyRef:
