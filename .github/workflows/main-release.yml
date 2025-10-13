@@ -187,8 +187,10 @@ jobs:
       - validate-externalsecrets
     steps:
       - name: Install Argo CD CLI
+        env:
+          ARGOCD_VERSION: v2.9.3
         run: |
-          curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          curl -sSL -o argocd "https://github.com/argoproj/argo-cd/releases/download/${ARGOCD_VERSION}/argocd-linux-amd64"
           sudo install -m 755 argocd /usr/local/bin/argocd
 
       - name: Argo CD login and sync
