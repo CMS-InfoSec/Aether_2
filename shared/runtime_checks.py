@@ -20,6 +20,14 @@ _GLOBAL_ALLOW_FLAG = "AETHER_ALLOW_INSECURE_DEFAULTS"
 _SYSTEM_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "system.yaml"
 _ENV_FLAG = "ENV"
 _REQUIRED_ALLOWLIST_ENV = ("ADMIN_ALLOWLIST", "DIRECTOR_ALLOWLIST")
+_PRODUCTION_ENV_KEYS: tuple[str, ...] = ("ENV", "ENVIRONMENT", "AETHER_ENV")
+_PRODUCTION_NAMESPACE_ENV_KEYS: tuple[str, ...] = (
+    "KUBERNETES_NAMESPACE",
+    "POD_NAMESPACE",
+    "NAMESPACE",
+)
+_PRODUCTION_VALUES: frozenset[str] = frozenset({"prod", "production", "live"})
+_TRUTHY: frozenset[str] = frozenset({"1", "true", "yes", "on"})
 
 
 def _is_test_environment() -> bool:
