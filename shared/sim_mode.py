@@ -42,6 +42,7 @@ from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from common.schemas.contracts import FillEvent
+from common.utils.tracing import attach_correlation
 try:  # pragma: no cover - optional dependency for broker publishing
     from services.common.adapters import KafkaNATSAdapter as _KafkaNATSAdapter
 except Exception as exc:  # pragma: no cover - exercised when adapters module unavailable
@@ -66,11 +67,14 @@ if _KafkaNATSAdapter is None:
             self.account_id = account_id.strip() or "default"
 
         async def publish(self, topic: str, payload: Dict[str, Any]) -> None:
+            enriched = attach_correlation(payload)
+            correlation_id = enriched.get("correlation_id")
             record = {
                 "topic": topic,
-                "payload": payload,
+                "payload": enriched,
                 "timestamp": datetime.now(timezone.utc),
-                "delivered": False,
+                "correlation_id": correlation_id,
+                "delivered": True,
                 "partial_delivery": False,
             }
             self._event_store.setdefault(self.account_id, []).append(record)
