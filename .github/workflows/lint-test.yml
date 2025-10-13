@@ -8,6 +8,24 @@ on:
       - kill-switch
 
 jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install actionlint
+        env:
+          ACTIONLINT_VERSION: v1.7.8
+        run: |
+          set -euo pipefail
+          archive="actionlint_${ACTIONLINT_VERSION#v}_linux_amd64.tar.gz"
+          curl -sSL -o "${archive}" "https://github.com/rhysd/actionlint/releases/download/${ACTIONLINT_VERSION}/${archive}"
+          tar -xzf "${archive}" actionlint
+          sudo mv actionlint /usr/local/bin/
+          rm -f "${archive}"
+          actionlint --version
+      - name: Run actionlint
+        run: actionlint -color
+
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -41,7 +59,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: azure/setup-helm@v3
+      - uses: azure/setup-helm@v4
         with:
           version: v3.13.3
       - name: Lint Helm charts
