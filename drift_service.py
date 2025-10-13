@@ -34,7 +34,7 @@ except Exception:  # pragma: no cover - dependency might be unavailable in tests
 
 from fastapi import Depends, FastAPI, HTTPException, Response, status
 from pydantic import BaseModel, Field
-from prometheus_client import (
+from metrics import (
     CONTENT_TYPE_LATEST,
     CollectorRegistry,
     Gauge,

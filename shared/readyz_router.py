@@ -4,11 +4,55 @@ from __future__ import annotations
 
 import inspect
 from collections import OrderedDict
-from typing import Any, Awaitable, Callable, Mapping
+from types import SimpleNamespace
+from typing import Any, Awaitable, Callable, Mapping, cast
 
-from fastapi import APIRouter
-from fastapi.responses import JSONResponse
-from starlette import status
+try:  # pragma: no cover - exercised when FastAPI is installed
+    from fastapi import APIRouter
+    from fastapi.responses import JSONResponse
+except Exception:  # pragma: no cover - provide lightweight stand-ins
+    import json
+
+    class _FallbackJSONResponse:
+        def __init__(self, content: Any, status_code: int = 200) -> None:
+            self.content = content
+            self.media_type = "application/json"
+            self.status_code = status_code
+            self.body = json.dumps(content).encode("utf-8")
+
+    class _FallbackAPIRouter:
+        def __init__(self) -> None:
+            self.routes: list[SimpleNamespace] = []
+
+        def get(
+            self,
+            path: str,
+            *,
+            include_in_schema: bool = True,
+        ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+            def _decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+                self.routes.append(
+                    SimpleNamespace(
+                        path=path,
+                        endpoint=func,
+                        methods=["GET"],
+                        include_in_schema=include_in_schema,
+                    )
+                )
+                return func
+
+            return _decorator
+
+    APIRouter = cast(Any, _FallbackAPIRouter)
+    JSONResponse = cast(Any, _FallbackJSONResponse)
+
+try:  # pragma: no cover - exercised when Starlette is installed
+    from starlette import status
+except Exception:  # pragma: no cover - provide HTTP status constants
+    status = SimpleNamespace(
+        HTTP_200_OK=200,
+        HTTP_503_SERVICE_UNAVAILABLE=503,
+    )
 
 from .readiness import ReadinessProbeError
 
