@@ -67,7 +67,7 @@ dependencies = [
 test = [
     "aiohttp==3.12.15",
     "cryptography==45.0.7",
-    "gevent==24.2.1",
+    "gevent==25.9.1",
     "httpx==0.28.1",
     "locust==2.32.2",
     "prometheus-client==0.23.1",
