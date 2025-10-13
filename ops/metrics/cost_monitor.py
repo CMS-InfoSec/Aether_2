@@ -17,10 +17,11 @@ from typing import Deque, Dict, Iterable, Mapping, MutableMapping, Optional, Tup
 import httpx
 from fastapi import FastAPI, Response
 from fastapi.responses import JSONResponse
-from prometheus_client import (
-    CONTENT_TYPE_LATEST,
+
+from metrics import (
     CollectorRegistry,
     Gauge,
+    CONTENT_TYPE_LATEST,
     generate_latest,
 )
 from shared.health import setup_health_checks
