@@ -6,6 +6,7 @@ import builtins
 import importlib
 import os
 import sys
+from dataclasses import dataclass
 from types import ModuleType
 from typing import Iterable
 
@@ -44,6 +45,9 @@ def _purge_modules(prefixes: Iterable[str]) -> None:
         "services.ui.explain_service",
         "services.report_service",
         "ops.metrics.cost_monitor",
+        "signal_graph",
+        "time_travel",
+        "multiformat_export",
     ],
 )
 def test_core_services_import_without_fastapi(
@@ -65,6 +69,26 @@ def test_core_services_import_without_fastapi(
     if module_name == "override_service":
         monkeypatch.setenv("OVERRIDE_ALLOW_SQLITE_FOR_TESTS", "1")
         monkeypatch.setenv("OVERRIDE_DATABASE_URL", "sqlite:///override.db")
+
+    if module_name == "multiformat_export":
+        _purge_modules(["services.common.adapters"])
+        adapters_stub = ModuleType("services.common.adapters")
+        adapters_stub.TimescaleAdapter = object  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "services.common.adapters", adapters_stub)
+
+        _purge_modules(["audit_mode"])
+        audit_stub = ModuleType("audit_mode")
+
+        @dataclass
+        class _AuditorPrincipal:
+            account_id: str
+
+        def _require_auditor_identity(*_: object, **__: object) -> _AuditorPrincipal:
+            return _AuditorPrincipal(account_id="test-account")
+
+        audit_stub.AuditorPrincipal = _AuditorPrincipal  # type: ignore[attr-defined]
+        audit_stub.require_auditor_identity = _require_auditor_identity  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "audit_mode", audit_stub)
 
     module = importlib.import_module(module_name)
 
