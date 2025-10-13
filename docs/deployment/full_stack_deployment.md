@@ -93,6 +93,7 @@ if you disable optional services.
 | `account-service-secrets` | `encryptionKey` | Fernet key for customer data encryption.【F:deploy/helm/aether-platform/values.yaml†L180-L209】 |
 | `auth-service-config` | `AUTH_DATABASE_URL`, `AUTH_JWT_SECRET` | Login API DSN plus JWT signing secret.【F:deploy/helm/aether-platform/values.yaml†L204-L221】 |
 | `behavior-service-database` | `dsn` | Behavior analytics database DSN.【F:deploy/helm/aether-platform/values.yaml†L223-L268】 |
+| `compliance-service-database` | `dsn` | Compliance checks datastore consumed by the risk API.【F:deploy/helm/aether-platform/values.yaml†L228-L236】【F:deploy/helm/aether-platform/values.yaml†L1196-L1203】 |
 | `capital-allocator-database` | `dsn` | Capital allocation database used by the allocator service.【F:deploy/helm/aether-platform/values.yaml†L240-L252】 |
 | `config-service-database` | `dsn` | Configuration service DSN used by migrations and runtime APIs.【F:deploy/helm/aether-platform/values.yaml†L253-L265】 |
 | `kraken-keys-*` | `credentials.json` | Kraken trading credentials for company/directors when Kraken access is enabled.【F:deploy/helm/aether-platform/values.yaml†L19-L60】 |

@@ -231,6 +231,13 @@ managedSecrets:
         username: behavior_service
         password: behavior-service-password
         sslmode: require
+    compliance-service-database:
+      type: postgresDsn
+      connection:
+        database: compliance_service
+        username: compliance_service
+        password: compliance-service-password
+        sslmode: require
     benchmark-service-database:
       type: postgresDsn
       connection:
@@ -1198,6 +1205,17 @@ backendServices:
     replicaCount: 2
     containerPort: 8000
     env:
+      - name: COMPLIANCE_DATABASE_URL
+        valueFrom:
+          secretKeyRef:
+            name: compliance-service-database
+            key: dsn
+      - name: COMPLIANCE_DB_SSLMODE
+        valueFrom:
+          secretKeyRef:
+            name: compliance-service-database
+            key: sslmode
+            optional: true
 
       - name: RISK_DATABASE_URL
         valueFrom:
