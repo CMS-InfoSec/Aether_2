@@ -28,6 +28,7 @@ from metrics import increment_safe_mode_triggers, setup_metrics
 from services.common.security import require_admin_account
 from common.utils.redis import create_redis_from_url
 from shared.async_utils import dispatch_async
+from shared.event_bus import KafkaNATSAdapter
 from shared.audit_hooks import AuditEvent, load_audit_hooks
 from shared.health import setup_health_checks
 
@@ -607,24 +608,17 @@ class KafkaSafeModePublisher:
 
     def publish(self, event: SafeModeEvent) -> None:
         payload = event.to_payload()
-        try:  # pragma: no cover - adapter import may fail in lightweight environments
-            from services.common.adapters import KafkaNATSAdapter  # type: ignore
-        except Exception:  # pragma: no cover - fall back to in-memory history
-            LOGGER.debug(
-                "Kafka adapter unavailable for safe mode publish", exc_info=True
+        try:
+            dispatch_async(
+                KafkaNATSAdapter(account_id=self._account_id).publish(
+                    topic=self._topic,
+                    payload=payload,
+                ),
+                context="safe_mode.kafka_publish",
+                logger=LOGGER,
             )
-        else:
-            try:
-                dispatch_async(
-                    KafkaNATSAdapter(account_id=self._account_id).publish(
-                        topic=self._topic,
-                        payload=payload,
-                    ),
-                    context="safe_mode.kafka_publish",
-                    logger=LOGGER,
-                )
-            except Exception:  # pragma: no cover - defensive scheduling guard
-                LOGGER.exception("Failed to schedule safe mode publish task")
+        except Exception:  # pragma: no cover - defensive scheduling guard
+            LOGGER.exception("Failed to schedule safe mode publish task")
 
         self._history.append({"topic": self._topic, "payload": payload})
 
