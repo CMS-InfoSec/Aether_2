@@ -36,7 +36,7 @@ jobs:
       - name: Install tooling
         run: |
           python -m pip install --upgrade pip
-          pip install yamllint==1.33.0
+          python -m pip install yamllint==1.33.0
       - name: YAML lint
         run: |
           yamllint deploy .github/workflows
