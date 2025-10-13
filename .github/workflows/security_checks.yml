@@ -108,10 +108,19 @@ jobs:
         run: |
           set -euo pipefail
           archive="conftest_${CONFTEST_VERSION#v}_Linux_x86_64.tar.gz"
-          curl -sSL -o "${archive}" "https://github.com/open-policy-agent/conftest/releases/download/${CONFTEST_VERSION}/${archive}"
+          checksum_file="checksums.txt"
+          base_url="https://github.com/open-policy-agent/conftest/releases/download/${CONFTEST_VERSION}"
+          curl -fsSLo "${archive}" "${base_url}/${archive}"
+          curl -fsSLo "${checksum_file}" "${base_url}/${checksum_file}"
+          expected_sum="$(grep " ${archive}$" "${checksum_file}" | awk '{print $1}')"
+          if [ -z "${expected_sum}" ]; then
+            echo "Unable to determine checksum for ${archive}" >&2
+            exit 1
+          fi
+          echo "${expected_sum}  ${archive}" | sha256sum --check --status
           tar -xzf "${archive}" conftest
-          sudo mv conftest /usr/local/bin/
-          rm -f "${archive}"
+          sudo install -m 0755 conftest /usr/local/bin/conftest
+          rm -f "${archive}" "${checksum_file}" conftest
           conftest --version
 
       - name: Run OPA policies against Kubernetes manifests

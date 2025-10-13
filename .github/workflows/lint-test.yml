@@ -18,10 +18,19 @@ jobs:
         run: |
           set -euo pipefail
           archive="actionlint_${ACTIONLINT_VERSION#v}_linux_amd64.tar.gz"
-          curl -sSL -o "${archive}" "https://github.com/rhysd/actionlint/releases/download/${ACTIONLINT_VERSION}/${archive}"
+          checksum_file="actionlint_${ACTIONLINT_VERSION#v}_checksums.txt"
+          base_url="https://github.com/rhysd/actionlint/releases/download/${ACTIONLINT_VERSION}"
+          curl -fsSLo "${archive}" "${base_url}/${archive}"
+          curl -fsSLo "${checksum_file}" "${base_url}/${checksum_file}"
+          expected_sum="$(grep " ${archive}$" "${checksum_file}" | awk '{print $1}')"
+          if [ -z "${expected_sum}" ]; then
+            echo "Unable to determine checksum for ${archive}" >&2
+            exit 1
+          fi
+          echo "${expected_sum}  ${archive}" | sha256sum --check --status
           tar -xzf "${archive}" actionlint
-          sudo mv actionlint /usr/local/bin/
-          rm -f "${archive}"
+          sudo install -m 0755 actionlint /usr/local/bin/actionlint
+          rm -f "${archive}" "${checksum_file}" actionlint
           actionlint --version
       - name: Run actionlint
         run: actionlint -color
