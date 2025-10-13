@@ -35,7 +35,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Generate SLSA provenance
-        uses: slsa-framework/slsa-github-generator@v2.0.0
+        uses: slsa-framework/slsa-github-generator@v2.1.0
         with:
           build-type: https://slsa.dev/container/v0.1
           upload-assets: true
