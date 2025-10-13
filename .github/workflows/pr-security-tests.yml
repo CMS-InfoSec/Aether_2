@@ -79,9 +79,9 @@ PY
           echo "total=$total" >> "$GITHUB_OUTPUT"
 
       - name: Download Syft
-        uses: anchore/sbom-action/download-syft@v0.16.0
+        uses: anchore/sbom-action/download-syft@v0.20.6
         with:
-          syft-version: v1.17.0
+          syft-version: v1.33.0
 
       - name: Generate SBOM
         run: syft dir:. -o json > sbom.json

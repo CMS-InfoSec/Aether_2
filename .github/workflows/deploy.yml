@@ -135,7 +135,7 @@ PY
 
       - name: Generate SBOM with Syft
         id: sbom
-        uses: anchore/sbom-action@v0.16.0
+        uses: anchore/sbom-action@v0.20.6
         with:
           image: ${{ steps.image_meta.outputs.sha_tag }}
           format: spdx-json

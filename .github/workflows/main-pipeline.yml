@@ -175,7 +175,7 @@ jobs:
 
       - name: Generate SBOM
         id: sbom
-        uses: anchore/sbom-action@v0.16.0
+        uses: anchore/sbom-action@v0.20.6
         with:
           image: ${{ steps.image_meta.outputs.sha_tag }}
           output-file: sbom-${{ matrix.build.name }}.spdx.json
