@@ -54,3 +54,24 @@ def test_in_memory_kafka_reset_normalises_account_ids(monkeypatch):
     assert adapter.history() == []
 
     sys.modules.pop("shared.sim_mode", None)
+
+
+def test_sim_mode_service_imports_without_adapters(monkeypatch):
+    """Service should fall back to the shared in-memory Kafka adapter when needed."""
+
+    dummy_module = ModuleType("services.common.adapters")
+    monkeypatch.setitem(sys.modules, "services.common.adapters", dummy_module)
+    sys.modules.pop("shared.sim_mode", None)
+    sys.modules.pop("sim_mode", None)
+
+    shared_module = importlib.import_module("shared.sim_mode")
+    service_module = importlib.import_module("sim_mode")
+
+    assert service_module.KafkaNATSAdapter is shared_module.KafkaNATSAdapter
+
+    adapter = service_module.KafkaNATSAdapter(account_id="acct-789")
+    asyncio.run(adapter.publish("topic", {"payload": "value"}))
+    assert adapter.history()
+
+    sys.modules.pop("sim_mode", None)
+    sys.modules.pop("shared.sim_mode", None)

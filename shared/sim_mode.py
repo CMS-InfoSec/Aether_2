@@ -787,5 +787,6 @@ __all__ = [
     "SimulatedOrderSnapshot",
     "SimulatedExecution",
     "sim_broker",
+    "KafkaNATSAdapter",
 ]
 
