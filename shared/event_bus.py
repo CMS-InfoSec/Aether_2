@@ -18,8 +18,13 @@ def _normalize_account_id(value: str | None) -> str:
 
     if value is None:
         return "default"
+
     candidate = value.strip()
-    return candidate or "default"
+    if not candidate:
+        return "default"
+
+    normalized = candidate.lower().replace(" ", "-")
+    return normalized or "default"
 
 
 def _adapter_dependencies_ready() -> tuple[bool, BaseException | None]:

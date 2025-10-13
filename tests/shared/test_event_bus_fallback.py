@@ -25,3 +25,19 @@ def test_event_bus_fallback_handles_missing_adapter(monkeypatch):
     assert adapter.history() == []
 
     sys.modules.pop("shared.event_bus", None)
+
+
+def test_event_bus_fallback_normalizes_account_ids(monkeypatch):
+    dummy_module = ModuleType("services.common.adapters")
+    monkeypatch.setitem(sys.modules, "services.common.adapters", dummy_module)
+    sys.modules.pop("shared.event_bus", None)
+
+    event_bus = importlib.import_module("shared.event_bus")
+
+    adapter = event_bus.KafkaNATSAdapter(account_id="  MASTER Account  ")
+    asyncio.run(adapter.publish("topic", {"value": 1}))
+
+    drained = asyncio.run(event_bus.KafkaNATSAdapter.flush_events())
+    assert drained == {"master-account": 1}
+
+    sys.modules.pop("shared.event_bus", None)
