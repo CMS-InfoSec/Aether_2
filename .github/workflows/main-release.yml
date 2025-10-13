@@ -25,8 +25,8 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install ruff black mypy pytest
+          python -m pip install -r requirements.txt
+          python -m pip install ruff black mypy pytest
 
       - name: Run Ruff
         run: ruff check .
@@ -62,7 +62,7 @@ jobs:
 
       - name: Build and push image
         id: publish
-        uses: int128/kaniko-action@v1
+        uses: int128/kaniko-action@v1.52.0
         with:
           push: true
           context: .
@@ -90,10 +90,12 @@ jobs:
       packages: write
     steps:
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3.4.0
+        uses: sigstore/cosign-installer@v3.5.0
 
       - name: Install Syft
-        uses: anchore/syft-action/download-syft@v0
+        uses: anchore/sbom-action/download-syft@v0.20.6
+        with:
+          syft-version: v1.33.0
 
       - name: Authenticate to GHCR
         uses: docker/login-action@v3
@@ -103,12 +105,10 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Scan image for vulnerabilities
-        uses: anchore/grype-action@v0
+        uses: anchore/scan-action@v7
         with:
           image: ${{ needs.build-image.outputs.image_ref }}@${{ needs.build-image.outputs.image_digest }}
-          fail-on-severity: critical
-          registry-username: ${{ github.actor }}
-          registry-password: ${{ secrets.GITHUB_TOKEN }}
+          severity-cutoff: critical
 
       - name: Generate SBOM
         env:
@@ -165,10 +165,10 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: python -m pip install --upgrade pip && pip install pyyaml
+        run: python -m pip install --upgrade pip && python -m pip install pyyaml
 
       - name: Authenticate to Vault
-        uses: hashicorp/vault-action@v2
+        uses: hashicorp/vault-action@v3
         with:
           url: ${{ secrets.VAULT_ADDR }}
           method: approle
@@ -187,9 +187,22 @@ jobs:
       - validate-externalsecrets
     steps:
       - name: Install Argo CD CLI
+        env:
+          ARGOCD_VERSION: v2.9.3
         run: |
-          curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
-          sudo install -m 755 argocd /usr/local/bin/argocd
+          set -euo pipefail
+          binary="argocd-linux-amd64"
+          base_url="https://github.com/argoproj/argo-cd/releases/download/${ARGOCD_VERSION}"
+          curl -fsSLo "${binary}" "${base_url}/${binary}"
+          curl -fsSLo cli_checksums.txt "${base_url}/cli_checksums.txt"
+          expected_sum="$(grep " ${binary}$" cli_checksums.txt | awk '{print $1}')"
+          if [ -z "${expected_sum}" ]; then
+            echo "Unable to determine checksum for ${binary}" >&2
+            exit 1
+          fi
+          echo "${expected_sum}  ${binary}" | sha256sum --check --status
+          sudo install -m 0755 "${binary}" /usr/local/bin/argocd
+          rm -f "${binary}" cli_checksums.txt
 
       - name: Argo CD login and sync
         env:
