@@ -46,6 +46,12 @@ jobs:
       - name: Type check backend
         run: mypy
 
+      - name: Run readiness smoke tests
+        env:
+          PYTHONWARNINGS: error
+        run: |
+          pytest tests/smoke/test_readyz_dependency_failures.py --maxfail=1 --strict-markers --strict-config --runxfail
+
       - name: Run pytest (full stack, fail on warnings/skips)
         env:
           PYTHONWARNINGS: error
