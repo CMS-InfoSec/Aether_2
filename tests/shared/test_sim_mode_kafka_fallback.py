@@ -9,6 +9,7 @@ def test_in_memory_kafka_adapter_enriches_events(monkeypatch):
 
     dummy_module = ModuleType("services.common.adapters")
     monkeypatch.setitem(sys.modules, "services.common.adapters", dummy_module)
+    sys.modules.pop("shared.event_bus", None)
     sys.modules.pop("shared.sim_mode", None)
 
     sim_mode = importlib.import_module("shared.sim_mode")
@@ -36,6 +37,7 @@ def test_in_memory_kafka_adapter_enriches_events(monkeypatch):
     assert drained == {"acct-123": 1}
     assert adapter.history() == []
 
+    sys.modules.pop("shared.event_bus", None)
     sys.modules.pop("shared.sim_mode", None)
 
 
@@ -61,6 +63,7 @@ def test_sim_mode_service_imports_without_adapters(monkeypatch):
 
     dummy_module = ModuleType("services.common.adapters")
     monkeypatch.setitem(sys.modules, "services.common.adapters", dummy_module)
+    sys.modules.pop("shared.event_bus", None)
     sys.modules.pop("shared.sim_mode", None)
     sys.modules.pop("sim_mode", None)
 
@@ -75,3 +78,4 @@ def test_sim_mode_service_imports_without_adapters(monkeypatch):
 
     sys.modules.pop("sim_mode", None)
     sys.modules.pop("shared.sim_mode", None)
+    sys.modules.pop("shared.event_bus", None)

@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from functools import partial
 from threading import Lock
-from typing import Any, Awaitable, ClassVar, Dict, Iterable, Iterator, List, Optional, Tuple, cast
+from typing import Any, Awaitable, Dict, Iterable, Iterator, List, Optional, Tuple, cast
 
 from sqlalchemy import (
     Boolean,
@@ -42,15 +42,8 @@ from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from common.schemas.contracts import FillEvent
-from common.utils.tracing import attach_correlation
-try:  # pragma: no cover - optional dependency for broker publishing
-    from services.common.adapters import KafkaNATSAdapter as _KafkaNATSAdapter
-except Exception as exc:  # pragma: no cover - exercised when adapters module unavailable
-    _KafkaNATSAdapter = None
-    _KAFKA_IMPORT_ERROR = exc
-else:  # pragma: no cover - executed when dependency available
-    _KAFKA_IMPORT_ERROR = None
 from shared.async_utils import dispatch_async
+from shared.event_bus import KafkaNATSAdapter
 from shared.postgres import normalize_sqlalchemy_dsn
 from shared.account_scope import account_id_column
 
