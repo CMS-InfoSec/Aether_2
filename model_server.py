@@ -19,6 +19,9 @@ try:  # pragma: no cover - mlflow is optional for local tests.
     from mlflow import pyfunc
     from mlflow.exceptions import MlflowException
     from mlflow.tracking import MlflowClient
+    from shared.mlflow_safe import harden_mlflow
+
+    harden_mlflow(mlflow)
 except Exception:  # pragma: no cover - graceful degradation when mlflow missing.
     mlflow = None  # type: ignore
     pyfunc = None  # type: ignore
