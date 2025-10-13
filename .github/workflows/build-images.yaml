@@ -34,7 +34,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build Risk API Image
-        uses: int128/kaniko-action@v1
+        uses: int128/kaniko-action@v1.52.0
         with:
           push: true
           context: .
@@ -69,7 +69,7 @@ if missing:
 print("Verified critical Python modules:", ", ".join(modules))
 PY
       - name: Build Ingestor Image
-        uses: int128/kaniko-action@v1
+        uses: int128/kaniko-action@v1.52.0
         with:
           push: true
           context: .
@@ -132,11 +132,15 @@ PY
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Install Buildah and Syft
+      - name: Install Buildah
         run: |
           sudo apt-get update
           sudo apt-get install -y buildah
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Download Syft
+        uses: anchore/sbom-action/download-syft@v0.20.6
+        with:
+          syft-version: v1.33.0
       - name: Build Risk API with Buildah
         run: |
           buildah bud -f deploy/docker/risk-api/Dockerfile -t ghcr.io/aether/risk-api:${{ github.sha }} .
