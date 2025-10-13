@@ -107,7 +107,6 @@ jobs:
         with:
           image: ${{ needs.build-image.outputs.image_ref }}@${{ needs.build-image.outputs.image_digest }}
           severity-cutoff: critical
-          fail-build: true
 
       - name: Generate SBOM
         env:
