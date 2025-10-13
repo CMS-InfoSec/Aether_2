@@ -207,6 +207,16 @@ managedSecrets:
       type: opaque
       data:
         encryptionKey: change-me-account-secret
+    auth-service-config:
+      type: postgresDsn
+      dsnKey: AUTH_DATABASE_URL
+      connection:
+        database: auth_service
+        username: auth_service
+        password: auth-service-password
+        sslmode: require
+      additionalData:
+        AUTH_JWT_SECRET: change-me-jwt-secret
     advisor-service-database:
       type: postgresDsn
       connection:
@@ -234,6 +244,20 @@ managedSecrets:
         database: capital_flow_service
         username: capital_flow_service
         password: capital-flow-service-password
+        sslmode: require
+    capital-allocator-database:
+      type: postgresDsn
+      connection:
+        database: capital_allocator
+        username: capital_allocator
+        password: capital-allocator-password
+        sslmode: require
+    config-service-database:
+      type: postgresDsn
+      connection:
+        database: config_service
+        username: config_service
+        password: config-service-password
         sslmode: require
     fees-service-database:
       type: postgresDsn
@@ -281,6 +305,13 @@ managedSecrets:
         username: sim_mode
         password: sim-mode-password
         sslmode: require
+    strategy-orchestrator-database:
+      type: postgresDsn
+      connection:
+        database: strategy_orchestrator
+        username: strategy_orchestrator
+        password: strategy-orchestrator-password
+        sslmode: require
     training-service-database:
       type: postgresDsn
       connection:
@@ -316,6 +347,61 @@ runtimeSafety:
   _ALLOW_INSECURE_DEFAULTS: false
 
 backendServices:
+  auth:
+    enabled: true
+    nameOverride: auth-service
+    image:
+      repository: ghcr.io/aether/auth-service
+      tag: latest
+    replicaCount: 3
+    containerPort: 8000
+    serviceAccountName: api-services
+    envFrom:
+      - secretRef:
+          name: auth-service-config
+    env:
+      - name: AUTH_DATABASE_SCHEMA
+        value: auth
+      - name: AUTH_DATABASE_POOL_SIZE
+        value: "10"
+      - name: AUTH_DATABASE_MAX_OVERFLOW
+        value: "20"
+      - name: AUTH_DATABASE_POOL_TIMEOUT_SECONDS
+        value: "30"
+      - name: AUTH_DATABASE_POOL_RECYCLE_SECONDS
+        value: "300"
+    usesKrakenSecrets: false
+    extraVolumeMounts: []
+    extraVolumes: []
+    service:
+      port: 80
+      targetPort: http
+    ingress:
+      enabled: true
+      host: auth.aether.example.com
+      tlsSecret: auth-service-tls
+      annotations: {}
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    hpa:
+      enabled: true
+      minReplicas: 3
+      maxReplicas: 6
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 60
+    pdb:
+      enabled: true
+      maxUnavailable: 1
   accountService:
     enabled: true
     nameOverride: account-service
@@ -536,6 +622,58 @@ backendServices:
     pdb:
       enabled: true
       maxUnavailable: 1
+  capitalAllocator:
+    enabled: true
+    nameOverride: capital-allocator
+    image:
+      repository: ghcr.io/aether/capital-allocator
+      tag: latest
+    replicaCount: 2
+    containerPort: 8000
+    env:
+      - name: CAPITAL_ALLOCATOR_DB_URL
+        valueFrom:
+          secretKeyRef:
+            name: capital-allocator-database
+            key: dsn
+      - name: CAPITAL_ALLOCATOR_SSLMODE
+        valueFrom:
+          secretKeyRef:
+            name: capital-allocator-database
+            key: sslmode
+            optional: true
+    usesKrakenSecrets: false
+    extraVolumeMounts: []
+    extraVolumes: []
+    service:
+      port: 80
+      targetPort: http
+    ingress:
+      enabled: false
+      host: ""
+      tlsSecret: ""
+      annotations: {}
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 4
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 60
+    pdb:
+      enabled: true
+      maxUnavailable: 1
   capitalFlow:
     enabled: true
     nameOverride: capital-flow-service
@@ -606,6 +744,57 @@ backendServices:
           stabilizationWindowSeconds: 60
         scaleDown:
           stabilizationWindowSeconds: 120
+    pdb:
+      enabled: true
+      maxUnavailable: 1
+  config:
+    enabled: true
+    nameOverride: config-service
+    image:
+      repository: ghcr.io/aether/config-service
+      tag: latest
+    replicaCount: 2
+    containerPort: 8000
+    env:
+      - name: CONFIG_DATABASE_URL
+        valueFrom:
+          secretKeyRef:
+            name: config-service-database
+            key: dsn
+      - name: CONFIG_DB_SSLMODE
+        valueFrom:
+          secretKeyRef:
+            name: config-service-database
+            key: sslmode
+    usesKrakenSecrets: false
+    extraVolumeMounts: []
+    extraVolumes: []
+    service:
+      port: 80
+      targetPort: http
+    ingress:
+      enabled: true
+      host: config.aether.example.com
+      tlsSecret: config-service-tls
+      annotations: {}
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 4
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 60
     pdb:
       enabled: true
       maxUnavailable: 1
@@ -1081,6 +1270,58 @@ backendServices:
           stabilizationWindowSeconds: 60
         scaleDown:
           stabilizationWindowSeconds: 60
+    pdb:
+      enabled: true
+      maxUnavailable: 1
+  strategyOrchestrator:
+    enabled: true
+    nameOverride: strategy-orchestrator
+    image:
+      repository: ghcr.io/aether/strategy-orchestrator
+      tag: latest
+    replicaCount: 2
+    containerPort: 8000
+    env:
+      - name: STRATEGY_DATABASE_URL
+        valueFrom:
+          secretKeyRef:
+            name: strategy-orchestrator-database
+            key: dsn
+      - name: STRATEGY_DB_SSLMODE
+        valueFrom:
+          secretKeyRef:
+            name: strategy-orchestrator-database
+            key: sslmode
+            optional: true
+    usesKrakenSecrets: false
+    extraVolumeMounts: []
+    extraVolumes: []
+    service:
+      port: 80
+      targetPort: http
+    ingress:
+      enabled: true
+      host: strategy.aether.example.com
+      tlsSecret: strategy-orchestrator-tls
+      annotations: {}
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 600m
+        memory: 1Gi
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 5
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 60
     pdb:
       enabled: true
       maxUnavailable: 1

@@ -80,6 +80,18 @@
                 "image": {
                     "$ref": "#/$defs/image"
                 },
+                "serviceAccountName": {
+                    "type": "string",
+                    "description": "Optional service account bound to the generated Deployment."
+                },
+                "envFrom": {
+                    "type": "array",
+                    "description": "Environment sources projected with envFrom, useful for opaque configuration secrets.",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                    }
+                },
                 "resources": {
                     "$ref": "#/$defs/resources"
                 }

@@ -54,6 +54,9 @@ spec:
     spec:
       securityContext:
         {{- toYaml $global.podSecurityContext | nindent 8 }}
+      {{- if $svc.serviceAccountName }}
+      serviceAccountName: {{ $svc.serviceAccountName }}
+      {{- end }}
       containers:
         - name: {{ $name }}
           image: {{ include "aether-platform.image" $svc.image }}
@@ -61,11 +64,16 @@ spec:
           ports:
             - containerPort: {{ $svc.containerPort | default 8000 }}
               name: http
+          {{- $extraEnvFrom := $svc.envFrom | default (list) -}}
           {{- $extraEnv := $svc.env | default (list) -}}
           {{- $sessionRedis := include "aether-platform.redisUrl" $ -}}
           {{- $releaseManifest := $global.releaseManifest | default (dict) -}}
           {{- $releaseManifestEnabled := and ($releaseManifest.enabled | default false) $releaseManifest.databaseSecretName -}}
           {{- $envEnabled := or $hasKraken (gt (len $extraEnv) 0) (ne $sessionRedis "") $releaseManifestEnabled -}}
+          {{- if gt (len $extraEnvFrom) 0 }}
+          envFrom:
+            {{- toYaml $extraEnvFrom | nindent 12 }}
+          {{- end }}
           {{- if $envEnabled }}
           env:
             {{- if $hasKraken }}

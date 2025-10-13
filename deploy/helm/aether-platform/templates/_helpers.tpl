@@ -97,10 +97,11 @@ app: {{ .name }}
 {{- $redis := .Values.dependencies.redis -}}
 {{- $service := include "aether-platform.redisServiceName" . -}}
 {{- $password := $redis.auth.password | default "" -}}
+{{- $redisPort := $redis.master.service.ports.redis | default 6379 -}}
 {{- if and ($redis.auth.enabled | default false) (ne $password "") -}}
-{{- printf "redis://:%s@%s.%s.svc.cluster.local:%v/0" (urlquery $password) $service .Release.Namespace ($redis.master.service.ports.redis | default 6379) -}}
+{{- printf "redis://:%s@%s.%s.svc.cluster.local:%v/0" (urlquery $password) $service .Release.Namespace $redisPort -}}
 {{- else -}}
-{{- printf "redis://%s.%s.svc.cluster.local:%v/0" $service .Release.Namespace ($redis.master.service.ports.redis | default 6379) -}}
+{{- printf "redis://%s.%s.svc.cluster.local:%v/0" $service .Release.Namespace $redisPort -}}
 {{- end -}}
 {{- else -}}
 {{- $session.redisUrl | default "" -}}

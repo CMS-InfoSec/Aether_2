@@ -91,10 +91,14 @@ if you disable optional services.
 |-------------|---------------|---------|
 | `account-service-database` | `dsn` | SQLAlchemy DSN for account storage.【F:deploy/helm/aether-platform/values.yaml†L188-L215】 |
 | `account-service-secrets` | `encryptionKey` | Fernet key for customer data encryption.【F:deploy/helm/aether-platform/values.yaml†L180-L209】 |
-| `behavior-service-database` | `dsn` | Behavior analytics database DSN.【F:deploy/helm/aether-platform/values.yaml†L218-L263】 |
+| `auth-service-config` | `AUTH_DATABASE_URL`, `AUTH_JWT_SECRET` | Login API DSN plus JWT signing secret.【F:deploy/helm/aether-platform/values.yaml†L204-L221】 |
+| `behavior-service-database` | `dsn` | Behavior analytics database DSN.【F:deploy/helm/aether-platform/values.yaml†L223-L268】 |
+| `capital-allocator-database` | `dsn` | Capital allocation database used by the allocator service.【F:deploy/helm/aether-platform/values.yaml†L240-L252】 |
+| `config-service-database` | `dsn` | Configuration service DSN used by migrations and runtime APIs.【F:deploy/helm/aether-platform/values.yaml†L253-L265】 |
 | `kraken-keys-*` | `credentials.json` | Kraken trading credentials for company/directors when Kraken access is enabled.【F:deploy/helm/aether-platform/values.yaml†L19-L60】 |
 | `platform-account-allowlists` | `admins`, `directors` | Account-level access control lists consumed by the services.【F:deploy/helm/aether-platform/values.yaml†L61-L78】 |
-| `release-manifest-database` | `dsn` | TimescaleDB DSN for release manifest auditing.【F:deploy/helm/aether-platform/values.yaml†L42-L55】 |
+| `release-manifest-database` | `dsn` | TimescaleDB DSN for release manifest auditing.【F:deploy/helm/aether-platform/values.yaml†L333-L341】 |
+| `strategy-orchestrator-database` | `dsn` | Strategy orchestration datastore DSN.【F:deploy/helm/aether-platform/values.yaml†L307-L319】 |
 
 Create the secrets with `kubectl create secret` or configure External Secrets so
 Lens shows them as ready before you install the chart. Make sure TLS secrets for
