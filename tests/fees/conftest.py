@@ -72,6 +72,8 @@ def fees_test_database(tmp_path_factory: pytest.TempPathFactory) -> None:
     fee_service.ENGINE = engine
     fee_service.SessionLocal = session_factory
     fee_service.DATABASE_URL = url
+    fee_service.app.state.db_engine = engine
+    fee_service.app.state.db_sessionmaker = session_factory
     fee_service.Base.metadata.drop_all(bind=engine)
     fee_service.Base.metadata.create_all(bind=engine)
 

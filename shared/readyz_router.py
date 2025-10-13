@@ -7,8 +7,27 @@ from collections import OrderedDict
 from typing import Any, Awaitable, Callable, Mapping
 
 from fastapi import APIRouter
-from fastapi.responses import JSONResponse
-from starlette import status
+
+try:  # pragma: no cover - fallback for lightweight FastAPI stubs
+    from fastapi.responses import JSONResponse
+except Exception:  # pragma: no cover - degrade gracefully when dependencies missing
+    class JSONResponse:  # type: ignore[no-redef]
+        """Minimal stand-in used when FastAPI dependencies are unavailable."""
+
+        def __init__(self, content: dict[str, Any], status_code: int = 200) -> None:
+            self.content = content
+            self.status_code = status_code
+
+        def __iter__(self):  # pragma: no cover - compatibility shim
+            yield from self.content
+try:  # pragma: no cover - prefer Starlette when available
+    from starlette import status
+except Exception:  # pragma: no cover - minimal constants for lightweight tests
+    class _StatusCodes:
+        HTTP_200_OK = 200
+        HTTP_503_SERVICE_UNAVAILABLE = 503
+
+    status = _StatusCodes()  # type: ignore[assignment]
 
 from .readiness import ReadinessProbeError
 
@@ -26,6 +45,8 @@ class ReadyzRouter:
 
     def __init__(self) -> None:
         self._router = APIRouter()
+        if not hasattr(self._router, "prefix"):  # pragma: no cover - compatibility with stubs
+            setattr(self._router, "prefix", "")
         self._probes: "OrderedDict[str, ProbeCallable]" = OrderedDict()
 
         @self._router.get("/readyz", include_in_schema=False)
