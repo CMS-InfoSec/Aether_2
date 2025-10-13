@@ -11,68 +11,31 @@ import os
 from datetime import datetime, timezone
 from time import perf_counter
 from types import SimpleNamespace
-from typing import Any, Awaitable, Callable, Dict, Generator, Iterable, Optional
+from typing import Any, Awaitable, Callable, Dict, Generator, Iterable, Iterator, Optional
 from uuid import uuid4
 
 from fastapi import FastAPI, Request, Response
 
+CollectorRegistry: Any
+Counter: Callable[..., Any]
+Gauge: Callable[..., Any]
+Histogram: Callable[..., Any]
+generate_latest: Callable[..., bytes]
+start_http_server: Callable[..., None]
+BaseHTTPMiddleware: Any
+
 try:  # pragma: no cover - prometheus client may be unavailable in lightweight tests
     from prometheus_client import (
         CONTENT_TYPE_LATEST,
-        CollectorRegistry,
-        Counter,
-        Gauge,
-        Histogram,
-        generate_latest,
-        start_http_server,
+        CollectorRegistry as _PromCollectorRegistry,
+        Counter as _PromCounter,
+        Gauge as _PromGauge,
+        Histogram as _PromHistogram,
+        generate_latest as _prom_generate_latest,
+        start_http_server as _prom_start_http_server,
     )
 except ImportError:  # pragma: no cover - provide a no-op metrics backend
-    CONTENT_TYPE_LATEST = "text/plain; version=0.0.4"  # type: ignore[assignment]
-
-    class CollectorRegistry:  # type: ignore[override]
-        """Lightweight registry compatible with the Prometheus client interface."""
-
-        def __init__(self) -> None:
-            self._collectors: Dict[int, object] = {}
-            self._names_to_collectors: Dict[str, object] = {}
-
-        def register(self, collector: object) -> None:
-            self._collectors[id(collector)] = collector
-            name = getattr(collector, "_name", None)
-            if isinstance(name, str):
-                self._names_to_collectors[name] = collector
-
-        def unregister(self, collector: object) -> None:
-            self._collectors.pop(id(collector), None)
-            name = getattr(collector, "_name", None)
-            if isinstance(name, str):
-                self._names_to_collectors.pop(name, None)
-
-        def collect(self):  # pragma: no cover - used in optional dependency paths
-            for collector in list(self._collectors.values()):
-                if hasattr(collector, "collect"):
-                    yield from collector.collect()
-
-        def get_sample_value(
-            self, name: str, labels: Optional[Dict[str, str]] = None
-        ) -> float | None:
-            collector = self._names_to_collectors.get(name)
-            if collector is None:
-                for candidate in self._collectors.values():
-                    if getattr(candidate, "_name", None) == name:
-                        collector = candidate
-                        break
-            if collector is None or not hasattr(collector, "collect"):
-                return None
-            for family in collector.collect():
-                samples = getattr(family, "samples", [])
-                for sample in samples:
-                    if labels:
-                        if all(sample.labels.get(k) == v for k, v in labels.items()):
-                            return sample.value
-                    else:
-                        return sample.value
-            return None
+    CONTENT_TYPE_LATEST = "text/plain; version=0.0.4"
 
     @dataclass
     class _Sample:
@@ -87,7 +50,7 @@ except ImportError:  # pragma: no cover - provide a no-op metrics backend
             documentation: str,
             labelnames: Optional[Iterable[str]] = None,
             *,
-            registry: CollectorRegistry | None = None,
+            registry: "CollectorRegistry" | None = None,
             **_: Any,
         ) -> None:
             self._name = name
@@ -126,7 +89,7 @@ except ImportError:  # pragma: no cover - provide a no-op metrics backend
         def observe(self, value: float) -> None:
             self.set(value)
 
-        def collect(self):  # pragma: no cover - exercised via registry.collect
+        def collect(self) -> Iterator[SimpleNamespace]:  # pragma: no cover - exercised via registry.collect
             samples = [
                 _Sample(
                     name=self._name,
@@ -137,30 +100,89 @@ except ImportError:  # pragma: no cover - provide a no-op metrics backend
             ]
             yield SimpleNamespace(name=self._name, documentation=self._documentation, samples=samples)
 
-    def Counter(name: str, documentation: str, labelnames=(), **kwargs: Any) -> _Metric:  # type: ignore[override]
+    class _FallbackCollectorRegistry:
+        """Lightweight registry compatible with the Prometheus client interface."""
+
+        def __init__(self) -> None:
+            self._collectors: Dict[int, _Metric] = {}
+            self._names_to_collectors: Dict[str, _Metric] = {}
+
+        def register(self, collector: _Metric) -> None:
+            self._collectors[id(collector)] = collector
+            name = getattr(collector, "_name", None)
+            if isinstance(name, str):
+                self._names_to_collectors[name] = collector
+
+        def unregister(self, collector: _Metric) -> None:
+            self._collectors.pop(id(collector), None)
+            name = getattr(collector, "_name", None)
+            if isinstance(name, str):
+                self._names_to_collectors.pop(name, None)
+
+        def collect(self) -> Iterator[SimpleNamespace]:  # pragma: no cover - used in optional dependency paths
+            for collector in list(self._collectors.values()):
+                yield from collector.collect()
+
+        def get_sample_value(
+            self, name: str, labels: Optional[Dict[str, str]] = None
+        ) -> float | None:
+            collector = self._names_to_collectors.get(name)
+            if collector is None:
+                for candidate in self._collectors.values():
+                    if getattr(candidate, "_name", None) == name:
+                        collector = candidate
+                        break
+            if collector is None:
+                return None
+            for family in collector.collect():
+                samples = getattr(family, "samples", [])
+                for sample in samples:
+                    if labels:
+                        if all(sample.labels.get(k) == v for k, v in labels.items()):
+                            return sample.value
+                    else:
+                        return sample.value
+            return None
+
+    def Counter(name: str, documentation: str, labelnames=(), **kwargs: Any) -> _Metric:
         return _Metric(name, documentation, labelnames, **kwargs)
 
-    def Gauge(name: str, documentation: str, labelnames=(), **kwargs: Any) -> _Metric:  # type: ignore[override]
+    def Gauge(name: str, documentation: str, labelnames=(), **kwargs: Any) -> _Metric:
         return _Metric(name, documentation, labelnames, **kwargs)
 
-    def Histogram(name: str, documentation: str, labelnames=(), **kwargs: Any) -> _Metric:  # type: ignore[override]
+    def Histogram(name: str, documentation: str, labelnames=(), **kwargs: Any) -> _Metric:
         return _Metric(name, documentation, labelnames, **kwargs)
 
-    def generate_latest(*args: Any, **kwargs: Any) -> bytes:  # type: ignore[override]
+    def generate_latest(*args: Any, **kwargs: Any) -> bytes:
         return b""
 
-    def start_http_server(*args: Any, **kwargs: Any) -> None:  # type: ignore[override]
-        logger = logging.getLogger(__name__)
-        logger.warning("prometheus_client.start_http_server unavailable; exporter disabled")
+    def start_http_server(*args: Any, **kwargs: Any) -> None:
+        logging.getLogger(__name__).warning(
+            "prometheus_client.start_http_server unavailable; exporter disabled"
+        )
+    CollectorRegistry = _FallbackCollectorRegistry
+else:
+    CollectorRegistry = _PromCollectorRegistry
+    Counter = _PromCounter
+    Gauge = _PromGauge
+    Histogram = _PromHistogram
+    generate_latest = _prom_generate_latest
+    start_http_server = _prom_start_http_server
 try:  # pragma: no cover - optional dependency in lightweight test environments
-    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.middleware.base import BaseHTTPMiddleware as _BaseHTTPMiddleware
 except ImportError:  # pragma: no cover - exercised in unit-only environments
-    class BaseHTTPMiddleware:  # type: ignore[override]
+    class _FallbackBaseHTTPMiddleware:
         def __init__(self, app: Any) -> None:
             self.app = app
 
-        async def dispatch(self, request: Request, call_next: Callable[[Request], Awaitable[Response]]):  # type: ignore[override]
+        async def dispatch(
+            self, request: Request, call_next: Callable[[Request], Awaitable[Response]]
+        ) -> Response:
             return await call_next(request)
+
+    BaseHTTPMiddleware = _FallbackBaseHTTPMiddleware
+else:
+    BaseHTTPMiddleware = _BaseHTTPMiddleware
 
 try:  # pragma: no cover - OpenTelemetry may be optional in some deployments
     from opentelemetry import trace
@@ -675,7 +697,7 @@ _risk_marketdata_latest_timestamp_seconds = Gauge(
     registry=_REGISTRY,
 )
 
-_METRICS: Dict[str, Counter | Gauge | Histogram] = {
+_METRICS: Dict[str, Any] = {
     "trades_submitted_total": _trades_submitted_total,
     "trades_rejected_total": _trades_rejected_total,
     "trade_rejections_total": _trade_rejections_total,
@@ -952,7 +974,7 @@ class RequestTracingMiddleware(BaseHTTPMiddleware):
             _REQUEST_ID.reset(token)
 
 
-def init_metrics(service_name: str = "service") -> Dict[str, Counter | Gauge | Histogram]:
+def init_metrics(service_name: str = "service") -> Dict[str, Any]:
     """Initialise metrics once and store the configured service name."""
 
     global _INITIALISED, _SERVICE_NAME
