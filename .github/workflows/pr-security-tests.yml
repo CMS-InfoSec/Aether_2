@@ -26,13 +26,17 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install ".[test]"
-          pip install bandit ruff mypy pytest-cov
+          python -m pip install ".[test]"
+          python -m pip install bandit ruff mypy pytest-cov
 
       - name: Install Gitleaks
+        env:
+          GITLEAKS_VERSION: v8.28.0
         run: |
-          curl -sSfL https://raw.githubusercontent.com/gitleaks/gitleaks/master/install.sh \
-            | sh -s -- -b "$(pwd)/bin"
+          set -euo pipefail
+          mkdir -p bin
+          curl -sSfL "https://raw.githubusercontent.com/gitleaks/gitleaks/${GITLEAKS_VERSION}/install.sh" \
+            | sh -s -- -b "$(pwd)/bin" "${GITLEAKS_VERSION}"
           echo "$(pwd)/bin" >> "$GITHUB_PATH"
 
       - name: Run Gitleaks secret scan
@@ -66,22 +70,23 @@ jobs:
         run: |
           if [ -f coverage.xml ]; then
             total=$(python - <<'PY'
-import xml.etree.ElementTree as ET
-from decimal import Decimal, ROUND_HALF_UP
-root = ET.parse("coverage.xml").getroot()
-rate = Decimal(root.get('line-rate', '0')) * Decimal(100)
-print(rate.quantize(Decimal('0.1'), rounding=ROUND_HALF_UP))
-PY
-)
+            import xml.etree.ElementTree as ET
+            from decimal import Decimal, ROUND_HALF_UP
+
+            root = ET.parse("coverage.xml").getroot()
+            rate = Decimal(root.get('line-rate', '0')) * Decimal(100)
+            print(rate.quantize(Decimal('0.1'), rounding=ROUND_HALF_UP))
+            PY
+            )
           else
             total="N/A"
           fi
           echo "total=$total" >> "$GITHUB_OUTPUT"
 
       - name: Download Syft
-        uses: anchore/sbom-action/download-syft@v0.15.4
+        uses: anchore/sbom-action/download-syft@v0.20.6
         with:
-          syft-version: v1.17.0
+          syft-version: v1.33.0
 
       - name: Generate SBOM
         run: syft dir:. -o json > sbom.json
@@ -96,7 +101,7 @@ PY
 
       - name: Run Trivy filesystem scan
         id: trivy_scan
-        uses: aquasecurity/trivy-action@v0.20.0
+        uses: aquasecurity/trivy-action@0.33.1
         with:
           scan-type: fs
           format: json
@@ -152,20 +157,20 @@ PY
           fi
 
           cat <<'COMMENT' > pr-comment.md
-### Automated Security & Test Summary
+          ### Automated Security & Test Summary
 
-| Check | Result |
-| --- | --- |
-| Gitleaks | GITLEAKS_STATUS |
-| Bandit | BANDIT_STATUS |
-| Ruff | RUFF_STATUS |
-| MyPy | MYPY_STATUS |
-| Pytest (coverage) | PYTEST_STATUS (Coverage: COVERAGE%) |
+          | Check | Result |
+          | --- | --- |
+          | Gitleaks | GITLEAKS_STATUS |
+          | Bandit | BANDIT_STATUS |
+          | Ruff | RUFF_STATUS |
+          | MyPy | MYPY_STATUS |
+          | Pytest (coverage) | PYTEST_STATUS (Coverage: COVERAGE%) |
 
-**Vulnerabilities**
-- Total: TOTAL_VULNS
-- Critical: CRITICAL_VULNS
-COMMENT
+          **Vulnerabilities**
+          - Total: TOTAL_VULNS
+          - Critical: CRITICAL_VULNS
+          COMMENT
 
           sed -i "s/GITLEAKS_STATUS/$gitleaks_status/" pr-comment.md
           sed -i "s/BANDIT_STATUS/$bandit_status/" pr-comment.md
