@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Run Trivy config scan
-        uses: aquasecurity/trivy-action@v0.17.0
+        uses: aquasecurity/trivy-action@v0.33.1
         with:
           scan-type: config
           format: table
@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Run Trivy FS scan
-        uses: aquasecurity/trivy-action@v0.17.0
+        uses: aquasecurity/trivy-action@v0.33.1
         with:
           scan-type: fs
           format: table

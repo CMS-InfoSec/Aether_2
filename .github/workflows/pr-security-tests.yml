@@ -30,9 +30,13 @@ jobs:
           pip install bandit ruff mypy pytest-cov
 
       - name: Install Gitleaks
+        env:
+          GITLEAKS_VERSION: v8.28.0
         run: |
-          curl -sSfL https://raw.githubusercontent.com/gitleaks/gitleaks/master/install.sh \
-            | sh -s -- -b "$(pwd)/bin"
+          set -euo pipefail
+          mkdir -p bin
+          curl -sSfL "https://raw.githubusercontent.com/gitleaks/gitleaks/${GITLEAKS_VERSION}/install.sh" \
+            | sh -s -- -b "$(pwd)/bin" "${GITLEAKS_VERSION}"
           echo "$(pwd)/bin" >> "$GITHUB_PATH"
 
       - name: Run Gitleaks secret scan
@@ -79,9 +83,9 @@ PY
           echo "total=$total" >> "$GITHUB_OUTPUT"
 
       - name: Download Syft
-        uses: anchore/sbom-action/download-syft@v0.15.4
+        uses: anchore/sbom-action/download-syft@v0.20.6
         with:
-          syft-version: v1.17.0
+          syft-version: v1.33.0
 
       - name: Generate SBOM
         run: syft dir:. -o json > sbom.json
@@ -96,7 +100,7 @@ PY
 
       - name: Run Trivy filesystem scan
         id: trivy_scan
-        uses: aquasecurity/trivy-action@v0.20.0
+        uses: aquasecurity/trivy-action@v0.33.1
         with:
           scan-type: fs
           format: json
