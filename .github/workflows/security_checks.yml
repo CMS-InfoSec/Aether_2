@@ -15,7 +15,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -70,7 +70,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Run Trivy filesystem scan
-        uses: aquasecurity/trivy-action@v0.14.0
+        uses: aquasecurity/trivy-action@v0.21.0
         with:
           scan-type: "fs"
           ignore-unfixed: true
@@ -86,10 +86,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Conftest
-        uses: open-policy-agent/setup-conftest@v1
-        with:
-          version: latest
+      - name: Install Conftest
+        env:
+          CONFTEST_VERSION: v0.63.0
+        run: |
+          set -euo pipefail
+          archive="conftest_${CONFTEST_VERSION#v}_Linux_x86_64.tar.gz"
+          curl -sSL -o "${archive}" "https://github.com/open-policy-agent/conftest/releases/download/${CONFTEST_VERSION}/${archive}"
+          tar -xzf "${archive}" conftest
+          sudo mv conftest /usr/local/bin/
+          rm -f "${archive}"
+          conftest --version
 
       - name: Run OPA policies against Kubernetes manifests
         run: |
