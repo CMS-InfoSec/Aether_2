@@ -1,0 +1,139 @@
+{{- $global := .Values.global -}}
+{{- $pipelines := .Values.dataPipelines | default (dict) -}}
+{{- if and ($pipelines.enabled | default true) ($pipelines.deployments) }}
+{{- $promGlobal := $global.prometheus | default (dict) -}}
+{{- $promDefaultEnabled := ternary $promGlobal.enabled true (hasKey $promGlobal "enabled") -}}
+{{- $promDefaultPath := $promGlobal.path | default "/metrics" -}}
+{{- $promDefaultPort := $promGlobal.port | default "http" -}}
+{{- $promDefaultScheme := $promGlobal.scheme | default "http" -}}
+{{- range $pipelineName, $pipeline := $pipelines.deployments }}
+{{- if $pipeline.enabled | default true }}
+{{- $name := default $pipelineName $pipeline.nameOverride -}}
+{{- $labels := dict "name" $name "Release" $.Release -}}
+{{- $svcProm := $pipeline.prometheus | default (dict) -}}
+{{- $promEnabled := ternary $svcProm.enabled $promDefaultEnabled (hasKey $svcProm "enabled") -}}
+{{- $promPath := $svcProm.path | default $promDefaultPath -}}
+{{- $promPort := $svcProm.port | default $promDefaultPort -}}
+{{- $promScheme := $svcProm.scheme | default $promDefaultScheme -}}
+{{- $annotations := dict -}}
+{{- if and $promEnabled (ne $promEnabled false) }}
+{{- $_ := set $annotations "prometheus.io/scrape" "true" -}}
+{{- $_ := set $annotations "prometheus.io/path" $promPath -}}
+{{- $_ := set $annotations "prometheus.io/port" (printf "%v" $promPort) -}}
+{{- $_ := set $annotations "prometheus.io/scheme" $promScheme -}}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "aether-platform.labels" $labels | nindent 4 }}
+    app: {{ $name }}
+spec:
+  replicas: {{ $pipeline.replicaCount | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "aether-platform.selectorLabels" (dict "name" $name) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "aether-platform.selectorLabels" (dict "name" $name) | nindent 8 }}
+        {{- include "aether-platform.labels" $labels | nindent 8 }}
+      {{- if gt (len $annotations) 0 }}
+      annotations:
+        {{- range $key, $value := $annotations }}
+        {{ $key }}: {{ $value | quote }}
+        {{- end }}
+      {{- end }}
+    spec:
+      securityContext:
+        {{- toYaml $global.podSecurityContext | nindent 8 }}
+      {{- if $pipeline.serviceAccountName }}
+      serviceAccountName: {{ $pipeline.serviceAccountName }}
+      {{- end }}
+      {{- with $pipeline.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $pipeline.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ $name }}
+          image: {{ include "aether-platform.image" $pipeline.image }}
+          imagePullPolicy: {{ default $global.imagePullPolicy $pipeline.imagePullPolicy }}
+          {{- with $pipeline.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $pipeline.args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $pipeline.ports }}
+          ports:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $pipeline.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $pipeline.env }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $pipeline.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- else }}
+          {{- if $global.probes.readiness }}
+          readinessProbe:
+            {{- toYaml $global.probes.readiness | nindent 12 }}
+          {{- end }}
+          {{- end }}
+          {{- with $pipeline.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- else }}
+          {{- if $global.probes.liveness }}
+          livenessProbe:
+            {{- toYaml $global.probes.liveness | nindent 12 }}
+          {{- end }}
+          {{- end }}
+          resources:
+            {{- toYaml $pipeline.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: {{ $global.containerSecurityContext.allowPrivilegeEscalation }}
+            readOnlyRootFilesystem: {{ $global.containerSecurityContext.readOnlyRootFilesystem }}
+            {{- with $global.containerSecurityContext.capabilities }}
+            capabilities:
+              {{- with .drop }}
+              drop:
+                {{- range . }}
+                - {{ . }}
+                {{- end }}
+              {{- end }}
+              {{- with omit . "drop" }}
+              {{- toYaml . | nindent 14 }}
+              {{- end }}
+            {{- end }}
+            {{- with omit $global.containerSecurityContext "allowPrivilegeEscalation" "readOnlyRootFilesystem" "capabilities" }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- with $pipeline.volumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- with $pipeline.volumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+---
+{{- end }}
+{{- end }}
+{{- end }}

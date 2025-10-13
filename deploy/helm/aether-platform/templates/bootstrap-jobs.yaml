@@ -1,0 +1,269 @@
+{{- $bootstrap := .Values.bootstrap | default (dict) -}}
+{{- if $bootstrap.enabled | default true -}}
+{{- $global := .Values.global -}}
+{{- $image := $bootstrap.image | default (dict) -}}
+{{- $workingDir := $bootstrap.workingDir | default "/app" -}}
+{{- $pullPolicy := $global.imagePullPolicy | default "IfNotPresent" -}}
+{{- $podSecurityContext := $global.podSecurityContext | default (dict) -}}
+{{- $containerSecurityContext := $global.containerSecurityContext | default (dict) -}}
+{{- $defaultResources := $bootstrap.resources | default (dict) -}}
+{{- $defaultBackoff := $bootstrap.backoffLimit | default 0 -}}
+{{- $defaultTtl := $bootstrap.ttlSecondsAfterFinished | default nil -}}
+{{- $defaultServiceAccount := $bootstrap.serviceAccountName | default "" -}}
+
+{{- if $bootstrap.config.enabled | default false -}}
+{{- $cfg := $bootstrap.config -}}
+{{- $cfgJobName := $cfg.jobName | default "config-bootstrap" -}}
+{{- $cfgFullName := printf "%s-%s" $.Release.Name $cfgJobName | trunc 63 | trimSuffix "-" -}}
+{{- $cfgLabels := dict "name" $cfgFullName "Release" $.Release -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $cfgFullName }}
+  labels:
+    {{- include "aether-platform.labels" $cfgLabels | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    "helm.sh/hook-weight": "10"
+    {{- with $cfg.jobAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  backoffLimit: {{ $cfg.backoffLimit | default $defaultBackoff }}
+  {{- if $cfg.ttlSecondsAfterFinished | default $defaultTtl }}
+  ttlSecondsAfterFinished: {{ $cfg.ttlSecondsAfterFinished | default $defaultTtl }}
+  {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- include "aether-platform.labels" $cfgLabels | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      {{- $cfgSa := $cfg.serviceAccountName | default $defaultServiceAccount }}
+      {{- if $cfgSa }}
+      serviceAccountName: {{ $cfgSa }}
+      {{- end }}
+      {{- if $podSecurityContext }}
+      securityContext:
+        {{- toYaml $podSecurityContext | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ $cfgJobName }}
+          image: {{ include "aether-platform.image" ($cfg.image | default $image) }}
+          imagePullPolicy: {{ $pullPolicy }}
+          workingDir: {{ $cfg.workingDir | default $workingDir }}
+          command:
+            - /bin/sh
+          args:
+            - -c
+            - |
+              set -euo pipefail
+              cd {{ $cfg.workingDir | default $workingDir }}
+              python migrate.py apply {{ printf "%s/%s" ($cfg.mountPath | default "/bootstrap") ($cfg.fileName | default "bootstrap.yaml") }}
+          env:
+            - name: CONFIG_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $cfg.databaseSecret.name | default "config-service-database" }}
+                  key: {{ $cfg.databaseSecret.dsnKey | default "dsn" }}
+            - name: CONFIG_DB_SSLMODE
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $cfg.databaseSecret.name | default "config-service-database" }}
+                  key: {{ $cfg.databaseSecret.sslmodeKey | default "sslmode" }}
+                  optional: true
+            - name: MIGRATION_ACTOR
+              value: {{ $bootstrap.actor | default "helm" | quote }}
+            {{- with $cfg.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if $cfg.envFrom }}
+          envFrom:
+            {{- toYaml $cfg.envFrom | nindent 12 }}
+          {{- end }}
+          {{- if $defaultResources }}
+          resources:
+            {{- toYaml ($cfg.resources | default $defaultResources) | nindent 12 }}
+          {{- end }}
+          {{- if $containerSecurityContext }}
+          securityContext:
+            {{- toYaml $containerSecurityContext | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: config-bootstrap
+              mountPath: {{ $cfg.mountPath | default "/bootstrap" }}
+      volumes:
+        - name: config-bootstrap
+          configMap:
+            name: {{ printf "%s-%s" $.Release.Name ($cfg.configMapName | default "config-bootstrap") | trunc 63 | trimSuffix "-" }}
+            items:
+              - key: {{ $cfg.fileName | default "bootstrap.yaml" }}
+                path: {{ $cfg.fileName | default "bootstrap.yaml" }}
+---
+{{- end -}}
+
+{{- if $bootstrap.accounts.enabled | default false -}}
+{{- $accounts := $bootstrap.accounts -}}
+{{- $acctJobName := $accounts.jobName | default "account-bootstrap" -}}
+{{- $acctFullName := printf "%s-%s" $.Release.Name $acctJobName | trunc 63 | trimSuffix "-" -}}
+{{- $acctLabels := dict "name" $acctFullName "Release" $.Release -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $acctFullName }}
+  labels:
+    {{- include "aether-platform.labels" $acctLabels | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    "helm.sh/hook-weight": "20"
+    {{- with $accounts.jobAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  backoffLimit: {{ $accounts.backoffLimit | default $defaultBackoff }}
+  {{- if $accounts.ttlSecondsAfterFinished | default $defaultTtl }}
+  ttlSecondsAfterFinished: {{ $accounts.ttlSecondsAfterFinished | default $defaultTtl }}
+  {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- include "aether-platform.labels" $acctLabels | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      {{- $acctSa := $accounts.serviceAccountName | default $defaultServiceAccount }}
+      {{- if $acctSa }}
+      serviceAccountName: {{ $acctSa }}
+      {{- end }}
+      {{- if $podSecurityContext }}
+      securityContext:
+        {{- toYaml $podSecurityContext | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ $acctJobName }}
+          image: {{ include "aether-platform.image" ($accounts.image | default $image) }}
+          imagePullPolicy: {{ $pullPolicy }}
+          workingDir: {{ $accounts.workingDir | default $workingDir }}
+          command:
+            - /bin/sh
+          args:
+            - -c
+            - |
+              set -euo pipefail
+              cd {{ $accounts.workingDir | default $workingDir }}
+              python - <<'PY'
+              {{- ($accounts.python | default "import os\nfrom sqlalchemy import create_engine\nimport account_migrations as migrations\n\nengine = create_engine(os.environ[\"ACCOUNTS_DATABASE_URL\"])\nmigrations.upgrade(engine)\n") | trim | nindent 14 }}
+              PY
+          env:
+            - name: ACCOUNTS_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $accounts.databaseSecret.name | default "account-service-database" }}
+                  key: {{ $accounts.databaseSecret.dsnKey | default "dsn" }}
+            - name: MIGRATION_ACTOR
+              value: {{ $bootstrap.actor | default "helm" | quote }}
+            {{- with $accounts.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if $accounts.envFrom }}
+          envFrom:
+            {{- toYaml $accounts.envFrom | nindent 12 }}
+          {{- end }}
+          {{- if $defaultResources }}
+          resources:
+            {{- toYaml ($accounts.resources | default $defaultResources) | nindent 12 }}
+          {{- end }}
+          {{- if $containerSecurityContext }}
+          securityContext:
+            {{- toYaml $containerSecurityContext | nindent 12 }}
+          {{- end }}
+---
+{{- end -}}
+
+{{- if $bootstrap.migrations.enabled | default false -}}
+{{- $migrate := $bootstrap.migrations -}}
+{{- $migJobName := $migrate.jobName | default "data-migrations" -}}
+{{- $migFullName := printf "%s-%s" $.Release.Name $migJobName | trunc 63 | trimSuffix "-" -}}
+{{- $migLabels := dict "name" $migFullName "Release" $.Release -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $migFullName }}
+  labels:
+    {{- include "aether-platform.labels" $migLabels | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    "helm.sh/hook-weight": "30"
+    {{- with $migrate.jobAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  backoffLimit: {{ $migrate.backoffLimit | default $defaultBackoff }}
+  {{- if $migrate.ttlSecondsAfterFinished | default $defaultTtl }}
+  ttlSecondsAfterFinished: {{ $migrate.ttlSecondsAfterFinished | default $defaultTtl }}
+  {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- include "aether-platform.labels" $migLabels | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      {{- $migSa := $migrate.serviceAccountName | default $defaultServiceAccount }}
+      {{- if $migSa }}
+      serviceAccountName: {{ $migSa }}
+      {{- end }}
+      {{- if $podSecurityContext }}
+      securityContext:
+        {{- toYaml $podSecurityContext | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ $migJobName }}
+          image: {{ include "aether-platform.image" ($migrate.image | default $image) }}
+          imagePullPolicy: {{ $pullPolicy }}
+          workingDir: {{ $migrate.workingDir | default $workingDir }}
+          command:
+            - /bin/sh
+          args:
+            - -c
+            - |
+              set -euo pipefail
+              cd {{ $migrate.workingDir | default $workingDir }}
+              {{- ($migrate.script | default "export DATABASE_URL=\"$RISK_DATABASE_URL\"\nalembic -c data/migrations/alembic.ini upgrade head\nalembic -c data/alembic/alembic.ini upgrade head\npython - <<'PY'\nimport os\nfrom release_manifest import run_release_manifest_migrations\n\nrun_release_manifest_migrations(os.environ[\"RELEASE_MANIFEST_DATABASE_URL\"])\nPY\n") | trim | nindent 14 }}
+          env:
+            - name: RISK_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $migrate.riskDatabaseSecret.name | default "risk-service-database" }}
+                  key: {{ $migrate.riskDatabaseSecret.dsnKey | default "dsn" }}
+            - name: RELEASE_MANIFEST_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $migrate.releaseManifestSecret.name | default "release-manifest-database" }}
+                  key: {{ $migrate.releaseManifestSecret.dsnKey | default "dsn" }}
+            - name: RELEASE_MANIFEST_SSLMODE
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $migrate.releaseManifestSecret.name | default "release-manifest-database" }}
+                  key: {{ $migrate.releaseManifestSecret.sslmodeKey | default "sslmode" }}
+                  optional: true
+            - name: MIGRATION_ACTOR
+              value: {{ $bootstrap.actor | default "helm" | quote }}
+            {{- with $migrate.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if $migrate.envFrom }}
+          envFrom:
+            {{- toYaml $migrate.envFrom | nindent 12 }}
+          {{- end }}
+          {{- if $defaultResources }}
+          resources:
+            {{- toYaml ($migrate.resources | default $defaultResources) | nindent 12 }}
+          {{- end }}
+          {{- if $containerSecurityContext }}
+          securityContext:
+            {{- toYaml $containerSecurityContext | nindent 12 }}
+          {{- end }}
+{{- end -}}
+{{- end -}}

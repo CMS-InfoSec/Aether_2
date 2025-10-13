@@ -1,6 +1,23 @@
 apiVersion: v2
 name: aether-platform
-version: 0.1.0
+version: 0.4.0
 description: Umbrella chart for deploying Aether backend services and UI.
 type: application
 appVersion: "1.0.0"
+dependencies:
+  - name: postgresql
+    repository: https://charts.bitnami.com/bitnami
+    version: 17.0.0
+    condition: dependencies.postgresql.enabled
+  - name: redis
+    repository: https://charts.bitnami.com/bitnami
+    version: 23.0.2
+    condition: dependencies.redis.enabled
+  - name: kafka
+    repository: https://charts.bitnami.com/bitnami
+    version: 32.4.4
+    condition: dependencies.kafka.enabled
+  - name: nats
+    repository: https://charts.bitnami.com/bitnami
+    version: 9.0.29
+    condition: dependencies.nats.enabled
