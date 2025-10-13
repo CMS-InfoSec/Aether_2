@@ -15,6 +15,16 @@ from types import SimpleNamespace
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+
+from shared import readiness
+from shared.readyz_router import ReadyzRouter
+from shared.service_readiness import (
+    SQLAlchemyProbeClient,
+    engine_from_state,
+    session_factory_from_state,
+    using_sqlite,
+    verify_session_store,
+)
 _SQLALCHEMY_AVAILABLE = True
 
 try:  # pragma: no cover - optional dependency used in production
@@ -553,6 +563,40 @@ class ConfigUpdateResponse(BaseModel):
 
 
 app = FastAPI(title="Config Service")
+
+
+_readyz_router = ReadyzRouter()
+
+
+def _build_probe_client() -> SQLAlchemyProbeClient:
+    session_factory = session_factory_from_state(
+        app,
+        dependency_name="Config service database",
+    )
+    return SQLAlchemyProbeClient(session_factory)
+
+
+async def _postgres_read_probe() -> None:
+    client = _build_probe_client()
+    await readiness.postgres_read_probe(client=client)
+
+
+async def _postgres_write_probe() -> None:
+    client = _build_probe_client()
+    engine = engine_from_state(app)
+    read_only_query = "SELECT 1" if using_sqlite(engine) else "SELECT pg_is_in_recovery()"
+    await readiness.postgres_write_probe(client=client, read_only_query=read_only_query)
+
+
+async def _session_store_probe() -> None:
+    store = getattr(app.state, "session_store", None)
+    await verify_session_store(store)
+
+
+_readyz_router.register_probe("postgres_read", _postgres_read_probe)
+_readyz_router.register_probe("postgres_write", _postgres_write_probe)
+_readyz_router.register_probe("session_store", _session_store_probe)
+app.include_router(_readyz_router.router)
 
 
 @app.on_event("startup")
