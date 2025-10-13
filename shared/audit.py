@@ -7,16 +7,12 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Protocol, TYPE_CHECKING
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Protocol
 
 from .correlation import get_correlation_id
 
 
 logger = logging.getLogger(__name__)
-
-
-if TYPE_CHECKING:  # pragma: no cover - import only used for typing
-    from services.common.adapters import TimescaleAdapter
 
 
 @dataclass(frozen=True)

@@ -48,6 +48,7 @@ else:  # pragma: no cover - runtime fallback when psycopg2 is absent.
     TimescaleConnection = Any  # type: ignore[assignment]
 
 from shared.common_bootstrap import ensure_common_helpers
+from shared.dependency_alerts import notify_dependency_fallback
 
 ensure_common_helpers()
 
@@ -138,6 +139,15 @@ class ModelPerformance:
 
 
 LOGGER = logging.getLogger(__name__)
+
+if psycopg2 is None:
+    notify_dependency_fallback(
+        component="drift-service",
+        dependency="psycopg2",
+        fallback="disabled-timescale-operations",
+        reason="psycopg2 import failed; drift persistence features disabled",
+        metadata={"module": __name__},
+    )
 
 ACCOUNT_ID = os.getenv("AETHER_ACCOUNT_ID", "default")
 TIMESCALE = get_timescale_session(ACCOUNT_ID)

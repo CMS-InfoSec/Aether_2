@@ -3,24 +3,31 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Final
+from typing import Any, Final, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from zoneinfo import ZoneInfo
+
+ZoneInfoType: type[Any] | None
 
 try:  # pragma: no cover - prefer stdlib tzdata when available
-    from zoneinfo import ZoneInfo  # type: ignore[attr-defined]
+    from zoneinfo import ZoneInfo as ZoneInfoType
 except (ModuleNotFoundError, KeyError):  # pragma: no cover - stripped tzdata
-    ZoneInfo = None  # type: ignore[assignment]
+    ZoneInfoType = None
 
 _UTC: Final = timezone.utc
 _GMT: Final = timezone(timedelta(0), name="GMT")
 _BST: Final = timezone(timedelta(hours=1), name="BST")
 
-if ZoneInfo is not None:  # pragma: no branch - mainline path
+if ZoneInfoType is not None:  # pragma: no branch - mainline path
     try:
-        _LONDON_TZ: Final | None = ZoneInfo("Europe/London")
+        _london_tz: Optional["ZoneInfo"] = ZoneInfoType("Europe/London")
     except Exception:  # pragma: no cover - tzdata missing at runtime
-        _LONDON_TZ = None
+        _london_tz = None
 else:  # pragma: no cover - fallback approximation
-    _LONDON_TZ = None
+    _london_tz = None
+
+_LONDON_TZ: Final[Optional["ZoneInfo"]] = _london_tz
 
 
 def _coerce_utc(instant: datetime) -> datetime:
