@@ -55,7 +55,7 @@ dependencies = [
     "markdown2==2.5.4",
     "cryptography==45.0.7",
     "great-expectations==1.7.0",
-    "lightgbm==4.5.0",
+    "lightgbm==4.6.0",
     "optuna==4.1.0",
     "stable-baselines3==2.7.0",
     "transformers==4.46.2",
