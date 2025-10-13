@@ -21,12 +21,13 @@ if no ORM (real or stubbed) has been registered at all.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any, Iterable, Tuple
+from typing import Any, Tuple
 from uuid import UUID
 
 import importlib
 
 SQLALCHEMY_AVAILABLE = True
+AccountId: type[Any]
 
 try:  # pragma: no cover - exercised when SQLAlchemy is installed
     from sqlalchemy import Column, ForeignKey, String, Table
@@ -146,7 +147,7 @@ def _ensure_column_metadata(column: Any, *, primary_key: bool, nullable: bool, i
 
 if SQLALCHEMY_AVAILABLE:
 
-    class AccountId(TypeDecorator):
+    class _SQLAlchemyAccountId(TypeDecorator):
         """Store UUID account identifiers across PostgreSQL and SQLite backends."""
 
         impl = PGUUID(as_uuid=True)
@@ -173,6 +174,9 @@ if SQLALCHEMY_AVAILABLE:
             return UUID(str(value))
 
 
+    AccountId = _SQLAlchemyAccountId
+
+
     def account_id_column(
         *,
         primary_key: bool = False,
@@ -195,11 +199,14 @@ if SQLALCHEMY_AVAILABLE:
 
 else:  # pragma: no cover - exercised in dependency-light environments
 
-    class AccountId:  # type: ignore[override]
+    class _StubAccountId:
         """Placeholder type when SQLAlchemy is not installed."""
 
         def __init__(self, *args, **kwargs) -> None:
             del args, kwargs
+
+
+    AccountId = _StubAccountId
 
 
     def account_id_column(
@@ -215,26 +222,15 @@ else:  # pragma: no cover - exercised in dependency-light environments
             raise RuntimeError("SQLAlchemy is required to declare account_id columns")
 
         column_factory, foreign_key_factory = resolved
+        fk = foreign_key_factory("accounts.account_id", ondelete=ondelete) if foreign_key_factory else None
         column = column_factory(
             AccountId(),
-            foreign_key_factory("accounts.account_id", ondelete=ondelete) if foreign_key_factory else None,
+            fk,
             primary_key=primary_key,
             index=index,
             nullable=nullable,
             unique=unique,
         )
-
-        fk = None
-        if hasattr(column, "args") and column.args:
-            # Lightweight stubs typically record positional arguments in ``args``.
-            maybe_fk = column.args[0] if len(column.args) == 1 else column.args[1:]
-            if isinstance(maybe_fk, Iterable):
-                for candidate in maybe_fk:
-                    if getattr(candidate, "target_fullname", None) == "accounts.account_id":
-                        fk = candidate
-                        break
-            elif getattr(maybe_fk, "target_fullname", None) == "accounts.account_id":
-                fk = maybe_fk
 
         if fk is None:
             fk = SimpleNamespace(target_fullname="accounts.account_id")

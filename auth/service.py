@@ -15,26 +15,27 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 from types import ModuleType
-from typing import Any, Dict, Optional, Protocol, Set, runtime_checkable
+from typing import Any, Callable, Dict, Optional, Protocol, Set, runtime_checkable
+
+from shared.correlation import get_correlation_id
 
 
 class MissingDependencyError(RuntimeError):
     """Raised when required optional dependencies are unavailable."""
 
 
+_PYOTP_IMPORT_ERROR: Exception | None = None
+
 try:  # pragma: no cover - optional dependency in some environments
     import pyotp
 except ModuleNotFoundError as exc:  # pragma: no cover - exercised in lightweight setups
-    class _DeterministicTOTP:
+    class _DeterministicTOTPStub:
         """Minimal TOTP replacement used when pyotp is unavailable."""
 
         def __init__(self, secret: str) -> None:
             self._secret = secret
 
         def now(self) -> str:
-            # Derive a deterministic 6-digit code from the secret so multiple calls
-            # within the same test yield the same value without relying on the real
-            # pyotp implementation.
             digest = hashlib.sha256(self._secret.encode("utf-8")).hexdigest()
             value = int(digest[:8], 16) % 1_000_000
             return f"{value:06d}"
@@ -47,15 +48,16 @@ except ModuleNotFoundError as exc:  # pragma: no cover - exercised in lightweigh
         return base64.b32encode(os.urandom(20)).decode("ascii").rstrip("=")
 
     pyotp_stub = ModuleType("pyotp")
-    pyotp_stub.TOTP = _DeterministicTOTP  # type: ignore[attr-defined]
+    pyotp_stub.TOTP = _DeterministicTOTPStub  # type: ignore[attr-defined]
     pyotp_stub.random_base32 = _random_base32  # type: ignore[attr-defined]
     sys.modules.setdefault("pyotp", pyotp_stub)
     pyotp = pyotp_stub  # type: ignore[assignment]
     _PYOTP_IMPORT_ERROR = exc
 else:
+    _PYOTP_IMPORT_ERROR = None
     totp_cls = getattr(pyotp, "TOTP", None)
     if totp_cls is not None and getattr(totp_cls, "__module__", "").startswith("conftest"):
-        class _DeterministicTOTP:
+        class _DeterministicTOTPAdapter:
             """Adapter that enforces deterministic verification in stubbed environments."""
 
             def __init__(self, secret: str) -> None:
@@ -67,10 +69,7 @@ else:
             def verify(self, code: str, valid_window: int = 1) -> bool:
                 return code == self.now()
 
-        pyotp.TOTP = _DeterministicTOTP  # type: ignore[assignment]
-    _PYOTP_IMPORT_ERROR = None
-
-from shared.correlation import get_correlation_id
+        pyotp.TOTP = _DeterministicTOTPAdapter  # type: ignore[assignment]
 
 try:
     from common.utils.redis import create_redis_from_url
@@ -82,26 +81,35 @@ except ModuleNotFoundError:  # pragma: no cover - redis helpers optional in test
 
 _ARGON2_IMPORT_ERROR: Exception | None = None
 _USING_ARGON2_FALLBACK = False
+Type: Any
+VerificationError: type[Exception]
+InvalidHash: type[Exception]
+VerifyMismatchError: type[Exception]
+PasswordHasher: Any
 
 try:  # pragma: no cover - optional dependency in some test environments
-    from argon2 import PasswordHasher as _Argon2PasswordHasher, Type
-    from argon2.exceptions import InvalidHash, VerificationError, VerifyMismatchError
+    from argon2 import PasswordHasher as _Argon2PasswordHasher, Type as _Argon2Type
+    from argon2.exceptions import (
+        InvalidHash as _Argon2InvalidHash,
+        VerificationError as _Argon2VerificationError,
+        VerifyMismatchError as _Argon2VerifyMismatchError,
+    )
 except ImportError as _ARGON2_IMPORT_ERROR:  # pragma: no cover - fallback when argon2 is unavailable
     _USING_ARGON2_FALLBACK = True
-    class Type:  # type: ignore[override]
+    class _FallbackArgon2Type:
         """Fallback stub mirroring the argon2 Type enum attributes used here."""
 
         ID = "argon2id"
 
 
-    class VerificationError(ValueError):
+    class _FallbackVerificationError(ValueError):
         """Minimal stand-in for argon2's verification errors."""
 
 
-    class InvalidHash(VerificationError):
+    class _FallbackInvalidHash(_FallbackVerificationError):
         """Raised when an argon2 hash cannot be parsed."""
 
-    class VerifyMismatchError(VerificationError):
+    class _FallbackVerifyMismatchError(_FallbackVerificationError):
         """Raised when a password does not match the stored hash."""
 
     class _FallbackPasswordHasher:
@@ -130,33 +138,33 @@ except ImportError as _ARGON2_IMPORT_ERROR:  # pragma: no cover - fallback when 
 
         def verify(self, hashed: str, password: str) -> bool:
             if not hashed.startswith(self.hash_prefix):
-                raise InvalidHash("Unsupported password hash prefix")
+                raise _FallbackInvalidHash("Unsupported password hash prefix")
 
             try:
                 parts = hashed.split("$")
                 _, prefix_name, iterations_str, salt_b64, derived_b64 = parts
             except ValueError as exc:
-                raise InvalidHash("Malformed password hash") from exc
+                raise _FallbackInvalidHash("Malformed password hash") from exc
 
             if prefix_name != "pbkdf2-sha256":
-                raise InvalidHash("Unexpected password hash algorithm")
+                raise _FallbackInvalidHash("Unexpected password hash algorithm")
 
             try:
                 iterations = int(iterations_str)
             except ValueError as exc:
-                raise InvalidHash("Invalid iteration count in password hash") from exc
+                raise _FallbackInvalidHash("Invalid iteration count in password hash") from exc
 
             try:
                 salt = base64.b64decode(salt_b64.encode("ascii"))
                 expected = base64.b64decode(derived_b64.encode("ascii"))
             except (ValueError, binascii.Error) as exc:
-                raise InvalidHash("Invalid base64 in stored password hash") from exc
+                raise _FallbackInvalidHash("Invalid base64 in stored password hash") from exc
 
             computed = hashlib.pbkdf2_hmac(
                 "sha256", password.encode("utf-8"), salt, iterations
             )
             if not hmac.compare_digest(expected, computed):
-                raise VerifyMismatchError("Password does not match stored hash")
+                raise _FallbackVerifyMismatchError("Password does not match stored hash")
             return True
 
         def needs_update(self, hashed: str) -> bool:
@@ -182,7 +190,7 @@ except ImportError as _ARGON2_IMPORT_ERROR:  # pragma: no cover - fallback when 
             return self.needs_update(hashed)
 
 
-    class _Argon2PasswordHasher:
+    class _FallbackArgon2PasswordHasher:
         """Deterministic stand-in for argon2 when the real dependency is absent."""
 
         def __init__(self, delegate: _FallbackPasswordHasher | None = None, **kwargs: object) -> None:
@@ -230,27 +238,39 @@ except ImportError as _ARGON2_IMPORT_ERROR:  # pragma: no cover - fallback when 
                     return False
             return self.check_needs_rehash(hashed)
 
-    PasswordHasher = _Argon2PasswordHasher  # type: ignore[assignment]
+    Type = _FallbackArgon2Type
+    VerificationError = _FallbackVerificationError
+    InvalidHash = _FallbackInvalidHash
+    VerifyMismatchError = _FallbackVerifyMismatchError
+    PasswordHasher = _FallbackArgon2PasswordHasher
     _ARGON2_HASHER = PasswordHasher()
     _PBKDF2_HASHER: _FallbackPasswordHasher | None = _FallbackPasswordHasher()
 else:
+    Type = _Argon2Type
+    VerificationError = _Argon2VerificationError
+    InvalidHash = _Argon2InvalidHash
+    VerifyMismatchError = _Argon2VerifyMismatchError
     PasswordHasher = _Argon2PasswordHasher
     _ARGON2_HASHER = PasswordHasher(type=Type.ID)
     _PBKDF2_HASHER = None
 
 
+CollectorRegistry: type[Any]
+Counter: Callable[..., Any]
+
 try:  # pragma: no cover - prometheus is optional outside production
-    from prometheus_client import CollectorRegistry, Counter
+    from prometheus_client import CollectorRegistry as _PromCollectorRegistry, Counter as _PromCounter
 except Exception:  # pragma: no cover - provide a no-op fallback
-    class CollectorRegistry:  # type: ignore[override]
+    class _FallbackCollectorRegistry:
         def __init__(self) -> None:
             self._collectors: list[object] = []
 
-    class Counter:  # type: ignore[override]
+    class _FallbackCounter:
         def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
             self._value = 0.0
 
-        def labels(self, **kwargs: object) -> "Counter":
+        def labels(self, **kwargs: object) -> "_FallbackCounter":
             return self
 
         def inc(self, value: float = 1.0) -> None:
@@ -258,6 +278,12 @@ except Exception:  # pragma: no cover - provide a no-op fallback
 
         def set(self, value: float) -> None:
             self._value = value
+
+    CollectorRegistry = _FallbackCollectorRegistry
+    Counter = _FallbackCounter
+else:
+    CollectorRegistry = _PromCollectorRegistry
+    Counter = _PromCounter
 
 
 
@@ -270,10 +296,10 @@ _STATE_SUBDIR = "auth_sessions"
 _STATE_FILE = "sessions.json"
 
 
-_METRICS_REGISTRY: CollectorRegistry | None = None
-_LOGIN_FAILURE_COUNTER: Counter
-_MFA_DENIED_COUNTER: Counter
-_LOGIN_SUCCESS_COUNTER: Counter
+_METRICS_REGISTRY: Any = None
+_LOGIN_FAILURE_COUNTER: Any
+_MFA_DENIED_COUNTER: Any
+_LOGIN_SUCCESS_COUNTER: Any
 
 if _USING_ARGON2_FALLBACK:
     logger.warning(
@@ -281,7 +307,7 @@ if _USING_ARGON2_FALLBACK:
     )
 
 
-def _build_counter(name: str, documentation: str, labels: tuple[str, ...] = ()) -> Counter:
+def _build_counter(name: str, documentation: str, labels: tuple[str, ...] = ()) -> Any:
     kwargs: dict[str, object] = {}
     if _METRICS_REGISTRY is not None:
         kwargs["registry"] = _METRICS_REGISTRY
@@ -291,7 +317,8 @@ def _build_counter(name: str, documentation: str, labels: tuple[str, ...] = ()) 
         return Counter(name, documentation, **kwargs)  # type: ignore[misc]
 
 
-def _init_metrics(*, registry: CollectorRegistry | None = None) -> None:
+
+def _init_metrics(*, registry: Any = None) -> None:
     """Initialise or reset Prometheus counters used by the auth service."""
 
     global _METRICS_REGISTRY
@@ -719,6 +746,7 @@ class FileBackedSessionStore(SessionStoreProtocol):
             self._persist()
         return session
 
+
     def get(self, token: str) -> Optional[Session]:
         with self._lock:
             self._purge_expired()
@@ -737,11 +765,15 @@ class FileBackedSessionStore(SessionStoreProtocol):
             )
 
 
+# Backwards-compatible alias for legacy imports
+SessionStore = InMemorySessionStore
+
+
 def _insecure_defaults_enabled() -> bool:
     return (
         os.getenv(_INSECURE_DEFAULTS_FLAG) == "1"
         or os.getenv("AETHER_ALLOW_INSECURE_TEST_DEFAULTS") == "1"
-        or os.getenv("PYTEST_CURRENT_TEST")
+        or bool(os.getenv("PYTEST_CURRENT_TEST"))
         or "pytest" in sys.modules
     )
 
@@ -768,11 +800,6 @@ def build_session_store_from_url(redis_url: str, *, ttl_minutes: int = 60) -> Se
         )
         return FileBackedSessionStore(path=state_path, ttl_minutes=ttl_minutes)
     return RedisSessionStore(client, ttl_minutes=ttl_minutes)
-
-
-# Backwards-compatible aliases for legacy imports
-AdminRepository = InMemoryAdminRepository
-SessionStore = InMemorySessionStore
 
 
 class AuthService:
