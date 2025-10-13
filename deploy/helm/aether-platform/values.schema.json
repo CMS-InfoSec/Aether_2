@@ -334,6 +334,125 @@
                 }
             },
             "additionalProperties": true
+        },
+        "postgresConnection": {
+            "type": "object",
+            "description": "Connection attributes for managed PostgreSQL secrets.",
+            "required": [
+                "database",
+                "username",
+                "password"
+            ],
+            "properties": {
+                "host": {
+                    "type": "string",
+                    "description": "Override the hostname when using an external PostgreSQL instance."
+                },
+                "port": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Override the port when using a non-standard PostgreSQL listener."
+                },
+                "database": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "username": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "password": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "sslmode": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "parameters": {
+                    "type": "object",
+                    "description": "Additional query parameters appended to the generated DSN.",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                }
+            },
+            "additionalProperties": true
+        },
+        "managedSecret": {
+            "type": "object",
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "default": true
+                },
+                "type": {
+                    "type": "string",
+                    "enum": [
+                        "postgresDsn",
+                        "opaque"
+                    ],
+                    "default": "opaque"
+                },
+                "dsnKey": {
+                    "type": "string",
+                    "description": "Key used to store the generated DSN when type is postgresDsn.",
+                    "default": "dsn"
+                },
+                "sslmodeKey": {
+                    "type": "string",
+                    "description": "Key used to store the SSL mode alongside generated DSNs.",
+                    "default": "sslmode"
+                },
+                "connection": {
+                    "$ref": "#/$defs/postgresConnection"
+                },
+                "data": {
+                    "type": "object",
+                    "description": "Literal key/value pairs for opaque secrets.",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                },
+                "additionalData": {
+                    "type": "object",
+                    "description": "Additional key/value pairs appended to generated DSN secrets.",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                }
+            },
+            "allOf": [
+                {
+                    "if": {
+                        "properties": {
+                            "type": {
+                                "const": "postgresDsn"
+                            }
+                        }
+                    },
+                    "then": {
+                        "required": [
+                            "connection"
+                        ]
+                    }
+                },
+                {
+                    "if": {
+                        "properties": {
+                            "type": {
+                                "const": "opaque"
+                            }
+                        }
+                    },
+                    "then": {
+                        "required": [
+                            "data"
+                        ]
+                    }
+                }
+            ],
+            "additionalProperties": true
         }
     },
     "properties": {

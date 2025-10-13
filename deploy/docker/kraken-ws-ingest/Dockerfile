@@ -14,7 +14,32 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt \
+    && python - <<'PY'
+import importlib
+import json
+import sys
+
+modules = ["psycopg", "argon2", "cryptography"]
+missing: dict[str, str] = {}
+for name in modules:
+    try:
+        importlib.import_module(name)
+    except Exception as exc:  # pragma: no cover - executed only when modules missing
+        missing[name] = repr(exc)
+
+if missing:
+    payload = {
+        "event": "missing_critical_modules",
+        "modules": missing,
+        "component": "kraken-ws-ingest-image",
+    }
+    sys.stderr.write(json.dumps(payload) + "\n")
+    raise SystemExit(1)
+
+print("Verified critical Python modules:", ", ".join(modules))
+PY
 
 COPY services/kraken_ws_ingest.py services/kraken_ws_ingest.py
 

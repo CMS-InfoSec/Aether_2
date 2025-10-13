@@ -46,6 +46,7 @@ from common.schemas.contracts import IntentEvent
 from services.common.adapters import KafkaNATSAdapter
 from services.common.security import require_admin_account
 from shared.account_scope import account_id_column
+from shared.dependency_alerts import notify_dependency_fallback
 from shared.runtime_checks import ensure_insecure_default_flag_disabled
 from shared.spot import is_spot_symbol, normalize_spot_symbol
 
@@ -169,6 +170,13 @@ def _initialise_database(app: FastAPI) -> WatchdogRepository:
                 fallback_url = _sqlite_fallback_url()
                 LOGGER.warning(
                     "psycopg unavailable; watchdog falling back to SQLite store at %s", fallback_url
+                )
+                notify_dependency_fallback(
+                    component="watchdog-service",
+                    dependency="psycopg",
+                    fallback="sqlite",
+                    reason="psycopg import failed during watchdog database initialisation",
+                    metadata={"module": __name__, "fallback_url": fallback_url},
                 )
                 fallback_options: Dict[str, Any] = {
                     "future": True,

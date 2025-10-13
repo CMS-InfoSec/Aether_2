@@ -173,7 +173,7 @@ def _ensure_fastapi_stub() -> None:
         try:
             return importlib.import_module("fastapi")
         except ModuleNotFoundError:
-            import services.common.fastapi_stub  # type: ignore[import-not-found]
+            import services.common.fastapi_stub  # type: ignore[import-not-found]  # noqa: F401
             module = sys.modules.get("fastapi")
             if isinstance(module, ModuleType):
                 return module
@@ -186,7 +186,7 @@ def _ensure_fastapi_stub() -> None:
         module = _reload()
 
     try:
-        stub = importlib.import_module("services.common.fastapi_stub")
+        stub = importlib.import_module("services.common.fastapi_stub")  # noqa: F401
     except ModuleNotFoundError:
         return
 
