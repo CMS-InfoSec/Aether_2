@@ -20,7 +20,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install --no-cache-dir '.[dev,test]'
+          python -m pip install --no-cache-dir '.[dev,test]'
 
       - name: Ensure container tags are immutable
         run: |
@@ -75,7 +75,7 @@ jobs:
           docker build -t risk-api:ci -f deploy/docker/risk-api/Dockerfile .
 
       - name: Scan risk API image with Trivy
-        uses: aquasecurity/trivy-action@0.21.0
+        uses: aquasecurity/trivy-action@0.33.1
         with:
           image-ref: risk-api:ci
           severity: CRITICAL,HIGH
