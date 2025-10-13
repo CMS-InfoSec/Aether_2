@@ -347,11 +347,55 @@ managedSecrets:
         username: release_manifest
         password: release-manifest-password
         sslmode: require
+    fastapi-credentials:
+      type: opaque
+      data:
+        JWT_SECRET: change-me-fastapi-jwt
+        DB_URI: postgresql://api_user:change-me@aether-postgresql:5432/aether_admin
+        API_KEY: change-me-fastapi-api-key
+    fastapi-secrets:
+      type: opaque
+      data:
+        KAFKA_BOOTSTRAP: PLAINTEXT://aether-kafka:9092
+        NATS_URL: nats://aether-nats:4222
+        KAFKA_USERNAME: change-me-kafka-user
+        KAFKA_PASSWORD: change-me-kafka-password
+        NATS_USERNAME: change-me-nats-user
+        NATS_PASSWORD: change-me-nats-password
+        REDIS_URL: rediss://:aether-redis-password@aether-redis:6379/0
+    feast-offline-store:
+      type: postgresDsn
+      connection:
+        database: feast
+        username: feast
+        password: feast-service-password
+        sslmode: require
+    feast-backup-object-storage:
+      type: opaque
+      data:
+        bucket: aether-feast-backups
+        region: us-east-1
+        access_key: change-me-object-access
+        secret_key: change-me-object-secret
+        prefix: feast
+        retention_days: "30"
 simulation:
   enabled: false
 
 runtimeSafety:
   _ALLOW_INSECURE_DEFAULTS: false
+
+serviceAccounts:
+  enabled: true
+  names:
+    - data-services
+    - cache-services
+    - streaming-services
+    - api-services
+    - ml-services
+    - gitops-controller
+    - external-secrets-operator
+    - cicd-bot
 
 backendServices:
   auth:
@@ -1481,6 +1525,255 @@ backendServices:
     pdb:
       enabled: true
       maxUnavailable: 1
+dataPipelines:
+  enabled: true
+  sharedConfig:
+    fastapi-settings:
+      enabled: true
+      name: fastapi-config
+      data:
+        settings.yaml: |
+          kafka:
+            brokers:
+              - aether-kafka:9093
+            tls:
+              enabled: true
+              caFile: /etc/aether/tls/kafka/ca.crt
+            sasl:
+              mechanism: scram-sha-512
+              usernameSecretKey: KAFKA_USERNAME
+              passwordSecretKey: KAFKA_PASSWORD
+          nats:
+            url: nats://aether-nats:4222
+            authentication:
+              usernameSecretKey: NATS_USERNAME
+              passwordSecretKey: NATS_PASSWORD
+            tls:
+              enabled: true
+          timescaledb:
+            host: aether-postgresql
+            port: 5432
+            database: marketdata
+            user: risk_engine
+            tls: true
+          redis:
+            host: aether-redis
+            port: 6380
+            tls: true
+          feature_store:
+            host: feast-online
+            port: 6566
+            tls: true
+          risk_thresholds:
+            liquidation_ratio: 0.25
+            drawdown_limit: 0.18
+          universe_controls:
+            assets:
+              - BTC/USD
+              - ETH/USD
+              - SOL/USD
+  deployments:
+    marketdataIngestor:
+      enabled: true
+      nameOverride: marketdata-ingestor
+      image:
+        repository: ghcr.io/aether/risk-ingestor
+        tag: latest
+      replicaCount: 2
+      ports:
+        - containerPort: 8000
+          name: http
+      env:
+        - name: SETTINGS_FILE
+          value: /etc/aether/settings.yaml
+        - name: KAFKA_BOOTSTRAP_SERVERS
+          valueFrom:
+            secretKeyRef:
+              name: fastapi-secrets
+              key: KAFKA_BOOTSTRAP
+        - name: AETHER_DEFAULT_KAFKA_BOOTSTRAP
+          valueFrom:
+            secretKeyRef:
+              name: fastapi-secrets
+              key: KAFKA_BOOTSTRAP
+        - name: AETHER_DEFAULT_NATS_SERVERS
+          valueFrom:
+            secretKeyRef:
+              name: fastapi-secrets
+              key: NATS_URL
+        - name: AETHER_DEFAULT_KAFKA_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: fastapi-secrets
+              key: KAFKA_USERNAME
+        - name: AETHER_DEFAULT_KAFKA_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: fastapi-secrets
+              key: KAFKA_PASSWORD
+        - name: AETHER_DEFAULT_NATS_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: fastapi-secrets
+              key: NATS_USERNAME
+        - name: AETHER_DEFAULT_NATS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: fastapi-secrets
+              key: NATS_PASSWORD
+      volumeMounts:
+        - name: config
+          mountPath: /etc/aether
+          readOnly: true
+        - name: kafka-tls
+          mountPath: /etc/aether/tls/kafka
+          readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: fastapi-config
+        - name: kafka-tls
+          secret:
+            secretName: kafka-tls
+      readinessProbe:
+        httpGet:
+          path: /metrics
+          port: http
+        initialDelaySeconds: 10
+        periodSeconds: 10
+        timeoutSeconds: 3
+        failureThreshold: 6
+      livenessProbe:
+        httpGet:
+          path: /healthz
+          port: http
+        initialDelaySeconds: 30
+        periodSeconds: 20
+        timeoutSeconds: 5
+        failureThreshold: 3
+      resources:
+        requests:
+          cpu: 200m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+      service:
+        enabled: true
+        ports:
+          - name: http
+            port: 80
+            targetPort: http
+    krakenWsIngest:
+      enabled: true
+      nameOverride: kraken-ws-ingest
+      image:
+        repository: ghcr.io/aether/kraken-ws-ingest
+        tag: latest
+      replicaCount: 1
+      args:
+        - --pairs
+        - XBT/USD,ETH/USD
+        - --kafka-bootstrap
+        - aether-kafka:9092
+        - --kafka-security-protocol
+        - SSL
+        - --kafka-ca-path
+        - /etc/aether/tls/kafka/ca.crt
+        - --trade-topic
+        - md.trades
+        - --book-topic
+        - md.book
+        - --metrics-port
+        - "9000"
+      env:
+        - name: LOG_LEVEL
+          value: INFO
+        - name: METRICS_PORT
+          value: "9000"
+      ports:
+        - containerPort: 9000
+          name: metrics
+      volumeMounts:
+        - name: kafka-tls
+          mountPath: /etc/aether/tls/kafka
+          readOnly: true
+      volumes:
+        - name: kafka-tls
+          secret:
+            secretName: kafka-tls
+      livenessProbe:
+        exec:
+          command:
+            - /bin/sh
+            - -c
+            - pgrep -f kraken_ws_ingest || exit 1
+        initialDelaySeconds: 30
+        periodSeconds: 30
+      readinessProbe:
+        exec:
+          command:
+            - /bin/sh
+            - -c
+            - pgrep -f kraken_ws_ingest || exit 1
+        initialDelaySeconds: 10
+        periodSeconds: 30
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+      service:
+        enabled: true
+        ports:
+          - name: metrics
+            port: 9000
+            targetPort: metrics
+      prometheus:
+        enabled: true
+        path: /metrics
+        port: metrics
+feast:
+  enabled: true
+  nameOverride: feast-online
+  image:
+    repository: feastdev/feast-serving
+    tag: 1.0.0
+  init:
+    image: python:3.11-slim
+  replicaCount: 2
+  redis:
+    host: aether-redis
+    port: 6379
+  registry:
+    pvcName: feast-registry
+    accessMode: ReadWriteOnce
+    size: 5Gi
+    path: /data/registry.db
+  offlineStoreSecret: feast-offline-store
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      cpu: 500m
+      memory: 1Gi
+  service:
+    grpcPort: 6566
+    httpPort: 80
+  backup:
+    name: feast-backup
+    schedule: "15 3 * * *"
+    concurrencyPolicy: Forbid
+    successfulJobsHistoryLimit: 1
+    failedJobsHistoryLimit: 3
+    backoffLimit: 1
+    objectStoreSecret: feast-backup-object-storage
+    image:
+      repository: ghcr.io/aether/ops-runtime
+      tag: latest
 ui:
   enabled: true
   nameOverride: aether-2-ui

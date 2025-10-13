@@ -14,10 +14,17 @@ platform end to end.
   by every service deployment.【F:deploy/k8s/base/kustomization.yaml†L5-L27】
 * **Backend services** – The Helm chart exposes configuration for each FastAPI
   service (risk, policy, OMS, secrets, reports, etc.) including images, resource
-  profiles, ingress, HPAs, and PodDisruptionBudgets.【F:deploy/helm/aether-platform/values.yaml†L1-L1049】
+  profiles, ingress, HPAs, and PodDisruptionBudgets.【F:deploy/helm/aether-platform/values.yaml†L1-L1494】
+* **Data pipelines** – Real-time Kraken WebSocket ingestion and the REST-based
+  market data ingestor are deployed as first-class workloads with ConfigMaps,
+  TLS mounts, and Prometheus annotations so streaming data reaches Kafka/NATS
+  without manual manifests.【F:deploy/helm/aether-platform/values.yaml†L1496-L1602】【F:deploy/helm/aether-platform/templates/data-pipeline-deployments.yaml†L1-L86】
+* **Feature store (Feast)** – The chart renders the Feast online serving
+  deployment, registry PVC, and scheduled backups so risk models receive feature
+  vectors immediately after install.【F:deploy/helm/aether-platform/values.yaml†L1604-L1641】【F:deploy/helm/aether-platform/templates/feast.yaml†L1-L211】
 * **Frontend** – The `aether-2-ui` deployment serves the web client and relies
   on environment variables that point at the public risk API ingress.
-  【F:deploy/helm/aether-platform/values.yaml†L1052-L1080】
+  【F:deploy/helm/aether-platform/values.yaml†L1643-L1671】
 * **Security & runtime guardrails** – Global settings enforce TLS issuers,
   seccomp profiles, Kraken credential projections, and secure network policies
   so the release is production ready by default.
@@ -35,12 +42,12 @@ platform end to end.
      your workstation running Lens.
 3. **Container registry**
    * Push access to a registry for the images you build locally. Update
-     `image.repository`/`tag` entries in your Helm values to point at that
-     registry.【F:deploy/helm/aether-platform/values.yaml†L200-L1049】
+    `image.repository`/`tag` entries in your Helm values to point at that
+    registry.【F:deploy/helm/aether-platform/values.yaml†L200-L1494】
 4. **Secrets & PKI**
    * Vault/secret manager populated with database DSNs, TLS bundles, Kraken API
      keys, and account allow-lists that the chart consumes through Kubernetes
-     Secrets.【F:deploy/helm/aether-platform/values.yaml†L19-L1049】
+  Secrets.【F:deploy/helm/aether-platform/values.yaml†L19-L1494】
 5. **DNS & certificates**
    * DNS records for each ingress hostname and a cluster issuer that matches
      `global.tls.issuer` (default `letsencrypt-production`).
@@ -73,12 +80,12 @@ docker push "$REGISTRY/risk-ingestor:$TAG"
 
 Override the corresponding `image.repository` and `image.tag` fields for each
 service you own in your Helm values file so the deployments reference your
-artifacts.【F:deploy/helm/aether-platform/values.yaml†L200-L1049】 If you rely on
+artifacts.【F:deploy/helm/aether-platform/values.yaml†L200-L1494】 If you rely on
 pre-built upstream images for ancillary services, keep the defaults.
 
 Build the web client using your CI pipeline or a local Node build, then publish a
 container image (or use the default `ghcr.io/aether/aether-2-ui:latest`). Update
-`ui.image` if you host a private build.【F:deploy/helm/aether-platform/values.yaml†L1052-L1071】
+`ui.image` if you host a private build.【F:deploy/helm/aether-platform/values.yaml†L1643-L1671】
 
 ## 4. Prepare Kubernetes Secrets
 
@@ -91,6 +98,8 @@ if you disable optional services.
 |-------------|---------------|---------|
 | `account-service-database` | `dsn` | SQLAlchemy DSN for account storage.【F:deploy/helm/aether-platform/values.yaml†L188-L215】 |
 | `account-service-secrets` | `encryptionKey` | Fernet key for customer data encryption.【F:deploy/helm/aether-platform/values.yaml†L180-L209】 |
+| `fastapi-credentials` | `JWT_SECRET`, `DB_URI`, `API_KEY` | Shared API secret bundle for gateway-style services (OMS, pricing, etc.).【F:deploy/helm/aether-platform/values.yaml†L214-L224】 |
+| `fastapi-secrets` | `KAFKA_BOOTSTRAP`, `NATS_URL`, `KAFKA_USERNAME`, `KAFKA_PASSWORD`, `NATS_USERNAME`, `NATS_PASSWORD`, `REDIS_URL` | Broker credentials projected into the ingestors and marketdata services.【F:deploy/helm/aether-platform/values.yaml†L224-L232】 |
 | `auth-service-config` | `AUTH_DATABASE_URL`, `AUTH_JWT_SECRET` | Login API DSN plus JWT signing secret.【F:deploy/helm/aether-platform/values.yaml†L204-L221】 |
 | `behavior-service-database` | `dsn` | Behavior analytics database DSN.【F:deploy/helm/aether-platform/values.yaml†L223-L268】 |
 | `compliance-service-database` | `dsn` | Compliance checks datastore consumed by the risk API.【F:deploy/helm/aether-platform/values.yaml†L228-L236】【F:deploy/helm/aether-platform/values.yaml†L1196-L1203】 |
@@ -100,6 +109,8 @@ if you disable optional services.
 | `platform-account-allowlists` | `admins`, `directors` | Account-level access control lists consumed by the services.【F:deploy/helm/aether-platform/values.yaml†L61-L78】 |
 | `release-manifest-database` | `dsn` | TimescaleDB DSN for release manifest auditing.【F:deploy/helm/aether-platform/values.yaml†L333-L341】 |
 | `strategy-orchestrator-database` | `dsn` | Strategy orchestration datastore DSN.【F:deploy/helm/aether-platform/values.yaml†L307-L319】 |
+| `feast-offline-store` | `dsn` | Offline Timescale credentials for Feast feature loading.【F:deploy/helm/aether-platform/values.yaml†L232-L242】 |
+| `feast-backup-object-storage` | `bucket`, `region`, `access_key`, `secret_key`, `prefix`, `retention_days` | Object storage target for Feast backups produced by the CronJob.【F:deploy/helm/aether-platform/values.yaml†L242-L252】 |
 
 Create the secrets with `kubectl create secret` or configure External Secrets so
 Lens shows them as ready before you install the chart. Make sure TLS secrets for
@@ -150,7 +161,7 @@ FastAPI services mount the correct certificates.
 
 Create a `platform-values.yaml` that sets global options, image overrides, and
 per-service environment variables. Start from the published defaults and adjust
-for your domains, secrets, and scaling targets.【F:deploy/helm/aether-platform/values.yaml†L1-L1179】
+for your domains, secrets, and scaling targets.【F:deploy/helm/aether-platform/values.yaml†L1-L1671】
 
 Key items to review:
 
@@ -160,13 +171,20 @@ Key items to review:
   rolls pods when credentials rotate.【F:deploy/helm/aether-platform/values.yaml†L19-L60】
 * `runtimeSafety._ALLOW_INSECURE_DEFAULTS` must remain `false` for production so
   services refuse to use on-disk fallbacks.【F:deploy/helm/aether-platform/values.yaml†L116-L118】
+* `serviceAccounts.names` if you need to align with pre-existing RBAC; the chart
+  provisions the defaults for you otherwise.【F:deploy/helm/aether-platform/values.yaml†L171-L184】【F:deploy/helm/aether-platform/templates/serviceaccounts.yaml†L1-L11】
 * Backend service `env` sections for DSNs, Redis URLs, and API keys. Reference
-  the secrets you created earlier.【F:deploy/helm/aether-platform/values.yaml†L180-L1049】
+  the secrets you created earlier.【F:deploy/helm/aether-platform/values.yaml†L180-L1494】
 * UI environment variables (`NEXT_PUBLIC_API_BASE_URL`, `VITE_API_BASE_URL`) so
   compiled assets call the deployed risk API ingress.
-  【F:deploy/helm/aether-platform/values.yaml†L1052-L1071】
+  【F:deploy/helm/aether-platform/values.yaml†L1643-L1671】
 * Ingress hosts for every service and the UI to align with your DNS entries.
-  【F:deploy/helm/aether-platform/values.yaml†L180-L1179】
+  【F:deploy/helm/aether-platform/values.yaml†L180-L1671】
+* `dataPipelines` replica counts, TLS mounts, and service endpoints to keep
+  ingestion healthy.【F:deploy/helm/aether-platform/values.yaml†L1496-L1602】
+* `feast` Redis host, offline store secret, and backup bucket so the feature
+  store and CronJob succeed immediately after install.
+  【F:deploy/helm/aether-platform/values.yaml†L1604-L1641】
 
 ## 7. Deploy the Platform Chart
 
@@ -223,7 +241,7 @@ environment point at the TimescaleDB release you installed in Step 5.
 
 * **Scaling & resiliency** – Tune replicas, HPAs, and PodDisruptionBudgets in
   your values file and run `helm upgrade` when you need to scale out.
-  【F:deploy/helm/aether-platform/values.yaml†L188-L1049】
+  【F:deploy/helm/aether-platform/values.yaml†L188-L1494】
 * **Observability** – Integrate Prometheus/Grafana using the scrape annotations
   and metrics ports defined in the chart, or point to a managed monitoring
   solution.【F:deploy/helm/aether-platform/values.yaml†L90-L112】
