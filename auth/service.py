@@ -69,10 +69,9 @@ else:
             def verify(self, code: str, valid_window: int = 1) -> bool:
                 return code == self.now()
 
-        pyotp.TOTP = _DeterministicTOTP  # type: ignore[assignment]
+        pyotp.TOTP = _DeterministicTOTPAdapter  # type: ignore[assignment]
     _PYOTP_IMPORT_ERROR = None
 
-from shared.correlation import get_correlation_id
 from shared.dependency_alerts import notify_dependency_fallback
 
 try:
