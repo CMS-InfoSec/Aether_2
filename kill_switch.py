@@ -7,7 +7,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List
 
-from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
+from services.common.adapters import TimescaleAdapter
+from shared.event_bus import KafkaNATSAdapter
 from services.common.security import require_admin_account
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status

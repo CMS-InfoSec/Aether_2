@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from functools import partial
 from threading import Lock
-from typing import Awaitable, Dict, Iterable, Iterator, Optional, Tuple, cast
+from typing import Any, Awaitable, Dict, Iterable, Iterator, List, Optional, Tuple, cast
 
 from sqlalchemy import (
     Boolean,
@@ -42,8 +42,8 @@ from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from common.schemas.contracts import FillEvent
-from services.common.adapters import KafkaNATSAdapter
 from shared.async_utils import dispatch_async
+from shared.event_bus import KafkaNATSAdapter
 from shared.postgres import normalize_sqlalchemy_dsn
 from shared.account_scope import account_id_column
 
@@ -718,5 +718,6 @@ __all__ = [
     "SimulatedOrderSnapshot",
     "SimulatedExecution",
     "sim_broker",
+    "KafkaNATSAdapter",
 ]
 

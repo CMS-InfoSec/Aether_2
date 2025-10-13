@@ -19,24 +19,9 @@ from fastapi import FastAPI
 from metrics import setup_metrics
 
 from shared.pydantic_compat import BaseModel, Field
+from shared.event_bus import KafkaNATSAdapter
 
 from common.schemas.contracts import IntentEvent
-try:
-    from services.common.adapters import KafkaNATSAdapter
-except (ImportError, AttributeError):  # pragma: no cover - lightweight fallback
-    class KafkaNATSAdapter:  # type: ignore[override]
-        def __init__(self, account_id: str) -> None:
-            self.account_id = account_id
-
-        async def publish(self, topic: str, payload: Dict[str, Any]) -> None:
-            LOGGER.warning(
-                "Kafka/NATS adapter unavailable; dropping backpressure event",
-                extra={
-                    "topic": topic,
-                    "account_id": self.account_id,
-                    "payload_keys": sorted(payload.keys()),
-                },
-            )
 from prometheus_client import Counter as PrometheusCounter, Gauge
 
 LOGGER = logging.getLogger(__name__)
