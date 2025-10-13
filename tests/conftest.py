@@ -865,25 +865,70 @@ def _install_prometheus_stub() -> None:
     prom = ModuleType("prometheus_client")
 
     class _Metric:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            self.args = args
-            self.kwargs = kwargs
+        def __init__(
+            self,
+            *args: object,
+            labelnames: tuple[str, ...] | list[str] | None = None,
+            registry: "_CollectorRegistry" | None = None,
+            **kwargs: object,
+        ) -> None:
+            del args, kwargs
+            self._labelnames = tuple(labelnames or ())
+            self._values: dict[tuple[str, ...], float] = {}
+            if registry is not None:
+                registry.register(self)
 
-        def labels(self, **kwargs: object) -> "_Metric":
+        def labels(self, *args: object, **kwargs: object) -> "_Metric":
+            if args and kwargs:
+                raise ValueError("Use positional or keyword labels, not both")
+            if args:
+                key = tuple(str(value) for value in args)
+            else:
+                key = tuple(str(kwargs.get(name, "")) for name in self._labelnames)
+            self._current_key = key
+            self._values.setdefault(key, 0.0)
             return self
 
         def set(self, value: float) -> None:
-            self._value = value
+            key = getattr(self, "_current_key", ())
+            self._values[key] = value
 
         def inc(self, value: float = 1.0) -> None:
-            self._value = getattr(self, "_value", 0.0) + value
+            key = getattr(self, "_current_key", ())
+            self._values[key] = self._values.get(key, 0.0) + value
+
+        def observe(self, value: float) -> None:
+            self.set(value)
+
+        def collect(self) -> list[SimpleNamespace]:
+            samples = []
+            for key, value in self._values.items():
+                labels = {name: label for name, label in zip(self._labelnames, key)}
+                samples.append(SimpleNamespace(name=getattr(self, "_name", ""), labels=labels, value=value))
+            return [SimpleNamespace(samples=samples)]
+
+    class _CollectorRegistry:
+        def __init__(self) -> None:
+            self._collectors: set[_Metric] = set()
+
+        def register(self, collector: _Metric) -> None:
+            self._collectors.add(collector)
+
+        def unregister(self, collector: _Metric) -> None:
+            self._collectors.discard(collector)
+
+        def collect(self) -> list[SimpleNamespace]:
+            families: list[SimpleNamespace] = []
+            for collector in list(self._collectors):
+                families.extend(collector.collect())
+            return families
 
     prom.Counter = _Metric
     prom.Gauge = _Metric
     prom.Summary = _Metric
     prom.Histogram = _Metric
-    prom.CollectorRegistry = SimpleNamespace
-    prom.REGISTRY = SimpleNamespace()
+    prom.CollectorRegistry = _CollectorRegistry
+    prom.REGISTRY = _CollectorRegistry()
     prom.CONTENT_TYPE_LATEST = "text/plain"
     prom.generate_latest = lambda registry: b""
     sys.modules["prometheus_client"] = prom
