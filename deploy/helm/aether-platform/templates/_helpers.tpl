@@ -82,7 +82,7 @@ app: {{ .name }}
 {{- $redis := .Values.dependencies.redis | default (dict) -}}
 {{- $fullname := $redis.fullnameOverride | default (printf "%s-redis" .Release.Name) -}}
 {{- $arch := lower ($redis.architecture | default "standalone") -}}
-{{- if eq $arch "replication" -}}
+{{- if or (eq $arch "replication") (eq $arch "standalone") -}}
 {{- printf "%s-master" $fullname -}}
 {{- else -}}
 {{- $fullname -}}
