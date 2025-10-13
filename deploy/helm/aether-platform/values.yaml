@@ -17,7 +17,7 @@ global:
       X-Frame-Options: "DENY"
       X-XSS-Protection: "1; mode=block"
   krakenSecrets:
-    enabled: true
+    enabled: false
     basePath: /var/run/secrets/kraken
     annotationKey: checksum/kraken-secrets
     checksum: ""
@@ -40,11 +40,11 @@ global:
         secretName: kraken-keys-director-2
   accountAllowlists:
     admin:
-      secretName: platform-account-allowlists
-      secretKey: admins
+      secretName: ""
+      secretKey: ""
     director:
-      secretName: platform-account-allowlists
-      secretKey: directors
+      secretName: ""
+      secretKey: ""
   podSecurityContext:
     runAsNonRoot: true
     runAsUser: 1000
@@ -60,7 +60,7 @@ global:
     readOnlyRootFilesystem: true
 
   sessionStore:
-    redisUrl: redis://redis.aether.svc.cluster.local:6379/0
+    redisUrl: ""
   releaseManifest:
     enabled: true
     databaseSecretName: release-manifest-database
@@ -134,6 +134,219 @@ global:
           - 172.104.0.0/13
         ports:
           - 443
+
+dependencies:
+  postgresql:
+    enabled: true
+    fullnameOverride: aether-postgresql
+    auth:
+      username: aether_admin
+      password: aether-admin-password
+      database: aether_admin
+    primary:
+      initdbScriptsConfigMap: aether-postgresql-init
+      persistence:
+        enabled: true
+        size: 100Gi
+      resources:
+        requests:
+          cpu: 500m
+          memory: 2Gi
+        limits:
+          cpu: 2
+          memory: 4Gi
+  redis:
+    enabled: true
+    fullnameOverride: aether-redis
+    architecture: standalone
+    auth:
+      enabled: true
+      password: aether-redis-password
+    master:
+      persistence:
+        enabled: true
+        size: 10Gi
+      service:
+        ports:
+          redis: 6379
+  kafka:
+    enabled: true
+    fullnameOverride: aether-kafka
+    replicaCount: 3
+    persistence:
+      enabled: true
+      size: 50Gi
+    listeners:
+      client:
+        protocol: PLAINTEXT
+      external:
+        enabled: false
+    zookeeper:
+      replicaCount: 3
+      persistence:
+        enabled: true
+        size: 10Gi
+  nats:
+    enabled: true
+    fullnameOverride: aether-nats
+    auth:
+      enabled: false
+    replicaCount: 3
+
+managedSecrets:
+  enabled: true
+  secrets:
+    account-service-database:
+      type: postgresDsn
+      connection:
+        database: account_service
+        username: account_service
+        password: account-service-password
+        sslmode: require
+    account-service-secrets:
+      type: opaque
+      data:
+        encryptionKey: change-me-account-secret
+    auth-service-config:
+      type: postgresDsn
+      dsnKey: AUTH_DATABASE_URL
+      connection:
+        database: auth_service
+        username: auth_service
+        password: auth-service-password
+        sslmode: require
+      additionalData:
+        AUTH_JWT_SECRET: change-me-jwt-secret
+    advisor-service-database:
+      type: postgresDsn
+      connection:
+        database: advisor_service
+        username: advisor_service
+        password: advisor-service-password
+        sslmode: require
+    behavior-service-database:
+      type: postgresDsn
+      connection:
+        database: behavior_service
+        username: behavior_service
+        password: behavior-service-password
+        sslmode: require
+    compliance-service-database:
+      type: postgresDsn
+      connection:
+        database: compliance_service
+        username: compliance_service
+        password: compliance-service-password
+        sslmode: require
+    benchmark-service-database:
+      type: postgresDsn
+      connection:
+        database: benchmark_service
+        username: benchmark_service
+        password: benchmark-service-password
+        sslmode: require
+    capital-flow-service-database:
+      type: postgresDsn
+      connection:
+        database: capital_flow_service
+        username: capital_flow_service
+        password: capital-flow-service-password
+        sslmode: require
+    capital-allocator-database:
+      type: postgresDsn
+      connection:
+        database: capital_allocator
+        username: capital_allocator
+        password: capital-allocator-password
+        sslmode: require
+    config-service-database:
+      type: postgresDsn
+      connection:
+        database: config_service
+        username: config_service
+        password: config-service-password
+        sslmode: require
+    fees-service-database:
+      type: postgresDsn
+      connection:
+        database: fees_service
+        username: fees_service
+        password: fees-service-password
+        sslmode: require
+    hitl-service-database:
+      type: postgresDsn
+      connection:
+        database: hitl_service
+        username: hitl_service
+        password: hitl-service-password
+        sslmode: require
+    override-service-database:
+      type: postgresDsn
+      connection:
+        database: override_service
+        username: override_service
+        password: override-service-password
+        sslmode: require
+    risk-service-database:
+      type: postgresDsn
+      connection:
+        database: risk_service
+        username: risk_service
+        password: risk-service-password
+        sslmode: require
+    seasonality-service-database:
+      type: postgresDsn
+      connection:
+        database: seasonality_service
+        username: seasonality_service
+        password: seasonality-service-password
+        sslmode: require
+    secrets-service-config:
+      type: opaque
+      data:
+        SECRET_ENCRYPTION_KEY: change-me-platform-secret
+    sim-mode-database:
+      type: postgresDsn
+      connection:
+        database: sim_mode
+        username: sim_mode
+        password: sim-mode-password
+        sslmode: require
+    strategy-orchestrator-database:
+      type: postgresDsn
+      connection:
+        database: strategy_orchestrator
+        username: strategy_orchestrator
+        password: strategy-orchestrator-password
+        sslmode: require
+    training-service-database:
+      type: postgresDsn
+      connection:
+        database: training_service
+        username: training_service
+        password: training-service-password
+        sslmode: require
+    universe-service-database:
+      type: postgresDsn
+      connection:
+        database: universe_service
+        username: universe_service
+        password: universe-service-password
+        sslmode: require
+    volatility-service-database:
+      type: postgresDsn
+      connection:
+        database: volatility_service
+        username: volatility_service
+        password: volatility-service-password
+        sslmode: require
+    release-manifest-database:
+      type: postgresDsn
+      connection:
+        database: release_manifest
+        username: release_manifest
+        password: release-manifest-password
+        sslmode: require
 simulation:
   enabled: false
 
@@ -141,6 +354,61 @@ runtimeSafety:
   _ALLOW_INSECURE_DEFAULTS: false
 
 backendServices:
+  auth:
+    enabled: true
+    nameOverride: auth-service
+    image:
+      repository: ghcr.io/aether/auth-service
+      tag: latest
+    replicaCount: 3
+    containerPort: 8000
+    serviceAccountName: api-services
+    envFrom:
+      - secretRef:
+          name: auth-service-config
+    env:
+      - name: AUTH_DATABASE_SCHEMA
+        value: auth
+      - name: AUTH_DATABASE_POOL_SIZE
+        value: "10"
+      - name: AUTH_DATABASE_MAX_OVERFLOW
+        value: "20"
+      - name: AUTH_DATABASE_POOL_TIMEOUT_SECONDS
+        value: "30"
+      - name: AUTH_DATABASE_POOL_RECYCLE_SECONDS
+        value: "300"
+    usesKrakenSecrets: false
+    extraVolumeMounts: []
+    extraVolumes: []
+    service:
+      port: 80
+      targetPort: http
+    ingress:
+      enabled: true
+      host: auth.aether.example.com
+      tlsSecret: auth-service-tls
+      annotations: {}
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    hpa:
+      enabled: true
+      minReplicas: 3
+      maxReplicas: 6
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 60
+    pdb:
+      enabled: true
+      maxUnavailable: 1
   accountService:
     enabled: true
     nameOverride: account-service
@@ -361,6 +629,58 @@ backendServices:
     pdb:
       enabled: true
       maxUnavailable: 1
+  capitalAllocator:
+    enabled: true
+    nameOverride: capital-allocator
+    image:
+      repository: ghcr.io/aether/capital-allocator
+      tag: latest
+    replicaCount: 2
+    containerPort: 8000
+    env:
+      - name: CAPITAL_ALLOCATOR_DB_URL
+        valueFrom:
+          secretKeyRef:
+            name: capital-allocator-database
+            key: dsn
+      - name: CAPITAL_ALLOCATOR_SSLMODE
+        valueFrom:
+          secretKeyRef:
+            name: capital-allocator-database
+            key: sslmode
+            optional: true
+    usesKrakenSecrets: false
+    extraVolumeMounts: []
+    extraVolumes: []
+    service:
+      port: 80
+      targetPort: http
+    ingress:
+      enabled: false
+      host: ""
+      tlsSecret: ""
+      annotations: {}
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 4
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 60
+    pdb:
+      enabled: true
+      maxUnavailable: 1
   capitalFlow:
     enabled: true
     nameOverride: capital-flow-service
@@ -431,6 +751,57 @@ backendServices:
           stabilizationWindowSeconds: 60
         scaleDown:
           stabilizationWindowSeconds: 120
+    pdb:
+      enabled: true
+      maxUnavailable: 1
+  config:
+    enabled: true
+    nameOverride: config-service
+    image:
+      repository: ghcr.io/aether/config-service
+      tag: latest
+    replicaCount: 2
+    containerPort: 8000
+    env:
+      - name: CONFIG_DATABASE_URL
+        valueFrom:
+          secretKeyRef:
+            name: config-service-database
+            key: dsn
+      - name: CONFIG_DB_SSLMODE
+        valueFrom:
+          secretKeyRef:
+            name: config-service-database
+            key: sslmode
+    usesKrakenSecrets: false
+    extraVolumeMounts: []
+    extraVolumes: []
+    service:
+      port: 80
+      targetPort: http
+    ingress:
+      enabled: true
+      host: config.aether.example.com
+      tlsSecret: config-service-tls
+      annotations: {}
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 4
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 60
     pdb:
       enabled: true
       maxUnavailable: 1
@@ -612,8 +983,6 @@ backendServices:
     replicaCount: 2
     containerPort: 8000
     env:
-      - name: SESSION_REDIS_URL
-        value: redis://redis:6379/0
       - name: SIM_MODE_DATABASE_URL
         valueFrom:
           secretKeyRef:
@@ -836,6 +1205,17 @@ backendServices:
     replicaCount: 2
     containerPort: 8000
     env:
+      - name: COMPLIANCE_DATABASE_URL
+        valueFrom:
+          secretKeyRef:
+            name: compliance-service-database
+            key: dsn
+      - name: COMPLIANCE_DB_SSLMODE
+        valueFrom:
+          secretKeyRef:
+            name: compliance-service-database
+            key: sslmode
+            optional: true
 
       - name: RISK_DATABASE_URL
         valueFrom:
@@ -908,6 +1288,58 @@ backendServices:
           stabilizationWindowSeconds: 60
         scaleDown:
           stabilizationWindowSeconds: 60
+    pdb:
+      enabled: true
+      maxUnavailable: 1
+  strategyOrchestrator:
+    enabled: true
+    nameOverride: strategy-orchestrator
+    image:
+      repository: ghcr.io/aether/strategy-orchestrator
+      tag: latest
+    replicaCount: 2
+    containerPort: 8000
+    env:
+      - name: STRATEGY_DATABASE_URL
+        valueFrom:
+          secretKeyRef:
+            name: strategy-orchestrator-database
+            key: dsn
+      - name: STRATEGY_DB_SSLMODE
+        valueFrom:
+          secretKeyRef:
+            name: strategy-orchestrator-database
+            key: sslmode
+            optional: true
+    usesKrakenSecrets: false
+    extraVolumeMounts: []
+    extraVolumes: []
+    service:
+      port: 80
+      targetPort: http
+    ingress:
+      enabled: true
+      host: strategy.aether.example.com
+      tlsSecret: strategy-orchestrator-tls
+      annotations: {}
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 600m
+        memory: 1Gi
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 5
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 60
     pdb:
       enabled: true
       maxUnavailable: 1
