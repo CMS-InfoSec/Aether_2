@@ -132,11 +132,15 @@ PY
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Install Buildah and Syft
+      - name: Install Buildah
         run: |
           sudo apt-get update
           sudo apt-get install -y buildah
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Download Syft
+        uses: anchore/sbom-action/download-syft@v0.16.0
+        with:
+          syft-version: v1.17.0
       - name: Build Risk API with Buildah
         run: |
           buildah bud -f deploy/docker/risk-api/Dockerfile -t ghcr.io/aether/risk-api:${{ github.sha }} .
