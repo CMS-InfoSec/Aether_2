@@ -2,6 +2,6 @@
 
 from __future__ import annotations
 
-from . import readiness
+from . import readiness, readyz_router
 
-__all__ = ["readiness"]
+__all__ = ["readiness", "readyz_router"]

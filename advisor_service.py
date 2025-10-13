@@ -25,7 +25,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import ModuleType, SimpleNamespace, TracebackType
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, cast
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, TypeVar, cast
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, status
@@ -34,7 +34,7 @@ from pydantic import BaseModel, Field, validator
 _SQLALCHEMY_AVAILABLE = True
 
 try:  # pragma: no cover - exercised when SQLAlchemy is installed
-    from sqlalchemy import JSON, Column, DateTime, Integer, String, create_engine
+    from sqlalchemy import JSON, Column, DateTime, Integer, String, create_engine, text
     from sqlalchemy.engine import Engine
     from sqlalchemy.exc import SQLAlchemyError
     from sqlalchemy.ext.declarative import declarative_base
@@ -42,7 +42,7 @@ try:  # pragma: no cover - exercised when SQLAlchemy is installed
     from sqlalchemy.pool import StaticPool
 except Exception:  # pragma: no cover - executed in lightweight environments
     _SQLALCHEMY_AVAILABLE = False
-    JSON = Column = DateTime = Integer = String = None  # type: ignore[assignment]
+    JSON = Column = DateTime = Integer = String = text = None  # type: ignore[assignment]
     SQLAlchemyError = RuntimeError  # type: ignore[assignment]
     Engine = Any  # type: ignore[assignment]
     Session = Any  # type: ignore[assignment]
@@ -57,6 +57,8 @@ except Exception:  # pragma: no cover - executed in lightweight environments
     def sessionmaker(*_: Any, **__: Any) -> Callable[[], Any]:  # type: ignore[override]
         raise RuntimeError("SQLAlchemy sessionmaker is unavailable")
 
+_T = TypeVar("_T")
+
 from auth.service import (
     InMemorySessionStore,
     SessionStoreProtocol,
@@ -66,6 +68,9 @@ from services.common import security
 from services.common.security import require_admin_account
 from shared.postgres import normalize_sqlalchemy_dsn
 from shared.session_config import load_session_ttl_minutes
+from shared import readiness
+from shared.readiness import ProbeFailure, ProviderNotConfigured
+from shared.readyz_router import ReadyzRouter
 
 LOGGER = logging.getLogger(__name__)
 
@@ -442,6 +447,137 @@ def get_db(request: Request) -> Iterable[Session]:
 
 
 # ---------------------------------------------------------------------------
+# Readiness probes
+# ---------------------------------------------------------------------------
+
+
+async def _run_in_thread(func: Callable[[], _T]) -> _T:
+    """Execute blocking *func* in a worker thread."""
+
+    try:
+        to_thread = asyncio.to_thread
+    except AttributeError:  # pragma: no cover - fallback for Python < 3.9
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, func)
+    return await to_thread(func)
+
+
+class _SQLAlchemyProbeClient:
+    """Adapter exposing async helpers for the readiness probes."""
+
+    def __init__(self, session_factory: Callable[[], Session]) -> None:
+        self._session_factory = session_factory
+
+    async def fetchval(self, query: str, *args: Any, timeout: float | None = None) -> Any:
+        def _execute() -> Any:
+            session = self._session_factory()
+            try:
+                result = session.execute(text(query))
+                return result.scalar()
+            finally:
+                session.close()
+
+        return await _run_in_thread(_execute)
+
+    async def execute(self, query: str, *args: Any, timeout: float | None = None) -> Any:
+        def _execute() -> Any:
+            session = self._session_factory()
+            try:
+                session.execute(text(query))
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
+        return await _run_in_thread(_execute)
+
+
+class _InMemoryProbeClient:
+    """Minimal adapter used when SQLAlchemy is unavailable."""
+
+    def __init__(self, session_factory: Callable[[], _InMemorySession]) -> None:
+        self._session_factory = session_factory
+
+    async def fetchval(self, query: str, *args: Any, timeout: float | None = None) -> int:
+        session = self._session_factory()
+        try:
+            session.query(AdvisorQuery)
+        finally:
+            session.close()
+        return 1
+
+    async def execute(self, query: str, *args: Any, timeout: float | None = None) -> None:
+        session = self._session_factory()
+        try:
+            session.query(AdvisorQuery)
+        finally:
+            session.close()
+
+
+def _get_session_factory(application: FastAPI) -> Callable[[], Any]:
+    session_factory = getattr(application.state, "db_session_factory", None)
+    if session_factory is None:
+        raise ProviderNotConfigured("Advisor database")
+    return session_factory
+
+
+def _using_sqlite(application: FastAPI) -> bool:
+    engine = getattr(application.state, "db_engine", None)
+    if not _SQLALCHEMY_AVAILABLE:
+        return isinstance(engine, _InMemoryEngine)
+    if engine is None:
+        return False
+    backend = getattr(getattr(engine, "dialect", None), "name", "")
+    return str(backend).lower() == "sqlite"
+
+
+def _build_postgres_probe_client(application: FastAPI) -> Any:
+    session_factory = _get_session_factory(application)
+    if _SQLALCHEMY_AVAILABLE:
+        return _SQLAlchemyProbeClient(session_factory)  # type: ignore[arg-type]
+    return _InMemoryProbeClient(session_factory)  # type: ignore[arg-type]
+
+
+async def _postgres_read_probe() -> None:
+    client = _build_postgres_probe_client(app)
+    await readiness.postgres_read_probe(client=client)
+
+
+async def _postgres_write_probe() -> None:
+    client = _build_postgres_probe_client(app)
+    read_only_query = "SELECT 1" if _using_sqlite(app) else "SELECT pg_is_in_recovery()"
+    await readiness.postgres_write_probe(client=client, read_only_query=read_only_query)
+
+
+async def _session_store_probe() -> None:
+    store = getattr(app.state, "session_store", None)
+    if store is None:
+        raise ProviderNotConfigured("Session store")
+
+    redis_client = getattr(store, "_redis", None)
+    if redis_client is not None:
+        await readiness.redis_ping_probe(client=redis_client)
+        return
+
+    getter = getattr(store, "get", None)
+    if not callable(getter):
+        raise ProbeFailure("Session store", "configured store does not expose a get method")
+
+    try:
+        getter("_advisor_readyz_probe_")
+    except Exception as exc:  # pragma: no cover - defensive surface
+        raise ProbeFailure("Session store", f"probe lookup failed with {exc!r}") from exc
+
+
+_readyz_router = ReadyzRouter()
+_readyz_router.register_probe("postgres_read", _postgres_read_probe)
+_readyz_router.register_probe("postgres_write", _postgres_write_probe)
+_readyz_router.register_probe("session_store", _session_store_probe)
+
+
+# ---------------------------------------------------------------------------
 # Data acquisition helpers
 # ---------------------------------------------------------------------------
 
@@ -739,6 +875,7 @@ class AdvisorQueryResponse(BaseModel):
 
 
 app = FastAPI(title="Advisor Service", version="1.0.0")
+app.include_router(_readyz_router.router)
 
 SESSION_STORE: SessionStoreProtocol | None = None
 

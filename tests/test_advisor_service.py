@@ -140,3 +140,30 @@ def test_insecure_store_persists_across_reloads(tmp_path: Path, monkeypatch: pyt
     records = store_reloaded.all()
     assert records, "Expected advisor history to persist across reloads"
     assert records[0].question == "How did we perform?"
+
+
+def test_readyz_reports_success(advisor_client) -> None:
+    client, _, _ = advisor_client
+
+    response = client.get("/readyz")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "ok"
+    assert payload["checks"]["postgres_read"]["status"] == "ok"
+
+
+def test_readyz_returns_503_on_failure(advisor_client) -> None:
+    client, module, _ = advisor_client
+
+    original_factory = getattr(module.app.state, "db_session_factory", None)
+    module.app.state.db_session_factory = None
+    try:
+        response = client.get("/readyz")
+    finally:
+        module.app.state.db_session_factory = original_factory
+
+    assert response.status_code == 503
+    payload = response.json()
+    assert payload["status"] == "error"
+    assert payload["checks"]["postgres_read"]["status"] == "error"
