@@ -78,6 +78,8 @@ This document enumerates every FastAPI application defined in the repository, hi
 
 ## `/readyz` rollout progress
 
+Refer to [the readiness contract and rollout plan](deployment/readyz_rollout.md) for alerting, communication, and tracking details that back this table.
+
 | Service module | Status |
 | --- | --- |
 | `advisor_service.py` | ✅ Adopted shared router |
