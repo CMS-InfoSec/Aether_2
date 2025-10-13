@@ -73,7 +73,7 @@ test = [
     "prometheus-client==0.23.1",
     "pytest==8.4.2",
     "pytest-benchmark==5.1.0",
-    "pytest-asyncio==0.24.0",
+    "pytest-asyncio==1.2.0",
     "requests==2.32.5",
     "websockets==15.0.1",
 ]
