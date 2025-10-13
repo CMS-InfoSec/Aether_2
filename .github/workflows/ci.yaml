@@ -75,7 +75,7 @@ jobs:
           docker build -t risk-api:ci -f deploy/docker/risk-api/Dockerfile .
 
       - name: Scan risk API image with Trivy
-        uses: aquasecurity/trivy-action@0.21.0
+        uses: aquasecurity/trivy-action@v0.21.0
         with:
           image-ref: risk-api:ci
           severity: CRITICAL,HIGH

@@ -26,6 +26,7 @@ jobs:
           exit_code=0
           pip-audit \
             --progress-spinner off \
+            --config pip-audit.toml \
             -r requirements.txt \
             -r requirements-ci.txt || exit_code=$?
 
@@ -35,4 +36,5 @@ jobs:
 
           if [ "$exit_code" -eq 1 ]; then
             echo "pip-audit reported vulnerabilities that require manual remediation."
+            exit 1
           fi
