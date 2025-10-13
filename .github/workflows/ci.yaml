@@ -40,15 +40,20 @@ jobs:
 
       - name: Lint for unused imports and insecure defaults
         run: |
-          ruff check . --select F401,F402,F403,F404,F405,F406,F407,F601,F602 --exclude tests
+          ruff check app.py auth shared metrics.py
           python scripts/lint_insecure_defaults.py
+
+      - name: Type check backend
+        run: mypy
 
       - name: Run pytest (full stack, fail on warnings/skips)
         env:
           PYTHONWARNINGS: error
         run: |
-          pytest --maxfail=1 --strict-markers --strict-config --runxfail --junitxml=pytest-report.xml
+          coverage run -m pytest --maxfail=1 --strict-markers --strict-config --runxfail --junitxml=pytest-report.xml
           python scripts/ensure_no_skips.py pytest-report.xml
+          coverage xml
+          coverage report > coverage-summary.txt
 
       - name: Enforce spot-only compliance exporter
         env:
@@ -108,3 +113,11 @@ jobs:
         with:
           name: build-manifest-${{ github.job }}
           path: build-manifest.json
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ github.job }}
+          path: |
+            coverage.xml
+            coverage-summary.txt
