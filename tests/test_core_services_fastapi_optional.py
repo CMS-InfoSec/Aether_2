@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 import importlib
+import os
 import sys
 from types import ModuleType
 from typing import Iterable
@@ -32,6 +33,17 @@ def _purge_modules(prefixes: Iterable[str]) -> None:
         "policy_service",
         "kill_switch",
         "latency_profiler",
+        "model_server",
+        "training_service",
+        "pack_exporter",
+        "taxlots",
+        "override_service",
+        "capital_optimizer",
+        "alert_prioritizer",
+        "alt_data",
+        "services.ui.explain_service",
+        "services.report_service",
+        "ops.metrics.cost_monitor",
     ],
 )
 def test_core_services_import_without_fastapi(
@@ -49,6 +61,10 @@ def test_core_services_import_without_fastapi(
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", _fake_import)
+
+    if module_name == "override_service":
+        monkeypatch.setenv("OVERRIDE_ALLOW_SQLITE_FOR_TESTS", "1")
+        monkeypatch.setenv("OVERRIDE_DATABASE_URL", "sqlite:///override.db")
 
     module = importlib.import_module(module_name)
 
