@@ -61,8 +61,8 @@ jobs:
           tmpdir="$(mktemp -d)"
           archive="kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz"
           base_url="https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize/v${KUSTOMIZE_VERSION}"
-          curl -sSLo "${tmpdir}/${archive}" "${base_url}/${archive}"
-          curl -sSLo "${tmpdir}/checksums.txt" "${base_url}/kustomize_v${KUSTOMIZE_VERSION}_checksums.txt"
+          curl -fsSLo "${tmpdir}/${archive}" "${base_url}/${archive}"
+          curl -fsSLo "${tmpdir}/checksums.txt" "${base_url}/kustomize_v${KUSTOMIZE_VERSION}_checksums.txt"
           (cd "${tmpdir}" && grep "${archive}" checksums.txt | sha256sum -c -)
           tar -xzf "${tmpdir}/${archive}" -C "${tmpdir}"
           sudo install -m 0755 "${tmpdir}/kustomize" /usr/local/bin/kustomize
