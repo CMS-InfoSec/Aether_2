@@ -1,9 +1,11 @@
+import importlib
 import json
-from copy import deepcopy
-from datetime import datetime
-from typing import Any, Dict, List, Tuple
-
 import os
+import sys
+import types
+from copy import deepcopy
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Tuple
 
 os.environ.setdefault("ADMIN_ALLOWLIST", "company")
 os.environ.setdefault("DIRECTOR_ALLOWLIST", "company")
@@ -13,7 +15,30 @@ from fastapi.testclient import TestClient
 
 from kill_switch import KillSwitchReason, app
 from metrics import record_kill_switch_state
-from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
+
+try:  # pragma: no cover - exercised when adapters package unavailable
+    from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
+except ImportError:  # pragma: no cover - fallback for lightweight environments
+
+    from shared.event_bus import KafkaNATSAdapter  # type: ignore[attr-defined]
+
+    adapters_stub = types.ModuleType("services.common.adapters")
+
+    class _PlaceholderTimescaleAdapter:  # pragma: no cover - simple stub
+        def __init__(self, *args: object, **kwargs: object) -> None:  # noqa: D401
+            self.args = args
+            self.kwargs = kwargs
+
+        @classmethod
+        def reset(cls, *_: object, **__: object) -> None:
+            return
+
+    adapters_stub.KafkaNATSAdapter = KafkaNATSAdapter  # type: ignore[attr-defined]
+    adapters_stub.TimescaleAdapter = _PlaceholderTimescaleAdapter  # type: ignore[attr-defined]
+    sys.modules.pop("services.common.adapters", None)
+    sys.modules["services.common.adapters"] = adapters_stub
+    KafkaNATSAdapter = adapters_stub.KafkaNATSAdapter  # type: ignore[assignment]
+    TimescaleAdapter = adapters_stub.TimescaleAdapter  # type: ignore[assignment]
 
 
 class _DummyResponse:
@@ -146,7 +171,7 @@ def test_trigger_kill_switch_publishes_event_and_sets_state(monkeypatch: pytest.
             return _DummyResponse(status_code=200)
         raise AssertionError(f"Unexpected URL {url}")
 
-    monkeypatch.setattr("kill_alerts.requests.post", _fake_post)
+    monkeypatch.setattr("kill_alerts._perform_http_post", _fake_post)
 
     response = client.post(
         "/risk/kill",
@@ -186,7 +211,7 @@ def test_trigger_kill_switch_publishes_event_and_sets_state(monkeypatch: pytest.
 
     email_request = requests_made[0]
     assert email_request[0] == "https://sendgrid.test/mail/send"
-    email_json = email_request[1]["json"]
+    email_json = email_request[1]["json_body"]
     assert email_json["from"]["email"] == "alerts@example.com"
     assert email_json["personalizations"][0]["to"] == [{"email": "risk@example.com"}]
     assert email_json["custom_args"]["account_id"] == "alpha"
@@ -223,7 +248,7 @@ def test_metrics_endpoint_exposes_kill_switch_state(monkeypatch: pytest.MonkeyPa
             return _DummyResponse(status_code=200)
         raise AssertionError(f"Unexpected URL {url}")
 
-    monkeypatch.setattr("kill_alerts.requests.post", _fake_post)
+    monkeypatch.setattr("kill_alerts._perform_http_post", _fake_post)
 
     response = client.post(
         "/risk/kill",
@@ -235,7 +260,11 @@ def test_metrics_endpoint_exposes_kill_switch_state(monkeypatch: pytest.MonkeyPa
 
     metrics_response = client.get("/metrics")
     assert metrics_response.status_code == 200
-    payload = metrics_response.text
+    raw_payload = getattr(metrics_response, "text", "")
+    if not raw_payload and hasattr(metrics_response, "content"):
+        content = metrics_response.content  # type: ignore[attr-defined]
+        raw_payload = content.decode("utf-8") if isinstance(content, bytes) else str(content)
+    payload = raw_payload
     assert "kill_switch_state{account_id=\"omega\"}" in payload
     assert "kill_switch_state{account_id=\"omega\"} 1" in payload
 
@@ -254,7 +283,7 @@ def test_list_kill_events_endpoint_returns_recent_events(monkeypatch: pytest.Mon
             return _DummyResponse(status_code=200)
         raise AssertionError(f"Unexpected URL {url}")
 
-    monkeypatch.setattr("kill_alerts.requests.post", _fake_post)
+    monkeypatch.setattr("kill_alerts._perform_http_post", _fake_post)
 
     response = client.post(
         "/risk/kill",
@@ -292,7 +321,7 @@ def test_partial_notification_failure_is_reported(monkeypatch: pytest.MonkeyPatc
             return _DummyResponse(status_code=200)
         raise AssertionError(f"Unexpected URL {url}")
 
-    monkeypatch.setattr("kill_alerts.requests.post", _fake_post)
+    monkeypatch.setattr("kill_alerts._perform_http_post", _fake_post)
 
     response = client.post(
         "/risk/kill",
@@ -305,3 +334,45 @@ def test_partial_notification_failure_is_reported(monkeypatch: pytest.MonkeyPatc
     assert payload["status"] == "partial"
     assert payload["channels_sent"] == ["email", "webhook"]
     assert payload["failed_channels"] == ["sms"]
+
+
+def test_timescale_fallback_captures_kill_events(monkeypatch: pytest.MonkeyPatch) -> None:
+    import kill_switch as kill_switch_module
+    import shared.event_bus as event_bus_module
+
+    adapters_stub = types.ModuleType("services.common.adapters")
+    adapters_stub.KafkaNATSAdapter = None  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "services.common.adapters", adapters_stub)
+
+    importlib.reload(event_bus_module)
+    reloaded = importlib.reload(kill_switch_module)
+
+    assert reloaded.TimescaleAdapter is reloaded._FallbackTimescaleAdapter
+
+    reloaded.TimescaleAdapter.reset()
+    adapter = reloaded.TimescaleAdapter(account_id="acme")
+    adapter.set_kill_switch(engaged=True, reason="testing", actor="ops")
+
+    config = adapter.load_risk_config()
+    assert config["kill_switch"] is True
+    assert config.get("kill_switch_reason") == "testing"
+    assert config.get("kill_switch_actor") == "ops"
+
+    now = datetime.now(timezone.utc)
+    adapter.record_kill_event(
+        reason_code="testing",
+        triggered_at=now,
+        channels_sent=["email"],
+    )
+
+    events = adapter.events()["events"]
+    assert events
+    assert events[-1]["type"] == "kill_switch_engaged"
+
+    recorded = reloaded.TimescaleAdapter.all_kill_events(account_id="acme")
+    assert recorded
+    assert recorded[0]["reason"] == "testing"
+    assert recorded[0]["channels_sent"] == ["email"]
+
+    importlib.reload(event_bus_module)
+    importlib.reload(kill_switch_module)
