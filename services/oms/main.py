@@ -28,7 +28,8 @@ from auth.service import (
 
 from services.common import security
 
-from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
+from services.common.adapters import TimescaleAdapter
+from shared.event_bus import KafkaNATSAdapter
 from services.common.schemas import (
     GTD_EXPIRE_TIME_REQUIRED,
     OrderPlacementRequest,
