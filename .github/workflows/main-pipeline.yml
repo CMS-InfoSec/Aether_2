@@ -90,7 +90,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Run Trivy SAST scan
-        uses: aquasecurity/trivy-action@v0.21.0
+        uses: aquasecurity/trivy-action@0.33.1
         with:
           scan-type: fs
           severity: CRITICAL
@@ -147,7 +147,7 @@ jobs:
           echo "latest_tag=${IMAGE_ID}:latest" >> "$GITHUB_OUTPUT"
 
       - name: Authenticate to GHCR
-        uses: redhat-actions/podman-login@v1
+        uses: redhat-actions/podman-login@v2
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -175,13 +175,14 @@ jobs:
 
       - name: Generate SBOM
         id: sbom
-        uses: anchore/syft-action@v1
+        uses: anchore/sbom-action@v0.16.0
         with:
           image: ${{ steps.image_meta.outputs.sha_tag }}
           output-file: sbom-${{ matrix.build.name }}.spdx.json
           format: spdx-json
           registry-username: ${{ github.actor }}
           registry-password: ${{ secrets.GITHUB_TOKEN }}
+          upload-artifact: false
 
       - name: Upload SBOM artifact
         uses: actions/upload-artifact@v4
