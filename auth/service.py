@@ -92,6 +92,27 @@ else:
             def verify(self, code: str, valid_window: int = 1) -> bool:
                 return code == self.now()
 
+            def provisioning_uri(
+                self,
+                name: str,
+                issuer_name: str | None = None,
+                **parameters: object,
+            ) -> str:
+                """Mirror ``pyotp.TOTP.provisioning_uri`` when tests stub the class."""
+
+                label = name
+                if issuer_name:
+                    label = f"{issuer_name}:{name}"
+                label = quote(label)
+                query: dict[str, str] = {"secret": self._secret}
+                if issuer_name:
+                    query["issuer"] = issuer_name
+                for key, value in parameters.items():
+                    if value is None:
+                        continue
+                    query[key] = str(value)
+                return f"otpauth://totp/{label}?{urlencode(query)}"
+
         pyotp.TOTP = _DeterministicTOTPAdapter  # type: ignore[assignment]
     _PYOTP_IMPORT_ERROR = None
 
