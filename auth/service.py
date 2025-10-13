@@ -56,7 +56,8 @@ except ModuleNotFoundError as exc:  # pragma: no cover - exercised in lightweigh
 else:
     _PYOTP_IMPORT_ERROR = None
     totp_cls = getattr(pyotp, "TOTP", None)
-    if totp_cls is not None and getattr(totp_cls, "__module__", "").startswith("conftest"):
+    module_name = getattr(totp_cls, "__module__", "")
+    if totp_cls is not None and module_name and "conftest" in module_name:
         class _DeterministicTOTPAdapter:
             """Adapter that enforces deterministic verification in stubbed environments."""
 
@@ -947,9 +948,14 @@ def hash_password(password: str) -> str:
 
 
 def _require_pyotp():
-    if pyotp is None:  # pragma: no cover - executed when pyotp missing
-        raise MissingDependencyError("pyotp is required for multi-factor authentication") from _PYOTP_IMPORT_ERROR
-    return pyotp
+    module = sys.modules.get("pyotp", pyotp)
+    if module is None:  # pragma: no cover - executed when pyotp missing
+        raise MissingDependencyError(
+            "pyotp is required for multi-factor authentication"
+        ) from _PYOTP_IMPORT_ERROR
+    if module is not pyotp:
+        globals()["pyotp"] = module
+    return module
 
 
 __all__ = [
