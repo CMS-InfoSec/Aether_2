@@ -109,6 +109,8 @@ except ImportError:  # pragma: no cover - provide a no-op metrics backend
             self._labelnames = tuple(labelnames or ())
             self._metric_type = metric_type or "gauge"
             self._values: Dict[tuple[str, ...], float] = {}
+            self._counts: Dict[tuple[str, ...], int] = {}
+            self._sums: Dict[tuple[str, ...], float] = {}
             if registry is not None:
                 try:
                     registry.register(self)
@@ -140,6 +142,9 @@ except ImportError:  # pragma: no cover - provide a no-op metrics backend
 
         def observe(self, value: float) -> None:
             self.set(value)
+            key = getattr(self, "_current_key", ())
+            self._counts[key] = self._counts.get(key, 0) + 1
+            self._sums[key] = self._sums.get(key, 0.0) + value
 
         def collect(self) -> Iterator[SimpleNamespace]:  # pragma: no cover - exercised via registry.collect
             samples = [
@@ -150,6 +155,22 @@ except ImportError:  # pragma: no cover - provide a no-op metrics backend
                 )
                 for key, value in self._values.items()
             ]
+            for key, count in self._counts.items():
+                labels = {name: label for name, label in zip(self._labelnames, key)}
+                samples.append(
+                    _Sample(
+                        name=f"{self._name}_count",
+                        labels=labels,
+                        value=float(count),
+                    )
+                )
+                samples.append(
+                    _Sample(
+                        name=f"{self._name}_sum",
+                        labels=labels,
+                        value=self._sums.get(key, 0.0),
+                    )
+                )
             yield SimpleNamespace(
                 name=self._name,
                 documentation=self._documentation,

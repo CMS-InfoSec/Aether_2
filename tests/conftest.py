@@ -872,9 +872,16 @@ def _install_prometheus_stub() -> None:
             registry: "_CollectorRegistry" | None = None,
             **kwargs: object,
         ) -> None:
-            del args, kwargs
+            name = ""
+            if args:
+                name = str(args[0])
+            elif "name" in kwargs:
+                name = str(kwargs["name"])
+            self._name = name
             self._labelnames = tuple(labelnames or ())
             self._values: dict[tuple[str, ...], float] = {}
+            self._counts: dict[tuple[str, ...], int] = {}
+            self._sums: dict[tuple[str, ...], float] = {}
             if registry is not None:
                 registry.register(self)
 
@@ -899,12 +906,31 @@ def _install_prometheus_stub() -> None:
 
         def observe(self, value: float) -> None:
             self.set(value)
+            key = getattr(self, "_current_key", ())
+            self._counts[key] = self._counts.get(key, 0) + 1
+            self._sums[key] = self._sums.get(key, 0.0) + value
 
         def collect(self) -> list[SimpleNamespace]:
             samples = []
             for key, value in self._values.items():
                 labels = {name: label for name, label in zip(self._labelnames, key)}
-                samples.append(SimpleNamespace(name=getattr(self, "_name", ""), labels=labels, value=value))
+                metric_name = getattr(self, "_name", "")
+                samples.append(SimpleNamespace(name=metric_name, labels=labels, value=value))
+                if key in self._counts:
+                    samples.append(
+                        SimpleNamespace(
+                            name=f"{metric_name}_count",
+                            labels=labels,
+                            value=float(self._counts[key]),
+                        )
+                    )
+                    samples.append(
+                        SimpleNamespace(
+                            name=f"{metric_name}_sum",
+                            labels=labels,
+                            value=self._sums[key],
+                        )
+                    )
             return [SimpleNamespace(samples=samples)]
 
     class _CollectorRegistry:
@@ -922,6 +948,19 @@ def _install_prometheus_stub() -> None:
             for collector in list(self._collectors):
                 families.extend(collector.collect())
             return families
+
+        def get_sample_value(
+            self, name: str, labels: dict[str, str] | None = None
+        ) -> float | None:
+            for collector in list(self._collectors):
+                for family in collector.collect():
+                    for sample in getattr(family, "samples", []):
+                        if getattr(sample, "name", "") != name:
+                            continue
+                        if labels and any(sample.labels.get(k) != v for k, v in labels.items()):
+                            continue
+                        return getattr(sample, "value", None)
+            return None
 
     prom.Counter = _Metric
     prom.Gauge = _Metric
