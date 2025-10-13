@@ -16,13 +16,12 @@ from typing import Any, Awaitable, Callable, Deque, Dict, Iterable, Mapping, Mut
 
 from fastapi import FastAPI
 
-from metrics import setup_metrics
+from metrics import Counter as PrometheusCounter, Gauge, setup_metrics
 
 from shared.pydantic_compat import BaseModel, Field
 from shared.event_bus import KafkaNATSAdapter
 
 from common.schemas.contracts import IntentEvent
-from prometheus_client import Counter as PrometheusCounter, Gauge
 
 LOGGER = logging.getLogger(__name__)
 
