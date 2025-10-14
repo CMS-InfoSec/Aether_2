@@ -906,6 +906,9 @@ def _get_mlflow_client() -> tuple[Any | None, str | None, Dict[str, Any] | None]
     try:  # pragma: no cover - optional dependency path.
         import mlflow
         from mlflow.tracking import MlflowClient
+        from shared.mlflow_safe import harden_mlflow
+
+        harden_mlflow(mlflow)
     except Exception as exc:  # pragma: no cover - optional dependency path.
         LOGGER.warning("MLflow unavailable: %s", exc)
         return None, model_name, {"status": "skipped", "reason": "mlflow_unavailable"}
