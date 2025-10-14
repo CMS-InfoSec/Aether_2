@@ -46,10 +46,11 @@ spec:
               value: require
           readinessProbe:
             httpGet:
-              path: /metrics
+              path: /readyz
               port: http
-            initialDelaySeconds: 10
+            initialDelaySeconds: 15
             periodSeconds: 10
+            timeoutSeconds: 5
             failureThreshold: 3
           livenessProbe:
             httpGet:
