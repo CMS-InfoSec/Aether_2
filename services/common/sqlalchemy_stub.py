@@ -167,6 +167,26 @@ def install() -> ModuleType:
         def close(self) -> None:  # pragma: no cover - compatibility shim
             return None
 
+    class _AsyncConnection:
+        def __init__(self) -> None:
+            self._sync = _Connection()
+
+        async def execute(self, statement: object, *multiparams: object, **params: object) -> SimpleNamespace:
+            return self._sync.execute(statement, *multiparams, **params)
+
+        async def close(self) -> None:  # pragma: no cover - compatibility shim
+            return None
+
+    class _AsyncBeginContext:
+        def __init__(self, connection: _AsyncConnection) -> None:
+            self._connection = connection
+
+        async def __aenter__(self) -> _AsyncConnection:  # type: ignore[override]
+            return self._connection
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:  # type: ignore[override]
+            return None
+
     def _create_engine(url: str, **kwargs: object) -> SimpleNamespace:
         del kwargs
         engine = SimpleNamespace(
@@ -177,6 +197,23 @@ def install() -> ModuleType:
         )
         engine._aether_url = url
         return engine
+
+    class _AsyncEngine:
+        def __init__(self, url: str) -> None:
+            self.url = url
+
+        def begin(self) -> _AsyncBeginContext:
+            return _AsyncBeginContext(_AsyncConnection())
+
+        async def dispose(self) -> None:
+            return None
+
+        async def connect(self) -> _AsyncConnection:  # pragma: no cover - compatibility shim
+            return _AsyncConnection()
+
+        @property
+        def sync_engine(self) -> SimpleNamespace:
+            return _create_engine(self.url)
 
     def _engine_from_config(*args: object, **kwargs: object) -> SimpleNamespace:
         return _create_engine(str(args[0]) if args else "sqlite://", **kwargs)
@@ -488,7 +525,13 @@ def install() -> ModuleType:
             return None
 
     ext_asyncio.AsyncSession = AsyncSession
-    ext_asyncio.create_async_engine = _create_engine  # type: ignore[attr-defined]
+    ext_asyncio.AsyncEngine = _AsyncEngine  # type: ignore[attr-defined]
+
+    def _create_async_engine(url: str, **kwargs: object) -> _AsyncEngine:
+        del kwargs
+        return _AsyncEngine(url)
+
+    ext_asyncio.create_async_engine = _create_async_engine  # type: ignore[attr-defined]
 
     sys.modules["sqlalchemy.ext.asyncio"] = ext_asyncio
     ext.asyncio = ext_asyncio  # type: ignore[attr-defined]
