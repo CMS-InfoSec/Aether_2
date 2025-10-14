@@ -111,7 +111,7 @@ def test_core_services_import_without_fastapi(
     blocked_prefixes = ["fastapi"]
     if module_name in {"capital_flow", "esg_filter"}:
         blocked_prefixes.append("sqlalchemy")
-    if module_name == "services.secrets.main":
+    if module_name in {"secrets_service", "services.secrets.main"}:
         blocked_prefixes.append("starlette")
 
     def _fake_import(name: str, *args: object, **kwargs: object) -> ModuleType:
