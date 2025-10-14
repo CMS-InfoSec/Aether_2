@@ -65,7 +65,7 @@ except ModuleNotFoundError:  # pragma: no cover - fallback stub for tests
 
         APIRouter = _RouterStub
 
-from prometheus_client import CollectorRegistry, Counter
+from metrics import CollectorRegistry, Counter
 
 from services.common.security import ensure_admin_access
 
