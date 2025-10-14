@@ -131,7 +131,7 @@ jobs:
               raise SystemExit(1)
 
           print("Verified critical Python modules:", ", ".join(modules))
-          PY
+PY
 
       - name: Generate SBOM with Syft
         id: sbom
