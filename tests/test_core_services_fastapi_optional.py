@@ -53,6 +53,8 @@ def _purge_modules(prefixes: Iterable[str]) -> None:
         "tca_service",
         "sequencer",
         "services.ui.explain_service",
+        "services.models.meta_learner",
+        "services.models.model_zoo",
         "services.report_service",
         "services.builder.routes",
         "ops.metrics.cost_monitor",
@@ -99,6 +101,8 @@ def test_core_services_import_without_fastapi(
         prefixes.append("services.backtest")
     if module_name.startswith("services.fees."):
         prefixes.append("services.fees")
+    if module_name.startswith("services.models."):
+        prefixes.append("services.models")
     if module_name.startswith("services.secrets."):
         prefixes.append("services.secrets")
     if module_name.startswith("ml."):
