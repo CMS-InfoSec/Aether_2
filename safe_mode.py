@@ -28,6 +28,7 @@ from metrics import increment_safe_mode_triggers, setup_metrics
 from services.common.security import require_admin_account
 from common.utils.redis import create_redis_from_url
 from shared.async_utils import dispatch_async
+from shared.event_bus import KafkaNATSAdapter
 from shared.audit_hooks import AuditEvent, load_audit_hooks
 from shared.health import setup_health_checks
 
@@ -333,6 +334,12 @@ class _OpenOrder:
     exchange_order_id: str
 
 
+def _default_timescale_factory(account: str) -> "TimescaleAdapter":
+    from services.common.adapters import TimescaleAdapter
+
+    return TimescaleAdapter(account_id=account)
+
+
 class OrderControls:
     """Production order controls backed by OMS/Timescale adapters."""
 
@@ -349,7 +356,6 @@ class OrderControls:
         ] = None,
     ) -> None:
         from exchange_adapter import KrakenAdapter, ExchangeAdapter
-        from services.common.adapters import TimescaleAdapter
 
         self._logger = LOGGER.getChild("OrderControls")
         self.open_orders: List[str] = []
@@ -363,8 +369,8 @@ class OrderControls:
         self._accounts: Sequence[str] = accounts
 
         exchange_factory = exchange_factory or (lambda _: KrakenAdapter())
-        timescale_factory = timescale_factory or (
-            lambda account: TimescaleAdapter(account_id=account)
+        self._timescale_factory: Callable[[str], "TimescaleAdapter"] = (
+            timescale_factory or _default_timescale_factory
         )
 
         self._exchange_adapters: Dict[str, ExchangeAdapter] = {}
@@ -376,16 +382,8 @@ class OrderControls:
                     "Failed to initialise exchange adapter for safe mode",
                     extra={"account_id": account},
                 )
-        self._timescale_adapters: Dict[str, Optional[TimescaleAdapter]] = {}
-        for account in accounts:
-            try:
-                self._timescale_adapters[account] = timescale_factory(account)
-            except Exception:
-                self._logger.exception(
-                    "Failed to initialise Timescale adapter for safe mode",
-                    extra={"account_id": account},
-                )
-                self._timescale_adapters[account] = None
+        self._timescale_adapters: Dict[str, Optional["TimescaleAdapter"]] = {}
+        self._timescale_attempted: set[str] = set()
 
         if order_snapshot_loader is None:
             self._order_snapshot_loader = self._default_snapshot_loader
@@ -438,6 +436,8 @@ class OrderControls:
         self.hedging_only = False
         self.only_hedging = False
         self._last_reason = None
+        self._timescale_adapters.clear()
+        self._timescale_attempted.clear()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -479,7 +479,7 @@ class OrderControls:
         return None
 
     def _load_open_orders(self, account_id: str) -> List[_OpenOrder]:
-        timescale = self._timescale_adapters.get(account_id)
+        timescale = self._get_timescale_adapter(account_id)
         if not timescale:
             return []
         snapshot = self._order_snapshot_loader(account_id, timescale)
@@ -565,7 +565,8 @@ class OrderControls:
     def _set_safe_mode_state(
         self, engaged: bool, *, reason: Optional[str], actor: Optional[str]
     ) -> None:
-        for account, adapter in self._timescale_adapters.items():
+        for account in self._accounts:
+            adapter = self._get_timescale_adapter(account)
             if adapter is None:
                 continue
             try:
@@ -575,6 +576,24 @@ class OrderControls:
                     "Failed to update safe mode flag in Timescale",
                     extra={"account_id": account, "engaged": engaged, "reason": reason},
                 )
+
+    def _get_timescale_adapter(self, account_id: str) -> Optional["TimescaleAdapter"]:
+        adapter = self._timescale_adapters.get(account_id)
+        if adapter is not None:
+            return adapter
+        if account_id in self._timescale_attempted:
+            return None
+        self._timescale_attempted.add(account_id)
+        try:
+            adapter = self._timescale_factory(account_id)
+        except Exception:
+            self._logger.exception(
+                "Failed to initialise Timescale adapter for safe mode",
+                extra={"account_id": account_id},
+            )
+            adapter = None
+        self._timescale_adapters[account_id] = adapter
+        return adapter
 
 
 class IntentGuard:
@@ -597,6 +616,18 @@ class IntentGuard:
             raise RuntimeError("Safe mode active; new trading intents are blocked")
 
 
+def _resolve_kafka_adapter_factory() -> Callable[[str], KafkaNATSAdapter]:
+    try:
+        from services.common import adapters as common_adapters
+    except Exception:
+        return KafkaNATSAdapter
+
+    candidate = getattr(common_adapters, "KafkaNATSAdapter", None)
+    if callable(candidate):
+        return candidate  # type: ignore[return-value]
+    return KafkaNATSAdapter
+
+
 class KafkaSafeModePublisher:
     """Publish safe mode events to Kafka (via the in-memory adapter)."""
 
@@ -604,27 +635,26 @@ class KafkaSafeModePublisher:
         self._account_id = account_id
         self._topic = topic
         self._history: List[Dict[str, object]] = []
+        self._adapter_factory = _resolve_kafka_adapter_factory()
 
     def publish(self, event: SafeModeEvent) -> None:
         payload = event.to_payload()
-        try:  # pragma: no cover - adapter import may fail in lightweight environments
-            from services.common.adapters import KafkaNATSAdapter  # type: ignore
-        except Exception:  # pragma: no cover - fall back to in-memory history
-            LOGGER.debug(
-                "Kafka adapter unavailable for safe mode publish", exc_info=True
+        try:
+            adapter = self._adapter_factory(account_id=self._account_id)
+        except Exception:  # pragma: no cover - defensive guard when factory misbehaves
+            LOGGER.exception("Failed to resolve Kafka adapter for safe mode", extra={"payload": payload})
+            return
+        try:
+            dispatch_async(
+                adapter.publish(
+                    topic=self._topic,
+                    payload=payload,
+                ),
+                context="safe_mode.kafka_publish",
+                logger=LOGGER,
             )
-        else:
-            try:
-                dispatch_async(
-                    KafkaNATSAdapter(account_id=self._account_id).publish(
-                        topic=self._topic,
-                        payload=payload,
-                    ),
-                    context="safe_mode.kafka_publish",
-                    logger=LOGGER,
-                )
-            except Exception:  # pragma: no cover - defensive scheduling guard
-                LOGGER.exception("Failed to schedule safe mode publish task")
+        except Exception:  # pragma: no cover - defensive scheduling guard
+            LOGGER.exception("Failed to schedule safe mode publish task")
 
         self._history.append({"topic": self._topic, "payload": payload})
 
@@ -797,7 +827,52 @@ class SafeModeController:
         return []
 
 
-controller = SafeModeController()
+class _ControllerProxy:
+    """Lazily instantiate :class:`SafeModeController` on first use."""
+
+    __slots__ = ("_instance", "_lock")
+
+    def __init__(self) -> None:
+        object.__setattr__(self, "_instance", None)
+        object.__setattr__(self, "_lock", Lock())
+
+    def _resolve(self) -> "SafeModeController":
+        controller = object.__getattribute__(self, "_instance")
+        if controller is None:
+            lock: Lock = object.__getattribute__(self, "_lock")
+            with lock:
+                controller = object.__getattribute__(self, "_instance")
+                if controller is None:
+                    controller = SafeModeController()
+                    object.__setattr__(self, "_instance", controller)
+        return controller
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._resolve(), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in self.__slots__:
+            object.__setattr__(self, name, value)
+            return
+        setattr(self._resolve(), name, value)
+
+    def __delattr__(self, name: str) -> None:
+        if name in self.__slots__:
+            object.__delattr__(self, name)
+            return
+        delattr(self._resolve(), name)
+
+    def __repr__(self) -> str:  # pragma: no cover - representation aid
+        return repr(self._resolve())
+
+
+controller = _ControllerProxy()
+
+
+def get_controller() -> "SafeModeController":
+    """Return the lazily initialised :class:`SafeModeController` instance."""
+
+    return controller._resolve()
 
 
 # ---------------------------------------------------------------------------

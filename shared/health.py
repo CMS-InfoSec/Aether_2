@@ -3,9 +3,33 @@
 from __future__ import annotations
 
 import inspect
-from typing import Any, Awaitable, Callable, Dict, Mapping, MutableMapping
+import logging
+from types import SimpleNamespace
+from typing import Any, Awaitable, Callable, Dict, Mapping, MutableMapping, cast
 
-from fastapi import FastAPI
+logger = logging.getLogger(__name__)
+
+try:  # pragma: no cover - exercised when FastAPI is installed
+    from fastapi import FastAPI
+except Exception:  # pragma: no cover - provide a lightweight stand-in
+    logger.warning("FastAPI dependency missing; using health check fallback", exc_info=False)
+
+    class _FallbackRoute(SimpleNamespace):
+        def __init__(self, path: str, endpoint: Callable[..., Any]) -> None:
+            super().__init__(method="GET", path=path, endpoint=endpoint)
+
+    class _FallbackFastAPI:
+        def __init__(self) -> None:
+            self.routes: list[Any] = []
+
+        def get(self, path: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+            def _decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+                self.routes.append(_FallbackRoute(path, func))
+                return func
+
+            return _decorator
+
+    FastAPI = cast(Any, _FallbackFastAPI)
 
 HealthCheck = Callable[[], Awaitable[object | None] | object | None]
 
