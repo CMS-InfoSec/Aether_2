@@ -23,7 +23,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
-from fastapi import Depends, FastAPI, Query
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import Depends, FastAPI, Query
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        Depends,
+        FastAPI,
+        Query,
+    )
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import (
     JSON,
