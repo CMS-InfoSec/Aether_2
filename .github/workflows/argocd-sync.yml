@@ -9,6 +9,9 @@ on:
       - '.github/workflows/argocd-sync.yml'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   notify-argocd:
     runs-on: ubuntu-latest
@@ -18,19 +21,20 @@ jobs:
           ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
           ARGOCD_TOKEN: ${{ secrets.ARGOCD_TOKEN }}
         run: |
+          set -euo pipefail
+
           if [ -z "$ARGOCD_SERVER" ] || [ -z "$ARGOCD_TOKEN" ]; then
             echo "ArgoCD server or token not configured; skipping"
             exit 0
           fi
-          curl -sk -X POST "${ARGOCD_SERVER}/api/v1/applications/aether-prod/sync" \
-            -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d '{"revision": "main"}'
-          curl -sk -X POST "${ARGOCD_SERVER}/api/v1/applications/aether-staging/sync" \
-            -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d '{"revision": "main"}'
-          curl -sk -X POST "${ARGOCD_SERVER}/api/v1/applications/aether-observability/sync" \
-            -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d '{"revision": "main"}'
+
+          echo "::add-mask::${ARGOCD_TOKEN}"
+
+          for app in aether-prod aether-staging aether-observability; do
+            curl --fail-with-body -sk \
+              --retry 3 --retry-delay 5 \
+              -X POST "${ARGOCD_SERVER}/api/v1/applications/${app}/sync" \
+              -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d '{"revision": "main"}'
+          done
