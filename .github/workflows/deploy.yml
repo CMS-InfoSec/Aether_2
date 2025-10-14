@@ -168,6 +168,31 @@ jobs:
           COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
         run: |
+          set -euo pipefail
+
+          if [ -z "$COSIGN_PRIVATE_KEY" ]; then
+            echo "COSIGN_PRIVATE_KEY secret must be provided" >&2
+            exit 1
+          fi
+
+          if [ -z "$COSIGN_PASSWORD" ]; then
+            echo "COSIGN_PASSWORD secret must be provided" >&2
+            exit 1
+          fi
+
+          mask_secret() {
+            if [ -z "$1" ]; then
+              return
+            fi
+            printf '%s' "$1" | while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              echo "::add-mask::$line"
+            done
+          }
+
+          mask_secret "$COSIGN_PRIVATE_KEY"
+          mask_secret "$COSIGN_PASSWORD"
+
           cosign sign --key env://COSIGN_PRIVATE_KEY "${{ steps.image_meta.outputs.sha_tag }}"
           cosign sign --key env://COSIGN_PRIVATE_KEY "${{ steps.image_meta.outputs.latest_tag }}"
 
