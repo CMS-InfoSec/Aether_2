@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
   packages: write
+  actions: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.pull_requests && github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.head_branch || github.event.pull_request && github.event.pull_request.number || github.head_ref || github.ref || github.run_id }}
+  cancel-in-progress: true
 
 jobs:
   lint-and-test:
@@ -16,17 +21,37 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+          key: >-
+            pip-${{ runner.os }}-${{
+              hashFiles(
+                '**/requirements.txt',
+                '**/requirements-ci.txt',
+                'pyproject.toml',
+                'poetry.lock'
+              )
+            }}
+          restore-keys: |
+            pip-${{ runner.os }}-
+
       - name: Install dependencies
         run: |
+          set -euxo pipefail
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install ruff black mypy pytest
+          python -m pip install -r requirements.txt
+          python -m pip install ruff black mypy pytest
 
       - name: Run Ruff
         run: ruff check .
@@ -44,14 +69,14 @@ jobs:
     name: Build and Push Container Image
     runs-on: ubuntu-latest
     needs: lint-and-test
-    env:
-      IMAGE_DESTINATION: ghcr.io/${{ github.repository_owner }}/aether-app
     outputs:
       image_ref: ${{ steps.image-metadata.outputs.image_ref }}
       image_digest: ${{ steps.image-metadata.outputs.digest }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -60,23 +85,31 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Determine image destination
+        id: image-meta
+        run: |
+          set -euo pipefail
+          owner="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          echo "destination=ghcr.io/${owner}/aether-app" >> "$GITHUB_OUTPUT"
+
       - name: Build and push image
         id: publish
-        uses: int128/kaniko-action@v1
+        uses: int128/kaniko-action@v1.52.0
         with:
           push: true
           context: .
           file: deploy/docker/kraken-ws-ingest/Dockerfile
           tags: |
-            ${{ env.IMAGE_DESTINATION }}:${{ github.sha }}
-            ${{ env.IMAGE_DESTINATION }}:latest
+            ${{ steps.image-meta.outputs.destination }}:${{ github.sha }}
+            ${{ steps.image-meta.outputs.destination }}:latest
 
       - name: Capture image metadata
         id: image-metadata
         env:
-          IMAGE_DESTINATION: ${{ env.IMAGE_DESTINATION }}
+          IMAGE_DESTINATION: ${{ steps.image-meta.outputs.destination }}
           IMAGE_DIGEST: ${{ steps.publish.outputs.digest }}
         run: |
+          set -euo pipefail
           echo "image_ref=${IMAGE_DESTINATION}" >> "$GITHUB_OUTPUT"
           echo "digest=${IMAGE_DIGEST}" >> "$GITHUB_OUTPUT"
 
@@ -86,14 +119,18 @@ jobs:
     needs: build-image
     permissions:
       contents: read
+      actions: write
       id-token: write
       packages: write
+      actions: write
     steps:
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3.4.0
+        uses: sigstore/cosign-installer@v3.5.0
 
       - name: Install Syft
-        uses: anchore/syft-action/download-syft@v0
+        uses: anchore/sbom-action/download-syft@v0.20.6
+        with:
+          syft-version: v1.33.0
 
       - name: Authenticate to GHCR
         uses: docker/login-action@v3
@@ -103,12 +140,10 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Scan image for vulnerabilities
-        uses: anchore/grype-action@v0
+        uses: anchore/scan-action@v7
         with:
           image: ${{ needs.build-image.outputs.image_ref }}@${{ needs.build-image.outputs.image_digest }}
-          fail-on-severity: critical
-          registry-username: ${{ github.actor }}
-          registry-password: ${{ secrets.GITHUB_TOKEN }}
+          severity-cutoff: critical
 
       - name: Generate SBOM
         env:
@@ -158,6 +193,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -165,10 +202,13 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: python -m pip install --upgrade pip && pip install pyyaml
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install pyyaml
 
       - name: Authenticate to Vault
-        uses: hashicorp/vault-action@v2
+        uses: hashicorp/vault-action@v3
         with:
           url: ${{ secrets.VAULT_ADDR }}
           method: approle
@@ -187,9 +227,24 @@ jobs:
       - validate-externalsecrets
     steps:
       - name: Install Argo CD CLI
+        env:
+          ARGOCD_VERSION: v2.9.3
         run: |
-          curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
-          sudo install -m 755 argocd /usr/local/bin/argocd
+          set -euo pipefail
+          binary="argocd-linux-amd64"
+          base_url="https://github.com/argoproj/argo-cd/releases/download/${ARGOCD_VERSION}"
+          curl --fail --show-error --silent --location --retry 5 --retry-delay 2 --retry-all-errors \
+            -o "${binary}" "${base_url}/${binary}"
+          curl --fail --show-error --silent --location --retry 5 --retry-delay 2 --retry-all-errors \
+            -o cli_checksums.txt "${base_url}/cli_checksums.txt"
+          expected_sum="$(grep " ${binary}$" cli_checksums.txt | awk '{print $1}')"
+          if [ -z "${expected_sum}" ]; then
+            echo "Unable to determine checksum for ${binary}" >&2
+            exit 1
+          fi
+          echo "${expected_sum}  ${binary}" | sha256sum --check --status
+          sudo install -m 0755 "${binary}" /usr/local/bin/argocd
+          rm -f "${binary}" cli_checksums.txt
 
       - name: Argo CD login and sync
         env:
@@ -198,10 +253,41 @@ jobs:
           ARGOCD_PASSWORD: ${{ secrets.ARGOCD_PASSWORD }}
           ARGOCD_APP: ${{ vars.ARGOCD_APP_NAME }}
         run: |
-          if [ -z "$ARGOCD_SERVER" ] || [ -z "$ARGOCD_USERNAME" ] || [ -z "$ARGOCD_PASSWORD" ] || [ -z "$ARGOCD_APP" ]; then
-            echo "Argo CD credentials and application name must be provided" >&2
+          set -euo pipefail
+
+          if [ -z "${ARGOCD_SERVER:-}" ]; then
+            echo "ARGOCD_SERVER secret must be provided" >&2
             exit 1
           fi
+
+          if [ -z "${ARGOCD_USERNAME:-}" ]; then
+            echo "ARGOCD_USERNAME secret must be provided" >&2
+            exit 1
+          fi
+
+          if [ -z "${ARGOCD_PASSWORD:-}" ]; then
+            echo "ARGOCD_PASSWORD secret must be provided" >&2
+            exit 1
+          fi
+
+          if [ -z "${ARGOCD_APP:-}" ]; then
+            echo "ARGOCD_APP_NAME environment variable must be provided" >&2
+            exit 1
+          fi
+
+          mask_secret() {
+            if [ -z "$1" ]; then
+              return
+            fi
+            printf '%s' "$1" | while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              echo "::add-mask::$line"
+            done
+          }
+
+          mask_secret "$ARGOCD_USERNAME"
+          mask_secret "$ARGOCD_PASSWORD"
+
           argocd login "$ARGOCD_SERVER" --username "$ARGOCD_USERNAME" --password "$ARGOCD_PASSWORD" --insecure
           argocd app set "$ARGOCD_APP" --revision "${GITHUB_SHA}"
           argocd app sync "$ARGOCD_APP"

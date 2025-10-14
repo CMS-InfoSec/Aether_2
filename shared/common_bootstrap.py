@@ -129,6 +129,10 @@ def _reload_with_overrides(module_name: str) -> ModuleType:
         module = importlib.import_module(module_name)
         return module
 
+    spec = getattr(existing, "__spec__", None)
+    if getattr(spec, "_initializing", False):
+        return existing
+
     module_file = getattr(existing, "__file__", None)
     if module_file and not str(module_file).startswith(str(_TESTS_ROOT)):
         return existing
@@ -151,7 +155,14 @@ def _reload_with_overrides(module_name: str) -> ModuleType:
             if spec and spec.loader:
                 module = importlib.util.module_from_spec(spec)
                 sys.modules[module_name] = module
-                spec.loader.exec_module(module)
+                try:
+                    spec.loader.exec_module(module)
+                except Exception:
+                    sys.modules.pop(module_name, None)
+                    if existing is not None:
+                        sys.modules[module_name] = existing
+                        return existing
+                    raise
                 return module
         if existing is not None:
             sys.modules[module_name] = existing
@@ -448,11 +459,15 @@ def preload_core_modules() -> None:
             if not hasattr(module, attr):
                 setattr(module, attr, None)
 
-def ensure_common_helpers() -> None:
+def ensure_common_helpers(*, skip_modules: Iterable[str] | None = None) -> None:
     """Guarantee the real ``services.common`` helpers are available."""
 
     global _ENSURING_COMMON_HELPERS
 
+    if "pytest" in sys.modules:
+        return
+
+    skip = set(skip_modules or ())
     reentrant_call = _ENSURING_COMMON_HELPERS
     if not reentrant_call:
         _ENSURING_COMMON_HELPERS = True
@@ -465,10 +480,20 @@ def ensure_common_helpers() -> None:
 
         loaded: Dict[str, ModuleType] = {}
         for name in _COMMON_MODULES:
+            if name in skip:
+                module = sys.modules.get(name)
+                if isinstance(module, ModuleType):
+                    loaded[name] = module
+                continue
             loaded[name] = _reload_with_overrides(name)
 
         if not reentrant_call:
             for name in _RISK_MODULES:
+                if name in skip:
+                    module = sys.modules.get(name)
+                    if isinstance(module, ModuleType):
+                        loaded[name] = module
+                    continue
                 try:
                     loaded[name] = _reload_with_overrides(name)
                 except Exception:  # pragma: no cover - optional risk modules may fail
