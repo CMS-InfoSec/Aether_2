@@ -50,10 +50,11 @@ spec:
                   optional: true
           readinessProbe:
             httpGet:
-              path: /metrics
+              path: /readyz
               port: http
-            initialDelaySeconds: 10
-            periodSeconds: 10
+            initialDelaySeconds: 45
+            periodSeconds: 15
+            timeoutSeconds: 10
             failureThreshold: 3
           livenessProbe:
             httpGet:
