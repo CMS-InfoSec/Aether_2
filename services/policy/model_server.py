@@ -63,6 +63,9 @@ else:  # pragma: no cover - executed at runtime.
     MlflowClientType = cast(type[Any] | None, None)
     try:
         mlflow_pyfunc = import_module("mlflow.pyfunc")
+        from shared.mlflow_safe import harden_mlflow
+
+        harden_mlflow()
         MlflowModelSignature = cast(
             type[Any], getattr(import_module("mlflow.models.signature"), "ModelSignature")
         )
