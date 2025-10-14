@@ -16,6 +16,11 @@ jobs:
           BASE_URL: ${{ secrets.STAGING_URL }}
         run: |
           set -euo pipefail
+          if [ -z "${BASE_URL:-}" ]; then
+            echo "STAGING_URL secret is not configured." >&2
+            exit 1
+          fi
+          echo "::add-mask::${BASE_URL}"
           curl --fail --show-error --silent --location --retry 5 --retry-delay 2 --retry-all-errors \
             "$BASE_URL/healthz"
           curl --fail --show-error --silent --location --retry 5 --retry-delay 2 --retry-all-errors \
