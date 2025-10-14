@@ -14,10 +14,23 @@ from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, InvalidO
 import time
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
-from fastapi.exception_handlers import request_validation_exception_handler
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+    from fastapi.exception_handlers import request_validation_exception_handler
+    from fastapi.exceptions import RequestValidationError
+    from fastapi.responses import JSONResponse
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        Depends,
+        FastAPI,
+        HTTPException,
+        JSONResponse,
+        Query,
+        Request,
+        RequestValidationError,
+        request_validation_exception_handler,
+        status,
+    )
 from pydantic import BaseModel, Field
 
 from auth.service import (
@@ -28,7 +41,8 @@ from auth.service import (
 
 from services.common import security
 
-from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
+from services.common.adapters import TimescaleAdapter
+from shared.event_bus import KafkaNATSAdapter
 from services.common.schemas import (
     GTD_EXPIRE_TIME_REQUIRED,
     OrderPlacementRequest,
