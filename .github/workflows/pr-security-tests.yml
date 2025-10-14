@@ -6,7 +6,11 @@ on:
 permissions:
   contents: read
   pull-requests: write
-  actions: read
+  actions: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.head_branch || github.event.pull_request.number || github.ref || github.run_id }}
+  cancel-in-progress: true
 
 jobs:
   security-and-tests:
@@ -17,23 +21,63 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+          key: >-
+            pip-${{ runner.os }}-${{
+              hashFiles(
+                '**/requirements.txt',
+                '**/requirements-ci.txt',
+                'pyproject.toml',
+                'poetry.lock'
+              )
+            }}
+          restore-keys: |
+            pip-${{ runner.os }}-
+
       - name: Install dependencies
         run: |
+          set -euxo pipefail
           python -m pip install --upgrade pip
-          pip install ".[test]"
-          pip install bandit ruff mypy pytest-cov
+          python -m pip install ".[test]"
+          python -m pip install bandit ruff mypy pytest-cov
 
       - name: Install Gitleaks
+        env:
+          GITLEAKS_VERSION: v8.28.0
         run: |
-          curl -sSfL https://raw.githubusercontent.com/gitleaks/gitleaks/master/install.sh \
-            | sh -s -- -b "$(pwd)/bin"
-          echo "$(pwd)/bin" >> "$GITHUB_PATH"
+          set -euo pipefail
+          archive="gitleaks_${GITLEAKS_VERSION#v}_linux_x64.tar.gz"
+          checksum_file="checksums.txt"
+          base_url="https://github.com/gitleaks/gitleaks/releases/download/${GITLEAKS_VERSION}"
+          curl --fail --show-error --silent --location --retry 5 --retry-delay 2 --retry-all-errors \
+            -o "${archive}" "${base_url}/${archive}"
+          curl --fail --show-error --silent --location --retry 5 --retry-delay 2 --retry-all-errors \
+            -o "${checksum_file}" "${base_url}/${checksum_file}"
+          expected_sum="$(grep " ${archive}$" "${checksum_file}" | awk '{print $1}')"
+          if [ -z "${expected_sum}" ]; then
+            echo "Unable to determine checksum for ${archive}" >&2
+            exit 1
+          fi
+          echo "${expected_sum}  ${archive}" | sha256sum --check --status
+          tar -xzf "${archive}" gitleaks
+          install_dir="$(pwd)/bin"
+          mkdir -p "${install_dir}"
+          install -m 0755 gitleaks "${install_dir}/gitleaks"
+          rm -f "${archive}" "${checksum_file}" gitleaks
+          echo "${install_dir}" >> "$GITHUB_PATH"
+          "${install_dir}/gitleaks" version
 
       - name: Run Gitleaks secret scan
         id: gitleaks
@@ -66,22 +110,23 @@ jobs:
         run: |
           if [ -f coverage.xml ]; then
             total=$(python - <<'PY'
-import xml.etree.ElementTree as ET
-from decimal import Decimal, ROUND_HALF_UP
-root = ET.parse("coverage.xml").getroot()
-rate = Decimal(root.get('line-rate', '0')) * Decimal(100)
-print(rate.quantize(Decimal('0.1'), rounding=ROUND_HALF_UP))
-PY
-)
+            import xml.etree.ElementTree as ET
+            from decimal import Decimal, ROUND_HALF_UP
+
+            root = ET.parse("coverage.xml").getroot()
+            rate = Decimal(root.get('line-rate', '0')) * Decimal(100)
+            print(rate.quantize(Decimal('0.1'), rounding=ROUND_HALF_UP))
+            PY
+            )
           else
             total="N/A"
           fi
           echo "total=$total" >> "$GITHUB_OUTPUT"
 
       - name: Download Syft
-        uses: anchore/sbom-action/download-syft@v0.15.4
+        uses: anchore/sbom-action/download-syft@v0.20.6
         with:
-          syft-version: v1.17.0
+          syft-version: v1.33.0
 
       - name: Generate SBOM
         run: syft dir:. -o json > sbom.json
@@ -96,7 +141,7 @@ PY
 
       - name: Run Trivy filesystem scan
         id: trivy_scan
-        uses: aquasecurity/trivy-action@v0.20.0
+        uses: aquasecurity/trivy-action@0.33.1
         with:
           scan-type: fs
           format: json
@@ -152,20 +197,20 @@ PY
           fi
 
           cat <<'COMMENT' > pr-comment.md
-### Automated Security & Test Summary
+          ### Automated Security & Test Summary
 
-| Check | Result |
-| --- | --- |
-| Gitleaks | GITLEAKS_STATUS |
-| Bandit | BANDIT_STATUS |
-| Ruff | RUFF_STATUS |
-| MyPy | MYPY_STATUS |
-| Pytest (coverage) | PYTEST_STATUS (Coverage: COVERAGE%) |
+          | Check | Result |
+          | --- | --- |
+          | Gitleaks | GITLEAKS_STATUS |
+          | Bandit | BANDIT_STATUS |
+          | Ruff | RUFF_STATUS |
+          | MyPy | MYPY_STATUS |
+          | Pytest (coverage) | PYTEST_STATUS (Coverage: COVERAGE%) |
 
-**Vulnerabilities**
-- Total: TOTAL_VULNS
-- Critical: CRITICAL_VULNS
-COMMENT
+          **Vulnerabilities**
+          - Total: TOTAL_VULNS
+          - Critical: CRITICAL_VULNS
+          COMMENT
 
           sed -i "s/GITLEAKS_STATUS/$gitleaks_status/" pr-comment.md
           sed -i "s/BANDIT_STATUS/$bandit_status/" pr-comment.md
