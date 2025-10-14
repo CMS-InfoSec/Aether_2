@@ -17,8 +17,17 @@ try:  # pragma: no cover - markdown2 may be absent during some tests.
 except Exception:  # pragma: no cover
     markdown2 = None  # type: ignore[assignment]
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import Response
+try:  # pragma: no cover - prefer FastAPI when available
+    from fastapi import APIRouter, Depends, HTTPException, Query
+    from fastapi.responses import Response
+except Exception:  # pragma: no cover - exercised when FastAPI unavailable
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        APIRouter,
+        Depends,
+        HTTPException,
+        Query,
+        Response,
+    )
 
 try:  # pragma: no cover - reportlab is an optional dependency.
     from reportlab.lib import colors
