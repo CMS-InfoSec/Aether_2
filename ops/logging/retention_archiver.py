@@ -11,6 +11,7 @@ import tarfile
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, Iterable, List, Optional
 
 try:  # pragma: no cover - optional dependency in some environments.
@@ -23,7 +24,34 @@ try:  # pragma: no cover - optional dependency
 except Exception:  # pragma: no cover - requests may not be installed during static checks.
     requests = None  # type: ignore
 
-from fastapi import APIRouter, HTTPException
+try:  # pragma: no cover - prefer the real FastAPI implementations when available
+    from fastapi import APIRouter, HTTPException
+except Exception:  # pragma: no cover - provide lightweight fallbacks
+    class HTTPException(Exception):  # type: ignore[assignment]
+        """Minimal FastAPI HTTPException stand-in used in lightweight envs."""
+
+        def __init__(self, status_code: int, detail: Optional[str] = None) -> None:
+            self.status_code = status_code
+            self.detail = detail
+            message = detail or f"HTTP {status_code}"
+            super().__init__(message)
+
+    class APIRouter:  # type: ignore[assignment]
+        """Simplified APIRouter replacement that records registered routes."""
+
+        def __init__(self, *, prefix: str = "", tags: Optional[Iterable[str]] = None) -> None:
+            self.prefix = prefix
+            self.tags = list(tags or [])
+            self.routes: List[SimpleNamespace] = []
+
+        def get(self, path: str):
+            def _decorator(func):
+                self.routes.append(
+                    SimpleNamespace(path=path, methods=["GET"], endpoint=func)
+                )
+                return func
+
+            return _decorator
 
 
 LOGGER = logging.getLogger(__name__)

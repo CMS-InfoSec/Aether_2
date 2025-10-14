@@ -13,7 +13,10 @@ from shared.pydantic_compat import (
     model_validator,
 )
 
-from fastapi import HTTPException, status
+try:  # pragma: no cover - prefer FastAPI when available
+    from fastapi import HTTPException, status
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import HTTPException, status  # type: ignore[misc]
 
 from shared.spot import is_spot_symbol, normalize_spot_symbol
 

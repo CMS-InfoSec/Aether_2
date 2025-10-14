@@ -47,39 +47,20 @@ except ImportError:  # pragma: no cover - fallback when FastAPI is stubbed out
         jsonable_encoder,
         status,
     )
-from starlette.middleware.trustedhost import TrustedHostMiddleware
-from pydantic import BaseModel, Field, SecretStr, validator
+try:  # pragma: no cover - Starlette may be unavailable alongside FastAPI
+    from starlette.middleware.trustedhost import TrustedHostMiddleware
+except ModuleNotFoundError:  # pragma: no cover - minimal fallback when Starlette missing
+    class TrustedHostMiddleware:  # type: ignore[no-redef]
+        """Lightweight stand-in that records configured hosts."""
 
-try:  # pragma: no cover - FastAPI is optional in some unit tests
-    from fastapi import (
-        BackgroundTasks,
-        Depends,
-        FastAPI,
-        HTTPException,
-        Query,
-        Request,
-        Response,
-        status,
-    )
-    from fastapi.encoders import jsonable_encoder
-    from fastapi.exceptions import RequestValidationError
-    from fastapi.responses import JSONResponse
-except ImportError:  # pragma: no cover - fallback when FastAPI is stubbed out
-    from services.common.fastapi_stub import (  # type: ignore[misc]
-        BackgroundTasks,
-        Depends,
-        FastAPI,
-        HTTPException,
-        JSONResponse,
-        Query,
-        Request,
-        RequestValidationError,
-        Response,
-        jsonable_encoder,
-        status,
-    )
-from starlette.middleware.trustedhost import TrustedHostMiddleware
-from pydantic import Field, SecretStr, validator as pydantic_validator
+        def __init__(self, app, *, allowed_hosts=None):
+            self.app = app
+            self.allowed_hosts = allowed_hosts or []
+
+        async def __call__(self, scope, receive, send):
+            await self.app(scope, receive, send)
+
+from pydantic import BaseModel, Field, SecretStr, validator as pydantic_validator
 
 from services.common.security import (
     require_admin_account,
