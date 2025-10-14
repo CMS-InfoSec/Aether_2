@@ -10,6 +10,7 @@ permissions:
   contents: read
   packages: write
   id-token: write
+  actions: write
 
 jobs:
   quality-checks:
@@ -131,7 +132,7 @@ jobs:
               raise SystemExit(1)
 
           print("Verified critical Python modules:", ", ".join(modules))
-PY
+          PY
 
       - name: Generate SBOM with Syft
         id: sbom
