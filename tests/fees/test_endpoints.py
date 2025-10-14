@@ -22,6 +22,32 @@ def client_fixture(fees_app) -> TestClient:
     return TestClient(fees_app)
 
 
+def test_readyz_reports_ok(client: TestClient) -> None:
+    response = client.get("/readyz")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "ok"
+    assert payload["checks"]["postgres_read"]["status"] == "ok"
+
+
+def test_readyz_returns_503_when_database_missing(client: TestClient) -> None:
+    original_factory = getattr(client.app.state, "db_sessionmaker", None)
+    if hasattr(client.app.state, "db_sessionmaker"):
+        delattr(client.app.state, "db_sessionmaker")
+
+    try:
+        response = client.get("/readyz")
+    finally:
+        if original_factory is not None:
+            client.app.state.db_sessionmaker = original_factory
+
+    assert response.status_code == 503
+    payload = response.json()
+    assert payload["status"] == "error"
+    assert payload["checks"]["postgres_read"]["status"] == "error"
+
+
 @pytest.mark.parametrize("account_id", sorted(ADMIN_ACCOUNTS))
 def test_get_effective_fees_returns_tiered_breakdown(
     monkeypatch: pytest.MonkeyPatch,
