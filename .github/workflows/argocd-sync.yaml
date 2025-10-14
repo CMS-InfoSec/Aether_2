@@ -7,6 +7,26 @@ on:
       - completed
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: >-
+    ${{ github.workflow }}-${{
+      github.event.workflow_run && github.event.workflow_run.pull_requests && github.event.workflow_run.pull_requests[0]
+        && github.event.workflow_run.pull_requests[0].number
+      || github.event.workflow_run && github.event.workflow_run.head_branch && github.event.workflow_run.head_branch != ''
+        && github.event.workflow_run.head_branch
+      || github.event.pull_request && github.event.pull_request.number
+      || github.head_ref && github.head_ref != '' && github.head_ref
+      || github.ref
+      || github.run_id
+    }}
+  cancel-in-progress: true
+
+
+
+
 jobs:
   sync:
     if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
@@ -14,19 +34,50 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install ArgoCD CLI
         run: |
-          curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/download/v2.9.3/argocd-linux-amd64
-          chmod +x argocd
-          sudo mv argocd /usr/local/bin/
+          set -euo pipefail
+          binary="argocd-linux-amd64"
+          base_url="https://github.com/argoproj/argo-cd/releases/download/v2.9.3"
+          curl --fail --show-error --silent --location --retry 5 --retry-delay 2 --retry-all-errors \
+            -o "${binary}" "${base_url}/${binary}"
+          curl --fail --show-error --silent --location --retry 5 --retry-delay 2 --retry-all-errors \
+            -o cli_checksums.txt "${base_url}/cli_checksums.txt"
+          expected_sum="$(grep " ${binary}$" cli_checksums.txt | awk '{print $1}')"
+          if [ -z "${expected_sum}" ]; then
+            echo "Unable to determine checksum for ${binary}" >&2
+            exit 1
+          fi
+          echo "${expected_sum}  ${binary}" | sha256sum --check --status
+          sudo install -m 0755 "${binary}" /usr/local/bin/argocd
+          rm -f "${binary}" cli_checksums.txt
+      - name: Validate ArgoCD credentials
+        env:
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ARGOCD_SERVER}" ]; then
+            echo "ARGOCD_SERVER secret is not configured." >&2
+            exit 1
+          fi
+          if [ -z "${ARGOCD_AUTH_TOKEN}" ]; then
+            echo "ARGOCD_TOKEN secret is not configured." >&2
+            exit 1
+          fi
+          echo "::add-mask::${ARGOCD_AUTH_TOKEN}"
       - name: ArgoCD Login
         env:
           ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
           ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_TOKEN }}
         run: |
-          argocd login $ARGOCD_SERVER --auth-token $ARGOCD_AUTH_TOKEN --insecure
+          set -euo pipefail
+          argocd login "${ARGOCD_SERVER}" --auth-token "${ARGOCD_AUTH_TOKEN}" --insecure
       - name: Sync Applications
         run: |
+          set -euo pipefail
           argocd app sync aether-risk-staging
           argocd app wait aether-risk-staging --health --timeout 600
           argocd app sync aether-risk-prod

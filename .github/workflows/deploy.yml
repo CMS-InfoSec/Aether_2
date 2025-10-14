@@ -10,6 +10,24 @@ permissions:
   contents: read
   packages: write
   id-token: write
+  actions: write
+
+concurrency:
+  group: >-
+    ${{ github.workflow }}-${{
+      github.event.workflow_run && github.event.workflow_run.pull_requests && github.event.workflow_run.pull_requests[0]
+        && github.event.workflow_run.pull_requests[0].number
+      || github.event.workflow_run && github.event.workflow_run.head_branch && github.event.workflow_run.head_branch != ''
+        && github.event.workflow_run.head_branch
+      || github.event.pull_request && github.event.pull_request.number
+      || github.head_ref && github.head_ref != '' && github.head_ref
+      || github.ref
+      || github.run_id
+    }}
+  cancel-in-progress: true
+
+
+
 
 jobs:
   quality-checks:
@@ -18,6 +36,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -30,15 +50,24 @@ jobs:
         with:
           path: |
             ~/.cache/pip
-          key: pip-${{ runner.os }}-${{ hashFiles('**/requirements.txt') }}
+          key: >-
+            pip-${{ runner.os }}-${{
+              hashFiles(
+                '**/requirements.txt',
+                '**/requirements-ci.txt',
+                'pyproject.toml',
+                'poetry.lock'
+              )
+            }}
           restore-keys: |
             pip-${{ runner.os }}-
 
       - name: Install dependencies
         run: |
+          set -euxo pipefail
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install ruff black mypy pytest pytest-cov
+          if [ -f requirements.txt ]; then python -m pip install -r requirements.txt; fi
+          python -m pip install ruff black mypy pytest pytest-cov
 
       - name: Run Ruff
         run: ruff check .
@@ -74,6 +103,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Determine image coordinates
         id: image_meta
@@ -92,7 +123,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push image with Kaniko
-        uses: int128/kaniko-action@v1
+        uses: int128/kaniko-action@v1.52.0
         with:
           registry: ${{ env.REGISTRY }}
           image: ${{ steps.image_meta.outputs.image_id }}
@@ -107,41 +138,43 @@ jobs:
 
       - name: Verify critical wheels in ${{ matrix.build.name }} image
         run: |
+          set -euo pipefail
           docker pull ${{ steps.image_meta.outputs.sha_tag }}
           docker run --rm ${{ steps.image_meta.outputs.sha_tag }} python - <<'PY'
-import importlib
-import json
-import sys
+          import importlib
+          import json
+          import sys
 
-modules = ["psycopg", "argon2", "cryptography"]
-missing: dict[str, str] = {}
-for name in modules:
-    try:
-        importlib.import_module(name)
-    except Exception as exc:
-        missing[name] = repr(exc)
+          modules = ["psycopg", "argon2", "cryptography"]
+          missing: dict[str, str] = {}
+          for name in modules:
+              try:
+                  importlib.import_module(name)
+              except Exception as exc:
+                  missing[name] = repr(exc)
 
-if missing:
-    payload = {
-        "event": "missing_critical_modules",
-        "modules": missing,
-        "component": "${{ matrix.build.name }}-image",
-    }
-    sys.stderr.write(json.dumps(payload) + "\n")
-    raise SystemExit(1)
+          if missing:
+              payload = {
+                  "event": "missing_critical_modules",
+                  "modules": missing,
+                  "component": "${{ matrix.build.name }}-image",
+              }
+              sys.stderr.write(json.dumps(payload) + "\n")
+              raise SystemExit(1)
 
-print("Verified critical Python modules:", ", ".join(modules))
-PY
+          print("Verified critical Python modules:", ", ".join(modules))
+          PY
 
       - name: Generate SBOM with Syft
         id: sbom
-        uses: anchore/syft-action@v1
+        uses: anchore/sbom-action@v0.20.6
         with:
           image: ${{ steps.image_meta.outputs.sha_tag }}
           format: spdx-json
           output-file: sbom-${{ matrix.build.name }}.spdx.json
           registry-username: ${{ github.actor }}
           registry-password: ${{ secrets.GITHUB_TOKEN }}
+          upload-artifact: false
 
       - name: Upload SBOM artifact
         uses: actions/upload-artifact@v4
@@ -150,7 +183,7 @@ PY
           path: sbom-${{ matrix.build.name }}.spdx.json
 
       - name: Scan image with Trivy
-        uses: aquasecurity/trivy-action@0.21.0
+        uses: aquasecurity/trivy-action@0.33.1
         with:
           image-ref: ${{ steps.image_meta.outputs.sha_tag }}
           severity: CRITICAL,HIGH
@@ -166,6 +199,31 @@ PY
           COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
         run: |
+          set -euo pipefail
+
+          if [ -z "$COSIGN_PRIVATE_KEY" ]; then
+            echo "COSIGN_PRIVATE_KEY secret must be provided" >&2
+            exit 1
+          fi
+
+          if [ -z "$COSIGN_PASSWORD" ]; then
+            echo "COSIGN_PASSWORD secret must be provided" >&2
+            exit 1
+          fi
+
+          mask_secret() {
+            if [ -z "$1" ]; then
+              return
+            fi
+            printf '%s' "$1" | while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              echo "::add-mask::$line"
+            done
+          }
+
+          mask_secret "$COSIGN_PRIVATE_KEY"
+          mask_secret "$COSIGN_PASSWORD"
+
           cosign sign --key env://COSIGN_PRIVATE_KEY "${{ steps.image_meta.outputs.sha_tag }}"
           cosign sign --key env://COSIGN_PRIVATE_KEY "${{ steps.image_meta.outputs.latest_tag }}"
 
@@ -176,6 +234,8 @@ PY
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -183,10 +243,13 @@ PY
           python-version: '3.11'
 
       - name: Install dependencies
-        run: python -m pip install --upgrade pip && pip install pyyaml
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install pyyaml
 
       - name: Authenticate to Vault
-        uses: hashicorp/vault-action@v2
+        uses: hashicorp/vault-action@v3
         with:
           url: ${{ secrets.VAULT_ADDR }}
           method: approle
@@ -206,18 +269,56 @@ PY
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install ArgoCD CLI
         run: |
-          curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/download/v2.9.3/argocd-linux-amd64
-          chmod +x argocd
-          sudo mv argocd /usr/local/bin/
+          set -euo pipefail
+          binary="argocd-linux-amd64"
+          base_url="https://github.com/argoproj/argo-cd/releases/download/v2.9.3"
+          curl --fail --show-error --silent --location --retry 5 --retry-delay 2 --retry-all-errors \
+            -o "${binary}" "${base_url}/${binary}"
+          curl --fail --show-error --silent --location --retry 5 --retry-delay 2 --retry-all-errors \
+            -o cli_checksums.txt "${base_url}/cli_checksums.txt"
+          expected_sum="$(grep " ${binary}$" cli_checksums.txt | awk '{print $1}')"
+          if [ -z "${expected_sum}" ]; then
+            echo "Unable to determine checksum for ${binary}" >&2
+            exit 1
+          fi
+          echo "${expected_sum}  ${binary}" | sha256sum --check --status
+          sudo install -m 0755 "${binary}" /usr/local/bin/argocd
+          rm -f "${binary}" cli_checksums.txt
 
       - name: Login to ArgoCD
         env:
           ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
           ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_TOKEN }}
         run: |
+          set -euo pipefail
+
+          if [ -z "${ARGOCD_SERVER:-}" ]; then
+            echo "ARGOCD_SERVER secret must be provided" >&2
+            exit 1
+          fi
+
+          if [ -z "${ARGOCD_AUTH_TOKEN:-}" ]; then
+            echo "ARGOCD_TOKEN secret must be provided" >&2
+            exit 1
+          fi
+
+          mask_secret() {
+            if [ -z "$1" ]; then
+              return
+            fi
+            printf '%s' "$1" | while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              echo "::add-mask::$line"
+            done
+          }
+
+          mask_secret "$ARGOCD_AUTH_TOKEN"
+
           argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --insecure
 
       - name: Sync Linode Kubernetes applications
@@ -225,6 +326,8 @@ PY
           STAGING_APP: ${{ secrets.ARGOCD_STAGING_APP }}
           PRODUCTION_APP: ${{ secrets.ARGOCD_PRODUCTION_APP }}
         run: |
+          set -euo pipefail
+
           if [ -z "$STAGING_APP" ] && [ -z "$PRODUCTION_APP" ]; then
             echo "No ArgoCD applications configured" >&2
             exit 1
