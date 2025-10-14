@@ -82,7 +82,7 @@ except ModuleNotFoundError:  # pragma: no cover - executed in minimal test envs
 
 from common.schemas.contracts import FillEvent, IntentEvent, OrderEvent, RiskDecisionEvent
 from common.utils import tracing
-from services.common.adapters import KafkaNATSAdapter
+from shared.event_bus import KafkaNATSAdapter
 from shared.common_bootstrap import ensure_common_helpers
 
 ensure_common_helpers()

@@ -15,7 +15,14 @@ try:  # pragma: no cover - optional dependency in lightweight test environments
 except ImportError:  # pragma: no cover - exercised in unit-only environments
     httpx = None  # type: ignore[assignment]
 
-from fastapi import APIRouter, FastAPI, HTTPException
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import APIRouter, FastAPI, HTTPException
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        APIRouter,
+        FastAPI,
+        HTTPException,
+    )
 
 from services.oms.kraken_rest import KrakenRESTError
 from services.oms.kraken_ws import KrakenWSError, KrakenWSTimeout, OrderState
