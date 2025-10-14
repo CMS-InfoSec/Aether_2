@@ -40,6 +40,10 @@ def install() -> ModuleType:
             self.args = args
             self.kwargs = kwargs
 
+        def with_variant(self, variant: object, *_dialects: object) -> "_Type":
+            del variant, _dialects
+            return self
+
     class _Constraint:
         def __init__(self, *args: object, **kwargs: object) -> None:
             self.args = args
@@ -125,9 +129,15 @@ def install() -> ModuleType:
                 + (f" ON CONFLICT ({conflict}) DO UPDATE" if conflict else "")
             )
 
+    class _FuncCallable(SimpleNamespace):
+        def __call__(self, *args: object, **kwargs: object) -> SimpleNamespace:  # pragma: no cover
+            return SimpleNamespace(name=self.name, args=args, kwargs=kwargs)
+
     class _FuncProxy(SimpleNamespace):
-        def __getattr__(self, name: str) -> SimpleNamespace:  # pragma: no cover - simple proxy
-            return SimpleNamespace(name=name, args=(), kwargs={})
+        def __getattr__(self, name: str) -> _FuncCallable:  # pragma: no cover - simple proxy
+            return _FuncCallable(name=name, args=(), kwargs={})
+
+    func_proxy = _FuncProxy()
 
     def _select(*entities: object, **kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(_entities=entities, kwargs=kwargs)
@@ -198,7 +208,7 @@ def install() -> ModuleType:
     sa.Index = _Constraint
     sa.MetaData = MetaData
     sa.Table = Table
-    sa.func = _FuncProxy()
+    sa.func = func_proxy
     sa.select = _select
     sa.insert = _insert
     sa.text = _text
@@ -324,6 +334,12 @@ def install() -> ModuleType:
     orm.declarative_base = declarative_base
     orm.registry = lambda *a, **k: SimpleNamespace(mapper=lambda *args, **kwargs: None)
     orm.relationship = lambda *a, **k: None  # type: ignore[attr-defined]
+    orm.Mapped = Any  # type: ignore[attr-defined]
+
+    def _mapped_column(*args: object, **kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(args=args, kwargs=kwargs)
+
+    orm.mapped_column = _mapped_column  # type: ignore[attr-defined]
 
     sys.modules["sqlalchemy.orm"] = orm
     sa.orm = orm  # type: ignore[attr-defined]
@@ -332,6 +348,7 @@ def install() -> ModuleType:
     engine.__spec__ = ModuleSpec("sqlalchemy.engine", loader=None)
     engine.Engine = SimpleNamespace
     engine.create_engine = _create_engine
+    engine.URL = SimpleNamespace  # type: ignore[attr-defined]
 
     class _URL(SimpleNamespace):
         def __init__(self, raw_url: str) -> None:
@@ -380,6 +397,8 @@ def install() -> ModuleType:
         )
 
     engine.create_mock_engine = _create_mock_engine
+    engine.URL = _URL  # type: ignore[attr-defined]
+    engine.make_url = _make_url  # type: ignore[attr-defined]
 
     engine_url = ModuleType("sqlalchemy.engine.url")
     engine_url.__spec__ = ModuleSpec("sqlalchemy.engine.url", loader=None)
@@ -447,6 +466,13 @@ def install() -> ModuleType:
     ext = ModuleType("sqlalchemy.ext")
     ext.__spec__ = ModuleSpec("sqlalchemy.ext", loader=None)
     sys.modules["sqlalchemy.ext"] = ext
+    sa.ext = ext  # type: ignore[attr-defined]
+
+    ext_declarative = ModuleType("sqlalchemy.ext.declarative")
+    ext_declarative.__spec__ = ModuleSpec("sqlalchemy.ext.declarative", loader=None)
+    ext_declarative.declarative_base = declarative_base  # type: ignore[attr-defined]
+    sys.modules["sqlalchemy.ext.declarative"] = ext_declarative
+    ext.declarative = ext_declarative  # type: ignore[attr-defined]
 
     ext_asyncio = ModuleType("sqlalchemy.ext.asyncio")
     ext_asyncio.__spec__ = ModuleSpec("sqlalchemy.ext.asyncio", loader=None)
@@ -465,5 +491,23 @@ def install() -> ModuleType:
     ext_asyncio.create_async_engine = _create_engine  # type: ignore[attr-defined]
 
     sys.modules["sqlalchemy.ext.asyncio"] = ext_asyncio
+    ext.asyncio = ext_asyncio  # type: ignore[attr-defined]
+
+    sql = ModuleType("sqlalchemy.sql")
+    sql.__spec__ = ModuleSpec("sqlalchemy.sql", loader=None)
+    sql.func = func_proxy
+    sql.select = _select  # type: ignore[attr-defined]
+    sql.text = _text  # type: ignore[attr-defined]
+
+    sql_schema = ModuleType("sqlalchemy.sql.schema")
+    sql_schema.__spec__ = ModuleSpec("sqlalchemy.sql.schema", loader=None)
+    sql_schema.Table = Table
+    sql_schema.Column = _Column  # type: ignore[attr-defined]
+
+    sys.modules["sqlalchemy.sql"] = sql
+    sys.modules["sqlalchemy.sql.schema"] = sql_schema
+    sql.schema = sql_schema  # type: ignore[attr-defined]
+
+    sa.sql = sql  # type: ignore[attr-defined]
 
     return sa
