@@ -24,7 +24,15 @@ try:  # pragma: no cover - optional scientific stack
 except Exception:  # pragma: no cover - fallback when pandas is unavailable
     pd = None  # type: ignore[assignment]
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+try:  # pragma: no cover - prefer FastAPI when available
+    from fastapi import Depends, FastAPI, HTTPException, Query
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        Depends,
+        FastAPI,
+        HTTPException,
+        Query,
+    )
 from pydantic import BaseModel, Field
 
 try:  # pragma: no cover - optional scientific stack

@@ -18,7 +18,10 @@ from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 from urllib.parse import parse_qsl
 
 import httpx
-from fastapi import FastAPI
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import FastAPI
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import FastAPI  # type: ignore[assignment]
 from pydantic import BaseModel, Field
 
 from shared.spot import is_spot_symbol, normalize_spot_symbol
