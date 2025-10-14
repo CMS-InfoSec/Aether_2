@@ -52,6 +52,7 @@ def _purge_modules(prefixes: Iterable[str]) -> None:
         "sequencer",
         "services.ui.explain_service",
         "services.report_service",
+        "services.builder.routes",
         "ops.metrics.cost_monitor",
         "signal_graph",
         "time_travel",
