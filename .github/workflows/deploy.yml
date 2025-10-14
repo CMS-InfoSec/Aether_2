@@ -257,6 +257,30 @@ jobs:
           ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
           ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_TOKEN }}
         run: |
+          set -euo pipefail
+
+          if [ -z "${ARGOCD_SERVER:-}" ]; then
+            echo "ARGOCD_SERVER secret must be provided" >&2
+            exit 1
+          fi
+
+          if [ -z "${ARGOCD_AUTH_TOKEN:-}" ]; then
+            echo "ARGOCD_TOKEN secret must be provided" >&2
+            exit 1
+          fi
+
+          mask_secret() {
+            if [ -z "$1" ]; then
+              return
+            fi
+            printf '%s' "$1" | while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              echo "::add-mask::$line"
+            done
+          }
+
+          mask_secret "$ARGOCD_AUTH_TOKEN"
+
           argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --insecure
 
       - name: Sync Linode Kubernetes applications
@@ -264,6 +288,8 @@ jobs:
           STAGING_APP: ${{ secrets.ARGOCD_STAGING_APP }}
           PRODUCTION_APP: ${{ secrets.ARGOCD_PRODUCTION_APP }}
         run: |
+          set -euo pipefail
+
           if [ -z "$STAGING_APP" ] && [ -z "$PRODUCTION_APP" ]; then
             echo "No ArgoCD applications configured" >&2
             exit 1

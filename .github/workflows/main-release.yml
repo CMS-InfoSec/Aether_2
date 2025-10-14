@@ -222,10 +222,41 @@ jobs:
           ARGOCD_PASSWORD: ${{ secrets.ARGOCD_PASSWORD }}
           ARGOCD_APP: ${{ vars.ARGOCD_APP_NAME }}
         run: |
-          if [ -z "$ARGOCD_SERVER" ] || [ -z "$ARGOCD_USERNAME" ] || [ -z "$ARGOCD_PASSWORD" ] || [ -z "$ARGOCD_APP" ]; then
-            echo "Argo CD credentials and application name must be provided" >&2
+          set -euo pipefail
+
+          if [ -z "${ARGOCD_SERVER:-}" ]; then
+            echo "ARGOCD_SERVER secret must be provided" >&2
             exit 1
           fi
+
+          if [ -z "${ARGOCD_USERNAME:-}" ]; then
+            echo "ARGOCD_USERNAME secret must be provided" >&2
+            exit 1
+          fi
+
+          if [ -z "${ARGOCD_PASSWORD:-}" ]; then
+            echo "ARGOCD_PASSWORD secret must be provided" >&2
+            exit 1
+          fi
+
+          if [ -z "${ARGOCD_APP:-}" ]; then
+            echo "ARGOCD_APP_NAME environment variable must be provided" >&2
+            exit 1
+          fi
+
+          mask_secret() {
+            if [ -z "$1" ]; then
+              return
+            fi
+            printf '%s' "$1" | while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              echo "::add-mask::$line"
+            done
+          }
+
+          mask_secret "$ARGOCD_USERNAME"
+          mask_secret "$ARGOCD_PASSWORD"
+
           argocd login "$ARGOCD_SERVER" --username "$ARGOCD_USERNAME" --password "$ARGOCD_PASSWORD" --insecure
           argocd app set "$ARGOCD_APP" --revision "${GITHUB_SHA}"
           argocd app sync "$ARGOCD_APP"
