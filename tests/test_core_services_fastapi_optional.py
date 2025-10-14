@@ -27,6 +27,7 @@ def _purge_modules(prefixes: Iterable[str]) -> None:
         "anomaly_service",
         "compliance_filter",
         "compliance_scanner",
+        "behavior_service",
         "exposure_forecast",
         "report_service",
         "advisor_service",
