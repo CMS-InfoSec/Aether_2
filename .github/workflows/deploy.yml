@@ -12,6 +12,10 @@ permissions:
   id-token: write
   actions: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.head_branch || github.event.pull_request.number || github.ref || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   quality-checks:
     name: Lint, Type Check, and Test
