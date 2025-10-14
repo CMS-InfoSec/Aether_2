@@ -12,8 +12,19 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Generator, Iterable, List, Mapping, Optional, Set, Tuple
 from types import SimpleNamespace
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
-from fastapi.responses import JSONResponse
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+    from fastapi.responses import JSONResponse
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        Depends,
+        FastAPI,
+        HTTPException,
+        JSONResponse,
+        Query,
+        Request,
+        status,
+    )
 from pydantic import BaseModel, Field
 _SQLALCHEMY_AVAILABLE = True
 
