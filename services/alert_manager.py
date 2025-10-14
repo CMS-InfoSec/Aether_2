@@ -8,15 +8,50 @@ import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, Iterable, Optional
+from types import SimpleNamespace
+from typing import Any, Callable, Dict, Iterable, Optional
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
-from fastapi import FastAPI
+try:  # pragma: no cover - prefer real FastAPI when available
+    from fastapi import FastAPI
+    _FASTAPI_AVAILABLE = True
+except Exception:  # pragma: no cover - provide a minimal stand-in
+    _FASTAPI_AVAILABLE = False
+
+    class _FallbackFastAPI:
+        """Lightweight FastAPI replacement used when the framework is missing."""
+
+        def __init__(self) -> None:
+            self.state = SimpleNamespace()
+
+        def on_event(self, _: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+            def _decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+                return func
+
+            return _decorator
+
+    FastAPI = _FallbackFastAPI  # type: ignore[assignment]
 
 try:  # pragma: no cover - prefer the real Prometheus client when available
-    from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, REGISTRY
+    from prometheus_client import (
+        CollectorRegistry as _PromCollectorRegistry,
+        Counter as _PromCounter,
+        Gauge as _PromGauge,
+        Histogram as _PromHistogram,
+        REGISTRY as _PROM_REGISTRY,
+    )
 except ModuleNotFoundError:  # pragma: no cover - fall back to in-repo metrics shims
+    _PromCollectorRegistry = None  # type: ignore[assignment]
+else:
+    try:
+        probe_registry = _PromCollectorRegistry()
+    except Exception:  # pragma: no cover - defensive guard for unexpected signatures
+        probe_registry = None
+    if probe_registry is None or not hasattr(probe_registry, "get_sample_value"):
+        _PromCollectorRegistry = None  # type: ignore[assignment]
+
+if _PromCollectorRegistry is None:  # pragma: no cover - exercised when shim required
     from metrics import (  # type: ignore[attr-defined]
         CollectorRegistry,
         Counter,
@@ -24,6 +59,12 @@ except ModuleNotFoundError:  # pragma: no cover - fall back to in-repo metrics s
         Histogram,
         _REGISTRY as REGISTRY,
     )
+else:  # pragma: no cover - exercised when full prometheus client available
+    CollectorRegistry = _PromCollectorRegistry
+    Counter = _PromCounter
+    Gauge = _PromGauge
+    Histogram = _PromHistogram
+    REGISTRY = _PROM_REGISTRY
 
 logger = logging.getLogger(__name__)
 
@@ -304,6 +345,16 @@ def alert_trade_rejections(account_id: str) -> None:
 
 def setup_alerting(app: FastAPI, alertmanager_url: Optional[str] = None) -> None:
     """Register startup/shutdown hooks for metrics and alert manager wiring."""
+
+    if not _FASTAPI_AVAILABLE:
+        metrics = get_alert_metrics()
+        manager = AlertManager(metrics=metrics, alertmanager_url=alertmanager_url)
+        set_alert_manager(manager)
+        if not hasattr(app, "state"):
+            app.state = SimpleNamespace()
+        app.state.alert_manager = manager
+        logger.info("FastAPI unavailable; configured alert manager using fallback app")
+        return
 
     @app.on_event("startup")
     async def _configure_alerting() -> None:  # pragma: no cover - FastAPI lifecycle
