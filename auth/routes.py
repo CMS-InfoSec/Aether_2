@@ -1,6 +1,10 @@
 """FastAPI routes exposing authentication endpoints for Builder.io Fusion."""
 from __future__ import annotations
 
+from shared.common_bootstrap import _ensure_fastapi_stub
+
+_ensure_fastapi_stub()
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, EmailStr
 
