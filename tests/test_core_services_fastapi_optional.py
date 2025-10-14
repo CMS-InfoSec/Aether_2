@@ -32,6 +32,7 @@ def _purge_modules(prefixes: Iterable[str]) -> None:
         "advisor_service",
         "capital_allocator",
         "benchmark_service",
+        "capital_flow",
         "governance_simulator",
         "policy_service",
         "kill_switch",
@@ -87,10 +88,17 @@ def test_core_services_import_without_fastapi(
         prefixes.append("ml")
     _purge_modules(prefixes)
 
+    if module_name == "capital_flow":
+        _purge_modules(["sqlalchemy"])
+
     real_import = builtins.__import__
 
+    blocked_prefixes = ["fastapi"]
+    if module_name == "capital_flow":
+        blocked_prefixes.append("sqlalchemy")
+
     def _fake_import(name: str, *args: object, **kwargs: object) -> ModuleType:
-        if name == "fastapi" or name.startswith("fastapi."):
+        if any(name == prefix or name.startswith(prefix + ".") for prefix in blocked_prefixes):
             raise ModuleNotFoundError("fastapi unavailable")
         return real_import(name, *args, **kwargs)
 
@@ -158,6 +166,13 @@ def test_core_services_import_without_fastapi(
         monkeypatch.setitem(sys.modules, "services.common.adapters", adapters_stub)
 
     module = importlib.import_module(module_name)
+
+    if module_name == "capital_flow":
+        # Restore the SQLAlchemy stub installed by tests.conftest so subsequent
+        # parametrised runs continue to see the shimmed modules.
+        from tests import conftest as _test_conftest
+
+        _test_conftest._install_sqlalchemy_stub()
 
     for attr_name in ("FastAPI", "APIRouter"):
         candidate = getattr(module, attr_name, None)
