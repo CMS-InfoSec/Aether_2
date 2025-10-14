@@ -37,6 +37,14 @@ from services.common.spot import require_spot_http
 from services.fees.fee_optimizer import FeeOptimizer
 from services.fees.models import AccountFill, AccountVolume30d, Base, FeeTier
 from shared.pydantic_compat import BaseModel, Field
+from shared import readiness
+from shared.readyz_router import ReadyzRouter
+from shared.service_readiness import (
+    SQLAlchemyProbeClient,
+    engine_from_state,
+    session_factory_from_state,
+    using_sqlite,
+)
 
 try:  # pragma: no cover - optional dependencies may be unavailable
     from services.common.adapters import (  # type: ignore[import]
@@ -251,7 +259,37 @@ SessionLocal = sessionmaker(
 
 
 app = FastAPI(title="Fee Schedule Service")
+app.state.db_sessionmaker = SessionLocal
+app.state.db_engine = ENGINE
 setup_metrics(app, service_name="fee-service")
+
+
+_readyz_router = ReadyzRouter()
+
+
+def _build_probe_client() -> SQLAlchemyProbeClient:
+    session_factory = session_factory_from_state(
+        app,
+        dependency_name="Fee service database",
+    )
+    return SQLAlchemyProbeClient(session_factory)
+
+
+async def _postgres_read_probe() -> None:
+    client = _build_probe_client()
+    await readiness.postgres_read_probe(client=client)
+
+
+async def _postgres_write_probe() -> None:
+    client = _build_probe_client()
+    engine = engine_from_state(app)
+    read_only_query = "SELECT 1" if using_sqlite(engine) else "SELECT pg_is_in_recovery()"
+    await readiness.postgres_write_probe(client=client, read_only_query=read_only_query)
+
+
+_readyz_router.register_probe("postgres_read", _postgres_read_probe)
+_readyz_router.register_probe("postgres_write", _postgres_write_probe)
+app.include_router(_readyz_router.router)
 
 
 logger = logging.getLogger(__name__)

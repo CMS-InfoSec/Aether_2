@@ -63,6 +63,9 @@ if TYPE_CHECKING:  # pragma: no cover - imported for typing only
 try:  # pragma: no cover - mlflow is optional for tests/CI.
     import mlflow
     from mlflow.tracking import MlflowClient
+    from shared.mlflow_safe import harden_mlflow
+
+    harden_mlflow(mlflow)
 except Exception:  # pragma: no cover - executed when mlflow is missing.
     mlflow = None  # type: ignore
     MlflowClient = None  # type: ignore
