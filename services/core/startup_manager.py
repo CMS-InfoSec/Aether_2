@@ -25,7 +25,14 @@ from typing import (
 )
 from typing_extensions import ParamSpec
 
-from fastapi import APIRouter, FastAPI, HTTPException
+try:  # pragma: no cover - prefer FastAPI when available
+    from fastapi import APIRouter, FastAPI, HTTPException
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (
+        APIRouter,
+        FastAPI,
+        HTTPException,
+    )  # type: ignore[assignment]
 
 try:  # pragma: no cover - optional dependency during documentation builds
     import sqlalchemy as sa

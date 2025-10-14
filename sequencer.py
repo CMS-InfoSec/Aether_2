@@ -13,20 +13,33 @@ import time
 import uuid
 from typing import Any, Awaitable, Callable, Deque, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
-from fastapi import Depends, FastAPI, HTTPException, status
-from fastapi.encoders import jsonable_encoder
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import Depends, FastAPI, HTTPException, status
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        Depends,
+        FastAPI,
+        HTTPException,
+        status,
+    )
+
+try:  # pragma: no cover - prefer the real FastAPI encoder when available
+    from fastapi.encoders import jsonable_encoder
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import jsonable_encoder  # type: ignore[assignment]
 from pydantic import BaseModel, Field
 
 import httpx
 from auth.session_client import AdminSessionManager, get_default_session_manager
 from common.utils import tracing
 from exchange_adapter import get_exchange_adapter
-from services.common.adapters import KafkaNATSAdapter
 from services.common.schemas import FeeBreakdown, PolicyDecisionRequest, PolicyDecisionResponse
 
 from services.common.security import require_admin_account
 
 from enum import Enum
+
+from shared.event_bus import KafkaNATSAdapter
 
 try:
     from override_service import OverrideDecision, OverrideRecord, latest_override
