@@ -76,6 +76,10 @@ def _purge_modules(prefixes: Iterable[str]) -> None:
         "services.logging_export",
         "services.oms.main",
         "services.oms.reconcile",
+        "services.analytics.seasonality_service",
+        "services.analytics.vwap_service",
+        "services.backtest.stress_engine",
+        "services.fees.fee_service",
     ],
 )
 def test_core_services_import_without_fastapi(
@@ -86,6 +90,12 @@ def test_core_services_import_without_fastapi(
     prefixes = ["fastapi", module_name]
     if module_name.startswith("services.oms."):
         prefixes.append("services.oms")
+    if module_name.startswith("services.analytics."):
+        prefixes.append("services.analytics")
+    if module_name.startswith("services.backtest."):
+        prefixes.append("services.backtest")
+    if module_name.startswith("services.fees."):
+        prefixes.append("services.fees")
     if module_name.startswith("ml."):
         prefixes.append("ml")
     _purge_modules(prefixes)
