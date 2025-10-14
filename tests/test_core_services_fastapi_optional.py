@@ -64,6 +64,11 @@ def _purge_modules(prefixes: Iterable[str]) -> None:
         "hitl_service",
         "secrets_service",
         "sim_mode",
+        "services.core.backpressure",
+        "services.core.cache_warmer",
+        "services.core.sim_mode",
+        "services.core.startup_manager",
+        "services.logging_export",
     ],
 )
 def test_core_services_import_without_fastapi(

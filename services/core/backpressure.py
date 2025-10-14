@@ -14,7 +14,10 @@ from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Deque, Dict, Iterable, Mapping, MutableMapping, ParamSpec, TypeVar, cast
 
-from fastapi import FastAPI
+try:  # pragma: no cover - prefer FastAPI when available
+    from fastapi import FastAPI
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import FastAPI  # type: ignore[assignment]
 
 from metrics import Counter as PrometheusCounter, Gauge, setup_metrics
 

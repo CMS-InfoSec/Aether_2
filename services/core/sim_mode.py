@@ -6,7 +6,18 @@ import logging
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Iterable, Optional, ParamSpec, TypeVar, cast
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
+try:  # pragma: no cover - prefer FastAPI when available
+    from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (
+        APIRouter,
+        Body,
+        Depends,
+        HTTPException,
+        Query,
+        Request,
+        status,
+    )  # type: ignore[assignment]
 
 from shared.pydantic_compat import BaseModel, Field
 
