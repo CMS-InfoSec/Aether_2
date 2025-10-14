@@ -9,7 +9,10 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Callable, ClassVar, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+try:  # pragma: no cover - prefer real FastAPI when available
+    from fastapi import APIRouter, Depends, HTTPException, Query, status
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import APIRouter, Depends, HTTPException, Query, status
 
 try:  # pragma: no cover - prefer psycopg (v3) when available
     import psycopg
