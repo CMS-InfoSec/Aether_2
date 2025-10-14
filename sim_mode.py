@@ -7,7 +7,18 @@ from typing import Iterable, Optional
 
 import logging
 
-from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, status
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, status
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        Body,
+        Depends,
+        FastAPI,
+        HTTPException,
+        Query,
+        Request,
+        status,
+    )
 from pydantic import BaseModel, Field
 
 from common.schemas.contracts import SimModeEvent

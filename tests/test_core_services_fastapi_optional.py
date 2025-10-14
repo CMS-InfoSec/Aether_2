@@ -23,6 +23,7 @@ def _purge_modules(prefixes: Iterable[str]) -> None:
 @pytest.mark.parametrize(
     "module_name",
     [
+        "anomaly_service",
         "compliance_filter",
         "compliance_scanner",
         "exposure_forecast",
@@ -58,6 +59,11 @@ def _purge_modules(prefixes: Iterable[str]) -> None:
         "ml.policy.meta_strategy",
         "ml.features.feature_versioning",
         "ml.monitoring.drift_service",
+        "ops.observability.latency_metrics",
+        "prompt_refiner",
+        "hitl_service",
+        "secrets_service",
+        "sim_mode",
     ],
 )
 def test_core_services_import_without_fastapi(
@@ -106,6 +112,9 @@ def test_core_services_import_without_fastapi(
         audit_stub.AuditorPrincipal = _AuditorPrincipal  # type: ignore[attr-defined]
         audit_stub.require_auditor_identity = _require_auditor_identity  # type: ignore[attr-defined]
         monkeypatch.setitem(sys.modules, "audit_mode", audit_stub)
+
+    if module_name == "anomaly_service":
+        monkeypatch.setenv("ANOMALY_DATABASE_URL", "sqlite:///anomaly.db")
 
     module = importlib.import_module(module_name)
 
