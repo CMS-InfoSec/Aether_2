@@ -19,6 +19,11 @@ except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
         Query,
         status,
     )
+
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
 from sqlalchemy import create_engine, func, select
 from typing import TYPE_CHECKING
 
