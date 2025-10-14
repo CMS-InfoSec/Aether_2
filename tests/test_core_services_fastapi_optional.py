@@ -8,7 +8,7 @@ import os
 import sys
 from dataclasses import dataclass
 from types import ModuleType
-from typing import Iterable
+from typing import Dict, Iterable
 
 import pytest
 
@@ -23,6 +23,7 @@ def _purge_modules(prefixes: Iterable[str]) -> None:
 @pytest.mark.parametrize(
     "module_name",
     [
+        "auth_service",
         "anomaly_service",
         "compliance_filter",
         "compliance_scanner",
@@ -64,11 +65,14 @@ def _purge_modules(prefixes: Iterable[str]) -> None:
         "hitl_service",
         "secrets_service",
         "sim_mode",
+        "oms_service",
         "services.core.backpressure",
         "services.core.cache_warmer",
         "services.core.sim_mode",
         "services.core.startup_manager",
         "services.logging_export",
+        "services.oms.main",
+        "services.oms.reconcile",
     ],
 )
 def test_core_services_import_without_fastapi(
@@ -77,6 +81,8 @@ def test_core_services_import_without_fastapi(
     """Modules should fall back to the in-repo FastAPI shim when missing."""
 
     prefixes = ["fastapi", module_name]
+    if module_name.startswith("services.oms."):
+        prefixes.append("services.oms")
     if module_name.startswith("ml."):
         prefixes.append("ml")
     _purge_modules(prefixes)
@@ -120,6 +126,36 @@ def test_core_services_import_without_fastapi(
 
     if module_name == "anomaly_service":
         monkeypatch.setenv("ANOMALY_DATABASE_URL", "sqlite:///anomaly.db")
+
+    if module_name == "services.oms.main":
+        _purge_modules(["services.common.adapters"])
+        adapters_stub = ModuleType("services.common.adapters")
+
+        class _StubTimescaleAdapter:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                pass
+
+            @classmethod
+            def flush_event_buffers(cls) -> Dict[str, int]:
+                return {}
+
+            def record_ack(self, *_: object, **__: object) -> None:
+                return None
+
+            def record_usage(self, *_: object, **__: object) -> None:
+                return None
+
+            def record_fill(self, *_: object, **__: object) -> None:
+                return None
+
+            def record_shadow_fill(self, *_: object, **__: object) -> None:
+                return None
+
+            def record_event(self, *_: object, **__: object) -> None:
+                return None
+
+        adapters_stub.TimescaleAdapter = _StubTimescaleAdapter  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "services.common.adapters", adapters_stub)
 
     module = importlib.import_module(module_name)
 
