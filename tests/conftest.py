@@ -865,25 +865,109 @@ def _install_prometheus_stub() -> None:
     prom = ModuleType("prometheus_client")
 
     class _Metric:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            self.args = args
-            self.kwargs = kwargs
+        def __init__(
+            self,
+            *args: object,
+            labelnames: tuple[str, ...] | list[str] | None = None,
+            registry: "_CollectorRegistry" | None = None,
+            **kwargs: object,
+        ) -> None:
+            name = ""
+            if args:
+                name = str(args[0])
+            elif "name" in kwargs:
+                name = str(kwargs["name"])
+            self._name = name
+            self._labelnames = tuple(labelnames or ())
+            self._values: dict[tuple[str, ...], float] = {}
+            self._counts: dict[tuple[str, ...], int] = {}
+            self._sums: dict[tuple[str, ...], float] = {}
+            if registry is not None:
+                registry.register(self)
 
-        def labels(self, **kwargs: object) -> "_Metric":
+        def labels(self, *args: object, **kwargs: object) -> "_Metric":
+            if args and kwargs:
+                raise ValueError("Use positional or keyword labels, not both")
+            if args:
+                key = tuple(str(value) for value in args)
+            else:
+                key = tuple(str(kwargs.get(name, "")) for name in self._labelnames)
+            self._current_key = key
+            self._values.setdefault(key, 0.0)
             return self
 
         def set(self, value: float) -> None:
-            self._value = value
+            key = getattr(self, "_current_key", ())
+            self._values[key] = value
 
         def inc(self, value: float = 1.0) -> None:
-            self._value = getattr(self, "_value", 0.0) + value
+            key = getattr(self, "_current_key", ())
+            self._values[key] = self._values.get(key, 0.0) + value
+
+        def observe(self, value: float) -> None:
+            self.set(value)
+            key = getattr(self, "_current_key", ())
+            self._counts[key] = self._counts.get(key, 0) + 1
+            self._sums[key] = self._sums.get(key, 0.0) + value
+
+        def collect(self) -> list[SimpleNamespace]:
+            samples = []
+            for key, value in self._values.items():
+                labels = {name: label for name, label in zip(self._labelnames, key)}
+                metric_name = getattr(self, "_name", "")
+                samples.append(SimpleNamespace(name=metric_name, labels=labels, value=value))
+                if key in self._counts:
+                    samples.append(
+                        SimpleNamespace(
+                            name=f"{metric_name}_count",
+                            labels=labels,
+                            value=float(self._counts[key]),
+                        )
+                    )
+                    samples.append(
+                        SimpleNamespace(
+                            name=f"{metric_name}_sum",
+                            labels=labels,
+                            value=self._sums[key],
+                        )
+                    )
+            return [SimpleNamespace(samples=samples)]
+
+    class _CollectorRegistry:
+        def __init__(self) -> None:
+            self._collectors: set[_Metric] = set()
+
+        def register(self, collector: _Metric) -> None:
+            self._collectors.add(collector)
+
+        def unregister(self, collector: _Metric) -> None:
+            self._collectors.discard(collector)
+
+        def collect(self) -> list[SimpleNamespace]:
+            families: list[SimpleNamespace] = []
+            for collector in list(self._collectors):
+                families.extend(collector.collect())
+            return families
+
+        def get_sample_value(
+            self, name: str, labels: dict[str, str] | None = None
+        ) -> float | None:
+            for collector in list(self._collectors):
+                for family in collector.collect():
+                    for sample in getattr(family, "samples", []):
+                        if getattr(sample, "name", "") != name:
+                            continue
+                        if labels and any(sample.labels.get(k) != v for k, v in labels.items()):
+                            continue
+                        return getattr(sample, "value", None)
+            return None
 
     prom.Counter = _Metric
     prom.Gauge = _Metric
     prom.Summary = _Metric
     prom.Histogram = _Metric
-    prom.CollectorRegistry = SimpleNamespace
-    prom.REGISTRY = SimpleNamespace()
+    prom.CollectorRegistry = _CollectorRegistry
+    prom.REGISTRY = _CollectorRegistry()
     prom.CONTENT_TYPE_LATEST = "text/plain"
     prom.generate_latest = lambda registry: b""
     sys.modules["prometheus_client"] = prom
