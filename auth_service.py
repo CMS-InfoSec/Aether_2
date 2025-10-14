@@ -75,9 +75,20 @@ except ImportError:  # pragma: no cover - exercised in unit-only environments
 
     pyotp = _MissingPyOTP()
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
-from fastapi.concurrency import run_in_threadpool
-from fastapi.middleware.cors import CORSMiddleware
+try:  # pragma: no cover - prefer the real FastAPI implementation
+    from fastapi import Depends, FastAPI, HTTPException, Request, status
+    from fastapi.concurrency import run_in_threadpool
+    from fastapi.middleware.cors import CORSMiddleware
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        CORSMiddleware,
+        Depends,
+        FastAPI,
+        HTTPException,
+        Request,
+        run_in_threadpool,
+        status,
+    )
 from pydantic import BaseModel, Field, HttpUrl
 
 _SQLALCHEMY_AVAILABLE = True

@@ -13,7 +13,10 @@ from pathlib import Path
 from threading import Lock
 from typing import Callable, Dict, Mapping, MutableMapping, Tuple
 
-from fastapi import FastAPI, HTTPException, status
+try:  # pragma: no cover - prefer FastAPI when available
+    from fastapi import FastAPI, HTTPException, status
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import FastAPI, HTTPException, status  # type: ignore[misc]
 from pydantic import BaseModel, Field, validator
 
 LOGGER = logging.getLogger(__name__)

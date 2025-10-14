@@ -31,7 +31,16 @@ from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Iterable, Iterator, Mapping, MutableMapping, Sequence
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import Depends, FastAPI, HTTPException, Query, Request
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        Depends,
+        FastAPI,
+        HTTPException,
+        Query,
+        Request,
+    )
 from pydantic import BaseModel, Field
 
 _SQLALCHEMY_AVAILABLE = False
