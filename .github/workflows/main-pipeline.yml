@@ -298,10 +298,35 @@ jobs:
           ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
           ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_TOKEN }}
         run: |
+          set -euo pipefail
+
+          if [ -z "${ARGOCD_SERVER:-}" ]; then
+            echo "ARGOCD_SERVER secret must be provided" >&2
+            exit 1
+          fi
+
+          if [ -z "${ARGOCD_AUTH_TOKEN:-}" ]; then
+            echo "ARGOCD_TOKEN secret must be provided" >&2
+            exit 1
+          fi
+
+          mask_secret() {
+            if [ -z "$1" ]; then
+              return
+            fi
+            printf '%s' "$1" | while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              echo "::add-mask::$line"
+            done
+          }
+
+          mask_secret "$ARGOCD_AUTH_TOKEN"
+
           argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --insecure
 
       - name: Sync applications
         run: |
+          set -euo pipefail
           argocd app sync aether-risk-staging
           argocd app wait aether-risk-staging --health --timeout 600
           argocd app sync aether-risk-prod
