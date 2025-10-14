@@ -43,12 +43,12 @@ from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from common.schemas.contracts import IntentEvent
-from services.common.adapters import KafkaNATSAdapter
 from services.common.security import require_admin_account
 from shared.account_scope import account_id_column
 from shared.dependency_alerts import notify_dependency_fallback
 from shared.runtime_checks import ensure_insecure_default_flag_disabled
 from shared.spot import is_spot_symbol, normalize_spot_symbol
+from shared.event_bus import KafkaNATSAdapter
 
 try:  # pragma: no cover - LightGBM is optional in many environments
     import lightgbm as lgb  # type: ignore
