@@ -484,6 +484,7 @@ class APIRouter:
         self.routes: List[Tuple[str, Tuple[str, ...], Callable[..., Any]]] = []
         self.prefix = kwargs.get("prefix", "")
         self.tags = list(kwargs.get("tags", []))
+        self.event_handlers: Dict[str, List[Callable[..., Any]]] = {}
 
     def add_api_route(
         self,
@@ -513,6 +514,13 @@ class APIRouter:
 
     def put(self, path: str, **_: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         return self.route(path, methods=("PUT",))
+
+    def on_event(self, event_type: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+            self.event_handlers.setdefault(event_type, []).append(func)
+            return func
+
+        return decorator
 
 
 class FastAPI:
@@ -545,6 +553,9 @@ class FastAPI:
         for path, methods, endpoint in router.routes:
             full_path = _join_path(combined_prefix, path)
             self._register_route(full_path, endpoint, methods)
+        for event, handlers in getattr(router, "event_handlers", {}).items():
+            existing = self.event_handlers.setdefault(event, [])
+            existing.extend(handlers)
 
     def openapi(self) -> Dict[str, Any]:  # pragma: no cover - exercised via tooling
         """Generate a minimal OpenAPI structure for tooling that expects FastAPI."""
