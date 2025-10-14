@@ -5,7 +5,10 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any, Callable, TypeVar, cast
 
-from fastapi import APIRouter, HTTPException
+try:  # pragma: no cover - prefer FastAPI when available
+    from fastapi import APIRouter, HTTPException
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import APIRouter, HTTPException  # type: ignore[assignment]
 
 from logging_export import MissingDependencyError, latest_export
 
