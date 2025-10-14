@@ -107,7 +107,16 @@ except ImportError:  # pragma: no cover - gracefully degrade when missing
 
     json_graph = _JSONGraph  # type: ignore[assignment]
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+try:  # pragma: no cover - prefer FastAPI when available
+    from fastapi import Depends, FastAPI, HTTPException, Query, status
+except Exception:  # pragma: no cover - exercised when FastAPI unavailable
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        Depends,
+        FastAPI,
+        HTTPException,
+        Query,
+        status,
+    )
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from services.common.security import require_admin_account

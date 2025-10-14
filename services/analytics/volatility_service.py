@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator, List, Optional, Seque
 
 from alembic import command
 from alembic.config import Config
-from prometheus_client import Gauge
+from metrics import Gauge
 from sqlalchemy import Column, DateTime, Float, String, create_engine, func, select
 from sqlalchemy.engine import Engine, URL
 from sqlalchemy.engine.url import make_url
