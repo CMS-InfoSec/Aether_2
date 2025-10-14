@@ -86,7 +86,13 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Buildah
-        run: sudo apt-get update && sudo apt-get install -y buildah
+        run: |
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends buildah
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
       - name: Determine image registry
         id: image-meta
         run: |
