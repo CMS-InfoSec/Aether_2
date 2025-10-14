@@ -241,3 +241,35 @@ def test_guarded_key_requires_two_authors(
     history_body = history.json()
     assert len(history_body) == 1
     assert history_body[0]["approvers"] == ["company", "director-1"]
+
+
+def test_readyz_reports_ok(config_client: tuple[TestClient, InMemorySessionStore]) -> None:
+    client, _store = config_client
+
+    response = client.get("/readyz")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "ok"
+    assert payload["checks"]["postgres_read"]["status"] == "ok"
+
+
+def test_readyz_returns_503_when_session_store_missing(
+    config_client: tuple[TestClient, InMemorySessionStore]
+) -> None:
+    client, _store = config_client
+
+    original_store = getattr(client.app.state, "session_store", None)
+    if hasattr(client.app.state, "session_store"):
+        delattr(client.app.state, "session_store")
+
+    try:
+        response = client.get("/readyz")
+    finally:
+        if original_store is not None:
+            client.app.state.session_store = original_store
+
+    assert response.status_code == 503
+    payload = response.json()
+    assert payload["status"] == "error"
+    assert payload["checks"]["session_store"]["status"] == "error"
