@@ -37,10 +37,23 @@ except Exception:  # pragma: no cover - gracefully degrade when OTel unavailable
     Span = object  # type: ignore
     SpanKind = None  # type: ignore
 
+_HISTOGRAM_REGISTRY: Any | None = None
+
 try:  # pragma: no cover - prometheus client may be optional
-    from prometheus_client import Histogram
-except Exception:  # pragma: no cover
-    Histogram = None  # type: ignore
+    from prometheus_client import Histogram as _PrometheusHistogram
+except Exception:  # pragma: no cover - gracefully degrade when the library is absent
+    _PrometheusHistogram = None  # type: ignore[assignment]
+
+if _PrometheusHistogram is not None:
+    Histogram = _PrometheusHistogram
+else:  # pragma: no cover - exercised in optional dependency environments
+    try:
+        import metrics as _metrics_module
+    except Exception:  # pragma: no cover - fallback metrics unavailable
+        Histogram = None  # type: ignore[assignment]
+    else:
+        Histogram = getattr(_metrics_module, "Histogram", None)
+        _HISTOGRAM_REGISTRY = getattr(_metrics_module, "_REGISTRY", None)
 
 try:  # pragma: no cover - FastAPI/Starlette may be optional
     from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -60,15 +73,17 @@ _LOG_FILTER_INSTALLED = False
 
 R = TypeVar("R")
 
-_STAGE_LATENCY_HISTOGRAM = (
-    Histogram(
+_STAGE_LATENCY_HISTOGRAM = None
+if Histogram is not None:
+    kwargs: Dict[str, Any] = {}
+    if _HISTOGRAM_REGISTRY is not None:
+        kwargs["registry"] = _HISTOGRAM_REGISTRY
+    _STAGE_LATENCY_HISTOGRAM = Histogram(
         "trading_stage_latency_seconds",
         "Latency of trading pipeline stages in seconds.",
         ["stage"],
+        **kwargs,
     )
-    if Histogram is not None
-    else None
-)
 
 
 class _CorrelationIdFilter(logging.Filter):

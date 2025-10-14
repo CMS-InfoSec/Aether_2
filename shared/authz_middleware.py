@@ -11,9 +11,13 @@ import logging
 import os
 from datetime import datetime, timezone
 from functools import wraps
+from types import SimpleNamespace
 from typing import Any, Callable, Iterable, Mapping, MutableMapping, Optional, Sequence, Tuple, TypeVar
 
-from fastapi import HTTPException, Request
+try:  # pragma: no cover - prefer FastAPI when available
+    from fastapi import HTTPException, Request
+except Exception:  # pragma: no cover - fallback when FastAPI is absent
+    from services.common.fastapi_stub import HTTPException, Request
 
 
 logger = logging.getLogger(__name__)
@@ -173,8 +177,14 @@ async def authz_dependency(request: Request) -> AuthenticatedUser:
 
     user = AuthenticatedUser(user_id=user_id, claims=payload)
 
-    request.scope["user"] = user
-    request.scope["account_scopes"] = scopes
+    scope = _ensure_request_scope(request)
+    scope["user"] = user
+    scope["account_scopes"] = scopes
+
+    state = getattr(request, "state", None)
+    if state is None:
+        state = SimpleNamespace()
+        setattr(request, "state", state)
     request.state.user = user
     request.state.account_scopes = scopes
     setattr(request, "account_scopes", scopes)
@@ -190,7 +200,7 @@ async def authz_dependency(request: Request) -> AuthenticatedUser:
 
 
 def _log_denied_attempt(request: Request, user_id: str, account_id: str) -> None:
-    endpoint = request.url.path
+    endpoint = _resolve_request_path(request)
     timestamp = datetime.now(timezone.utc).isoformat()
     try:
         access_log(user_id, account_id, endpoint, timestamp, reason="scope_violation")
@@ -206,6 +216,58 @@ def _resolve_request(args: Tuple[Any, ...], kwargs: MutableMapping[str, Any]) ->
         if isinstance(arg, Request):
             return arg
     raise RuntimeError("@requires_account_scope decorated endpoint must receive a Request")
+
+
+def _ensure_request_scope(request: Request) -> MutableMapping[str, Any]:
+    """Return a mutable scope mapping, creating one when necessary."""
+
+    scope_candidate = getattr(request, "scope", None)
+    if isinstance(scope_candidate, MutableMapping):
+        return scope_candidate
+
+    private_scope = getattr(request, "_scope", None)
+    if isinstance(private_scope, MutableMapping):
+        try:
+            setattr(request, "scope", private_scope)
+        except Exception:  # pragma: no cover - attribute assignment may fail on proxies
+            pass
+        return private_scope
+
+    scope: MutableMapping[str, Any] = {}
+    try:
+        setattr(request, "scope", scope)
+    except Exception:  # pragma: no cover - some request objects forbid setting attributes
+        pass
+    try:
+        setattr(request, "_scope", scope)
+    except Exception:  # pragma: no cover - optional attribute on FastAPI requests
+        pass
+    return scope
+
+
+def _resolve_request_path(request: Request) -> str:
+    """Best-effort extraction of the request path for logging."""
+
+    url = getattr(request, "url", None)
+    if url is not None:
+        path = getattr(url, "path", None)
+        if isinstance(path, str) and path:
+            return path
+        try:
+            rendered = str(url)
+        except Exception:  # pragma: no cover - objects without stringification support
+            rendered = None
+        if rendered:
+            return rendered
+
+    for attr in ("scope", "_scope"):
+        scope = getattr(request, attr, None)
+        if isinstance(scope, Mapping):
+            path = scope.get("path")
+            if isinstance(path, str) and path:
+                return path
+
+    return "/"
 
 
 def _ensure_scope(request: Request, account_id: Optional[str]) -> None:
