@@ -88,12 +88,27 @@ def build_audit_plan() -> List[AuditCommand]:
         AuditCommand(name="Pytest", command=["pytest"]),
     ]
 
-    requirements = REPO_ROOT / "requirements.txt"
-    if requirements.exists():
+    requirement_files = [
+        path
+        for path in (
+            REPO_ROOT / "requirements.txt",
+            REPO_ROOT / "requirements-ci.txt",
+        )
+        if path.exists()
+    ]
+    if requirement_files:
+        pip_audit_command = ["pip-audit", "--progress-spinner", "off"]
+        config_path = REPO_ROOT / "pip-audit.toml"
+        if config_path.exists():
+            pip_audit_command += ["--config", str(config_path)]
+        pip_audit_command.append("--strict")
+        for requirement in requirement_files:
+            pip_audit_command += ["--requirement", str(requirement)]
+
         plan.append(
             AuditCommand(
                 name="pip-audit",
-                command=["pip-audit", "--strict", "-r", str(requirements)],
+                command=pip_audit_command,
             )
         )
 
