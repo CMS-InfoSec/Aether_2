@@ -45,13 +45,16 @@ jobs:
 
       - name: Run pip-audit
         run: |
-          set -o pipefail
+          set -euo pipefail
           exit_code=0
-          pip-audit \
+          if ! pip-audit \
             --progress-spinner off \
             --config pip-audit.toml \
             -r requirements.txt \
-            -r requirements-ci.txt || exit_code=$?
+            -r requirements-ci.txt
+          then
+            exit_code=$?
+          fi
 
           if [ "$exit_code" -gt 1 ]; then
             exit "$exit_code"

@@ -102,13 +102,16 @@ jobs:
 
       - name: Audit locked dependencies
         run: |
-          set -o pipefail
+          set -euo pipefail
           exit_code=0
-          pip-audit \
+          if ! pip-audit \
             --progress-spinner off \
             --config pip-audit.toml \
             --requirement requirements.txt \
-            --requirement requirements-ci.txt || exit_code=$?
+            --requirement requirements-ci.txt
+          then
+            exit_code=$?
+          fi
 
           if [ "$exit_code" -gt 1 ]; then
             exit "$exit_code"
