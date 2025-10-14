@@ -20,6 +20,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Generate SBOM
         uses: anchore/sbom-action@v0.20.6
         with:
@@ -38,6 +40,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Generate SLSA provenance
         uses: slsa-framework/slsa-github-generator@v2.1.0
         with:

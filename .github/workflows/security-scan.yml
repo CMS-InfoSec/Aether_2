@@ -13,6 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Run Trivy config scan
         uses: aquasecurity/trivy-action@0.33.1
         with:
@@ -26,6 +28,8 @@ jobs:
     needs: trivy-config
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Run Trivy FS scan
         uses: aquasecurity/trivy-action@0.33.1
         with:
@@ -39,6 +43,8 @@ jobs:
     needs: trivy-repo
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install kube-score
         env:
           KUBE_SCORE_VERSION: v1.18.0

@@ -24,6 +24,8 @@ jobs:
       should_build: ${{ steps.guard.outputs.should_build }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Check required Dockerfiles
         id: guard
@@ -81,6 +83,8 @@ jobs:
     if: ${{ needs.kaniko.outputs.should_build == 'true' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install Buildah
         run: sudo apt-get update && sudo apt-get install -y buildah
       - name: Determine image registry
