@@ -38,6 +38,7 @@ def _purge_modules(prefixes: Iterable[str]) -> None:
         "training_service",
         "config_service",
         "config_sandbox",
+        "compliance_pack",
         "pack_exporter",
         "taxlots",
         "override_service",
