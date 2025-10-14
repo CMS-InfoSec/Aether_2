@@ -90,7 +90,7 @@ jobs:
             root = ET.parse("coverage.xml").getroot()
             rate = Decimal(root.get('line-rate', '0')) * Decimal(100)
             print(rate.quantize(Decimal('0.1'), rounding=ROUND_HALF_UP))
-            PY
+PY
             )
           else
             total="N/A"
@@ -184,7 +184,7 @@ jobs:
           **Vulnerabilities**
           - Total: TOTAL_VULNS
           - Critical: CRITICAL_VULNS
-          COMMENT
+COMMENT
 
           sed -i "s/GITLEAKS_STATUS/$gitleaks_status/" pr-comment.md
           sed -i "s/BANDIT_STATUS/$bandit_status/" pr-comment.md

@@ -76,7 +76,7 @@ jobs:
               raise SystemExit(1)
 
           print("Verified critical Python modules:", ", ".join(modules))
-          PY
+PY
       - name: Build Ingestor Image
         uses: int128/kaniko-action@v1.52.0
         with:
@@ -113,7 +113,7 @@ jobs:
               raise SystemExit(1)
 
           print("Verified critical Python modules:", ", ".join(modules))
-          PY
+PY
 
       - name: Generate build metadata manifest
         run: |
@@ -127,7 +127,7 @@ jobs:
               "GDPR"
             ]
           }
-          EOF
+EOF
         env:
           CHANGE_REQUEST_ID: ${{ github.event.pull_request.number || github.run_id }}
 
@@ -196,7 +196,7 @@ jobs:
               "GDPR"
             ]
           }
-          EOF
+EOF
         env:
           CHANGE_REQUEST_ID: ${{ github.event.pull_request.number || github.run_id }}
 
