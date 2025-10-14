@@ -53,6 +53,7 @@ jobs:
           python-version: '3.11'
       - name: Install tooling
         run: |
+          set -euxo pipefail
           python -m pip install --upgrade pip
           python -m pip install yamllint==1.33.0
       - name: YAML lint
