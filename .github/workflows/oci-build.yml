@@ -10,100 +10,119 @@ on:
       - '.github/workflows/oci-build.yml'
 
 env:
-  REGISTRY: ghcr.io/aether
+  REGISTRY_HOST: ghcr.io
 
 permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.head_branch || github.event.pull_request.number || github.ref || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   kaniko:
     name: Kaniko Build
     runs-on: ubuntu-latest
-    if: ${{ hashFiles('deploy/docker/kraken-ws-ingest/Dockerfile') != '' && hashFiles('deploy/docker/risk-api/Dockerfile') != '' }}
+    outputs:
+      should_build: ${{ steps.guard.outputs.should_build }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Authenticate to GHCR for Kaniko
-        env:
-          GHCR_USER: ${{ github.actor }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          mask_secret() {
-            if [ -z "$1" ]; then
-              return
-            fi
-            printf '%s' "$1" | while IFS= read -r line; do
-              [ -z "$line" ] && continue
-              echo "::add-mask::$line"
-            done
-          }
-          mask_secret "$GHCR_TOKEN"
-          mkdir -p /kaniko/.docker
-          AUTH_TOKEN=$(printf '%s' "${GHCR_USER}:${GHCR_TOKEN}" | base64 | tr -d '\n')
-          mask_secret "$AUTH_TOKEN"
-          cat <<EOF >/kaniko/.docker/config.json
-          {
-            "auths": {
-              "ghcr.io": {
-                "auth": "${AUTH_TOKEN}"
-              }
-            }
-          }
-          EOF
-      - name: Build Order Gateway image
-
-        uses: addnab/docker-run-action@v3
         with:
-          image: gcr.io/kaniko-project/executor:v1.18.0
-          options: >-
-            --rm
-            -v ${GITHUB_WORKSPACE}:/workspace
-            -v /kaniko/.docker:/kaniko/.docker
-          run: >-
-            /kaniko/executor
-            --context /workspace
-            --dockerfile /workspace/deploy/docker/kraken-ws-ingest/Dockerfile
-            --destination ${REGISTRY}/kraken-ws-ingest:${{ github.sha }}
-            --snapshotMode time
+          persist-credentials: false
+
+      - name: Check required Dockerfiles
+        id: guard
+        run: |
+          if [ -f deploy/docker/kraken-ws-ingest/Dockerfile ] && [ -f deploy/docker/risk-api/Dockerfile ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "Required Dockerfiles not found. Skipping Kaniko build stage."
+          fi
+
+      - name: Log in to GHCR
+        if: steps.guard.outputs.should_build == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY_HOST }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Determine image registry
+        if: steps.guard.outputs.should_build == 'true'
+        id: image-meta
+        run: |
+          set -euo pipefail
+          owner="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          echo "kraken_tag=${{ env.REGISTRY_HOST }}/${owner}/kraken-ws-ingest:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "risk_api_tag=${{ env.REGISTRY_HOST }}/${owner}/risk-api:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+      - name: Build Kraken WS Ingest image
+        if: steps.guard.outputs.should_build == 'true'
+        uses: int128/kaniko-action@v1.52.0
+        with:
+          context: .
+          file: deploy/docker/kraken-ws-ingest/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.image-meta.outputs.kraken_tag }}
+          kaniko-args: |
+            --snapshotMode=time
             --single-snapshot
       - name: Build Risk API image
-        uses: addnab/docker-run-action@v3
+        if: steps.guard.outputs.should_build == 'true'
+        uses: int128/kaniko-action@v1.52.0
         with:
-          image: gcr.io/kaniko-project/executor:v1.18.0
-          options: >-
-            --rm
-            -v ${GITHUB_WORKSPACE}:/workspace
-            -v /kaniko/.docker:/kaniko/.docker
-          run: >-
-            /kaniko/executor
-            --context /workspace
-            --dockerfile /workspace/deploy/docker/risk-api/Dockerfile
-            --destination ${REGISTRY}/risk-api:${{ github.sha }}
-            --snapshotMode time
+          context: .
+          file: deploy/docker/risk-api/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.image-meta.outputs.risk_api_tag }}
+          kaniko-args: |
+            --snapshotMode=time
             --single-snapshot
   buildah:
     name: Buildah Build
     runs-on: ubuntu-latest
     needs: kaniko
-    if: ${{ needs.kaniko.result == 'success' }}
+    if: ${{ needs.kaniko.outputs.should_build == 'true' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install Buildah
-        run: sudo apt-get update && sudo apt-get install -y buildah
+        run: |
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends buildah
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+      - name: Determine image registry
+        id: image-meta
+        run: |
+          set -euo pipefail
+          owner="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          echo "kraken_tag=${{ env.REGISTRY_HOST }}/${owner}/kraken-ws-ingest:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "risk_api_tag=${{ env.REGISTRY_HOST }}/${owner}/risk-api:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
       - name: Build Kraken WS Ingest image
+        env:
+          IMAGE_REF: ${{ steps.image-meta.outputs.kraken_tag }}
         run: |
-          buildah bud --layers -f deploy/docker/kraken-ws-ingest/Dockerfile -t ${REGISTRY}/kraken-ws-ingest:${{ github.sha }} .
+          buildah bud --layers -f deploy/docker/kraken-ws-ingest/Dockerfile -t "${IMAGE_REF}" .
       - name: Build Risk API image
+        env:
+          IMAGE_REF: ${{ steps.image-meta.outputs.risk_api_tag }}
         run: |
-          buildah bud --layers -f deploy/docker/risk-api/Dockerfile -t ${REGISTRY}/risk-api:${{ github.sha }} .
+          buildah bud --layers -f deploy/docker/risk-api/Dockerfile -t "${IMAGE_REF}" .
       - name: Push images
         env:
           CR_PAT: ${{ secrets.GITHUB_TOKEN }}
+          KRAKEN_REF: ${{ steps.image-meta.outputs.kraken_tag }}
+          RISK_API_REF: ${{ steps.image-meta.outputs.risk_api_tag }}
         run: |
           if [ -n "$CR_PAT" ]; then
             echo "::add-mask::$CR_PAT"
           fi
-          echo "${CR_PAT}" | buildah login --username ${{ github.actor }} --password-stdin ghcr.io
-          buildah push ${REGISTRY}/kraken-ws-ingest:${{ github.sha }}
-          buildah push ${REGISTRY}/risk-api:${{ github.sha }}
+          echo "${CR_PAT}" | buildah login --username ${{ github.actor }} --password-stdin "${{ env.REGISTRY_HOST }}"
+          buildah push "${KRAKEN_REF}"
+          buildah push "${RISK_API_REF}"
