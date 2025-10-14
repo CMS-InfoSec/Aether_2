@@ -96,6 +96,7 @@ jobs:
       actions: write
       id-token: write
       packages: write
+      actions: write
     steps:
       - name: Install cosign
         uses: sigstore/cosign-installer@v3.5.0
