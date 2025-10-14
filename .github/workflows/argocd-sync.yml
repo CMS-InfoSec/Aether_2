@@ -28,6 +28,8 @@ jobs:
             exit 0
           fi
 
+          echo "::add-mask::${ARGOCD_TOKEN}"
+
           for app in aether-prod aether-staging aether-observability; do
             curl --fail-with-body -sk \
               --retry 3 --retry-delay 5 \
