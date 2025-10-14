@@ -70,6 +70,7 @@ def _purge_modules(prefixes: Iterable[str]) -> None:
         "secrets_service",
         "services.secrets.main",
         "sim_mode",
+        "scenario_simulator",
         "oms_service",
         "services.core.backpressure",
         "services.core.cache_warmer",
