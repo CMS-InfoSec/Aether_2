@@ -52,6 +52,11 @@ def _purge_modules(prefixes: Iterable[str]) -> None:
         "signal_graph",
         "time_travel",
         "multiformat_export",
+        "drift_service",
+        "ml.training.training_service",
+        "ml.policy.meta_strategy",
+        "ml.features.feature_versioning",
+        "ml.monitoring.drift_service",
     ],
 )
 def test_core_services_import_without_fastapi(
@@ -59,7 +64,10 @@ def test_core_services_import_without_fastapi(
 ) -> None:
     """Modules should fall back to the in-repo FastAPI shim when missing."""
 
-    _purge_modules(["fastapi", module_name])
+    prefixes = ["fastapi", module_name]
+    if module_name.startswith("ml."):
+        prefixes.append("ml")
+    _purge_modules(prefixes)
 
     real_import = builtins.__import__
 

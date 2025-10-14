@@ -32,7 +32,16 @@ except Exception:  # pragma: no cover - dependency might be unavailable in tests
     sql = None  # type: ignore[assignment]
     RealDictCursor = None  # type: ignore[assignment]
 
-from fastapi import Depends, FastAPI, HTTPException, Response, status
+try:  # pragma: no cover - prefer FastAPI when available
+    from fastapi import Depends, FastAPI, HTTPException, Response, status
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        Depends,
+        FastAPI,
+        HTTPException,
+        Response,
+        status,
+    )
 from pydantic import BaseModel, Field
 from metrics import (
     CONTENT_TYPE_LATEST,
