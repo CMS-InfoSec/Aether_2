@@ -40,7 +40,7 @@ try:  # pragma: no cover - optional scientific stack dependency
 except Exception:  # pragma: no cover - executed when numpy is unavailable
     np = None  # type: ignore[assignment]
 from fastapi import Depends, FastAPI, HTTPException, Query
-from prometheus_client import Gauge
+from metrics import Gauge
 
 try:  # pragma: no cover - metrics helper optional when FastAPI unavailable
     from metrics import setup_metrics
