@@ -11,14 +11,85 @@ import threading
 import time
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
-from typing import Awaitable, Callable, Iterable, List, Optional, Sequence, Set
-
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse
-from starlette import status as http_status
+from types import SimpleNamespace
+from typing import Any, Awaitable, Callable, Iterable, List, Optional, Sequence, Set, cast
 
 
 logger = logging.getLogger(__name__)
+
+try:  # pragma: no cover - exercised when FastAPI and Starlette are installed
+    from fastapi import FastAPI, Request, Response
+    from fastapi.responses import JSONResponse
+    from starlette import status as http_status
+except Exception:  # pragma: no cover - provide lightweight stand-ins
+    logger.warning(
+        "FastAPI dependency missing; using graceful shutdown fallbacks", exc_info=False
+    )
+
+    class _FallbackResponse:
+        def __init__(self, content: Any | None = None, status_code: int = 200) -> None:
+            self.body = content
+            self.status_code = status_code
+
+    class _FallbackJSONResponse(_FallbackResponse):
+        media_type = "application/json"
+
+    class _FallbackRequest:
+        def __init__(self, url: str = "/", method: str = "GET") -> None:
+            self.method = method
+            self.url = SimpleNamespace(path=url)
+
+    class _FallbackRouter:
+        def __init__(self) -> None:
+            self.lifespan_context = None
+
+    class _FallbackFastAPI:
+        def __init__(self) -> None:
+            self.state = SimpleNamespace()
+            self.router = _FallbackRouter()
+            self.user_middleware: list[Any] = []
+            self.routes: list[Any] = []
+
+        def middleware(self, middleware_type: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+            def _decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+                self.user_middleware.append(
+                    SimpleNamespace(type=middleware_type, handler=func)
+                )
+                return func
+
+            return _decorator
+
+        def post(
+            self, path: str, *, tags: Optional[Iterable[str]] = None
+        ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+            def _decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+                self.routes.append(
+                    SimpleNamespace(method="POST", path=path, endpoint=func, tags=list(tags or ()))
+                )
+                return func
+
+            return _decorator
+
+        def get(
+            self, path: str, *, tags: Optional[Iterable[str]] = None
+        ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+            def _decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+                self.routes.append(
+                    SimpleNamespace(method="GET", path=path, endpoint=func, tags=list(tags or ()))
+                )
+                return func
+
+            return _decorator
+
+    FastAPI = cast(Any, _FallbackFastAPI)
+    Request = cast(Any, _FallbackRequest)
+    Response = cast(Any, _FallbackResponse)
+    JSONResponse = cast(Any, _FallbackJSONResponse)
+    http_status = SimpleNamespace(
+        HTTP_200_OK=200,
+        HTTP_202_ACCEPTED=202,
+        HTTP_503_SERVICE_UNAVAILABLE=503,
+    )
 
 FlushCallback = Callable[[], Awaitable[None] | None]
 
