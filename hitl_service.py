@@ -32,7 +32,14 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import Depends, FastAPI, HTTPException
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        Depends,
+        FastAPI,
+        HTTPException,
+    )
 from pydantic import BaseModel, Field, PositiveFloat
 
 _SQLALCHEMY_AVAILABLE = True
