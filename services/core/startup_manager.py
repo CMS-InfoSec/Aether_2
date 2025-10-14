@@ -25,6 +25,10 @@ from typing import (
 )
 from typing_extensions import ParamSpec
 
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
 try:  # pragma: no cover - prefer FastAPI when available
     from fastapi import APIRouter, FastAPI, HTTPException
 except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
@@ -187,6 +191,12 @@ class SQLStartupStateStore:
         metadata.create_all(engine, checkfirst=True)
         self._memory_state: Optional[Dict[str, Any]] = None
         self._use_memory_only = False
+        if not hasattr(self._table, "update"):
+            LOGGER.info(
+                "SQLAlchemy stub detected; falling back to in-memory startup state store",
+            )
+            self._use_memory_only = True
+            return
         try:
             session = self._session_factory()
             close = getattr(session, "close", None)
