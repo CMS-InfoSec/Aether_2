@@ -67,6 +67,7 @@ def _purge_modules(prefixes: Iterable[str]) -> None:
         "prompt_refiner",
         "hitl_service",
         "secrets_service",
+        "services.secrets.main",
         "sim_mode",
         "oms_service",
         "services.core.backpressure",
@@ -96,6 +97,8 @@ def test_core_services_import_without_fastapi(
         prefixes.append("services.backtest")
     if module_name.startswith("services.fees."):
         prefixes.append("services.fees")
+    if module_name.startswith("services.secrets."):
+        prefixes.append("services.secrets")
     if module_name.startswith("ml."):
         prefixes.append("ml")
     _purge_modules(prefixes)
@@ -108,11 +111,15 @@ def test_core_services_import_without_fastapi(
     blocked_prefixes = ["fastapi"]
     if module_name in {"capital_flow", "esg_filter"}:
         blocked_prefixes.append("sqlalchemy")
+    if module_name == "services.secrets.main":
+        blocked_prefixes.append("starlette")
 
     def _fake_import(name: str, *args: object, **kwargs: object) -> ModuleType:
-        if any(name == prefix or name.startswith(prefix + ".") for prefix in blocked_prefixes):
-            if name not in sys.modules:
-                raise ModuleNotFoundError("fastapi unavailable")
+        for prefix in blocked_prefixes:
+            if name == prefix or name.startswith(prefix + "."):
+                if name not in sys.modules:
+                    raise ModuleNotFoundError(f"{prefix} unavailable")
+                break
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", _fake_import)
