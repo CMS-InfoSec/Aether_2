@@ -14,30 +14,17 @@ from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Deque, Dict, Iterable, Mapping, MutableMapping, ParamSpec, TypeVar, cast
 
-from fastapi import FastAPI
+try:  # pragma: no cover - prefer FastAPI when available
+    from fastapi import FastAPI
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import FastAPI  # type: ignore[assignment]
 
-from metrics import setup_metrics
+from metrics import Counter as PrometheusCounter, Gauge, setup_metrics
 
 from shared.pydantic_compat import BaseModel, Field
+from shared.event_bus import KafkaNATSAdapter
 
 from common.schemas.contracts import IntentEvent
-try:
-    from services.common.adapters import KafkaNATSAdapter
-except (ImportError, AttributeError):  # pragma: no cover - lightweight fallback
-    class KafkaNATSAdapter:  # type: ignore[override]
-        def __init__(self, account_id: str) -> None:
-            self.account_id = account_id
-
-        async def publish(self, topic: str, payload: Dict[str, Any]) -> None:
-            LOGGER.warning(
-                "Kafka/NATS adapter unavailable; dropping backpressure event",
-                extra={
-                    "topic": topic,
-                    "account_id": self.account_id,
-                    "payload_keys": sorted(payload.keys()),
-                },
-            )
-from prometheus_client import Counter as PrometheusCounter, Gauge
 
 LOGGER = logging.getLogger(__name__)
 

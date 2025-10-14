@@ -12,7 +12,10 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, Dict, Iterable, Optional, Protocol
 
-from fastapi import APIRouter
+try:  # pragma: no cover - prefer FastAPI when it is available
+    from fastapi import APIRouter
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import APIRouter  # type: ignore[assignment]
 
 
 LOGGER = logging.getLogger(__name__)
