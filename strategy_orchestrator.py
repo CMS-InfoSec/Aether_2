@@ -52,6 +52,15 @@ from shared.spot import is_spot_symbol, normalize_spot_symbol
 from services.common.schemas import RiskValidationRequest, RiskValidationResponse
 from services.common.security import require_admin_account
 from strategy_bus import StrategySignalBus, ensure_signal_tables
+from shared import readiness
+from shared.readyz_router import ReadyzRouter
+from shared.service_readiness import (
+    SQLAlchemyProbeClient,
+    engine_from_state,
+    session_factory_from_state,
+    using_sqlite,
+    verify_session_store,
+)
 
 LOGGER = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -545,6 +554,19 @@ def _update_module_state(state: OrchestratorRuntimeState) -> None:
     SIGNAL_BUS = state.signal_bus
     INITIALIZATION_ERROR = state.initialization_error
 
+    if "app" in globals():
+        application = globals()["app"]
+        if isinstance(application, FastAPI):
+            if state.session_factory is not None:
+                application.state.db_sessionmaker = state.session_factory
+            elif hasattr(application.state, "db_sessionmaker"):
+                delattr(application.state, "db_sessionmaker")
+
+            if state.engine is not None:
+                application.state.db_engine = state.engine
+            elif hasattr(application.state, "db_engine"):
+                delattr(application.state, "db_engine")
+
 
 def _clear_components(state: OrchestratorRuntimeState, error: Optional[Exception] = None) -> None:
     state.registry = None
@@ -664,6 +686,40 @@ app = FastAPI(title="Strategy Orchestrator", version="0.1.0")
 SESSION_STORE = _build_session_store_from_env()
 app.state.session_store = SESSION_STORE
 app.state.orchestrator_state = OrchestratorRuntimeState()
+
+
+_readyz_router = ReadyzRouter()
+
+
+def _build_postgres_probe_client() -> SQLAlchemyProbeClient:
+    session_factory = session_factory_from_state(
+        app,
+        dependency_name="Strategy orchestrator database",
+    )
+    return SQLAlchemyProbeClient(session_factory)
+
+
+async def _postgres_read_probe() -> None:
+    client = _build_postgres_probe_client()
+    await readiness.postgres_read_probe(client=client)
+
+
+async def _postgres_write_probe() -> None:
+    client = _build_postgres_probe_client()
+    engine = engine_from_state(app)
+    read_only_query = "SELECT 1" if using_sqlite(engine) else "SELECT pg_is_in_recovery()"
+    await readiness.postgres_write_probe(client=client, read_only_query=read_only_query)
+
+
+async def _session_store_probe() -> None:
+    store = getattr(app.state, "session_store", None)
+    await verify_session_store(store)
+
+
+_readyz_router.register_probe("postgres_read", _postgres_read_probe)
+_readyz_router.register_probe("postgres_write", _postgres_write_probe)
+_readyz_router.register_probe("session_store", _session_store_probe)
+app.include_router(_readyz_router.router)
 
 
 def _set_components(
