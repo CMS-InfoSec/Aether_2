@@ -92,7 +92,8 @@ jobs:
           docker run -d --rm -p 8000:8000 --name risk-api-ci risk-api:ci
           for attempt in {1..10}; do
             sleep 6
-            if curl -fsS http://127.0.0.1:8000/healthz; then
+            if curl --fail --show-error --silent --retry 5 --retry-delay 2 --retry-all-errors \
+              http://127.0.0.1:8000/healthz; then
               docker stop risk-api-ci
               exit 0
             fi

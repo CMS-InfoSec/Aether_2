@@ -16,6 +16,8 @@ jobs:
           BASE_URL: ${{ secrets.STAGING_URL }}
         run: |
           set -euo pipefail
-          curl -fsSL "$BASE_URL/healthz"
-          curl -fsSL "$BASE_URL/metrics" | grep http_request_duration_seconds
+          curl --fail --show-error --silent --location --retry 5 --retry-delay 2 --retry-all-errors \
+            "$BASE_URL/healthz"
+          curl --fail --show-error --silent --location --retry 5 --retry-delay 2 --retry-all-errors \
+            "$BASE_URL/metrics" | grep http_request_duration_seconds
           echo "✅ Smoke tests passed."

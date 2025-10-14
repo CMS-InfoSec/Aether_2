@@ -202,8 +202,10 @@ jobs:
           set -euo pipefail
           binary="argocd-linux-amd64"
           base_url="https://github.com/argoproj/argo-cd/releases/download/${ARGOCD_VERSION}"
-          curl -fsSLo "${binary}" "${base_url}/${binary}"
-          curl -fsSLo cli_checksums.txt "${base_url}/cli_checksums.txt"
+          curl --fail --show-error --silent --location --retry 5 --retry-delay 2 --retry-all-errors \
+            -o "${binary}" "${base_url}/${binary}"
+          curl --fail --show-error --silent --location --retry 5 --retry-delay 2 --retry-all-errors \
+            -o cli_checksums.txt "${base_url}/cli_checksums.txt"
           expected_sum="$(grep " ${binary}$" cli_checksums.txt | awk '{print $1}')"
           if [ -z "${expected_sum}" ]; then
             echo "Unable to determine checksum for ${binary}" >&2

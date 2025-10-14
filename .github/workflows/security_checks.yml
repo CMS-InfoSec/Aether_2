@@ -114,8 +114,10 @@ jobs:
           archive="conftest_${CONFTEST_VERSION#v}_Linux_x86_64.tar.gz"
           checksum_file="checksums.txt"
           base_url="https://github.com/open-policy-agent/conftest/releases/download/${CONFTEST_VERSION}"
-          curl -fsSLo "${archive}" "${base_url}/${archive}"
-          curl -fsSLo "${checksum_file}" "${base_url}/${checksum_file}"
+          curl --fail --show-error --silent --location --retry 5 --retry-delay 2 --retry-all-errors \
+            -o "${archive}" "${base_url}/${archive}"
+          curl --fail --show-error --silent --location --retry 5 --retry-delay 2 --retry-all-errors \
+            -o "${checksum_file}" "${base_url}/${checksum_file}"
           expected_sum="$(grep " ${archive}$" "${checksum_file}" | awk '{print $1}')"
           if [ -z "${expected_sum}" ]; then
             echo "Unable to determine checksum for ${archive}" >&2
