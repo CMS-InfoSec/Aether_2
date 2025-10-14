@@ -16,7 +16,10 @@ from types import SimpleNamespace
 from typing import AsyncIterator, Iterable, Mapping, Optional
 from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Response
+try:  # pragma: no cover - prefer real FastAPI when available
+    from fastapi import Depends, FastAPI, HTTPException, Query, Response
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import Depends, FastAPI, HTTPException, Query, Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 _SQLALCHEMY_AVAILABLE = True
@@ -50,6 +53,8 @@ if _SQLALCHEMY_AVAILABLE and _ACCOUNT_SCOPE_AVAILABLE:
     metadata = getattr(Base, "metadata", None)
     if metadata is None or not hasattr(metadata, "drop_all"):
         _SQLALCHEMY_AVAILABLE = False
+else:
+    _SQLALCHEMY_AVAILABLE = False
 
 if not _SQLALCHEMY_AVAILABLE:
 

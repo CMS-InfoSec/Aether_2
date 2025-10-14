@@ -20,8 +20,17 @@ from enum import Enum
 from threading import RLock
 from typing import Any, Dict, Iterable, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import Response, StreamingResponse
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import FastAPI, HTTPException, Query
+    from fastapi.responses import Response, StreamingResponse
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        FastAPI,
+        HTTPException,
+        Query,
+        Response,
+        StreamingResponse,
+    )
 from pydantic import BaseModel, Field, field_validator
 
 from services.common.spot import require_spot_http

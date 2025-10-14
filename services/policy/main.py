@@ -8,7 +8,8 @@ from typing import Any, Callable, TypeVar, cast, SupportsFloat, SupportsIndex
 
 from fastapi import Depends, FastAPI, HTTPException, status
 
-from services.common.adapters import KafkaNATSAdapter, RedisFeastAdapter, TimescaleAdapter
+from services.common.adapters import RedisFeastAdapter, TimescaleAdapter
+from shared.event_bus import KafkaNATSAdapter
 from services.common.schemas import (
     ActionTemplate,
     BookSnapshot,
