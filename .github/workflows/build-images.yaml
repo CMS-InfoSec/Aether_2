@@ -33,6 +33,13 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Determine image registry
+        id: image-meta
+        run: |
+          set -euo pipefail
+          owner="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          echo "risk_api_tag=ghcr.io/${owner}/risk-api:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "risk_ingestor_tag=ghcr.io/${owner}/risk-ingestor:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
       - name: Build Risk API Image
         uses: int128/kaniko-action@v1.52.0
         with:
@@ -40,11 +47,13 @@ jobs:
           context: .
           file: deploy/docker/risk-api/Dockerfile
           tags: |
-            ghcr.io/aether/risk-api:${{ github.sha }}
+            ${{ steps.image-meta.outputs.risk_api_tag }}
       - name: Verify critical wheels in Risk API image
+        env:
+          IMAGE_REF: ${{ steps.image-meta.outputs.risk_api_tag }}
         run: |
-          docker pull ghcr.io/aether/risk-api:${{ github.sha }}
-          docker run --rm ghcr.io/aether/risk-api:${{ github.sha }} python - <<'PY'
+          docker pull "${IMAGE_REF}"
+          docker run --rm "${IMAGE_REF}" python - <<'PY'
           import importlib
           import json
           import sys
@@ -75,11 +84,13 @@ jobs:
           context: .
           file: deploy/docker/risk-ingestor/Dockerfile
           tags: |
-            ghcr.io/aether/risk-ingestor:${{ github.sha }}
+            ${{ steps.image-meta.outputs.risk_ingestor_tag }}
       - name: Verify critical wheels in Risk Ingestor image
+        env:
+          IMAGE_REF: ${{ steps.image-meta.outputs.risk_ingestor_tag }}
         run: |
-          docker pull ghcr.io/aether/risk-ingestor:${{ github.sha }}
-          docker run --rm ghcr.io/aether/risk-ingestor:${{ github.sha }} python - <<'PY'
+          docker pull "${IMAGE_REF}"
+          docker run --rm "${IMAGE_REF}" python - <<'PY'
           import importlib
           import json
           import sys
@@ -136,21 +147,35 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y buildah
+      - name: Determine image registry
+        id: image-meta
+        run: |
+          set -euo pipefail
+          owner="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          echo "risk_api_tag=ghcr.io/${owner}/risk-api:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "risk_ingestor_tag=ghcr.io/${owner}/risk-ingestor:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Download Syft
         uses: anchore/sbom-action/download-syft@v0.20.6
         with:
           syft-version: v1.33.0
       - name: Build Risk API with Buildah
+        env:
+          IMAGE_REF: ${{ steps.image-meta.outputs.risk_api_tag }}
         run: |
-          buildah bud -f deploy/docker/risk-api/Dockerfile -t ghcr.io/aether/risk-api:${{ github.sha }} .
+          buildah bud -f deploy/docker/risk-api/Dockerfile -t "${IMAGE_REF}" .
       - name: Build Ingestor with Buildah
+        env:
+          IMAGE_REF: ${{ steps.image-meta.outputs.risk_ingestor_tag }}
         run: |
-          buildah bud -f deploy/docker/risk-ingestor/Dockerfile -t ghcr.io/aether/risk-ingestor:${{ github.sha }} .
+          buildah bud -f deploy/docker/risk-ingestor/Dockerfile -t "${IMAGE_REF}" .
       - name: Generate SBOMs
+        env:
+          RISK_API_REF: ${{ steps.image-meta.outputs.risk_api_tag }}
+          RISK_INGESTOR_REF: ${{ steps.image-meta.outputs.risk_ingestor_tag }}
         run: |
-          syft ghcr.io/aether/risk-api:${{ github.sha }} -o json > sbom-risk-api.json
-          syft ghcr.io/aether/risk-ingestor:${{ github.sha }} -o json > sbom-risk-ingestor.json
+          syft "${RISK_API_REF}" -o json > sbom-risk-api.json
+          syft "${RISK_INGESTOR_REF}" -o json > sbom-risk-ingestor.json
       - name: Upload SBOMs
         uses: actions/upload-artifact@v4
         with:
