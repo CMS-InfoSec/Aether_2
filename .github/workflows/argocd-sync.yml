@@ -9,6 +9,9 @@ on:
       - '.github/workflows/argocd-sync.yml'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   notify-argocd:
     runs-on: ubuntu-latest

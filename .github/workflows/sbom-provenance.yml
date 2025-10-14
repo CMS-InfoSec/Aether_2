@@ -11,6 +11,10 @@ on:
       - 'deploy/**'
       - '.github/workflows/sbom-provenance.yml'
 
+permissions:
+  contents: read
+  actions: write
+
 jobs:
   sbom:
     runs-on: ubuntu-latest

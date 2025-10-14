@@ -6,6 +6,10 @@ on:
       - "**"
   pull_request:
 
+permissions:
+  contents: read
+  actions: write
+
 jobs:
   lint-and-test:
     name: Lint and Test Suite

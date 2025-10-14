@@ -3,6 +3,9 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "*/30 * * * *"
+
+permissions:
+  contents: read
 jobs:
   smoke:
     runs-on: ubuntu-latest
