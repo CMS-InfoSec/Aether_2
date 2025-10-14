@@ -27,6 +27,11 @@ except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
     from services.common.fastapi_stub import Depends, FastAPI, HTTPException, Query, status
 
 from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, model_validator
+
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
 from sqlalchemy import (
     Column,
     DateTime,
@@ -423,6 +428,21 @@ def _normalize_limit_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _engine_uses_sqlite(engine: Engine) -> bool:
+    """Return whether the configured SQLAlchemy engine targets SQLite."""
+
+    dialect = getattr(engine, "dialect", None)
+    name = getattr(dialect, "name", None)
+    if isinstance(name, str) and name.lower() == "sqlite":
+        return True
+
+    for attr in ("_aether_url", "url"):
+        url = getattr(engine, attr, None)
+        if isinstance(url, str) and url.lower().startswith("sqlite"):
+            return True
+    return False
+
+
 def _seed_default_limits(session: Session) -> None:
     for payload in _DEFAULT_LIMITS:
         normalized = _normalize_limit_payload(payload)
@@ -452,7 +472,9 @@ def _seed_default_limits(session: Session) -> None:
 
 
 def _bootstrap_storage() -> None:
-    if ENGINE.dialect.name == "sqlite" and "accounts" not in Base.metadata.tables:
+    is_sqlite = _engine_uses_sqlite(ENGINE)
+
+    if is_sqlite and "accounts" not in Base.metadata.tables:
         Table(
             "accounts",
             Base.metadata,
@@ -461,7 +483,7 @@ def _bootstrap_storage() -> None:
             extend_existing=True,
         )
 
-    if ENGINE.dialect.name == "sqlite" and "accounts" not in BattleModeBase.metadata.tables:
+    if is_sqlite and "accounts" not in BattleModeBase.metadata.tables:
         Table(
             "accounts",
             BattleModeBase.metadata,
@@ -471,7 +493,7 @@ def _bootstrap_storage() -> None:
 
     Base.metadata.create_all(bind=ENGINE)
 
-    if ENGINE.dialect.name == "sqlite":
+    if is_sqlite:
         with ENGINE.begin() as connection:
             inspector = inspect(connection)
             if "accounts" not in inspector.get_table_names():
