@@ -55,6 +55,7 @@ jobs:
         env:
           IMAGE_REF: ${{ steps.image-meta.outputs.risk_api_tag }}
         run: |
+          set -euo pipefail
           docker pull "${IMAGE_REF}"
           docker run --rm "${IMAGE_REF}" python - <<'PY'
           import importlib
@@ -92,6 +93,7 @@ jobs:
         env:
           IMAGE_REF: ${{ steps.image-meta.outputs.risk_ingestor_tag }}
         run: |
+          set -euo pipefail
           docker pull "${IMAGE_REF}"
           docker run --rm "${IMAGE_REF}" python - <<'PY'
           import importlib

@@ -121,6 +121,7 @@ jobs:
 
       - name: Verify critical wheels in ${{ matrix.build.name }} image
         run: |
+          set -euo pipefail
           docker pull ${{ steps.image_meta.outputs.sha_tag }}
           docker run --rm ${{ steps.image_meta.outputs.sha_tag }} python - <<'PY'
           import importlib
