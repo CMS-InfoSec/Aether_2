@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import dataclasses
 import datetime as dt
 import os
@@ -11,6 +12,7 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Iterable, List
+from urllib.parse import urlparse
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DOC_PATH = REPO_ROOT / "docs" / "production_readiness_review.md"
@@ -258,17 +260,45 @@ def stage_commit_and_push(timestamp: dt.datetime) -> None:
     )
     run_git(["commit", "-m", commit_message])
 
-    push_result = subprocess.run(
-        ["git", "push"],
-        cwd=REPO_ROOT,
-        text=True,
-        capture_output=True,
-    )
-    if push_result.returncode != 0:
-        raise RuntimeError(
-            "Failed to push automated audit update:\n"
-            f"STDOUT: {push_result.stdout}\nSTDERR: {push_result.stderr}"
+    token = os.environ.get("GITHUB_TOKEN")
+    extraheader_key: str | None = None
+    if token:
+        remote_url = run_git(["remote", "get-url", "origin"]).stdout.strip()
+        parsed = urlparse(remote_url)
+        if parsed.scheme in {"https", "http"} and parsed.netloc:
+            base_url = f"{parsed.scheme}://{parsed.netloc}"
+            extraheader_key = f"http.{base_url}/.extraheader"
+            encoded = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+            # Mask both the raw token and encoded value in workflow logs.
+            print(f"::add-mask::{token}")
+            print(f"::add-mask::{encoded}")
+            run_git([
+                "config",
+                extraheader_key,
+                f"AUTHORIZATION: basic {encoded}",
+            ])
+
+    try:
+        push_result = subprocess.run(
+            ["git", "push"],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
         )
+        if push_result.returncode != 0:
+            raise RuntimeError(
+                "Failed to push automated audit update:\n"
+                f"STDOUT: {push_result.stdout}\nSTDERR: {push_result.stderr}"
+            )
+    finally:
+        if extraheader_key:
+            subprocess.run(
+                ["git", "config", "--unset", extraheader_key],
+                cwd=REPO_ROOT,
+                check=False,
+                text=True,
+                capture_output=True,
+            )
 
 
 def main() -> None:
