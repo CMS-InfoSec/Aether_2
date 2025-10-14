@@ -255,6 +255,9 @@ def _resolve_mlflow_artifact_source(uri: str) -> Tuple[Path, Optional[Path]]:
 
     try:  # pragma: no cover - mlflow optional in unit tests
         from mlflow.artifacts import download_artifacts
+        from shared.mlflow_safe import harden_mlflow
+
+        harden_mlflow()
     except Exception as exc:  # pragma: no cover - optional dependency
         raise RuntimeError(
             "mlflow is required to download artifact snapshots from non-local URIs"

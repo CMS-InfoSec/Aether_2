@@ -12,8 +12,17 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import Response
+try:  # pragma: no cover - prefer FastAPI when available
+    from fastapi import APIRouter, Depends, HTTPException, Query
+    from fastapi.responses import Response
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        APIRouter,
+        Depends,
+        HTTPException,
+        Query,
+        Response,
+    )
 
 from audit_mode import AuditorPrincipal, require_auditor_identity
 from shared.spot import is_spot_symbol, normalize_spot_symbol
