@@ -9,6 +9,7 @@ import datetime as dt
 import os
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Iterable, List
@@ -99,7 +100,7 @@ def build_audit_plan() -> List[AuditCommand]:
         if path.exists()
     ]
     if requirement_files:
-        pip_audit_command = ["pip-audit", "--progress-spinner", "off"]
+        pip_audit_command = [sys.executable, "-m", "pip_audit", "--progress-spinner", "off"]
         config_path = REPO_ROOT / "pip-audit.toml"
         if config_path.exists():
             pip_audit_command += ["--config", str(config_path)]

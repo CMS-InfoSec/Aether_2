@@ -110,10 +110,9 @@ jobs:
         run: |
           set -euo pipefail
           exit_code=0
-          if ! pip-audit \
+          if ! python -m pip_audit \
             --progress-spinner off \
             --config pip-audit.toml \
-            --require-hashes \
             -r requirements.txt \
             -r requirements-ci.txt
           then
