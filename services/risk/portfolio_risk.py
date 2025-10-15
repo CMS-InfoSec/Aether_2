@@ -11,7 +11,19 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import Depends, FastAPI, HTTPException, status
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        Depends,
+        FastAPI,
+        HTTPException,
+        status,
+    )
 
 from metrics import setup_metrics
 from pydantic import BaseModel, Field
