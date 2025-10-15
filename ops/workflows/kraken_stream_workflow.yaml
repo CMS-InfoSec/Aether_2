@@ -5,27 +5,78 @@ metadata:
   labels:
     workflow-type: realtime
 spec:
+  arguments:
+    parameters:
+      - name: database_url
+        value: postgresql://feast:feast@timescaledb:5432/aether
+      - name: kafka_brokers
+        value: kafka:9092
+      - name: trading_pairs
+        value: BTC/USD,ETH/USD
+      - name: nats_servers
+        value: nats://nats:4222
+      - name: nats_subject
+        value: marketdata.kraken.orderbook
+      - name: pip_version
+        value: "24.3.1"
   entrypoint: run
   templates:
     - name: run
       container:
         image: python:3.11-slim
-        command:
-          - python
-          - data/ingest/kraken_ws.py
-          - BTC/USD
-          - ETH/USD
+        command: ["bash", "-lc"]
         args:
-          - --kafka-bootstrap
-          - kafka:9092
-          - --database-url
-          - postgresql://feast:feast@timescaledb:5432/aether
-          - --snapshot-interval
-          - "120"
+          - |
+            set -euo pipefail
+            PIP_VERSION="$(python - <<'PY'
+import re
+
+value = "{{workflow.parameters.pip_version}}"
+if not value or not re.fullmatch(r"[0-9][0-9A-Za-z.+-]*", value):
+    raise SystemExit(f"Invalid pip_version value: {value!r}")
+print(value)
+PY
+)"
+            python -m pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}"
+            python -m pip install --no-cache-dir \
+              "aiohttp==3.12.15" \
+              "sqlalchemy==2.0.44" \
+              "psycopg[binary]==3.2.10" \
+              "nats-py==2.11.0"
+            python - <<'PY'
+import os
+
+def _validate(name: str) -> None:
+    value = os.environ.get(name, "")
+    if not value:
+        raise SystemExit(f"{name} is empty")
+    if any(ch in value for ch in "\r\n"):
+        raise SystemExit(f"{name} contains unexpected whitespace")
+
+for _name in (
+    "DATABASE_URL",
+    "KAFKA_BROKERS",
+    "KRAKEN_PAIRS",
+    "NATS_SERVERS",
+    "NATS_SUBJECT",
+):
+    _validate(_name)
+PY
+            exec python -m data.ingest.kraken_ws
         workingDir: /workspace
         env:
           - name: PYTHONUNBUFFERED
             value: "1"
+          - name: DATABASE_URL
+            value: "{{workflow.parameters.database_url}}"
+          - name: KAFKA_BROKERS
+            value: "{{workflow.parameters.kafka_brokers}}"
+          - name: KRAKEN_PAIRS
+            value: "{{workflow.parameters.trading_pairs}}"
+          - name: NATS_SERVERS
+            value: "{{workflow.parameters.nats_servers}}"
+          - name: NATS_SUBJECT
+            value: "{{workflow.parameters.nats_subject}}"
         volumeMounts:
           - name: workspace
             mountPath: /workspace
