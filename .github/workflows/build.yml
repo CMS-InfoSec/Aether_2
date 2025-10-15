@@ -9,6 +9,69 @@ on:
 permissions:
   contents: read
   packages: write
+  actions: write
+
+env:
+  PYTHON_BUILD_VERSION: 1.2.1
+
+concurrency:
+  group: >-
+    ${{ github.workflow }}-${{
+      github.event.workflow_run && github.event.workflow_run.pull_requests && github.event.workflow_run.pull_requests[0]
+        && github.event.workflow_run.pull_requests[0].number
+      || (
+        github.event.workflow_run
+        && (
+          github.event.workflow_run.head_repository
+          && github.event.workflow_run.head_repository.full_name
+          && github.event.workflow_run.head_repository.full_name != ''
+          && format(
+            '{0}:{1}',
+            github.event.workflow_run.head_repository.full_name,
+            (
+              github.event.workflow_run.head_branch
+              && github.event.workflow_run.head_branch != ''
+              && github.event.workflow_run.head_branch
+            )
+            || github.event.workflow_run.run_number
+            || github.event.workflow_run.id
+            || github.run_id
+          )
+          || (
+            github.event.workflow_run.repository
+            && github.event.workflow_run.repository.full_name
+            && github.event.workflow_run.repository.full_name != ''
+            && format(
+              '{0}:{1}',
+              github.event.workflow_run.repository.full_name,
+              (
+                github.event.workflow_run.head_branch
+                && github.event.workflow_run.head_branch != ''
+                && github.event.workflow_run.head_branch
+              )
+              || github.event.workflow_run.run_number
+              || github.event.workflow_run.id
+              || github.run_id
+            )
+          )
+          || (
+            github.event.workflow_run.head_branch
+            && github.event.workflow_run.head_branch != ''
+            && github.event.workflow_run.head_branch
+          )
+        )
+      )
+      || github.event.pull_request && github.event.pull_request.number
+      || github.head_ref && github.head_ref != '' && github.head_ref
+      || github.ref
+      || github.event.workflow_run && github.event.workflow_run.run_number
+      || github.event.workflow_run && github.event.workflow_run.id
+      || github.run_id
+    }}
+  cancel-in-progress: true
+
+
+
 
 jobs:
   build:
@@ -16,16 +79,37 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python
+        id: setup-python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+          key: >-
+            pip-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version }}-${{
+              hashFiles(
+                '**/requirements.txt',
+                '**/requirements-ci.txt',
+                'pyproject.toml',
+                'poetry.lock'
+              )
+            }}
+          restore-keys: |
+            pip-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version }}-
+
       - name: Install build dependencies
         run: |
+          set -euxo pipefail
           python -m pip install --upgrade pip
-          pip install build
+          python -m pip install "build==${PYTHON_BUILD_VERSION}"
 
       - name: Build package
         run: python -m build
