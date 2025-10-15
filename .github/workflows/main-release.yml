@@ -135,6 +135,7 @@ jobs:
     needs: build-image
     permissions:
       contents: read
+      actions: write
       id-token: write
       packages: write
       actions: write
