@@ -32,14 +32,16 @@ spec:
       - name: run
         container:
           image: python:3.11-slim
-          command: ["python", "reports/daily_pnl.py"]
+          command: ["bash", "-lc"]
           args:
-            - "--database-url"
-            - "{{workflow.parameters.database_url}}"
-            - "--report-date"
-            - "{{workflow.parameters.report_date}}"
-            - "--output-formats"
-            - "csv,parquet"
+            - |
+              set -euo pipefail
+              python -m pip install --no-cache-dir --upgrade "pip=={{workflow.parameters.pip_version}}"
+              python -m pip install --no-cache-dir pandas "psycopg[binary]" pyarrow boto3
+              exec python reports/daily_pnl.py \
+                --database-url '{{workflow.parameters.database_url}}' \
+                --report-date '{{workflow.parameters.report_date}}' \
+                --output-formats csv,parquet
           env:
             - name: REPORT_STORAGE_PATH
               value: /reports
@@ -60,6 +62,8 @@ spec:
           value: postgresql://readonly:readonly@timescaledb:5432/aether
         - name: report_date
           value: "{{workflow.creationTimestamp | argo.date(\"2006-01-02\")}}"
+        - name: pip_version
+          value: "24.3.1"
 ---
 apiVersion: argoproj.io/v1alpha1
 kind: CronWorkflow
@@ -95,14 +99,16 @@ spec:
       - name: run
         container:
           image: python:3.11-slim
-          command: ["python", "reports/weekly_xai.py"]
+          command: ["bash", "-lc"]
           args:
-            - "--database-url"
-            - "{{workflow.parameters.database_url}}"
-            - "--week-ending"
-            - "{{workflow.parameters.week_ending}}"
-            - "--output-formats"
-            - "csv,parquet"
+            - |
+              set -euo pipefail
+              python -m pip install --no-cache-dir --upgrade "pip=={{workflow.parameters.pip_version}}"
+              python -m pip install --no-cache-dir pandas "psycopg[binary]" pyarrow boto3
+              exec python reports/weekly_xai.py \
+                --database-url '{{workflow.parameters.database_url}}' \
+                --week-ending '{{workflow.parameters.week_ending}}' \
+                --output-formats csv,parquet
           env:
             - name: REPORT_STORAGE_PATH
               value: /reports
@@ -123,6 +129,8 @@ spec:
           value: postgresql://readonly:readonly@timescaledb:5432/aether
         - name: week_ending
           value: "{{workflow.creationTimestamp | argo.date(\"2006-01-02\")}}"
+        - name: pip_version
+          value: "24.3.1"
 ---
 apiVersion: argoproj.io/v1alpha1
 kind: CronWorkflow
@@ -158,14 +166,16 @@ spec:
       - name: run
         container:
           image: python:3.11-slim
-          command: ["python", "reports/quarterly_summary.py"]
+          command: ["bash", "-lc"]
           args:
-            - "--database-url"
-            - "{{workflow.parameters.database_url}}"
-            - "--quarter-ending"
-            - "{{workflow.parameters.quarter_ending}}"
-            - "--output-formats"
-            - "csv,parquet"
+            - |
+              set -euo pipefail
+              python -m pip install --no-cache-dir --upgrade "pip=={{workflow.parameters.pip_version}}"
+              python -m pip install --no-cache-dir pandas "psycopg[binary]" pyarrow boto3
+              exec python reports/quarterly_summary.py \
+                --database-url '{{workflow.parameters.database_url}}' \
+                --quarter-ending '{{workflow.parameters.quarter_ending}}' \
+                --output-formats csv,parquet
           env:
             - name: REPORT_STORAGE_PATH
               value: /reports
@@ -186,3 +196,5 @@ spec:
           value: postgresql://readonly:readonly@timescaledb:5432/aether
         - name: quarter_ending
           value: "{{workflow.creationTimestamp | argo.date(\"2006-01-02\")}}"
+        - name: pip_version
+          value: "24.3.1"

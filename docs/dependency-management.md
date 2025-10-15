@@ -11,7 +11,7 @@ This repository now uses [Poetry](https://python-poetry.org/) to resolve and loc
 ## Standard operating procedure
 
 1. **Create a feature branch** for the dependency refresh.
-2. **Install Poetry** (if not already installed): `pip install poetry poetry-plugin-export`.
+2. **Install Poetry** (if not already installed): `python -m pip install poetry poetry-plugin-export`.
 3. **Update dependencies** as needed, then refresh the lockfiles:
    ```bash
    poetry lock
@@ -26,7 +26,7 @@ This repository now uses [Poetry](https://python-poetry.org/) to resolve and loc
 5. **Run local validation and security scans:**
    ```bash
    poetry install
-   pip-audit --strict -r requirements.txt
+   python -m pip_audit --strict -r requirements.txt
    trivy fs --exit-code 1 --scanners vuln .
    poetry run pytest
    ```
