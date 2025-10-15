@@ -16,7 +16,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Mapping, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import APIRouter, Depends, HTTPException
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        APIRouter,
+        Depends,
+        HTTPException,
+    )
 
 from services.common.security import require_admin_account
 

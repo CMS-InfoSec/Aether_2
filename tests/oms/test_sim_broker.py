@@ -2,10 +2,17 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import importlib
+import sys
+import types
+
 import pytest
 
-from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
-from services.oms.sim_broker import SimBroker
+from shared.event_bus import KafkaNATSAdapter
+import services.oms.sim_broker as sim_broker_module
+
+TimescaleAdapter = sim_broker_module.TimescaleAdapter
+SimBroker = sim_broker_module.SimBroker
 
 
 @pytest.fixture(autouse=True)
@@ -34,8 +41,8 @@ def _stub_timescale_adapter(monkeypatch: pytest.MonkeyPatch) -> type[TimescaleAd
                 "acks": list(type(self)._acks),
             }
 
-    monkeypatch.setattr("services.oms.sim_broker.TimescaleAdapter", _StubTimescaleAdapter)
-    monkeypatch.setattr("tests.oms.test_sim_broker.TimescaleAdapter", _StubTimescaleAdapter)
+    monkeypatch.setattr(sim_broker_module, "TimescaleAdapter", _StubTimescaleAdapter)
+    monkeypatch.setattr(sys.modules[__name__], "TimescaleAdapter", _StubTimescaleAdapter)
     return _StubTimescaleAdapter
 
 
@@ -209,3 +216,41 @@ def test_invalid_stop_loss_configuration_rejected(
             market_data={"last_price": 100.0},
             stop_loss=Decimal("120"),
         )
+
+
+def test_sim_broker_timescale_fallback_when_adapter_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stub_module = types.ModuleType("services.common.adapters")
+    monkeypatch.setitem(sys.modules, "services.common.adapters", stub_module)
+    monkeypatch.delitem(sys.modules, "services.oms.sim_broker", raising=False)
+
+    module = importlib.import_module("services.oms.sim_broker")
+
+    assert module.TimescaleAdapter.__module__ == "services.oms.sim_broker"
+
+    module.KafkaNATSAdapter.reset()
+    module.TimescaleAdapter.reset()
+
+    broker = module.SimBroker("ACC-DEFAULT")
+
+    result = broker.place_order(
+        client_order_id="fallback-case",
+        symbol="BTC-USD",
+        side="buy",
+        quantity=0.5,
+        order_type="market",
+        market_data={"last_price": 100.0},
+    )
+
+    assert result["status"] == "filled"
+
+    kafka_history = module.KafkaNATSAdapter(account_id="ACC-DEFAULT").history()
+    assert kafka_history, "expected fallback Kafka adapter to capture events"
+
+    events = broker._timescale.events()
+    assert events["acks"], "expected fallback Timescale adapter to capture ack payloads"
+    assert events["fills"], "expected fallback Timescale adapter to capture fill payloads"
+
+    module.KafkaNATSAdapter.reset()
+    module.TimescaleAdapter.reset()

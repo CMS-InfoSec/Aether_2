@@ -15,17 +15,21 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Deque, Dict, Iterable, MutableMapping, Optional, Set, Tuple
 
-from fastapi import FastAPI, Response
-from prometheus_client import (
-    CONTENT_TYPE_LATEST,
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import FastAPI, Response
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import FastAPI, Response  # type: ignore[misc]
+
+from metrics import (
+    AccountSegment,
     CollectorRegistry,
     Counter,
     Gauge,
     Histogram,
+    SymbolTier,
+    CONTENT_TYPE_LATEST,
     generate_latest,
 )
-
-from metrics import AccountSegment, SymbolTier
 from shared.health import setup_health_checks
 
 LOGGER = logging.getLogger(__name__)
