@@ -79,6 +79,8 @@ def _purge_modules(prefixes: Iterable[str]) -> None:
         "services.risk.pretrade_sanity",
         "secrets_service",
         "services.secrets.main",
+        "services.universe.main",
+        "services.universe.universe_service",
         "sim_mode",
         "scenario_simulator",
         "oms_service",
@@ -115,6 +117,8 @@ def test_core_services_import_without_fastapi(
         prefixes.append("services.models")
     if module_name.startswith("services.secrets."):
         prefixes.append("services.secrets")
+    if module_name.startswith("services.universe."):
+        prefixes.append("services.universe")
     if module_name.startswith("ml."):
         prefixes.append("ml")
     _purge_modules(prefixes)
