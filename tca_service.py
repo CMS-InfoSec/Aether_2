@@ -31,10 +31,21 @@ from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Iterable, Iterator, Mapping, MutableMapping, Sequence
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import Depends, FastAPI, HTTPException, Query, Request
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        Depends,
+        FastAPI,
+        HTTPException,
+        Query,
+        Request,
+    )
 from pydantic import BaseModel, Field
 
 _SQLALCHEMY_AVAILABLE = False
+_ACCOUNT_SCOPE_AVAILABLE = False
+_account_scope_column_factory = None
 
 try:  # pragma: no cover - SQLAlchemy is optional during testing
     import sqlalchemy as _sa  # type: ignore[import-untyped]
@@ -42,6 +53,15 @@ except Exception:  # pragma: no cover - executed when SQLAlchemy missing entirel
     _sa = None  # type: ignore[assignment]
 else:
     _SQLALCHEMY_AVAILABLE = bool(getattr(_sa, "__version__", None))
+
+try:  # pragma: no cover - shared account scope helpers may be unavailable
+    from shared.account_scope import (  # type: ignore[import-not-found]
+        SQLALCHEMY_AVAILABLE as _ACCOUNT_SCOPE_AVAILABLE,
+        account_id_column as _account_scope_column_factory,
+    )
+except Exception:  # pragma: no cover - exercised when helpers missing entirely
+    _ACCOUNT_SCOPE_AVAILABLE = False
+    _account_scope_column_factory = None
 
 if _SQLALCHEMY_AVAILABLE and _ACCOUNT_SCOPE_AVAILABLE:
     from sqlalchemy import Column, DateTime, MetaData, Numeric, String, create_engine, text
@@ -84,7 +104,25 @@ from services.common.spot import require_spot_http
 from shared.audit_hooks import AuditEvent, load_audit_hooks
 from shared.postgres import normalize_sqlalchemy_dsn
 from shared.spot import is_spot_symbol, normalize_spot_symbol
-from shared.account_scope import SQLALCHEMY_AVAILABLE as _ACCOUNT_SCOPE_AVAILABLE, account_id_column
+
+if _account_scope_column_factory is not None:
+    account_id_column = _account_scope_column_factory
+elif _SQLALCHEMY_AVAILABLE:
+
+    def account_id_column(
+        *_, primary_key: bool = False, nullable: bool = False, **kwargs: object
+    ) -> Any:
+        return Column(  # type: ignore[misc]
+            String,
+            primary_key=primary_key,
+            nullable=nullable,
+            **kwargs,
+        )
+
+else:
+
+    def account_id_column(*_: object, **__: object) -> Any:  # pragma: no cover - guard
+        raise RuntimeError("account scope helpers unavailable without SQLAlchemy")
 
 
 LOGGER = logging.getLogger(__name__)

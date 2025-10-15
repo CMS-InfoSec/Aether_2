@@ -17,10 +17,38 @@ import sys
 import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence
 
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+try:  # pragma: no cover - FastAPI optional in lightweight environments.
+    from fastapi import FastAPI
+    from fastapi.responses import JSONResponse
+except Exception:  # pragma: no cover - fallback when FastAPI is unavailable.
+    logging.getLogger("chaos_monkey").warning(
+        "FastAPI dependency missing; using chaos monkey fallbacks",
+        exc_info=False,
+    )
+
+    class JSONResponse(dict):  # type: ignore[assignment]
+        """Minimal JSONResponse replacement used in FastAPI-optional environments."""
+
+        def __init__(self, content: Mapping[str, Any], status_code: int = 200) -> None:
+            super().__init__(content=content, status_code=status_code)
+            self.content = content
+            self.status_code = status_code
+
+    class FastAPI:  # type: ignore[assignment]
+        """Simplified FastAPI stand-in that records registered routes."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.routes: Dict[str, SimpleNamespace] = {}
+
+        def get(self, path: str, **_: Any):
+            def _decorator(func):
+                self.routes[path] = SimpleNamespace(endpoint=func, methods=["GET"], path=path)
+                return func
+
+            return _decorator
 
 logger = logging.getLogger("chaos_monkey")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")

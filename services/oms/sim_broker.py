@@ -25,13 +25,13 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import logging
 from threading import Lock
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Set
+from typing import Any, ClassVar, Dict, Iterable, List, Mapping, Optional, Set
 from uuid import uuid4
 
 from common.schemas.contracts import FillEvent, OrderEvent
 from config.simulation import SimulationConfig, get_simulation_config
-from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
 from shared.common_bootstrap import ensure_common_helpers
+from shared.event_bus import KafkaNATSAdapter
 
 ensure_common_helpers()
 
@@ -48,6 +48,66 @@ except Exception:  # pragma: no cover - gracefully degrade without psycopg
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+try:  # pragma: no cover - depends on optional services.common.adapters package
+    from services.common.adapters import TimescaleAdapter as _TimescaleAdapter
+except Exception as exc:  # pragma: no cover - exercised when dependency unavailable
+    _TimescaleAdapter = None  # type: ignore[assignment]
+    _TIMESCALE_IMPORT_ERROR: BaseException | None = exc
+else:
+    if _TimescaleAdapter is None:  # pragma: no cover - defensive guard
+        _TIMESCALE_IMPORT_ERROR = AttributeError(
+            "services.common.adapters lacks TimescaleAdapter"
+        )
+    else:
+        _TIMESCALE_IMPORT_ERROR = None
+
+
+class _InMemoryTimescaleAdapter:  # pragma: no cover - simple deterministic fallback
+    """Minimal Timescale stand-in that captures ack and fill payloads in memory."""
+
+    _acks: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
+    _fills: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
+
+    def __init__(self, *, account_id: str, **_: object) -> None:
+        self.account_id = account_id
+
+    def record_ack(self, payload: Mapping[str, Any]) -> None:
+        bucket = self._acks.setdefault(self.account_id, [])
+        bucket.append(dict(payload))
+
+    def record_fill(self, payload: Mapping[str, Any]) -> None:
+        bucket = self._fills.setdefault(self.account_id, [])
+        bucket.append(dict(payload))
+
+    def record_shadow_fill(self, payload: Mapping[str, Any]) -> None:
+        self.record_fill(payload)
+
+    def record_usage(self, *_: object, **__: object) -> None:
+        return
+
+    def events(self) -> Dict[str, List[Dict[str, Any]]]:
+        return {
+            "acks": [dict(entry) for entry in self._acks.get(self.account_id, [])],
+            "fills": [dict(entry) for entry in self._fills.get(self.account_id, [])],
+        }
+
+    @classmethod
+    def reset(cls) -> None:
+        cls._acks.clear()
+        cls._fills.clear()
+
+
+if _TimescaleAdapter is None:
+    TimescaleAdapter = _InMemoryTimescaleAdapter  # type: ignore[assignment]
+    if _TIMESCALE_IMPORT_ERROR is not None:
+        LOGGER.warning(
+            "TimescaleAdapter unavailable; using in-memory fallback",
+            exc_info=_TIMESCALE_IMPORT_ERROR,
+        )
+else:
+    TimescaleAdapter = _TimescaleAdapter  # type: ignore[assignment]
 
 
 _DEFAULT_KRAKEN_USD_PAIRS: Set[str] = {
