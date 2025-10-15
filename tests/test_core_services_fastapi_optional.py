@@ -69,7 +69,14 @@ def _purge_modules(prefixes: Iterable[str]) -> None:
         "ops.observability.latency_metrics",
         "prompt_refiner",
         "hitl_service",
+        "services.risk.circuit_breakers",
+        "services.risk.correlation_service",
+        "services.risk.cvar_forecast",
+        "services.risk.diversification_allocator",
         "services.risk.main",
+        "services.risk.nav_forecaster",
+        "services.risk.portfolio_risk",
+        "services.risk.pretrade_sanity",
         "secrets_service",
         "services.secrets.main",
         "sim_mode",
@@ -122,6 +129,8 @@ def test_core_services_import_without_fastapi(
         blocked_prefixes.append("sqlalchemy")
     if module_name in {"secrets_service", "services.secrets.main"}:
         blocked_prefixes.append("starlette")
+    if module_name.startswith("services.risk."):
+        monkeypatch.setenv("RISK_ALLOW_INSECURE_DEFAULTS", "1")
 
     def _fake_import(name: str, *args: object, **kwargs: object) -> ModuleType:
         for prefix in blocked_prefixes:
