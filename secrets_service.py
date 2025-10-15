@@ -20,9 +20,23 @@ try:  # pragma: no cover - prefer the real cryptography implementation
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 except ImportError:  # pragma: no cover - lightweight environments
     AESGCM = None  # type: ignore[assignment]
-from fastapi import Depends, FastAPI, HTTPException, Header, Query, Request, status
-from fastapi.params import Header as HeaderInfo
-from fastapi.responses import JSONResponse
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import Depends, FastAPI, HTTPException, Header, Query, Request, status
+    from fastapi.params import Header as HeaderInfo
+    from fastapi.responses import JSONResponse
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        Depends,
+        FastAPI,
+        HTTPException,
+        Header,
+        JSONResponse,
+        Query,
+        Request,
+        status,
+    )
+
+    HeaderInfo = type(Header())  # type: ignore[assignment]
 from kubernetes import client, config
 from kubernetes.client import ApiException
 from kubernetes.config.config_exception import ConfigException
