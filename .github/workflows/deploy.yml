@@ -298,6 +298,7 @@ jobs:
         env:
           ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
           ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_TOKEN }}
+          ARGOCD_CACERT: ${{ secrets.ARGOCD_CACERT }}
         run: |
           set -euo pipefail
 
@@ -354,7 +355,26 @@ jobs:
               ;;
           esac
 
-          argocd login "${host_and_path}" --auth-token "$ARGOCD_AUTH_TOKEN" --insecure
+          cleanup_ca() {
+            if [ -n "${1:-}" ] && [ -f "$1" ]; then
+              rm -f "$1"
+            fi
+          }
+
+          ca_file=""
+          declare -a login_args
+          if [ -n "${ARGOCD_CACERT:-}" ]; then
+            ca_file="$(mktemp)"
+            trap 'cleanup_ca "${ca_file}"' EXIT
+            printf '%s' "${ARGOCD_CACERT}" > "${ca_file}"
+            chmod 0600 "${ca_file}"
+            login_args+=(--certificate-authority "${ca_file}")
+          fi
+
+          argocd login "${host_and_path}" --auth-token "$ARGOCD_AUTH_TOKEN" "${login_args[@]}"
+
+          cleanup_ca "${ca_file}"
+          trap - EXIT
 
       - name: Sync Linode Kubernetes applications
         env:

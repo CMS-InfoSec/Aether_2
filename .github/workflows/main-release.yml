@@ -268,6 +268,7 @@ jobs:
           ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
           ARGOCD_USERNAME: ${{ secrets.ARGOCD_USERNAME }}
           ARGOCD_PASSWORD: ${{ secrets.ARGOCD_PASSWORD }}
+          ARGOCD_CACERT: ${{ secrets.ARGOCD_CACERT }}
           ARGOCD_APP: ${{ vars.ARGOCD_APP_NAME }}
         run: |
           set -euo pipefail
@@ -336,7 +337,26 @@ jobs:
               ;;
           esac
 
-          argocd login "${host_and_path}" --username "$ARGOCD_USERNAME" --password "$ARGOCD_PASSWORD" --insecure
+          cleanup_ca() {
+            if [ -n "${1:-}" ] && [ -f "$1" ]; then
+              rm -f "$1"
+            fi
+          }
+
+          ca_file=""
+          declare -a login_args
+          if [ -n "${ARGOCD_CACERT:-}" ]; then
+            ca_file="$(mktemp)"
+            trap 'cleanup_ca "${ca_file}"' EXIT
+            printf '%s' "${ARGOCD_CACERT}" > "${ca_file}"
+            chmod 0600 "${ca_file}"
+            login_args+=(--certificate-authority "${ca_file}")
+          fi
+
+          argocd login "${host_and_path}" --username "$ARGOCD_USERNAME" --password "$ARGOCD_PASSWORD" "${login_args[@]}"
+
+          cleanup_ca "${ca_file}"
+          trap - EXIT
           argocd app set "$ARGOCD_APP" --revision "${GITHUB_SHA}"
           argocd app sync "$ARGOCD_APP"
           argocd app wait "$ARGOCD_APP" --health --timeout 600

@@ -39,6 +39,7 @@ jobs:
         env:
           ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
           ARGOCD_TOKEN: ${{ secrets.ARGOCD_TOKEN }}
+          ARGOCD_CACERT: ${{ secrets.ARGOCD_CACERT }}
         run: |
           set -euo pipefail
 
@@ -85,12 +86,31 @@ jobs:
 
           echo "::add-mask::${ARGOCD_TOKEN}"
 
+          cleanup_ca() {
+            if [ -n "${1:-}" ] && [ -f "$1" ]; then
+              rm -f "$1"
+            fi
+          }
+
+          ca_file=""
+          declare -a curl_extra
+          if [ -n "${ARGOCD_CACERT:-}" ]; then
+            ca_file="$(mktemp)"
+            trap 'cleanup_ca "${ca_file}"' EXIT
+            printf '%s' "${ARGOCD_CACERT}" > "${ca_file}"
+            chmod 0600 "${ca_file}"
+            curl_extra+=(--cacert "${ca_file}")
+          fi
+
           for app in aether-prod aether-staging aether-observability; do
             curl --fail --show-error --silent --location --retry 5 --retry-delay 2 --retry-all-errors \
               --proto '=https' --tlsv1.2 \
-              --insecure \
+              "${curl_extra[@]}" \
               -X POST "${server_url}/api/v1/applications/${app}/sync" \
               -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
               -H "Content-Type: application/json" \
               -d '{"revision": "main"}'
           done
+
+          cleanup_ca "${ca_file}"
+          trap - EXIT
