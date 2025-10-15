@@ -86,6 +86,9 @@ def _require_torch():
 try:  # pragma: no cover - optional dependency in CI environments.
     import mlflow
     from mlflow import pytorch as mlflow_pytorch
+    from shared.mlflow_safe import harden_mlflow
+
+    harden_mlflow(mlflow)
 except Exception:  # pragma: no cover - degrade gracefully when MLflow is absent.
     mlflow = None  # type: ignore
     mlflow_pytorch = None  # type: ignore
