@@ -59,10 +59,11 @@ spec:
               value: /var/run/secrets/kraken/director-2/credentials.json
           readinessProbe:
             httpGet:
-              path: /metrics
+              path: /readyz
               port: http
-            initialDelaySeconds: 20
+            initialDelaySeconds: 25
             periodSeconds: 10
+            timeoutSeconds: 5
             failureThreshold: 3
           livenessProbe:
             httpGet:
