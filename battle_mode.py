@@ -5,7 +5,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from threading import Lock
-from typing import Callable, ContextManager, Dict, Optional
+from typing import Callable, ContextManager, Dict, Iterable, List, Optional
+
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
+try:  # pragma: no cover - prefer the real dependency when installed
+    import sqlalchemy as _sqlalchemy_module  # type: ignore[import-not-found]
+except ModuleNotFoundError:  # pragma: no cover - exercised in dependency-light environments
+    _sqlalchemy_module = None  # type: ignore[assignment]
 
 from sqlalchemy import Column, DateTime, String, select
 from sqlalchemy.orm import Session, declarative_base
@@ -13,6 +22,10 @@ from sqlalchemy.orm import Session, declarative_base
 from shared.account_scope import account_id_column
 
 BattleModeBase = declarative_base()
+
+_USING_SQLALCHEMY_STUB = bool(
+    getattr(_sqlalchemy_module, "__aether_stub__", False)
+)
 
 
 class BattleModeLog(BattleModeBase):
@@ -86,8 +99,11 @@ class BattleModeController:
         self._session_factory = session_factory
         self._threshold = max(float(threshold), 0.0)
         self._lock = Lock()
+        self._history_lock = Lock()
         self._states: Dict[str, _BattleModeState] = {}
         self._metrics: Dict[str, _MetricSnapshot] = {}
+        self._history: Dict[str, List[BattleModeLog]] = {}
+        self._use_in_memory = _USING_SQLALCHEMY_STUB
         self._hydrate_active_states()
 
     @property
@@ -95,18 +111,21 @@ class BattleModeController:
         return self._threshold
 
     def _hydrate_active_states(self) -> None:
-        try:
-            with self._session_factory() as session:
-                records = (
-                    session.execute(
-                        select(BattleModeLog).where(BattleModeLog.exited_at.is_(None))
+        if self._use_in_memory:
+            records = self._list_in_memory_records(active_only=True)
+        else:
+            try:
+                with self._session_factory() as session:
+                    records = (
+                        session.execute(
+                            select(BattleModeLog).where(BattleModeLog.exited_at.is_(None))
+                        )
+                        .scalars()
+                        .all()
                     )
-                    .scalars()
-                    .all()
-                )
-        except Exception:
-            # Database might not be initialised yet during bootstrap.
-            return
+            except Exception:
+                # Database might not be initialised yet during bootstrap.
+                return
 
         now = datetime.now(timezone.utc)
         with self._lock:
@@ -242,32 +261,39 @@ class BattleModeController:
         ts = updated or datetime.now(timezone.utc)
         reason_text = reason or "volatility_exceeded"
         entered_at = ts
-        with self._session_factory() as session:
-            existing = (
-                session.execute(
-                    select(BattleModeLog)
-                    .where(
-                        BattleModeLog.account_id == account_id,
-                        BattleModeLog.exited_at.is_(None),
-                    )
-                    .order_by(BattleModeLog.entered_at.desc())
-                )
-                .scalars()
-                .first()
+        if self._use_in_memory:
+            entered_at = self._record_in_memory_entry(
+                account_id,
+                reason_text,
+                timestamp=ts,
             )
-            if existing:
-                existing.reason = reason_text
-                entered_at = existing.entered_at or ts
-            else:
-                session.add(
-                    BattleModeLog(
-                        account_id=account_id,
-                        entered_at=ts,
-                        exited_at=None,
-                        reason=reason_text,
+        else:
+            with self._session_factory() as session:
+                existing = (
+                    session.execute(
+                        select(BattleModeLog)
+                        .where(
+                            BattleModeLog.account_id == account_id,
+                            BattleModeLog.exited_at.is_(None),
+                        )
+                        .order_by(BattleModeLog.entered_at.desc())
                     )
+                    .scalars()
+                    .first()
                 )
-                entered_at = ts
+                if existing:
+                    existing.reason = reason_text
+                    entered_at = existing.entered_at or ts
+                else:
+                    session.add(
+                        BattleModeLog(
+                            account_id=account_id,
+                            entered_at=ts,
+                            exited_at=None,
+                            reason=reason_text,
+                        )
+                    )
+                    entered_at = ts
 
         self._states[account_id] = _BattleModeState(
             engaged=True,
@@ -291,35 +317,38 @@ class BattleModeController:
     ) -> None:
         ts = updated or datetime.now(timezone.utc)
         reason_text = reason or "volatility_normalized"
-        with self._session_factory() as session:
-            active = (
-                session.execute(
-                    select(BattleModeLog)
-                    .where(
-                        BattleModeLog.account_id == account_id,
-                        BattleModeLog.exited_at.is_(None),
+        if self._use_in_memory:
+            self._record_in_memory_exit(account_id, reason_text, timestamp=ts)
+        else:
+            with self._session_factory() as session:
+                active = (
+                    session.execute(
+                        select(BattleModeLog)
+                        .where(
+                            BattleModeLog.account_id == account_id,
+                            BattleModeLog.exited_at.is_(None),
+                        )
+                        .order_by(BattleModeLog.entered_at.desc())
                     )
-                    .order_by(BattleModeLog.entered_at.desc())
+                    .scalars()
+                    .first()
                 )
-                .scalars()
-                .first()
-            )
-            if active:
-                active.exited_at = ts
-                if reason_text:
-                    if active.reason:
-                        active.reason = f"{active.reason} | exit: {reason_text}"
-                    else:
-                        active.reason = reason_text
-            else:
-                session.add(
-                    BattleModeLog(
-                        account_id=account_id,
-                        entered_at=ts,
-                        exited_at=ts,
-                        reason=reason_text,
+                if active:
+                    active.exited_at = ts
+                    if reason_text:
+                        if active.reason:
+                            active.reason = f"{active.reason} | exit: {reason_text}"
+                        else:
+                            active.reason = reason_text
+                else:
+                    session.add(
+                        BattleModeLog(
+                            account_id=account_id,
+                            entered_at=ts,
+                            exited_at=ts,
+                            reason=reason_text,
+                        )
                     )
-                )
 
         self._states.pop(account_id, None)
         snapshot = self._metrics.get(account_id)
@@ -331,6 +360,8 @@ class BattleModeController:
             )
 
     def _load_last_record(self, account_id: str) -> Optional[BattleModeLog]:
+        if self._use_in_memory:
+            return self._last_in_memory_record(account_id)
         with self._session_factory() as session:
             return (
                 session.execute(
@@ -348,6 +379,79 @@ class BattleModeController:
         if not normalized:
             raise ValueError("Account identifier must not be empty.")
         return normalized
+
+    def _list_in_memory_records(
+        self, *, account_id: Optional[str] = None, active_only: bool = False
+    ) -> List[BattleModeLog]:
+        with self._history_lock:
+            histories: Iterable[List[BattleModeLog]]
+            if account_id is not None:
+                histories = (self._history.get(account_id, []),)
+            else:
+                histories = self._history.values()
+            records: List[BattleModeLog] = [
+                record
+                for history in histories
+                for record in history
+                if not active_only or record.exited_at is None
+            ]
+            return list(records)
+
+    def _record_in_memory_entry(
+        self,
+        account_id: str,
+        reason: str,
+        *,
+        timestamp: datetime,
+    ) -> datetime:
+        with self._history_lock:
+            history = self._history.setdefault(account_id, [])
+            active = next((record for record in reversed(history) if record.exited_at is None), None)
+            if active:
+                active.reason = reason
+                return active.entered_at or timestamp
+
+            entry = BattleModeLog(
+                account_id=account_id,
+                entered_at=timestamp,
+                exited_at=None,
+                reason=reason,
+            )
+            history.append(entry)
+            return timestamp
+
+    def _record_in_memory_exit(
+        self,
+        account_id: str,
+        reason: str,
+        *,
+        timestamp: datetime,
+    ) -> None:
+        with self._history_lock:
+            history = self._history.setdefault(account_id, [])
+            active = next((record for record in reversed(history) if record.exited_at is None), None)
+            if active:
+                active.exited_at = timestamp
+                if reason:
+                    if active.reason:
+                        active.reason = f"{active.reason} | exit: {reason}"
+                    else:
+                        active.reason = reason
+                return
+
+            history.append(
+                BattleModeLog(
+                    account_id=account_id,
+                    entered_at=timestamp,
+                    exited_at=timestamp,
+                    reason=reason,
+                )
+            )
+
+    def _last_in_memory_record(self, account_id: str) -> Optional[BattleModeLog]:
+        with self._history_lock:
+            history = self._history.get(account_id, [])
+            return history[-1] if history else None
 
 
 def create_battle_mode_tables(engine) -> None:

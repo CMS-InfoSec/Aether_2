@@ -286,6 +286,25 @@ def _ensure_fastapi_stub() -> None:
             setattr(testclient_module, "TestClient", test_client)
 
 
+def _ensure_sqlalchemy_stub() -> None:
+    """Install the lightweight SQLAlchemy shim when the real dependency is absent."""
+
+    try:
+        module = importlib.import_module("sqlalchemy")  # type: ignore[import-not-found]
+    except ModuleNotFoundError:
+        module = None
+
+    if module is not None and getattr(module, "__file__", None):
+        return
+
+    try:
+        from services.common import sqlalchemy_stub  # type: ignore[import-not-found]
+    except ModuleNotFoundError:  # pragma: no cover - stub not available in some deployments
+        return
+
+    sqlalchemy_stub.install()
+
+
 def _ensure_httpx_module() -> None:
     """Reload the lightweight ``httpx`` shim when pytest leaves placeholders."""
 
@@ -359,6 +378,34 @@ def _ensure_httpx_module() -> None:
         class _HTTPXRequest(SimpleNamespace):
             pass
 
+        class _HTTPXClient:
+            def __init__(self, *args: object, timeout: float | None = None, **kwargs: object) -> None:
+                self.timeout = timeout
+
+            def __enter__(self) -> "_HTTPXClient":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> bool:
+                return False
+
+            def request(self, method: str, *args: object, **kwargs: object) -> _HTTPXResponse:
+                return _HTTPXResponse()
+
+            def get(self, *args: object, **kwargs: object) -> _HTTPXResponse:
+                return self.request("GET", *args, **kwargs)
+
+            def post(self, *args: object, **kwargs: object) -> _HTTPXResponse:
+                return self.request("POST", *args, **kwargs)
+
+            def put(self, *args: object, **kwargs: object) -> _HTTPXResponse:
+                return self.request("PUT", *args, **kwargs)
+
+            def delete(self, *args: object, **kwargs: object) -> _HTTPXResponse:
+                return self.request("DELETE", *args, **kwargs)
+
+            def patch(self, *args: object, **kwargs: object) -> _HTTPXResponse:
+                return self.request("PATCH", *args, **kwargs)
+
         class _HTTPXAsyncClient:
             async def __aenter__(self) -> "_HTTPXAsyncClient":
                 return self
@@ -366,13 +413,50 @@ def _ensure_httpx_module() -> None:
             async def __aexit__(self, exc_type, exc, tb) -> None:
                 return None
 
-            async def get(self, *args: object, **kwargs: object) -> _HTTPXResponse:
+            async def request(self, method: str, *args: object, **kwargs: object) -> _HTTPXResponse:
                 return _HTTPXResponse()
+
+            async def get(self, *args: object, **kwargs: object) -> _HTTPXResponse:
+                return await self.request("GET", *args, **kwargs)
 
             async def post(self, *args: object, **kwargs: object) -> _HTTPXResponse:
-                return _HTTPXResponse()
+                return await self.request("POST", *args, **kwargs)
 
+            async def put(self, *args: object, **kwargs: object) -> _HTTPXResponse:
+                return await self.request("PUT", *args, **kwargs)
+
+            async def delete(self, *args: object, **kwargs: object) -> _HTTPXResponse:
+                return await self.request("DELETE", *args, **kwargs)
+
+            async def patch(self, *args: object, **kwargs: object) -> _HTTPXResponse:
+                return await self.request("PATCH", *args, **kwargs)
+
+        def _httpx_request(method: str, *args: object, **kwargs: object) -> _HTTPXResponse:
+            return _HTTPXResponse()
+
+        def _httpx_get(*args: object, **kwargs: object) -> _HTTPXResponse:
+            return _httpx_request("GET", *args, **kwargs)
+
+        def _httpx_post(*args: object, **kwargs: object) -> _HTTPXResponse:
+            return _httpx_request("POST", *args, **kwargs)
+
+        def _httpx_put(*args: object, **kwargs: object) -> _HTTPXResponse:
+            return _httpx_request("PUT", *args, **kwargs)
+
+        def _httpx_delete(*args: object, **kwargs: object) -> _HTTPXResponse:
+            return _httpx_request("DELETE", *args, **kwargs)
+
+        def _httpx_patch(*args: object, **kwargs: object) -> _HTTPXResponse:
+            return _httpx_request("PATCH", *args, **kwargs)
+
+        module.Client = _HTTPXClient  # type: ignore[attr-defined]
         module.AsyncClient = _HTTPXAsyncClient  # type: ignore[attr-defined]
+        module.request = _httpx_request  # type: ignore[attr-defined]
+        module.get = _httpx_get  # type: ignore[attr-defined]
+        module.post = _httpx_post  # type: ignore[attr-defined]
+        module.put = _httpx_put  # type: ignore[attr-defined]
+        module.delete = _httpx_delete  # type: ignore[attr-defined]
+        module.patch = _httpx_patch  # type: ignore[attr-defined]
         module.Request = _HTTPXRequest  # type: ignore[attr-defined]
         module.Response = _HTTPXResponse  # type: ignore[attr-defined]
         module.HTTPError = _HTTPXError  # type: ignore[attr-defined]
@@ -385,6 +469,16 @@ def _ensure_httpx_module() -> None:
 
     for key, value in overrides.items():
         setattr(module, key, value)
+
+
+def ensure_httpx_ready() -> ModuleType:
+    """Return an ``httpx`` implementation, installing the stub when necessary."""
+
+    _ensure_httpx_module()
+    module = importlib.import_module("httpx")
+    if not isinstance(module, ModuleType):  # pragma: no cover - defensive guard
+        raise RuntimeError("httpx failed to initialise with a module instance")
+    return module
 
 
 def preload_core_modules() -> None:
@@ -463,6 +557,7 @@ def ensure_common_helpers() -> None:
             setattr(parent, attribute, getattr(loaded[module_name], source_attr))
 
         _ensure_fastapi_stub()
+        _ensure_sqlalchemy_stub()
         _ensure_httpx_module()
 
         if _ensure_services_namespace is not None:

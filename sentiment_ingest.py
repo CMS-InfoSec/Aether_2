@@ -31,8 +31,18 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import unquote, urlsplit
 
-from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.routing import APIRouter
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import APIRouter, Depends, FastAPI, HTTPException, Header, Query, Request
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        APIRouter,
+        Depends,
+        FastAPI,
+        HTTPException,
+        Header,
+        Query,
+        Request,
+    )
 from pydantic import BaseModel
 
 try:  # pragma: no cover - exercised indirectly through fallbacks
@@ -62,11 +72,9 @@ else:  # pragma: no cover - exercised through SQLAlchemy-backed tests
     SQLALCHEMY_AVAILABLE = True
 
 from shared.postgres import normalize_sqlalchemy_dsn
+from shared.common_bootstrap import ensure_httpx_ready
 
-try:  # pragma: no cover - optional dependency for HTTP clients
-    import httpx
-except Exception:  # pragma: no cover - keep runtime light during tests
-    httpx = None  # type: ignore
+httpx = ensure_httpx_ready()
 
 from shared.spot import filter_spot_symbols, is_spot_symbol, normalize_spot_symbol
 from services.common.spot import require_spot_http
@@ -99,8 +107,6 @@ def _resolve_security_dependency() -> Callable[..., str]:
             dependency = getattr(module, "require_admin_account", None)
             if dependency is not None:
                 return dependency
-
-    from fastapi import Header, Request  # type: ignore
 
     def _missing_dependency(
         request: Request,
