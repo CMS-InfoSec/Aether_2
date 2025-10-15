@@ -15,6 +15,8 @@ spec:
           value: postgresql+psycopg2://aether:aether@timescale:5432/aether
         - name: redis_url
           value: redis://redis:6379/0
+        - name: pip_version
+          value: "24.3.1"
     templates:
       - name: coingecko-pipeline
         steps:
@@ -23,7 +25,7 @@ spec:
               arguments:
                 parameters:
                   - name: command
-                    value: python data/ingest/coingecko_job.py
+                    value: python -m data.ingest.coingecko_job
           - - name: run-quality-checks
               template: python-task
               arguments:
@@ -36,7 +38,7 @@ spec:
               arguments:
                 parameters:
                   - name: command
-                    value: python data/feast/materialize.py --mode refresh --repo data/feast --days 3
+                    value: python -m data.feast.materialize --mode refresh --repo data/feast --days 3
       - name: python-task
         inputs:
           parameters:
@@ -45,16 +47,44 @@ spec:
           image: python:3.11-slim
           workingDir: /workspace
           command: ["bash", "-lc"]
+          env:
+            - name: DATABASE_URL
+              value: "{{workflow.parameters.database_url}}"
+            - name: FEAST_REDIS_URL
+              value: "{{workflow.parameters.redis_url}}"
+            - name: GE_DATA_CONTEXT_ROOT_DIR
+              value: data/great_expectations
           args:
-            - >-
-              pip install --no-cache-dir feast great_expectations sqlalchemy psycopg2-binary requests aiohttp nats-py &&
-              export DATABASE_URL={{workflow.parameters.database_url}} &&
-              export FEAST_REDIS_URL={{workflow.parameters.redis_url}} &&
+            - |
+              set -euo pipefail
+              PIP_VERSION="$(python - <<'PY'
+import re
+
+value = "{{workflow.parameters.pip_version}}"
+if not value or not re.fullmatch(r"[0-9][0-9A-Za-z.+-]*", value):
+    raise SystemExit(f"Invalid pip_version value: {value!r}")
+print(value)
+PY
+)"
+              python -m pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}"
+              python -m pip install --no-cache-dir \
+                "feast==0.54.0" \
+                "great_expectations==1.7.0" \
+                "sqlalchemy==2.0.44" \
+                "psycopg2-binary==2.9.10" \
+                "requests==2.32.5" \
+                "aiohttp==3.12.15" \
+                "nats-py==2.11.0"
               eval "$(python - <<'PY'
 import os
+import shlex
 from urllib.parse import urlparse
 
 url = os.environ["DATABASE_URL"]
+if not url:
+    raise SystemExit("DATABASE_URL is empty")
+if any(ch in url for ch in "\r\n"):
+    raise SystemExit("DATABASE_URL contains unexpected whitespace")
 parsed = urlparse(url)
 
 envs = {
@@ -67,11 +97,12 @@ envs = {
 
 for key, value in envs.items():
     if value:
-        print(f"export {key}='{value}'")
+        if any(ch in value for ch in "\r\n"):
+            raise SystemExit(f"{key} contains unexpected whitespace")
+        print(f"export {key}={shlex.quote(value)}")
 PY
-)" &&
-              export GE_DATA_CONTEXT_ROOT_DIR=data/great_expectations &&
-              {{inputs.parameters.command}}
+)"
+              exec {{inputs.parameters.command}}
 ---
 apiVersion: argoproj.io/v1alpha1
 kind: CronWorkflow
@@ -89,6 +120,8 @@ spec:
           value: postgresql+psycopg2://aether:aether@timescale:5432/aether
         - name: redis_url
           value: redis://redis:6379/0
+        - name: pip_version
+          value: "24.3.1"
     templates:
       - name: feast-incremental
         steps:
@@ -97,7 +130,7 @@ spec:
               arguments:
                 parameters:
                   - name: command
-                    value: python data/feast/materialize.py --mode incremental --repo data/feast
+                    value: python -m data.feast.materialize --mode incremental --repo data/feast
       - name: python-task
         inputs:
           parameters:
@@ -106,16 +139,39 @@ spec:
           image: python:3.11-slim
           workingDir: /workspace
           command: ["bash", "-lc"]
+          env:
+            - name: DATABASE_URL
+              value: "{{workflow.parameters.database_url}}"
+            - name: FEAST_REDIS_URL
+              value: "{{workflow.parameters.redis_url}}"
           args:
-            - >-
-              pip install --no-cache-dir feast sqlalchemy psycopg2-binary redis &&
-              export DATABASE_URL={{workflow.parameters.database_url}} &&
-              export FEAST_REDIS_URL={{workflow.parameters.redis_url}} &&
+            - |
+              set -euo pipefail
+              PIP_VERSION="$(python - <<'PY'
+import re
+
+value = "{{workflow.parameters.pip_version}}"
+if not value or not re.fullmatch(r"[0-9][0-9A-Za-z.+-]*", value):
+    raise SystemExit(f"Invalid pip_version value: {value!r}")
+print(value)
+PY
+)"
+              python -m pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}"
+              python -m pip install --no-cache-dir \
+                "feast==0.54.0" \
+                "sqlalchemy==2.0.44" \
+                "psycopg2-binary==2.9.10" \
+                "redis==5.0.4"
               eval "$(python - <<'PY'
 import os
+import shlex
 from urllib.parse import urlparse
 
 url = os.environ["DATABASE_URL"]
+if not url:
+    raise SystemExit("DATABASE_URL is empty")
+if any(ch in url for ch in "\r\n"):
+    raise SystemExit("DATABASE_URL contains unexpected whitespace")
 parsed = urlparse(url)
 
 envs = {
@@ -128,7 +184,9 @@ envs = {
 
 for key, value in envs.items():
     if value:
-        print(f"export {key}='{value}'")
+        if any(ch in value for ch in "\r\n"):
+            raise SystemExit(f"{key} contains unexpected whitespace")
+        print(f"export {key}={shlex.quote(value)}")
 PY
-)" &&
-              {{inputs.parameters.command}}
+)"
+              exec {{inputs.parameters.command}}
