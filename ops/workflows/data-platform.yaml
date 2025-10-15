@@ -75,7 +75,7 @@ for key, value in envs.items():
 PY
 )" &&
               export GE_DATA_CONTEXT_ROOT_DIR=data/great_expectations &&
-              {{inputs.parameters.command}}
+              exec {{inputs.parameters.command}}
 ---
 apiVersion: argoproj.io/v1alpha1
 kind: CronWorkflow
@@ -139,4 +139,4 @@ for key, value in envs.items():
         print(f"export {key}='{value}'")
 PY
 )" &&
-              {{inputs.parameters.command}}
+              exec {{inputs.parameters.command}}
