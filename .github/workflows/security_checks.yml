@@ -111,7 +111,6 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then python -m pip install -r requirements.txt; fi
           if [ -f pyproject.toml ]; then python -m pip install .; fi
-          python -m pip install ruff mypy black pytest
 
       - name: Run Ruff
         run: ruff check .

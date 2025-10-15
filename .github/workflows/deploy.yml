@@ -12,6 +12,9 @@ permissions:
   id-token: write
   actions: write
 
+env:
+  PYTEST_COV_VERSION: 5.0.0
+
 concurrency:
   group: >-
     ${{ github.workflow }}-${{
@@ -110,7 +113,7 @@ jobs:
           set -euxo pipefail
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then python -m pip install -r requirements.txt; fi
-          python -m pip install ruff black mypy pytest pytest-cov
+          python -m pip install "pytest-cov==${PYTEST_COV_VERSION}"
 
       - name: Run Ruff
         run: ruff check .

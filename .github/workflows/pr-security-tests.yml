@@ -8,6 +8,10 @@ permissions:
   pull-requests: write
   actions: write
 
+env:
+  PYTEST_COV_VERSION: 5.0.0
+  BANDIT_VERSION: 1.7.9
+
 concurrency:
   group: >-
     ${{ github.workflow }}-${{
@@ -106,8 +110,8 @@ jobs:
         run: |
           set -euxo pipefail
           python -m pip install --upgrade pip
-          python -m pip install ".[test]"
-          python -m pip install bandit ruff mypy pytest-cov
+          python -m pip install '.[dev,test]'
+          python -m pip install "bandit==${BANDIT_VERSION}" "pytest-cov==${PYTEST_COV_VERSION}"
 
       - name: Install Gitleaks
         env:
