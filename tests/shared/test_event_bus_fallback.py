@@ -223,3 +223,59 @@ def test_event_bus_wrapper_marks_undelivered_delegate_records(monkeypatch):
 
     drained = asyncio.run(event_bus.KafkaNATSAdapter.flush_events())
     assert drained == {"acct-789": 1}
+
+
+def test_event_bus_flush_normalizes_delegate_counts(monkeypatch):
+    event_bus = importlib.import_module("shared.event_bus")
+
+    class _PartialDelegate:
+        _history: dict[str, list[dict[str, object]]] = {}
+
+        def __init__(self, account_id: str, **_: object) -> None:
+            self.account_id = account_id
+
+        async def publish(self, topic: str, payload: dict[str, object]) -> None:
+            record = attach_correlation(payload)
+            entry = {
+                "topic": topic,
+                "payload": record,
+                "timestamp": datetime.now(timezone.utc),
+                "correlation_id": record["correlation_id"],
+                "delivered": False,
+                "partial_delivery": True,
+            }
+            self._history.setdefault(self.account_id, []).append(entry)
+
+        def history(self, correlation_id: str | None = None) -> list[dict[str, object]]:
+            records = list(self._history.get(self.account_id, []))
+            if correlation_id is not None:
+                return [r for r in records if r["correlation_id"] == correlation_id]
+            return records
+
+        @classmethod
+        def reset(cls, account_id: str | None = None) -> None:
+            if account_id is None:
+                cls._history.clear()
+            else:
+                cls._history.pop(account_id, None)
+
+        @classmethod
+        async def flush_events(cls) -> dict[str, int]:
+            drained = {acct: len(records) for acct, records in cls._history.items() if records}
+            cls._history.clear()
+            return drained
+
+        @classmethod
+        def shutdown(cls) -> None:
+            cls._history.clear()
+
+    monkeypatch.setattr(event_bus, "_delegate_cls", _PartialDelegate, raising=False)
+    monkeypatch.setattr(event_bus, "_KafkaNATSAdapter", _PartialDelegate, raising=False)
+
+    event_bus.KafkaNATSAdapter.reset()
+    adapter = event_bus.KafkaNATSAdapter(account_id="  MASTER Account  ")
+    asyncio.run(adapter.publish("topic", {"value": 11}))
+
+    drained = asyncio.run(event_bus.KafkaNATSAdapter.flush_events())
+    assert drained == {"master-account": 1}
+    assert "  MASTER Account  " not in drained

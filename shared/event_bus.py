@@ -223,12 +223,28 @@ class KafkaNATSAdapter:  # type: ignore[no-redef]
         drained: Dict[str, int] = {}
         if _delegate_cls is not None:
             try:
-                drained.update(await _delegate_cls.flush_events())
+                raw_counts = await _delegate_cls.flush_events()
             except Exception as exc:  # pragma: no cover - delegate flush failure
                 LOGGER.warning(
                     "Delegate flush failed; falling back to shimmed in-memory counts",
                     exc_info=exc,
                 )
+            else:
+                for account, count in (raw_counts or {}).items():
+                    normalized = _normalize_account_id(account)
+                    try:
+                        numeric = int(count)  # type: ignore[arg-type]
+                    except (TypeError, ValueError):
+                        LOGGER.warning(
+                            "Delegate flush returned non-integer count for account %r", account
+                        )
+                        continue
+                    if numeric < 0:
+                        LOGGER.warning(
+                            "Delegate flush returned negative count %s for account %r", numeric, account
+                        )
+                        continue
+                    drained[normalized] = drained.get(normalized, 0) + numeric
 
         local_counts: Dict[str, int] = {}
         for account, events in cls._event_store.items():
