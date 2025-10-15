@@ -24,7 +24,20 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, Iterable, Iterator, Literal, Mapping, Optional, Sequence, cast
 from urllib.parse import parse_qsl, urlparse
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import APIRouter, Depends, HTTPException, Query, status
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        APIRouter,
+        Depends,
+        HTTPException,
+        Query,
+        status,
+    )
 from pydantic import BaseModel
 
 from services.common.adapters import RedisFeastAdapter, TimescaleAdapter

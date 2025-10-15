@@ -64,7 +64,13 @@ if not _SQLALCHEMY_AVAILABLE:
     def select(*args: object, **kwargs: object) -> None:  # type: ignore[override]
         raise RuntimeError("SQLAlchemy is unavailable in this environment")
 
-from fastapi import FastAPI, HTTPException
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import FastAPI, HTTPException
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        FastAPI,
+        HTTPException,
+    )
 from pydantic import BaseModel, Field, model_validator
 
 from shared.postgres import normalize_sqlalchemy_dsn
