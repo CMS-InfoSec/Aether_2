@@ -46,10 +46,12 @@ spec:
           workingDir: /workspace
           command: ["bash", "-lc"]
           args:
-            - >-
-              pip install --no-cache-dir feast great_expectations sqlalchemy psycopg2-binary requests aiohttp nats-py &&
-              export DATABASE_URL={{workflow.parameters.database_url}} &&
-              export FEAST_REDIS_URL={{workflow.parameters.redis_url}} &&
+            - |
+              set -euo pipefail
+              python -m pip install --no-cache-dir --upgrade "pip==24.3.1"
+              python -m pip install --no-cache-dir feast great_expectations sqlalchemy psycopg2-binary requests aiohttp nats-py
+              export DATABASE_URL={{workflow.parameters.database_url}}
+              export FEAST_REDIS_URL={{workflow.parameters.redis_url}}
               eval "$(python - <<'PY'
 import os
 from urllib.parse import urlparse
@@ -107,10 +109,12 @@ spec:
           workingDir: /workspace
           command: ["bash", "-lc"]
           args:
-            - >-
-              pip install --no-cache-dir feast sqlalchemy psycopg2-binary redis &&
-              export DATABASE_URL={{workflow.parameters.database_url}} &&
-              export FEAST_REDIS_URL={{workflow.parameters.redis_url}} &&
+            - |
+              set -euo pipefail
+              python -m pip install --no-cache-dir --upgrade "pip==24.3.1"
+              python -m pip install --no-cache-dir feast sqlalchemy psycopg2-binary redis
+              export DATABASE_URL={{workflow.parameters.database_url}}
+              export FEAST_REDIS_URL={{workflow.parameters.redis_url}}
               eval "$(python - <<'PY'
 import os
 from urllib.parse import urlparse
