@@ -255,6 +255,43 @@ def install() -> ModuleType:
 
     sys.modules["sqlalchemy"] = sa
 
+    types_module = ModuleType("sqlalchemy.types")
+    types_module.__spec__ = ModuleSpec("sqlalchemy.types", loader=None)
+
+    class TypeDecorator:
+        """Lightweight stand-in for SQLAlchemy's ``TypeDecorator`` base class."""
+
+        cache_ok = True
+
+        def __init_subclass__(cls, **kwargs: object) -> None:  # type: ignore[override]
+            super().__init_subclass__(**kwargs)
+            if not hasattr(cls, "impl"):
+                cls.impl = _Type()
+
+        def load_dialect_impl(self, dialect: object) -> object:  # pragma: no cover - shim hook
+            del dialect
+            return getattr(self, "impl", _Type())
+
+        def process_bind_param(self, value: object, dialect: object) -> object:  # pragma: no cover
+            del dialect
+            return value
+
+        def process_result_value(self, value: object, dialect: object) -> object:  # pragma: no cover
+            del dialect
+            return value
+
+    class CHAR(_Type):
+        """Lightweight CHAR column type used by the account scope helpers."""
+
+    types_module.TypeDecorator = TypeDecorator  # type: ignore[attr-defined]
+    types_module.CHAR = CHAR  # type: ignore[attr-defined]
+
+    sa.TypeDecorator = TypeDecorator  # type: ignore[attr-defined]
+    sa.CHAR = CHAR  # type: ignore[attr-defined]
+
+    sys.modules["sqlalchemy.types"] = types_module
+    sa.types = types_module  # type: ignore[attr-defined]
+
     original_find_spec = getattr(importlib.util, "_sqlalchemy_original_find_spec", None)
     if original_find_spec is None:
         original_find_spec = importlib.util.find_spec

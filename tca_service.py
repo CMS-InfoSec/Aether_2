@@ -31,6 +31,10 @@ from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Iterable, Iterator, Mapping, MutableMapping, Sequence
 
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
 try:  # pragma: no cover - prefer the real FastAPI implementation when available
     from fastapi import Depends, FastAPI, HTTPException, Query, Request
 except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
@@ -52,7 +56,8 @@ try:  # pragma: no cover - SQLAlchemy is optional during testing
 except Exception:  # pragma: no cover - executed when SQLAlchemy missing entirely
     _sa = None  # type: ignore[assignment]
 else:
-    _SQLALCHEMY_AVAILABLE = bool(getattr(_sa, "__version__", None))
+    module_spec = getattr(_sa, "__spec__", None)
+    _SQLALCHEMY_AVAILABLE = bool(getattr(_sa, "__version__", None) or module_spec)
 
 try:  # pragma: no cover - shared account scope helpers may be unavailable
     from shared.account_scope import (  # type: ignore[import-not-found]
@@ -63,7 +68,7 @@ except Exception:  # pragma: no cover - exercised when helpers missing entirely
     _ACCOUNT_SCOPE_AVAILABLE = False
     _account_scope_column_factory = None
 
-if _SQLALCHEMY_AVAILABLE and _ACCOUNT_SCOPE_AVAILABLE:
+if _SQLALCHEMY_AVAILABLE:
     from sqlalchemy import Column, DateTime, MetaData, Numeric, String, create_engine, text
     from sqlalchemy.engine import Engine
     from sqlalchemy.exc import SQLAlchemyError

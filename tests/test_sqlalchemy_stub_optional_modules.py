@@ -43,3 +43,13 @@ def test_sqlalchemy_stub_exposes_submodules(monkeypatch):
 
     engine_module = importlib.import_module("sqlalchemy.engine")
     assert hasattr(engine_module, "URL")
+
+    types_module = importlib.import_module("sqlalchemy.types")
+    decorator = getattr(types_module, "TypeDecorator")
+    char_type = getattr(types_module, "CHAR")
+
+    class _ExampleDecorator(decorator):
+        impl = char_type
+
+    instance = _ExampleDecorator()
+    assert instance.process_bind_param("value", object()) == "value"
