@@ -7,8 +7,16 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-from fastapi import Depends, FastAPI, Query
-from fastapi.responses import JSONResponse
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import Depends, FastAPI, Query
+    from fastapi.responses import JSONResponse
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        Depends,
+        FastAPI,
+        JSONResponse,
+        Query,
+    )
 from pydantic import BaseModel, Field, field_validator
 
 from services.common.security import require_admin_account
@@ -19,6 +27,9 @@ try:  # pragma: no cover - mlflow is optional for local tests.
     from mlflow import pyfunc
     from mlflow.exceptions import MlflowException
     from mlflow.tracking import MlflowClient
+    from shared.mlflow_safe import harden_mlflow
+
+    harden_mlflow(mlflow)
 except Exception:  # pragma: no cover - graceful degradation when mlflow missing.
     mlflow = None  # type: ignore
     pyfunc = None  # type: ignore

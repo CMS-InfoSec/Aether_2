@@ -29,8 +29,18 @@ except Exception:  # pragma: no cover - dependency might be unavailable in tests
     errors = _ErrorsModule()  # type: ignore[assignment]
     sql = None  # type: ignore[assignment]
 
-from fastapi import FastAPI, Header, HTTPException, Request, status
-from fastapi.responses import JSONResponse
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import FastAPI, Header, HTTPException, Request, status
+    from fastapi.responses import JSONResponse
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        FastAPI,
+        Header,
+        HTTPException,
+        JSONResponse,
+        Request,
+        status,
+    )
 from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:  # pragma: no cover - imported for type checking only.
