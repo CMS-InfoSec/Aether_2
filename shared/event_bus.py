@@ -10,6 +10,7 @@ from typing import Any, ClassVar, Dict, List, Tuple
 
 from common.utils.tracing import attach_correlation
 from shared.correlation import CorrelationContext
+from shared.common_bootstrap import ensure_httpx_ready
 
 LOGGER = logging.getLogger(__name__)
 
@@ -32,7 +33,7 @@ def _adapter_dependencies_ready() -> tuple[bool, BaseException | None]:
     """Return ``True`` when runtime dependencies for the real adapter exist."""
 
     try:
-        import httpx  # type: ignore
+        httpx = ensure_httpx_ready()
     except Exception as exc:  # pragma: no cover - exercised when httpx missing
         return False, exc
 
