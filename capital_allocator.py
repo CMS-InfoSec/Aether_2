@@ -20,7 +20,10 @@ except Exception:  # pragma: no cover - degrade gracefully when Alembic missing
     command = None  # type: ignore[assignment]
     Config = None  # type: ignore[assignment]
 
-from fastapi import Depends, FastAPI, HTTPException
+try:  # pragma: no cover - prefer real FastAPI when available
+    from fastapi import Depends, FastAPI, HTTPException
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from shared.account_scope import SQLALCHEMY_AVAILABLE as _ACCOUNT_SCOPE_AVAILABLE, account_id_column
