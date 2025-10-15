@@ -13,8 +13,15 @@ from decimal import Decimal, InvalidOperation
 
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-
-from fastapi import FastAPI, HTTPException, Query, status
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import FastAPI, HTTPException, Query, status
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        FastAPI,
+        HTTPException,
+        Query,
+        status,
+    )
 from pydantic import BaseModel, Field, field_validator
 
 from common.schemas.contracts import FillEvent
@@ -32,7 +39,7 @@ from metrics import (
     setup_metrics,
     traced_span,
 )
-from services.common.adapters import KafkaNATSAdapter
+from shared.event_bus import KafkaNATSAdapter
 from services.oms.kraken_rest import KrakenRESTClient, KrakenRESTError
 from services.oms.kraken_ws import (
     KrakenWSClient,

@@ -22,10 +22,12 @@ try:  # pragma: no cover - numpy is optional in some environments
 except Exception:  # pragma: no cover - exercised when numpy is unavailable
     np = None  # type: ignore[assignment]
 
+from shared.common_bootstrap import _ensure_fastapi_stub, ensure_common_helpers
+
+_ensure_fastapi_stub()
+
 from fastapi import Depends, FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
-
-from shared.common_bootstrap import ensure_common_helpers
 
 from exposure_forecast import ForecastResult, PNL_CURVE_QUERY, get_exposure_ml_pipeline
 

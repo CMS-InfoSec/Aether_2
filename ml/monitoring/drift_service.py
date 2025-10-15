@@ -40,7 +40,15 @@ try:  # pragma: no cover - pandas is optional in lightweight environments
 except Exception:  # pragma: no cover - executed when pandas is unavailable
     pd = None  # type: ignore[assignment]
 
-from fastapi import APIRouter, Depends, HTTPException, status
+try:  # pragma: no cover - prefer FastAPI when available
+    from fastapi import APIRouter, Depends, HTTPException, status
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        APIRouter,
+        Depends,
+        HTTPException,
+        status,
+    )
 from pydantic import BaseModel, Field
 
 from ml.monitoring.drift import DriftReport, MissingDependencyError, generate_drift_report
@@ -55,6 +63,9 @@ if TYPE_CHECKING:  # pragma: no cover - imported for typing only
 try:  # pragma: no cover - mlflow is optional for tests/CI.
     import mlflow
     from mlflow.tracking import MlflowClient
+    from shared.mlflow_safe import harden_mlflow
+
+    harden_mlflow(mlflow)
 except Exception:  # pragma: no cover - executed when mlflow is missing.
     mlflow = None  # type: ignore
     MlflowClient = None  # type: ignore
