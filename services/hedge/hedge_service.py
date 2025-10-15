@@ -26,7 +26,15 @@ from typing import (
     cast,
 )
 
-from fastapi import APIRouter, Depends, HTTPException, status
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import APIRouter, Depends, HTTPException, status
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        APIRouter,
+        Depends,
+        HTTPException,
+        status,
+    )
 
 from services.common.security import require_admin_account
 from shared.audit_hooks import AuditEvent, AuditHooks, load_audit_hooks
