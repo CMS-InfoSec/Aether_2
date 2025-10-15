@@ -9,6 +9,28 @@ on:
       - '.github/workflows/argocd-sync.yml'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: >-
+    ${{ github.workflow }}-${{
+      github.event.workflow_run && github.event.workflow_run.pull_requests && github.event.workflow_run.pull_requests[0]
+        && github.event.workflow_run.pull_requests[0].number
+      || github.event.workflow_run && github.event.workflow_run.head_branch && github.event.workflow_run.head_branch != ''
+        && github.event.workflow_run.head_branch
+      || github.event.pull_request && github.event.pull_request.number
+      || github.head_ref && github.head_ref != '' && github.head_ref
+      || github.ref
+      || github.event.workflow_run && github.event.workflow_run.run_number
+      || github.event.workflow_run && github.event.workflow_run.id
+      || github.run_id
+    }}
+  cancel-in-progress: true
+
+
+
+
 jobs:
   notify-argocd:
     runs-on: ubuntu-latest
@@ -17,20 +39,88 @@ jobs:
         env:
           ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
           ARGOCD_TOKEN: ${{ secrets.ARGOCD_TOKEN }}
+          ARGOCD_CACERT: ${{ secrets.ARGOCD_CACERT }}
         run: |
-          if [ -z "$ARGOCD_SERVER" ] || [ -z "$ARGOCD_TOKEN" ]; then
-            echo "ArgoCD server or token not configured; skipping"
-            exit 0
+          set -euo pipefail
+
+          if [ -z "${ARGOCD_SERVER:-}" ]; then
+            echo "ARGOCD_SERVER secret is not configured." >&2
+            exit 1
           fi
-          curl -sk -X POST "${ARGOCD_SERVER}/api/v1/applications/aether-prod/sync" \
-            -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d '{"revision": "main"}'
-          curl -sk -X POST "${ARGOCD_SERVER}/api/v1/applications/aether-staging/sync" \
-            -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d '{"revision": "main"}'
-          curl -sk -X POST "${ARGOCD_SERVER}/api/v1/applications/aether-observability/sync" \
-            -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d '{"revision": "main"}'
+
+          if [ -z "${ARGOCD_TOKEN:-}" ]; then
+            echo "ARGOCD_TOKEN secret is not configured." >&2
+            exit 1
+          fi
+
+          server_url="${ARGOCD_SERVER%/}"
+          case "${server_url}" in
+            https://*) ;;
+            *)
+              echo "ARGOCD_SERVER must start with https:// to enforce TLS." >&2
+              exit 1
+              ;;
+          esac
+
+          if printf '%s' "${server_url}" | LC_ALL=C grep -q '[[:space:]]'; then
+            echo "ARGOCD_SERVER must not contain whitespace characters." >&2
+            exit 1
+          fi
+
+          if printf '%s' "${server_url}" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+            echo "ARGOCD_SERVER must not contain control characters." >&2
+            exit 1
+          fi
+
+          host_and_path="${server_url#https://}"
+          if [ -z "${host_and_path}" ]; then
+            echo "ARGOCD_SERVER must include a hostname." >&2
+            exit 1
+          fi
+
+          if printf '%s' "${host_and_path}" | grep -q '/'; then
+            echo "ARGOCD_SERVER must not include a path component." >&2
+            exit 1
+          fi
+
+          case "${host_and_path}" in
+            *'@'*)
+              echo "ARGOCD_SERVER must not include embedded credentials." >&2
+              exit 1
+              ;;
+            *'?'*|*'#'*)
+              echo "ARGOCD_SERVER must not include query parameters or fragments." >&2
+              exit 1
+              ;;
+          esac
+
+          echo "::add-mask::${ARGOCD_TOKEN}"
+
+          cleanup_ca() {
+            if [ -n "${1:-}" ] && [ -f "$1" ]; then
+              rm -f "$1"
+            fi
+          }
+
+          ca_file=""
+          declare -a curl_extra
+          if [ -n "${ARGOCD_CACERT:-}" ]; then
+            ca_file="$(mktemp)"
+            trap 'cleanup_ca "${ca_file}"' EXIT
+            printf '%s' "${ARGOCD_CACERT}" > "${ca_file}"
+            chmod 0600 "${ca_file}"
+            curl_extra+=(--cacert "${ca_file}")
+          fi
+
+          for app in aether-prod aether-staging aether-observability; do
+            curl --fail --show-error --silent --location --retry 5 --retry-delay 2 --retry-all-errors \
+              --proto '=https' --tlsv1.2 \
+              "${curl_extra[@]}" \
+              -X POST "${server_url}/api/v1/applications/${app}/sync" \
+              -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d '{"revision": "main"}'
+          done
+
+          cleanup_ca "${ca_file}"
+          trap - EXIT
