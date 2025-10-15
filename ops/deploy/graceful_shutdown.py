@@ -27,7 +27,9 @@ import sys
 import time
 from typing import Dict, Iterable, List, Mapping
 
-import httpx
+from shared.common_bootstrap import ensure_httpx_ready
+
+httpx = ensure_httpx_ready()
 
 
 DEFAULT_SERVICE_ORDER = ["policy", "risk", "oms"]

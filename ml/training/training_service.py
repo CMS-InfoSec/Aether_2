@@ -10,7 +10,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
+try:  # pragma: no cover - prefer FastAPI when available
+    from fastapi import FastAPI, HTTPException
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import FastAPI, HTTPException  # type: ignore[misc]
 from pydantic import BaseModel, Field, field_validator
 
 from shared.postgres import normalize_sqlalchemy_dsn

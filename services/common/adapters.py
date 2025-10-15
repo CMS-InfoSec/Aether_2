@@ -29,7 +29,9 @@ from typing import (
 from urllib.parse import urlparse
 from weakref import WeakSet
 
-import httpx
+from shared.common_bootstrap import ensure_common_helpers, ensure_httpx_ready
+
+httpx = ensure_httpx_ready()
 
 
 from common.utils.tracing import attach_correlation, current_correlation_id
@@ -39,8 +41,6 @@ from services.secrets.secure_secrets import (
     EncryptedSecretEnvelope,
     EnvelopeEncryptor,
 )
-
-from shared.common_bootstrap import ensure_common_helpers
 
 ensure_common_helpers()
 
