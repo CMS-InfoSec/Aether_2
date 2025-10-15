@@ -5,7 +5,9 @@ from __future__ import annotations
 import os
 from typing import Dict, Mapping, Optional
 
-import httpx
+from shared.common_bootstrap import ensure_httpx_ready
+
+httpx = ensure_httpx_ready()
 
 _DEFAULT_ALERTMANAGER_URL = os.getenv("ALERTMANAGER_URL", "http://alertmanager:9093")
 _ALERT_ENDPOINT = "/api/v2/alerts"

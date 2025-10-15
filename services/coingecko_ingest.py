@@ -17,11 +17,31 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Iterable, Sequence
 
-import httpx
-from sqlalchemy import Column, DateTime, MetaData, Numeric, String, Table
-from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from shared.common_bootstrap import ensure_httpx_ready
+
+httpx = ensure_httpx_ready()
+
+try:  # pragma: no cover - prefer the real SQLAlchemy package when available
+    from sqlalchemy import Column, DateTime, MetaData, Numeric, String, Table
+    from sqlalchemy.dialects.postgresql import insert
+    from sqlalchemy.exc import SQLAlchemyError
+    from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+except Exception as exc:  # pragma: no cover - exercised when SQLAlchemy is absent
+    try:
+        from services.common import sqlalchemy_stub  # type: ignore[import-not-found]
+    except Exception as stub_error:  # pragma: no cover - defensive guard
+        raise RuntimeError(
+            "sqlalchemy is required for the CoinGecko ingest script; install it or enable the stub",
+        ) from stub_error
+
+    stub = sqlalchemy_stub.install()
+    if not hasattr(stub, "Table"):
+        raise RuntimeError("sqlalchemy stub installation failed") from exc
+
+    from sqlalchemy import Column, DateTime, MetaData, Numeric, String, Table  # type: ignore[assignment]
+    from sqlalchemy.dialects.postgresql import insert  # type: ignore[assignment]
+    from sqlalchemy.exc import SQLAlchemyError  # type: ignore[assignment]
+    from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine  # type: ignore[assignment]
 
 LOGGER = logging.getLogger(__name__)
 

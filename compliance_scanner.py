@@ -10,8 +10,13 @@ import sys
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-import httpx
-from fastapi import Depends, FastAPI
+from shared.common_bootstrap import ensure_httpx_ready
+
+httpx = ensure_httpx_ready()
+try:  # pragma: no cover - prefer real FastAPI when available
+    from fastapi import Depends, FastAPI
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import Depends, FastAPI
 try:
     from sqlalchemy import delete
 except Exception:  # pragma: no cover - lightweight SQLAlchemy shim may omit delete
