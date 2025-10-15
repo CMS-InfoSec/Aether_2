@@ -391,6 +391,8 @@ def _ensure_httpx_module() -> None:
         class _HTTPXRequest(SimpleNamespace):
             pass
 
+        from collections import Counter
+
         class _HTTPXQueryParams(Mapping[str, str]):
             """Lightweight representation of query parameters."""
 
@@ -493,12 +495,13 @@ def _ensure_httpx_module() -> None:
 
             def __eq__(self, other: object) -> bool:
                 if isinstance(other, _HTTPXQueryParams):
-                    return self._pairs == other._pairs
-                if isinstance(other, str):
-                    return str(self) == other.lstrip("?")
-                if isinstance(other, Mapping):
-                    return self.items() == _HTTPXQueryParams(other).items()
+                    return Counter(self._pairs) == Counter(other._pairs)
                 return NotImplemented
+
+            def __bool__(self) -> bool:
+                return bool(self._pairs)
+
+            __hash__ = None
 
         class _HTTPXClient:
             def __init__(self, *args: object, timeout: float | None = None, **kwargs: object) -> None:

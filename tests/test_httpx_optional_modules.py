@@ -73,6 +73,8 @@ def test_httpx_queryparams_stub_mapping_behaviour(simulate_missing_httpx):
     httpx_module = bootstrap.ensure_httpx_ready()
     params = httpx_module.QueryParams([("multi", "a"), ("multi", "b"), ("foo", "bar")])
 
+    assert params
+
     assert list(params) == ["multi", "foo"]
     assert len(params) == 2
     assert "multi" in params
@@ -87,8 +89,17 @@ def test_httpx_queryparams_stub_mapping_behaviour(simulate_missing_httpx):
     clone = httpx_module.QueryParams(params)
     assert clone == params
 
+    reordered = httpx_module.QueryParams([("foo", "bar"), ("multi", "b"), ("multi", "a")])
+    assert reordered == params
+
+    assert params != "multi=a&multi=b&foo=bar"
+    assert params != {"multi": ["a", "b"], "foo": "bar"}
+
     empty = httpx_module.QueryParams({"empty": None})
     assert str(empty) == "empty="
     assert empty.items() == [("empty", "")]
     assert empty.get_list("empty") == [""]
-    assert empty == "empty="
+    assert empty
+
+    blank = httpx_module.QueryParams()
+    assert not blank
