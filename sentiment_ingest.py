@@ -72,11 +72,9 @@ else:  # pragma: no cover - exercised through SQLAlchemy-backed tests
     SQLALCHEMY_AVAILABLE = True
 
 from shared.postgres import normalize_sqlalchemy_dsn
+from shared.common_bootstrap import ensure_httpx_ready
 
-try:  # pragma: no cover - optional dependency for HTTP clients
-    import httpx
-except Exception:  # pragma: no cover - keep runtime light during tests
-    httpx = None  # type: ignore
+httpx = ensure_httpx_ready()
 
 from shared.spot import filter_spot_symbols, is_spot_symbol, normalize_spot_symbol
 from services.common.spot import require_spot_http

@@ -57,14 +57,9 @@ from typing import Any, Dict, Literal, Mapping, Optional
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
-try:  # pragma: no cover - optional dependency used in production
-    import httpx
-except ImportError:  # pragma: no cover - exercised in unit-only environments
-    class _MissingHTTPX(SimpleNamespace):
-        def __getattr__(self, name: str) -> Any:
-            raise RuntimeError("httpx is required for auth_service network operations")
+from shared.common_bootstrap import ensure_httpx_ready
 
-    httpx = _MissingHTTPX()
+httpx = ensure_httpx_ready()
 
 try:  # pragma: no cover - optional dependency used in production
     import pyotp

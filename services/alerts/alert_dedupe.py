@@ -68,6 +68,7 @@ except ModuleNotFoundError:  # pragma: no cover - fallback stub for tests
 from metrics import CollectorRegistry, Counter
 
 from services.common.security import ensure_admin_access
+from shared.common_bootstrap import ensure_httpx_ready
 
 
 RouteFn = TypeVar("RouteFn", bound=Callable[..., Any])
@@ -216,14 +217,10 @@ class AlertDedupeService:
         if self._httpx_module is not None:
             return self._httpx_module
 
-        try:
-            import httpx as httpx_module
-        except ImportError as exc:  # pragma: no cover - optional dependency
-            raise RuntimeError("httpx is required to fetch alerts from Alertmanager") from exc
-
-        module = cast(_HttpxModule, httpx_module)
-        self._httpx_module = module
-        return module
+        if self._httpx_module is None:
+            module = ensure_httpx_ready()
+            self._httpx_module = cast(_HttpxModule, module)
+        return self._httpx_module
 
     async def _get_client(self) -> _HttpxClientProtocol:
         httpx = self._ensure_httpx()

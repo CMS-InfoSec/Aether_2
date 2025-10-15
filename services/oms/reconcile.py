@@ -10,10 +10,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-try:  # pragma: no cover - optional dependency in lightweight test environments
-    import httpx
-except ImportError:  # pragma: no cover - exercised in unit-only environments
-    httpx = None  # type: ignore[assignment]
+from shared.common_bootstrap import ensure_httpx_ready
 
 try:  # pragma: no cover - prefer the real FastAPI implementation when available
     from fastapi import APIRouter, FastAPI, HTTPException
@@ -27,6 +24,8 @@ except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
 from services.oms.kraken_rest import KrakenRESTError
 from services.oms.kraken_ws import KrakenWSError, KrakenWSTimeout, OrderState
 from services.oms.rate_limit_guard import rate_limit_guard
+
+httpx = ensure_httpx_ready()
 
 logger = logging.getLogger(__name__)
 
