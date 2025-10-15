@@ -64,6 +64,9 @@ except Exception:  # pragma: no cover - optuna may be unavailable during tests.
 try:  # pragma: no cover - mlflow is optional for unit tests.
     import mlflow as _MLFLOW_MODULE  # type: ignore[import-not-found]
     import mlflow.pytorch as _MLFLOW_PYTORCH_MODULE  # type: ignore[import-not-found]
+    from shared.mlflow_safe import harden_mlflow
+
+    harden_mlflow(_MLFLOW_MODULE)
 except Exception:  # pragma: no cover - dependency may be absent in tests.
     _MLFLOW_MODULE = None  # type: ignore[assignment]
     _MLFLOW_PYTORCH_MODULE = None  # type: ignore[assignment]
