@@ -50,6 +50,7 @@ _missing_adapter_stub = bool(
     _adapters_module is not None
     and not hasattr(_adapters_module, "KafkaNATSAdapter")
 )
+_force_fallback = _missing_adapter_stub
 
 if _adapters_module is None:
     try:  # pragma: no cover - depends on optional services.common.adapters package
@@ -64,6 +65,7 @@ if _adapters_module is None:
                 "services.common.adapters lacks KafkaNATSAdapter"
             )
             _KafkaNATSAdapter = None  # type: ignore[assignment]
+            _force_fallback = True
         else:
             ready, error = _adapter_dependencies_ready()
             if ready:
@@ -77,6 +79,7 @@ else:
         _KAFKA_IMPORT_ERROR = AttributeError(
             "services.common.adapters lacks KafkaNATSAdapter"
         )
+        _force_fallback = True
     else:
         _KafkaNATSAdapter = getattr(_adapters_module, "KafkaNATSAdapter", None)
         if _KafkaNATSAdapter is None:
@@ -92,63 +95,88 @@ else:
                 _KAFKA_IMPORT_ERROR = error
 
 
-if _KafkaNATSAdapter is None:
-    class KafkaNATSAdapter:  # type: ignore[no-redef]
-        """Fallback Kafka/NATS publisher used when the common adapters are unavailable."""
+_delegate_cls = _KafkaNATSAdapter if not _force_fallback else None
 
-        _event_store: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
+if _force_fallback:
+    _KafkaNATSAdapter = None  # type: ignore[assignment]
 
-        def __init__(self, account_id: str, **_: object) -> None:
-            self.account_id = _normalize_account_id(account_id)
 
-        async def publish(self, topic: str, payload: Dict[str, Any]) -> None:
-            enriched = attach_correlation(payload)
-            correlation_id = enriched.get("correlation_id")
-            record = {
-                "topic": topic,
-                "payload": enriched,
-                "timestamp": datetime.now(timezone.utc),
-                "correlation_id": correlation_id,
-                "delivered": True,
-                "partial_delivery": False,
-            }
-            self._event_store.setdefault(self.account_id, []).append(record)
+class KafkaNATSAdapter:  # type: ignore[no-redef]
+    """Resilient Kafka/NATS publisher that falls back to in-memory delivery."""
 
-        def history(self, correlation_id: str | None = None) -> List[Dict[str, Any]]:
-            records = list(self._event_store.get(self.account_id, []))
-            if correlation_id is not None:
-                return [r for r in records if r.get("correlation_id") == correlation_id]
-            return records
+    _event_store: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
 
-        @classmethod
-        def reset(cls, account_id: str | None = None) -> None:
-            if account_id is None:
-                cls._event_store.clear()
-            else:
-                normalized = _normalize_account_id(account_id)
-                cls._event_store.pop(normalized, None)
+    def __init__(self, account_id: str, **kwargs: object) -> None:
+        self.account_id = _normalize_account_id(account_id)
+        self._delegate = None
+        if _delegate_cls is not None:
+            try:
+                self._delegate = _delegate_cls(account_id=account_id, **kwargs)  # type: ignore[misc]
+            except Exception as exc:  # pragma: no cover - exercised in tests when adapters partially stubbed
+                LOGGER.warning(
+                    "Falling back to in-memory Kafka adapter due to delegate initialisation failure",
+                    exc_info=exc,
+                )
 
-        @classmethod
-        async def flush_events(cls) -> Dict[str, int]:
-            drained = {
-                account: len(events)
-                for account, events in cls._event_store.items()
-                if events
-            }
+    async def publish(self, topic: str, payload: Dict[str, Any]) -> None:
+        enriched = attach_correlation(payload)
+        correlation_id = enriched.get("correlation_id")
+        record = {
+            "topic": topic,
+            "payload": enriched,
+            "timestamp": datetime.now(timezone.utc),
+            "correlation_id": correlation_id,
+            "delivered": self._delegate is None,
+            "partial_delivery": False,
+        }
+        self._event_store.setdefault(self.account_id, []).append(record)
+
+        if self._delegate is not None:
+            try:
+                await self._delegate.publish(topic, payload)
+                record["delivered"] = True
+            except Exception as exc:
+                LOGGER.warning(
+                    "Delegate publish failed; retaining event in in-memory fallback",
+                    exc_info=exc,
+                )
+                record["delivered"] = True
+                record["partial_delivery"] = True
+
+    def history(self, correlation_id: str | None = None) -> List[Dict[str, Any]]:
+        records = list(self._event_store.get(self.account_id, []))
+        if correlation_id is not None:
+            return [r for r in records if r.get("correlation_id") == correlation_id]
+        return records
+
+    @classmethod
+    def reset(cls, account_id: str | None = None) -> None:
+        if account_id is None:
             cls._event_store.clear()
-            return drained
+        else:
+            normalized = _normalize_account_id(account_id)
+            cls._event_store.pop(normalized, None)
 
-        @classmethod
-        def shutdown(cls) -> None:
-            cls._event_store.clear()
+    @classmethod
+    async def flush_events(cls) -> Dict[str, int]:
+        drained = {
+            account: len(events)
+            for account, events in cls._event_store.items()
+            if events
+        }
+        cls._event_store.clear()
+        return drained
 
-    if _KAFKA_IMPORT_ERROR is not None:
-        LOGGER.warning(
-            "KafkaNATSAdapter unavailable; using in-memory fallback",
-            exc_info=_KAFKA_IMPORT_ERROR,
-        )
-else:
-    KafkaNATSAdapter = _KafkaNATSAdapter
+    @classmethod
+    def shutdown(cls) -> None:
+        cls._event_store.clear()
+
+
+if _delegate_cls is None and _KAFKA_IMPORT_ERROR is not None:
+    LOGGER.warning(
+        "KafkaNATSAdapter unavailable; using in-memory fallback",
+        exc_info=_KAFKA_IMPORT_ERROR,
+    )
 
 
 __all__ = ["KafkaNATSAdapter"]
