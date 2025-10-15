@@ -315,6 +315,16 @@ jobs:
               ;;
           esac
 
+          if printf '%s' "${server_url}" | LC_ALL=C grep -q '[[:space:]]'; then
+            echo "ARGOCD_SERVER must not contain whitespace characters." >&2
+            exit 1
+          fi
+
+          if printf '%s' "${server_url}" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+            echo "ARGOCD_SERVER must not contain control characters." >&2
+            exit 1
+          fi
+
           host_and_path="${server_url#https://}"
           if [ -z "${host_and_path}" ]; then
             echo "ARGOCD_SERVER must include a hostname." >&2
