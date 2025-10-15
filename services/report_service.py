@@ -13,7 +13,16 @@ from datetime import date, datetime, timedelta, timezone
 from statistics import mean
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, MutableMapping, Optional, Sequence
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import APIRouter, Depends, HTTPException, Query, Request
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        APIRouter,
+        Depends,
+        HTTPException,
+        Query,
+        Request,
+    )
 try:  # pragma: no cover - prefer the real driver when available
     from psycopg2 import sql
     from psycopg2.extras import RealDictCursor

@@ -31,8 +31,18 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import unquote, urlsplit
 
-from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.routing import APIRouter
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import APIRouter, Depends, FastAPI, HTTPException, Header, Query, Request
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        APIRouter,
+        Depends,
+        FastAPI,
+        HTTPException,
+        Header,
+        Query,
+        Request,
+    )
 from pydantic import BaseModel
 
 try:  # pragma: no cover - exercised indirectly through fallbacks
@@ -99,8 +109,6 @@ def _resolve_security_dependency() -> Callable[..., str]:
             dependency = getattr(module, "require_admin_account", None)
             if dependency is not None:
                 return dependency
-
-    from fastapi import Header, Request  # type: ignore
 
     def _missing_dependency(
         request: Request,

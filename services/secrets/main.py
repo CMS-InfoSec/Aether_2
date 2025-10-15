@@ -2,10 +2,30 @@
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, TypeVar, cast
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+try:  # pragma: no cover - FastAPI is optional in some environments
+    from fastapi import Depends, FastAPI, HTTPException, Query, status
+except ModuleNotFoundError:  # pragma: no cover - fall back to the in-repo shim
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        Depends,
+        FastAPI,
+        HTTPException,
+        Query,
+        status,
+    )
 
 from metrics import setup_metrics
-from starlette.middleware.trustedhost import TrustedHostMiddleware
+try:  # pragma: no cover - Starlette may be unavailable alongside FastAPI
+    from starlette.middleware.trustedhost import TrustedHostMiddleware
+except ModuleNotFoundError:  # pragma: no cover - minimal fallback when Starlette missing
+    class TrustedHostMiddleware:  # type: ignore[no-redef]
+        """Lightweight stand-in that records configured hosts."""
+
+        def __init__(self, app, *, allowed_hosts=None):
+            self.app = app
+            self.allowed_hosts = allowed_hosts or []
+
+        async def __call__(self, scope, receive, send):
+            await self.app(scope, receive, send)
 
 from services.common.adapters import KrakenSecretManager
 from services.common.schemas import (

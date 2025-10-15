@@ -23,7 +23,16 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import httpx
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+try:  # pragma: no cover - prefer FastAPI when available
+    from fastapi import Depends, FastAPI, HTTPException, Request, status
+except Exception:  # pragma: no cover - fallback when FastAPI is absent
+    from services.common.fastapi_stub import (
+        Depends,
+        FastAPI,
+        HTTPException,
+        Request,
+        status,
+    )
 
 from pydantic import BaseModel, Field, PositiveFloat, constr
 from sqlalchemy import Boolean, Column, DateTime, Float, String, create_engine, func, select
