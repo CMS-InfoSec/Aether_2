@@ -7,10 +7,19 @@ import os
 import sys
 from typing import Any, Callable, Iterable, Mapping, Sequence, TypeVar, cast
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import Depends, FastAPI, HTTPException, Query
+    from fastapi.responses import JSONResponse
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        Depends,
+        FastAPI,
+        HTTPException,
+        JSONResponse,
+        Query,
+    )
 
 from metrics import setup_metrics
-from fastapi.responses import JSONResponse
 
 from services.common.security import require_admin_account
 from services.models.model_server import get_active_model

@@ -22,7 +22,16 @@ from types import MethodType
 from typing import Any, Awaitable, Callable, Dict, Generator, List, Mapping, MutableMapping, Optional, TypeVar, cast
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import Depends, FastAPI, HTTPException, Query, status
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        Depends,
+        FastAPI,
+        HTTPException,
+        Query,
+        status,
+    )
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import (
     JSON,
@@ -46,6 +55,9 @@ from ml.experiment_tracking.model_registry import register_model as registry_reg
 
 try:  # pragma: no cover - optional dependency in minimal environments.
     import mlflow
+    from shared.mlflow_safe import harden_mlflow
+
+    harden_mlflow(mlflow)
 except Exception:  # pragma: no cover - gracefully degrade when MLflow absent.
     mlflow = None  # type: ignore
 
