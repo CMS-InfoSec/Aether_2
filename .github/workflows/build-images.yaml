@@ -151,7 +151,7 @@ jobs:
               "GDPR"
             ]
           }
-          EOF
+EOF
         env:
           CHANGE_REQUEST_ID: ${{ github.event.pull_request.number || github.run_id }}
 
@@ -226,7 +226,7 @@ jobs:
               "GDPR"
             ]
           }
-          EOF
+EOF
         env:
           CHANGE_REQUEST_ID: ${{ github.event.pull_request.number || github.run_id }}
 
