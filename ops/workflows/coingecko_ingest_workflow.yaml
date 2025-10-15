@@ -45,7 +45,7 @@ spec:
               set -euo pipefail
               python -m pip install --no-cache-dir --upgrade "pip=={{workflow.parameters.pip_version}}"
               python -m pip install --no-cache-dir great_expectations sqlalchemy psycopg2-binary
-              exec great_expectations checkpoint run nightly_ingest
+              exec python -m great_expectations checkpoint run nightly_ingest
           workingDir: /workspace
           env:
             - name: DATABASE_URL
