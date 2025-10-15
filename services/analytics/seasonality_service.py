@@ -11,7 +11,16 @@ from threading import RLock
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import Depends, FastAPI, HTTPException, Query, Request
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        Depends,
+        FastAPI,
+        HTTPException,
+        Query,
+        Request,
+    )
 
 try:  # pragma: no cover - metrics optional when FastAPI missing
     from metrics import setup_metrics

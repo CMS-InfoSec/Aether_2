@@ -19,7 +19,16 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import APIRouter, Depends, HTTPException, Query, status
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        APIRouter,
+        Depends,
+        HTTPException,
+        Query,
+        status,
+    )
 from pydantic import BaseModel, Field
 
 from services.common.security import require_admin_account
@@ -30,6 +39,9 @@ try:  # pragma: no cover - optional dependency
     from mlflow.entities.model_registry import ModelVersion
     from mlflow.exceptions import MlflowException
     from mlflow.tracking import MlflowClient
+    from shared.mlflow_safe import harden_mlflow
+
+    harden_mlflow()
 except Exception:  # pragma: no cover - defensive guard for environments without mlflow
     ModelVersion = object  # type: ignore[assignment]
     MlflowException = Exception  # type: ignore
