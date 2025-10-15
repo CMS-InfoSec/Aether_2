@@ -391,13 +391,12 @@ def _ensure_httpx_module() -> None:
         class _HTTPXRequest(SimpleNamespace):
             pass
 
-        from collections import Counter
-
         class _HTTPXQueryParams(Mapping[str, str]):
             """Lightweight representation of query parameters."""
 
             def __init__(self, params: object | None = None, **kwargs: object) -> None:
                 self._pairs: list[tuple[str, str]] = []
+                self._canonical_cache: tuple[tuple[str, str], ...] | None = None
                 if params is None:
                     pass
                 elif isinstance(params, _HTTPXQueryParams):
@@ -429,6 +428,15 @@ def _ensure_httpx_module() -> None:
 
             def _append_pair(self, key: object, value: object) -> None:
                 self._pairs.append((str(key), str(value)))
+                self._canonical_cache = None
+
+            def _canonical_pairs(self) -> tuple[tuple[str, str], ...]:
+                if self._canonical_cache is None:
+                    if not self._pairs:
+                        self._canonical_cache = ()
+                    else:
+                        self._canonical_cache = tuple(sorted(self._pairs))
+                return self._canonical_cache
 
             def __iter__(self) -> Iterator[str]:
                 seen: set[str] = set()
@@ -495,14 +503,14 @@ def _ensure_httpx_module() -> None:
 
             def __eq__(self, other: object) -> bool:
                 if isinstance(other, _HTTPXQueryParams):
-                    return Counter(self._pairs) == Counter(other._pairs)
+                    return self._canonical_pairs() == other._canonical_pairs()
                 return NotImplemented
 
             def __bool__(self) -> bool:
                 return bool(self._pairs)
 
             def __hash__(self) -> int:
-                return hash(str(self))
+                return hash(self._canonical_pairs())
 
         class _HTTPXClient:
             def __init__(self, *args: object, timeout: float | None = None, **kwargs: object) -> None:

@@ -91,6 +91,7 @@ def test_httpx_queryparams_stub_mapping_behaviour(simulate_missing_httpx):
 
     reordered = httpx_module.QueryParams([("foo", "bar"), ("multi", "b"), ("multi", "a")])
     assert reordered == params
+    assert hash(reordered) == hash(params)
 
     assert params != "multi=a&multi=b&foo=bar"
     assert params != {"multi": ["a", "b"], "foo": "bar"}
