@@ -53,3 +53,13 @@ def test_sqlalchemy_stub_exposes_submodules(monkeypatch):
 
     instance = _ExampleDecorator()
     assert instance.process_bind_param("value", object()) == "value"
+
+    compiler_module = importlib.import_module("sqlalchemy.ext.compiler")
+    compiles = getattr(compiler_module, "compiles")
+
+    @compiles(object, "sqlite")
+    def _render_sql(value: object, compiler: object, **kwargs: object) -> str:
+        del value, compiler, kwargs
+        return "SQL"
+
+    assert _render_sql(object(), object()) == "SQL"

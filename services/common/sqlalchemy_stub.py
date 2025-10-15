@@ -549,6 +549,19 @@ def install() -> ModuleType:
     sys.modules["sqlalchemy.ext.declarative"] = ext_declarative
     ext.declarative = ext_declarative  # type: ignore[attr-defined]
 
+    ext_compiler = ModuleType("sqlalchemy.ext.compiler")
+    ext_compiler.__spec__ = ModuleSpec("sqlalchemy.ext.compiler", loader=None)
+
+    def _compiles(*_entities: object, **_kwargs: object):
+        def decorator(function: _T) -> _T:
+            return function
+
+        return decorator
+
+    ext_compiler.compiles = _compiles  # type: ignore[attr-defined]
+    sys.modules["sqlalchemy.ext.compiler"] = ext_compiler
+    ext.compiler = ext_compiler  # type: ignore[attr-defined]
+
     ext_asyncio = ModuleType("sqlalchemy.ext.asyncio")
     ext_asyncio.__spec__ = ModuleSpec("sqlalchemy.ext.asyncio", loader=None)
 
