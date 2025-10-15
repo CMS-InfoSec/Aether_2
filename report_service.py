@@ -31,8 +31,15 @@ try:  # pragma: no cover - pandas is an optional dependency in lightweight envir
 except Exception:  # pragma: no cover - executed when pandas is unavailable
     pd = None  # type: ignore[assignment]
 
-from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+try:  # pragma: no cover - prefer real FastAPI when available
+    from fastapi import Depends, FastAPI, HTTPException, Query
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import Depends, FastAPI, HTTPException, Query
+
+try:  # pragma: no cover - prefer real FastAPI response types
+    from fastapi.responses import HTMLResponse, JSONResponse, Response
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import HTMLResponse, JSONResponse, Response
 
 from reports.storage import ArtifactStorage, build_storage_from_env
 from services.common.security import require_admin_account
