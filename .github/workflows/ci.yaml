@@ -19,6 +19,7 @@ concurrency:
       || github.event.pull_request && github.event.pull_request.number
       || github.head_ref && github.head_ref != '' && github.head_ref
       || github.ref
+      || github.event.workflow_run && github.event.workflow_run.run_number
       || github.event.workflow_run && github.event.workflow_run.id
       || github.run_id
     }}
