@@ -36,7 +36,16 @@ spec:
           args:
             - |
               set -euo pipefail
-              python -m pip install --no-cache-dir --upgrade "pip=={{workflow.parameters.pip_version}}"
+              PIP_VERSION="$(python - <<'PY'
+import re
+
+value = "{{workflow.parameters.pip_version}}"
+if not value or not re.fullmatch(r"[0-9][0-9A-Za-z.+-]*", value):
+    raise SystemExit(f"Invalid pip_version value: {value!r}")
+print(value)
+PY
+)"
+              python -m pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}"
               python -m pip install --no-cache-dir pandas "psycopg[binary]" pyarrow boto3
               exec python -m reports.daily_pnl \
                 --database-url '{{workflow.parameters.database_url}}' \
@@ -103,7 +112,16 @@ spec:
           args:
             - |
               set -euo pipefail
-              python -m pip install --no-cache-dir --upgrade "pip=={{workflow.parameters.pip_version}}"
+              PIP_VERSION="$(python - <<'PY'
+import re
+
+value = "{{workflow.parameters.pip_version}}"
+if not value or not re.fullmatch(r"[0-9][0-9A-Za-z.+-]*", value):
+    raise SystemExit(f"Invalid pip_version value: {value!r}")
+print(value)
+PY
+)"
+              python -m pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}"
               python -m pip install --no-cache-dir pandas "psycopg[binary]" pyarrow boto3
               exec python -m reports.weekly_xai \
                 --database-url '{{workflow.parameters.database_url}}' \
@@ -170,7 +188,16 @@ spec:
           args:
             - |
               set -euo pipefail
-              python -m pip install --no-cache-dir --upgrade "pip=={{workflow.parameters.pip_version}}"
+              PIP_VERSION="$(python - <<'PY'
+import re
+
+value = "{{workflow.parameters.pip_version}}"
+if not value or not re.fullmatch(r"[0-9][0-9A-Za-z.+-]*", value):
+    raise SystemExit(f"Invalid pip_version value: {value!r}")
+print(value)
+PY
+)"
+              python -m pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}"
               python -m pip install --no-cache-dir pandas "psycopg[binary]" pyarrow boto3
               exec python -m reports.quarterly_summary \
                 --database-url '{{workflow.parameters.database_url}}' \

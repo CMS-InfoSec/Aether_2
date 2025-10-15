@@ -26,7 +26,16 @@ spec:
           args:
             - |
               set -euo pipefail
-              python -m pip install --no-cache-dir --upgrade "pip=={{workflow.parameters.pip_version}}"
+              PIP_VERSION="$(python - <<'PY'
+import re
+
+value = "{{workflow.parameters.pip_version}}"
+if not value or not re.fullmatch(r"[0-9][0-9A-Za-z.+-]*", value):
+    raise SystemExit(f"Invalid pip_version value: {value!r}")
+print(value)
+PY
+)"
+              python -m pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}"
               python -m pip install --no-cache-dir requests sqlalchemy psycopg2-binary nats-py
               exec python -m data.ingest.coingecko_job
           workingDir: /workspace
@@ -43,7 +52,16 @@ spec:
           args:
             - |
               set -euo pipefail
-              python -m pip install --no-cache-dir --upgrade "pip=={{workflow.parameters.pip_version}}"
+              PIP_VERSION="$(python - <<'PY'
+import re
+
+value = "{{workflow.parameters.pip_version}}"
+if not value or not re.fullmatch(r"[0-9][0-9A-Za-z.+-]*", value):
+    raise SystemExit(f"Invalid pip_version value: {value!r}")
+print(value)
+PY
+)"
+              python -m pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}"
               python -m pip install --no-cache-dir great_expectations sqlalchemy psycopg2-binary
               exec python -m great_expectations checkpoint run nightly_ingest
           workingDir: /workspace

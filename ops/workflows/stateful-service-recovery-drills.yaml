@@ -27,7 +27,16 @@ spec:
             - >-
               set -euo pipefail
               && cd /workspace
-              && python -m pip install --no-cache-dir --upgrade "pip=={{workflow.parameters.pip_version}}"
+              && PIP_VERSION="$(python - <<'PY'
+import re
+
+value = "{{workflow.parameters.pip_version}}"
+if not value or not re.fullmatch(r"[0-9][0-9A-Za-z.+-]*", value):
+    raise SystemExit(f"Invalid pip_version value: {value!r}")
+print(value)
+PY
+)"
+              && python -m pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}"
               && REF_DATE=$(date --utc --date='{{inputs.parameters.reference-date}}' +%F)
               && OUTPUT_DATE=$(date --utc --date="$REF_DATE" +%Y-%m-%d)
               && exec python -m docs.runbooks.scripts.stateful_service_exercise
