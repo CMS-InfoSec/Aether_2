@@ -205,6 +205,12 @@ NetworkPolicies for every enabled backend plus the UI, applying the global
 security context and Prometheus scraping annotations automatically.
 【F:deploy/helm/aether-platform/templates/backend-deployments.yaml†L1-L188】【F:deploy/helm/aether-platform/templates/ui.yaml†L1-L118】【F:deploy/helm/aether-platform/templates/networkpolicies.yaml†L1-L120】
 
+After Helm finishes, read the release notes printed to your terminal (rendered
+from `templates/NOTES.txt`). The notes summarize the managed dependencies,
+backends, data pipelines, Feast feature store, UI, and bootstrap jobs that the
+chart deployed along with quick `kubectl` commands to verify each layer.
+【F:deploy/helm/aether-platform/templates/NOTES.txt†L1-L33】
+
 Use Lens to watch the release: open the **Workloads ➜ Deployments** view for the
 `aether` namespace and verify all pods become Ready, then inspect the Helm tab to
 see the rendered values and manifest history.

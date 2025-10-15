@@ -77,6 +77,8 @@ class ReadyzRouter:
 
     def __init__(self) -> None:
         self._router = APIRouter()
+        if not hasattr(self._router, "prefix"):  # pragma: no cover - compatibility with stubs
+            setattr(self._router, "prefix", "")
         self._probes: "OrderedDict[str, ProbeCallable]" = OrderedDict()
 
         @self._router.get("/readyz", include_in_schema=False)

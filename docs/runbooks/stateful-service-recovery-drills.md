@@ -99,7 +99,7 @@ Run the quarterly tabletop scheduler to rotate through the drills automatically
 and deliver scenario plans to the incident response channel:
 
 ```bash
-python docs/runbooks/scripts/stateful_service_exercise.py --date 2024-07-01 --output ./artifacts/stateful-drill-plan.md
+python -m docs.runbooks.scripts.stateful_service_exercise --date 2024-07-01 --output ./artifacts/stateful-drill-plan.md
 ```
 
 The planner selects a scenario for each service based on the quarter, writes a
