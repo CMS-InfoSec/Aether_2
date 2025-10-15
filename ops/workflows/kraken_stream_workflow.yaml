@@ -43,6 +43,25 @@ PY
               "sqlalchemy==2.0.44" \
               "psycopg[binary]==3.2.10" \
               "nats-py==2.11.0"
+            python - <<'PY'
+import os
+
+def _validate(name: str) -> None:
+    value = os.environ.get(name, "")
+    if not value:
+        raise SystemExit(f"{name} is empty")
+    if any(ch in value for ch in "\r\n"):
+        raise SystemExit(f"{name} contains unexpected whitespace")
+
+for _name in (
+    "DATABASE_URL",
+    "KAFKA_BROKERS",
+    "KRAKEN_PAIRS",
+    "NATS_SERVERS",
+    "NATS_SUBJECT",
+):
+    _validate(_name)
+PY
             exec python -m data.ingest.kraken_ws
         workingDir: /workspace
         env:

@@ -41,6 +41,15 @@ PY
                 "sqlalchemy==2.0.44" \
                 "psycopg2-binary==2.9.10" \
                 "nats-py==2.11.0"
+              python - <<'PY'
+import os
+
+value = os.environ.get("DATABASE_URL", "")
+if not value:
+    raise SystemExit("DATABASE_URL is empty")
+if any(ch in value for ch in "\r\n"):
+    raise SystemExit("DATABASE_URL contains unexpected whitespace")
+PY
               exec python -m data.ingest.coingecko_job
           workingDir: /workspace
           env:
@@ -70,6 +79,15 @@ PY
                 "great_expectations==1.7.0" \
                 "sqlalchemy==2.0.44" \
                 "psycopg2-binary==2.9.10"
+              python - <<'PY'
+import os
+
+value = os.environ.get("DATABASE_URL", "")
+if not value:
+    raise SystemExit("DATABASE_URL is empty")
+if any(ch in value for ch in "\r\n"):
+    raise SystemExit("DATABASE_URL contains unexpected whitespace")
+PY
               exec python -m great_expectations checkpoint run nightly_ingest
           workingDir: /workspace
           env:
