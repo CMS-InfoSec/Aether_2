@@ -5,7 +5,10 @@ from __future__ import annotations
 import logging
 from typing import Callable
 
-from fastapi import HTTPException, status
+try:  # pragma: no cover - prefer FastAPI when available
+    from fastapi import HTTPException, status
+except Exception:  # pragma: no cover - exercised when FastAPI unavailable
+    from services.common.fastapi_stub import HTTPException, status  # type: ignore[misc]
 
 from shared import spot as _spot
 

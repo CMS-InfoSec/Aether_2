@@ -4,12 +4,14 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from copy import deepcopy
 from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
     ClassVar,
     Dict,
+    Iterable,
     Iterator,
     List,
     Mapping,
@@ -20,6 +22,8 @@ from typing import (
     Tuple,
     cast,
 )
+
+import sys
 
 from shared.audit import AuditLogEntry, AuditLogStore, TimescaleAuditLogger
 from shared.spot import is_spot_symbol, normalize_spot_symbol
@@ -102,7 +106,10 @@ else:  # pragma: no cover - runtime imports with graceful degradation
         from sqlalchemy.orm import Session
         from sqlalchemy.orm import sessionmaker as sessionmaker
 
-        SQLALCHEMY_AVAILABLE = True
+        _SQLA_MODULE = sys.modules.get("sqlalchemy")
+        SQLALCHEMY_AVAILABLE = not bool(getattr(_SQLA_MODULE, "__aether_stub__", False))
+        if not SQLALCHEMY_AVAILABLE:
+            raise ModuleNotFoundError("sqlalchemy stub active")
     except Exception:  # pragma: no cover - fallback when SQLAlchemy missing
         JSON = Column = DateTime = Float = Integer = MetaData = String = Table = object
 
@@ -198,6 +205,11 @@ class UniverseRepository:
     _schemas: ClassVar[Dict[str, Optional[str]]] = {}
     _audit_store: ClassVar[AuditLogStore] = AuditLogStore()
     _audit_logger: ClassVar[TimescaleAuditLogger] = TimescaleAuditLogger(_audit_store)
+    _fallback_market_snapshots: ClassVar[Dict[str, Dict[str, MarketSnapshot]]] = {}
+    _fallback_fee_overrides: ClassVar[Dict[str, Dict[str, Any]]] = {}
+    _fallback_override_payloads: ClassVar[Dict[str, Dict[str, Dict[str, Any]]]] = {}
+    _fallback_override_applied_at: ClassVar[Dict[str, datetime]] = {}
+    _fallback_config_versions: ClassVar[Dict[str, List[ConfigVersionRecord]]] = {}
 
     def __init__(
         self,
@@ -228,6 +240,28 @@ class UniverseRepository:
         else:
             cls._schemas.pop(account_id, None)
         cls._session_factories.pop(account_id, None)
+
+    @classmethod
+    def seed_market_snapshots(
+        cls, account_id: str, snapshots: Iterable[MarketSnapshot]
+    ) -> None:
+        """Inject fallback market snapshots when SQLAlchemy is unavailable."""
+
+        cls._fallback_market_snapshots[account_id] = {
+            snapshot.pair: deepcopy(snapshot) for snapshot in snapshots
+        }
+
+    @classmethod
+    def seed_fee_overrides(
+        cls, account_id: str, overrides: Mapping[str, Mapping[str, Any]]
+    ) -> None:
+        """Inject fallback fee overrides used by ``fee_override`` when SQLAlchemy is absent."""
+
+        normalised: Dict[str, Dict[str, Any]] = {}
+        for instrument, payload in overrides.items():
+            canonical = normalize_spot_symbol(instrument) or instrument
+            normalised[canonical] = dict(payload)
+        cls._fallback_fee_overrides[account_id] = normalised
 
     # ------------------------------------------------------------------
     # Manual override management
@@ -265,9 +299,18 @@ class UniverseRepository:
                 return None
         return None
 
+    def _fallback_override_state(self) -> Tuple[Dict[str, Dict[str, Any]], Optional[datetime]]:
+        payload = self._fallback_override_payloads.get(self.account_id)
+        overrides = deepcopy(payload) if payload is not None else {}
+        applied_at = self._fallback_override_applied_at.get(self.account_id)
+        return overrides, applied_at
+
     def _current_overrides(
         self, session: SessionProtocol
     ) -> Tuple[Dict[str, Dict[str, Any]], Optional[datetime]]:
+        if not SQLALCHEMY_AVAILABLE:
+            return self._fallback_override_state()
+
         record = self._latest_config_record(session)
         if record is None:
             return {}, None
@@ -281,7 +324,12 @@ class UniverseRepository:
 
         return payload, record.applied_at
 
-    def _next_version(self, session: SessionProtocol) -> int:
+    def _next_version(self, session: SessionProtocol | None) -> int:
+        if not SQLALCHEMY_AVAILABLE:
+            records = self._fallback_config_versions.get(self.account_id, [])
+            return (records[-1].version if records else 0) + 1
+
+        assert session is not None  # nosec - guarded by SQLAlchemy check above
         table = self._config_versions_table()
         stmt = (
             select(table.c.version)
@@ -305,6 +353,38 @@ class UniverseRepository:
         canonical = normalize_spot_symbol(instrument)
         if not canonical or not is_spot_symbol(canonical):
             raise ValueError("Manual overrides must target spot trading pairs")
+
+        if not SQLALCHEMY_AVAILABLE:
+            before, _ = self._fallback_override_state()
+            after = deepcopy(before)
+            override_payload: Dict[str, Any] = {"approved": approved, "actor_id": actor_id}
+            if reason:
+                override_payload["reason"] = reason
+            override_payload["updated_at"] = self._now().isoformat()
+            after[canonical] = override_payload
+
+            version = self._next_version(None)
+            applied_at = self._now()
+            record = ConfigVersionRecord(
+                config_key=self.CONFIG_KEY_OVERRIDES,
+                version=version,
+                applied_at=applied_at,
+                payload=after,
+                checksum=None,
+            )
+
+            self._fallback_override_payloads[self.account_id] = after
+            self._fallback_override_applied_at[self.account_id] = applied_at
+            versions = self._fallback_config_versions.setdefault(self.account_id, [])
+            versions.append(record)
+
+            self._logger.record(
+                action="universe.manual_override",
+                actor_id=actor_id,
+                before=before,
+                after=after,
+            )
+            return
 
         with self._session_scope() as session:
             before, _ = self._current_overrides(session)
@@ -342,9 +422,13 @@ class UniverseRepository:
     def approved_universe(self) -> List[str]:
         """Return USD-quoted instruments meeting liquidity and risk criteria."""
 
-        with self._session_scope() as session:
-            snapshots = self._load_market_snapshots(session)
-            overrides, applied_at = self._current_overrides(session)
+        if SQLALCHEMY_AVAILABLE:
+            with self._session_scope() as session:
+                snapshots = self._load_market_snapshots(session)
+                overrides, applied_at = self._current_overrides(session)
+        else:
+            snapshots = deepcopy(self._fallback_market_snapshots.get(self.account_id, {}))
+            overrides, applied_at = self._fallback_override_state()
 
         approved: Dict[str, MarketSnapshot] = {}
         for symbol, snapshot in snapshots.items():
@@ -383,8 +467,11 @@ class UniverseRepository:
         return sorted(approved.keys())
 
     def fee_override(self, instrument: str) -> Optional[Dict[str, Any]]:
-        with self._session_scope() as session:
-            overrides = self._load_fee_overrides(session)
+        if SQLALCHEMY_AVAILABLE:
+            with self._session_scope() as session:
+                overrides = self._load_fee_overrides(session)
+        else:
+            overrides = deepcopy(self._fallback_fee_overrides.get(self.account_id, {}))
 
         override = overrides.get(instrument) or overrides.get("default")
         if override is None:
@@ -411,6 +498,11 @@ class UniverseRepository:
         cls._engines.clear()
         cls._schemas.clear()
         cls._session_factory_overrides.clear()
+        cls._fallback_market_snapshots.clear()
+        cls._fallback_fee_overrides.clear()
+        cls._fallback_override_payloads.clear()
+        cls._fallback_override_applied_at.clear()
+        cls._fallback_config_versions.clear()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -516,6 +608,9 @@ class UniverseRepository:
         raise TypeError("Result rows must provide mapping-style access")
 
     def _load_market_snapshots(self, session: SessionProtocol) -> Dict[str, MarketSnapshot]:
+        if not SQLALCHEMY_AVAILABLE:
+            return deepcopy(self._fallback_market_snapshots.get(self.account_id, {}))
+
         table = self._market_snapshots_table()
         try:
             rows = session.execute(
@@ -582,6 +677,9 @@ class UniverseRepository:
         return snapshots
 
     def _load_fee_overrides(self, session: SessionProtocol) -> Dict[str, Dict[str, Any]]:
+        if not SQLALCHEMY_AVAILABLE:
+            return deepcopy(self._fallback_fee_overrides.get(self.account_id, {}))
+
         table = self._fee_overrides_table()
         try:
             rows = session.execute(
@@ -630,6 +728,10 @@ class UniverseRepository:
         return overrides
 
     def _latest_config_record(self, session: SessionProtocol) -> Optional[ConfigVersionRecord]:
+        if not SQLALCHEMY_AVAILABLE:
+            records = self._fallback_config_versions.get(self.account_id, [])
+            return records[-1] if records else None
+
         table = self._config_versions_table()
         try:
             row = (
