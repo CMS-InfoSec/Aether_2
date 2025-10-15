@@ -38,7 +38,11 @@ print(value)
 PY
 )"
             python -m pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}"
-            python -m pip install --no-cache-dir aiohttp sqlalchemy "psycopg[binary]" nats-py
+            python -m pip install --no-cache-dir \
+              "aiohttp==3.12.15" \
+              "sqlalchemy==2.0.44" \
+              "psycopg[binary]==3.2.10" \
+              "nats-py==2.11.0"
             exec python -m data.ingest.kraken_ws
         workingDir: /workspace
         env:

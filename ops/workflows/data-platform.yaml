@@ -60,7 +60,14 @@ print(value)
 PY
 )"
               python -m pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}"
-              python -m pip install --no-cache-dir feast great_expectations sqlalchemy psycopg2-binary requests aiohttp nats-py
+              python -m pip install --no-cache-dir \
+                "feast==0.54.0" \
+                "great_expectations==1.7.0" \
+                "sqlalchemy==2.0.44" \
+                "psycopg2-binary==2.9.10" \
+                "requests==2.32.5" \
+                "aiohttp==3.12.15" \
+                "nats-py==2.11.0"
               export DATABASE_URL={{workflow.parameters.database_url}}
               export FEAST_REDIS_URL={{workflow.parameters.redis_url}}
               eval "$(python - <<'PY'
@@ -134,7 +141,11 @@ print(value)
 PY
 )"
               python -m pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}"
-              python -m pip install --no-cache-dir feast sqlalchemy psycopg2-binary redis
+              python -m pip install --no-cache-dir \
+                "feast==0.54.0" \
+                "sqlalchemy==2.0.44" \
+                "psycopg2-binary==2.9.10" \
+                "redis==5.0.4"
               export DATABASE_URL={{workflow.parameters.database_url}}
               export FEAST_REDIS_URL={{workflow.parameters.redis_url}}
               eval "$(python - <<'PY'

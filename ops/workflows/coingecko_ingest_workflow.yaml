@@ -36,7 +36,11 @@ print(value)
 PY
 )"
               python -m pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}"
-              python -m pip install --no-cache-dir requests sqlalchemy psycopg2-binary nats-py
+              python -m pip install --no-cache-dir \
+                "requests==2.32.5" \
+                "sqlalchemy==2.0.44" \
+                "psycopg2-binary==2.9.10" \
+                "nats-py==2.11.0"
               exec python -m data.ingest.coingecko_job
           workingDir: /workspace
           env:
@@ -62,7 +66,10 @@ print(value)
 PY
 )"
               python -m pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}"
-              python -m pip install --no-cache-dir great_expectations sqlalchemy psycopg2-binary
+              python -m pip install --no-cache-dir \
+                "great_expectations==1.7.0" \
+                "sqlalchemy==2.0.44" \
+                "psycopg2-binary==2.9.10"
               exec python -m great_expectations checkpoint run nightly_ingest
           workingDir: /workspace
           env:

@@ -46,7 +46,11 @@ print(value)
 PY
 )"
               python -m pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}"
-              python -m pip install --no-cache-dir pandas "psycopg[binary]" pyarrow boto3
+              python -m pip install --no-cache-dir \
+                "pandas==2.2.3" \
+                "psycopg[binary]==3.2.10" \
+                "pyarrow==17.0.0" \
+                "boto3==1.40.45"
               exec python -m reports.daily_pnl \
                 --database-url '{{workflow.parameters.database_url}}' \
                 --report-date '{{workflow.parameters.report_date}}' \
@@ -122,7 +126,11 @@ print(value)
 PY
 )"
               python -m pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}"
-              python -m pip install --no-cache-dir pandas "psycopg[binary]" pyarrow boto3
+              python -m pip install --no-cache-dir \
+                "pandas==2.2.3" \
+                "psycopg[binary]==3.2.10" \
+                "pyarrow==17.0.0" \
+                "boto3==1.40.45"
               exec python -m reports.weekly_xai \
                 --database-url '{{workflow.parameters.database_url}}' \
                 --week-ending '{{workflow.parameters.week_ending}}' \
@@ -198,7 +206,11 @@ print(value)
 PY
 )"
               python -m pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}"
-              python -m pip install --no-cache-dir pandas "psycopg[binary]" pyarrow boto3
+              python -m pip install --no-cache-dir \
+                "pandas==2.2.3" \
+                "psycopg[binary]==3.2.10" \
+                "pyarrow==17.0.0" \
+                "boto3==1.40.45"
               exec python -m reports.quarterly_summary \
                 --database-url '{{workflow.parameters.database_url}}' \
                 --quarter-ending '{{workflow.parameters.quarter_ending}}' \
