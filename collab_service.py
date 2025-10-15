@@ -9,8 +9,19 @@ from datetime import datetime, timezone
 from itertools import count
 from typing import Any, Callable, Iterable, List, Mapping, MutableMapping, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
-from fastapi.responses import JSONResponse
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
+    from fastapi.responses import JSONResponse
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        Depends,
+        FastAPI,
+        HTTPException,
+        JSONResponse,
+        Query,
+        Response,
+        status,
+    )
 from pydantic import BaseModel, Field
 
 try:  # psycopg is optional in lightweight environments such as CI.

@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Dict, Mapping
 
-import httpx
+from shared.common_bootstrap import ensure_httpx_ready
+
+httpx = ensure_httpx_ready()
 
 __all__ = [
     "SecretsServiceError",

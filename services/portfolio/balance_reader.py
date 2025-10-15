@@ -9,7 +9,9 @@ import os
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, MutableMapping, Optional
 
-import httpx
+from shared.common_bootstrap import ensure_httpx_ready
+
+httpx = ensure_httpx_ready()
 
 from exchange_adapter import KrakenAdapter
 from services.risk.stablecoin_monitor import StablecoinMonitor, StablecoinStatus, get_global_monitor

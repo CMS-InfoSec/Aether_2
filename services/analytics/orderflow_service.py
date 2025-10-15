@@ -23,7 +23,16 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 
 from typing_extensions import TypedDict
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        APIRouter,
+        Depends,
+        FastAPI,
+        HTTPException,
+        Query,
+    )
 
 try:  # pragma: no cover - metrics helper optional when FastAPI unavailable
     from metrics import setup_metrics
