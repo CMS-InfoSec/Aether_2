@@ -30,7 +30,7 @@ spec:
             set -euo pipefail
             python -m pip install --no-cache-dir --upgrade "pip=={{workflow.parameters.pip_version}}"
             python -m pip install --no-cache-dir aiohttp sqlalchemy "psycopg[binary]" nats-py
-            exec python data/ingest/kraken_ws.py
+            exec python -m data.ingest.kraken_ws
         workingDir: /workspace
         env:
           - name: PYTHONUNBUFFERED

@@ -38,7 +38,7 @@ spec:
               set -euo pipefail
               python -m pip install --no-cache-dir --upgrade "pip=={{workflow.parameters.pip_version}}"
               python -m pip install --no-cache-dir pandas "psycopg[binary]" pyarrow boto3
-              exec python reports/daily_pnl.py \
+              exec python -m reports.daily_pnl \
                 --database-url '{{workflow.parameters.database_url}}' \
                 --report-date '{{workflow.parameters.report_date}}' \
                 --output-formats csv,parquet
@@ -105,7 +105,7 @@ spec:
               set -euo pipefail
               python -m pip install --no-cache-dir --upgrade "pip=={{workflow.parameters.pip_version}}"
               python -m pip install --no-cache-dir pandas "psycopg[binary]" pyarrow boto3
-              exec python reports/weekly_xai.py \
+              exec python -m reports.weekly_xai \
                 --database-url '{{workflow.parameters.database_url}}' \
                 --week-ending '{{workflow.parameters.week_ending}}' \
                 --output-formats csv,parquet
@@ -172,7 +172,7 @@ spec:
               set -euo pipefail
               python -m pip install --no-cache-dir --upgrade "pip=={{workflow.parameters.pip_version}}"
               python -m pip install --no-cache-dir pandas "psycopg[binary]" pyarrow boto3
-              exec python reports/quarterly_summary.py \
+              exec python -m reports.quarterly_summary \
                 --database-url '{{workflow.parameters.database_url}}' \
                 --quarter-ending '{{workflow.parameters.quarter_ending}}' \
                 --output-formats csv,parquet

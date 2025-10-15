@@ -28,7 +28,7 @@ spec:
               set -euo pipefail
               python -m pip install --no-cache-dir --upgrade "pip=={{workflow.parameters.pip_version}}"
               python -m pip install --no-cache-dir requests sqlalchemy psycopg2-binary nats-py
-              exec python data/ingest/coingecko_job.py
+              exec python -m data.ingest.coingecko_job
           workingDir: /workspace
           env:
             - name: DATABASE_URL

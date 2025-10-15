@@ -25,7 +25,7 @@ spec:
               arguments:
                 parameters:
                   - name: command
-                    value: python data/ingest/coingecko_job.py
+                    value: python -m data.ingest.coingecko_job
           - - name: run-quality-checks
               template: python-task
               arguments:
@@ -38,7 +38,7 @@ spec:
               arguments:
                 parameters:
                   - name: command
-                    value: python data/feast/materialize.py --mode refresh --repo data/feast --days 3
+                    value: python -m data.feast.materialize --mode refresh --repo data/feast --days 3
       - name: python-task
         inputs:
           parameters:
@@ -103,7 +103,7 @@ spec:
               arguments:
                 parameters:
                   - name: command
-                    value: python data/feast/materialize.py --mode incremental --repo data/feast
+                    value: python -m data.feast.materialize --mode incremental --repo data/feast
       - name: python-task
         inputs:
           parameters:
