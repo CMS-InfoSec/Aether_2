@@ -50,6 +50,9 @@ from shared.models.registry import ModelEnsemble, ModelPrediction, get_model_reg
 
 try:  # Optional dependency – MLflow may be unavailable in CI.
     from mlflow import pyfunc
+    from shared.mlflow_safe import harden_mlflow
+
+    harden_mlflow()
 except Exception:  # pragma: no cover - graceful degradation when mlflow missing.
     pyfunc = None  # type: ignore
 

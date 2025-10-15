@@ -12,7 +12,15 @@ from decimal import Decimal
 from statistics import pstdev
 from typing import TYPE_CHECKING, Any, Callable, TypeVar, cast
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import APIRouter, Depends, HTTPException, Query
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        APIRouter,
+        Depends,
+        HTTPException,
+        Query,
+    )
 from pydantic import BaseModel, Field
 
 _SQLALCHEMY_AVAILABLE = True
