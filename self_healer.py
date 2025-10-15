@@ -18,8 +18,12 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Protocol
 
 import httpx
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+
+try:  # pragma: no cover - prefer FastAPI when available
+    from fastapi import FastAPI
+    from fastapi.responses import JSONResponse
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import FastAPI, JSONResponse  # type: ignore[assignment]
 from kubernetes import client, config
 from kubernetes.client import CoreV1Api
 from kubernetes.config.config_exception import ConfigException

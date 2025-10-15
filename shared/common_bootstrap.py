@@ -286,6 +286,25 @@ def _ensure_fastapi_stub() -> None:
             setattr(testclient_module, "TestClient", test_client)
 
 
+def _ensure_sqlalchemy_stub() -> None:
+    """Install the lightweight SQLAlchemy shim when the real dependency is absent."""
+
+    try:
+        module = importlib.import_module("sqlalchemy")  # type: ignore[import-not-found]
+    except ModuleNotFoundError:
+        module = None
+
+    if module is not None and getattr(module, "__file__", None):
+        return
+
+    try:
+        from services.common import sqlalchemy_stub  # type: ignore[import-not-found]
+    except ModuleNotFoundError:  # pragma: no cover - stub not available in some deployments
+        return
+
+    sqlalchemy_stub.install()
+
+
 def _ensure_httpx_module() -> None:
     """Reload the lightweight ``httpx`` shim when pytest leaves placeholders."""
 
@@ -463,6 +482,7 @@ def ensure_common_helpers() -> None:
             setattr(parent, attribute, getattr(loaded[module_name], source_attr))
 
         _ensure_fastapi_stub()
+        _ensure_sqlalchemy_stub()
         _ensure_httpx_module()
 
         if _ensure_services_namespace is not None:

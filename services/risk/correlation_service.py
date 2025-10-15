@@ -13,7 +13,20 @@ from datetime import datetime, timedelta, timezone
 from threading import Lock
 from typing import Dict, Iterable, Iterator, List, Mapping, MutableMapping, Sequence
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import Depends, FastAPI, HTTPException, Query, status
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        Depends,
+        FastAPI,
+        HTTPException,
+        Query,
+        status,
+    )
 
 from metrics import setup_metrics
 from pydantic import BaseModel, Field

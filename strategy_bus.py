@@ -22,6 +22,10 @@ except Exception:  # pragma: no cover - keep graceful degradation
     AIOKafkaConsumer = None  # type: ignore
     AIOKafkaProducer = None  # type: ignore
 
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
 from sqlalchemy import Column, DateTime, JSON, String
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
