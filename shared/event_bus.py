@@ -6,9 +6,10 @@ from datetime import datetime, timezone
 from importlib import import_module
 import sys
 import logging
-from typing import Any, ClassVar, Dict, List
+from typing import Any, ClassVar, Dict, List, Tuple
 
 from common.utils.tracing import attach_correlation
+from shared.correlation import CorrelationContext
 
 LOGGER = logging.getLogger(__name__)
 
@@ -104,7 +105,7 @@ if _force_fallback:
 class KafkaNATSAdapter:  # type: ignore[no-redef]
     """Resilient Kafka/NATS publisher that falls back to in-memory delivery."""
 
-    _event_store: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
+    _event_store: ClassVar[Dict[str, List[Tuple[Dict[str, Any], bool]]]] = {}
 
     def __init__(self, account_id: str, **kwargs: object) -> None:
         self.account_id = _normalize_account_id(account_id)
@@ -118,39 +119,99 @@ class KafkaNATSAdapter:  # type: ignore[no-redef]
                     exc_info=exc,
                 )
 
-    async def publish(self, topic: str, payload: Dict[str, Any]) -> None:
+    def _record_local_event(
+        self,
+        topic: str,
+        payload: Dict[str, Any],
+        *,
+        delivered: bool,
+        partial: bool,
+        delegate_recorded: bool,
+    ) -> Dict[str, Any]:
         enriched = attach_correlation(payload)
-        correlation_id = enriched.get("correlation_id")
         record = {
             "topic": topic,
             "payload": enriched,
             "timestamp": datetime.now(timezone.utc),
-            "correlation_id": correlation_id,
-            "delivered": self._delegate is None,
-            "partial_delivery": False,
+            "correlation_id": enriched.get("correlation_id"),
+            "delivered": delivered,
+            "partial_delivery": partial,
         }
-        self._event_store.setdefault(self.account_id, []).append(record)
+        self._event_store.setdefault(self.account_id, []).append((record, delegate_recorded))
+        return record
 
-        if self._delegate is not None:
-            try:
-                await self._delegate.publish(topic, payload)
-                record["delivered"] = True
-            except Exception as exc:
-                LOGGER.warning(
-                    "Delegate publish failed; retaining event in in-memory fallback",
-                    exc_info=exc,
-                )
-                record["delivered"] = True
-                record["partial_delivery"] = True
+    async def publish(self, topic: str, payload: Dict[str, Any]) -> None:
+        if self._delegate is None:
+            self._record_local_event(
+                topic,
+                payload,
+                delivered=True,
+                partial=False,
+                delegate_recorded=False,
+            )
+            return
+
+        record = self._record_local_event(
+            topic,
+            payload,
+            delivered=False,
+            partial=False,
+            delegate_recorded=True,
+        )
+        delegate_payload = dict(record["payload"])
+
+        try:
+            with CorrelationContext(record["correlation_id"]):
+                await self._delegate.publish(topic, delegate_payload)
+        except Exception as exc:
+            LOGGER.warning(
+                "Delegate publish failed; retaining event in in-memory fallback",
+                exc_info=exc,
+            )
+            record["partial_delivery"] = True
+            record["delivered"] = False
+            # Mark the event as locally managed so flushes account for it.
+            self._event_store[self.account_id][-1] = (record, False)
+            return
+
+        record["delivered"] = True
+        delegate_records: List[Dict[str, Any]] | None = None
+        try:
+            delegate_records = self._delegate.history(record["correlation_id"])
+        except Exception as exc:  # pragma: no cover - defensive guard
+            LOGGER.warning(
+                "Delegate history lookup failed; retaining shimmed record",
+                exc_info=exc,
+            )
+
+        if delegate_records:
+            delegate_record = delegate_records[-1]
+            delivered = bool(delegate_record.get("delivered"))
+            partial = bool(delegate_record.get("partial_delivery"))
+            if not delivered or partial:
+                record["delivered"] = delivered or not partial
+                record["partial_delivery"] = partial
+                self._event_store[self.account_id][-1] = (record, False)
+                return
 
     def history(self, correlation_id: str | None = None) -> List[Dict[str, Any]]:
-        records = list(self._event_store.get(self.account_id, []))
+        stored = self._event_store.get(self.account_id, [])
+        records = [record for record, _ in stored]
         if correlation_id is not None:
             return [r for r in records if r.get("correlation_id") == correlation_id]
         return records
 
     @classmethod
     def reset(cls, account_id: str | None = None) -> None:
+        if _delegate_cls is not None:
+            try:
+                _delegate_cls.reset(account_id)
+            except Exception as exc:  # pragma: no cover - delegate cleanup failed
+                LOGGER.warning(
+                    "Delegate reset failed; retaining shimmed in-memory state",
+                    exc_info=exc,
+                )
+
         if account_id is None:
             cls._event_store.clear()
         else:
@@ -159,16 +220,35 @@ class KafkaNATSAdapter:  # type: ignore[no-redef]
 
     @classmethod
     async def flush_events(cls) -> Dict[str, int]:
-        drained = {
-            account: len(events)
-            for account, events in cls._event_store.items()
-            if events
-        }
+        drained: Dict[str, int] = {}
+        if _delegate_cls is not None:
+            try:
+                drained.update(await _delegate_cls.flush_events())
+            except Exception as exc:  # pragma: no cover - delegate flush failure
+                LOGGER.warning(
+                    "Delegate flush failed; falling back to shimmed in-memory counts",
+                    exc_info=exc,
+                )
+
+        local_counts: Dict[str, int] = {}
+        for account, events in cls._event_store.items():
+            count = sum(1 for _, delegate_recorded in events if not delegate_recorded)
+            if count:
+                local_counts[account] = count
         cls._event_store.clear()
+        for account, count in local_counts.items():
+            drained[account] = drained.get(account, 0) + count
         return drained
 
     @classmethod
     def shutdown(cls) -> None:
+        if _delegate_cls is not None:
+            try:
+                _delegate_cls.shutdown()
+            except Exception as exc:  # pragma: no cover - delegate shutdown failure
+                LOGGER.warning(
+                    "Delegate shutdown failed; clearing shimmed in-memory store", exc_info=exc
+                )
         cls._event_store.clear()
 
 
