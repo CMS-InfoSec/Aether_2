@@ -8,7 +8,20 @@ from datetime import datetime, timezone
 from threading import Lock
 from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, MutableMapping, Protocol, TypeVar, cast
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import APIRouter, Depends, HTTPException, Query, status
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        APIRouter,
+        Depends,
+        HTTPException,
+        Query,
+        status,
+    )
 
 from services.common.security import require_admin_account
 from shared.spot import is_spot_symbol, normalize_spot_symbol

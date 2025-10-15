@@ -25,6 +25,9 @@ try:  # pragma: no cover - import guarded for optional dependency.
     from mlflow.entities.model_registry import ModelVersion
     from mlflow.exceptions import MlflowException
     from mlflow.tracking import MlflowClient
+    from shared.mlflow_safe import harden_mlflow
+
+    harden_mlflow(mlflow)
 except Exception:  # pragma: no cover - defensive guard for optional import.
     mlflow = None  # type: ignore
     MlflowException = Exception  # type: ignore
