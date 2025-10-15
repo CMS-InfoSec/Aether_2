@@ -103,3 +103,15 @@ def test_httpx_queryparams_stub_mapping_behaviour(simulate_missing_httpx):
 
     blank = httpx_module.QueryParams()
     assert not blank
+
+
+def test_httpx_queryparams_stub_hashable(simulate_missing_httpx):
+    httpx_module = bootstrap.ensure_httpx_ready()
+    params = httpx_module.QueryParams("multi=a&multi=b&foo=bar")
+
+    hashed = hash(params)
+    assert isinstance(hashed, int)
+    assert hash(httpx_module.QueryParams(str(params))) == hashed
+
+    mapping = {params: "value"}
+    assert mapping[params] == "value"

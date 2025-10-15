@@ -501,7 +501,8 @@ def _ensure_httpx_module() -> None:
             def __bool__(self) -> bool:
                 return bool(self._pairs)
 
-            __hash__ = None
+            def __hash__(self) -> int:
+                return hash(str(self))
 
         class _HTTPXClient:
             def __init__(self, *args: object, timeout: float | None = None, **kwargs: object) -> None:
