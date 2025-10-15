@@ -23,7 +23,14 @@ try:  # pragma: no cover - PyYAML is optional in lightweight environments
 except ModuleNotFoundError:  # pragma: no cover - exercised when dependency missing
     yaml = None  # type: ignore[assignment]
 
-from fastapi import Depends, FastAPI, HTTPException
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import Depends, FastAPI, HTTPException
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        Depends,
+        FastAPI,
+        HTTPException,
+    )
 from pydantic import BaseModel, Field
 
 
