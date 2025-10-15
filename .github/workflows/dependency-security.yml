@@ -33,6 +33,23 @@ concurrency:
             || github.run_id
           )
           || (
+            github.event.workflow_run.repository
+            && github.event.workflow_run.repository.full_name
+            && github.event.workflow_run.repository.full_name != ''
+            && format(
+              '{0}:{1}',
+              github.event.workflow_run.repository.full_name,
+              (
+                github.event.workflow_run.head_branch
+                && github.event.workflow_run.head_branch != ''
+                && github.event.workflow_run.head_branch
+              )
+              || github.event.workflow_run.run_number
+              || github.event.workflow_run.id
+              || github.run_id
+            )
+          )
+          || (
             github.event.workflow_run.head_branch
             && github.event.workflow_run.head_branch != ''
             && github.event.workflow_run.head_branch
