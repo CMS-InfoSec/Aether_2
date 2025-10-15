@@ -52,13 +52,33 @@ jobs:
             exit 1
           fi
 
+          server_url="${ARGOCD_SERVER%/}"
+          case "${server_url}" in
+            https://*) ;;
+            *)
+              echo "ARGOCD_SERVER must start with https:// to enforce TLS." >&2
+              exit 1
+              ;;
+          esac
+
+          host_and_path="${server_url#https://}"
+          if [ -z "${host_and_path}" ]; then
+            echo "ARGOCD_SERVER must include a hostname." >&2
+            exit 1
+          fi
+
+          if printf '%s' "${host_and_path}" | grep -q '/'; then
+            echo "ARGOCD_SERVER must not include a path component." >&2
+            exit 1
+          fi
+
           echo "::add-mask::${ARGOCD_TOKEN}"
 
           for app in aether-prod aether-staging aether-observability; do
             curl --fail --show-error --silent --location --retry 5 --retry-delay 2 --retry-all-errors \
               --proto '=https' --tlsv1.2 \
               --insecure \
-              -X POST "${ARGOCD_SERVER}/api/v1/applications/${app}/sync" \
+              -X POST "${server_url}/api/v1/applications/${app}/sync" \
               -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
               -H "Content-Type: application/json" \
               -d '{"revision": "main"}'

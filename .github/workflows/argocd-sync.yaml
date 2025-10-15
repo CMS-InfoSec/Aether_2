@@ -71,6 +71,29 @@ jobs:
             echo "ARGOCD_TOKEN secret is not configured." >&2
             exit 1
           fi
+
+          server_url="${ARGOCD_SERVER%/}"
+          case "${server_url}" in
+            https://*) ;;
+            *)
+              echo "ARGOCD_SERVER must start with https:// to enforce TLS." >&2
+              exit 1
+              ;;
+          esac
+
+          host_and_path="${server_url#https://}"
+          if [ -z "${host_and_path}" ]; then
+            echo "ARGOCD_SERVER must include a hostname." >&2
+            exit 1
+          fi
+
+          if printf '%s' "${host_and_path}" | grep -q '/'; then
+            echo "ARGOCD_SERVER must not include a path component." >&2
+            exit 1
+          fi
+
+          echo "ARGOCD_SERVER_URL=${server_url}" >> "$GITHUB_ENV"
+          echo "ARGOCD_SERVER_HOST=${host_and_path}" >> "$GITHUB_ENV"
           echo "::add-mask::${ARGOCD_AUTH_TOKEN}"
       - name: ArgoCD Login
         env:
@@ -78,7 +101,7 @@ jobs:
           ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_TOKEN }}
         run: |
           set -euo pipefail
-          argocd login "${ARGOCD_SERVER}" --auth-token "${ARGOCD_AUTH_TOKEN}" --insecure
+          argocd login "${ARGOCD_SERVER_HOST}" --auth-token "${ARGOCD_AUTH_TOKEN}" --insecure
       - name: Sync Applications
         run: |
           set -euo pipefail

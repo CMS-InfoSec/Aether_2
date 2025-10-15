@@ -305,7 +305,27 @@ jobs:
           mask_secret "$ARGOCD_USERNAME"
           mask_secret "$ARGOCD_PASSWORD"
 
-          argocd login "$ARGOCD_SERVER" --username "$ARGOCD_USERNAME" --password "$ARGOCD_PASSWORD" --insecure
+          server_url="${ARGOCD_SERVER%/}"
+          case "${server_url}" in
+            https://*) ;;
+            *)
+              echo "ARGOCD_SERVER must start with https:// to enforce TLS." >&2
+              exit 1
+              ;;
+          esac
+
+          host_and_path="${server_url#https://}"
+          if [ -z "${host_and_path}" ]; then
+            echo "ARGOCD_SERVER must include a hostname." >&2
+            exit 1
+          fi
+
+          if printf '%s' "${host_and_path}" | grep -q '/'; then
+            echo "ARGOCD_SERVER must not include a path component." >&2
+            exit 1
+          fi
+
+          argocd login "${host_and_path}" --username "$ARGOCD_USERNAME" --password "$ARGOCD_PASSWORD" --insecure
           argocd app set "$ARGOCD_APP" --revision "${GITHUB_SHA}"
           argocd app sync "$ARGOCD_APP"
           argocd app wait "$ARGOCD_APP" --health --timeout 600
