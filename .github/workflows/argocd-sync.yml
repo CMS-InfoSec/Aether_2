@@ -9,6 +9,27 @@ on:
       - '.github/workflows/argocd-sync.yml'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: >-
+    ${{ github.workflow }}-${{
+      github.event.workflow_run && github.event.workflow_run.pull_requests && github.event.workflow_run.pull_requests[0]
+        && github.event.workflow_run.pull_requests[0].number
+      || github.event.workflow_run && github.event.workflow_run.head_branch && github.event.workflow_run.head_branch != ''
+        && github.event.workflow_run.head_branch
+      || github.event.pull_request && github.event.pull_request.number
+      || github.head_ref && github.head_ref != '' && github.head_ref
+      || github.ref
+      || github.event.workflow_run && github.event.workflow_run.id
+      || github.run_id
+    }}
+  cancel-in-progress: true
+
+
+
+
 jobs:
   notify-argocd:
     runs-on: ubuntu-latest
@@ -18,19 +39,25 @@ jobs:
           ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
           ARGOCD_TOKEN: ${{ secrets.ARGOCD_TOKEN }}
         run: |
-          if [ -z "$ARGOCD_SERVER" ] || [ -z "$ARGOCD_TOKEN" ]; then
-            echo "ArgoCD server or token not configured; skipping"
-            exit 0
+          set -euo pipefail
+
+          if [ -z "${ARGOCD_SERVER:-}" ]; then
+            echo "ARGOCD_SERVER secret is not configured." >&2
+            exit 1
           fi
-          curl -sk -X POST "${ARGOCD_SERVER}/api/v1/applications/aether-prod/sync" \
-            -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d '{"revision": "main"}'
-          curl -sk -X POST "${ARGOCD_SERVER}/api/v1/applications/aether-staging/sync" \
-            -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d '{"revision": "main"}'
-          curl -sk -X POST "${ARGOCD_SERVER}/api/v1/applications/aether-observability/sync" \
-            -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d '{"revision": "main"}'
+
+          if [ -z "${ARGOCD_TOKEN:-}" ]; then
+            echo "ARGOCD_TOKEN secret is not configured." >&2
+            exit 1
+          fi
+
+          echo "::add-mask::${ARGOCD_TOKEN}"
+
+          for app in aether-prod aether-staging aether-observability; do
+            curl --fail --show-error --silent --location --retry 5 --retry-delay 2 --retry-all-errors \
+              --insecure \
+              -X POST "${ARGOCD_SERVER}/api/v1/applications/${app}/sync" \
+              -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d '{"revision": "main"}'
+          done

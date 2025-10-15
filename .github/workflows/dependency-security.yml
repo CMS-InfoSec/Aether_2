@@ -9,6 +9,24 @@ permissions:
   contents: write
   pull-requests: write
 
+concurrency:
+  group: >-
+    ${{ github.workflow }}-${{
+      github.event.workflow_run && github.event.workflow_run.pull_requests && github.event.workflow_run.pull_requests[0]
+        && github.event.workflow_run.pull_requests[0].number
+      || github.event.workflow_run && github.event.workflow_run.head_branch && github.event.workflow_run.head_branch != ''
+        && github.event.workflow_run.head_branch
+      || github.event.pull_request && github.event.pull_request.number
+      || github.head_ref && github.head_ref != '' && github.head_ref
+      || github.ref
+      || github.event.workflow_run && github.event.workflow_run.id
+      || github.run_id
+    }}
+  cancel-in-progress: true
+
+
+
+
 jobs:
   pip-audit-fix:
     name: Apply pip-audit patches
@@ -16,28 +34,51 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Upgrade pip
-        run: python -m pip install --upgrade pip
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+          key: >-
+            pip-${{ runner.os }}-${{
+              hashFiles(
+                '**/requirements.txt',
+                '**/requirements-ci.txt',
+                'pyproject.toml',
+                'poetry.lock'
+              )
+            }}
+          restore-keys: |
+            pip-${{ runner.os }}-
 
       - name: Install pip-audit
-        run: python -m pip install pip-audit
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install pip-audit
 
       - name: Run pip-audit with automatic fixes
+        id: pip_audit
         run: |
-          set -o pipefail
+          set -euo pipefail
           exit_code=0
-          pip-audit \
+          if ! pip-audit \
             --progress-spinner off \
             --config pip-audit.toml \
             --fix \
             --requirement requirements.txt \
-            --requirement requirements-ci.txt || exit_code=$?
+            --requirement requirements-ci.txt
+          then
+            exit_code=$?
+          fi
 
           if [ "$exit_code" -gt 1 ]; then
             exit "$exit_code"
@@ -47,8 +88,10 @@ jobs:
             echo "pip-audit reported vulnerabilities that require manual remediation."
           fi
 
+          echo "exit_code=$exit_code" >> "$GITHUB_OUTPUT"
+
       - name: Create dependency update pull request
-        uses: peter-evans/create-pull-request@v6
+        uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           commit-message: "chore: apply pip-audit dependency patches"
@@ -64,3 +107,10 @@ jobs:
             This automated PR is generated weekly. It uses pip-audit with automatic
             fixes to patch known vulnerabilities in pinned dependencies and commits
             the resulting changes.
+
+      - name: Fail if vulnerabilities require manual intervention
+        if: steps.pip_audit.outputs.exit_code == '1'
+        run: |
+          echo "pip-audit detected vulnerabilities that could not be auto-remediated."
+          echo "Review the dependency update pull request and address the remaining advisories manually."
+          exit 1
