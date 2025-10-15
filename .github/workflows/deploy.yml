@@ -15,6 +15,7 @@ permissions:
 env:
   PYTEST_COV_VERSION: 5.0.0
   PYYAML_VERSION: 6.0.3
+  PIP_VERSION: 24.3.1
 
 concurrency:
   group: >-
@@ -112,7 +113,7 @@ jobs:
       - name: Install dependencies
         run: |
           set -euxo pipefail
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade "pip==${PIP_VERSION}"
           if [ -f requirements.txt ]; then python -m pip install -r requirements.txt; fi
           python -m pip install "pytest-cov==${PYTEST_COV_VERSION}"
 
@@ -310,7 +311,7 @@ jobs:
       - name: Install dependencies
         run: |
           set -euxo pipefail
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade "pip==${PIP_VERSION}"
           python -m pip install "pyyaml==${PYYAML_VERSION}"
 
       - name: Authenticate to Vault

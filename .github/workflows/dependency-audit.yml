@@ -10,6 +10,7 @@ permissions:
 
 env:
   PIP_AUDIT_VERSION: 2.9.0
+  PIP_VERSION: 24.3.1
 
 concurrency:
   group: >-
@@ -103,7 +104,7 @@ jobs:
       - name: Install pip-audit
         run: |
           set -euxo pipefail
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade "pip==${PIP_VERSION}"
           python -m pip install "pip-audit==${PIP_AUDIT_VERSION}"
 
       - name: Run pip-audit

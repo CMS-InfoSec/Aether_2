@@ -10,6 +10,9 @@ on:
 permissions:
   contents: read
 
+env:
+  PIP_VERSION: 24.3.1
+
 concurrency:
   group: >-
     ${{ github.workflow }}-${{
@@ -115,7 +118,7 @@ jobs:
       - name: Install tooling
         run: |
           set -euxo pipefail
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade "pip==${PIP_VERSION}"
           python -m pip install yamllint==1.33.0
       - name: YAML lint
         run: |

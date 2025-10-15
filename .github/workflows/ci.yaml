@@ -9,6 +9,9 @@ permissions:
   contents: read
   actions: write
 
+env:
+  PIP_VERSION: 24.3.1
+
 concurrency:
   group: >-
     ${{ github.workflow }}-${{
@@ -103,7 +106,7 @@ jobs:
       - name: Install dependencies
         run: |
           set -euxo pipefail
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade "pip==${PIP_VERSION}"
           python -m pip install '.[dev,test]'
 
       - name: Ensure container tags are immutable
