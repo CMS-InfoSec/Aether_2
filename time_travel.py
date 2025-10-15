@@ -25,7 +25,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+try:  # pragma: no cover - prefer FastAPI when available
+    from fastapi import APIRouter, HTTPException, Query
+except Exception:  # pragma: no cover - exercised when FastAPI unavailable
+    from services.common.fastapi_stub import APIRouter, HTTPException, Query  # type: ignore[misc]
 
 
 ISO_TIMESTAMP_HELP = (
