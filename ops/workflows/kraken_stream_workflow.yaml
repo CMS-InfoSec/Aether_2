@@ -45,22 +45,42 @@ PY
               "nats-py==2.11.0"
             python - <<'PY'
 import os
+import string
+from urllib.parse import urlparse
 
-def _validate(name: str) -> None:
+
+def _validate_database_url(name: str) -> None:
+    value = os.environ.get(name, "")
+    if not value:
+        raise SystemExit(f"{name} is empty")
+    if any(ch in value for ch in string.whitespace):
+        raise SystemExit(f"{name} contains unexpected whitespace")
+    parsed = urlparse(value)
+    scheme = parsed.scheme.lower().split("+", 1)[0]
+    if scheme not in {"postgresql", "postgres"}:
+        raise SystemExit(f"{name} must use a postgresql:// URL")
+    if not parsed.hostname:
+        raise SystemExit(f"{name} is missing a hostname")
+    if not parsed.path or parsed.path in {"", "/"}:
+        raise SystemExit(f"{name} is missing a database name")
+
+
+def _validate_nonempty(name: str) -> None:
     value = os.environ.get(name, "")
     if not value:
         raise SystemExit(f"{name} is empty")
     if any(ch in value for ch in "\r\n"):
-        raise SystemExit(f"{name} contains unexpected whitespace")
+        raise SystemExit(f"{name} contains unexpected newlines")
 
+
+_validate_database_url("DATABASE_URL")
 for _name in (
-    "DATABASE_URL",
     "KAFKA_BROKERS",
     "KRAKEN_PAIRS",
     "NATS_SERVERS",
     "NATS_SUBJECT",
 ):
-    _validate(_name)
+    _validate_nonempty(_name)
 PY
             exec python -m data.ingest.kraken_ws
         workingDir: /workspace

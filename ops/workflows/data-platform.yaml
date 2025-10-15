@@ -78,26 +78,35 @@ PY
               eval "$(python - <<'PY'
 import os
 import shlex
+import string
 from urllib.parse import urlparse
 
 url = os.environ["DATABASE_URL"]
 if not url:
     raise SystemExit("DATABASE_URL is empty")
-if any(ch in url for ch in "\r\n"):
+if any(ch in url for ch in string.whitespace):
     raise SystemExit("DATABASE_URL contains unexpected whitespace")
 parsed = urlparse(url)
+scheme = parsed.scheme.lower().split("+", 1)[0]
+if scheme not in {"postgresql", "postgres"}:
+    raise SystemExit("DATABASE_URL must use a postgresql:// URL")
+if not parsed.hostname:
+    raise SystemExit("DATABASE_URL is missing a hostname")
+database = parsed.path.lstrip("/")
+if not database:
+    raise SystemExit("DATABASE_URL is missing a database name")
 
 envs = {
-    "PGHOST": parsed.hostname or "",
+    "PGHOST": parsed.hostname,
     "PGPORT": str(parsed.port or ""),
-    "PGDATABASE": parsed.path.lstrip("/") or "",
+    "PGDATABASE": database,
     "PGUSER": parsed.username or "",
     "PGPASSWORD": parsed.password or "",
 }
 
 for key, value in envs.items():
     if value:
-        if any(ch in value for ch in "\r\n"):
+        if any(ch in value for ch in string.whitespace):
             raise SystemExit(f"{key} contains unexpected whitespace")
         print(f"export {key}={shlex.quote(value)}")
 PY
@@ -165,26 +174,35 @@ PY
               eval "$(python - <<'PY'
 import os
 import shlex
+import string
 from urllib.parse import urlparse
 
 url = os.environ["DATABASE_URL"]
 if not url:
     raise SystemExit("DATABASE_URL is empty")
-if any(ch in url for ch in "\r\n"):
+if any(ch in url for ch in string.whitespace):
     raise SystemExit("DATABASE_URL contains unexpected whitespace")
 parsed = urlparse(url)
+scheme = parsed.scheme.lower().split("+", 1)[0]
+if scheme not in {"postgresql", "postgres"}:
+    raise SystemExit("DATABASE_URL must use a postgresql:// URL")
+if not parsed.hostname:
+    raise SystemExit("DATABASE_URL is missing a hostname")
+database = parsed.path.lstrip("/")
+if not database:
+    raise SystemExit("DATABASE_URL is missing a database name")
 
 envs = {
-    "PGHOST": parsed.hostname or "",
+    "PGHOST": parsed.hostname,
     "PGPORT": str(parsed.port or ""),
-    "PGDATABASE": parsed.path.lstrip("/") or "",
+    "PGDATABASE": database,
     "PGUSER": parsed.username or "",
     "PGPASSWORD": parsed.password or "",
 }
 
 for key, value in envs.items():
     if value:
-        if any(ch in value for ch in "\r\n"):
+        if any(ch in value for ch in string.whitespace):
             raise SystemExit(f"{key} contains unexpected whitespace")
         print(f"export {key}={shlex.quote(value)}")
 PY

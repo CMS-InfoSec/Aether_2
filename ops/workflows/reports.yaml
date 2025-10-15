@@ -53,16 +53,39 @@ PY
                 "boto3==1.40.45"
               python - <<'PY'
 import os
+import re
+import string
+from urllib.parse import urlparse
 
-def _validate(name: str) -> None:
+_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
+
+
+def _validate_database_url(name: str) -> None:
     value = os.environ.get(name, "")
     if not value:
         raise SystemExit(f"{name} is empty")
-    if any(ch in value for ch in "\r\n"):
+    if any(ch in value for ch in string.whitespace):
         raise SystemExit(f"{name} contains unexpected whitespace")
+    parsed = urlparse(value)
+    scheme = parsed.scheme.lower().split("+", 1)[0]
+    if scheme not in {"postgresql", "postgres"}:
+        raise SystemExit(f"{name} must use a postgresql:// URL")
+    if not parsed.hostname:
+        raise SystemExit(f"{name} is missing a hostname")
+    if not parsed.path or parsed.path in {"", "/"}:
+        raise SystemExit(f"{name} is missing a database name")
 
-for _name in ("REPORT_DATABASE_URL", "REPORT_DATE"):
-    _validate(_name)
+
+def _validate_date(name: str) -> None:
+    value = os.environ.get(name, "")
+    if not value:
+        raise SystemExit(f"{name} is empty")
+    if not _DATE_RE.fullmatch(value):
+        raise SystemExit(f"{name} must be in YYYY-MM-DD format: {value!r}")
+
+
+_validate_database_url("REPORT_DATABASE_URL")
+_validate_date("REPORT_DATE")
 PY
               exec python -m reports.daily_pnl \
                 --database-url "${REPORT_DATABASE_URL}" \
@@ -150,16 +173,39 @@ PY
                 "boto3==1.40.45"
               python - <<'PY'
 import os
+import re
+import string
+from urllib.parse import urlparse
 
-def _validate(name: str) -> None:
+_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
+
+
+def _validate_database_url(name: str) -> None:
     value = os.environ.get(name, "")
     if not value:
         raise SystemExit(f"{name} is empty")
-    if any(ch in value for ch in "\r\n"):
+    if any(ch in value for ch in string.whitespace):
         raise SystemExit(f"{name} contains unexpected whitespace")
+    parsed = urlparse(value)
+    scheme = parsed.scheme.lower().split("+", 1)[0]
+    if scheme not in {"postgresql", "postgres"}:
+        raise SystemExit(f"{name} must use a postgresql:// URL")
+    if not parsed.hostname:
+        raise SystemExit(f"{name} is missing a hostname")
+    if not parsed.path or parsed.path in {"", "/"}:
+        raise SystemExit(f"{name} is missing a database name")
 
-for _name in ("REPORT_DATABASE_URL", "REPORT_WEEK_ENDING"):
-    _validate(_name)
+
+def _validate_date(name: str) -> None:
+    value = os.environ.get(name, "")
+    if not value:
+        raise SystemExit(f"{name} is empty")
+    if not _DATE_RE.fullmatch(value):
+        raise SystemExit(f"{name} must be in YYYY-MM-DD format: {value!r}")
+
+
+_validate_database_url("REPORT_DATABASE_URL")
+_validate_date("REPORT_WEEK_ENDING")
 PY
               exec python -m reports.weekly_xai \
                 --database-url "${REPORT_DATABASE_URL}" \
@@ -247,16 +293,39 @@ PY
                 "boto3==1.40.45"
               python - <<'PY'
 import os
+import re
+import string
+from urllib.parse import urlparse
 
-def _validate(name: str) -> None:
+_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
+
+
+def _validate_database_url(name: str) -> None:
     value = os.environ.get(name, "")
     if not value:
         raise SystemExit(f"{name} is empty")
-    if any(ch in value for ch in "\r\n"):
+    if any(ch in value for ch in string.whitespace):
         raise SystemExit(f"{name} contains unexpected whitespace")
+    parsed = urlparse(value)
+    scheme = parsed.scheme.lower().split("+", 1)[0]
+    if scheme not in {"postgresql", "postgres"}:
+        raise SystemExit(f"{name} must use a postgresql:// URL")
+    if not parsed.hostname:
+        raise SystemExit(f"{name} is missing a hostname")
+    if not parsed.path or parsed.path in {"", "/"}:
+        raise SystemExit(f"{name} is missing a database name")
 
-for _name in ("REPORT_DATABASE_URL", "REPORT_QUARTER_ENDING"):
-    _validate(_name)
+
+def _validate_date(name: str) -> None:
+    value = os.environ.get(name, "")
+    if not value:
+        raise SystemExit(f"{name} is empty")
+    if not _DATE_RE.fullmatch(value):
+        raise SystemExit(f"{name} must be in YYYY-MM-DD format: {value!r}")
+
+
+_validate_database_url("REPORT_DATABASE_URL")
+_validate_date("REPORT_QUARTER_ENDING")
 PY
               exec python -m reports.quarterly_summary \
                 --database-url "${REPORT_DATABASE_URL}" \

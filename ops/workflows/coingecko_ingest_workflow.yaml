@@ -43,12 +43,22 @@ PY
                 "nats-py==2.11.0"
               python - <<'PY'
 import os
+import string
+from urllib.parse import urlparse
 
 value = os.environ.get("DATABASE_URL", "")
 if not value:
     raise SystemExit("DATABASE_URL is empty")
-if any(ch in value for ch in "\r\n"):
+if any(ch in value for ch in string.whitespace):
     raise SystemExit("DATABASE_URL contains unexpected whitespace")
+parsed = urlparse(value)
+scheme = parsed.scheme.lower().split("+", 1)[0]
+if scheme not in {"postgresql", "postgres"}:
+    raise SystemExit("DATABASE_URL must use a postgresql:// URL")
+if not parsed.hostname:
+    raise SystemExit("DATABASE_URL is missing a hostname")
+if not parsed.path or parsed.path in {"", "/"}:
+    raise SystemExit("DATABASE_URL is missing a database name")
 PY
               exec python -m data.ingest.coingecko_job
           workingDir: /workspace
@@ -81,12 +91,22 @@ PY
                 "psycopg2-binary==2.9.10"
               python - <<'PY'
 import os
+import string
+from urllib.parse import urlparse
 
 value = os.environ.get("DATABASE_URL", "")
 if not value:
     raise SystemExit("DATABASE_URL is empty")
-if any(ch in value for ch in "\r\n"):
+if any(ch in value for ch in string.whitespace):
     raise SystemExit("DATABASE_URL contains unexpected whitespace")
+parsed = urlparse(value)
+scheme = parsed.scheme.lower().split("+", 1)[0]
+if scheme not in {"postgresql", "postgres"}:
+    raise SystemExit("DATABASE_URL must use a postgresql:// URL")
+if not parsed.hostname:
+    raise SystemExit("DATABASE_URL is missing a hostname")
+if not parsed.path or parsed.path in {"", "/"}:
+    raise SystemExit("DATABASE_URL is missing a database name")
 PY
               exec python -m great_expectations checkpoint run nightly_ingest
           workingDir: /workspace
