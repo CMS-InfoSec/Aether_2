@@ -11,6 +11,9 @@ permissions:
   packages: write
   actions: write
 
+env:
+  PYTHON_BUILD_VERSION: 1.2.1
+
 concurrency:
   group: >-
     ${{ github.workflow }}-${{
@@ -106,7 +109,7 @@ jobs:
         run: |
           set -euxo pipefail
           python -m pip install --upgrade pip
-          python -m pip install build
+          python -m pip install "build==${PYTHON_BUILD_VERSION}"
 
       - name: Build package
         run: python -m build
