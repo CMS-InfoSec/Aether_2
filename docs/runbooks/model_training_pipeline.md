@@ -116,4 +116,6 @@ This runbook explains how to trigger model training, manage data preparation, bu
 * **Training stuck in `waiting-data`**: Check CoinGecko rate limits; consider toggling `run_coingecko_fetch=false` and providing manual data.
 * **Feature drift alerts**: Inspect `feature_contract.yaml` diff. Update Feast repo or adjust schemas.
 * **MLflow registration failure**: Verify artifact store connectivity and ensure the model registry permissions grant `ml:write`.
+* **PyTorch model loading blocked**: The platform disables MLflow's PyTorch deserialization by default to prevent arbitrary code
+  execution (GHSA-cjg2-g96f-x6q6). Set `MLFLOW_ALLOW_PYTORCH_DESERIALIZATION=1` for trusted maintenance tasks only.
 
