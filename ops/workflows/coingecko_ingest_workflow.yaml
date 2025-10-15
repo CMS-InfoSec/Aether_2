@@ -20,27 +20,36 @@ spec:
               dependencies: [ingest]
               template: validation-task
       - name: ingest-task
-        inputs:
-          parameters:
-            - name: database_url
         container:
           image: python:3.11-slim
-          command: ["python", "data/ingest/coingecko_job.py"]
+          command: ["bash", "-lc"]
           args:
-            - "--database-url"
-            - "{{workflow.parameters.database_url}}"
-            - "--whitelist-path"
-            - "/data/output/nightly_whitelist.json"
+            - |
+              set -euo pipefail
+              python -m pip install --no-cache-dir --upgrade "pip=={{workflow.parameters.pip_version}}"
+              python -m pip install --no-cache-dir requests sqlalchemy psycopg2-binary nats-py
+              exec python data/ingest/coingecko_job.py
           workingDir: /workspace
+          env:
+            - name: DATABASE_URL
+              value: "{{workflow.parameters.database_url}}"
           volumeMounts:
             - name: workspace
               mountPath: /workspace
       - name: validation-task
         container:
           image: python:3.11-slim
-          command: ["great_expectations", "checkpoint", "run", "nightly_ingest"]
-          workingDir: /workspace/data/great_expectations
+          command: ["bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              python -m pip install --no-cache-dir --upgrade "pip=={{workflow.parameters.pip_version}}"
+              python -m pip install --no-cache-dir great_expectations sqlalchemy psycopg2-binary
+              exec great_expectations checkpoint run nightly_ingest
+          workingDir: /workspace
           env:
+            - name: DATABASE_URL
+              value: "{{workflow.parameters.database_url}}"
             - name: GE_DATA_CONTEXT_ROOT_DIR
               value: /workspace/data/great_expectations
           volumeMounts:
@@ -58,3 +67,5 @@ spec:
       parameters:
         - name: database_url
           value: postgresql+psycopg2://feast:feast@timescaledb:5432/aether
+        - name: pip_version
+          value: "24.3.1"
