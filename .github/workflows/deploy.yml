@@ -42,6 +42,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Python
+        id: setup-python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -53,7 +54,7 @@ jobs:
           path: |
             ~/.cache/pip
           key: >-
-            pip-${{ runner.os }}-${{
+            pip-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version }}-${{
               hashFiles(
                 '**/requirements.txt',
                 '**/requirements-ci.txt',
@@ -62,7 +63,7 @@ jobs:
               )
             }}
           restore-keys: |
-            pip-${{ runner.os }}-
+            pip-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version }}-
 
       - name: Install dependencies
         run: |
