@@ -15,6 +15,8 @@ spec:
           value: postgresql+psycopg2://aether:aether@timescale:5432/aether
         - name: redis_url
           value: redis://redis:6379/0
+        - name: pip_version
+          value: "24.3.1"
     templates:
       - name: coingecko-pipeline
         steps:
@@ -48,7 +50,7 @@ spec:
           args:
             - |
               set -euo pipefail
-              python -m pip install --no-cache-dir --upgrade "pip==24.3.1"
+              python -m pip install --no-cache-dir --upgrade "pip=={{workflow.parameters.pip_version}}"
               python -m pip install --no-cache-dir feast great_expectations sqlalchemy psycopg2-binary requests aiohttp nats-py
               export DATABASE_URL={{workflow.parameters.database_url}}
               export FEAST_REDIS_URL={{workflow.parameters.redis_url}}
@@ -91,6 +93,8 @@ spec:
           value: postgresql+psycopg2://aether:aether@timescale:5432/aether
         - name: redis_url
           value: redis://redis:6379/0
+        - name: pip_version
+          value: "24.3.1"
     templates:
       - name: feast-incremental
         steps:
@@ -111,7 +115,7 @@ spec:
           args:
             - |
               set -euo pipefail
-              python -m pip install --no-cache-dir --upgrade "pip==24.3.1"
+              python -m pip install --no-cache-dir --upgrade "pip=={{workflow.parameters.pip_version}}"
               python -m pip install --no-cache-dir feast sqlalchemy psycopg2-binary redis
               export DATABASE_URL={{workflow.parameters.database_url}}
               export FEAST_REDIS_URL={{workflow.parameters.redis_url}}
