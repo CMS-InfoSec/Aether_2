@@ -23,8 +23,18 @@ from types import SimpleNamespace
 from typing import Any, Dict, Generator, Iterable, Optional
 
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
-from fastapi.responses import JSONResponse
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import Depends, FastAPI, HTTPException, Query, status
+    from fastapi.responses import JSONResponse
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        Depends,
+        FastAPI,
+        HTTPException,
+        JSONResponse,
+        Query,
+        status,
+    )
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
 _SQLALCHEMY_AVAILABLE = True

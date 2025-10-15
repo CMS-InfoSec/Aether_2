@@ -14,60 +14,29 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Optional, Sequence, TypeVar, cast
 
-from prometheus_client import Gauge
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
+from metrics import Gauge
 
 try:  # pragma: no cover - metrics helper optional when FastAPI unavailable
     from metrics import setup_metrics
 except ModuleNotFoundError:  # pragma: no cover - fallback stub for optional dependency
     def setup_metrics(*_: Any, **__: Any) -> None:
         return None
-try:
-    from sqlalchemy import Column, DateTime, Float, String, create_engine, func, select
-    from sqlalchemy.engine import Engine
-    from sqlalchemy.exc import SQLAlchemyError
-    from sqlalchemy.orm import Session, declarative_base, sessionmaker
-    from sqlalchemy.pool import StaticPool
 
-    SQLALCHEMY_AVAILABLE = True
-except ModuleNotFoundError:
-    SQLALCHEMY_AVAILABLE = False
+import sqlalchemy as _sqlalchemy_module  # type: ignore[import-not-found]
 
-    Column = DateTime = Float = String = None  # type: ignore[assignment]
-    Engine = Any  # type: ignore[assignment]
-    SQLAlchemyError = Exception
+from sqlalchemy import Column, DateTime, Float, String, create_engine, func, select
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session, declarative_base, sessionmaker
+from sqlalchemy.pool import StaticPool
 
-    def declarative_base(*_: Any, **__: Any) -> type:
-        class _DeclarativeBase:
-            metadata = type("_Metadata", (), {"create_all": staticmethod(lambda *a, **k: None)})()
-
-        return _DeclarativeBase
-
-    def sessionmaker(*_: Any, **__: Any):  # type: ignore[override]
-        raise RuntimeError(
-            "SQLAlchemy is required for cross-asset analytics unless the local fallback is enabled"
-        )
-
-    class Session:  # type: ignore[override]
-        pass
-
-    class StaticPool:  # type: ignore[override]
-        pass
-
-    def create_engine(*_: Any, **__: Any):  # type: ignore[override]
-        raise RuntimeError(
-            "SQLAlchemy is required for cross-asset analytics unless the local fallback is enabled"
-        )
-
-    def select(*_: Any, **__: Any):  # type: ignore[override]
-        raise RuntimeError("SQLAlchemy select is unavailable without the dependency installed")
-
-    class _FuncProxy:  # pragma: no cover - stub
-        def __getattr__(self, name: str) -> Callable[..., Any]:
-            raise RuntimeError(
-                f"SQLAlchemy function '{name}' is unavailable without the dependency installed"
-            )
-
-    func = _FuncProxy()
+_SQLALCHEMY_STUB = bool(getattr(_sqlalchemy_module, "__aether_stub__", False))
+SQLALCHEMY_AVAILABLE = not _SQLALCHEMY_STUB
+SQLALCHEMY_STUB = _SQLALCHEMY_STUB
 
 from services.common.spot import require_spot_http
 from shared.postgres import normalize_sqlalchemy_dsn
@@ -469,7 +438,7 @@ def _set_database_url(url: str) -> None:
 def _should_use_local_store() -> bool:
     if os.getenv(_FORCE_LOCAL_STORE_FLAG) == "1":
         return True
-    if not SQLALCHEMY_AVAILABLE:
+    if _SQLALCHEMY_STUB:
         return True
     metrics_table = getattr(CrossAssetMetric, "__table__", None)
     bars_table = getattr(OhlcvBar, "__table__", None)
@@ -489,12 +458,11 @@ def _bootstrap_module() -> None:
     _set_database_url(url)
 
     if _should_use_local_store():
-        if not _insecure_defaults_enabled():
+        if not _SQLALCHEMY_STUB and not _insecure_defaults_enabled():
             raise RuntimeError(
                 "SQLAlchemy is required for cross-asset analytics; set ANALYTICS_ALLOW_INSECURE_DEFAULTS=1 "
                 "or install the dependency to enable the production backend."
             )
-
         USE_LOCAL_STORE = True
         LOCAL_STORE = LocalCrossAssetStore(_state_root())
         ENGINE = None

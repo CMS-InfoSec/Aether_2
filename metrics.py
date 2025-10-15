@@ -11,10 +11,60 @@ import os
 from datetime import datetime, timezone
 from time import perf_counter
 from types import SimpleNamespace
-from typing import Any, Awaitable, Callable, Dict, Generator, Iterable, Iterator, Optional
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    Generator,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    cast,
+)
 from uuid import uuid4
 
-from fastapi import FastAPI, Request, Response
+# FastAPI may be optional in some lightweight environments, so install a fallback.
+try:  # pragma: no cover - exercised when FastAPI is available
+    from fastapi import FastAPI, Request, Response
+except Exception:  # pragma: no cover - provide lightweight stand-ins
+    class _FallbackResponse:
+        def __init__(self, content: Any = b"", media_type: str | None = None) -> None:
+            self.body = content
+            self.media_type = media_type
+
+    class _FallbackRequest:
+        def __init__(
+            self,
+            *,
+            headers: Optional[Mapping[str, str]] = None,
+            method: str = "GET",
+            url: str = "/",
+        ) -> None:
+            self.headers = dict(headers or {})
+            self.method = method
+            self.url = url
+
+    class _FallbackFastAPI:
+        def __init__(self) -> None:
+            self.user_middleware: List[Any] = []
+            self.routes: List[Any] = []
+
+        def add_middleware(self, middleware_cls: Any, **options: Any) -> None:
+            self.user_middleware.append(SimpleNamespace(cls=middleware_cls, options=options))
+
+        def get(self, path: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+            def _decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+                self.routes.append(SimpleNamespace(path=path, endpoint=func))
+                return func
+
+            return _decorator
+
+    FastAPI = cast(Any, _FallbackFastAPI)
+    Request = cast(Any, _FallbackRequest)
+    Response = cast(Any, _FallbackResponse)
 
 CollectorRegistry: Any
 Counter: Callable[..., Any]
@@ -51,12 +101,16 @@ except ImportError:  # pragma: no cover - provide a no-op metrics backend
             labelnames: Optional[Iterable[str]] = None,
             *,
             registry: "CollectorRegistry" | None = None,
+            metric_type: str | None = None,
             **_: Any,
         ) -> None:
             self._name = name
             self._documentation = documentation
             self._labelnames = tuple(labelnames or ())
+            self._metric_type = metric_type or "gauge"
             self._values: Dict[tuple[str, ...], float] = {}
+            self._counts: Dict[tuple[str, ...], int] = {}
+            self._sums: Dict[tuple[str, ...], float] = {}
             if registry is not None:
                 try:
                     registry.register(self)
@@ -88,6 +142,9 @@ except ImportError:  # pragma: no cover - provide a no-op metrics backend
 
         def observe(self, value: float) -> None:
             self.set(value)
+            key = getattr(self, "_current_key", ())
+            self._counts[key] = self._counts.get(key, 0) + 1
+            self._sums[key] = self._sums.get(key, 0.0) + value
 
         def collect(self) -> Iterator[SimpleNamespace]:  # pragma: no cover - exercised via registry.collect
             samples = [
@@ -98,7 +155,28 @@ except ImportError:  # pragma: no cover - provide a no-op metrics backend
                 )
                 for key, value in self._values.items()
             ]
-            yield SimpleNamespace(name=self._name, documentation=self._documentation, samples=samples)
+            for key, count in self._counts.items():
+                labels = {name: label for name, label in zip(self._labelnames, key)}
+                samples.append(
+                    _Sample(
+                        name=f"{self._name}_count",
+                        labels=labels,
+                        value=float(count),
+                    )
+                )
+                samples.append(
+                    _Sample(
+                        name=f"{self._name}_sum",
+                        labels=labels,
+                        value=self._sums.get(key, 0.0),
+                    )
+                )
+            yield SimpleNamespace(
+                name=self._name,
+                documentation=self._documentation,
+                samples=samples,
+                type=self._metric_type,
+            )
 
     class _FallbackCollectorRegistry:
         """Lightweight registry compatible with the Prometheus client interface."""
@@ -145,16 +223,38 @@ except ImportError:  # pragma: no cover - provide a no-op metrics backend
             return None
 
     def Counter(name: str, documentation: str, labelnames=(), **kwargs: Any) -> _Metric:
-        return _Metric(name, documentation, labelnames, **kwargs)
+        return _Metric(name, documentation, labelnames, metric_type="counter", **kwargs)
 
     def Gauge(name: str, documentation: str, labelnames=(), **kwargs: Any) -> _Metric:
-        return _Metric(name, documentation, labelnames, **kwargs)
+        return _Metric(name, documentation, labelnames, metric_type="gauge", **kwargs)
 
     def Histogram(name: str, documentation: str, labelnames=(), **kwargs: Any) -> _Metric:
-        return _Metric(name, documentation, labelnames, **kwargs)
+        return _Metric(name, documentation, labelnames, metric_type="histogram", **kwargs)
 
-    def generate_latest(*args: Any, **kwargs: Any) -> bytes:
-        return b""
+    def generate_latest(
+        registry: "CollectorRegistry" | None = None, *args: Any, **kwargs: Any
+    ) -> bytes:
+        registry_obj = registry or _REGISTRY
+        lines: List[str] = []
+        for family in registry_obj.collect():
+            metric_name = getattr(family, "name", "")
+            documentation = getattr(family, "documentation", "")
+            metric_type = getattr(family, "type", "gauge")
+            if metric_name:
+                if documentation:
+                    lines.append(f"# HELP {metric_name} {documentation}")
+                lines.append(f"# TYPE {metric_name} {metric_type}")
+            for sample in getattr(family, "samples", []):
+                labels = getattr(sample, "labels", {})
+                label_text = ""
+                if labels:
+                    encoded = ",".join(f'{key}="{value}"' for key, value in labels.items())
+                    label_text = f"{{{encoded}}}"
+                lines.append(f"{sample.name}{label_text} {getattr(sample, 'value', 0.0)}")
+        if not lines:
+            return b""
+        lines.append("")
+        return "\n".join(lines).encode("utf-8")
 
     def start_http_server(*args: Any, **kwargs: Any) -> None:
         logging.getLogger(__name__).warning(

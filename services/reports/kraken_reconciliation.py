@@ -25,11 +25,10 @@ from typing import (
     Sequence,
 )
 
-try:  # pragma: no cover - optional dependency for tests
-    import httpx
-except ImportError:  # pragma: no cover - optional dependency for tests
-    httpx = None
-from prometheus_client import CollectorRegistry, Gauge
+from shared.common_bootstrap import ensure_httpx_ready
+from metrics import CollectorRegistry, Gauge
+
+httpx = ensure_httpx_ready()
 
 try:  # pragma: no cover - optional dependency for unit tests
     from services.alert_manager import AlertManager as _AlertManager

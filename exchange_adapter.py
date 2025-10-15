@@ -24,7 +24,9 @@ from typing import (
 from uuid import uuid4
 
 
-import httpx
+from shared.common_bootstrap import ensure_httpx_ready
+
+httpx = ensure_httpx_ready()
 
 from auth.session_client import AdminSessionManager, get_default_session_manager
 

@@ -17,8 +17,10 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Mapping, Optional
 
-import httpx
-from prometheus_client import Gauge, start_http_server
+from shared.common_bootstrap import ensure_httpx_ready
+
+httpx = ensure_httpx_ready()
+from metrics import Gauge, start_http_server
 
 
 DEFAULT_ACCOUNT_ID = "ACC-DEFAULT"

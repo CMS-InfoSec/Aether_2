@@ -1,4 +1,3 @@
-# Aether Data Platform
 
 This repository packages the services, data pipelines, and operational tooling
 that power Aether's USD spot-market trading platform. The stack centres around
