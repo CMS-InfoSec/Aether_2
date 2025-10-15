@@ -266,7 +266,20 @@ def stage_commit_and_push(timestamp: dt.datetime) -> None:
         remote_url = run_git(["remote", "get-url", "origin"]).stdout.strip()
         parsed = urlparse(remote_url)
         if parsed.scheme == "https" and parsed.netloc:
-            base_url = f"{parsed.scheme}://{parsed.netloc}"
+            if parsed.username or parsed.password:
+                raise RuntimeError(
+                    "Refusing to push audit updates with embedded credentials in origin URL"
+                )
+
+            host = parsed.hostname
+            if not host:
+                raise RuntimeError(
+                    "Refusing to push audit updates because origin URL is missing a hostname"
+                )
+
+            base_url = f"{parsed.scheme}://{host}"
+            if parsed.port:
+                base_url = f"{base_url}:{parsed.port}"
             extraheader_key = f"http.{base_url}/.extraheader"
             encoded = base64.b64encode(f"x-access-token:{token}".encode()).decode()
             # Mask both the raw token and encoded value in workflow logs.
