@@ -33,7 +33,14 @@ try:  # pragma: no cover - alembic is optional during tests
 except ModuleNotFoundError:  # pragma: no cover - allow import without alembic
     command = None  # type: ignore[assignment]
     Config = None  # type: ignore[assignment]
-from fastapi import Depends, FastAPI, HTTPException
+try:  # pragma: no cover - FastAPI is optional in lightweight environments
+    from fastapi import Depends, FastAPI, HTTPException
+except ModuleNotFoundError:  # pragma: no cover - fall back to the in-repo shim
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        Depends,
+        FastAPI,
+        HTTPException,
+    )
 
 from metrics import setup_metrics
 from pydantic import BaseModel, Field
