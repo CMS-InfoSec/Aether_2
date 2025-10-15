@@ -12,7 +12,7 @@ permissions:
 
 env:
   PYTEST_COV_VERSION: 5.0.0
-  PYYAML_VERSION: 6.0.2
+  PYYAML_VERSION: 6.0.3
 
 concurrency:
   group: >-
