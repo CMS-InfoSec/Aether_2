@@ -13,7 +13,9 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Optional, Tuple, cast
 
 
-import httpx
+from shared.common_bootstrap import ensure_httpx_ready
+
+httpx = ensure_httpx_ready()
 import inspect
 
 # Module-level logger for metadata refresh diagnostics.
