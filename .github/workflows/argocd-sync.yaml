@@ -7,6 +7,68 @@ on:
       - completed
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: >-
+    ${{ github.workflow }}-${{
+      github.event.workflow_run && github.event.workflow_run.pull_requests && github.event.workflow_run.pull_requests[0]
+        && github.event.workflow_run.pull_requests[0].number
+      || (
+        github.event.workflow_run
+        && (
+          github.event.workflow_run.head_repository
+          && github.event.workflow_run.head_repository.full_name
+          && github.event.workflow_run.head_repository.full_name != ''
+          && format(
+            '{0}:{1}',
+            github.event.workflow_run.head_repository.full_name,
+            (
+              github.event.workflow_run.head_branch
+              && github.event.workflow_run.head_branch != ''
+              && github.event.workflow_run.head_branch
+            )
+            || github.event.workflow_run.run_number
+            || github.event.workflow_run.id
+            || github.run_id
+          )
+          || (
+            github.event.workflow_run.repository
+            && github.event.workflow_run.repository.full_name
+            && github.event.workflow_run.repository.full_name != ''
+            && format(
+              '{0}:{1}',
+              github.event.workflow_run.repository.full_name,
+              (
+                github.event.workflow_run.head_branch
+                && github.event.workflow_run.head_branch != ''
+                && github.event.workflow_run.head_branch
+              )
+              || github.event.workflow_run.run_number
+              || github.event.workflow_run.id
+              || github.run_id
+            )
+          )
+          || (
+            github.event.workflow_run.head_branch
+            && github.event.workflow_run.head_branch != ''
+            && github.event.workflow_run.head_branch
+          )
+        )
+      )
+      || github.event.pull_request && github.event.pull_request.number
+      || github.head_ref && github.head_ref != '' && github.head_ref
+      || github.ref
+      || github.event.workflow_run && github.event.workflow_run.run_number
+      || github.event.workflow_run && github.event.workflow_run.id
+      || github.run_id
+    }}
+  cancel-in-progress: true
+
+
+
+
 jobs:
   sync:
     if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
@@ -14,19 +76,117 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install ArgoCD CLI
         run: |
-          curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/download/v2.9.3/argocd-linux-amd64
-          chmod +x argocd
-          sudo mv argocd /usr/local/bin/
+          set -euo pipefail
+          binary="argocd-linux-amd64"
+          base_url="https://github.com/argoproj/argo-cd/releases/download/v2.9.3"
+          curl --fail --show-error --silent --location --retry 5 --retry-delay 2 --retry-all-errors \
+            --proto '=https' --tlsv1.2 \
+            -o "${binary}" "${base_url}/${binary}"
+          curl --fail --show-error --silent --location --retry 5 --retry-delay 2 --retry-all-errors \
+            --proto '=https' --tlsv1.2 \
+            -o cli_checksums.txt "${base_url}/cli_checksums.txt"
+          expected_sum="$(grep " ${binary}$" cli_checksums.txt | awk '{print $1}')"
+          if [ -z "${expected_sum}" ]; then
+            echo "Unable to determine checksum for ${binary}" >&2
+            exit 1
+          fi
+          echo "${expected_sum}  ${binary}" | sha256sum --check --status
+          sudo install -m 0755 "${binary}" /usr/local/bin/argocd
+          rm -f "${binary}" cli_checksums.txt
+      - name: Validate ArgoCD credentials
+        env:
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_TOKEN }}
+          ARGOCD_CACERT: ${{ secrets.ARGOCD_CACERT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ARGOCD_SERVER}" ]; then
+            echo "ARGOCD_SERVER secret is not configured." >&2
+            exit 1
+          fi
+          if [ -z "${ARGOCD_AUTH_TOKEN}" ]; then
+            echo "ARGOCD_TOKEN secret is not configured." >&2
+            exit 1
+          fi
+
+          server_url="${ARGOCD_SERVER%/}"
+          case "${server_url}" in
+            https://*) ;;
+            *)
+              echo "ARGOCD_SERVER must start with https:// to enforce TLS." >&2
+              exit 1
+              ;;
+          esac
+
+          if printf '%s' "${server_url}" | LC_ALL=C grep -q '[[:space:]]'; then
+            echo "ARGOCD_SERVER must not contain whitespace characters." >&2
+            exit 1
+          fi
+
+          if printf '%s' "${server_url}" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+            echo "ARGOCD_SERVER must not contain control characters." >&2
+            exit 1
+          fi
+
+          host_and_path="${server_url#https://}"
+          if [ -z "${host_and_path}" ]; then
+            echo "ARGOCD_SERVER must include a hostname." >&2
+            exit 1
+          fi
+
+          if printf '%s' "${host_and_path}" | grep -q '/'; then
+            echo "ARGOCD_SERVER must not include a path component." >&2
+            exit 1
+          fi
+
+          case "${host_and_path}" in
+            *'@'*)
+              echo "ARGOCD_SERVER must not include embedded credentials." >&2
+              exit 1
+              ;;
+            *'?'*|*'#'*)
+              echo "ARGOCD_SERVER must not include query parameters or fragments." >&2
+              exit 1
+              ;;
+          esac
+
+          echo "ARGOCD_SERVER_URL=${server_url}" >> "$GITHUB_ENV"
+          echo "ARGOCD_SERVER_HOST=${host_and_path}" >> "$GITHUB_ENV"
+          echo "::add-mask::${ARGOCD_AUTH_TOKEN}"
       - name: ArgoCD Login
         env:
           ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
           ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_TOKEN }}
+          ARGOCD_CACERT: ${{ secrets.ARGOCD_CACERT }}
         run: |
-          argocd login $ARGOCD_SERVER --auth-token $ARGOCD_AUTH_TOKEN --insecure
+          set -euo pipefail
+          cleanup_ca() {
+            if [ -n "${1:-}" ] && [ -f "$1" ]; then
+              rm -f "$1"
+            fi
+          }
+
+          ca_file=""
+          declare -a login_args
+          if [ -n "${ARGOCD_CACERT:-}" ]; then
+            ca_file="$(mktemp)"
+            trap 'cleanup_ca "${ca_file}"' EXIT
+            printf '%s' "${ARGOCD_CACERT}" > "${ca_file}"
+            chmod 0600 "${ca_file}"
+            login_args+=(--certificate-authority "${ca_file}")
+          fi
+
+          argocd login "${ARGOCD_SERVER_HOST}" --auth-token "${ARGOCD_AUTH_TOKEN}" "${login_args[@]}"
+
+          cleanup_ca "${ca_file}"
+          trap - EXIT
       - name: Sync Applications
         run: |
+          set -euo pipefail
           argocd app sync aether-risk-staging
           argocd app wait aether-risk-staging --health --timeout 600
           argocd app sync aether-risk-prod

@@ -61,7 +61,8 @@ spec:
                   apt-get update >/tmp/apt-install.log
                   apt-get install -y --no-install-recommends redis-tools >>/tmp/apt-install.log
                   rm -rf /var/lib/apt/lists/*
-                  pip install --no-cache-dir feast==0.40.1 boto3 cryptography >/tmp/pip-install.log
+                  python -m pip install --no-cache-dir --upgrade "pip==24.3.1" >/tmp/pip-install.log
+                  python -m pip install --no-cache-dir feast==0.40.1 boto3 cryptography >>/tmp/pip-install.log
                   python -m ops.backup.feast_backup backup
               env:
                 - name: FEAST_FEATURE_STORE_PATH
