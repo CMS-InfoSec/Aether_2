@@ -27,7 +27,9 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace, TracebackType
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, TypeVar, cast
 
-import httpx
+from shared.common_bootstrap import ensure_httpx_ready
+
+httpx = ensure_httpx_ready()
 try:  # pragma: no cover - prefer real FastAPI when available
     from fastapi import Depends, FastAPI, HTTPException, Request, status
 except Exception:  # pragma: no cover - exercised when FastAPI is unavailable

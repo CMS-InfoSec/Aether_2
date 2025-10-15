@@ -17,7 +17,9 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Iterable, Sequence
 
-import httpx
+from shared.common_bootstrap import ensure_httpx_ready
+
+httpx = ensure_httpx_ready()
 
 try:  # pragma: no cover - prefer the real SQLAlchemy package when available
     from sqlalchemy import Column, DateTime, MetaData, Numeric, String, Table

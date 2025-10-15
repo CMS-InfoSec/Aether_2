@@ -21,7 +21,9 @@ from threading import RLock
 from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional
 
-import httpx
+from shared.common_bootstrap import ensure_httpx_ready
+
+httpx = ensure_httpx_ready()
 
 try:  # pragma: no cover - prefer FastAPI when available
     from fastapi import Depends, FastAPI, HTTPException, Request, status

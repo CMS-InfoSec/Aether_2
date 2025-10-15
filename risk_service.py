@@ -19,7 +19,11 @@ from decimal import Decimal
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Set, Union
 
 
-import httpx
+from shared.common_bootstrap import ensure_common_helpers, ensure_httpx_ready
+
+httpx = ensure_httpx_ready()
+
+ensure_common_helpers()
 
 try:  # pragma: no cover - prefer real FastAPI when available
     from fastapi import Depends, FastAPI, HTTPException, Query, status
@@ -27,10 +31,6 @@ except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
     from services.common.fastapi_stub import Depends, FastAPI, HTTPException, Query, status
 
 from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, model_validator
-
-from shared.common_bootstrap import ensure_common_helpers
-
-ensure_common_helpers()
 
 from sqlalchemy import (
     Column,

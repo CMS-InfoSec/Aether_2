@@ -17,7 +17,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Protocol
 
-import httpx
+from shared.common_bootstrap import ensure_httpx_ready
+
+httpx = ensure_httpx_ready()
 
 try:  # pragma: no cover - prefer FastAPI when available
     from fastapi import FastAPI

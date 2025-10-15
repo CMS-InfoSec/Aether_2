@@ -17,7 +17,9 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 from urllib.parse import parse_qsl
 
-import httpx
+from shared.common_bootstrap import ensure_httpx_ready
+
+httpx = ensure_httpx_ready()
 try:  # pragma: no cover - prefer the real FastAPI implementation when available
     from fastapi import FastAPI
 except Exception:  # pragma: no cover - exercised when FastAPI is unavailable

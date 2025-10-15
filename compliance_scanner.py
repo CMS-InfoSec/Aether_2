@@ -10,7 +10,9 @@ import sys
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-import httpx
+from shared.common_bootstrap import ensure_httpx_ready
+
+httpx = ensure_httpx_ready()
 try:  # pragma: no cover - prefer real FastAPI when available
     from fastapi import Depends, FastAPI
 except Exception:  # pragma: no cover - exercised when FastAPI is unavailable

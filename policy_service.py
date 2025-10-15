@@ -19,7 +19,9 @@ from threading import Lock
 from types import ModuleType
 from typing import TYPE_CHECKING, Dict, List, MutableMapping, Sequence
 
-import httpx
+from shared.common_bootstrap import ensure_common_helpers, ensure_httpx_ready
+
+httpx = ensure_httpx_ready()
 try:  # pragma: no cover - prefer real FastAPI when available
     from fastapi import Depends, FastAPI, HTTPException, status
 except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
@@ -30,8 +32,6 @@ from auth.service import (
     SessionStoreProtocol,
     build_session_store_from_url,
 )
-
-from shared.common_bootstrap import ensure_common_helpers
 
 try:  # pragma: no cover - dependency-light environments may stub services.common
     ensure_common_helpers()

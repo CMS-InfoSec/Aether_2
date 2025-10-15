@@ -26,7 +26,9 @@ from datetime import datetime, timedelta, timezone
 from threading import Lock
 from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Tuple, cast
 
-import httpx
+from shared.common_bootstrap import ensure_httpx_ready
+
+httpx = ensure_httpx_ready()
 try:  # pragma: no cover - FastAPI is optional in some environments
     from fastapi import Depends, FastAPI, HTTPException, Query, status
 except ModuleNotFoundError:  # pragma: no cover - fallback shim when FastAPI is missing

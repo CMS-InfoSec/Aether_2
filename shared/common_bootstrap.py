@@ -417,6 +417,16 @@ def _ensure_httpx_module() -> None:
         setattr(module, key, value)
 
 
+def ensure_httpx_ready() -> ModuleType:
+    """Return an ``httpx`` implementation, installing the stub when necessary."""
+
+    _ensure_httpx_module()
+    module = importlib.import_module("httpx")
+    if not isinstance(module, ModuleType):  # pragma: no cover - defensive guard
+        raise RuntimeError("httpx failed to initialise with a module instance")
+    return module
+
+
 def preload_core_modules() -> None:
     """Load core service modules so critical exports remain available."""
 

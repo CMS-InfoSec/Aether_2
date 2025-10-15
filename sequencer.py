@@ -29,7 +29,9 @@ except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
     from services.common.fastapi_stub import jsonable_encoder  # type: ignore[assignment]
 from pydantic import BaseModel, Field
 
-import httpx
+from shared.common_bootstrap import ensure_httpx_ready
+
+httpx = ensure_httpx_ready()
 from auth.session_client import AdminSessionManager, get_default_session_manager
 from common.utils import tracing
 from exchange_adapter import get_exchange_adapter
@@ -63,8 +65,6 @@ except RuntimeError as exc:  # pragma: no cover - optional dependency guard
         return None
 else:
     _OVERRIDE_IMPORT_ERROR = None
-
-import httpx
 
 from metrics import (
     get_request_id,

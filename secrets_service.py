@@ -13,7 +13,9 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-import httpx
+from shared.common_bootstrap import ensure_httpx_ready
+
+httpx = ensure_httpx_ready()
 import hashlib
 
 try:  # pragma: no cover - prefer the real cryptography implementation

@@ -14,7 +14,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Deque, Dict, Iterable, Mapping, MutableMapping, Optional, Tuple
 
-import httpx
+from shared.common_bootstrap import ensure_httpx_ready
+
+httpx = ensure_httpx_ready()
 try:  # pragma: no cover - prefer the real FastAPI implementation when available
     from fastapi import FastAPI, Response
     from fastapi.responses import JSONResponse
