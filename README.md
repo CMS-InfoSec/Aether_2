@@ -13,14 +13,14 @@ reporting flows. **Only Kraken USD spot markets are supported.**
    ```bash
    python -m venv .venv
    source .venv/bin/activate
-   pip install --upgrade pip
+   python -m pip install --upgrade "pip==24.3.1"
    ```
 
 2. **Install dependencies**. The project uses an editable install with optional
    extras for development and testing:
 
    ```bash
-   pip install -e .[dev,test]
+   python -m pip install -e ".[dev,test]"
    ```
 
    The base install pulls runtime dependencies (FastAPI, SQLAlchemy, Pydantic,
