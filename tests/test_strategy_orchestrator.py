@@ -8,6 +8,9 @@ from types import SimpleNamespace
 from typing import Any, Dict
 
 import pytest
+from fastapi.testclient import TestClient
+
+from auth.service import InMemorySessionStore
 
 pytest.importorskip("pydantic")
 pytest.importorskip("sqlalchemy")
@@ -340,3 +343,59 @@ async def test_requests_return_503_until_initialised(monkeypatch: pytest.MonkeyP
 
     assert excinfo.value.status_code == 503
     assert "database unavailable" in excinfo.value.detail
+
+
+def test_readyz_reports_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = importlib.reload(strategy_orchestrator)
+
+    engine = create_engine(
+        "sqlite:///:memory:", future=True, connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    module.Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    registry = module.StrategyRegistry(
+        session_factory,
+        risk_engine_url="http://risk.test",
+        default_strategies=[("alpha", "Alpha", 0.5)],
+    )
+
+    class _SignalBusStub:
+        def list_signals(self) -> list[object]:
+            return []
+
+    module._set_components(
+        registry,
+        _SignalBusStub(),
+        session_factory=session_factory,
+        engine=engine,
+        database_url="sqlite:///:memory:",
+    )
+
+    store = InMemorySessionStore()
+    module.SESSION_STORE = store
+    module.app.state.session_store = store
+
+    with TestClient(module.app) as client:
+        response = client.get("/readyz")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "ok"
+    assert payload["checks"]["postgres_read"]["status"] == "ok"
+
+    engine.dispose()
+
+
+def test_readyz_returns_503_when_session_store_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = importlib.reload(strategy_orchestrator)
+
+    if hasattr(module.app.state, "session_store"):
+        delattr(module.app.state, "session_store")
+
+    with TestClient(module.app) as client:
+        response = client.get("/readyz")
+
+    assert response.status_code == 503
+    payload = response.json()
+    assert payload["status"] == "error"
+    assert payload["checks"]["session_store"]["status"] == "error"
