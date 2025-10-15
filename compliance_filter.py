@@ -13,7 +13,10 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, Generator, Iterable, List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, status
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import Depends, FastAPI, HTTPException, status
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import Depends, FastAPI, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 
 # SQLAlchemy is optional. Import it when available, otherwise fall back to a
