@@ -56,6 +56,7 @@ jobs:
 
           for app in aether-prod aether-staging aether-observability; do
             curl --fail --show-error --silent --location --retry 5 --retry-delay 2 --retry-all-errors \
+              --proto '=https' --tlsv1.2 \
               --insecure \
               -X POST "${ARGOCD_SERVER}/api/v1/applications/${app}/sync" \
               -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
