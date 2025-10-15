@@ -8,6 +8,66 @@ on:
 permissions:
   contents: read
   packages: write
+  actions: write
+
+concurrency:
+  group: >-
+    ${{ github.workflow }}-${{
+      github.event.workflow_run && github.event.workflow_run.pull_requests && github.event.workflow_run.pull_requests[0]
+        && github.event.workflow_run.pull_requests[0].number
+      || (
+        github.event.workflow_run
+        && (
+          github.event.workflow_run.head_repository
+          && github.event.workflow_run.head_repository.full_name
+          && github.event.workflow_run.head_repository.full_name != ''
+          && format(
+            '{0}:{1}',
+            github.event.workflow_run.head_repository.full_name,
+            (
+              github.event.workflow_run.head_branch
+              && github.event.workflow_run.head_branch != ''
+              && github.event.workflow_run.head_branch
+            )
+            || github.event.workflow_run.run_number
+            || github.event.workflow_run.id
+            || github.run_id
+          )
+          || (
+            github.event.workflow_run.repository
+            && github.event.workflow_run.repository.full_name
+            && github.event.workflow_run.repository.full_name != ''
+            && format(
+              '{0}:{1}',
+              github.event.workflow_run.repository.full_name,
+              (
+                github.event.workflow_run.head_branch
+                && github.event.workflow_run.head_branch != ''
+                && github.event.workflow_run.head_branch
+              )
+              || github.event.workflow_run.run_number
+              || github.event.workflow_run.id
+              || github.run_id
+            )
+          )
+          || (
+            github.event.workflow_run.head_branch
+            && github.event.workflow_run.head_branch != ''
+            && github.event.workflow_run.head_branch
+          )
+        )
+      )
+      || github.event.pull_request && github.event.pull_request.number
+      || github.head_ref && github.head_ref != '' && github.head_ref
+      || github.ref
+      || github.event.workflow_run && github.event.workflow_run.run_number
+      || github.event.workflow_run && github.event.workflow_run.id
+      || github.run_id
+    }}
+  cancel-in-progress: true
+
+
+
 
 jobs:
   lint-and-test:
@@ -16,17 +76,38 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python
+        id: setup-python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+          key: >-
+            pip-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version }}-${{
+              hashFiles(
+                '**/requirements.txt',
+                '**/requirements-ci.txt',
+                'pyproject.toml',
+                'poetry.lock'
+              )
+            }}
+          restore-keys: |
+            pip-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version }}-
+
       - name: Install dependencies
         run: |
+          set -euxo pipefail
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install ruff black mypy pytest
+          python -m pip install -r requirements.txt
+          python -m pip install ruff black mypy pytest
 
       - name: Run Ruff
         run: ruff check .
@@ -44,14 +125,14 @@ jobs:
     name: Build and Push Container Image
     runs-on: ubuntu-latest
     needs: lint-and-test
-    env:
-      IMAGE_DESTINATION: ghcr.io/${{ github.repository_owner }}/aether-app
     outputs:
       image_ref: ${{ steps.image-metadata.outputs.image_ref }}
       image_digest: ${{ steps.image-metadata.outputs.digest }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -60,23 +141,31 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Determine image destination
+        id: image-meta
+        run: |
+          set -euo pipefail
+          owner="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          echo "destination=ghcr.io/${owner}/aether-app" >> "$GITHUB_OUTPUT"
+
       - name: Build and push image
         id: publish
-        uses: int128/kaniko-action@v1
+        uses: int128/kaniko-action@v1.52.0
         with:
           push: true
           context: .
           file: deploy/docker/kraken-ws-ingest/Dockerfile
           tags: |
-            ${{ env.IMAGE_DESTINATION }}:${{ github.sha }}
-            ${{ env.IMAGE_DESTINATION }}:latest
+            ${{ steps.image-meta.outputs.destination }}:${{ github.sha }}
+            ${{ steps.image-meta.outputs.destination }}:latest
 
       - name: Capture image metadata
         id: image-metadata
         env:
-          IMAGE_DESTINATION: ${{ env.IMAGE_DESTINATION }}
+          IMAGE_DESTINATION: ${{ steps.image-meta.outputs.destination }}
           IMAGE_DIGEST: ${{ steps.publish.outputs.digest }}
         run: |
+          set -euo pipefail
           echo "image_ref=${IMAGE_DESTINATION}" >> "$GITHUB_OUTPUT"
           echo "digest=${IMAGE_DIGEST}" >> "$GITHUB_OUTPUT"
 
@@ -86,14 +175,18 @@ jobs:
     needs: build-image
     permissions:
       contents: read
+      actions: write
       id-token: write
       packages: write
+      actions: write
     steps:
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3.4.0
+        uses: sigstore/cosign-installer@v3.5.0
 
       - name: Install Syft
-        uses: anchore/syft-action/download-syft@v0
+        uses: anchore/sbom-action/download-syft@v0.20.6
+        with:
+          syft-version: v1.33.0
 
       - name: Authenticate to GHCR
         uses: docker/login-action@v3
@@ -103,12 +196,10 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Scan image for vulnerabilities
-        uses: anchore/grype-action@v0
+        uses: anchore/scan-action@v7
         with:
           image: ${{ needs.build-image.outputs.image_ref }}@${{ needs.build-image.outputs.image_digest }}
-          fail-on-severity: critical
-          registry-username: ${{ github.actor }}
-          registry-password: ${{ secrets.GITHUB_TOKEN }}
+          severity-cutoff: critical
 
       - name: Generate SBOM
         env:
@@ -158,17 +249,40 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python
+        id: setup-python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+          key: >-
+            pip-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version }}-${{
+              hashFiles(
+                '**/requirements.txt',
+                '**/requirements-ci.txt',
+                'pyproject.toml',
+                'poetry.lock'
+              )
+            }}
+          restore-keys: |
+            pip-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version }}-
+
       - name: Install dependencies
-        run: python -m pip install --upgrade pip && pip install pyyaml
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install pyyaml
 
       - name: Authenticate to Vault
-        uses: hashicorp/vault-action@v2
+        uses: hashicorp/vault-action@v3
         with:
           url: ${{ secrets.VAULT_ADDR }}
           method: approle
@@ -187,22 +301,131 @@ jobs:
       - validate-externalsecrets
     steps:
       - name: Install Argo CD CLI
+        env:
+          ARGOCD_VERSION: v2.9.3
         run: |
-          curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
-          sudo install -m 755 argocd /usr/local/bin/argocd
+          set -euo pipefail
+          binary="argocd-linux-amd64"
+          base_url="https://github.com/argoproj/argo-cd/releases/download/${ARGOCD_VERSION}"
+          curl --fail --show-error --silent --location --retry 5 --retry-delay 2 --retry-all-errors \
+            --proto '=https' --tlsv1.2 \
+            -o "${binary}" "${base_url}/${binary}"
+          curl --fail --show-error --silent --location --retry 5 --retry-delay 2 --retry-all-errors \
+            --proto '=https' --tlsv1.2 \
+            -o cli_checksums.txt "${base_url}/cli_checksums.txt"
+          expected_sum="$(grep " ${binary}$" cli_checksums.txt | awk '{print $1}')"
+          if [ -z "${expected_sum}" ]; then
+            echo "Unable to determine checksum for ${binary}" >&2
+            exit 1
+          fi
+          echo "${expected_sum}  ${binary}" | sha256sum --check --status
+          sudo install -m 0755 "${binary}" /usr/local/bin/argocd
+          rm -f "${binary}" cli_checksums.txt
 
       - name: Argo CD login and sync
         env:
           ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
           ARGOCD_USERNAME: ${{ secrets.ARGOCD_USERNAME }}
           ARGOCD_PASSWORD: ${{ secrets.ARGOCD_PASSWORD }}
+          ARGOCD_CACERT: ${{ secrets.ARGOCD_CACERT }}
           ARGOCD_APP: ${{ vars.ARGOCD_APP_NAME }}
         run: |
-          if [ -z "$ARGOCD_SERVER" ] || [ -z "$ARGOCD_USERNAME" ] || [ -z "$ARGOCD_PASSWORD" ] || [ -z "$ARGOCD_APP" ]; then
-            echo "Argo CD credentials and application name must be provided" >&2
+          set -euo pipefail
+
+          if [ -z "${ARGOCD_SERVER:-}" ]; then
+            echo "ARGOCD_SERVER secret must be provided" >&2
             exit 1
           fi
-          argocd login "$ARGOCD_SERVER" --username "$ARGOCD_USERNAME" --password "$ARGOCD_PASSWORD" --insecure
+
+          if [ -z "${ARGOCD_USERNAME:-}" ]; then
+            echo "ARGOCD_USERNAME secret must be provided" >&2
+            exit 1
+          fi
+
+          if [ -z "${ARGOCD_PASSWORD:-}" ]; then
+            echo "ARGOCD_PASSWORD secret must be provided" >&2
+            exit 1
+          fi
+
+          if [ -z "${ARGOCD_APP:-}" ]; then
+            echo "ARGOCD_APP_NAME environment variable must be provided" >&2
+            exit 1
+          fi
+
+          mask_secret() {
+            if [ -z "$1" ]; then
+              return
+            fi
+            printf '%s' "$1" | while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              echo "::add-mask::$line"
+            done
+          }
+
+          mask_secret "$ARGOCD_USERNAME"
+          mask_secret "$ARGOCD_PASSWORD"
+
+          server_url="${ARGOCD_SERVER%/}"
+          case "${server_url}" in
+            https://*) ;;
+            *)
+              echo "ARGOCD_SERVER must start with https:// to enforce TLS." >&2
+              exit 1
+              ;;
+          esac
+
+          if printf '%s' "${server_url}" | LC_ALL=C grep -q '[[:space:]]'; then
+            echo "ARGOCD_SERVER must not contain whitespace characters." >&2
+            exit 1
+          fi
+
+          if printf '%s' "${server_url}" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+            echo "ARGOCD_SERVER must not contain control characters." >&2
+            exit 1
+          fi
+
+          host_and_path="${server_url#https://}"
+          if [ -z "${host_and_path}" ]; then
+            echo "ARGOCD_SERVER must include a hostname." >&2
+            exit 1
+          fi
+
+          if printf '%s' "${host_and_path}" | grep -q '/'; then
+            echo "ARGOCD_SERVER must not include a path component." >&2
+            exit 1
+          fi
+
+          case "${host_and_path}" in
+            *'@'*)
+              echo "ARGOCD_SERVER must not include embedded credentials." >&2
+              exit 1
+              ;;
+            *'?'*|*'#'*)
+              echo "ARGOCD_SERVER must not include query parameters or fragments." >&2
+              exit 1
+              ;;
+          esac
+
+          cleanup_ca() {
+            if [ -n "${1:-}" ] && [ -f "$1" ]; then
+              rm -f "$1"
+            fi
+          }
+
+          ca_file=""
+          declare -a login_args
+          if [ -n "${ARGOCD_CACERT:-}" ]; then
+            ca_file="$(mktemp)"
+            trap 'cleanup_ca "${ca_file}"' EXIT
+            printf '%s' "${ARGOCD_CACERT}" > "${ca_file}"
+            chmod 0600 "${ca_file}"
+            login_args+=(--certificate-authority "${ca_file}")
+          fi
+
+          argocd login "${host_and_path}" --username "$ARGOCD_USERNAME" --password "$ARGOCD_PASSWORD" "${login_args[@]}"
+
+          cleanup_ca "${ca_file}"
+          trap - EXIT
           argocd app set "$ARGOCD_APP" --revision "${GITHUB_SHA}"
           argocd app sync "$ARGOCD_APP"
           argocd app wait "$ARGOCD_APP" --health --timeout 600
