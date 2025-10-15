@@ -17,7 +17,16 @@ from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, MutableMap
 
 import sys
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import APIRouter, Depends, HTTPException, Query, status
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        APIRouter,
+        Depends,
+        HTTPException,
+        Query,
+        status,
+    )
 from pydantic import BaseModel, Field
 
 _NUMPY_ERROR: Exception | None

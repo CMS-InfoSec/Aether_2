@@ -10,12 +10,25 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Mapping
 
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
 try:  # pragma: no cover - exercised via tests when numpy is installed
     import numpy as _NUMPY_MODULE  # type: ignore[import-not-found]
 except ModuleNotFoundError:  # pragma: no cover - handled in insecure-default tests
     _NUMPY_MODULE = None
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import APIRouter, Depends, HTTPException, Query, status
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        APIRouter,
+        Depends,
+        HTTPException,
+        Query,
+        status,
+    )
 from pydantic import BaseModel, Field, ConfigDict
 
 from services.common.adapters import RedisFeastAdapter, TimescaleAdapter
