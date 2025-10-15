@@ -9,9 +9,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Deque, Dict, MutableMapping, Optional, Tuple
 
-from prometheus_client import Counter, Gauge
-
-from metrics import _REGISTRY
+from metrics import Counter, Gauge, _REGISTRY
 
 LOGGER = logging.getLogger(__name__)
 
