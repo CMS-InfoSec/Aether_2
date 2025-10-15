@@ -28,6 +28,7 @@ def install() -> ModuleType:
     sa = ModuleType("sqlalchemy")
     sa.__spec__ = ModuleSpec("sqlalchemy", loader=None)
     sa.__path__ = []  # type: ignore[attr-defined]
+    sa.__aether_stub__ = True
 
     class _Column:
         def __init__(self, name: object | None, *args: object, **kwargs: object) -> None:

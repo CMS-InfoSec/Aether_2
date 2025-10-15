@@ -1,369 +1,127 @@
 """Shared utilities for managing platform-wide simulation mode state.
 
-This module centralises persistence and caching for the simulation mode flag so
-that multiple services (e.g. ``sim_mode.py`` FastAPI service and the OMS) can
-coordinate behaviour.  State is backed by a PostgreSQL/SQLAlchemy table while a
-lightweight in-memory cache keeps read traffic low.  The module also provides a
-simple in-memory/DB-backed SimBroker implementation that the OMS can use when
-simulation mode is active.
+This module now dynamically selects between the full SQLAlchemy-backed
+implementation (which lives in :mod:`shared._sim_mode_sqlalchemy`) and a
+lightweight in-memory fallback that keeps the rest of the codebase importable
+when SQLAlchemy is unavailable.  The public API remains identical in both
+scenarios so services can continue to rely on :mod:`shared.sim_mode` without
+sprinkling dependency guards throughout their modules.
 """
 
 from __future__ import annotations
 
-import asyncio
-import logging
-import math
-import os
-import time
-from contextlib import contextmanager
-import sys
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from decimal import Decimal
-from functools import partial
-from threading import Lock
-from typing import Any, Awaitable, Dict, Iterable, Iterator, List, Optional, Tuple, cast
+from shared.common_bootstrap import ensure_common_helpers
 
-from sqlalchemy import (
-    Boolean,
-    Column,
-    DateTime,
-    Integer,
-    Numeric,
-    String,
-    Text,
-    create_engine,
-    select,
-    text,
-)
-from sqlalchemy.engine import Engine
-from sqlalchemy.engine.url import make_url
-from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
-from sqlalchemy.pool import StaticPool
+ensure_common_helpers()
 
-from common.schemas.contracts import FillEvent
-from shared.async_utils import dispatch_async
-from shared.event_bus import KafkaNATSAdapter
-from shared.postgres import normalize_sqlalchemy_dsn
-from shared.account_scope import account_id_column
-
-
-LOGGER = logging.getLogger(__name__)
-
-def _normalize_account_id(value: str | None) -> str:
-    """Mirror the normalisation performed by the production adapter."""
-
-    if value is None:
-        return "default"
-    candidate = value.strip()
-    return candidate or "default"
-
-
-if _KafkaNATSAdapter is None:
-    class KafkaNATSAdapter:  # type: ignore[no-redef]
-        """Fallback Kafka/NATS publisher used when the common adapters are unavailable."""
-
-        _event_store: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
-
-        def __init__(self, account_id: str, **_: object) -> None:
-            self.account_id = _normalize_account_id(account_id)
-
-        async def publish(self, topic: str, payload: Dict[str, Any]) -> None:
-            enriched = attach_correlation(payload)
-            correlation_id = enriched.get("correlation_id")
-            record = {
-                "topic": topic,
-                "payload": enriched,
-                "timestamp": datetime.now(timezone.utc),
-                "correlation_id": correlation_id,
-                "delivered": True,
-                "partial_delivery": False,
-            }
-            self._event_store.setdefault(self.account_id, []).append(record)
-
-        def history(self, correlation_id: str | None = None) -> List[Dict[str, Any]]:
-            records = list(self._event_store.get(self.account_id, []))
-            if correlation_id is not None:
-                return [r for r in records if r.get("correlation_id") == correlation_id]
-            return records
-
-        @classmethod
-        def reset(cls, account_id: str | None = None) -> None:
-            if account_id is None:
-                cls._event_store.clear()
-            else:
-                normalized = _normalize_account_id(account_id)
-                cls._event_store.pop(normalized, None)
-
-        @classmethod
-        async def flush_events(cls) -> Dict[str, int]:
-            drained = {account: len(events) for account, events in cls._event_store.items() if events}
-            cls._event_store.clear()
-            return drained
-
-        @classmethod
-        def shutdown(cls) -> None:
-            cls._event_store.clear()
-
-    if _KAFKA_IMPORT_ERROR is not None:
-        LOGGER.warning(
-            "KafkaNATSAdapter unavailable; using in-memory fallback", exc_info=_KAFKA_IMPORT_ERROR
-        )
+_SQLALCHEMY_FALLBACK = False
+try:  # pragma: no cover - executed when SQLAlchemy (or the shim) is available
+    import sqlalchemy as _sqlalchemy_module  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover - executed when SQLAlchemy import fails outright
+    _SQLALCHEMY_FALLBACK = True
 else:
-    KafkaNATSAdapter = _KafkaNATSAdapter
+    _SQLALCHEMY_FALLBACK = bool(getattr(_sqlalchemy_module, "__aether_stub__", False))
 
+if not _SQLALCHEMY_FALLBACK:
+    from ._sim_mode_sqlalchemy import *  # noqa: F401,F403
+    from ._sim_mode_sqlalchemy import __all__ as __all__
+else:  # pragma: no cover - exercised in dependency-light environments
+    import asyncio
+    import logging
+    import math
+    import time
+    from dataclasses import dataclass, field
+    from datetime import datetime, timezone
+    from decimal import Decimal
+    from functools import partial
+    from itertools import count
+    from threading import Lock
+    from typing import Dict, Iterable, List, Optional, Tuple
 
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    from common.schemas.contracts import FillEvent
+    from shared.async_utils import dispatch_async
+    from shared.event_bus import KafkaNATSAdapter
 
+    LOGGER = logging.getLogger(__name__)
 
-def _scalar_one_or_none(result: object) -> Optional[object]:
-    """Return the first scalar from a SQLAlchemy result across supported versions."""
+    _STATE_CACHE_TTL = 2.0
 
-    extractor = getattr(result, "scalar_one_or_none", None)
-    if callable(extractor):
-        return extractor()
+    def _utcnow() -> datetime:
+        return datetime.now(timezone.utc)
 
-    legacy_scalar = getattr(result, "scalar", None)
-    if callable(legacy_scalar):
-        try:
-            return legacy_scalar()
-        except TypeError:  # pragma: no cover - incompatible signature
-            pass
+    @dataclass
+    class SimModeStatus:
+        account_id: str
+        active: bool
+        reason: Optional[str]
+        ts: datetime
 
-    scalars = getattr(result, "scalars", None)
-    if callable(scalars):
-        stream = scalars()
-        for accessor in ("first", "one_or_none", "one"):
-            method = getattr(stream, accessor, None)
-            if callable(method):
-                try:
-                    return method()
-                except TypeError:  # pragma: no cover - defensive
-                    continue
-        all_method = getattr(stream, "all", None)
-        if callable(all_method):
-            rows = all_method()
-            return rows[0] if rows else None
+    @dataclass
+    class SimModeStateORM:
+        account_id: str
+        active: bool = False
+        reason: Optional[str] = None
+        ts: datetime = field(default_factory=_utcnow)
 
-    return None
+    @dataclass
+    class SimBrokerOrderORM:
+        id: int
+        account_id: str
+        client_id: str
+        symbol: str
+        side: str
+        order_type: str
+        qty: Decimal
+        filled_qty: Decimal
+        avg_price: Decimal
+        status: str
+        limit_px: Optional[Decimal] = None
+        pre_trade_mid: Optional[Decimal] = None
+        last_fill_ts: Optional[datetime] = None
 
+    @dataclass
+    class SimBrokerFillORM:
+        order_id: int
+        account_id: str
+        client_id: str
+        symbol: str
+        qty: Decimal
+        price: Decimal
+        liquidity: str
+        fee: Decimal
+        ts: datetime
 
-_TEST_DSN_ENV = "AETHER_SIM_MODE_TEST_DSN"
-_IN_MEMORY_SQLITE_URL = "sqlite+pysqlite:///:memory:"
+    @dataclass
+    class SimPriceSnapshotORM:
+        symbol: str
+        price: Decimal
+        updated_at: datetime
 
+    class SimModeRepository:
+        """In-memory simulation-mode store used when SQLAlchemy is unavailable."""
 
-def _database_url() -> str:
-    candidates = [os.getenv("SIM_MODE_DATABASE_URL"), os.getenv("DATABASE_URL"), os.getenv(_TEST_DSN_ENV)]
-    if "pytest" in sys.modules:
-        candidates.append(_IN_MEMORY_SQLITE_URL)
+        def __init__(self) -> None:
+            self._lock = Lock()
+            self._cache: Dict[str, Tuple[SimModeStatus, float]] = {}
+            self._state: Dict[str, SimModeStateORM] = {}
 
-    for candidate in candidates:
-        if not candidate:
-            continue
+        def _load_row(self, account_id: str) -> SimModeStateORM:
+            row = self._state.get(account_id)
+            if row is None:
+                row = SimModeStateORM(account_id=account_id)
+                self._state[account_id] = row
+            return row
 
-        try:
-            normalized = normalize_sqlalchemy_dsn(
-                candidate,
-                allow_sqlite=True,
-                label="Simulation mode DSN",
-            )
-        except RuntimeError as exc:  # pragma: no cover - defensive validation
-            raise RuntimeError("Invalid simulation mode database URL") from exc
+        def get_status(self, account_id: str, *, use_cache: bool = True) -> SimModeStatus:
+            if use_cache:
+                with self._lock:
+                    cached = self._cache.get(account_id)
+                    if cached is not None:
+                        status, expires = cached
+                        if expires >= time.monotonic():
+                            return status
 
-        try:
-            url_obj = make_url(normalized)
-        except Exception as exc:  # pragma: no cover - defensive validation
-            raise RuntimeError("Invalid simulation mode database URL") from exc
-
-        driver = url_obj.drivername.lower()
-        if driver.startswith("postgresql"):
-            return normalized
-
-        if driver.startswith("sqlite"):
-            if candidate == _IN_MEMORY_SQLITE_URL:
-                LOGGER.warning("Simulation mode DSN missing; using in-memory SQLite for tests")
-                return normalized
-            if candidate == os.getenv(_TEST_DSN_ENV):
-                LOGGER.warning("Simulation mode DSN missing; using %s for tests", _TEST_DSN_ENV)
-                return normalized
-            raise RuntimeError(
-                "Simulation mode requires a PostgreSQL/TimescaleDB DSN; received sqlite://"
-            )
-
-        raise RuntimeError(
-            "Simulation mode requires a PostgreSQL/TimescaleDB DSN; "
-            f"received driver '{url_obj.drivername}'."
-        )
-
-    raise RuntimeError(
-        "SIM_MODE_DATABASE_URL (or DATABASE_URL) must be set to a PostgreSQL/TimescaleDB DSN."
-    )
-
-
-def _dispatch_async(coro: Awaitable[None], *, context: str) -> None:
-    async def _run() -> None:
-        try:
-            await coro
-        except Exception:  # pragma: no cover - defensive logging
-            LOGGER.exception("Failed to publish %s", context)
-
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        asyncio.run(_run())
-    else:
-        loop.create_task(_run())
-
-
-def _engine() -> Engine:
-    url = _database_url()
-    url_obj = make_url(url)
-
-    engine_kwargs: Dict[str, object] = {"future": True, "pool_pre_ping": True}
-    connect_args: Dict[str, object] = {}
-
-    driver = url_obj.drivername.lower()
-    if driver.startswith("postgresql") or "timescale" in driver:
-        if "sslmode" not in url_obj.query:
-            connect_args["sslmode"] = os.getenv("SIM_MODE_DB_SSLMODE", "require")
-        engine_kwargs.update(
-            pool_size=int(os.getenv("SIM_MODE_DB_POOL_SIZE", "10")),
-            max_overflow=int(os.getenv("SIM_MODE_DB_MAX_OVERFLOW", "10")),
-            pool_timeout=int(os.getenv("SIM_MODE_DB_POOL_TIMEOUT", "30")),
-            pool_recycle=int(os.getenv("SIM_MODE_DB_POOL_RECYCLE", "1800")),
-        )
-    elif driver.startswith("sqlite"):  # pragma: no cover - only exercised in tests with alternative engines
-        connect_args["check_same_thread"] = False
-        engine_kwargs["poolclass"] = StaticPool
-    else:  # pragma: no cover - defensive guard for unexpected drivers
-        connect_args["check_same_thread"] = False
-
-    if connect_args:
-        engine_kwargs["connect_args"] = connect_args
-
-    return create_engine(url, **engine_kwargs)
-
-
-ENGINE = _engine()
-SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, expire_on_commit=False, future=True)
-
-
-class Base(DeclarativeBase):
-    pass
-
-
-class SimModeStateORM(Base):
-    __tablename__ = "sim_mode_state"
-
-    account_id = account_id_column(primary_key=True)
-    active = Column(Boolean, nullable=False, default=False)
-    reason = Column(Text, nullable=True)
-    ts = Column(
-        DateTime(timezone=True),
-        nullable=False,
-        default=_utcnow,
-        server_default=text("CURRENT_TIMESTAMP"),
-    )
-
-
-class SimBrokerOrderORM(Base):
-    __tablename__ = "sim_broker_orders"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    account_id = account_id_column(index=True)
-    client_id = Column(String(128), nullable=False, index=True)
-    symbol = Column(String(64), nullable=False)
-    side = Column(String(8), nullable=False)
-    order_type = Column(String(16), nullable=False)
-    qty = Column(Numeric(36, 18), nullable=False)
-    filled_qty = Column(Numeric(36, 18), nullable=False, default=Decimal("0"))
-    avg_price = Column(Numeric(36, 18), nullable=False, default=Decimal("0"))
-    limit_px = Column(Numeric(36, 18), nullable=True)
-    status = Column(String(32), nullable=False, default="open")
-    pre_trade_mid = Column(Numeric(36, 18), nullable=True)
-    last_fill_ts = Column(DateTime(timezone=True), nullable=True)
-    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow, server_default=text("CURRENT_TIMESTAMP"))
-    updated_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow, server_default=text("CURRENT_TIMESTAMP"))
-
-
-class SimBrokerFillORM(Base):
-    __tablename__ = "sim_broker_fills"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    order_id = Column(Integer, nullable=False, index=True)
-    account_id = account_id_column(index=True)
-    client_id = Column(String(128), nullable=False)
-    symbol = Column(String(64), nullable=False)
-    qty = Column(Numeric(36, 18), nullable=False)
-    price = Column(Numeric(36, 18), nullable=False)
-    liquidity = Column(String(16), nullable=False)
-    fee = Column(Numeric(36, 18), nullable=False, default=Decimal("0"))
-    ts = Column(DateTime(timezone=True), nullable=False, default=_utcnow, server_default=text("CURRENT_TIMESTAMP"))
-
-
-class SimPriceSnapshotORM(Base):
-    __tablename__ = "sim_price_snapshots"
-
-    symbol = Column(String(64), primary_key=True)
-    price = Column(Numeric(36, 18), nullable=False)
-    updated_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow, server_default=text("CURRENT_TIMESTAMP"))
-
-
-Base.metadata.create_all(bind=ENGINE)
-
-
-@contextmanager
-def session_scope() -> Iterator[Session]:
-    session = SessionLocal()
-    try:
-        yield session
-        session.commit()
-    except Exception:  # pragma: no cover - defensive cleanup
-        session.rollback()
-        raise
-    finally:
-        session.close()
-
-
-@dataclass(frozen=True)
-class SimModeStatus:
-    account_id: str
-    active: bool
-    reason: Optional[str]
-    ts: datetime
-
-
-class SimModeRepository:
-    """Persistence and caching layer for per-account simulation mode flags."""
-
-    def __init__(self) -> None:
-        self._lock = Lock()
-        self._cache: dict[str, Tuple[SimModeStatus, float]] = {}
-        self._cache_ttl = 2.0
-
-    def _load_row(self, session: Session, account_id: str) -> SimModeStateORM:
-        result = session.execute(
-            select(SimModeStateORM).where(SimModeStateORM.account_id == account_id)
-        )
-        row = cast(Optional[SimModeStateORM], _scalar_one_or_none(result))
-        if row is None:
-            row = SimModeStateORM(account_id=account_id, active=False, reason=None, ts=_utcnow())
-            session.add(row)
-            session.flush()
-        return row
-
-    def get_status(self, account_id: str, *, use_cache: bool = True) -> SimModeStatus:
-        if use_cache:
-            with self._lock:
-                cached = self._cache.get(account_id)
-                if cached is not None:
-                    status, expires = cached
-                    if expires >= time.monotonic():
-                        return status
-
-        with session_scope() as session:
-            row = self._load_row(session, account_id)
+            row = self._load_row(account_id)
             status = SimModeStatus(
                 account_id=row.account_id,
                 active=bool(row.active),
@@ -371,226 +129,176 @@ class SimModeRepository:
                 ts=row.ts,
             )
 
-        if use_cache:
-            with self._lock:
-                expires = time.monotonic() + self._cache_ttl
-                self._cache[account_id] = (status, expires)
-        return status
+            if use_cache:
+                with self._lock:
+                    self._cache[account_id] = (status, time.monotonic() + _STATE_CACHE_TTL)
+            return status
 
-    def get_many(self, account_ids: Iterable[str], *, use_cache: bool = True) -> list[SimModeStatus]:
-        statuses: list[SimModeStatus] = []
-        missing: list[str] = []
-        now = time.monotonic()
+        def get_many(self, account_ids: Iterable[str], *, use_cache: bool = True) -> List[SimModeStatus]:
+            statuses: List[SimModeStatus] = []
+            missing: List[str] = []
+            now = time.monotonic()
 
-        if use_cache:
-            with self._lock:
-                for account_id in account_ids:
-                    cached = self._cache.get(account_id)
-                    if cached is not None:
-                        status, expires = cached
-                        if expires >= now:
-                            statuses.append(status)
-                            continue
-                    missing.append(account_id)
-        else:
-            missing.extend(account_ids)
+            if use_cache:
+                with self._lock:
+                    for account_id in account_ids:
+                        cached = self._cache.get(account_id)
+                        if cached is not None:
+                            status, expires = cached
+                            if expires >= now:
+                                statuses.append(status)
+                                continue
+                        missing.append(account_id)
+            else:
+                missing.extend(account_ids)
 
-        if missing:
-            with session_scope() as session:
-                for account_id in missing:
-                    row = self._load_row(session, account_id)
-                    status = SimModeStatus(
-                        account_id=row.account_id,
-                        active=bool(row.active),
-                        reason=row.reason,
-                        ts=row.ts,
-                    )
-                    statuses.append(status)
-                    if use_cache:
-                        expires = time.monotonic() + self._cache_ttl
-                        with self._lock:
-                            self._cache[account_id] = (status, expires)
+            for account_id in missing:
+                row = self._load_row(account_id)
+                status = SimModeStatus(
+                    account_id=row.account_id,
+                    active=bool(row.active),
+                    reason=row.reason,
+                    ts=row.ts,
+                )
+                statuses.append(status)
+                if use_cache:
+                    with self._lock:
+                        self._cache[account_id] = (status, time.monotonic() + _STATE_CACHE_TTL)
 
-        statuses.sort(key=lambda item: item.account_id)
-        return statuses
+            statuses.sort(key=lambda item: item.account_id)
+            return statuses
 
-    async def get_status_async(self, account_id: str, *, use_cache: bool = True) -> SimModeStatus:
-        loop = asyncio.get_running_loop()
-        func = partial(self.get_status, account_id, use_cache=use_cache)
-        return await loop.run_in_executor(None, func)
+        async def get_status_async(self, account_id: str, *, use_cache: bool = True) -> SimModeStatus:
+            loop = asyncio.get_running_loop()
+            func = partial(self.get_status, account_id, use_cache=use_cache)
+            return await loop.run_in_executor(None, func)
 
-    async def get_many_async(
-        self, account_ids: Iterable[str], *, use_cache: bool = True
-    ) -> list[SimModeStatus]:
-        loop = asyncio.get_running_loop()
-        func = partial(self.get_many, list(account_ids), use_cache=use_cache)
-        return await loop.run_in_executor(None, func)
+        async def get_many_async(
+            self, account_ids: Iterable[str], *, use_cache: bool = True
+        ) -> List[SimModeStatus]:
+            loop = asyncio.get_running_loop()
+            func = partial(self.get_many, list(account_ids), use_cache=use_cache)
+            return await loop.run_in_executor(None, func)
 
-    def set_status(self, account_id: str, active: bool, reason: Optional[str]) -> SimModeStatus:
-        now = _utcnow()
-        with session_scope() as session:
-            row = self._load_row(session, account_id)
+        def set_status(self, account_id: str, active: bool, reason: Optional[str]) -> SimModeStatus:
+            row = self._load_row(account_id)
             row.active = active
             row.reason = reason
-            row.ts = now
-            session.add(row)
+            row.ts = _utcnow()
 
-        status = SimModeStatus(account_id=account_id, active=active, reason=reason, ts=now)
-        with self._lock:
-            expires = time.monotonic() + self._cache_ttl
-            self._cache[account_id] = (status, expires)
-        return status
+            status = SimModeStatus(account_id=account_id, active=active, reason=reason, ts=row.ts)
+            with self._lock:
+                self._cache[account_id] = (status, time.monotonic() + _STATE_CACHE_TTL)
+            return status
 
-    async def set_status_async(
-        self, account_id: str, active: bool, reason: Optional[str]
-    ) -> SimModeStatus:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self.set_status, account_id, active, reason)
+        async def set_status_async(
+            self, account_id: str, active: bool, reason: Optional[str]
+        ) -> SimModeStatus:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, self.set_status, account_id, active, reason)
 
+    sim_mode_repository = SimModeRepository()
 
-sim_mode_repository = SimModeRepository()
+    @dataclass
+    class SimulatedOrderSnapshot:
+        account_id: str
+        client_id: str
+        symbol: str
+        side: str
+        order_type: str
+        qty: Decimal
+        filled_qty: Decimal
+        avg_price: Decimal
+        status: str
+        limit_px: Optional[Decimal]
+        pre_trade_mid: Optional[Decimal]
+        last_fill_ts: Optional[datetime]
 
+    @dataclass
+    class SimulatedExecution:
+        snapshot: SimulatedOrderSnapshot
+        fill_qty: Decimal
+        fill_price: Decimal
+        liquidity: str
 
-@dataclass
-class SimulatedOrderSnapshot:
-    account_id: str
-    client_id: str
-    symbol: str
-    side: str
-    order_type: str
-    qty: Decimal
-    filled_qty: Decimal
-    avg_price: Decimal
-    status: str
-    limit_px: Optional[Decimal]
-    pre_trade_mid: Optional[Decimal]
-    last_fill_ts: Optional[datetime]
+    class MicrostructureSlippageModel:
+        """Toy microstructure model returning slippage in basis points."""
 
+        def estimate_bps(self, order_type: str, qty: Decimal) -> Decimal:
+            base = Decimal("1.2") if order_type.lower() == "market" else Decimal("0.4")
+            magnitude = Decimal(math.log10(max(float(qty), 1.0))) if qty > 0 else Decimal("0")
+            size_penalty = Decimal("0.35") * magnitude
+            return base + size_penalty
 
-@dataclass
-class SimulatedExecution:
-    snapshot: SimulatedOrderSnapshot
-    fill_qty: Decimal
-    fill_price: Decimal
-    liquidity: str
+    class SimBroker:
+        """In-memory execution simulator that mirrors the SQLAlchemy-backed API."""
 
+        def __init__(self) -> None:
+            self._lock = Lock()
+            self._orders: Dict[Tuple[str, str], SimulatedOrderSnapshot] = {}
+            self._prices: Dict[str, Decimal] = {}
+            self._order_records: Dict[Tuple[str, str], SimBrokerOrderORM] = {}
+            self._price_records: Dict[str, SimPriceSnapshotORM] = {}
+            self._fills: List[SimBrokerFillORM] = []
+            self._order_ids = count(1)
+            self._slippage = MicrostructureSlippageModel()
 
-class MicrostructureSlippageModel:
-    """Toy microstructure model returning slippage in basis points."""
-
-    def estimate_bps(self, order_type: str, qty: Decimal) -> Decimal:
-        base = Decimal("1.2") if order_type.lower() == "market" else Decimal("0.4")
-        magnitude = Decimal(math.log10(max(float(qty), 1.0))) if qty > 0 else Decimal("0")
-        size_penalty = Decimal("0.35") * magnitude
-        return base + size_penalty
-
-
-class SimBroker:
-    """Simple in-memory/DB backed execution simulator used during sim mode."""
-
-    def __init__(self) -> None:
-        self._lock = Lock()
-        self._orders: Dict[Tuple[str, str], SimulatedOrderSnapshot] = {}
-        self._prices: Dict[str, Decimal] = {}
-        self._slippage = MicrostructureSlippageModel()
-        self._load_state()
-
-    def _load_state(self) -> None:
-        with session_scope() as session:
-            rows = session.execute(select(SimBrokerOrderORM)).scalars().all()
-            for row in rows:
-                snapshot = SimulatedOrderSnapshot(
-                    account_id=row.account_id,
-                    client_id=row.client_id,
-                    symbol=row.symbol,
-                    side=row.side,
-                    order_type=row.order_type,
-                    qty=Decimal(row.qty),
-                    filled_qty=Decimal(row.filled_qty),
-                    avg_price=Decimal(row.avg_price),
-                    status=row.status,
-                    limit_px=Decimal(row.limit_px) if row.limit_px is not None else None,
-                    pre_trade_mid=Decimal(row.pre_trade_mid) if row.pre_trade_mid is not None else None,
-                    last_fill_ts=row.last_fill_ts,
-                )
-                self._orders[(row.account_id, row.client_id)] = snapshot
-            price_rows = session.execute(select(SimPriceSnapshotORM)).scalars().all()
-            for price in price_rows:
-                self._prices[price.symbol] = Decimal(price.price)
-
-    def _persist_price(self, symbol: str, price: Decimal) -> None:
-        with session_scope() as session:
-            existing = session.get(SimPriceSnapshotORM, symbol)
-            if existing is None:
-                session.add(SimPriceSnapshotORM(symbol=symbol, price=price, updated_at=_utcnow()))
-            else:
-                existing.price = price
-                existing.updated_at = _utcnow()
-                session.add(existing)
-
-    def _persist_order(self, snapshot: SimulatedOrderSnapshot) -> None:
-        with session_scope() as session:
-            row = cast(
-                Optional[SimBrokerOrderORM],
-                _scalar_one_or_none(
-                    session.execute(
-                        select(SimBrokerOrderORM).where(
-                            SimBrokerOrderORM.account_id == snapshot.account_id,
-                            SimBrokerOrderORM.client_id == snapshot.client_id,
-                        )
-                    )
-                ),
+        def _snapshot_from_order(self, row: SimBrokerOrderORM) -> SimulatedOrderSnapshot:
+            return SimulatedOrderSnapshot(
+                account_id=row.account_id,
+                client_id=row.client_id,
+                symbol=row.symbol,
+                side=row.side,
+                order_type=row.order_type,
+                qty=row.qty,
+                filled_qty=row.filled_qty,
+                avg_price=row.avg_price,
+                status=row.status,
+                limit_px=row.limit_px,
+                pre_trade_mid=row.pre_trade_mid,
+                last_fill_ts=row.last_fill_ts,
             )
-            if row is None:
-                row = SimBrokerOrderORM(
-                    account_id=snapshot.account_id,
-                    client_id=snapshot.client_id,
-                    symbol=snapshot.symbol,
-                    side=snapshot.side,
-                    order_type=snapshot.order_type,
-                    qty=snapshot.qty,
-                    filled_qty=snapshot.filled_qty,
-                    avg_price=snapshot.avg_price,
-                    limit_px=snapshot.limit_px,
-                    status=snapshot.status,
-                    pre_trade_mid=snapshot.pre_trade_mid,
-                    last_fill_ts=snapshot.last_fill_ts,
-                )
-            else:
-                row.qty = snapshot.qty
-                row.filled_qty = snapshot.filled_qty
-                row.avg_price = snapshot.avg_price
-                row.limit_px = snapshot.limit_px
-                row.status = snapshot.status
-                row.pre_trade_mid = snapshot.pre_trade_mid
-                row.last_fill_ts = snapshot.last_fill_ts
-            session.add(row)
 
-    def _record_fill(
-        self,
-        snapshot: SimulatedOrderSnapshot,
-        fill_qty: Decimal,
-        fill_price: Decimal,
-        liquidity: str,
-    ) -> None:
-        if fill_qty <= 0:
-            return
-        with session_scope() as session:
-            row = cast(
-                Optional[SimBrokerOrderORM],
-                _scalar_one_or_none(
-                    session.execute(
-                        select(SimBrokerOrderORM).where(
-                            SimBrokerOrderORM.account_id == snapshot.account_id,
-                            SimBrokerOrderORM.client_id == snapshot.client_id,
-                        )
-                    )
-                ),
+        def _persist_price(self, symbol: str, price: Decimal) -> None:
+            snapshot = SimPriceSnapshotORM(symbol=symbol, price=price, updated_at=_utcnow())
+            self._price_records[symbol] = snapshot
+            self._prices[symbol] = price
+
+        def _persist_order(self, snapshot: SimulatedOrderSnapshot) -> None:
+            key = (snapshot.account_id, snapshot.client_id)
+            existing = self._order_records.get(key)
+            order_id = existing.id if existing is not None else next(self._order_ids)
+            self._order_records[key] = SimBrokerOrderORM(
+                id=order_id,
+                account_id=snapshot.account_id,
+                client_id=snapshot.client_id,
+                symbol=snapshot.symbol,
+                side=snapshot.side,
+                order_type=snapshot.order_type,
+                qty=snapshot.qty,
+                filled_qty=snapshot.filled_qty,
+                avg_price=snapshot.avg_price,
+                status=snapshot.status,
+                limit_px=snapshot.limit_px,
+                pre_trade_mid=snapshot.pre_trade_mid,
+                last_fill_ts=snapshot.last_fill_ts,
             )
-            order_id = row.id if row is not None else None
-            session.add(
+
+        def _record_fill(
+            self,
+            snapshot: SimulatedOrderSnapshot,
+            fill_qty: Decimal,
+            fill_price: Decimal,
+            liquidity: str,
+        ) -> None:
+            if fill_qty <= 0:
+                return
+            key = (snapshot.account_id, snapshot.client_id)
+            order = self._order_records.get(key)
+            order_id = order.id if order is not None else next(self._order_ids)
+            self._fills.append(
                 SimBrokerFillORM(
-                    order_id=order_id or 0,
+                    order_id=order_id,
                     account_id=snapshot.account_id,
                     client_id=snapshot.client_id,
                     symbol=snapshot.symbol,
@@ -602,184 +310,169 @@ class SimBroker:
                 )
             )
 
-    def _resolve_reference_price(
-        self, symbol: str, pre_trade_mid: Optional[Decimal], limit_px: Optional[Decimal]
-    ) -> Decimal:
-        if pre_trade_mid and pre_trade_mid > 0:
-            return pre_trade_mid
-        if symbol in self._prices:
-            return self._prices[symbol]
-        if limit_px and limit_px > 0:
-            return limit_px
-        return Decimal("0")
+        def _resolve_reference_price(
+            self, symbol: str, pre_trade_mid: Optional[Decimal], limit_px: Optional[Decimal]
+        ) -> Decimal:
+            if pre_trade_mid and pre_trade_mid > 0:
+                return pre_trade_mid
+            if symbol in self._prices:
+                return self._prices[symbol]
+            if limit_px and limit_px > 0:
+                return limit_px
+            return Decimal("0")
 
-    def _simulate_execution(
-        self,
-        account_id: str,
-        client_id: str,
-        symbol: str,
-        side: str,
-        order_type: str,
-        qty: Decimal,
-        limit_px: Optional[Decimal],
-        pre_trade_mid: Optional[Decimal],
-    ) -> SimulatedExecution:
-        reference_price = self._resolve_reference_price(symbol, pre_trade_mid, limit_px)
-        slippage_bps = self._slippage.estimate_bps(order_type, qty)
-        direction = Decimal("1") if side.lower() == "buy" else Decimal("-1")
-        adjustment = Decimal("1") + (slippage_bps / Decimal("10000")) * direction
-        execution_price = reference_price * adjustment if reference_price > 0 else reference_price
+        def _simulate_execution(
+            self,
+            account_id: str,
+            client_id: str,
+            symbol: str,
+            side: str,
+            order_type: str,
+            qty: Decimal,
+            limit_px: Optional[Decimal],
+            pre_trade_mid: Optional[Decimal],
+        ) -> SimulatedExecution:
+            reference_price = self._resolve_reference_price(symbol, pre_trade_mid, limit_px)
+            slippage_bps = self._slippage.estimate_bps(order_type, qty)
+            direction = Decimal("1") if side.lower() == "buy" else Decimal("-1")
+            adjustment = Decimal("1") + (slippage_bps / Decimal("10000")) * direction
+            execution_price = reference_price * adjustment if reference_price > 0 else reference_price
 
-        fill_fraction = Decimal("1")
-        order_type_normalized = order_type.lower()
-        if order_type_normalized == "limit" and limit_px is not None and reference_price > 0:
-            if side.lower() == "buy" and limit_px < execution_price:
-                fill_fraction = Decimal("0.5")
-                execution_price = limit_px
-            elif side.lower() == "sell" and limit_px > execution_price:
-                fill_fraction = Decimal("0.5")
-                execution_price = limit_px
+            fill_fraction = Decimal("1")
+            order_type_normalized = order_type.lower()
+            if order_type_normalized == "limit" and limit_px is not None and reference_price > 0:
+                if side.lower() == "buy" and limit_px < execution_price:
+                    fill_fraction = Decimal("0.5")
+                    execution_price = limit_px
+                elif side.lower() == "sell" and limit_px > execution_price:
+                    fill_fraction = Decimal("0.5")
+                    execution_price = limit_px
 
-        fill_qty = (qty * fill_fraction).quantize(Decimal("0.00000001"))
-        remaining = qty - fill_qty
-        avg_price = execution_price if fill_qty > 0 else Decimal("0")
-        status = "filled" if remaining <= 0 else "partially_filled"
-        liquidity = "taker" if order_type_normalized == "market" else ("maker" if fill_fraction < 1 else "taker")
-
-        snapshot = SimulatedOrderSnapshot(
-            account_id=account_id,
-            client_id=client_id,
-            symbol=symbol,
-            side=side,
-            order_type=order_type,
-            qty=qty,
-            filled_qty=fill_qty,
-            avg_price=avg_price,
-            status=status,
-            limit_px=limit_px,
-            pre_trade_mid=pre_trade_mid,
-            last_fill_ts=_utcnow(),
-        )
-
-        return SimulatedExecution(snapshot=snapshot, fill_qty=fill_qty, fill_price=avg_price, liquidity=liquidity)
-
-    def place_order(
-        self,
-        account_id: str,
-        client_id: str,
-        symbol: str,
-        side: str,
-        order_type: str,
-        qty: Decimal,
-        limit_px: Optional[Decimal],
-        pre_trade_mid: Optional[Decimal],
-    ) -> SimulatedExecution:
-        with self._lock:
-            execution = self._simulate_execution(
-                account_id,
-                client_id,
-                symbol,
-                side,
-                order_type,
-                qty,
-                limit_px,
-                pre_trade_mid,
+            fill_qty = (qty * fill_fraction).quantize(Decimal("0.00000001"))
+            remaining = qty - fill_qty
+            avg_price = execution_price if fill_qty > 0 else Decimal("0")
+            status = "filled" if remaining <= 0 else "partially_filled"
+            liquidity = "taker" if order_type_normalized == "market" else (
+                "maker" if fill_fraction < 1 else "taker"
             )
-            self._orders[(account_id, client_id)] = execution.snapshot
-            if execution.fill_price > 0:
-                self._prices[symbol] = execution.fill_price
-                self._persist_price(symbol, execution.fill_price)
-            self._persist_order(execution.snapshot)
-            self._record_fill(execution.snapshot, execution.fill_qty, execution.fill_price, execution.liquidity)
-        adapter = KafkaNATSAdapter(account_id=account_id)
-        if execution.fill_qty > 0 and execution.fill_price > 0:
-            event = FillEvent(
+
+            snapshot = SimulatedOrderSnapshot(
                 account_id=account_id,
+                client_id=client_id,
                 symbol=symbol,
-                qty=float(execution.fill_qty),
-                price=float(execution.fill_price),
-                fee=0.0,
-                liquidity=execution.liquidity,
-                ts=_utcnow(),
-            )
-            dispatch_async(
-                adapter.publish("oms.fills.simulated", event.model_dump(mode="json")),
-                context="simulated fill event",
-                logger=LOGGER,
-            )
-        return execution
-
-    def cancel_order(self, account_id: str, client_id: str) -> Optional[SimulatedOrderSnapshot]:
-        with self._lock:
-            snapshot = self._orders.get((account_id, client_id))
-            if snapshot is None:
-                return None
-            cancelled = SimulatedOrderSnapshot(
-                account_id=snapshot.account_id,
-                client_id=snapshot.client_id,
-                symbol=snapshot.symbol,
-                side=snapshot.side,
-                order_type=snapshot.order_type,
-                qty=snapshot.qty,
-                filled_qty=snapshot.filled_qty,
-                avg_price=snapshot.avg_price,
-                status="cancelled",
-                limit_px=snapshot.limit_px,
-                pre_trade_mid=snapshot.pre_trade_mid,
+                side=side,
+                order_type=order_type,
+                qty=qty,
+                filled_qty=fill_qty,
+                avg_price=avg_price,
+                status=status,
+                limit_px=limit_px,
+                pre_trade_mid=pre_trade_mid,
                 last_fill_ts=_utcnow(),
             )
-            self._orders[(account_id, client_id)] = cancelled
-            self._persist_order(cancelled)
-            return cancelled
 
-    def lookup(self, account_id: str, client_id: str) -> Optional[SimulatedOrderSnapshot]:
-        with self._lock:
-            snapshot = self._orders.get((account_id, client_id))
-            if snapshot is not None:
+            return SimulatedExecution(snapshot=snapshot, fill_qty=fill_qty, fill_price=avg_price, liquidity=liquidity)
+
+        def place_order(
+            self,
+            account_id: str,
+            client_id: str,
+            symbol: str,
+            side: str,
+            order_type: str,
+            qty: Decimal,
+            limit_px: Optional[Decimal],
+            pre_trade_mid: Optional[Decimal],
+        ) -> SimulatedExecution:
+            with self._lock:
+                execution = self._simulate_execution(
+                    account_id,
+                    client_id,
+                    symbol,
+                    side,
+                    order_type,
+                    qty,
+                    limit_px,
+                    pre_trade_mid,
+                )
+                self._orders[(account_id, client_id)] = execution.snapshot
+                if execution.fill_price > 0:
+                    self._persist_price(symbol, execution.fill_price)
+                self._persist_order(execution.snapshot)
+                self._record_fill(execution.snapshot, execution.fill_qty, execution.fill_price, execution.liquidity)
+
+            adapter = KafkaNATSAdapter(account_id=account_id)
+            if execution.fill_qty > 0 and execution.fill_price > 0:
+                event = FillEvent(
+                    account_id=account_id,
+                    symbol=symbol,
+                    qty=float(execution.fill_qty),
+                    price=float(execution.fill_price),
+                    fee=0.0,
+                    liquidity=execution.liquidity,
+                    ts=_utcnow(),
+                )
+                payload: dict
+                dumper = getattr(event, "model_dump", None)
+                if callable(dumper):
+                    try:
+                        payload = dumper(mode="json")
+                    except TypeError:
+                        payload = dumper()
+                else:
+                    legacy = getattr(event, "dict", None)
+                    payload = legacy() if callable(legacy) else dict(event.__dict__)
+
+                dispatch_async(
+                    adapter.publish("oms.fills.simulated", payload),
+                    context="simulated fill event",
+                    logger=LOGGER,
+                )
+            return execution
+
+        def cancel_order(self, account_id: str, client_id: str) -> Optional[SimulatedOrderSnapshot]:
+            with self._lock:
+                snapshot = self._orders.get((account_id, client_id))
+                if snapshot is None:
+                    return None
+                cancelled = SimulatedOrderSnapshot(
+                    account_id=snapshot.account_id,
+                    client_id=snapshot.client_id,
+                    symbol=snapshot.symbol,
+                    side=snapshot.side,
+                    order_type=snapshot.order_type,
+                    qty=snapshot.qty,
+                    filled_qty=snapshot.filled_qty,
+                    avg_price=snapshot.avg_price,
+                    status="cancelled",
+                    limit_px=snapshot.limit_px,
+                    pre_trade_mid=snapshot.pre_trade_mid,
+                    last_fill_ts=_utcnow(),
+                )
+                self._orders[(account_id, client_id)] = cancelled
+                self._persist_order(cancelled)
+                return cancelled
+
+        def lookup(self, account_id: str, client_id: str) -> Optional[SimulatedOrderSnapshot]:
+            with self._lock:
+                snapshot = self._orders.get((account_id, client_id))
+                if snapshot is not None:
+                    return snapshot
+                row = self._order_records.get((account_id, client_id))
+                if row is None:
+                    return None
+                snapshot = self._snapshot_from_order(row)
+                self._orders[(account_id, client_id)] = snapshot
                 return snapshot
-        with session_scope() as session:
-            row = cast(
-                Optional[SimBrokerOrderORM],
-                _scalar_one_or_none(
-                    session.execute(
-                        select(SimBrokerOrderORM).where(
-                            SimBrokerOrderORM.account_id == account_id,
-                            SimBrokerOrderORM.client_id == client_id,
-                        )
-                    )
-                ),
-            )
-            if row is None:
-                return None
-            snapshot = SimulatedOrderSnapshot(
-                account_id=row.account_id,
-                client_id=row.client_id,
-                symbol=row.symbol,
-                side=row.side,
-                order_type=row.order_type,
-                qty=Decimal(row.qty),
-                filled_qty=Decimal(row.filled_qty),
-                avg_price=Decimal(row.avg_price),
-                status=row.status,
-                limit_px=Decimal(row.limit_px) if row.limit_px is not None else None,
-                pre_trade_mid=Decimal(row.pre_trade_mid) if row.pre_trade_mid is not None else None,
-                last_fill_ts=row.last_fill_ts,
-            )
-        with self._lock:
-            self._orders[(account_id, client_id)] = snapshot
-        return snapshot
 
+    sim_broker = SimBroker()
 
-sim_broker = SimBroker()
-
-
-__all__ = [
-    "SimModeStatus",
-    "SimModeRepository",
-    "sim_mode_repository",
-    "SimulatedOrderSnapshot",
-    "SimulatedExecution",
-    "sim_broker",
-    "KafkaNATSAdapter",
-]
-
+    __all__ = [
+        "SimModeStatus",
+        "SimModeRepository",
+        "sim_mode_repository",
+        "SimulatedOrderSnapshot",
+        "SimulatedExecution",
+        "sim_broker",
+        "KafkaNATSAdapter",
+    ]
