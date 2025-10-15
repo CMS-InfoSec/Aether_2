@@ -379,6 +379,8 @@ def _ensure_httpx_module() -> None:
                 self.write = write
                 self.pool = pool
 
+        from urllib.parse import parse_qsl, urlencode
+
         class _HTTPXResponse(SimpleNamespace):
             def __init__(self, status_code: int = 200, json_data: object | None = None):
                 super().__init__(status_code=status_code, _json=json_data)
@@ -388,6 +390,50 @@ def _ensure_httpx_module() -> None:
 
         class _HTTPXRequest(SimpleNamespace):
             pass
+
+        class _HTTPXQueryParams:
+            """Lightweight representation of query parameters."""
+
+            def __init__(self, params: object | None = None, **kwargs: object) -> None:
+                self._pairs: list[tuple[str, str]] = []
+                if params is None:
+                    pass
+                elif isinstance(params, _HTTPXQueryParams):
+                    self._pairs.extend(params.items())
+                elif isinstance(params, str):
+                    self._pairs.extend(parse_qsl(params.lstrip("?"), keep_blank_values=True))
+                else:
+                    self._extend_pairs(params)
+                if kwargs:
+                    self._extend_pairs(kwargs)
+
+            def _extend_pairs(self, params: object) -> None:
+                if isinstance(params, Mapping):
+                    iterable = params.items()
+                else:
+                    iterable = params  # type: ignore[assignment]
+                for key, value in iterable:  # type: ignore[misc]
+                    if isinstance(value, (list, tuple)):
+                        for item in value:
+                            self._append_pair(key, item)
+                    elif value is None:
+                        continue
+                    else:
+                        self._append_pair(key, value)
+
+            def _append_pair(self, key: object, value: object) -> None:
+                self._pairs.append((str(key), str(value)))
+
+            def __iter__(self):
+                return iter(self._pairs)
+
+            def items(self) -> list[tuple[str, str]]:
+                return list(self._pairs)
+
+            def __str__(self) -> str:
+                if not self._pairs:
+                    return ""
+                return urlencode(self._pairs, doseq=True)
 
         class _HTTPXClient:
             def __init__(self, *args: object, timeout: float | None = None, **kwargs: object) -> None:
@@ -470,6 +516,7 @@ def _ensure_httpx_module() -> None:
         module.patch = _httpx_patch  # type: ignore[attr-defined]
         module.Request = _HTTPXRequest  # type: ignore[attr-defined]
         module.Response = _HTTPXResponse  # type: ignore[attr-defined]
+        module.QueryParams = _HTTPXQueryParams  # type: ignore[attr-defined]
         module.HTTPError = _HTTPXError  # type: ignore[attr-defined]
         module.RequestError = _HTTPXRequestError  # type: ignore[attr-defined]
         module.TimeoutException = _HTTPXTimeoutException  # type: ignore[attr-defined]

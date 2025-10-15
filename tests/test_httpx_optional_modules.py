@@ -57,3 +57,12 @@ def test_alert_dedupe_uses_httpx_stub(simulate_missing_httpx):
     httpx_module = service._ensure_httpx()
     assert getattr(httpx_module, "__file__") == "<httpx-stub>"
     assert hasattr(httpx_module, "AsyncClient")
+
+
+def test_httpx_queryparams_stub_round_trip(simulate_missing_httpx):
+    httpx_module = bootstrap.ensure_httpx_ready()
+    params = httpx_module.QueryParams({"foo": "bar", "multi": ["a", "b"]})
+    assert str(params) == "foo=bar&multi=a&multi=b"
+    assert list(params.items()) == [("foo", "bar"), ("multi", "a"), ("multi", "b")]
+    cloned = httpx_module.QueryParams(params)
+    assert str(cloned) == "foo=bar&multi=a&multi=b"
