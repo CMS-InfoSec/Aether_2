@@ -10,6 +10,9 @@ permissions:
   contents: read
   actions: write
 
+env:
+  PIP_AUDIT_VERSION: 2.9.0
+
 concurrency:
   group: >-
     ${{ github.workflow }}-${{
@@ -159,7 +162,7 @@ jobs:
         run: |
           set -euxo pipefail
           python -m pip install --upgrade pip
-          python -m pip install pip-audit
+          python -m pip install "pip-audit==${PIP_AUDIT_VERSION}"
 
       - name: Audit locked dependencies
         run: |
