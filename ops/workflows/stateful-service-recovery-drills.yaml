@@ -30,7 +30,7 @@ spec:
               && python -m pip install --no-cache-dir --upgrade "pip=={{workflow.parameters.pip_version}}"
               && REF_DATE=$(date --utc --date='{{inputs.parameters.reference-date}}' +%F)
               && OUTPUT_DATE=$(date --utc --date="$REF_DATE" +%Y-%m-%d)
-              && python docs/runbooks/scripts/stateful_service_exercise.py
+              && python -m docs.runbooks.scripts.stateful_service_exercise
                  --date "$REF_DATE"
                  --output "artifacts/stateful-drill-plan-${OUTPUT_DATE}.md"
     ttlStrategy:
