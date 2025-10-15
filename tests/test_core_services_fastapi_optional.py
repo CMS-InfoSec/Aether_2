@@ -69,6 +69,7 @@ def _purge_modules(prefixes: Iterable[str]) -> None:
         "ops.observability.latency_metrics",
         "prompt_refiner",
         "hitl_service",
+        "services.risk.main",
         "secrets_service",
         "services.secrets.main",
         "sim_mode",
@@ -101,6 +102,8 @@ def test_core_services_import_without_fastapi(
         prefixes.append("services.backtest")
     if module_name.startswith("services.fees."):
         prefixes.append("services.fees")
+    if module_name.startswith("services.risk."):
+        prefixes.append("services.risk")
     if module_name.startswith("services.models."):
         prefixes.append("services.models")
     if module_name.startswith("services.secrets."):
