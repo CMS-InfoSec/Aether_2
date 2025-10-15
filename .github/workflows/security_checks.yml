@@ -170,6 +170,7 @@ jobs:
           if ! pip-audit \
             --progress-spinner off \
             --config pip-audit.toml \
+            --require-hashes \
             --requirement requirements.txt \
             --requirement requirements-ci.txt
           then
