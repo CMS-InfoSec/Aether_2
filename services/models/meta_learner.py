@@ -17,7 +17,18 @@ from datetime import datetime, timezone
 from threading import Lock
 from typing import DefaultDict, Dict, Iterable, List, Mapping, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        APIRouter,
+        Depends,
+        Header,
+        HTTPException,
+        Query,
+        Request,
+        status,
+    )
 from pydantic import BaseModel, Field
 
 try:  # pragma: no cover - policy service may be unavailable in insecure defaults

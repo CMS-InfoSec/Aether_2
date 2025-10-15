@@ -9,9 +9,31 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, List, Optional, Sequence, TypeVar, cast
 
-from alembic import command
-from alembic.config import Config
-from prometheus_client import Gauge
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
+try:  # pragma: no cover - alembic is optional in lightweight environments
+    from alembic import command
+    from alembic.config import Config
+except ModuleNotFoundError:  # pragma: no cover - fallback stubs when alembic missing
+    class Config:  # type: ignore[no-redef]
+        """Minimal configuration stub used when Alembic is unavailable."""
+
+        def __init__(self) -> None:
+            self.attributes: dict[str, Any] = {}
+
+        def set_main_option(self, *_: Any, **__: Any) -> None:
+            return None
+
+    class _AlembicCommandModule:
+        @staticmethod
+        def upgrade(config: Config, revision: str) -> None:  # type: ignore[override]
+            del config, revision
+            raise RuntimeError("Alembic is required to run volatility database migrations.")
+
+    command = _AlembicCommandModule()  # type: ignore[assignment]
+from metrics import Gauge
 from sqlalchemy import Column, DateTime, Float, String, create_engine, func, select
 from sqlalchemy.engine import Engine, URL
 from sqlalchemy.engine.url import make_url
@@ -29,52 +51,17 @@ else:  # pragma: no cover - lightweight fallbacks when FastAPI is unavailable
     try:
         from fastapi import Depends, FastAPI, HTTPException, Query, Request
         from starlette import status
-    except ModuleNotFoundError:  # pragma: no cover - minimal shims for optional deps
-        class HTTPException(Exception):
-            """Lightweight HTTP exception carrying status and detail."""
+    except ModuleNotFoundError:  # pragma: no cover - fallback to the in-repo shim
+        from services.common.fastapi_stub import (  # type: ignore[assignment]
+            Depends,
+            FastAPI,
+            HTTPException,
+            Query,
+            Request,
+            status as _shim_status,
+        )
 
-            def __init__(self, status_code: int, detail: str) -> None:
-                super().__init__(detail)
-                self.status_code = status_code
-                self.detail = detail
-
-        class _State:  # pragma: no cover - simple container for stateful attrs
-            pass
-
-        class FastAPI:  # pragma: no cover - decorator-friendly application shim
-            def __init__(self, *args: Any, **kwargs: Any) -> None:
-                del args, kwargs
-                self.state = _State()
-
-            def get(
-                self, *args: Any, **kwargs: Any
-            ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-                def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
-                    return func
-
-                return decorator
-
-            def on_event(
-                self, *_: Any, **__: Any
-            ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-                def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
-                    return func
-
-                return decorator
-
-        class Request:  # pragma: no cover - exposes ``app`` and ``state`` like FastAPI
-            def __init__(self) -> None:
-                self.app = FastAPI()
-                self.state = self.app.state
-
-        def Depends(dependency: Callable[..., Any]) -> Callable[..., Any]:  # type: ignore[misc]
-            return dependency
-
-        def Query(default: Any = None, **_: Any) -> Any:
-            return default
-
-        class status:  # pragma: no cover - subset of Starlette status codes
-            HTTP_404_NOT_FOUND = 404
+        status = _shim_status  # type: ignore[assignment]
 
 
 TCallable = TypeVar("TCallable", bound=Callable[..., Any])
