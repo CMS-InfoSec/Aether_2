@@ -15,6 +15,8 @@ spec:
           value: postgresql+psycopg2://aether:aether@timescale:5432/aether
         - name: redis_url
           value: redis://redis:6379/0
+        - name: pip_version
+          value: "24.3.1"
     templates:
       - name: coingecko-pipeline
         steps:
@@ -23,7 +25,7 @@ spec:
               arguments:
                 parameters:
                   - name: command
-                    value: python data/ingest/coingecko_job.py
+                    value: python -m data.ingest.coingecko_job
           - - name: run-quality-checks
               template: python-task
               arguments:
@@ -36,7 +38,7 @@ spec:
               arguments:
                 parameters:
                   - name: command
-                    value: python data/feast/materialize.py --mode refresh --repo data/feast --days 3
+                    value: python -m data.feast.materialize --mode refresh --repo data/feast --days 3
       - name: python-task
         inputs:
           parameters:
@@ -46,10 +48,12 @@ spec:
           workingDir: /workspace
           command: ["bash", "-lc"]
           args:
-            - >-
-              pip install --no-cache-dir feast great_expectations sqlalchemy psycopg2-binary requests aiohttp nats-py &&
-              export DATABASE_URL={{workflow.parameters.database_url}} &&
-              export FEAST_REDIS_URL={{workflow.parameters.redis_url}} &&
+            - |
+              set -euo pipefail
+              python -m pip install --no-cache-dir --upgrade "pip=={{workflow.parameters.pip_version}}"
+              python -m pip install --no-cache-dir feast great_expectations sqlalchemy psycopg2-binary requests aiohttp nats-py
+              export DATABASE_URL={{workflow.parameters.database_url}}
+              export FEAST_REDIS_URL={{workflow.parameters.redis_url}}
               eval "$(python - <<'PY'
 import os
 from urllib.parse import urlparse
@@ -89,6 +93,8 @@ spec:
           value: postgresql+psycopg2://aether:aether@timescale:5432/aether
         - name: redis_url
           value: redis://redis:6379/0
+        - name: pip_version
+          value: "24.3.1"
     templates:
       - name: feast-incremental
         steps:
@@ -97,7 +103,7 @@ spec:
               arguments:
                 parameters:
                   - name: command
-                    value: python data/feast/materialize.py --mode incremental --repo data/feast
+                    value: python -m data.feast.materialize --mode incremental --repo data/feast
       - name: python-task
         inputs:
           parameters:
@@ -107,10 +113,12 @@ spec:
           workingDir: /workspace
           command: ["bash", "-lc"]
           args:
-            - >-
-              pip install --no-cache-dir feast sqlalchemy psycopg2-binary redis &&
-              export DATABASE_URL={{workflow.parameters.database_url}} &&
-              export FEAST_REDIS_URL={{workflow.parameters.redis_url}} &&
+            - |
+              set -euo pipefail
+              python -m pip install --no-cache-dir --upgrade "pip=={{workflow.parameters.pip_version}}"
+              python -m pip install --no-cache-dir feast sqlalchemy psycopg2-binary redis
+              export DATABASE_URL={{workflow.parameters.database_url}}
+              export FEAST_REDIS_URL={{workflow.parameters.redis_url}}
               eval "$(python - <<'PY'
 import os
 from urllib.parse import urlparse
