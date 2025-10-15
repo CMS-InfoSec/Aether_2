@@ -14,6 +14,13 @@ def test_event_bus_fallback_handles_missing_adapter(monkeypatch):
 
     event_bus = importlib.import_module("shared.event_bus")
 
+    # ``ensure_common_helpers`` may reload the adapters module even after the
+    # test inserts a dummy placeholder.  Force the shared event bus wrapper to
+    # exercise its in-memory fallback so the assertions remain stable when the
+    # real adapter becomes available mid-import.
+    monkeypatch.setattr(event_bus, "_delegate_cls", None, raising=False)
+    monkeypatch.setattr(event_bus, "_force_fallback", True, raising=False)
+
     adapter = event_bus.KafkaNATSAdapter(account_id=" test ")
     asyncio.run(adapter.publish("topic", {"value": 1}))
 
@@ -160,3 +167,59 @@ def test_event_bus_wrapper_records_delegate_failures(monkeypatch):
 
     drained = asyncio.run(event_bus.KafkaNATSAdapter.flush_events())
     assert drained == {"acct-456": 1}
+
+
+def test_event_bus_wrapper_marks_undelivered_delegate_records(monkeypatch):
+    event_bus = importlib.import_module("shared.event_bus")
+
+    class _UndeliveredDelegate:
+        _history: dict[str, list[dict[str, object]]] = {}
+
+        def __init__(self, account_id: str, **_: object) -> None:
+            self.account_id = account_id
+
+        async def publish(self, topic: str, payload: dict[str, object]) -> None:
+            record = attach_correlation(payload)
+            entry = {
+                "topic": topic,
+                "payload": record,
+                "timestamp": datetime.now(timezone.utc),
+                "correlation_id": record["correlation_id"],
+                "delivered": False,
+                "partial_delivery": False,
+            }
+            self._history.setdefault(self.account_id, []).append(entry)
+
+        def history(self, correlation_id: str | None = None) -> list[dict[str, object]]:
+            records = list(self._history.get(self.account_id, []))
+            if correlation_id is not None:
+                return [r for r in records if r["correlation_id"] == correlation_id]
+            return records
+
+        @classmethod
+        def reset(cls, account_id: str | None = None) -> None:  # noqa: ARG003
+            cls._history.clear()
+
+        @classmethod
+        async def flush_events(cls) -> dict[str, int]:
+            drained = {acct: len(records) for acct, records in cls._history.items() if records}
+            cls._history.clear()
+            return drained
+
+        @classmethod
+        def shutdown(cls) -> None:
+            cls._history.clear()
+
+    monkeypatch.setattr(event_bus, "_delegate_cls", _UndeliveredDelegate, raising=False)
+    monkeypatch.setattr(event_bus, "_KafkaNATSAdapter", _UndeliveredDelegate, raising=False)
+
+    adapter = event_bus.KafkaNATSAdapter(account_id="acct-789")
+    asyncio.run(adapter.publish("topic", {"value": 9}))
+
+    history = adapter.history()
+    assert len(history) == 1
+    assert history[0]["delivered"] is False
+    assert history[0]["partial_delivery"] is False
+
+    drained = asyncio.run(event_bus.KafkaNATSAdapter.flush_events())
+    assert drained == {"acct-789": 1}

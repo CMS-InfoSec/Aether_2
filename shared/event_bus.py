@@ -189,7 +189,7 @@ class KafkaNATSAdapter:  # type: ignore[no-redef]
             delivered = bool(delegate_record.get("delivered"))
             partial = bool(delegate_record.get("partial_delivery"))
             if not delivered or partial:
-                record["delivered"] = delivered or not partial
+                record["delivered"] = delivered
                 record["partial_delivery"] = partial
                 self._event_store[self.account_id][-1] = (record, False)
                 return
@@ -235,6 +235,9 @@ class KafkaNATSAdapter:  # type: ignore[no-redef]
             count = sum(1 for _, delegate_recorded in events if not delegate_recorded)
             if count:
                 local_counts[account] = count
+        for account, count in local_counts.items():
+            if account in drained:
+                drained[account] = max(drained[account] - count, 0)
         cls._event_store.clear()
         for account, count in local_counts.items():
             drained[account] = drained.get(account, 0) + count
