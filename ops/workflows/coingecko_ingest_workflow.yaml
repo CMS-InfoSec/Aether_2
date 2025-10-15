@@ -20,27 +20,61 @@ spec:
               dependencies: [ingest]
               template: validation-task
       - name: ingest-task
-        inputs:
-          parameters:
-            - name: database_url
         container:
           image: python:3.11-slim
-          command: ["python", "data/ingest/coingecko_job.py"]
+          command: ["bash", "-lc"]
           args:
-            - "--database-url"
-            - "{{workflow.parameters.database_url}}"
-            - "--whitelist-path"
-            - "/data/output/nightly_whitelist.json"
+            - |
+              set -euo pipefail
+              PIP_VERSION="$(python - <<'PY'
+import re
+
+value = "{{workflow.parameters.pip_version}}"
+if not value or not re.fullmatch(r"[0-9][0-9A-Za-z.+-]*", value):
+    raise SystemExit(f"Invalid pip_version value: {value!r}")
+print(value)
+PY
+)"
+              python -m pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}"
+              python -m pip install --no-cache-dir \
+                "requests==2.32.5" \
+                "sqlalchemy==2.0.44" \
+                "psycopg2-binary==2.9.10" \
+                "nats-py==2.11.0"
+              exec python -m data.ingest.coingecko_job
           workingDir: /workspace
+          env:
+            - name: DATABASE_URL
+              value: "{{workflow.parameters.database_url}}"
           volumeMounts:
             - name: workspace
               mountPath: /workspace
       - name: validation-task
         container:
           image: python:3.11-slim
-          command: ["great_expectations", "checkpoint", "run", "nightly_ingest"]
-          workingDir: /workspace/data/great_expectations
+          command: ["bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              PIP_VERSION="$(python - <<'PY'
+import re
+
+value = "{{workflow.parameters.pip_version}}"
+if not value or not re.fullmatch(r"[0-9][0-9A-Za-z.+-]*", value):
+    raise SystemExit(f"Invalid pip_version value: {value!r}")
+print(value)
+PY
+)"
+              python -m pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}"
+              python -m pip install --no-cache-dir \
+                "great_expectations==1.7.0" \
+                "sqlalchemy==2.0.44" \
+                "psycopg2-binary==2.9.10"
+              exec python -m great_expectations checkpoint run nightly_ingest
+          workingDir: /workspace
           env:
+            - name: DATABASE_URL
+              value: "{{workflow.parameters.database_url}}"
             - name: GE_DATA_CONTEXT_ROOT_DIR
               value: /workspace/data/great_expectations
           volumeMounts:
@@ -58,3 +92,5 @@ spec:
       parameters:
         - name: database_url
           value: postgresql+psycopg2://feast:feast@timescaledb:5432/aether
+        - name: pip_version
+          value: "24.3.1"
