@@ -1,0 +1,30 @@
+Thank you for installing the Aether platform Helm chart!
+
+This release deploys the full application stack:
+
+  • Managed dependencies (PostgreSQL/Timescale, Redis, Kafka, NATS) when
+    `dependencies.*.enabled` are true.
+  • Backend FastAPI services defined under `backendServices` along with their
+    Services, Ingresses, HPAs, and PodDisruptionBudgets.
+  • Streaming data pipelines (`dataPipelines`) and Feast feature store
+    resources if enabled.
+  • The Next.js UI (`ui` block) with optional ingress.
+  • Post-install bootstrap Jobs that seed configuration, upgrade account
+    tables, and run data migrations whenever `bootstrap.*.enabled` flags are set.
+
+To verify the rollout:
+
+  1. Confirm the dependency pods are healthy
+     kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/part-of=aether-platform
+
+  2. Watch the Helm hook jobs until they complete
+     kubectl get jobs -n {{ .Release.Namespace }} | grep {{ .Release.Name }}
+
+  3. Ensure every service has an endpoint
+     kubectl get svc -n {{ .Release.Namespace }} | grep {{ .Release.Name }}
+
+  4. Validate ingress readiness (replace host as appropriate)
+     kubectl -n {{ .Release.Namespace }} describe ingress | grep Host
+
+If any optional component is disabled in your values, it will not render. Review
+`values.yaml` and `values.schema.json` for the complete list of tunables.

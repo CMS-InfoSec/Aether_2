@@ -20,6 +20,26 @@ on:
 permissions:
   contents: read
   packages: write
+  actions: write
+
+concurrency:
+  group: >-
+    ${{ github.workflow }}-${{
+      github.event.workflow_run && github.event.workflow_run.pull_requests && github.event.workflow_run.pull_requests[0]
+        && github.event.workflow_run.pull_requests[0].number
+      || github.event.workflow_run && github.event.workflow_run.head_branch && github.event.workflow_run.head_branch != ''
+        && github.event.workflow_run.head_branch
+      || github.event.pull_request && github.event.pull_request.number
+      || github.head_ref && github.head_ref != '' && github.head_ref
+      || github.ref
+      || github.event.workflow_run && github.event.workflow_run.run_number
+      || github.event.workflow_run && github.event.workflow_run.id
+      || github.run_id
+    }}
+  cancel-in-progress: true
+
+
+
 
 jobs:
   kaniko-build:
@@ -27,82 +47,97 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Determine image registry
+        id: image-meta
+        run: |
+          set -euo pipefail
+          owner="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          echo "risk_api_tag=ghcr.io/${owner}/risk-api:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "risk_ingestor_tag=ghcr.io/${owner}/risk-ingestor:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
       - name: Build Risk API Image
-        uses: int128/kaniko-action@v1
+        uses: int128/kaniko-action@v1.52.0
         with:
           push: true
           context: .
           file: deploy/docker/risk-api/Dockerfile
           tags: |
-            ghcr.io/aether/risk-api:${{ github.sha }}
+            ${{ steps.image-meta.outputs.risk_api_tag }}
       - name: Verify critical wheels in Risk API image
+        env:
+          IMAGE_REF: ${{ steps.image-meta.outputs.risk_api_tag }}
         run: |
-          docker pull ghcr.io/aether/risk-api:${{ github.sha }}
-          docker run --rm ghcr.io/aether/risk-api:${{ github.sha }} python - <<'PY'
-import importlib
-import json
-import sys
+          set -euo pipefail
+          docker pull "${IMAGE_REF}"
+          docker run --rm "${IMAGE_REF}" python - <<'PY'
+          import importlib
+          import json
+          import sys
 
-modules = ["psycopg", "argon2", "cryptography"]
-missing: dict[str, str] = {}
-for name in modules:
-    try:
-        importlib.import_module(name)
-    except Exception as exc:
-        missing[name] = repr(exc)
+          modules = ["psycopg", "argon2", "cryptography"]
+          missing: dict[str, str] = {}
+          for name in modules:
+              try:
+                  importlib.import_module(name)
+              except Exception as exc:
+                  missing[name] = repr(exc)
 
-if missing:
-    payload = {
-        "event": "missing_critical_modules",
-        "modules": missing,
-        "component": "risk-api-image",
-    }
-    sys.stderr.write(json.dumps(payload) + "\n")
-    raise SystemExit(1)
+          if missing:
+              payload = {
+                  "event": "missing_critical_modules",
+                  "modules": missing,
+                  "component": "risk-api-image",
+              }
+              sys.stderr.write(json.dumps(payload) + "\n")
+              raise SystemExit(1)
 
-print("Verified critical Python modules:", ", ".join(modules))
-PY
+          print("Verified critical Python modules:", ", ".join(modules))
+          PY
       - name: Build Ingestor Image
-        uses: int128/kaniko-action@v1
+        uses: int128/kaniko-action@v1.52.0
         with:
           push: true
           context: .
           file: deploy/docker/risk-ingestor/Dockerfile
           tags: |
-            ghcr.io/aether/risk-ingestor:${{ github.sha }}
+            ${{ steps.image-meta.outputs.risk_ingestor_tag }}
       - name: Verify critical wheels in Risk Ingestor image
+        env:
+          IMAGE_REF: ${{ steps.image-meta.outputs.risk_ingestor_tag }}
         run: |
-          docker pull ghcr.io/aether/risk-ingestor:${{ github.sha }}
-          docker run --rm ghcr.io/aether/risk-ingestor:${{ github.sha }} python - <<'PY'
-import importlib
-import json
-import sys
+          set -euo pipefail
+          docker pull "${IMAGE_REF}"
+          docker run --rm "${IMAGE_REF}" python - <<'PY'
+          import importlib
+          import json
+          import sys
 
-modules = ["psycopg", "argon2", "cryptography"]
-missing: dict[str, str] = {}
-for name in modules:
-    try:
-        importlib.import_module(name)
-    except Exception as exc:
-        missing[name] = repr(exc)
+          modules = ["psycopg", "argon2", "cryptography"]
+          missing: dict[str, str] = {}
+          for name in modules:
+              try:
+                  importlib.import_module(name)
+              except Exception as exc:
+                  missing[name] = repr(exc)
 
-if missing:
-    payload = {
-        "event": "missing_critical_modules",
-        "modules": missing,
-        "component": "risk-ingestor-image",
-    }
-    sys.stderr.write(json.dumps(payload) + "\n")
-    raise SystemExit(1)
+          if missing:
+              payload = {
+                  "event": "missing_critical_modules",
+                  "modules": missing,
+                  "component": "risk-ingestor-image",
+              }
+              sys.stderr.write(json.dumps(payload) + "\n")
+              raise SystemExit(1)
 
-print("Verified critical Python modules:", ", ".join(modules))
-PY
+          print("Verified critical Python modules:", ", ".join(modules))
+          PY
 
       - name: Generate build metadata manifest
         run: |
@@ -116,7 +151,7 @@ PY
               "GDPR"
             ]
           }
-          EOF
+EOF
         env:
           CHANGE_REQUEST_ID: ${{ github.event.pull_request.number || github.run_id }}
 
@@ -132,21 +167,45 @@ PY
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Install Buildah and Syft
+        with:
+          persist-credentials: false
+      - name: Install Buildah
         run: |
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
           sudo apt-get update
-          sudo apt-get install -y buildah
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          sudo apt-get install -y --no-install-recommends buildah
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+      - name: Determine image registry
+        id: image-meta
+        run: |
+          set -euo pipefail
+          owner="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          echo "risk_api_tag=ghcr.io/${owner}/risk-api:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "risk_ingestor_tag=ghcr.io/${owner}/risk-ingestor:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Download Syft
+        uses: anchore/sbom-action/download-syft@v0.20.6
+        with:
+          syft-version: v1.33.0
       - name: Build Risk API with Buildah
+        env:
+          IMAGE_REF: ${{ steps.image-meta.outputs.risk_api_tag }}
         run: |
-          buildah bud -f deploy/docker/risk-api/Dockerfile -t ghcr.io/aether/risk-api:${{ github.sha }} .
+          buildah bud -f deploy/docker/risk-api/Dockerfile -t "${IMAGE_REF}" .
       - name: Build Ingestor with Buildah
+        env:
+          IMAGE_REF: ${{ steps.image-meta.outputs.risk_ingestor_tag }}
         run: |
-          buildah bud -f deploy/docker/risk-ingestor/Dockerfile -t ghcr.io/aether/risk-ingestor:${{ github.sha }} .
+          buildah bud -f deploy/docker/risk-ingestor/Dockerfile -t "${IMAGE_REF}" .
       - name: Generate SBOMs
+        env:
+          RISK_API_REF: ${{ steps.image-meta.outputs.risk_api_tag }}
+          RISK_INGESTOR_REF: ${{ steps.image-meta.outputs.risk_ingestor_tag }}
         run: |
-          syft ghcr.io/aether/risk-api:${{ github.sha }} -o json > sbom-risk-api.json
-          syft ghcr.io/aether/risk-ingestor:${{ github.sha }} -o json > sbom-risk-ingestor.json
+          syft "${RISK_API_REF}" -o json > sbom-risk-api.json
+          syft "${RISK_INGESTOR_REF}" -o json > sbom-risk-ingestor.json
       - name: Upload SBOMs
         uses: actions/upload-artifact@v4
         with:
@@ -167,7 +226,7 @@ PY
               "GDPR"
             ]
           }
-          EOF
+EOF
         env:
           CHANGE_REQUEST_ID: ${{ github.event.pull_request.number || github.run_id }}
 
