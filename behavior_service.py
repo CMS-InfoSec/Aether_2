@@ -26,7 +26,16 @@ from types import ModuleType, SimpleNamespace
 
 import sys
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import Depends, FastAPI, HTTPException, Query, Request
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        Depends,
+        FastAPI,
+        HTTPException,
+        Query,
+        Request,
+    )
 from pydantic import BaseModel, Field
 
 from shared.account_scope import SQLALCHEMY_AVAILABLE as _ACCOUNT_SCOPE_AVAILABLE, account_id_column
@@ -52,12 +61,100 @@ except ImportError:  # pragma: no cover - exercised in unit-only environments
 
 
 from services.alert_manager import RiskEvent, get_alert_manager_instance
-from services.common.adapters import TimescaleAdapter
+# ``TimescaleAdapter`` lives in the optional ``services.common.adapters``
+# package.  The behaviour service should keep running – albeit without
+# historic event enrichment – when that dependency is missing, so we
+# lazily import the adapter and fall back to an in-memory stub that
+# exposes the minimal API the detector relies upon.
+try:  # pragma: no cover - covered via dedicated regression test
+    from services.common.adapters import TimescaleAdapter as _TimescaleAdapter
+except Exception:  # pragma: no cover - exercised in dependency-less envs
+    _TimescaleAdapter = None  # type: ignore[assignment]
+
+
+def _normalize_account_id(account_id: str) -> str:
+    return account_id.strip().lower()
+
+
+class _FallbackTimescaleAdapter:
+    """Deterministic stub that mimics the behaviour-facing API surface."""
+
+    _events: Dict[str, Dict[str, List[Mapping[str, Any]]]] = {}
+    _telemetry: Dict[str, List[Mapping[str, Any]]] = {}
+
+    def __init__(self, account_id: str) -> None:
+        self._account_id = _normalize_account_id(account_id)
+
+    @classmethod
+    def reset(cls, account_id: Optional[str] = None) -> None:
+        """Clear recorded state for a single account or all accounts."""
+
+        if account_id is None:
+            cls._events.clear()
+            cls._telemetry.clear()
+            return
+
+        normalized = _normalize_account_id(account_id)
+        cls._events.pop(normalized, None)
+        cls._telemetry.pop(normalized, None)
+
+    @classmethod
+    def _events_bucket(cls, account_id: str) -> Dict[str, List[Mapping[str, Any]]]:
+        bucket = cls._events.setdefault(account_id, {"events": [], "acks": []})
+        # Return copies so callers cannot mutate internal state.
+        return {key: list(value) for key, value in bucket.items()}
+
+    def events(self) -> Dict[str, List[Mapping[str, Any]]]:
+        return self._events_bucket(self._account_id)
+
+    def telemetry(self) -> List[Mapping[str, Any]]:
+        telemetry = self._telemetry.get(self._account_id, [])
+        return list(telemetry)
+
+    # The production adapter exposes helpers that record telemetry and OMS
+    # events.  The fallback keeps lightweight mirrors that tests can use to
+    # seed behaviour scenarios when the real adapter is unavailable.
+    @classmethod
+    def _append_event(
+        cls,
+        bucket: Dict[str, List[Mapping[str, Any]]],
+        event_type: str,
+        payload: Mapping[str, Any],
+    ) -> None:
+        bucket[event_type].append(dict(payload))
+
+    @classmethod
+    def record_event(
+        cls, account_id: str, event_type: str, payload: Mapping[str, Any]
+    ) -> None:
+        normalized = _normalize_account_id(account_id)
+        bucket = cls._events.setdefault(normalized, {"events": [], "acks": []})
+        if event_type not in bucket:
+            bucket[event_type] = []
+        cls._append_event(bucket, event_type, payload)
+
+    @classmethod
+    def record_ack(cls, account_id: str, payload: Mapping[str, Any]) -> None:
+        cls.record_event(account_id, "acks", payload)
+
+    @classmethod
+    def record_telemetry(cls, account_id: str, payload: Mapping[str, Any]) -> None:
+        normalized = _normalize_account_id(account_id)
+        telemetry = cls._telemetry.setdefault(normalized, [])
+        telemetry.append(dict(payload))
+
+
+TimescaleAdapter = _TimescaleAdapter or _FallbackTimescaleAdapter
 from services.common.security import require_admin_account
 
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+if _TimescaleAdapter is None:
+    logger.warning(
+        "services.common.adapters missing TimescaleAdapter; using in-memory fallback"
+    )
 
 
 _DATABASE_ENV_VAR = "BEHAVIOR_DATABASE_URL"
