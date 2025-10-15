@@ -9,7 +9,10 @@ from __future__ import annotations
 
 from typing import Any, Callable, TypeVar, cast
 
-from fastapi import Depends, FastAPI
+try:  # pragma: no cover - FastAPI is optional in lightweight environments
+    from fastapi import Depends, FastAPI
+except ModuleNotFoundError:  # pragma: no cover - fall back to the in-repo shim
+    from services.common.fastapi_stub import Depends, FastAPI  # type: ignore[assignment]
 
 from metrics import setup_metrics
 

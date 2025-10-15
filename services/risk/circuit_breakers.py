@@ -21,7 +21,20 @@ from typing import (
     Optional,
 )
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import APIRouter, Depends, HTTPException, Query, status
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        APIRouter,
+        Depends,
+        HTTPException,
+        Query,
+        status,
+    )
 from pydantic import BaseModel, Field
 
 from services.common import adapters as adapters_module
