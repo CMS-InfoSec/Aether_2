@@ -72,6 +72,17 @@ jobs:
             exit 1
           fi
 
+          case "${host_and_path}" in
+            *'@'*)
+              echo "ARGOCD_SERVER must not include embedded credentials." >&2
+              exit 1
+              ;;
+            *'?'*|*'#'*)
+              echo "ARGOCD_SERVER must not include query parameters or fragments." >&2
+              exit 1
+              ;;
+          esac
+
           echo "::add-mask::${ARGOCD_TOKEN}"
 
           for app in aether-prod aether-staging aether-observability; do

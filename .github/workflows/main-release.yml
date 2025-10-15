@@ -325,6 +325,17 @@ jobs:
             exit 1
           fi
 
+          case "${host_and_path}" in
+            *'@'*)
+              echo "ARGOCD_SERVER must not include embedded credentials." >&2
+              exit 1
+              ;;
+            *'?'*|*'#'*)
+              echo "ARGOCD_SERVER must not include query parameters or fragments." >&2
+              exit 1
+              ;;
+          esac
+
           argocd login "${host_and_path}" --username "$ARGOCD_USERNAME" --password "$ARGOCD_PASSWORD" --insecure
           argocd app set "$ARGOCD_APP" --revision "${GITHUB_SHA}"
           argocd app sync "$ARGOCD_APP"
