@@ -6,7 +6,7 @@ import importlib.util
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Callable, Dict, Mapping, Tuple
+from typing import Callable, Dict, Iterable, Iterator, Mapping, Tuple
 
 from shared.runtime_checks import (
     assert_account_allowlists_configured,
@@ -391,7 +391,7 @@ def _ensure_httpx_module() -> None:
         class _HTTPXRequest(SimpleNamespace):
             pass
 
-        class _HTTPXQueryParams:
+        class _HTTPXQueryParams(Mapping[str, str]):
             """Lightweight representation of query parameters."""
 
             def __init__(self, params: object | None = None, **kwargs: object) -> None:
@@ -399,7 +399,7 @@ def _ensure_httpx_module() -> None:
                 if params is None:
                     pass
                 elif isinstance(params, _HTTPXQueryParams):
-                    self._pairs.extend(params.items())
+                    self._pairs.extend(params.multi_items())
                 elif isinstance(params, str):
                     self._pairs.extend(parse_qsl(params.lstrip("?"), keep_blank_values=True))
                 else:
@@ -410,30 +410,95 @@ def _ensure_httpx_module() -> None:
             def _extend_pairs(self, params: object) -> None:
                 if isinstance(params, Mapping):
                     iterable = params.items()
-                else:
+                elif isinstance(params, Iterable):
                     iterable = params  # type: ignore[assignment]
+                else:
+                    raise TypeError(
+                        "QueryParams requires a mapping, string, or iterable of pairs"
+                    )
                 for key, value in iterable:  # type: ignore[misc]
                     if isinstance(value, (list, tuple)):
                         for item in value:
                             self._append_pair(key, item)
                     elif value is None:
-                        continue
+                        self._append_pair(key, "")
                     else:
                         self._append_pair(key, value)
 
             def _append_pair(self, key: object, value: object) -> None:
                 self._pairs.append((str(key), str(value)))
 
-            def __iter__(self):
-                return iter(self._pairs)
+            def __iter__(self) -> Iterator[str]:
+                seen: set[str] = set()
+                for key, _ in self._pairs:
+                    if key not in seen:
+                        seen.add(key)
+                        yield key
+
+            def __len__(self) -> int:
+                seen: set[str] = set()
+                for key, _ in self._pairs:
+                    seen.add(key)
+                return len(seen)
+
+            def __contains__(self, key: object) -> bool:
+                if not isinstance(key, str):
+                    return False
+                return any(pair_key == key for pair_key, _ in self._pairs)
+
+            def _first(self, key: str) -> str:
+                for pair_key, value in self._pairs:
+                    if pair_key == key:
+                        return value
+                raise KeyError(key)
+
+            def __getitem__(self, key: str) -> str:
+                if not isinstance(key, str):
+                    raise KeyError(key)
+                return self._first(key)
+
+            def get(self, key: str, default: object | None = None) -> object | None:
+                if not isinstance(key, str):
+                    return default
+                try:
+                    return self._first(key)
+                except KeyError:
+                    return default
+
+            def get_list(self, key: str) -> list[str]:
+                if not isinstance(key, str):
+                    return []
+                return [value for pair_key, value in self._pairs if pair_key == key]
 
             def items(self) -> list[tuple[str, str]]:
+                seen: set[str] = set()
+                result: list[tuple[str, str]] = []
+                for key, value in self._pairs:
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    result.append((key, value))
+                return result
+
+            def multi_items(self) -> list[tuple[str, str]]:
                 return list(self._pairs)
 
             def __str__(self) -> str:
                 if not self._pairs:
                     return ""
                 return urlencode(self._pairs, doseq=True)
+
+            def __repr__(self) -> str:
+                return f"QueryParams({str(self)!r})"
+
+            def __eq__(self, other: object) -> bool:
+                if isinstance(other, _HTTPXQueryParams):
+                    return self._pairs == other._pairs
+                if isinstance(other, str):
+                    return str(self) == other.lstrip("?")
+                if isinstance(other, Mapping):
+                    return self.items() == _HTTPXQueryParams(other).items()
+                return NotImplemented
 
         class _HTTPXClient:
             def __init__(self, *args: object, timeout: float | None = None, **kwargs: object) -> None:

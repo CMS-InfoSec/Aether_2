@@ -63,6 +63,32 @@ def test_httpx_queryparams_stub_round_trip(simulate_missing_httpx):
     httpx_module = bootstrap.ensure_httpx_ready()
     params = httpx_module.QueryParams({"foo": "bar", "multi": ["a", "b"]})
     assert str(params) == "foo=bar&multi=a&multi=b"
-    assert list(params.items()) == [("foo", "bar"), ("multi", "a"), ("multi", "b")]
+    assert list(params.items()) == [("foo", "bar"), ("multi", "a")]
     cloned = httpx_module.QueryParams(params)
     assert str(cloned) == "foo=bar&multi=a&multi=b"
+    assert cloned == params
+
+
+def test_httpx_queryparams_stub_mapping_behaviour(simulate_missing_httpx):
+    httpx_module = bootstrap.ensure_httpx_ready()
+    params = httpx_module.QueryParams([("multi", "a"), ("multi", "b"), ("foo", "bar")])
+
+    assert list(params) == ["multi", "foo"]
+    assert len(params) == 2
+    assert "multi" in params
+    assert params["multi"] == "a"
+    assert params.get("missing") is None
+    assert params.get("missing", "default") == "default"
+    assert params.get_list("multi") == ["a", "b"]
+    assert params.items() == [("multi", "a"), ("foo", "bar")]
+    assert params.multi_items() == [("multi", "a"), ("multi", "b"), ("foo", "bar")]
+    assert repr(params) == "QueryParams('multi=a&multi=b&foo=bar')"
+
+    clone = httpx_module.QueryParams(params)
+    assert clone == params
+
+    empty = httpx_module.QueryParams({"empty": None})
+    assert str(empty) == "empty="
+    assert empty.items() == [("empty", "")]
+    assert empty.get_list("empty") == [""]
+    assert empty == "empty="
