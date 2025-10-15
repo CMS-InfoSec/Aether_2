@@ -5,27 +5,46 @@ metadata:
   labels:
     workflow-type: realtime
 spec:
+  arguments:
+    parameters:
+      - name: database_url
+        value: postgresql://feast:feast@timescaledb:5432/aether
+      - name: kafka_brokers
+        value: kafka:9092
+      - name: trading_pairs
+        value: BTC/USD,ETH/USD
+      - name: nats_servers
+        value: nats://nats:4222
+      - name: nats_subject
+        value: marketdata.kraken.orderbook
+      - name: pip_version
+        value: "24.3.1"
   entrypoint: run
   templates:
     - name: run
       container:
         image: python:3.11-slim
-        command:
-          - python
-          - data/ingest/kraken_ws.py
-          - BTC/USD
-          - ETH/USD
+        command: ["bash", "-lc"]
         args:
-          - --kafka-bootstrap
-          - kafka:9092
-          - --database-url
-          - postgresql://feast:feast@timescaledb:5432/aether
-          - --snapshot-interval
-          - "120"
+          - |
+            set -euo pipefail
+            python -m pip install --no-cache-dir --upgrade "pip=={{workflow.parameters.pip_version}}"
+            python -m pip install --no-cache-dir aiohttp sqlalchemy "psycopg[binary]" nats-py
+            exec python -m data.ingest.kraken_ws
         workingDir: /workspace
         env:
           - name: PYTHONUNBUFFERED
             value: "1"
+          - name: DATABASE_URL
+            value: "{{workflow.parameters.database_url}}"
+          - name: KAFKA_BROKERS
+            value: "{{workflow.parameters.kafka_brokers}}"
+          - name: KRAKEN_PAIRS
+            value: "{{workflow.parameters.trading_pairs}}"
+          - name: NATS_SERVERS
+            value: "{{workflow.parameters.nats_servers}}"
+          - name: NATS_SUBJECT
+            value: "{{workflow.parameters.nats_subject}}"
         volumeMounts:
           - name: workspace
             mountPath: /workspace

@@ -22,7 +22,7 @@ If the script exits with a non-zero status:
 2. Run `kubectl logs job/daily-risk-report` to identify the failing step.
 3. Re-run manually:
    ```bash
-   python docs/runbooks/scripts/daily_report.py --date $(date -u +%Y-%m-%d)
+   python -m docs.runbooks.scripts.daily_report --date $(date -u +%Y-%m-%d)
    ```
 
 ## API authentication requirements
