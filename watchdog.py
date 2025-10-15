@@ -23,7 +23,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
-from fastapi import Depends, FastAPI, Query
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import Depends, FastAPI, Query
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        Depends,
+        FastAPI,
+        Query,
+    )
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import (
     JSON,
@@ -43,12 +50,12 @@ from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from common.schemas.contracts import IntentEvent
-from services.common.adapters import KafkaNATSAdapter
 from services.common.security import require_admin_account
 from shared.account_scope import account_id_column
 from shared.dependency_alerts import notify_dependency_fallback
 from shared.runtime_checks import ensure_insecure_default_flag_disabled
 from shared.spot import is_spot_symbol, normalize_spot_symbol
+from shared.event_bus import KafkaNATSAdapter
 
 try:  # pragma: no cover - LightGBM is optional in many environments
     import lightgbm as lgb  # type: ignore
