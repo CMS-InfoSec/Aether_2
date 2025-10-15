@@ -10,7 +10,10 @@ from collections.abc import Iterable as IterableCollection, Mapping as MappingCo
 from typing import Any, Dict, Iterable, Mapping
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, status
+try:  # pragma: no cover - prefer real FastAPI when available
+    from fastapi import Depends, FastAPI, HTTPException, status
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import Depends, FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
 
 LOGGER = logging.getLogger(__name__)

@@ -3,25 +3,171 @@ from __future__ import annotations
 
 import logging
 import time
+from copy import deepcopy
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional
 
-from services.common.adapters import KafkaNATSAdapter, TimescaleAdapter
+from shared.event_bus import KafkaNATSAdapter
 from services.common.security import require_admin_account
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
-from fastapi.responses import JSONResponse, Response
+try:  # pragma: no cover - prefer real FastAPI when available
+    from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import Depends, FastAPI, HTTPException, Query, Request, status
+
+try:  # pragma: no cover - prefer real FastAPI response types
+    from fastapi.responses import JSONResponse, Response
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import JSONResponse, Response
 
 from kill_alerts import NotificationDispatchError, dispatch_notifications
 from metrics import CONTENT_TYPE_LATEST, Histogram, _REGISTRY, generate_latest
 from shared.async_utils import dispatch_async
 from shared.audit_hooks import AuditEvent, load_audit_hooks
 
+if TYPE_CHECKING:  # pragma: no cover - import only for typing
+    from services.common.adapters import TimescaleAdapter as _RealTimescaleAdapter
+
+try:  # pragma: no cover - optional dependency in lightweight environments
+    from services.common.adapters import TimescaleAdapter as _TimescaleAdapter
+except Exception as exc:  # pragma: no cover - exercised when dependency absent
+    _TimescaleAdapter = None  # type: ignore[assignment]
+    _TIMESCALE_IMPORT_ERROR: Optional[BaseException] = exc
+else:
+    if _TimescaleAdapter is None:  # pragma: no cover - defensive guard
+        _TIMESCALE_IMPORT_ERROR = AttributeError(
+            "services.common.adapters lacks TimescaleAdapter"
+        )
+    else:
+        _TIMESCALE_IMPORT_ERROR = None
+
+
+class _FallbackTimescaleAdapter:
+    """Minimal Timescale stand-in for environments without the real adapter."""
+
+    _configs: ClassVar[Dict[str, Dict[str, Any]]] = {}
+    _events: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
+    _kill_events: ClassVar[Dict[str, List[Dict[str, Any]]]] = {}
+
+    def __init__(self, *, account_id: str, **_: Any) -> None:
+        self.account_id = account_id
+
+    @classmethod
+    def reset(cls, account_id: Optional[str] = None) -> None:
+        """Clear stored state for the provided account (or all accounts)."""
+
+        if account_id is None:
+            cls._configs.clear()
+            cls._events.clear()
+            cls._kill_events.clear()
+            return
+
+        cls._configs.pop(account_id, None)
+        cls._events.pop(account_id, None)
+        cls._kill_events.pop(account_id, None)
+
+    def _config(self) -> Dict[str, Any]:
+        return self._configs.setdefault(
+            self.account_id,
+            {
+                "kill_switch": False,
+                "safe_mode": False,
+                "loss_cap": None,
+            },
+        )
+
+    def set_kill_switch(
+        self,
+        *,
+        engaged: bool,
+        reason: Optional[str] = None,
+        actor: Optional[str] = None,
+    ) -> None:
+        config = self._config()
+        config["kill_switch"] = bool(engaged)
+        if reason is not None:
+            config["kill_switch_reason"] = reason
+        if actor is not None:
+            config["kill_switch_actor"] = actor
+
+        payload: Dict[str, Any] = {
+            "type": "kill_switch_engaged" if engaged else "kill_switch_released",
+            "ts": datetime.now(timezone.utc),
+        }
+        if reason is not None:
+            payload["reason"] = reason
+        if actor is not None:
+            payload["actor"] = actor
+
+        events = self._events.setdefault(self.account_id, [])
+        events.append(payload)
+
+    def load_risk_config(self) -> Dict[str, Any]:
+        return deepcopy(self._config())
+
+    def events(self) -> Dict[str, List[Dict[str, Any]]]:
+        return {"events": [deepcopy(event) for event in self._events.get(self.account_id, [])]}
+
+    def record_kill_event(
+        self,
+        *,
+        reason_code: str,
+        triggered_at: datetime,
+        channels_sent: List[str],
+    ) -> Dict[str, Any]:
+        payload = {
+            "account_id": self.account_id,
+            "reason": reason_code,
+            "ts": triggered_at,
+            "channels_sent": list(channels_sent),
+        }
+        entries = self._kill_events.setdefault(self.account_id, [])
+        entries.append(payload)
+        return deepcopy(payload)
+
+    def kill_events(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        entries = [deepcopy(entry) for entry in self._kill_events.get(self.account_id, [])]
+        entries.sort(key=lambda record: record["ts"], reverse=True)
+        if limit is not None:
+            entries = entries[:limit]
+        return entries
+
+    @classmethod
+    def all_kill_events(
+        cls,
+        *,
+        account_id: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        if account_id is not None:
+            entries = [deepcopy(entry) for entry in cls._kill_events.get(account_id, [])]
+        else:
+            entries = [
+                deepcopy(entry)
+                for records in cls._kill_events.values()
+                for entry in records
+            ]
+
+        entries.sort(key=lambda record: record["ts"], reverse=True)
+        if limit is not None:
+            entries = entries[:limit]
+        return entries
+
 app = FastAPI(title="Kill Switch Service")
 
 
 LOGGER = logging.getLogger("kill_switch")
+
+if _TimescaleAdapter is None:
+    TimescaleAdapter = _FallbackTimescaleAdapter  # type: ignore[assignment]
+    if _TIMESCALE_IMPORT_ERROR is not None:
+        LOGGER.warning(
+            "TimescaleAdapter unavailable; using in-memory fallback",
+            exc_info=_TIMESCALE_IMPORT_ERROR,
+        )
+else:
+    TimescaleAdapter = _TimescaleAdapter  # type: ignore[assignment]
 
 
 KILL_SWITCH_RESPONSE_SECONDS = Histogram(
@@ -72,8 +218,19 @@ def trigger_kill_switch(
         normalized_account = _normalize_account(account_id)
 
         activation_ts = datetime.now(timezone.utc)
+        if isinstance(reason_code, KillSwitchReason):
+            reason_enum = reason_code
+        else:
+            try:
+                reason_enum = KillSwitchReason(reason_code)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid reason_code: {reason_code}",
+                ) from exc
+
         reason_description = _REASON_DESCRIPTIONS.get(
-            reason_code, "Kill switch engaged"
+            reason_enum, "Kill switch engaged"
         )
 
         timescale = TimescaleAdapter(account_id=normalized_account)
@@ -93,7 +250,7 @@ def trigger_kill_switch(
                     "actor": actor_account,
                     "timestamp": activation_ts.isoformat(),
                     "actions": ["CANCEL_OPEN_ORDERS", "FLATTEN_POSITIONS"],
-                    "reason_code": reason_code.value,
+                    "reason_code": reason_enum.value,
                 },
             ),
             context="kill_switch.broadcast",
@@ -106,7 +263,7 @@ def trigger_kill_switch(
         try:
             channels_sent: List[str] = dispatch_notifications(
                 account_id=normalized_account,
-                reason_code=reason_code.value,
+                reason_code=reason_enum.value,
                 triggered_at=activation_ts,
                 extra_metadata={"actor": actor_account},
             )
@@ -114,14 +271,14 @@ def trigger_kill_switch(
             channels_sent = list(exc.delivered)
             failed_channels = sorted(exc.failed.keys())
             response_status = "partial"
-            http_status = status.HTTP_207_MULTI_STATUS
+            http_status = getattr(status, "HTTP_207_MULTI_STATUS", 207)
             LOGGER.error(
                 "Kill switch notifications partially delivered",
                 extra={"delivered": channels_sent, "failed": failed_channels},
             )
 
         timescale.record_kill_event(
-            reason_code=reason_code.value,
+            reason_code=reason_enum.value,
             triggered_at=activation_ts,
             channels_sent=channels_sent,
         )
@@ -133,7 +290,7 @@ def trigger_kill_switch(
             entity=normalized_account,
             before={},
             after={
-                "reason_code": reason_code.value,
+                "reason_code": reason_enum.value,
                 "reason": reason_description,
                 "channels_sent": channels_sent,
                 "failed_channels": failed_channels,
@@ -157,7 +314,7 @@ def trigger_kill_switch(
         response_body = {
             "status": response_status,
             "ts": activation_ts.isoformat(),
-            "reason_code": reason_code.value,
+            "reason_code": reason_enum.value,
             "channels_sent": channels_sent,
             "failed_channels": failed_channels,
         }

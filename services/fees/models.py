@@ -6,6 +6,10 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 from types import SimpleNamespace
 
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
 import sqlalchemy
 try:  # pragma: no cover - lightweight stubs may omit orm package
     from sqlalchemy import orm as sa_orm
