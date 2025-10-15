@@ -9,6 +9,10 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Dict, Generator, Iterable, List, Optional, Protocol
 
+from shared.common_bootstrap import _ensure_fastapi_stub
+
+_ensure_fastapi_stub()
+
 from fastapi import Depends, FastAPI, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 try:  # pragma: no cover - optional dependency

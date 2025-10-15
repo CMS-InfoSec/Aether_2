@@ -11,7 +11,14 @@ from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List, Mapping, Optional
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import APIRouter, HTTPException, Request
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        APIRouter,
+        HTTPException,
+        Request,
+    )
 from shared.postgres import normalize_postgres_dsn
 
 try:  # pragma: no cover - optional heavy dependency
