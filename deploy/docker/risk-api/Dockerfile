@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1
 FROM python:3.11.9-slim
 
+ARG PIP_VERSION=24.3.1
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app
@@ -14,8 +16,8 @@ RUN apt-get update \
     && adduser --system --ingroup appuser appuser
 
 COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r /tmp/requirements.txt \
+RUN python -m pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}" \
+    && python -m pip install --no-cache-dir -r /tmp/requirements.txt \
     && python - <<'PY'
 import importlib
 import json
