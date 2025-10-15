@@ -51,11 +51,28 @@ PY
                 "psycopg[binary]==3.2.10" \
                 "pyarrow==17.0.0" \
                 "boto3==1.40.45"
+              python - <<'PY'
+import os
+
+def _validate(name: str) -> None:
+    value = os.environ.get(name, "")
+    if not value:
+        raise SystemExit(f"{name} is empty")
+    if any(ch in value for ch in "\r\n"):
+        raise SystemExit(f"{name} contains unexpected whitespace")
+
+for _name in ("REPORT_DATABASE_URL", "REPORT_DATE"):
+    _validate(_name)
+PY
               exec python -m reports.daily_pnl \
-                --database-url '{{workflow.parameters.database_url}}' \
-                --report-date '{{workflow.parameters.report_date}}' \
+                --database-url "${REPORT_DATABASE_URL}" \
+                --report-date "${REPORT_DATE}" \
                 --output-formats csv,parquet
           env:
+            - name: REPORT_DATABASE_URL
+              value: "{{workflow.parameters.database_url}}"
+            - name: REPORT_DATE
+              value: "{{workflow.parameters.report_date}}"
             - name: REPORT_STORAGE_PATH
               value: /reports
           volumeMounts:
@@ -131,11 +148,28 @@ PY
                 "psycopg[binary]==3.2.10" \
                 "pyarrow==17.0.0" \
                 "boto3==1.40.45"
+              python - <<'PY'
+import os
+
+def _validate(name: str) -> None:
+    value = os.environ.get(name, "")
+    if not value:
+        raise SystemExit(f"{name} is empty")
+    if any(ch in value for ch in "\r\n"):
+        raise SystemExit(f"{name} contains unexpected whitespace")
+
+for _name in ("REPORT_DATABASE_URL", "REPORT_WEEK_ENDING"):
+    _validate(_name)
+PY
               exec python -m reports.weekly_xai \
-                --database-url '{{workflow.parameters.database_url}}' \
-                --week-ending '{{workflow.parameters.week_ending}}' \
+                --database-url "${REPORT_DATABASE_URL}" \
+                --week-ending "${REPORT_WEEK_ENDING}" \
                 --output-formats csv,parquet
           env:
+            - name: REPORT_DATABASE_URL
+              value: "{{workflow.parameters.database_url}}"
+            - name: REPORT_WEEK_ENDING
+              value: "{{workflow.parameters.week_ending}}"
             - name: REPORT_STORAGE_PATH
               value: /reports
           volumeMounts:
@@ -211,11 +245,28 @@ PY
                 "psycopg[binary]==3.2.10" \
                 "pyarrow==17.0.0" \
                 "boto3==1.40.45"
+              python - <<'PY'
+import os
+
+def _validate(name: str) -> None:
+    value = os.environ.get(name, "")
+    if not value:
+        raise SystemExit(f"{name} is empty")
+    if any(ch in value for ch in "\r\n"):
+        raise SystemExit(f"{name} contains unexpected whitespace")
+
+for _name in ("REPORT_DATABASE_URL", "REPORT_QUARTER_ENDING"):
+    _validate(_name)
+PY
               exec python -m reports.quarterly_summary \
-                --database-url '{{workflow.parameters.database_url}}' \
-                --quarter-ending '{{workflow.parameters.quarter_ending}}' \
+                --database-url "${REPORT_DATABASE_URL}" \
+                --quarter-ending "${REPORT_QUARTER_ENDING}" \
                 --output-formats csv,parquet
           env:
+            - name: REPORT_DATABASE_URL
+              value: "{{workflow.parameters.database_url}}"
+            - name: REPORT_QUARTER_ENDING
+              value: "{{workflow.parameters.quarter_ending}}"
             - name: REPORT_STORAGE_PATH
               value: /reports
           volumeMounts:

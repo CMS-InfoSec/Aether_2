@@ -47,6 +47,13 @@ spec:
           image: python:3.11-slim
           workingDir: /workspace
           command: ["bash", "-lc"]
+          env:
+            - name: DATABASE_URL
+              value: "{{workflow.parameters.database_url}}"
+            - name: FEAST_REDIS_URL
+              value: "{{workflow.parameters.redis_url}}"
+            - name: GE_DATA_CONTEXT_ROOT_DIR
+              value: data/great_expectations
           args:
             - |
               set -euo pipefail
@@ -68,13 +75,16 @@ PY
                 "requests==2.32.5" \
                 "aiohttp==3.12.15" \
                 "nats-py==2.11.0"
-              export DATABASE_URL={{workflow.parameters.database_url}}
-              export FEAST_REDIS_URL={{workflow.parameters.redis_url}}
               eval "$(python - <<'PY'
 import os
+import shlex
 from urllib.parse import urlparse
 
 url = os.environ["DATABASE_URL"]
+if not url:
+    raise SystemExit("DATABASE_URL is empty")
+if any(ch in url for ch in "\r\n"):
+    raise SystemExit("DATABASE_URL contains unexpected whitespace")
 parsed = urlparse(url)
 
 envs = {
@@ -87,10 +97,11 @@ envs = {
 
 for key, value in envs.items():
     if value:
-        print(f"export {key}='{value}'")
+        if any(ch in value for ch in "\r\n"):
+            raise SystemExit(f"{key} contains unexpected whitespace")
+        print(f"export {key}={shlex.quote(value)}")
 PY
-)" &&
-              export GE_DATA_CONTEXT_ROOT_DIR=data/great_expectations &&
+)"
               exec {{inputs.parameters.command}}
 ---
 apiVersion: argoproj.io/v1alpha1
@@ -128,6 +139,11 @@ spec:
           image: python:3.11-slim
           workingDir: /workspace
           command: ["bash", "-lc"]
+          env:
+            - name: DATABASE_URL
+              value: "{{workflow.parameters.database_url}}"
+            - name: FEAST_REDIS_URL
+              value: "{{workflow.parameters.redis_url}}"
           args:
             - |
               set -euo pipefail
@@ -146,13 +162,16 @@ PY
                 "sqlalchemy==2.0.44" \
                 "psycopg2-binary==2.9.10" \
                 "redis==5.0.4"
-              export DATABASE_URL={{workflow.parameters.database_url}}
-              export FEAST_REDIS_URL={{workflow.parameters.redis_url}}
               eval "$(python - <<'PY'
 import os
+import shlex
 from urllib.parse import urlparse
 
 url = os.environ["DATABASE_URL"]
+if not url:
+    raise SystemExit("DATABASE_URL is empty")
+if any(ch in url for ch in "\r\n"):
+    raise SystemExit("DATABASE_URL contains unexpected whitespace")
 parsed = urlparse(url)
 
 envs = {
@@ -165,7 +184,9 @@ envs = {
 
 for key, value in envs.items():
     if value:
-        print(f"export {key}='{value}'")
+        if any(ch in value for ch in "\r\n"):
+            raise SystemExit(f"{key} contains unexpected whitespace")
+        print(f"export {key}={shlex.quote(value)}")
 PY
-)" &&
+)"
               exec {{inputs.parameters.command}}
