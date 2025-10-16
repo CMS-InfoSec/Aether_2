@@ -168,6 +168,13 @@ def install() -> ModuleType:
         def close(self) -> None:  # pragma: no cover - compatibility shim
             return None
 
+        def __enter__(self) -> "_Connection":  # type: ignore[override]
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[override]
+            self.close()
+            return None
+
     class _AsyncConnection:
         def __init__(self) -> None:
             self._sync = _Connection()
@@ -456,6 +463,12 @@ def install() -> ModuleType:
                 del multiparams, params
                 executor(statement)
                 return SimpleNamespace(rowcount=1)
+
+            def __enter__(self):  # type: ignore[override]
+                return self
+
+            def __exit__(self, exc_type, exc, tb):  # type: ignore[override]
+                return None
 
         class _MockTransaction:
             def __enter__(self):  # type: ignore[override]
