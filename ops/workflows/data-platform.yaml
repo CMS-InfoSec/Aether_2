@@ -96,6 +96,18 @@ database = parsed.path.lstrip("/")
 if not database:
     raise SystemExit("DATABASE_URL is missing a database name")
 
+redis_url = os.environ.get("FEAST_REDIS_URL", "")
+if not redis_url:
+    raise SystemExit("FEAST_REDIS_URL is empty")
+if any(ch in redis_url for ch in string.whitespace):
+    raise SystemExit("FEAST_REDIS_URL contains unexpected whitespace")
+redis_parsed = urlparse(redis_url)
+redis_scheme = redis_parsed.scheme.lower()
+if redis_scheme not in {"redis", "rediss"}:
+    raise SystemExit("FEAST_REDIS_URL must use a redis:// or rediss:// URL")
+if not redis_parsed.hostname:
+    raise SystemExit("FEAST_REDIS_URL is missing a hostname")
+
 envs = {
     "PGHOST": parsed.hostname,
     "PGPORT": str(parsed.port or ""),
@@ -191,6 +203,18 @@ if not parsed.hostname:
 database = parsed.path.lstrip("/")
 if not database:
     raise SystemExit("DATABASE_URL is missing a database name")
+
+redis_url = os.environ.get("FEAST_REDIS_URL", "")
+if not redis_url:
+    raise SystemExit("FEAST_REDIS_URL is empty")
+if any(ch in redis_url for ch in string.whitespace):
+    raise SystemExit("FEAST_REDIS_URL contains unexpected whitespace")
+redis_parsed = urlparse(redis_url)
+redis_scheme = redis_parsed.scheme.lower()
+if redis_scheme not in {"redis", "rediss"}:
+    raise SystemExit("FEAST_REDIS_URL must use a redis:// or rediss:// URL")
+if not redis_parsed.hostname:
+    raise SystemExit("FEAST_REDIS_URL is missing a hostname")
 
 envs = {
     "PGHOST": parsed.hostname,
