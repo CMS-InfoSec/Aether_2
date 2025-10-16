@@ -381,12 +381,55 @@ def _ensure_httpx_module() -> None:
 
         from urllib.parse import parse_qsl, urlencode
 
-        class _HTTPXResponse(SimpleNamespace):
-            def __init__(self, status_code: int = 200, json_data: object | None = None):
-                super().__init__(status_code=status_code, _json=json_data)
+        class _HTTPXResponse:
+            """Lightweight replacement that mirrors key ``httpx.Response`` APIs."""
+
+            def __init__(
+                self,
+                status_code: int = 200,
+                json_data: object | None = None,
+                *,
+                text: str | None = None,
+                content: bytes | None = None,
+                headers: Mapping[str, str] | None = None,
+                request: object | None = None,
+            ) -> None:
+                self.status_code = status_code
+                self._json = json_data
+                if content is not None:
+                    self._content = content
+                    self._text = text
+                elif text is not None:
+                    self._text = text
+                    self._content = text.encode("utf-8")
+                else:
+                    self._text = None
+                    self._content = b""
+                self.headers: dict[str, str] = dict(headers or {})
+                self.request = request
+
+            @property
+            def content(self) -> bytes:
+                return self._content
+
+            @property
+            def text(self) -> str:
+                if self._text is not None:
+                    return self._text
+                return self._content.decode("utf-8", "replace")
 
             def json(self) -> object:
-                return getattr(self, "_json", {})
+                if self._json is not None:
+                    return self._json
+                import json as _json_module
+
+                return _json_module.loads(self.text)
+
+            def raise_for_status(self) -> None:
+                if self.status_code < 400:
+                    return
+                message = f"HTTP {self.status_code}"
+                raise _HTTPXHTTPStatusError(message, request=self.request, response=self)
 
         class _HTTPXRequest(SimpleNamespace):
             pass

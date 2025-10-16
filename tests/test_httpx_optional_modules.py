@@ -116,3 +116,21 @@ def test_httpx_queryparams_stub_hashable(simulate_missing_httpx):
 
     mapping = {params: "value"}
     assert mapping[params] == "value"
+
+
+def test_httpx_response_stub_behaviour(simulate_missing_httpx):
+    httpx_module = bootstrap.ensure_httpx_ready()
+
+    ok_response = httpx_module.Response(status_code=204, headers={"content-type": "text/plain"})
+    ok_response.raise_for_status()
+    assert ok_response.headers["content-type"] == "text/plain"
+
+    parsed = httpx_module.Response(text='{"ok": true}')
+    assert parsed.json() == {"ok": True}
+
+    failing = httpx_module.Response(status_code=503, request="request")
+    with pytest.raises(httpx_module.HTTPStatusError) as exc_info:
+        failing.raise_for_status()
+
+    assert exc_info.value.response is failing
+    assert exc_info.value.request == "request"
