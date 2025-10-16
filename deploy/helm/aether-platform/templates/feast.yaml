@@ -237,7 +237,7 @@ spec:
               command:
                 - /bin/bash
                 - -c
-                - {{ $feast.backup.script | default "set -euo pipefail\napt-get update >/tmp/apt-install.log\napt-get install -y --no-install-recommends redis-tools >>/tmp/apt-install.log\nrm -rf /var/lib/apt/lists/*\npip install --no-cache-dir feast==0.40.1 boto3 cryptography >/tmp/pip-install.log\npython -m ops.backup.feast_backup backup" | quote }}
+                - {{ $feast.backup.script | default "set -euo pipefail\napt-get update >/tmp/apt-install.log\napt-get install -y --no-install-recommends redis-tools >>/tmp/apt-install.log\nrm -rf /var/lib/apt/lists/*\npython -m pip install --no-cache-dir --upgrade \"pip==24.3.1\" >/tmp/pip-install.log\npython -m pip install --no-cache-dir feast==0.40.1 boto3 cryptography >>/tmp/pip-install.log\npython -m ops.backup.feast_backup backup" | quote }}
               env:
                 - name: FEAST_FEATURE_STORE_PATH
                   value: /etc/feast/feature_store.yaml

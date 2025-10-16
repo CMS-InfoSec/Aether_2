@@ -27,6 +27,14 @@ except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from shared.account_scope import SQLALCHEMY_AVAILABLE as _ACCOUNT_SCOPE_AVAILABLE, account_id_column
+from shared import readiness
+from shared.readyz_router import ReadyzRouter
+from shared.service_readiness import (
+    SQLAlchemyProbeClient,
+    engine_from_state,
+    session_factory_from_state,
+    using_sqlite,
+)
 
 _SQLALCHEMY_AVAILABLE = True
 
@@ -904,6 +912,35 @@ def _build_response(
 
 app = FastAPI(title="Capital Allocator Service", version="1.0.0")
 app.state.db_sessionmaker = SessionLocal
+app.state.db_engine = ENGINE
+
+
+_readyz_router = ReadyzRouter()
+
+
+def _build_probe_client() -> SQLAlchemyProbeClient:
+    session_factory = session_factory_from_state(
+        app,
+        dependency_name="Capital allocator database",
+    )
+    return SQLAlchemyProbeClient(session_factory)
+
+
+async def _postgres_read_probe() -> None:
+    client = _build_probe_client()
+    await readiness.postgres_read_probe(client=client)
+
+
+async def _postgres_write_probe() -> None:
+    client = _build_probe_client()
+    engine = engine_from_state(app)
+    read_only_query = "SELECT 1" if using_sqlite(engine) else "SELECT pg_is_in_recovery()"
+    await readiness.postgres_write_probe(client=client, read_only_query=read_only_query)
+
+
+_readyz_router.register_probe("postgres_read", _postgres_read_probe)
+_readyz_router.register_probe("postgres_write", _postgres_write_probe)
+app.include_router(_readyz_router.router)
 
 
 @app.on_event("startup")
