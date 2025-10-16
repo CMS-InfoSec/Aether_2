@@ -38,7 +38,9 @@ import os
 import secrets
 from typing import Any, Dict, Optional
 
-import httpx
+from shared.common_bootstrap import ensure_httpx_ready
+
+httpx = ensure_httpx_ready()
 import pyotp
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 
