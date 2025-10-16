@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import importlib
+
 import pytest
 
-from auth import service as auth_service
+auth_service = importlib.import_module("auth.service")
 
 
 class _StubRedis:
@@ -24,6 +26,31 @@ class _StubRedis:
 
 def _make_stub_client(*args, **kwargs):
     return _StubRedis(), True
+
+
+def test_build_session_store_rejects_whitespace_urls(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = {"count": 0}
+
+    def _recording_stub(*args, **kwargs):
+        calls["count"] += 1
+        return _StubRedis(), False
+
+    monkeypatch.setattr(auth_service, "create_redis_from_url", _recording_stub)
+
+    with pytest.raises(ValueError, match="whitespace"):
+        auth_service.build_session_store_from_url("redis://localhost/0\n")
+
+    assert calls["count"] == 0
+
+
+def test_build_session_store_rejects_invalid_schemes() -> None:
+    with pytest.raises(ValueError, match="redis:// or rediss://"):
+        auth_service.build_session_store_from_url("http://localhost:6379/0")
+
+
+def test_build_session_store_requires_hostname() -> None:
+    with pytest.raises(ValueError, match="hostname"):
+        auth_service.build_session_store_from_url("redis:///0")
 
 
 def test_session_store_requires_explicit_insecure_defaults(monkeypatch: pytest.MonkeyPatch) -> None:

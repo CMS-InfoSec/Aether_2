@@ -8,9 +8,9 @@ import hmac
 import json
 import logging
 import os
-import secrets
+import string
 import sys
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlparse
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -893,8 +893,26 @@ def _session_store_path() -> Path:
     return path
 
 
+def _validate_redis_url(redis_url: str) -> None:
+    """Ensure Redis DSNs are well-formed before attempting to connect."""
+
+    if not redis_url:
+        raise ValueError("Redis URL is empty")
+    if any(ch in redis_url for ch in string.whitespace):
+        raise ValueError("Redis URL contains unexpected whitespace")
+
+    parsed = urlparse(redis_url)
+    scheme = parsed.scheme.lower()
+    if scheme not in {"redis", "rediss"}:
+        raise ValueError("Redis URL must use a redis:// or rediss:// DSN")
+    if not parsed.hostname:
+        raise ValueError("Redis URL is missing a hostname")
+
+
 def build_session_store_from_url(redis_url: str, *, ttl_minutes: int = 60) -> SessionStoreProtocol:
     """Create a session store backed by Redis or a deterministic in-memory stub."""
+
+    _validate_redis_url(redis_url)
 
     client, used_stub = create_redis_from_url(redis_url, decode_responses=True, logger=logger)
     if used_stub:
