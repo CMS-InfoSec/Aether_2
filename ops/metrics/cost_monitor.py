@@ -14,13 +14,23 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Deque, Dict, Iterable, Mapping, MutableMapping, Optional, Tuple
 
-import httpx
-from fastapi import FastAPI, Response
-from fastapi.responses import JSONResponse
-from prometheus_client import (
-    CONTENT_TYPE_LATEST,
+from shared.common_bootstrap import ensure_httpx_ready
+
+httpx = ensure_httpx_ready()
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import FastAPI, Response
+    from fastapi.responses import JSONResponse
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        FastAPI,
+        JSONResponse,
+        Response,
+    )
+
+from metrics import (
     CollectorRegistry,
     Gauge,
+    CONTENT_TYPE_LATEST,
     generate_latest,
 )
 from shared.health import setup_health_checks

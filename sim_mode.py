@@ -7,14 +7,24 @@ from typing import Iterable, Optional
 
 import logging
 
-from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, status
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, status
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[misc]
+        Body,
+        Depends,
+        FastAPI,
+        HTTPException,
+        Query,
+        Request,
+        status,
+    )
 from pydantic import BaseModel, Field
 
 from common.schemas.contracts import SimModeEvent
 from metrics import setup_metrics
-from services.common.adapters import KafkaNATSAdapter
 from services.common.security import get_admin_accounts, require_admin_account
-from shared.sim_mode import SimModeStatus, sim_mode_repository
+from shared.sim_mode import KafkaNATSAdapter, SimModeStatus, sim_mode_repository
 from shared.audit_hooks import AuditEvent, load_audit_hooks
 from shared.health import setup_health_checks
 

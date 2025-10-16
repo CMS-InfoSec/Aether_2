@@ -14,15 +14,14 @@ from decimal import Decimal, ROUND_HALF_UP
 import logging
 from typing import Sequence
 
-try:  # pragma: no cover - httpx is optional in the test environment
-    import httpx
-except ModuleNotFoundError:  # pragma: no cover - provide a stub when dependency missing
-    httpx = None  # type: ignore[assignment]
+from shared.common_bootstrap import ensure_httpx_ready
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from services.fees.models import AccountVolume30d, FeeTier, FeeTierProgress
 
+
+httpx = ensure_httpx_ready()
 
 LOGGER = logging.getLogger(__name__)
 

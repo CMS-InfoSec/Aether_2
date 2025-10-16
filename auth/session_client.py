@@ -17,10 +17,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Mapping, Optional, Protocol
 
-try:
-    import httpx
-except Exception:  # pragma: no cover - optional dependency
-    httpx = None  # type: ignore[assignment]
+from shared.common_bootstrap import ensure_httpx_ready
+
+httpx = ensure_httpx_ready()
 
 logger = logging.getLogger(__name__)
 
