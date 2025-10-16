@@ -32,15 +32,70 @@ spec:
       - name: run
         container:
           image: python:3.11-slim
-          command: ["python", "reports/daily_pnl.py"]
+          command: ["bash", "-lc"]
           args:
-            - "--database-url"
-            - "{{workflow.parameters.database_url}}"
-            - "--report-date"
-            - "{{workflow.parameters.report_date}}"
-            - "--output-formats"
-            - "csv,parquet"
+            - |
+              set -euo pipefail
+              PIP_VERSION="$(python - <<'PY'
+import re
+
+value = "{{workflow.parameters.pip_version}}"
+if not value or not re.fullmatch(r"[0-9][0-9A-Za-z.+-]*", value):
+    raise SystemExit(f"Invalid pip_version value: {value!r}")
+print(value)
+PY
+)"
+              python -m pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}"
+              python -m pip install --no-cache-dir \
+                "pandas==2.2.3" \
+                "psycopg[binary]==3.2.10" \
+                "pyarrow==17.0.0" \
+                "boto3==1.40.45"
+              python - <<'PY'
+import os
+import re
+import string
+from urllib.parse import urlparse
+
+_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
+
+
+def _validate_database_url(name: str) -> None:
+    value = os.environ.get(name, "")
+    if not value:
+        raise SystemExit(f"{name} is empty")
+    if any(ch in value for ch in string.whitespace):
+        raise SystemExit(f"{name} contains unexpected whitespace")
+    parsed = urlparse(value)
+    scheme = parsed.scheme.lower().split("+", 1)[0]
+    if scheme not in {"postgresql", "postgres"}:
+        raise SystemExit(f"{name} must use a postgresql:// URL")
+    if not parsed.hostname:
+        raise SystemExit(f"{name} is missing a hostname")
+    if not parsed.path or parsed.path in {"", "/"}:
+        raise SystemExit(f"{name} is missing a database name")
+
+
+def _validate_date(name: str) -> None:
+    value = os.environ.get(name, "")
+    if not value:
+        raise SystemExit(f"{name} is empty")
+    if not _DATE_RE.fullmatch(value):
+        raise SystemExit(f"{name} must be in YYYY-MM-DD format: {value!r}")
+
+
+_validate_database_url("REPORT_DATABASE_URL")
+_validate_date("REPORT_DATE")
+PY
+              exec python -m reports.daily_pnl \
+                --database-url "${REPORT_DATABASE_URL}" \
+                --report-date "${REPORT_DATE}" \
+                --output-formats csv,parquet
           env:
+            - name: REPORT_DATABASE_URL
+              value: "{{workflow.parameters.database_url}}"
+            - name: REPORT_DATE
+              value: "{{workflow.parameters.report_date}}"
             - name: REPORT_STORAGE_PATH
               value: /reports
           volumeMounts:
@@ -60,6 +115,8 @@ spec:
           value: postgresql://readonly:readonly@timescaledb:5432/aether
         - name: report_date
           value: "{{workflow.creationTimestamp | argo.date(\"2006-01-02\")}}"
+        - name: pip_version
+          value: "24.3.1"
 ---
 apiVersion: argoproj.io/v1alpha1
 kind: CronWorkflow
@@ -95,15 +152,70 @@ spec:
       - name: run
         container:
           image: python:3.11-slim
-          command: ["python", "reports/weekly_xai.py"]
+          command: ["bash", "-lc"]
           args:
-            - "--database-url"
-            - "{{workflow.parameters.database_url}}"
-            - "--week-ending"
-            - "{{workflow.parameters.week_ending}}"
-            - "--output-formats"
-            - "csv,parquet"
+            - |
+              set -euo pipefail
+              PIP_VERSION="$(python - <<'PY'
+import re
+
+value = "{{workflow.parameters.pip_version}}"
+if not value or not re.fullmatch(r"[0-9][0-9A-Za-z.+-]*", value):
+    raise SystemExit(f"Invalid pip_version value: {value!r}")
+print(value)
+PY
+)"
+              python -m pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}"
+              python -m pip install --no-cache-dir \
+                "pandas==2.2.3" \
+                "psycopg[binary]==3.2.10" \
+                "pyarrow==17.0.0" \
+                "boto3==1.40.45"
+              python - <<'PY'
+import os
+import re
+import string
+from urllib.parse import urlparse
+
+_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
+
+
+def _validate_database_url(name: str) -> None:
+    value = os.environ.get(name, "")
+    if not value:
+        raise SystemExit(f"{name} is empty")
+    if any(ch in value for ch in string.whitespace):
+        raise SystemExit(f"{name} contains unexpected whitespace")
+    parsed = urlparse(value)
+    scheme = parsed.scheme.lower().split("+", 1)[0]
+    if scheme not in {"postgresql", "postgres"}:
+        raise SystemExit(f"{name} must use a postgresql:// URL")
+    if not parsed.hostname:
+        raise SystemExit(f"{name} is missing a hostname")
+    if not parsed.path or parsed.path in {"", "/"}:
+        raise SystemExit(f"{name} is missing a database name")
+
+
+def _validate_date(name: str) -> None:
+    value = os.environ.get(name, "")
+    if not value:
+        raise SystemExit(f"{name} is empty")
+    if not _DATE_RE.fullmatch(value):
+        raise SystemExit(f"{name} must be in YYYY-MM-DD format: {value!r}")
+
+
+_validate_database_url("REPORT_DATABASE_URL")
+_validate_date("REPORT_WEEK_ENDING")
+PY
+              exec python -m reports.weekly_xai \
+                --database-url "${REPORT_DATABASE_URL}" \
+                --week-ending "${REPORT_WEEK_ENDING}" \
+                --output-formats csv,parquet
           env:
+            - name: REPORT_DATABASE_URL
+              value: "{{workflow.parameters.database_url}}"
+            - name: REPORT_WEEK_ENDING
+              value: "{{workflow.parameters.week_ending}}"
             - name: REPORT_STORAGE_PATH
               value: /reports
           volumeMounts:
@@ -123,6 +235,8 @@ spec:
           value: postgresql://readonly:readonly@timescaledb:5432/aether
         - name: week_ending
           value: "{{workflow.creationTimestamp | argo.date(\"2006-01-02\")}}"
+        - name: pip_version
+          value: "24.3.1"
 ---
 apiVersion: argoproj.io/v1alpha1
 kind: CronWorkflow
@@ -158,15 +272,70 @@ spec:
       - name: run
         container:
           image: python:3.11-slim
-          command: ["python", "reports/quarterly_summary.py"]
+          command: ["bash", "-lc"]
           args:
-            - "--database-url"
-            - "{{workflow.parameters.database_url}}"
-            - "--quarter-ending"
-            - "{{workflow.parameters.quarter_ending}}"
-            - "--output-formats"
-            - "csv,parquet"
+            - |
+              set -euo pipefail
+              PIP_VERSION="$(python - <<'PY'
+import re
+
+value = "{{workflow.parameters.pip_version}}"
+if not value or not re.fullmatch(r"[0-9][0-9A-Za-z.+-]*", value):
+    raise SystemExit(f"Invalid pip_version value: {value!r}")
+print(value)
+PY
+)"
+              python -m pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}"
+              python -m pip install --no-cache-dir \
+                "pandas==2.2.3" \
+                "psycopg[binary]==3.2.10" \
+                "pyarrow==17.0.0" \
+                "boto3==1.40.45"
+              python - <<'PY'
+import os
+import re
+import string
+from urllib.parse import urlparse
+
+_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
+
+
+def _validate_database_url(name: str) -> None:
+    value = os.environ.get(name, "")
+    if not value:
+        raise SystemExit(f"{name} is empty")
+    if any(ch in value for ch in string.whitespace):
+        raise SystemExit(f"{name} contains unexpected whitespace")
+    parsed = urlparse(value)
+    scheme = parsed.scheme.lower().split("+", 1)[0]
+    if scheme not in {"postgresql", "postgres"}:
+        raise SystemExit(f"{name} must use a postgresql:// URL")
+    if not parsed.hostname:
+        raise SystemExit(f"{name} is missing a hostname")
+    if not parsed.path or parsed.path in {"", "/"}:
+        raise SystemExit(f"{name} is missing a database name")
+
+
+def _validate_date(name: str) -> None:
+    value = os.environ.get(name, "")
+    if not value:
+        raise SystemExit(f"{name} is empty")
+    if not _DATE_RE.fullmatch(value):
+        raise SystemExit(f"{name} must be in YYYY-MM-DD format: {value!r}")
+
+
+_validate_database_url("REPORT_DATABASE_URL")
+_validate_date("REPORT_QUARTER_ENDING")
+PY
+              exec python -m reports.quarterly_summary \
+                --database-url "${REPORT_DATABASE_URL}" \
+                --quarter-ending "${REPORT_QUARTER_ENDING}" \
+                --output-formats csv,parquet
           env:
+            - name: REPORT_DATABASE_URL
+              value: "{{workflow.parameters.database_url}}"
+            - name: REPORT_QUARTER_ENDING
+              value: "{{workflow.parameters.quarter_ending}}"
             - name: REPORT_STORAGE_PATH
               value: /reports
           volumeMounts:
@@ -186,3 +355,5 @@ spec:
           value: postgresql://readonly:readonly@timescaledb:5432/aether
         - name: quarter_ending
           value: "{{workflow.creationTimestamp | argo.date(\"2006-01-02\")}}"
+        - name: pip_version
+          value: "24.3.1"
