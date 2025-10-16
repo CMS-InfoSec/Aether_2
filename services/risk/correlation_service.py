@@ -13,13 +13,33 @@ from datetime import datetime, timedelta, timezone
 from threading import Lock
 from typing import Dict, Iterable, Iterator, List, Mapping, MutableMapping, Sequence
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from shared.common_bootstrap import ensure_common_helpers
+
+ensure_common_helpers()
+
+try:  # pragma: no cover - prefer the real FastAPI implementation when available
+    from fastapi import Depends, FastAPI, HTTPException, Query, status
+except Exception:  # pragma: no cover - exercised when FastAPI is unavailable
+    from services.common.fastapi_stub import (  # type: ignore[assignment]
+        Depends,
+        FastAPI,
+        HTTPException,
+        Query,
+        status,
+    )
 
 from metrics import setup_metrics
 from pydantic import BaseModel, Field
 
 try:  # pragma: no cover - optional dependency
-    from sqlalchemy import (
+    import sqlalchemy as _sqlalchemy_module  # type: ignore[import-not-found]
+except ModuleNotFoundError:  # pragma: no cover - executed when SQLAlchemy missing
+    _sqlalchemy_module = None  # type: ignore[assignment]
+
+if _sqlalchemy_module is not None and not getattr(
+    _sqlalchemy_module, "__aether_stub__", False
+):
+    from sqlalchemy import (  # type: ignore[import-not-found]
         Column,
         DateTime,
         Float,
@@ -30,13 +50,13 @@ try:  # pragma: no cover - optional dependency
         select,
         text,
     )
-    from sqlalchemy.engine import Engine
-    from sqlalchemy.exc import SQLAlchemyError
-    from sqlalchemy.orm import Session, declarative_base, sessionmaker
-    from sqlalchemy.pool import StaticPool
+    from sqlalchemy.engine import Engine  # type: ignore[import-not-found]
+    from sqlalchemy.exc import SQLAlchemyError  # type: ignore[import-not-found]
+    from sqlalchemy.orm import Session, declarative_base, sessionmaker  # type: ignore[import-not-found]
+    from sqlalchemy.pool import StaticPool  # type: ignore[import-not-found]
 
     SQLALCHEMY_AVAILABLE = True
-except Exception:  # pragma: no cover - executed when SQLAlchemy missing
+else:  # pragma: no cover - executed when SQLAlchemy is unavailable or shimmed
     Column = DateTime = Float = Integer = String = UniqueConstraint = object  # type: ignore[assignment]
     Engine = object  # type: ignore[assignment]
     SQLAlchemyError = Exception  # type: ignore[assignment]
@@ -53,7 +73,9 @@ except Exception:  # pragma: no cover - executed when SQLAlchemy missing
     def declarative_base():  # type: ignore[override]
         raise RuntimeError("sqlalchemy is required for correlation persistence")
 
-    sessionmaker = object  # type: ignore[assignment]
+    def sessionmaker(*_args, **_kwargs):  # type: ignore[override]
+        raise RuntimeError("sqlalchemy is required for correlation persistence")
+
     StaticPool = object  # type: ignore[assignment]
     Session = object  # type: ignore[assignment]
     SQLALCHEMY_AVAILABLE = False

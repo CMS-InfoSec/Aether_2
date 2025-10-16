@@ -19,7 +19,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, TypeVar
 
-import httpx
+from shared.common_bootstrap import ensure_httpx_ready
+
+httpx = ensure_httpx_ready()
 try:  # pragma: no cover - FastAPI is optional in some unit tests
     from fastapi import APIRouter, Depends, HTTPException, status
 except ImportError:  # pragma: no cover - fallback when FastAPI is stubbed out
