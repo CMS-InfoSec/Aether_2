@@ -8,9 +8,9 @@ import hmac
 import json
 import logging
 import os
-import string
+import secrets
 import sys
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import quote, urlencode
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
